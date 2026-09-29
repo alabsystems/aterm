@@ -56,8 +56,8 @@ use crate::sig::{Reject, VerifiedBytes};
 ///   attribution bind, because a schema-1 index carries no `machine_id`
 ///   ([`Reject::Unattributed`]) — and, again, would already have failed the signature.
 ///
-/// Both directions fail CLOSED, twice over. See `docs/ATPKG-KEY-MANAGEMENT.md` for what
-/// an already-installed client does about it (short answer: reinstall, accepted).
+/// Both directions fail CLOSED, twice over. There is no migration tier: a client from
+/// before the fold (installs older than v0.21.0) installs nothing new until reinstalled.
 pub const SUPPORTED_SCHEMA: u32 = 2;
 
 /// The default repository the signed index lives on, under the configurable account:
@@ -169,7 +169,7 @@ impl Program {
 }
 
 /// One `[[channels]]` entry: a named, pinned set of program builds plus the gating
-/// counters and the attested reproducibility tuple (`[channels.meta]`).
+/// counters.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Channel {
     /// Channel name (`stable`, `nightly`).
@@ -213,11 +213,9 @@ pub struct Channel {
     /// wire. Absent ⇒ no overlay: `for_target` is the identity.
     #[serde(default)]
     pub pin_by_target: BTreeMap<String, BTreeMap<String, u64>>,
-    /// `[channels.meta]` — the attested reproducibility tuple (nightly id, trust-mc rev,
-    /// …). Stored generically here; Phase 4/5 validate it. Not all fields are attested
-    /// (§4.1 — `trust_fork_rev`/`llvm`/`clean_kernel_rev` are net-new, unproven).
-    #[serde(default)]
-    pub meta: BTreeMap<String, String>,
+    // A `[channels.meta]` reproducibility tuple was designed (TOOLCHAIN-PACKAGE-MANAGER.md
+    // §4.1) and never published or read; the field that stored it went on 2026-09-27. An
+    // index that carries the table still parses: unknown keys are ignored.
 }
 
 impl Channel {
@@ -743,7 +741,9 @@ pin = {{ trust = 7100, nn = 108 }}
         // The attribution pair that replaced `[keys]` — what the roster bind checks.
         assert_eq!(idx.machine_id.as_deref(), Some(testkit::MACHINE_ID));
         assert_eq!(idx.roster_seq, Some(testkit::SEQ));
-        // Programs, channels, pin, meta all parsed.
+        // Programs, channels and pin parsed; the fixture's `[channels.meta]` table, which
+        // no field reads, is tolerated as an unknown key (wire-safe for any index that
+        // ever carried one).
         assert_eq!(
             idx.program("trust").unwrap().coherence_group.as_deref(),
             Some("rustc")
@@ -753,10 +753,6 @@ pin = {{ trust = 7100, nn = 108 }}
         let ch = &idx.channels[0];
         assert_eq!(ch.name, "stable");
         assert_eq!(ch.pin.get("trust"), Some(&4821));
-        assert_eq!(
-            ch.meta.get("nightly").map(String::as_str),
-            Some("nightly-2025-12-03")
-        );
     }
 
     /// A per-target overlay changes ONLY the target it names: that target sees the

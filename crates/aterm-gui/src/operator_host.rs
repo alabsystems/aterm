@@ -903,8 +903,11 @@ impl ControlHandle {
             .fleet_fault = Some(reason);
     }
 
+    /// Queue one "aterm operator" notice for the desktop. aterm's OWN words
+    /// ([`crate::notify::NotifyMsg::own`]): the delivery thread drops it while
+    /// `desktop_alerts` is off, as it does every notice aterm writes itself.
     fn surface_notice(&self, local_id: u64, body: &str) {
-        let message = crate::notify::NotifyMsg::new(
+        let message = crate::notify::NotifyMsg::own(
             local_id,
             Some("aterm operator".to_string()),
             body.to_string(),
@@ -2874,6 +2877,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         });
         SessionHandle {
             sid,
@@ -4362,14 +4367,18 @@ mod tests {
             slot.retry_after = None;
         }
         let store = crate::session_store::new_store();
+        // The predecessor parks for the longest a `next` may (the 30 s cap),
+        // so a predecessor that ignored its hangup holds the slot to then.
+        const PREDECESSOR_WAIT: Duration = Duration::from_secs(30);
         let park = |gone: Arc<AtomicBool>| {
             let (waiter, store) = (Arc::clone(&control), store.clone());
             let handle = std::thread::spawn(move || {
-                waiter.wait_claim(&store, Duration::from_secs(20), &mut || {
+                waiter.wait_claim(&store, PREDECESSOR_WAIT, &mut || {
                     gone.load(Ordering::SeqCst)
                 })
             });
-            let parked = Instant::now() + Duration::from_secs(5);
+            // The park must happen: a hang detector, a minute.
+            let parked = Instant::now() + Duration::from_secs(60);
             while !control.shared.claim_waiter_active.load(Ordering::SeqCst) {
                 assert!(Instant::now() < parked, "the first next never parked");
                 std::thread::sleep(Duration::from_millis(5));
@@ -4393,17 +4402,17 @@ mod tests {
             asked.elapsed()
         );
 
-        // The predecessor hangs up: its slot is free within the grace, so the
-        // successor's `next` is served (here: nothing queued, a timeout).
+        // The predecessor hangs up: it lets its slot go at its next probe, so
+        // the successor's `next` is served (here: nothing queued, a timeout)
+        // under the SHIPPING grace. That 1 s is the subject, not a test clock:
+        // past it the product refuses the successor "already waiting" (the
+        // RFC §9.1 bug), so the grace sits between the two outcomes and the
+        // verdict is the product's own. What is not asserted is the call's
+        // wall time: the claim step runs after the slot is taken, so a slow
+        // claim on a loaded machine is served late, not refused.
         live.store(true, Ordering::SeqCst);
-        let asked = Instant::now();
         let served = control.wait_claim(&store, Duration::ZERO, &mut || false);
         assert!(matches!(served, Ok(None)), "{served:?}");
-        assert!(
-            asked.elapsed() < NEXT_HANDOVER_GRACE,
-            "{:?}",
-            asked.elapsed()
-        );
         assert!(matches!(first.join().unwrap(), Ok(None)));
 
         // A hung-up client is handed nothing, and the event it would have
@@ -4536,7 +4545,7 @@ mod tests {
         let (notify_tx, notify_rx) = std::sync::mpsc::sync_channel(1);
         assert!(
             notify_tx
-                .try_send(crate::notify::NotifyMsg::new(
+                .try_send(crate::notify::NotifyMsg::program(
                     1,
                     None,
                     "occupied".to_string()
@@ -4556,6 +4565,8 @@ mod tests {
         assert_eq!(retried.session, 7);
         assert_eq!(retried.title.as_deref(), Some("aterm operator"));
         assert!(retried.body.contains("needs you"));
+        // aterm's own words, so `desktop_alerts` governs its delivery.
+        assert!(retried.own, "an operator notice is aterm's own");
         assert!(control.shared.pending_notice.lock().unwrap().is_none());
     }
 

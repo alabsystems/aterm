@@ -308,7 +308,7 @@ fn a_headless_launch_is_not_an_activatable_app_and_never_takes_the_front() {
     // The crate's own answer, so the pin follows the decision and cannot drift
     // from it — and the independent `!= Regular` line below is the incident
     // itself, kept even if the decision ever moves to Accessory.
-    let expected = aterm_gui::launch_posture(true)
+    let expected = aterm_gui::launch_posture(true, false)
         .policy
         .expect("a headless launch names a policy")
         .ns_raw();

@@ -24,7 +24,7 @@
 //!   the glyph stays sharp) inside a soft aura that slides into the nebula
 //!   haze at its rim — the block sits in a little pocket of space.
 //!
-//! Text-safe by construction, mirroring [`crate::cursor_fireball`]: the block
+//! Text-safe by construction, mirroring [`crate::cursor_rainbow`]: the block
 //! FILL rides the renderer's `floor_cursor_fill` contrast floor, and all rod /
 //! aura light is additive [`GlowQuad`]s with capped coverage — brightest along
 //! the thin axis over the cursor itself, a faint tint where it crosses a
@@ -57,7 +57,7 @@ const OVERSHOOT_MAX: f32 = 0.22;
 const COV_IDLE: f32 = 70.0;
 const COV_MAX: f32 = 150.0;
 /// Per-quad additive coverage ceiling — the same text-safety band as the
-/// fireball/curtain tuning. The thin axis saturates here (it sits over the
+/// fire curtain's tuning. The thin axis saturates here (it sits over the
 /// cursor cell's own column); the wider sleeve quads that actually reach a
 /// neighbouring glyph run at a fraction of it and stay a tint.
 const COV_CAP: f32 = 92.0;
@@ -143,7 +143,7 @@ impl CursorBeamRod {
         let e = (blaze.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         // Fully inert — byte-identical to the plain themed cursor — when off,
         // when the geometry is degenerate, or when the amplitude is zero
-        // (reduced motion / load-shed), mirroring the fireball's "0 ⇒ off".
+        // (reduced motion / load-shed), mirroring the rainbow block's "0 ⇒ off".
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.blaze = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);

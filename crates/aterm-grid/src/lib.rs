@@ -75,8 +75,8 @@ pub use damage::{
 #[cfg(any(test, kani, feature = "testing"))]
 pub use extra::is_combining_mark;
 pub use extra::{
-    CellCoord, CellExtra, CellExtras, ImageData, ImageFormat, ImageRef, KittyPlaceholderData,
-    UniformExtras,
+    CellCoord, CellExtra, CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling,
+    KittyPlacementTag, SourceRect, UniformExtras,
 };
 pub use page::PageStore;
 pub use pin::GenerationTracker;
@@ -94,7 +94,8 @@ pub use cursor::{Cursor, SavedCursor};
 pub use scroll_region::{HorizontalMargins, ScrollRegion};
 pub use state::{
     AbsoluteRowUpdate, BandSet, GridCursorState, GridPresentationState, MAX_SELECTION_DAMAGE_BANDS,
-    OutputOrigin, ROW_BAND_MOVES_PER_BATCH, RowBandMove, RowBandMoves, SelectionDamage,
+    OutputOrigin, ROW_BAND_MOVES_PER_BATCH, ResizeShape, RowBandMove, RowBandMoves,
+    SelectionDamage,
 };
 
 // Terminal style types shared with checkpoint system.

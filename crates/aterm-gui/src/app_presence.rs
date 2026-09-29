@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The App's side of PRESENCE ([`crate::presence`]): gathering each session's
-//! facts from its own leaf locks, folding them into the per-session
-//! [`Slot`], projecting the FOCUSED session of every window into that window's
-//! [`WindowView`] (rim, band, chip, a11y sentence), and paying the one PTY
-//! resize a band row costs when it appears or folds.
+//! The App's side of PRESENCE ([`crate::presence`]): SENSING each session's
+//! facts from its own leaf locks, and being the engine driver's host. The
+//! sequencing — fold the facts into the per-session slot, project the FOCUSED
+//! session of every window onto its view, commit the row to the geometry, the
+//! fold law, the ripple and the pulse, a told story, the deadline and the
+//! tick — is `aterm_messages::presence::drive` (design ruling 353); this file
+//! implements its [`Desk`] on the App: the window walk, the facts, the
+//! on-screen test, the motion policy, the re-grid, the repaint, the chips,
+//! the herald and the chime. Round 30 moved the pure core (ruling 348).
 //!
 //! Every entry point here runs at CHANGE rate: a `Wake::LeaseChanged` /
 //! `Wake::FabricChanged` / `Wake::MetaChanged`, a status-revision or
@@ -17,45 +21,39 @@
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::RenderCell;
+use aterm_messages::presence::drive::{self, Desk};
 use aterm_render::Theme;
 use aterm_session::SessionId;
 
 use crate::app_render::OverlayGlow;
 use crate::presence::{
-    self, ChipLevel, Facts, Hand, HoldFact, Level, Link, Rim, Slot, StoryVerb, TurnFact, WindowView,
+    self, Facts, Hand, HoldFact, LeaseMark, Link, Slot, StoryVerb, TurnFact, WindowView,
 };
 use crate::{App, WindowId};
 
-/// The rim's inset-border alpha: the drop target's crisp frame, so a driven
-/// window's teal reads at the same weight the drag highlight always has.
-const RIM_BORDER_ALPHA: u8 = 235;
-/// The wash under a HOLD (12/255, design §1): faint, readable through.
-const HOLD_WASH_ALPHA: u8 = 12;
-/// The ripple's peak wash, decaying to 0 over its nine steps.
-const RIPPLE_WASH_PEAK: u32 = 24;
+/// The chip level the existing indicator bits spell — the engine's
+/// (`aterm_messages::presence::chip_of_attention`), under the name the tab
+/// strip has always used.
+pub(crate) use aterm_messages::presence::chip_of_attention;
 
-/// The per-session slots, keyed by the pool's local id.
+/// The per-session presence state: the engine's table (the slots and each
+/// `ttl=` supervisor claim's lapse, `drive::Table`) and this host's herald.
 #[derive(Default, Debug)]
 pub(crate) struct PresenceTable {
-    slots: std::collections::HashMap<u64, Slot>,
+    table: drive::Table<presence::Native>,
     /// The menu-bar rows' and notifications' transition memory
     /// (`App::herald_session`), per session like the slots.
     pub(crate) herald: crate::status_item::Herald,
-    /// When each session's `ttl=` supervisor claim lapses — the timer
-    /// ([`App::presence_deadline`]) wakes there, because a supervisor that
-    /// dies writes nothing and its box must still reach the human.
-    supervisor_until: std::collections::HashMap<u64, Instant>,
 }
 
 impl PresenceTable {
     pub(crate) fn slot(&self, session: u64) -> Option<&Slot> {
-        self.slots.get(&session)
+        self.table.slot(session)
     }
 
     pub(crate) fn retire(&mut self, session: u64) {
-        self.slots.remove(&session);
+        self.table.retire(session);
         self.herald.retire(session);
-        self.supervisor_until.remove(&session);
     }
 }
 
@@ -70,6 +68,19 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn presence_regrids() -> u64 {
     PTY_RESIZES_FOR_PRESENCE.with(|c| c.get())
+}
+
+/// A session's own lease reduced to what the row's geometry hangs on
+/// ([`LeaseMark`]): the one reduction both the sensed facts and the live
+/// [`Desk::lease_mark`] use, so the two compare like for like. A drive lease
+/// past its expiry is `Free`, as `presence_facts` reads it.
+fn lease_mark_of(lease: Option<&crate::Lease>, now_us: u64) -> LeaseMark {
+    match lease {
+        Some(crate::Lease::Turn { typing: true, .. }) => LeaseMark::Typing,
+        Some(crate::Lease::Turn { typing: false, .. }) => LeaseMark::Settling,
+        Some(crate::Lease::Drive { expires_us, .. }) if *expires_us > now_us => LeaseMark::Typing,
+        _ => LeaseMark::Free,
+    }
 }
 
 impl App {
@@ -90,10 +101,15 @@ impl App {
         let ctx = &s.ctx;
         let now_us = crate::metrics::now_us();
         let now = Instant::now();
-        let (hand, lease_until) = {
+        let (hand, lease_until, typing, mark) = {
             let lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
-            match lease.as_ref() {
-                Some(crate::Lease::Turn { id, driver }) => (
+            let typing = lease.as_ref().is_some_and(|l| l.driver_may_type(now_us));
+            // The mark from THIS read of the lease, never a second lock of
+            // it: the words and the mark they are committed under must be
+            // one moment of the lease (`drive::commit_rows`).
+            let mark = lease_mark_of(lease.as_ref(), now_us);
+            let (hand, lease_until) = match lease.as_ref() {
+                Some(crate::Lease::Turn { id, driver, .. }) => (
                     Hand::DrivenTurn {
                         id: *id,
                         holder: driver.as_ref().map(|d| self.name_of_sid(d)),
@@ -110,7 +126,8 @@ impl App {
                     Some(now + Duration::from_micros(expires_us - now_us)),
                 ),
                 _ => (Hand::None, None),
-            }
+            };
+            (hand, lease_until, typing, mark)
         };
         // Driving ANOTHER session: an open turn on a peer whose lease names
         // this session as its driver (the same record the peer's own `◂`
@@ -122,6 +139,10 @@ impl App {
                 })
         } else {
             hand
+        };
+        let lease = match (&hand, mark) {
+            (Hand::Driving { .. }, LeaseMark::Free) => LeaseMark::Driving,
+            (_, mark) => mark,
         };
         let hold = ctx.fabric.hold().map(|h| HoldFact {
             reason: h.reason,
@@ -147,7 +168,9 @@ impl App {
                 upgrade_only && meta.attention.is_some(),
             )
         };
-        let link = match crate::fabric::fabric_state() {
+        // The link as THIS App sees it (`fabric_state_seen`: the process
+        // link, keyed away from a foreign test section in a test binary).
+        let link = match crate::fabric::fabric_state_seen() {
             "connected" => Link::Connected {
                 rtt_ms: crate::fabric::fabric_link_facts().1,
             },
@@ -196,6 +219,8 @@ impl App {
             agent,
             hand,
             lease_until,
+            typing,
+            lease,
             hold,
             mail,
             link,
@@ -252,45 +277,10 @@ impl App {
     }
 
     /// A fact about `session` changed: re-read it, fold it in, and project it
-    /// onto every window that shows the session. `submitted` marks a turn's
-    /// submit keypress — the ripple's edge.
+    /// onto every window that shows the session (`drive::refresh_session`).
+    /// `submitted` marks a turn's submit keypress — the ripple's edge.
     pub(crate) fn refresh_presence_session(&mut self, session: u64, submitted: bool) {
-        let now = Instant::now();
-        self.note_supervisor_expiry(session, now);
-        // The human channel rides every presence refresh — the same change
-        // rate (a verdict move from the sweep, a `meta set`, a lease wake) —
-        // and dedups by transition itself, so a refresh that moved nothing
-        // costs two leaf-lock reads and no AppKit call.
-        self.herald_session(session);
-        let Some(facts) = self.presence_facts(session) else {
-            return;
-        };
-        let changed = {
-            let slot = self
-                .presence
-                .slots
-                .entry(session)
-                .or_insert_with(|| Slot::new(now));
-            let first = slot.agent_seq_seen.is_none() && slot.shell.is_none();
-            slot.absorb(facts, now) || first
-        };
-        if !changed && !submitted {
-            return;
-        }
-        let mut windows = self.windows_with_focused_session(session);
-        for (wid, _) in self.tabs_viewing_session(session) {
-            if !windows.contains(&wid) {
-                windows.push(wid);
-            }
-        }
-        for wid in &windows {
-            if self.focused_session_id(*wid) == Some(session) && submitted {
-                self.start_presence_ripple(*wid, now);
-            }
-            self.refresh_presence_window(*wid);
-        }
-        // The chips: every strip showing the session re-stamps its levels.
-        self.refresh_tab_chrome_windows(windows);
+        drive::refresh_session(self, session, submitted);
     }
 
     /// The wake arms: resolve the fabric sid to the pool's local id.
@@ -300,419 +290,76 @@ impl App {
         }
     }
 
-    /// Start the 300 ms edge ripple on `wid` — unless motion is reduced, where
-    /// the amplitude is 0 and the ripple never starts (the same image).
-    pub(crate) fn start_presence_ripple(&mut self, wid: WindowId, now: Instant) {
-        self.start_ripple(wid, now, false);
-    }
-
-    /// Start the CHOICE PULSE on `wid`: the same 300 ms edge flash, gated the
-    /// same way (reduced motion or serious mode ⇒ it never starts), painted in
-    /// the story tone and shown even on a window with no rim — the supervisor
-    /// answered a question box in the session this window's front tab shows
-    /// (`App::tell_story` with [`StoryVerb::Chose`]).
-    pub(crate) fn start_presence_pulse(&mut self, wid: WindowId, now: Instant) {
-        // The pulse IS a rim flash: `[presence] rim = false` (the View menu's
-        // Presence Rim) means no rim is ever painted, this one included.
-        if self.presence_rim_on {
-            self.start_ripple(wid, now, true);
-        }
-    }
-
-    fn start_ripple(&mut self, wid: WindowId, now: Instant, chose: bool) {
-        // A CHOICE PULSE is not held to the window's OS key focus — the same
-        // reasoning as `chose_chime`'s "no focus test": its point is to show
-        // that a question in a window the person is NOT in was answered. Only
-        // reduced motion and serious mode stop it. The turn-submit ripple
-        // keeps the unfocused-window rule every decorative motion has.
-        let focused = chose || self.windows.get(&wid).is_some_and(|ws| ws.focused);
-        let focused = self.motion_focus(wid, focused);
-        let animate = self
-            .motion_policy(focused)
-            .animate(crate::motion::MotionEffect::PresenceRipple)
-            && self
-                .serious_mode_policy()
-                .allows(crate::motion::SeriousEffect::PresenceRipple);
-        if !animate {
-            return;
-        }
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.presence.ripple_at = Some(now);
-            ws.presence.ripple_chose = chose;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
-    }
-
-    /// Project the window's FOCUSED session onto its view: level, rim, words,
-    /// and the band row's existence. Bumps the view's seed when anything the
-    /// painter reads moved, and pays the re-grid when the row appears or folds.
+    /// Project the window's FOCUSED session onto its view and commit the row
+    /// (`drive::refresh_window`).
     pub(crate) fn refresh_presence_window(&mut self, wid: WindowId) {
-        let now = Instant::now();
-        let session = self.focused_session_id(wid);
-        let watermark = session
-            .and_then(|s| self.windows.get(&wid).map(|ws| ws.presence.watermark(s)))
-            .unwrap_or(0);
-        let (level, words) = match session.and_then(|s| self.presence.slots.get(&s)) {
-            Some(slot) => {
-                // What THIS window shows (rim, row): an attention the
-                // message band already tells is not repeated here
-                // ([`presence::Slot::shown_level`]); `status` keeps it.
-                let level = slot.shown_level(watermark);
-                let words = level
-                    .shows_row()
-                    .then(|| presence::words(slot, now, watermark));
-                (level, words)
-            }
-            None => (Level::Quiet, None),
-        };
-        // THE VIEW TOGGLES (round 19, `[presence] band` / `rim`): an unchecked
-        // band hides the row (no words ⇒ no row committed, and `chrome`
-        // reports an empty band — what the human sees); an unchecked rim
-        // paints none. The LEVEL is untouched: `status level=` and the chip
-        // still say the fact, and the a11y sentence rides the band's words.
-        let words = if self.presence_band_on() { words } else { None };
-        let rim = if self.presence_rim_on() {
-            level.rim()
-        } else {
-            presence::Rim::None
-        };
-        // The front window's hold, for the native menu's synchronous validate
-        // (the Fabric menu's halt pair reads it when the menu opens).
-        if self.frontmost_window == Some(wid) {
-            self.publish_front_hold(wid);
-        }
-        let mut moved = false;
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            let v = &mut ws.presence;
-            if v.level != level || v.rim != rim || v.words != words {
-                // New words re-arm their own clock ([`words_step`]): a
-                // minutes row's +60 s must not hold back a seconds row that
-                // replaced it. The earlier of the two wins, so a figure
-                // already due is never pushed back.
-                if v.words != words {
-                    let next = words.as_ref().map(|w| now + words_step(w));
-                    v.words_due = match (v.words_due, next) {
-                        (Some(old), Some(new)) => Some(old.min(new)),
-                        (_, next) => next,
-                    };
-                }
-                v.level = level;
-                v.rim = rim;
-                v.words = words;
-                v.seed = v.seed.wrapping_add(1).max(1);
-                moved = true;
-            }
-        }
-        let folded = self.sync_presence_rows(wid);
-        if (moved || folded)
-            && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
-        {
-            w.request_redraw();
-        }
+        drive::refresh_window(self, wid);
     }
 
     /// Every window: the tab-switch / focus-change / restore funnel.
     pub(crate) fn refresh_presence_all_windows(&mut self) {
-        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
-        for wid in wids {
-            self.refresh_presence_window(wid);
-        }
+        drive::refresh_all(self);
     }
 
-    /// Commit the band row's existence to the window geometry: `true` when the
-    /// count moved (and the window was re-gridded — ONE PTY resize). Frozen
-    /// mid-handoff for the same reason `sync_message_band_rows` is, and yielding
-    /// to the last terminal row the same way.
-    pub(crate) fn sync_presence_rows(&mut self, wid: WindowId) -> bool {
-        if self.update_handoff_parked() || self.incoming_handoff_pending {
-            return false;
-        }
-        let Some(ws) = self.windows.get(&wid) else {
-            return false;
-        };
-        let want = u16::from(ws.presence.words.is_some());
-        let afford = ws
-            .rows
-            .saturating_add(ws.presence.rows)
-            .saturating_sub(1)
-            .min(1);
-        let want = if ws.os_window.is_some() {
-            want.min(afford)
-        } else {
-            want
-        };
-        if want == ws.presence.rows {
-            return false;
-        }
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.presence.rows = want;
-            ws.presence.cached_key = None;
-        }
-        #[cfg(test)]
-        PTY_RESIZES_FOR_PRESENCE.with(|c| c.set(c.get() + 1));
-        self.regrid_window_for_chrome_rows(wid);
-        true
-    }
-
-    /// THE FOLD LAW. The human acted (a key, a click) in `wid`: if its session
-    /// is CALM, the story is read — the watermark moves to the newest point
-    /// and the row folds (one PTY resize). Never on focus alone, never on a
-    /// timer, and never while anything is still happening.
+    /// THE FOLD LAW (`drive::human_acted`): the human acted (a key, a click)
+    /// in `wid`; a CALM session's story is read and its row folds.
     pub(crate) fn note_human_acted(&mut self, wid: WindowId) {
-        let Some(session) = self.focused_session_id(wid) else {
-            return;
-        };
-        let Some(slot) = self.presence.slots.get(&session) else {
-            return;
-        };
-        if !slot.calm() {
-            return;
-        }
-        let seq = slot.story_seq;
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
-        if ws.presence.watermark(session) == seq && ws.presence.words.is_none() {
-            return;
-        }
-        ws.presence.watermarks.insert(session, seq);
-        self.refresh_presence_window(wid);
+        drive::human_acted(self, wid);
     }
 
-    /// Remember when `session`'s `ttl=` supervisor claim lapses (or forget a
-    /// session with none), so [`Self::presence_deadline`] wakes there. Read at
-    /// every presence refresh — a `meta set supervisor` posts
-    /// `Wake::MetaChanged`, which refreshes — so a renewal moves the deadline.
-    fn note_supervisor_expiry(&mut self, session: u64, now: Instant) {
-        let expiry = self.pool.get(session).and_then(|s| {
-            s.ctx
-                .meta
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .supervisor_expiry()
-        });
-        match expiry {
-            Some(at_us) => {
-                let now_us = crate::metrics::now_us();
-                // One millisecond past the expiry, so the lapse check at the
-                // wake sees it lapsed on the microsecond clock too.
-                let at = now
-                    + Duration::from_micros(at_us.saturating_sub(now_us))
-                    + Duration::from_millis(1);
-                self.presence.supervisor_until.insert(session, at);
-            }
-            None => {
-                self.presence.supervisor_until.remove(&session);
-            }
-        }
+    /// THE FOLD LAW for a press (`drive::human_acted_on`, ruling 372): the
+    /// human acted in `wid` while `session` was its front — the story they
+    /// SAW, read even when the press brought another pane or a tab with no
+    /// session front.
+    pub(crate) fn note_human_acted_on(&mut self, wid: WindowId, session: u64) {
+        drive::human_acted_on(self, wid, session);
     }
 
-    /// The timer's human-channel half: a `ttl=` supervisor claim that has
-    /// lapsed is removed and recorded (`meta-change field=supervisor
-    /// value=-`, pushed as `EVENT meta`), and the session is re-heralded — so
-    /// a box the dead supervisor was holding reaches the menu row and the
-    /// notification; and every owed notification the rate limit now allows
-    /// is posted ([`crate::status_item::Herald::due`]).
-    fn presence_herald_tick(&mut self, now: Instant) {
-        let lapsed: Vec<u64> = self
-            .presence
-            .supervisor_until
-            .iter()
-            .filter(|(_, at)| **at <= now)
-            .map(|(session, _)| *session)
-            .collect();
-        for session in lapsed {
-            let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
-                self.presence.retire(session);
-                continue;
-            };
-            if crate::session_timeline::lapse_supervisor(&ctx, crate::metrics::now_us())
-                && self.subscribers.any()
-            {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(session);
-            }
-            // Re-reads the claim: a lapsed one is gone (the deadline with it),
-            // a renewed one re-arms at its new expiry.
+    /// Arm the presence timer at every pooled session's `ttl=` supervisor
+    /// claim (round four, item 9) — called at a successor's Commit. A lease a
+    /// seamless update carried was seeded before its session was registered,
+    /// so no `meta set` wake ever armed its lapse; without this a lease whose
+    /// holder died with the old instance was never lapsed, never said, and
+    /// this instance's own supervisor host — parked behind it until a claim
+    /// is released or lapses — never took the session. A refresh reads each
+    /// claim (`drive::refresh_session`).
+    #[cfg(unix)]
+    pub(crate) fn arm_supervisor_expiries(&mut self) {
+        let sessions: Vec<u64> = self.pool.iter().map(|session| session.id).collect();
+        for session in sessions {
             self.refresh_presence_session(session, false);
         }
-        let (ready, _) = self.presence.herald.due(now);
-        for session in ready {
-            self.herald_session(session);
-        }
     }
 
-    /// The band's `since` text ticks — once a second while it shows seconds,
-    /// once a minute after — and the ripple steps. `None` on a quiet desktop.
+    /// The one instant the presence timer arms (`drive::deadline`): `None`
+    /// on a quiet desktop.
     pub(crate) fn presence_deadline(&self, now: Instant) -> Option<Instant> {
-        let mut deadline: Option<Instant> = None;
-        let mut fold = |d: Instant| {
-            if deadline.is_none_or(|cur| d < cur) {
-                deadline = Some(d);
-            }
-        };
-        for (wid, ws) in &self.windows {
-            let v = &ws.presence;
-            if let Some(d) = v.ripple_deadline(now) {
-                fold(d);
-            }
-            // A told point's three seconds in the phase slot: the one deadline
-            // a `ctl story` adds. Read off the focused session's slot only —
-            // a background tab's flash has no row to return from.
-            if let Some(d) = self
-                .focused_session_id(*wid)
-                .and_then(|s| self.presence.slot(s))
-                .and_then(|slot| slot.told_deadline(now))
-            {
-                fold(d);
-            }
-            // The words' own clock ([`words_step`]), and only for a band on
-            // screen: an occluded, minimized or headless window's `since` text
-            // is read by nobody, so it arms nothing (the idle law's
-            // hidden-window rule, audit 2026-09-24). A row not yet ticked is
-            // due now; a window revealed after its figure moved catches up at
-            // once.
-            if v.words.is_some() && crate::messages_host::band_on_screen(ws) {
-                fold(v.words_due.map_or(now, |d| d.max(now)));
-            }
-        }
-        // A cooperative lease's lapse: nothing posts for it, so it is a
-        // deadline — the hand is re-read when it passes (`presence_tick`).
-        for slot in self.presence.slots.values() {
-            if let Some(d) = slot.lease_until {
-                fold(d.max(now));
-            }
-        }
-        // A `ttl=` supervisor claim's lapse, and an owed notification the
-        // rate limit will allow: neither posts a wake of its own.
-        for d in self.presence.supervisor_until.values() {
-            fold((*d).max(now));
-        }
-        match self.presence.herald.due(now) {
-            (ready, _) if !ready.is_empty() => fold(now),
-            (_, Some(d)) => fold(d),
-            _ => {}
-        }
-        deadline
+        drive::deadline(self, now)
     }
 
-    /// The timer's tick: recompose the words of every window with a row up (the
-    /// `since` figures moved) and retire a finished ripple. Returns the windows
-    /// that need a repaint.
+    /// The timer's tick (`drive::tick`): the windows that need a repaint.
     pub(crate) fn presence_tick(&mut self, now: Instant) -> Vec<WindowId> {
-        let mut out = Vec::new();
-        self.presence_herald_tick(now);
-        // The facts a timer can move without a wake: a cooperative lease that
-        // LAPSED (its driver crashed; nothing posts for a lapse) is re-read the
-        // moment its deadline passes, on every session that holds one.
-        let lapsed: Vec<u64> = self
-            .presence
-            .slots
-            .iter()
-            .filter(|(_, slot)| slot.lease_until.is_some_and(|d| d <= now))
-            .map(|(session, _)| *session)
-            .collect();
-        for session in lapsed {
-            if self.pool.get(session).is_none() {
-                // A session the pool no longer holds cannot be re-read: its
-                // deadline is dropped rather than re-armed every tick.
-                self.presence.retire(session);
-                continue;
-            }
-            self.refresh_presence_session(session, false);
-            if let Some(slot) = self.presence.slots.get_mut(&session)
-                && slot.lease_until.is_some_and(|d| d <= now)
-            {
-                slot.lease_until = None;
-            }
-        }
-        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
-        for wid in wids {
-            let ripple_done = self.windows.get(&wid).is_some_and(|ws| {
-                ws.presence.ripple_at.is_some() && ws.presence.ripple_step(now).is_none()
-            });
-            if ripple_done && let Some(ws) = self.windows.get_mut(&wid) {
-                ws.presence.ripple_at = None;
-                ws.presence.ripple_chose = false;
-                out.push(wid);
-            }
-            // The words' own clock: recomposed only when their figure moved
-            // (`words_due`), never at whatever rate another owner wakes the
-            // loop (audit 2026-09-24).
-            let row_due = self.windows.get(&wid).is_some_and(|ws| {
-                ws.presence.words.is_some() && ws.presence.words_due.is_none_or(|d| d <= now)
-            });
-            if row_due {
-                let before = self.windows.get(&wid).map(|ws| ws.presence.seed);
-                // The belt under the wakes' braces: while a row is up, its
-                // session's facts are re-read at the tick (leaf locks; the
-                // agent reading is the sweep's, never re-classified), so a fact whose
-                // change posted nothing — the link coming back, a lease that
-                // lapsed — reaches the row at the tick, never later.
-                if let Some(session) = self.focused_session_id(wid) {
-                    self.refresh_presence_session(session, false);
-                }
-                self.refresh_presence_window(wid);
-                if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.presence.words_due = ws
-                        .presence
-                        .words
-                        .as_ref()
-                        .map(|words| now + words_step(words));
-                }
-                if self.windows.get(&wid).map(|ws| ws.presence.seed) != before
-                    && !out.contains(&wid)
-                {
-                    out.push(wid);
-                }
-            }
-        }
-        out
+        drive::tick(self, now)
     }
 
     /// The rim as an [`OverlayGlow`] for the frame path — plain field reads and
     /// arithmetic, no lock, no allocation; `None` on a quiet window.
     pub(crate) fn presence_overlay(&self, wid: WindowId, now: Instant) -> Option<OverlayGlow> {
         let ws = self.windows.get(&wid)?;
-        let v = &ws.presence;
-        // The quiet frame answers before the tones are derived: the four
-        // contrast-floored tones cost ~1.9 µs (measured, `adv8`), and every
-        // composed frame of every window took it for a `None` (round 19's
-        // review, C1). A rim pays it; a quiet window pays the match. A
-        // running CHOICE PULSE is the one ripple a rim-less window paints.
-        let step = v.ripple_step(now);
-        let pulse = v.ripple_chose && step.is_some() && self.presence_rim_on;
-        if matches!(v.rim, Rim::None) && !pulse {
-            return None;
-        }
-        let tones = crate::chrome_band::presence_tones(self.chrome_palette_theme());
-        let (accent, mut wash_a, scale) = match v.rim {
-            Rim::None => (tones.story, 0u8, 16u8),
-            Rim::Drive => (tones.drive, 0u8, 16u8),
-            Rim::Wait => (tones.wait, 0, 16),
-            Rim::Stop { hold: false } => (tones.stop, 0, 16),
-            Rim::Stop { hold: true } => (tones.stop, HOLD_WASH_ALPHA, 32),
-        };
-        // The pulse speaks in the story tone whatever rim it crosses: the
-        // rim's own colour returns with the steady frame after it.
-        let accent = if pulse { tones.story } else { accent };
-        let mut border_a = RIM_BORDER_ALPHA;
-        if let Some(step) = step {
-            // One edge flash, decaying over nine frames: the border to full and
-            // a wash that fades out — the pixels change, the fact does not.
-            border_a = 255;
-            let remaining = presence::RIPPLE_STEPS.saturating_sub(step);
-            wash_a = wash_a.max((RIPPLE_WASH_PEAK * remaining / presence::RIPPLE_STEPS) as u8);
-        }
+        // The engine's arithmetic (`View::rim_glow`). The quiet frame answers
+        // before the tones are derived: the four contrast-floored tones cost
+        // ~1.9 µs (measured, `adv8`), and every composed frame of every
+        // window took it for a `None` (round 19's review, C1). A rim pays it;
+        // a quiet window pays the match. A running CHOICE PULSE is the one
+        // ripple a rim-less window paints.
+        let glow = ws.presence.rim_glow(now, self.presence_rim_on, || {
+            crate::chrome_band::presence_tones(self.chrome_palette_theme())
+        })?;
         Some(OverlayGlow {
-            accent: pack(accent),
-            wash_a,
-            border_a,
-            border_scale_q4: scale,
+            accent: pack(glow.accent),
+            wash_a: glow.wash_a,
+            border_a: glow.border_a,
+            border_scale_q4: glow.border_scale_q4,
         })
     }
 
@@ -746,18 +393,18 @@ impl App {
             h.finish()
         };
         let key = (ws.presence.seed, cols, palette_key);
-        if ws.presence.cached_key != Some(key) {
+        if ws.presence_row_key != Some(key) {
             let row = match &ws.presence.words {
                 Some(words) => crate::message_band::paint_presence_row(words, cols, theme),
                 None => crate::message_band::blank_band_row(cols, theme),
             };
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.presence.cached_row = row;
-                ws.presence.cached_key = Some(key);
+                ws.presence_row = row;
+                ws.presence_row_key = Some(key);
             }
         }
         match self.windows.get(&wid) {
-            Some(ws) => ws.presence.cached_row.as_slice(),
+            Some(ws) => ws.presence_row.as_slice(),
             None => &[],
         }
     }
@@ -810,11 +457,7 @@ impl App {
         Some(crate::accesskit_tree::GridMessage {
             message: crate::accesskit_tree::ChromeMessage::PresenceStatus,
             text: words.sentence.clone(),
-            detail: Some(
-                words.fit(crate::message_band::presence_text_cols(usize::from(
-                    ws.cols,
-                ))),
-            ),
+            detail: Some(drive::report(&ws.presence, usize::from(ws.cols)).0),
             progress: None,
             busy: false,
             alarm: false,
@@ -824,31 +467,30 @@ impl App {
         })
     }
 
-    /// The band's words as the `chrome`/`status` verbs read them: the line as
-    /// the PAINTER fits it (the row keeps one margin cell each side, so the
-    /// wire never reports a slot the human cannot see) and the rim's name, or
-    /// `None` when the window is quiet.
+    /// The band's words as the `chrome` verb reads them, for the tests
+    /// ([`drive::report`]).
+    #[cfg(test)]
     pub(crate) fn presence_report(&self, wid: WindowId) -> Option<(String, &'static str)> {
         let ws = self.windows.get(&wid)?;
-        let rim = ws.presence.rim.wire();
-        let line = ws
-            .presence
-            .words
-            .as_ref()
-            .map(|w| {
-                w.fit(crate::message_band::presence_text_cols(usize::from(
-                    ws.cols,
-                )))
-            })
-            .unwrap_or_default();
-        Some((line, rim))
+        Some(drive::report(&ws.presence, usize::from(ws.cols)))
     }
 
     /// Re-grid ONE window after its chrome rows moved (the per-window twin of
     /// `regrid_for_chrome_rows`): the strip cache and the present key are
     /// cleared, and the window is re-gridded from its own OS size — which is
     /// the one PTY resize.
+    ///
+    /// A resize ENTRY POINT for the ledger (`site=chrome`, the outermost one,
+    /// so the `on_resize` below books under it): this shim alone is
+    /// `#[track_caller]`.
+    #[track_caller]
     pub(crate) fn regrid_window_for_chrome_rows(&mut self, wid: WindowId) {
+        let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Chrome);
+        self.regrid_window_for_chrome_rows_inner(wid);
+    }
+
+    /// The body of [`Self::regrid_window_for_chrome_rows`].
+    fn regrid_window_for_chrome_rows_inner(&mut self, wid: WindowId) {
         let size = {
             let Some(ws) = self.windows.get_mut(&wid) else {
                 return;
@@ -870,162 +512,58 @@ impl App {
         // the caches above are the whole re-grid.
     }
 
-    /// The window's presence level — the `chrome` line's `level=` and the
-    /// tests' probe.
-    pub(crate) fn presence_level(&self, wid: WindowId) -> Level {
+    /// The window's presence level, the tests' probe.
+    #[cfg(test)]
+    pub(crate) fn presence_level(&self, wid: WindowId) -> presence::Level {
         self.windows
             .get(&wid)
-            .map_or(Level::Quiet, |ws| ws.presence.level)
+            .map_or(presence::Level::Quiet, |ws| ws.presence.level)
     }
 
-    /// The window's view, for the tests and the introspection verbs.
+    /// The window's view, for the tests.
+    #[cfg(test)]
     pub(crate) fn presence_view(&self, wid: WindowId) -> Option<&WindowView> {
         self.windows.get(&wid).map(|ws| &ws.presence)
     }
 
-    /// `chrome`'s presence line for the front window — what the human sees,
-    /// as words: `presence rim=<none|drive|wait|stop|stop-hold> level=<level>
-    /// band="<the row, fitted to the window>" sentence="<the a11y sentence>"`.
-    /// The two quoted values are cell-sanitized already (no control bytes);
-    /// `"` and `\\` are escaped so the line stays one parseable record. A
-    /// quiet window prints both empty. No command text, mail body, OSC title
-    /// or limit message can appear here: the band never carries one.
+    /// `chrome`'s presence line for the front window (the frontmost, else
+    /// the first): the engine's bytes ([`drive::chrome_line`]).
     pub(crate) fn presence_chrome_line(&self) -> String {
-        let wid = self
+        let front = self
             .frontmost_window
             .or_else(|| self.windows.keys().next().copied());
-        let quote = |s: &str| {
-            let mut out = String::with_capacity(s.len() + 2);
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-            out
-        };
-        let Some(wid) = wid else {
-            return format!(
-                "presence rim=none level=quiet band={} sentence={}",
-                quote(""),
-                quote("")
-            );
-        };
-        let (band, rim) = self.presence_report(wid).unwrap_or_default();
-        let level = self.presence_level(wid).wire();
-        let sentence = self
-            .presence_view(wid)
-            .and_then(|v| v.words.as_ref())
-            .map(|w| w.sentence.clone())
-            .unwrap_or_default();
-        format!(
-            "presence rim={rim} level={level} band={} sentence={}",
-            quote(&band),
-            quote(&sentence)
-        )
+        let cols = front
+            .and_then(|w| self.windows.get(&w))
+            .map_or(0, |ws| usize::from(ws.cols));
+        drive::chrome_line(self, front, cols)
     }
 
-    /// A session's level as `status level=` reports it: read against the
-    /// HIGHEST watermark any window holds for the session — a story a human
-    /// read in any window (the fold law moved that window's mark) is read,
-    /// whichever tab is in front now. The tab chip reads its own window's
-    /// mark, so on the one-window desktop the two never disagree: reading the
-    /// FOCUSED window's mark instead answered `level=story` for a story the
-    /// human had already folded, the moment another tab came to the front
-    /// (round 19's review, `adv9`).
-    pub(crate) fn presence_session_level(&self, session: u64) -> Level {
-        let Some(slot) = self.presence.slot(session) else {
-            return Level::Quiet;
-        };
-        let watermark = self
-            .windows
-            .values()
-            .map(|ws| ws.presence.watermark(session))
-            .max()
-            .unwrap_or(0);
-        slot.level(watermark)
+    /// A session's level as `status level=` reports it, for the tests
+    /// ([`drive::session_level`]).
+    #[cfg(test)]
+    pub(crate) fn presence_session_level(&self, session: u64) -> presence::Level {
+        drive::session_level(self, session)
     }
 
-    /// The additive presence `status` fields: round 19's `hand=<token>
-    /// level=<level> story=<n>` (design §5), then `why=` — what put the
-    /// session at `level=attention` ([`Slot::why`]). Read from the slot the
-    /// wakes keep current — no lock, no classification — and `hand=-
-    /// level=quiet story=0 why=-` for a session no wake has touched yet.
+    /// The additive presence `status` fields (`hand= level= story= why=`):
+    /// the engine's bytes ([`drive::status_tail`]).
     pub(crate) fn presence_status_tail(&self, session: u64) -> String {
-        let level = self.presence_session_level(session).wire();
-        match self.presence.slot(session) {
-            Some(slot) => {
-                let watermark = self
-                    .windows
-                    .values()
-                    .map(|ws| ws.presence.watermark(session))
-                    .max()
-                    .unwrap_or(0);
-                format!(
-                    "hand={} level={level} story={} why={}",
-                    slot.hand.wire(),
-                    slot.story_seq,
-                    slot.why(watermark)
-                )
-            }
-            None => format!("hand=- level={level} story=0 why=-"),
-        }
+        drive::status_tail(self, session)
     }
 
-    /// `aterm ctl story <verb> [<text>]` landed for `session`: the slot is
-    /// brought current first (a story on a session no wake has touched must
-    /// not print a blank row), the point is noted, and every window showing
-    /// the session is re-projected — the phase slot reads the verb for
-    /// [`presence::TOLD_FLASH`], then returns to the phase on the timer. The
-    /// reply is the point's seq; `Err` for a session the pool no longer holds.
+    /// `aterm ctl story <verb> [<text>]` landed for `session`
+    /// (`drive::tell`): the slot is brought current, the point is noted, and
+    /// every window showing the session is re-projected — the phase slot reads
+    /// the verb for [`presence::TOLD_FLASH`], then returns to the phase on the
+    /// timer; a `chose` pulses and chimes. The reply is the point's seq; `Err`
+    /// for a session the pool no longer holds.
     pub(crate) fn tell_story(
         &mut self,
         session: u64,
         verb: StoryVerb,
         text: &str,
     ) -> Result<u64, &'static str> {
-        if self.pool.get(session).is_none() {
-            return Err("no such session");
-        }
-        self.refresh_presence_session(session, false);
-        let now = Instant::now();
-        let seq = self
-            .presence
-            .slots
-            .entry(session)
-            .or_insert_with(|| Slot::new(now))
-            .tell(verb, text, now);
-        let mut windows = self.windows_with_focused_session(session);
-        for (wid, _) in self.tabs_viewing_session(session) {
-            if !windows.contains(&wid) {
-                windows.push(wid);
-            }
-        }
-        for wid in &windows {
-            self.refresh_presence_window(*wid);
-        }
-        if verb == StoryVerb::Chose {
-            // The supervisor answered a question box without the human: a
-            // pulse on every window whose FRONT tab shows that session (a
-            // background tab has the story dot, and a rim flash would name
-            // the wrong tab), and one chime — bell-class, so it plays for a
-            // background tab too.
-            let fronts: Vec<WindowId> = self
-                .windows
-                .keys()
-                .copied()
-                .filter(|wid| self.focused_session_id(*wid) == Some(session))
-                .collect();
-            for wid in fronts {
-                self.start_presence_pulse(wid, now);
-            }
-            self.chose_chime(now);
-        }
-        self.refresh_tab_chrome_windows(windows);
-        Ok(seq)
+        drive::tell(self, session, verb, text).ok_or("no such session")
     }
 
     /// THE CHOICE CHIME: one short, quiet pip (the output voice's `Shimmer`,
@@ -1080,6 +618,262 @@ impl App {
     }
 }
 
+/// The presence driver's host (`aterm_messages::presence::drive::Desk`):
+/// every method a read of the App or one effect on it.
+impl Desk for App {
+    type V = presence::Native;
+    type Win = WindowId;
+
+    fn clock(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn table(&self) -> &drive::Table<presence::Native> {
+        &self.presence.table
+    }
+
+    fn table_mut(&mut self) -> &mut drive::Table<presence::Native> {
+        &mut self.presence.table
+    }
+
+    fn each_view(&self, f: &mut dyn FnMut(WindowId, &WindowView)) {
+        for (wid, ws) in &self.windows {
+            f(*wid, &ws.presence);
+        }
+    }
+
+    fn view_of(&self, w: WindowId) -> Option<&WindowView> {
+        self.windows.get(&w).map(|ws| &ws.presence)
+    }
+
+    fn view_of_mut(&mut self, w: WindowId) -> Option<&mut WindowView> {
+        self.windows.get_mut(&w).map(|ws| &mut ws.presence)
+    }
+
+    fn front_session(&self, w: WindowId) -> Option<u64> {
+        self.focused_session_id(w)
+    }
+
+    fn windows_showing(&self, session: u64) -> Vec<WindowId> {
+        let mut windows = self.windows_with_focused_session(session);
+        for (wid, _) in self.tabs_viewing_session(session) {
+            if !windows.contains(&wid) {
+                windows.push(wid);
+            }
+        }
+        windows
+    }
+
+    fn holds_session(&self, session: u64) -> bool {
+        self.pool.get(session).is_some()
+    }
+
+    fn sense(&self, session: u64) -> Option<Facts> {
+        self.presence_facts(session)
+    }
+
+    /// The claim's lapse on the microsecond clock, placed on `now`'s: one
+    /// millisecond past it, so the lapse check at the wake sees it lapsed on
+    /// the microsecond clock too.
+    fn supervisor_lapse(&self, session: u64, now: Instant) -> Option<Instant> {
+        let at_us = self.pool.get(session).and_then(|s| {
+            s.ctx
+                .meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .supervisor_expiry()
+        })?;
+        let now_us = crate::metrics::now_us();
+        Some(now + Duration::from_micros(at_us.saturating_sub(now_us)) + Duration::from_millis(1))
+    }
+
+    fn band_visible(&self, w: WindowId) -> bool {
+        self.windows
+            .get(&w)
+            .is_some_and(crate::messages_host::band_on_screen)
+    }
+
+    fn key_window(&self, w: WindowId) -> bool {
+        self.windows.get(&w).is_some_and(|ws| ws.focused)
+    }
+
+    fn ripple_allowed(&self, w: WindowId, focused: bool) -> bool {
+        let focused = self.motion_focus(w, focused);
+        self.motion_policy(focused)
+            .animate(crate::motion::MotionEffect::PresenceRipple)
+            && self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::PresenceRipple)
+    }
+
+    fn band_toggle(&self) -> bool {
+        self.presence_band_on()
+    }
+
+    fn rim_toggle(&self) -> bool {
+        self.presence_rim_on()
+    }
+
+    /// Frozen mid-handoff for the same reason `sync_message_band_rows` is.
+    fn rows_frozen(&self) -> bool {
+        self.update_handoff_parked() || self.incoming_handoff_pending
+    }
+
+    /// Read from the LIVE lease of every terminal session `w` hosts, in any
+    /// tab — never a slot a wake has not refreshed yet: the window's re-grid
+    /// resizes all of them.
+    fn driver_may_type(&self, w: WindowId) -> bool {
+        let Some(ws) = self.windows.get(&w) else {
+            return false;
+        };
+        let now_us = crate::metrics::now_us();
+        ws.tab_set.tabs().iter().any(|tab| {
+            tab.root.any_leaf(&mut |view| {
+                self.view_store
+                    .get(*view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    .and_then(|session| self.pool.get(session))
+                    .is_some_and(|s| {
+                        s.ctx
+                            .turn_lease
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_ref()
+                            .is_some_and(|lease| lease.driver_may_type(now_us))
+                    })
+            })
+        })
+    }
+
+    /// The LIVE mark, reduced as `presence_facts` reduces the read it senses:
+    /// the session's own lease, else whether it drives a peer's turn.
+    fn lease_mark(&self, session: u64) -> Option<LeaseMark> {
+        let s = self.pool.get(session)?;
+        let own = lease_mark_of(
+            s.ctx
+                .turn_lease
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref(),
+            crate::metrics::now_us(),
+        );
+        Some(match own {
+            LeaseMark::Free if self.driving_target(&s.ctx.self_id).is_some() => LeaseMark::Driving,
+            own => own,
+        })
+    }
+
+    /// The newest generation handed out ([`crate::presence::GenerationLook`])
+    /// of every terminal session `w` hosts, in any tab — the window's re-grid
+    /// resizes all of them — as an instant on the Desk's clock.
+    fn looked_at(&self, w: WindowId) -> Option<Instant> {
+        let ws = self.windows.get(&w)?;
+        let mut last: Option<u64> = None;
+        for tab in ws.tab_set.tabs() {
+            tab.root.any_leaf(&mut |view| {
+                let at = self
+                    .view_store
+                    .get(*view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    .and_then(|session| self.pool.get(session))
+                    .and_then(|s| s.ctx.generation_look.last_us());
+                if let Some(at) = at {
+                    last = Some(last.map_or(at, |x| x.max(at)));
+                }
+                false
+            });
+        }
+        // The stamp's own instant, placed off the metrics clock's one anchor:
+        // no second clock read, so `deadline` and the `tick` it arms see the
+        // SAME look (a mapping through `now_us() - last` and `clock()`, two
+        // reads microseconds apart, moved the look's due time between them).
+        crate::metrics::instant_at_us(last?)
+    }
+
+    fn grid_rows(&self, w: WindowId) -> Option<(u16, bool)> {
+        self.windows
+            .get(&w)
+            .map(|ws| (ws.rows, ws.os_window.is_some()))
+    }
+
+    fn herald_deadline(&self, now: Instant) -> Option<Instant> {
+        match self.presence.herald.due(now) {
+            (ready, _) if !ready.is_empty() => Some(now),
+            (_, next) => next,
+        }
+    }
+
+    /// The front window's hold, for the native menu's synchronous validate
+    /// (the Fabric menu's halt pair reads it when the menu opens).
+    fn projecting(&mut self, w: WindowId) {
+        if self.frontmost_window == Some(w) {
+            self.publish_front_hold(w);
+        }
+    }
+
+    fn regrid(&mut self, w: WindowId) {
+        if let Some(ws) = self.windows.get_mut(&w) {
+            ws.presence_row_key = None;
+        }
+        #[cfg(test)]
+        PTY_RESIZES_FOR_PRESENCE.with(|c| c.set(c.get() + 1));
+        self.regrid_window_for_chrome_rows(w);
+    }
+
+    fn request_redraw(&self, w: WindowId) {
+        if let Some(win) = self.windows.get(&w).and_then(|ws| ws.os_window.as_ref()) {
+            win.request_redraw();
+        }
+    }
+
+    fn restamp_chips(&mut self, windows: Vec<WindowId>) {
+        self.refresh_tab_chrome_windows(windows);
+    }
+
+    /// The human channel dedups by transition itself, so a refresh that moved
+    /// nothing costs two leaf-lock reads and no AppKit call.
+    fn herald(&mut self, session: u64) {
+        self.herald_session(session);
+    }
+
+    /// Every owed notification the rate limit now allows
+    /// ([`crate::status_item::Herald::due`]).
+    fn herald_owed(&mut self, now: Instant) {
+        let (ready, _) = self.presence.herald.due(now);
+        for session in ready {
+            self.herald_session(session);
+        }
+    }
+
+    /// The lapsed claim is removed and recorded (`meta-change
+    /// field=supervisor value=-`, pushed as `EVENT meta`); the driver's
+    /// re-read then re-heralds the session, so a box the dead supervisor was
+    /// holding reaches the menu row and the notification.
+    fn lapse_supervisor(&mut self, session: u64) {
+        let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
+            return;
+        };
+        if crate::session_timeline::lapse_supervisor(&ctx, crate::metrics::now_us())
+            && self.subscribers.any()
+        {
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notify(session);
+        }
+    }
+
+    fn forget(&mut self, session: u64) {
+        self.presence.retire(session);
+    }
+
+    fn chime(&mut self, now: Instant) {
+        self.chose_chime(now);
+    }
+}
+
 /// Whether the choice chime may speak at all, before its rate limiter: serious
 /// mode allows terminal sound, the Music effects master is on, AND
 /// `choice_sound` is on. Pure, so the gate is testable where the audio host is
@@ -1092,40 +886,8 @@ pub(crate) const fn chose_chime_allowed(
     serious_allows_sound && music_effects && choice_sound
 }
 
-/// How often a row's words move: every second while any `since` clause
-/// prints SECONDS (`12s`, `3m12s`, `since 3m12s`, `held 1m00s, resumed 40s
-/// ago`), once a minute when it prints only minutes, hours or days.
-fn words_step(words: &crate::presence::Words) -> Duration {
-    if words.since.iter().any(|c| prints_seconds(c)) {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_secs(60)
-    }
-}
-
-/// Whether a `since` clause prints a seconds figure (`12s`, `3m12s`, `since
-/// 40s`, `held 1m00s, resumed 5s ago`) — a token ending in `s` right after a
-/// digit; `3 turns`, `2h05m` and `1d 22h` do not.
-fn prints_seconds(clause: &str) -> bool {
-    clause
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|tok| {
-            tok.strip_suffix('s')
-                .is_some_and(|head| head.chars().last().is_some_and(|c| c.is_ascii_digit()))
-        })
-}
-
 fn pack(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
-}
-
-/// The chip level the existing indicator bits spell: `Wait`.
-pub(crate) fn chip_of_attention(attention: bool) -> ChipLevel {
-    if attention {
-        ChipLevel::Wait
-    } else {
-        ChipLevel::Off
-    }
 }
 
 #[cfg(test)]
@@ -1136,8 +898,9 @@ mod tests {
     //! images ride the sacred `image` path in `app_introspect`'s capture tests.
 
     use super::*;
-    use crate::presence::{AgentPhase, AgentReading, Level, Words};
+    use crate::presence::{AgentPhase, AgentReading, ChipLevel, Level, Words, words_step};
     use crate::{App, WindowId};
+    use aterm_messages::presence::FOLD_QUIET;
     use std::sync::Arc;
 
     fn app_with_stub() -> (App, WindowId, u64, Arc<crate::SessionCtx>) {
@@ -1187,12 +950,25 @@ mod tests {
         *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
             id: 41,
             driver: None,
+            typing: true,
         });
         app.on_presence_wake(&ctx.self_id, true);
         assert_eq!(app.presence_level(wid), Level::Driven);
         let (text, rim) = line(&app, wid);
         assert_eq!(rim, "drive");
         assert!(text.contains("\u{25c2} turn 41"), "{text}");
+        assert_eq!(
+            app.chrome_rows(wid),
+            app.chrome_rows_shared(),
+            "no re-grid under a driver that may still type"
+        );
+        // Its last Enter pressed: the row the hand asked for is born.
+        assert!(crate::control::end_turn_input(
+            &ctx.turn_lease,
+            41,
+            &ctx.self_id
+        ));
+        app.on_presence_wake(&ctx.self_id, false);
         assert_eq!(
             app.chrome_rows(wid),
             app.chrome_rows_shared() + 1,
@@ -1315,7 +1091,13 @@ mod tests {
         assert_eq!(app.presence_view(wid).unwrap().rows, 1, "never on a timer");
         assert_eq!(app.presence_level(wid), Level::Story);
 
-        // The key, while calm: the fold, and exactly one re-grid.
+        // The key, while calm: the fold, and exactly one re-grid. The row has
+        // stood the two minutes the ticks above played — past its minimum
+        // life (ruling 394: a key folds a row only once it has stood
+        // `FOLD_QUIET`); the App's clock is the wall's, so the birth is
+        // dated back to match.
+        let born = &mut app.windows.get_mut(&wid).unwrap().presence.born_at;
+        *born = born.and_then(|b| b.checked_sub(aterm_messages::presence::FOLD_QUIET));
         app.note_human_acted(wid);
         assert_eq!(app.presence_level(wid), Level::Quiet);
         assert_eq!(app.presence_view(wid).unwrap().rows, 0);
@@ -1324,6 +1106,208 @@ mod tests {
         // …and a second key changes nothing.
         app.note_human_acted(wid);
         assert_eq!(presence_regrids(), regrids + 2);
+    }
+
+    /// A CLICK LANDS WHERE THE PERSON SAW IT (ruling 369; day nine's fix
+    /// stage, live): with a story row up above the message band, a click on
+    /// a band capsule presses that capsule, THEN reads the story. The fold
+    /// law ran first and its re-grid moved the band up a row under the
+    /// pointer, so the press landed on the grid and the capsule never acted.
+    /// Control: the story still folds on that click.
+    #[test]
+    fn a_click_on_a_band_capsule_under_a_story_row_presses_the_capsule() {
+        crate::fabric::with_link_reset(|| {
+            let (mut app, wid, sid, ctx) = app_with_stub();
+            assert!(crate::fabric::apply_hold_for_test(
+                &ctx,
+                Some(crate::fabric::Hold {
+                    reason: "pause".into(),
+                    origin: "local".into(),
+                })
+            ));
+            app.on_presence_wake(&ctx.self_id, false);
+            assert!(crate::fabric::apply_hold_for_test(&ctx, None));
+            app.on_presence_wake(&ctx.self_id, false);
+            assert_eq!(app.presence_level(wid), Level::Story);
+            assert_eq!(app.presence_view(wid).unwrap().rows, 1);
+            let id = app.post_message(
+                aterm_messages::Message::new(
+                    aterm_messages::tags::CONFIG,
+                    aterm_messages::Severity::Warn,
+                    "Misspelled setting",
+                )
+                .action(aterm_messages::Intent::OpenSettings {
+                    route: "/packages".into(),
+                }),
+            );
+            assert_eq!(app.message_band_rows, 1);
+            let cols = usize::from(app.windows[&wid].cols);
+            let capsule = app.band_presentation(cols).rows[0]
+                .capsules
+                .iter()
+                .find(|c| !c.action.is_details())
+                .expect("the authored capsule")
+                .col
+                + 1;
+            let col = u16::try_from(capsule).unwrap();
+            use crate::app_mouse::PointerAction;
+            assert_eq!(
+                app.pointer_cmd(PointerAction::MoveChrome { up: 1, col }),
+                Ok(Some((-1, col)))
+            );
+            // The App's clock is the wall's: the row is dated born NOW, just
+            // before the press, so the setup above (a debug build, a loaded
+            // machine) never ages it past `FOLD_QUIET` and turns the young
+            // row this test reads into one the click may fold at once.
+            app.windows.get_mut(&wid).unwrap().presence.born_at = Some(Instant::now());
+            assert!(app.pointer_cmd(PointerAction::Click).is_ok());
+            // The press is logged `Acted` (the navigation then folds the
+            // row, design §10.5 H6).
+            assert_eq!(
+                app.messages
+                    .log()
+                    .get(id)
+                    .and_then(|r| r.last_action.as_ref().map(|(label, _)| label.clone())),
+                Some("Packages".to_string()),
+                "the capsule the person clicked was pressed"
+            );
+            // The capsule opened Settings: no session is front now, so the
+            // front-reading law would have read nothing here (the old
+            // "Quiet" check passed on the Settings tab alone). The story
+            // the person was looking at is read (ruling 372).
+            assert_eq!(app.focused_session_id(wid), None, "Settings is front");
+            let seq = app.presence.slot(sid).unwrap().story_seq;
+            assert!(seq > 0);
+            assert_eq!(
+                app.presence_view(wid).unwrap().watermark(sid),
+                seq,
+                "the story the person saw is read"
+            );
+            // The read folds the row once it has stood its minimum life
+            // (ruling 394, composed with ruling 369 at the integration): a
+            // row born just now stands until born + `FOLD_QUIET`, where the
+            // presence timer folds it with one re-grid — AFTER the press, so
+            // the band never moved under the pointer either way.
+            let young = app.presence_view(wid).unwrap();
+            assert_eq!(young.rows, 1, "a young row waits out its minimum life");
+            let due = young.born_at.expect("born") + FOLD_QUIET;
+            assert_eq!(app.presence_deadline(Instant::now()), Some(due));
+            let _ = app.presence_tick(due);
+            assert_eq!(app.presence_view(wid).unwrap().rows, 0);
+        });
+    }
+
+    /// A PRESS THAT MOVES THE FRONT READS THE STORY THE PERSON SAW (ruling
+    /// 372), through the one sequence the event loop's `MouseInput` arm
+    /// runs (`mouse_input_then_fold`): a click into the other split pane
+    /// reads the story of the pane that was front and leaves the pane it
+    /// focused — whose story nobody has seen — unread, its row up.
+    #[test]
+    fn a_click_into_another_pane_reads_the_story_seen_and_not_the_panes() {
+        crate::fabric::with_link_reset(|| {
+            use crate::app_mouse::PointerAction;
+            use winit::event::{ElementState, MouseButton};
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let top = app.focused_session_id(wid).expect("top terminal");
+            let bottom = app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
+            assert_eq!(app.focused_session_id(wid), Some(bottom));
+            let seq_top = app.tell_story(top, StoryVerb::Approval, "").expect("held");
+            let seq_bottom = app
+                .tell_story(bottom, StoryVerb::Approval, "")
+                .expect("held");
+            assert_eq!(app.presence_level(wid), Level::Story);
+            assert_eq!(app.presence_view(wid).unwrap().rows, 1);
+            // The pointer over the top pane, then the arm's press and release.
+            assert!(
+                app.pointer_cmd(PointerAction::Move { row: 1, col: 2 })
+                    .is_ok()
+            );
+            app.mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+            app.mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
+            assert_eq!(
+                app.focused_session_id(wid),
+                Some(top),
+                "the press focused it"
+            );
+            let view = app.presence_view(wid).unwrap();
+            assert_eq!(view.watermark(bottom), seq_bottom, "the story seen is read");
+            assert_eq!(view.watermark(top), 0, "the pane the press focused is not");
+            assert_eq!(app.presence_level(wid), Level::Story, "its row is up");
+            assert_eq!(app.presence_view(wid).unwrap().rows, 1);
+            // The next act in the pane now in front reads it.
+            // The row has stood its minimum life (ruling 394: a read folds a
+            // row only once it has stood `FOLD_QUIET`); the App's clock is
+            // the wall's, so the birth is dated back to match.
+            let born = &mut app.windows.get_mut(&wid).unwrap().presence.born_at;
+            *born = born.and_then(|b| b.checked_sub(FOLD_QUIET));
+            app.mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+            assert_eq!(app.presence_view(wid).unwrap().watermark(top), seq_top);
+            assert_eq!(app.presence_view(wid).unwrap().rows, 0);
+            app.mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
+        });
+    }
+
+    /// THE FOLD QUIET (ruling 394, proposed), on the real App: a settling
+    /// turn's lease born and dropped inside a millisecond — the incident's
+    /// schedule (measured 2026-09-28: 121x52 -> 51 -> 52 within ~0.8 ms, an
+    /// alt-screen Claude Code left stale) — pays ONE PTY re-grid, the birth,
+    /// not two; a second lease inside the quiet pays none; the row stands
+    /// blank with an empty `chrome` band meanwhile; and the timer the
+    /// presence deadline arms folds it once, one re-grid, after the quiet.
+    #[test]
+    fn a_quick_show_and_fold_pays_one_regrid_not_two() {
+        // Reads the process-global link through `presence_level`; takes the
+        // reset like every other reader (see review_r1's note, 2026-09-20).
+        crate::fabric::with_link_reset(a_quick_show_and_fold_pays_one_regrid_not_two_body);
+    }
+
+    fn a_quick_show_and_fold_pays_one_regrid_not_two_body() {
+        let (mut app, wid, _sid, ctx) = app_with_stub();
+        let regrids = presence_regrids();
+        let settling = || {
+            Some(crate::Lease::Turn {
+                id: 7,
+                driver: None,
+                typing: false,
+            })
+        };
+        *ctx.turn_lease.lock().unwrap() = settling();
+        app.on_presence_wake(&ctx.self_id, false);
+        assert_eq!(app.presence_view(wid).unwrap().rows, 1);
+        assert_eq!(presence_regrids(), regrids + 1, "the birth: one re-grid");
+        *ctx.turn_lease.lock().unwrap() = None;
+        app.on_presence_wake(&ctx.self_id, false);
+        assert_eq!(app.presence_level(wid), Level::Quiet);
+        assert_eq!(
+            app.presence_view(wid).unwrap().rows,
+            1,
+            "the fold waits out the quiet"
+        );
+        assert_eq!(presence_regrids(), regrids + 1, "not two re-grids");
+        assert_eq!(line(&app, wid).0, "", "a blank row, and the wire says so");
+        assert_eq!(app.chrome_rows(wid), app.chrome_rows_shared() + 1);
+        // The lease comes back inside the quiet: the fold is cancelled.
+        *ctx.turn_lease.lock().unwrap() = settling();
+        app.on_presence_wake(&ctx.self_id, false);
+        assert_eq!(presence_regrids(), regrids + 1, "a flap pays nothing");
+        *ctx.turn_lease.lock().unwrap() = None;
+        app.on_presence_wake(&ctx.self_id, false);
+        assert_eq!(presence_regrids(), regrids + 1);
+        // The presence timer: armed at the fold's due instant, and its tick
+        // there folds the row once.
+        let now = Instant::now();
+        let due = app
+            .presence_deadline(now)
+            .expect("the held fold arms the timer");
+        assert!(due > now && due <= now + FOLD_QUIET, "{due:?}");
+        let _ = app.presence_tick(due);
+        assert_eq!(app.presence_view(wid).unwrap().rows, 0);
+        assert_eq!(presence_regrids(), regrids + 2, "the fold: one re-grid");
+        assert_eq!(app.chrome_rows(wid), app.chrome_rows_shared());
+        assert_eq!(app.presence_deadline(due), None, "a quiet desk again");
+        let _ = app.presence_tick(due + FOLD_QUIET);
+        assert_eq!(presence_regrids(), regrids + 2, "folded once");
     }
 
     /// THE REPAINT INVARIANT (§7): on a quiet window `presence_fp` is exactly 0
@@ -1421,6 +1405,7 @@ mod tests {
             *_ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
                 id: 41,
                 driver: None,
+                typing: true,
             });
             app.on_presence_wake(&_ctx.self_id, false);
             let record = app.session_status_record(sid).expect("live");
@@ -1442,7 +1427,7 @@ mod tests {
         app.refresh_presence_session(sid, false);
         app.refresh_presence_all_windows();
         let now = Instant::now();
-        let cap_before = app.presence_view(wid).unwrap().cached_row.capacity();
+        let cap_before = app.windows[&wid].presence_row.capacity();
         for i in 0..1000u64 {
             let t = now + Duration::from_millis(i);
             assert_eq!(app.presence_fp(wid, t), 0);
@@ -1450,8 +1435,8 @@ mod tests {
             assert!(app.presence_tick(t).is_empty(), "no window is dirtied");
             assert!(app.presence_deadline(t).is_none(), "no timer is armed");
         }
+        assert_eq!(app.windows[&wid].presence_row.capacity(), cap_before);
         let v = app.presence_view(wid).unwrap();
-        assert_eq!(v.cached_row.capacity(), cap_before);
         assert_eq!(cap_before, 0, "a quiet window never painted a row");
         assert_eq!(v.rows, 0);
         assert!(v.ripple_at.is_none());
@@ -1474,8 +1459,8 @@ mod tests {
         }
         let t0 = Instant::now();
         let ev = Evidence {
-            pin: None,
             shell: None,
+            completed_block: None,
             lifecycle: None,
             foreground_job: Some(true),
             activity: ActivitySample {
@@ -1612,7 +1597,7 @@ mod tests {
                     },
                     now,
                 ),
-                "worker:claude-satcomp  bash approval 0s  \u{25c2} manager  \u{2709}0  ctx 38% left  \u{27df} 4ms",
+                "worker:claude-satcomp  bash approval 0s  \u{25c2} manager  ctx 38% left  \u{27df} 4ms",
             ),
             (
                 "question",
@@ -1626,7 +1611,7 @@ mod tests {
                     },
                     now - Duration::from_secs(120),
                 ),
-                "worker:claude-satcomp  question 2m00s  \u{2014}  \u{2709}0  ctx 12% left \u{26a0}  \u{27df} 6ms",
+                "worker:claude-satcomp  question 2m00s  \u{2014}  ctx 12% left \u{26a0}  \u{27df} 6ms",
             ),
             (
                 "limited",
@@ -1687,7 +1672,7 @@ mod tests {
                     },
                     now,
                 ),
-                "worker:claude-satcomp  needs a decision  \u{2014}  \u{2709}0  ctx 50% left  \u{27df} 3ms",
+                "worker:claude-satcomp  needs a decision  \u{2014}  ctx 50% left  \u{27df} 3ms",
             ),
             (
                 "stalled",
@@ -1703,7 +1688,7 @@ mod tests {
                     },
                     now - Duration::from_secs(120),
                 ),
-                "worker:claude-satcomp  busy 2m00s  \u{2014}  \u{2709}0  ctx 91% left  ~ 7s",
+                "worker:claude-satcomp  busy 2m00s  \u{2014}  ctx 91% left  ~ 7s",
             ),
         ];
         // The story row: three settled turns, then a hold that lifted.
@@ -1764,7 +1749,8 @@ mod tests {
     /// line is literal; at every width the painted text IS the fitted words
     /// (one margin cell each side), every cell sits on the band, every ink
     /// clears the band, the emoji-capable glyphs are pinned to text
-    /// presentation, and hand + phase + mail survive to 24 columns.
+    /// presentation, and hand + phase + mail (where there is any, ruling 366)
+    /// survive to 24 columns.
     #[test]
     fn golden_cells_for_every_band_row_at_120_60_and_24_in_light_dark_and_hc() {
         let now = Instant::now();
@@ -1798,8 +1784,11 @@ mod tests {
                 // hand, phase, mail survive to 24 columns
                 let phase_word: String = w.phase.chars().take(4).collect();
                 assert!(fitted.contains(&phase_word), "{name} at {cols}: {fitted}");
-                assert!(
+                // Mail survives where there is any; with none there is no
+                // slot to survive (ruling 366).
+                assert_eq!(
                     fitted.contains('\u{2709}'),
+                    !w.mail.is_empty(),
                     "{name} at {cols}: mail survives: {fitted}"
                 );
                 let hand_glyph = w.hand.chars().next().unwrap();
@@ -1915,6 +1904,8 @@ mod tests {
         *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
             id: 41,
             driver: None,
+            // The turn is settling, so its presence row may be committed.
+            typing: false,
         });
         app.on_presence_wake(&ctx.self_id, false);
         let m = app.presence_a11y_message(wid).expect("the band speaks");
@@ -2236,7 +2227,8 @@ mod tests {
     }
 
     /// R5: a `since` that prints seconds — `3m12s` included — ticks every
-    /// second, never once a minute with the figure stale by up to 59 s.
+    /// second, never once a minute with the figure stale by up to 59 s. (Which
+    /// clauses print seconds is the engine's law, proved in its own tests.)
     #[test]
     fn review_r5_a_since_that_prints_seconds_ticks_every_second() {
         let (mut app, wid, _sid, _ctx) = app_with_stub();
@@ -2256,13 +2248,6 @@ mod tests {
             "`busy 3m12s` changes at +1 s but the next tick is at +{:?}",
             d.saturating_duration_since(now)
         );
-        assert!(prints_seconds("3m12s"));
-        assert!(prints_seconds("since 40s"));
-        assert!(prints_seconds("held 1m00s, resumed 1m00s ago"));
-        assert!(!prints_seconds("2h05m"));
-        assert!(!prints_seconds("1d 22h"));
-        assert!(!prints_seconds("3 turns"));
-        assert!(!prints_seconds("\u{2192} 19:30"));
     }
 
     /// THE WORDS KEEP THEIR OWN CLOCK (audit 2026-09-24): another owner's
@@ -2317,8 +2302,8 @@ mod tests {
     fn new_words_from_a_wake_rearm_their_own_clock() {
         let (mut app, wid, sid, _ctx) = app_with_stub();
         let then = Instant::now() - Duration::from_secs(192);
-        let mut slot = Slot::new(then);
-        slot.absorb(
+        let _ = app.presence.table.absorb(
+            sid,
             Facts {
                 role: Some("worker:claude-satcomp".into()),
                 agent_seq: 1,
@@ -2331,7 +2316,6 @@ mod tests {
             },
             then,
         );
-        app.presence.slots.insert(sid, slot);
         let now = Instant::now();
         let minutes = presence::Words {
             since: vec!["2h05m".into()],
@@ -2349,7 +2333,7 @@ mod tests {
         let ws = app.windows.get(&wid).unwrap();
         let words = ws.presence.words.as_ref().expect("a busy row");
         assert!(
-            words.since.iter().any(|c| prints_seconds(c)),
+            words_step(words) == Duration::from_secs(1),
             "the wake's words print seconds: {:?}",
             words.since
         );
@@ -2525,6 +2509,7 @@ mod tests {
             *ctx_a.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
                 id: 41,
                 driver: None,
+                typing: true,
             });
             app.on_presence_wake(&ctx_a.self_id, false);
             let (text, _) = line(&app, wid);
@@ -2558,6 +2543,7 @@ mod tests {
             *ctx_a.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
                 id: 42,
                 driver: Some(ctx_b.self_id.clone()),
+                typing: true,
             });
             app.refresh_presence_session(sid_a, false);
             let (text, _) = line(&app, wid);
@@ -2587,7 +2573,7 @@ mod tests {
         let theme = aterm_render::Theme::default();
         let first_len = app.presence_band_row(wid, 120, theme).len();
         assert_eq!(first_len, 120);
-        let cached = app.presence_view(wid).unwrap().cached_row.as_ptr();
+        let cached = app.windows[&wid].presence_row.as_ptr();
         let second = app.presence_band_row(wid, 120, theme);
         assert_eq!(
             second.as_ptr(),
@@ -3195,8 +3181,8 @@ mod tests {
             app.refresh_presence_all_windows();
             let t0 = Instant::now();
             let mut ev = Evidence {
-                pin: None,
                 shell: None,
+                completed_block: None,
                 lifecycle: None,
                 foreground_job: Some(true),
                 activity: ActivitySample {
@@ -3230,7 +3216,7 @@ mod tests {
                 assert!(app.presence_tick(t).is_empty());
             }
             assert!(revisions > 0, "the replay moved no revision ({revisions})");
-            assert_eq!(app.presence_view(wid).unwrap().cached_row.capacity(), 0);
+            assert_eq!(app.windows[&wid].presence_row.capacity(), 0);
             eprintln!("adv5: {revisions} revisions replayed, fp stayed 0");
         });
     }
@@ -3468,7 +3454,7 @@ mod tests {
         app.system_reduce_motion = false;
         app.windows.get_mut(&wid).expect("window").focused = false;
         let now = Instant::now();
-        app.start_presence_ripple(wid, now);
+        drive::ripple(&mut app, wid, now);
         assert!(
             app.presence_view(wid)
                 .expect("a window")
@@ -3521,5 +3507,131 @@ mod tests {
             1,
             "the chime plays for a background tab"
         );
+    }
+
+    /// A CARRIED LEASE IS LAPSED ON TIME AFTER THE COMMIT (the round-four
+    /// plan, item 9). The handoff seeds another supervisor's `ttl=` lease on
+    /// an adopted session before it is registered, so no `meta set` wake ever
+    /// armed the presence timer at its expiry. The successor's Commit arms
+    /// every session's (`arm_supervisor_expiries`): a holder that died with
+    /// the old instance has its lease lapsed and said (`meta-change
+    /// field=supervisor value=-`) when it runs out, which is what tells this
+    /// instance's supervisor host — parked behind that claim — to take the
+    /// session.
+    ///
+    /// FAILS WITHOUT THE FIX: nothing is armed; the tick past the expiry
+    /// leaves the dead lease on the session for good (the host parked behind
+    /// it is never told), and `arm_supervisor_expiries` does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_carried_lease_is_lapsed_on_time_after_the_commit() {
+        let (mut app, _wid, _sid, ctx) = app_with_stub();
+        crate::session_timeline::seed_carried_claims(
+            &ctx.meta,
+            &ctx.timeline,
+            Some("watch-bob 30"),
+            &[],
+            crate::metrics::now_us(),
+        );
+        assert!(ctx.meta.lock().unwrap().supervisor.is_some(), "seeded");
+        std::thread::sleep(Duration::from_millis(60));
+        let _ = app.presence_tick(Instant::now());
+        assert!(
+            ctx.meta.lock().unwrap().supervisor.is_some(),
+            "a seed arms nothing by itself: the tick past the expiry misses it"
+        );
+        app.arm_supervisor_expiries();
+        assert!(
+            app.presence_deadline(Instant::now()).is_some(),
+            "armed at the lapse"
+        );
+        let _ = app.presence_tick(Instant::now() + Duration::from_millis(5));
+        assert!(
+            ctx.meta.lock().unwrap().supervisor.is_none(),
+            "the lease is lapsed at its expiry"
+        );
+        let lapsed = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == "meta-change" && e.payload == "field=supervisor value=-")
+            .count();
+        assert_eq!(lapsed, 1, "and said");
+    }
+
+    /// THE ROW'S COMMIT HOLDS WHILE THE SENSED MARK DIFFERS FROM THE LIVE ONE
+    /// (`drive::commit_rows`), so the two must be ONE reduction of the lease:
+    /// were they to disagree at rest, a window's row would never be committed.
+    /// Every state of the lease — none, a turn typing, a turn settling, a live
+    /// drive lease, a lapsed one, and a session driving a peer's turn — reads
+    /// the same through `presence_facts` and `Desk::lease_mark`.
+    #[test]
+    fn the_sensed_lease_mark_is_the_live_one_in_every_lease_state() {
+        let (mut app, wid, sid_a, ctx_a) = app_with_stub();
+        let sid_b = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(sid_b));
+        let ctx_b = app.pool.get(sid_b).unwrap().ctx.clone();
+        let now = crate::metrics::now_us();
+        let marks = |app: &App, sid: u64| {
+            (
+                app.presence_facts(sid).expect("pooled").lease,
+                Desk::lease_mark(app, sid).expect("pooled"),
+            )
+        };
+        let states = [
+            (None, LeaseMark::Free),
+            (
+                Some(crate::Lease::Turn {
+                    id: 7,
+                    driver: None,
+                    typing: true,
+                }),
+                LeaseMark::Typing,
+            ),
+            (
+                Some(crate::Lease::Turn {
+                    id: 7,
+                    driver: None,
+                    typing: false,
+                }),
+                LeaseMark::Settling,
+            ),
+            (
+                Some(crate::Lease::Drive {
+                    holder: "rig".into(),
+                    expires_us: now + 60_000_000,
+                    conn: None,
+                    hard: false,
+                }),
+                LeaseMark::Typing,
+            ),
+            (
+                Some(crate::Lease::Drive {
+                    holder: "rig".into(),
+                    expires_us: now.saturating_sub(1),
+                    conn: None,
+                    hard: false,
+                }),
+                LeaseMark::Free,
+            ),
+        ];
+        for (lease, want) in states {
+            *ctx_a.turn_lease.lock().unwrap() = lease.clone();
+            assert_eq!(marks(&app, sid_a), (want, want), "{lease:?}");
+        }
+        // A drives B's turn: A's band reads `▸ @B`, and so do both marks.
+        *ctx_a.turn_lease.lock().unwrap() = None;
+        *ctx_b.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+            id: 8,
+            driver: Some(ctx_a.self_id.clone()),
+            typing: true,
+        });
+        assert!(matches!(
+            app.presence_facts(sid_a).unwrap().hand,
+            Hand::Driving { .. }
+        ));
+        assert_eq!(marks(&app, sid_a), (LeaseMark::Driving, LeaseMark::Driving));
+        assert_eq!(marks(&app, sid_b), (LeaseMark::Typing, LeaseMark::Typing));
     }
 }

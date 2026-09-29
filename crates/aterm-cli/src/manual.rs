@@ -329,6 +329,55 @@ GOTCHAS
         ),
     },
     Topic {
+        name: "keeper",
+        tagline: "the PTY keeper — shells that outlive a crashed window (start | stop | status | serve)",
+        body: Some(
+            r#"keeper — the PTY keeper (`aterm keeper`): a per-login process that holds a
+custody copy of every terminal's master, so a window that crashes, is force-quit
+or is killed does not hang up its shells and agents.
+
+STATUS
+  OPT-IN (docs/DESIGN-pty-keeper-2026-09-26.md, phase P3). With
+  `[keeper] enabled = true` in aterm.toml a window registers every terminal
+  with this build's keeper, and when aterm is opened after a crash, a kill or
+  a Force Quit it reattaches the shells the keeper kept: the same shell, the
+  same program, its screen redrawn, and a row with `End sessions`. Nothing
+  starts the keeper by itself yet, and it never brings a window back on its
+  own: `aterm keeper start` runs one, and opening aterm is what recovers.
+
+VERBS
+  aterm keeper start  [--sock <path>] [--identity designated|uid] [--label <l>]
+      Submit this build's keeper as a transient launchd job (`launchctl
+      submit`: no plist, gone at logout), running `serve --no-relaunch`.
+  aterm keeper stop   [--label <l>]
+      Remove the job. The shells only it held are hung up, as a quit would.
+  aterm keeper status [--sock <path>] [--identity designated|uid]
+      What the keeper holds: masters by state (claimed, held for an update,
+      orphaned, offered), the relaunch brake, and the identity it requires.
+      `keeper=absent` when none answers.
+  aterm keeper serve  [--sock <path>] [--identity designated|uid] [--no-relaunch]
+      Run a keeper in the foreground. It never reads a terminal, never signals
+      anything, and the only program it ever starts is its own app bundle
+      (`/usr/bin/open -a`), to bring a window back after a crash — never with
+      --no-relaunch.
+
+HOW IT DECIDES
+  A window's quit (it says BYE) closes its terminals as today. A window that
+  dies without one leaves its terminals ORPHANED; the next window is offered
+  them — only when no live process still holds them (the holder scan) and the
+  shell is still the one registered. The keeper keeps its own copy through the
+  offer. It brings a window back at most three times in a row (after 0 s, 10 s,
+  60 s), then holds until a launch it did not cause.
+
+WHO MAY CONNECT
+  The same user, always; by default also only code that satisfies this build's
+  designated requirement (the installed app's Developer ID, or a dev build's
+  own hash). `--identity uid` is the same-user floor only. The installed app
+  and every dev tree use different sockets and launchd labels
+  (`com.aterm.aterm.keeper` is the installed app's)."#,
+        ),
+    },
+    Topic {
         name: "harness",
         tagline: "the agent harness — the window's default supervisor, its read views, the live upgrade",
         body: Some(
@@ -348,8 +397,11 @@ WHAT IT IS
     vendor note, every rm circuit breaker; never "don't ask again", a session grant
     or a purchase — credits the account turned off stay off — and a box with no yes
     it may take gets its `No`); the folder-trust dialog its Yes; a plan its yes that
-    grants no standing mode (`Yes, manually approve edits`); `Session paused` its
-    `Switch to <model>`; the confirmation a `/model` or `/effort` you typed raises
+    grants no standing mode (`Yes, manually approve edits`); Claude Code's
+    model-refusal pause (exactly its switch and its retry) its switch while
+    `model_fallback` is set (no other box's model switch is ever pressed); Codex's rate-limit nudge its switch only at 90% or more of Codex's own
+    usage reading, and only to save the work (see `rate_nudge`), else it keeps the
+    model; the confirmation a `/model` or `/effort` you typed raises
     on a warm conversation its yes (not when your own PreModelSwitch hook asked
     for it); a setup dialog, a proposed goal or a Computer Use grant its refusal;
     a box taller than the pane by the options it shows. A press no rule proved is
@@ -372,6 +424,12 @@ WHAT IT IS
     dialog the supervisor's own keys answered is told once: `CHOSE …
     policy=recommended <question → answer>` in the journal, and `◆ chose` on the band
     with a short chime (`choice_sound`) and one rim pulse.
+  * Claude Code's usage-limit dialog is no permission either, and `approve` does not
+    limit it: it gets its "Wait here, then continue automatically" row, chosen by
+    its label with fenced arrows and a confirmed Enter (`limit-wait@v1`,
+    `limit_wait`), so the session goes on by itself at the reset — never `Stop`,
+    usage credits, an upgrade or a reset claim; a menu without that row goes to the
+    menu bar.
   * a question or a request for a decision gets `answer_text` — one that names
     an irreversible act (delete, drop, overwrite, force-push) only "take the
     option that deletes, overwrites and force-pushes nothing"; a turn that ended
@@ -391,8 +449,8 @@ WHAT IT IS
     reset, a model-bucket limit relaunched on the fallback model (`--model`,
     session-only — never `/model`) and back at its reset, a full context
     `/compact`ed;
-  * a Claude Code that crashed is relaunched on its conversation, and a newer
-    installed build is taken at an idle point (below).
+  * a Claude Code or a Codex that crashed is relaunched on its conversation, and
+    a newer installed build is taken at an idle point (below).
   Within `human_grace_s` of a person's keystroke, paste, click, drag, scroll or IME
   composition in the session through a window (`status` and `ls` say how long ago
   as `human_ms=`, `text --json` as `"human_ms"`; a control-socket write never sets
@@ -403,17 +461,28 @@ WHAT IT IS
   session nobody has asked anything gets nothing typed, its draft included, and
   an upgrade waits on that draft for as long as it stands). What the table
   limited, and what nothing can answer (a lost login's browser step, a box no
-  reader can parse), goes to the menu bar with one notification (the session's
-  `attention`, `owner=supervisor`; it posts no mail).
+  reader can parse), goes to the menu bar (the session's `attention`,
+  `owner=supervisor`; it posts no mail) — and to one system notification only
+  with `desktop_alerts = true` in aterm.toml (default off: aterm's own alerts,
+  the operator's and update health's included, stay in the window, the menu bar
+  and messages.log).
   A worker that stopped reading its input (`status input=stalled|stopped`) is held:
   nothing is pressed or typed into it, its badge is withdrawn, and the server's own
   "frozen" row is the notice (`aterm help introspection`, `signal`); once its remedy
   (`signal term`, or `kill`) ends it, it is relaunched on its conversation and carried
-  on. Claude Code's
+  on. Nobody there, the window takes the remedy itself: a stall ten minutes old
+  (`stall_term_after_s`, 600 by default; `input=stalled` — a stopped job's `signal
+  cont` stays a person's), with no person's hand within `human_grace_s` and no lease
+  or named turn on the session, gets `signal term`, once — said as `SIGNALLED` in
+  the session's journal; a program that lives through it keeps the server's row,
+  whose `signal kill` is a person's (`stall_term_after_s = 0` or `relaunch = false`
+  limits it to the notice). Claude Code's
   critical-memory banner is answered by its remedy: nothing is typed at it, and at
   its next idle point the agent is ended and relaunched on its own conversation,
   then told to carry on (`relaunch = false` limits it to the menu bar, with the
-  remedy: restart it, then `claude --continue`).
+  remedy: restart it, then `claude --resume <its conversation>`, read from Claude
+  Code's own record of that process — never the directory's newest conversation,
+  which is a sibling tab's where two share it).
   An aterm.toml that does not load still has its [harness] lines read.
   `aterm drive watch|supervise` runs the same engine from a terminal (see `aterm
   drive --help`); a `watch` started on a session the window already supervises
@@ -448,7 +517,10 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   dismiss_surveys [true]   dismiss the session survey (`0`, never a rating)
   continue [true]          continue a turn that ended; one short turn after another
                            (under 2 min of work, or one that ends saying it is
-                           done) on a back-off that doubles, 2 min to an hour
+                           done) on a back-off that doubles, 2 min to an hour; a
+                           done report gets the done check ("reply DONE and stop;
+                           otherwise continue"), and a second one ends the task
+                           until someone else's turn
   continue_text ["keep going"]   what a continuation types when no suggestion fits
   continue_per_hour [0]    at most this many typed acts per session per hour; 0 is
                            no cap
@@ -470,12 +542,49 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            proxy; false never checks, and such a wall is tried on
                            the time ladder alone
   resume_limits [true]     continue a minute past a usage or spend limit's reset
-  model_fallback ["opus"]  on a model-bucket limit, the agent relaunched on this
-                           model (`--model`, session-only), and back at its reset;
-                           "" waits for the reset instead
+  limit_wait [true]        at Claude Code's usage-limit dialog, choose "Wait here,
+                           then continue automatically" (it continues at the reset)
+                           — never a spending row; independent of approve
+  model_fallback ["opus"]  Claude Code: on a model-bucket limit, the agent relaunched
+                           on this model (`--model`, session-only), and back at its
+                           reset; set, its model-refusal pause is switched; ""
+                           waits for the reset instead, and leaves the pause to you
+  rate_nudge [true]        Codex's rate-limit nudge: switched to the cheaper model
+                           only when Codex's own usage reading shows the window at
+                           90% or more, and only to save the work — Codex's goal
+                           stopped (an Esc on any turn it runs while switched, at
+                           most 3 stops, then you are told), one
+                           commit-and-push-then-stop turn (still working after 15
+                           minutes: one Esc, its save judged there), the thread
+                           put back on its own model and effort (`/model`, this
+                           conversation only), then nothing typed until the
+                           window resets (one record in Messages names the model
+                           and the reset; an earlier reset is seen only when
+                           another Codex session writes a usage reading), then
+                           `/goal resume` or a carry-on (under resume_limits and
+                           continue_policy; either off, you are told instead);
+                           any other nudge keeps the model. Nothing of it is
+                           typed into a thread that fell into a sandbox, and a
+                           turn you started is not stopped once your keystroke
+                           is seen in it — but a message you sent before the
+                           switch that Codex starts under the box is, so is a
+                           turn a restarted supervisor finds whose last
+                           keystroke is over 30 minutes older than its first
+                           look, and so is one first seen busy over 30 seconds
+                           after your keystroke, once your grace ends. A turn that
+                           ends under a Codex background terminal — idle, on a
+                           question, on a limit — is the switch's next step all
+                           the same (ten minutes stuck there: you are told once
+                           what holds it).
+                           Your message, `/model` (even to the cheaper model
+                           during the wait) or `/goal resume` ends it. false:
+                           the nudge is yours
   compact_on_context_wall [true]   `/compact` on a full context
-  relaunch [true]          relaunch an agent that crashed (its session record left
-                           behind as it exited), on its own conversation
+  relaunch [true]          relaunch an agent that crashed (Claude Code's session
+                           record left behind as it exited, a Codex's exit status),
+                           on its own conversation; a frozen one is ended for it
+  stall_term_after_s [600] a worker frozen this long, nobody's hand on it, gets
+                           `signal term` once for its relaunch; 0 never
   upgrade [true]           the live upgrade below
   human_grace_s [120]      after a person types, clicks or scrolls in a session, the
                            supervisor keeps its hands off it this many seconds
@@ -496,15 +605,28 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   where it went.
 
 KEY USAGE
-  aterm harness usage [--json]                 spend per model, folded from this directory's
-                                               newest Claude Code transcript
+  aterm harness usage [--json]                 this session's tokens per model, folded from
+                                               its transcripts and its subagents' (the session
+                                               CLAUDE_CODE_SESSION_ID or CLAUDE_PID names; else
+                                               this directory's newest, said so)
   aterm harness limits [@<sid>] [--json]       the wall on the session's screen, as the
                                                supervisor reads it, and any painted /usage
                                                windows (one `text --json` read; exit 1 if none
                                                answers)
   aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
-                                               free space and the stale targets; removal
-                                               needs `disk.apply = true` AND `--apply`
+                                               free space and the build caches it would
+                                               reclaim: the incremental/ of a cargo profile
+                                               no compile wrote into for `[disk]
+                                               target_stale_days`, default 1 day, and below
+                                               `[disk] auto_free_gib` recent profiles' too,
+                                               least recently used first, free space
+                                               measured again before each, until it is back
+                                               1 GiB above that floor (or the bytes released
+                                               cover what was short) — never a profile a
+                                               build holds or one built in the last 10 min,
+                                               and nothing else; removal needs `disk.apply =
+                                               true` AND `--apply`, or free space below the
+                                               floor (the window's tick)
   aterm harness ledger [@<sid>] [<n>] [--json] the supervisor's approval ledger for a session
   aterm harness ledger disk [<n>] [--json]     every disk measurement, removal and refusal
   aterm harness ledger upgrade [<n>] [--json]  every act of the live upgrade, and the owner's word
@@ -641,11 +763,18 @@ KEY USAGE
   agent's own process being no process under it, re-asks a READY it holds after
   30 minutes and releases the agent once the round gives up
   (`wait:status-stale:<status>`). `upgrade --status` names what holds a move
-  (`held_by=`: pid, name and age). A restart that stops after its SIGTERM ended
+  (`held_by=`: pid, name and age), the release an agent it asked to wind
+  down is still owed (`release=<why>`, `-` for none; `wait=release:<gate>` while
+  the line's own gate holds it), and the ladder's rung it stands at (`rung=`). A
+  session no look has reached — minted behind at attach, or its notice just
+  typed — reads Claude's own live status as its wait (`not-idle:waiting` for a
+  box), never over a word a look recorded. A restart that stops after its SIGTERM
+  ended
   the agent stays shown though no Claude Code holds it (for a day; `claude
   --resume <session>` in the tab takes it back), and one under way that has not
   moved for 5 minutes reads stalled (`stuck:exiting|exited|relaunched`): nothing
-  is forced, and no word moves it. Turn it off with `upgrade = false` under
+  is forced, and no word moves it; a sweep says so once on the upgrade ledger
+  (`stuck:<what>`). Turn it off with `upgrade = false` under
   aterm.toml's [harness]. The same supervisors relaunch a Claude Code that crashed
   (its session record left behind) on its own conversation, and tell it to carry
   on at its first idle point; a person's or a holder's exit, a graceful exit
@@ -654,38 +783,103 @@ KEY USAGE
   behind is read as the exit is seen (within a quarter second) and kept for every
   try: any Claude Code that starts removes dead sessions' records, so a crash's
   record read after the pause before a relaunch could pass for a graceful exit.
-  `relaunch = false` turns that off, and says so on the tab. A Codex exit is said on
-  its tab: its relaunch is not built yet (no [harness] limit) — resume it with the
-  `codex resume` line it printed. AN AGENT THE HARNESS'S OWN RESTART ENDED — the
-  upgrade's (Claude Code's SIGTERM or Codex's `/exit`) or a restart in place, whose
-  step returned with the relaunch still to type (you at the returned prompt, a hold)
-  — is none of those: its restart is carried at least every minute, whatever
+  `relaunch = false` turns that off, and says so on the tab. A CODEX that crashed is
+  relaunched the same way (decided 2026-09-27 under the owner's standing direction:
+  parity with Claude Code): its shell's word decides — the exit status of the
+  command that ran it (0, or someone's SIGHUP, SIGINT or SIGTERM: left alone;
+  SIGKILL, a SIGSEGV or SIGABRT, any failure: a crash), and with no word (no shell
+  integration) the exit is left — and it comes back through `<codex> resume
+  <flags> <thread>` on the thread it held (its writer lock, or the `resume <id>` it
+  was launched with; a daemon's client, the one thread its daemon began in its
+  directory after it started — two such, or another client of the daemon in the
+  same directory, and it is not guessed at), told why at its
+  first idle point when it held its thread itself (a daemon's conversation never
+  stopped). AN AGENT THE HARNESS'S OWN RESTART ENDED — the upgrade's (Claude
+  Code's SIGTERM or Codex's `/exit`) or a restart in place, whose step returned
+  with the relaunch still to type (you at the returned prompt, a hold) — is none
+  of those: its restart is carried at least every minute, whatever
   `relaunch` says, the line typed only once nobody types at the prompt and no hold
   stands, a line once typed never typed again, until it lands or its 5 minutes run
   out, and said on the tab either way.
   Claude Code's 5 minutes count from the agent's exit, however long it took to
   shut down; Codex's from its typed `/exit`, since a TUI still running a minute
   after its `/exit` is one the `/exit` did not take.
+  THE LADDER — ACTIVITY DELAYS; IT NEVER DISABLES (the owner's decision of
+  2026-09-28): the longer a session has been behind, the less the upgrade waits for
+  a comfortable moment. Under 20 minutes behind it asks for the natural idle point:
+  the screen still 20 s, nobody who gave the tab input within `human_grace_s`. From
+  20 minutes a pause that only LOOKS quiet counts — two looks 20 s apart that read
+  the screen idle with the same last words, whatever repainted between them. From
+  an hour a person holds it only by a keystroke in the last 20 s. From two hours it
+  moves at the first such pause. No rung moves it over a draft, a box, a keystroke
+  in the last 20 s, a hold, a usage limit or the login wall, or running work (the
+  agent's turn, the shells under it, a turn of a Codex client's own in its daemon:
+  `wait:daemon-turn`, `wait:goal`, `wait:daemon-busy`), and the restart still waits
+  for the READY answer and nothing running under the agent. `--now` is the last
+  rung at once, with the same floors.
   CODEX, by the same workers and the same step (the same lock, ledger, gates and
   owner's word): a Codex session's worker takes the step's Codex branch at its idle
   points when atpkg installs a newer Codex. Codex 0.157 runs a shared app-server
   DAEMON per $CODEX_HOME that holds every conversation, and a TUI in the tab that is
-  its client. THE DAEMON FIRST: one on an older build than the managed Codex, or on
-  the same build with the vendor's own updater armed (`auto-update-version`: it
-  re-runs chatgpt.com's installer outside atpkg), is moved by the vendor's verb
+  its client. THE DAEMON FIRST: one on an older build than the managed Codex is
+  moved by the vendor's verb
   `<managed codex> app-server daemon update --from-cli --yes`, with the daemon's own
   environment — the managed build copied in and PINNED, the updater gone, attached
-  TUIs reconnecting — only while nothing runs in it (every thread it holds, a tab's
+  TUIs reconnecting (one already on the managed build with the vendor's own updater
+  armed, `auto-update-version`, is pinned the same way: it keeps its tab due for
+  the pin alone, looked at at most once an hour, `wait:pin:<why>`, with no row, no
+  tab mark and no turn end of its own) — only while nothing runs in it (every thread it holds, a tab's
   or a detached one's, idle and settled, and no background terminal left running
   under it: the restart would end it), nobody is at a Codex tab on that home, the
   owner's `--skip`/`--defer` on none of them keeps it, and every Codex attached to it
   is one of this window's Codex tabs (`wait:background-terminal`, `owner-held`,
   `unseen-client` …); one AHEAD of the managed Codex is never moved back. THEN the
-  tab's own TUI, on an older build: a daemon-mode client at an idle point is ended
+  tab's own TUI, on an older build: a daemon-mode client at an idle point — its
+  input line `›`, or `»` on 0.158.0, and NO TURN OF ITS OWN RUNNING IN ITS DAEMON,
+  since an `/exit` might stop it (0.157 was measured printing `Disconnected from
+  this task. Any running work continues.`; 0.158.0's binary also holds `… The
+  current turn was stopped.`, and which case prints it is not measured). Its own
+  conversation is the one the kernel names (every thread of the daemon hangs from
+  that conversation's root — its subagents name it as their parent in their
+  rollouts — and this TUI is the daemon's only client): a turn anywhere in it, a
+  subagent's included, waits `wait:goal` while its footer says `Pursuing goal`, else
+  `wait:daemon-turn`. A GOAL IS PAUSED FOR THE MOVE (the owner's decision of
+  2026-09-28): a goal starts its next turn within milliseconds of the last one's
+  end, so from the Land rung (or `--now`), where its own turn is all that holds the
+  move and no save-then-wait switch is open, aterm types `/goal pause` — Codex takes
+  it while a turn runs, and it stops the NEXT turn, never the running one — waits
+  for that last turn to end (`wait:goal-held`), moves the tab, and resumes the goal
+  once (the box the relaunched Codex opens with, asking whether to resume its
+  paused goal, answered with its first option, or `/goal resume` typed; an
+  embedded session then gets no carry-on — the goal is it). A pause that never
+  shows is followed, at a goal turn's head only (nothing of its own work in its
+  rollout), by one Esc. Its record (`<aterm state>/drive/<tab>.goal-hold.json`,
+  written before every key) resumes it once after a restart, never twice; a person
+  resuming or changing the goal, or their hand on a pause not yet seen, takes it
+  from aterm; every wait at a goal held paused is `wait:goal-held`, which keeps the
+  supervisor's carry-on out; a move that does not come within an hour is given up
+  and the goal resumed — never into a thread fallen into a sandbox, where it stays
+  paused (`wait:goal-sandboxed`, a row naming the relaunch); only the relaunched
+  Codex's box is answered for it; a switch that opens over the pause resumes the
+  goal at its reset; a resume not made in an hour and a half is a row: `/goal
+  resume` in the tab (never while a switch holds the session or the paused goal's
+  last turn runs). Another session's turn on
+  the daemon holds it only until its screen places it there (a root running at
+  two looks 20 s apart while this screen's words stood still, another Codex
+  attached — never while its footer says `Pursuing goal`, since a goal's next turn
+  runs under words that stand still; a subagent's turn, or a second root's with
+  this TUI the only client, never): `wait:daemon-busy`, never said as a goal to
+  pause here nor presumed another session's — is ended
   by a TYPED `/exit` (fenced on the judged screen, its Enter guarded on the
-  composer's row) and relaunched through the same relaunch line Claude Code's
-  restart types, as `<managed codex> resume <same flags> <thread>`, the thread from
-  its own exit hint, read above the new prompt's first row — no notice and no
+  composer's row, its daemon read once more first: a turn begun since the
+  sweep's read waits `wait:changed`) and relaunched through the same relaunch
+  line Claude Code's restart types, as `<managed codex> resume <same flags>
+  <thread>`, the thread from
+  its own exit hint, read above the new prompt's first row — or, where the shell
+  integration's marks do not reach aterm (`integration=degraded`, as after an aterm
+  update), the root of the conversation the kernel names, recorded before the
+  `/exit`; where neither
+  can, the `/exit` waits `wait:no-shell-integration` — no notice and no
   carry-on, its work never stopped, in the daemon; it says what its daemon waits on
   (`wait:daemon-first:<why>`). An EMBEDDED session (`--no-daemon`, its thread's
   writer lock in its own hands) gets the notice, its READY answer in the rollout,
@@ -711,24 +905,44 @@ KEY USAGE
   until the resumed agent's model is read or the 2-minute wait for it runs out, and
   `done` from then — the ledger's `done` row comes with the next step; for `done`,
   how long ago it finished. Beside it, one Settings ▸ Messages record while sessions
-  wait, and a band row plus the tab's attention mark ONLY when an upgrade is stalled
-  — it was refused or its restart stopped, runs in a multiplexer pane the tab's
-  typing cannot reach, or is six hours behind with no `--now` in the last 30
+  wait — `Codex 0.158.0 installs itself in tab 1`, worded by what holds it: where
+  only the ladder's comfort does, nothing to do, it starts on its own at a quiet
+  moment, and from the ladder's two-hour mark (on your clock) as soon as it is idle
+  and nobody has typed there for 20 s; where a floor stands, which (a draft, a
+  dialog, a goal or a turn in this tab's Codex, a turn in another Codex session on
+  the same daemon, the shell integration) and when it moves — and a band row plus
+  the tab's attention mark ONLY
+  when an upgrade is stalled — it was refused or its restart stopped, runs in a
+  multiplexer pane the tab's typing cannot reach, has been blocked 30 minutes by
+  what no rung passes, whatever other wait came between
+  (`blocked:no-shell-integration`, `blocked:screen-unreadable`: quit it in its tab
+  and resume it there), or is six hours behind — four past the ladder's
+  last rung — with no `--now` in the last 30
   minutes. A round that gave up is no stall: it rests until its next round,
   which `--status` names (`next_round=`). The window's
   host keeps the view from its workers' own steps: it looks again when a worker
-  acts, at an activation notice or the owner's word, and at the moment an upgrade
-  turns overdue — no timer. `--status` prints the same from the recorded state. Only
+  acts, at an activation notice or the owner's word, at the moment an upgrade
+  turns overdue, and when the screen moves in a tab whose row reads Claude's live
+  status — no timer. `--status` prints the same from the recorded state. Only
   a conversation still live and behind in its tab is shown or counted.
+  THE WATCH: a record that no point has moved by its deadline (`watch_at=`: its
+  step's own bound, or a day behind) is read by the host OFF ANY POINT — at a
+  worker's start and at an activation notice too — as a dry run that types,
+  signals and ends nothing. It stamps `looked=`/`by=`, and may make only the
+  changes that need no hands: retarget onto a newer build (`retargeted:<a>-><b>`
+  in the ledger), hold the re-ask clock to a usage limit's named reset, and
+  re-arm a round that rested. Typing and restarting stay at the loop's points.
   A PERSON AT THE TAB: a session a person gave input to within `[harness]
   human_grace_s` (`status human_ms=`, the stamp the supervisor's question
-  answers read) is neither typed into nor signalled on the upgrade's own
+  answers read) — from the ladder's one-hour rung, within the last 20 s — is
+  neither typed into nor signalled on the upgrade's own
   judgment, busy or idle, by the window or a hand-run upgrade
   (`wait:attended`, said once as `held-back:attended`); the upgrade owns none of
   its turn ends meanwhile.
   THE OWNER'S WORD, on the tab named, taken by that tab's worker at its next
-  idle point: `--now` moves it at its next turn end (the quiet wait and the
-  person's grace waived — nothing else) and re-arms one that GAVE UP (no READY
+  idle point: `--now` moves it at its first pause (the ladder's last rung: no
+  quiet wait, a keystroke in the last 20 s still holding it — nothing else) and
+  re-arms one that GAVE UP (no READY
   answer after its last notice) at once rather than at its next round — the one
   place it adds an act (the notice is typed again); a refused or failed upgrade
   is not re-armed by the word (its next round comes by itself), and one held back
@@ -752,30 +966,84 @@ KEY USAGE
   turn, quiet reset by the grey suggestion, a lapsed ownership never decided
   again); the carry-on holding the tab 30 s and its answer unseen; `upgrade=`
   blank headless; a crash read as a graceful exit when another Claude removed
-  its record; and Claude's own `caffeinate` counted as work. STILL OPEN: a
-  FINISHED task is continued, answered and carried on like any other — the
-  relaunch scenario's haiku, its tester's prompt answered, was given `keep
-  going`, `answer_text` and a crash's carry-on, and invented work (`git init`,
-  `/init`, files, a commit). The no-task rule does not touch it; the fixes have
-  not been re-run with real Claude Code.
+  its record; and Claude's own `caffeinate` counted as work. A FINISHED task
+  (the relaunch scenario's haiku, given `keep going`, `answer_text` and a
+  crash's carry-on until it invented work) is now asked once and left: a turn
+  whose last words say the worker is done gets, past its back-off, "If the task
+  is finished and verified, reply DONE and stop; otherwise continue" (rule
+  `continue-done-check@v1`), and when that check's own answer says done again
+  nothing more is typed into the session — journaled `DONE` once — until a
+  person or an orchestrator types (decided 2026-09-27 under the owner's
+  standing direction; no key). The fixes have not been re-run with real Claude
+  Code.
 
 THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
-  In a window, Claude Code's mode row (`⏵⏵ … (shift+tab to cycle)`) is painted as
-  `◆ <model> <effort>   ⌂ <path>   ⎇ <branch>` (the path with home as `~`, cut from
-  the front to `…/<dir>` in a narrow pane). It is GLASS ONLY: `ctl text` and every
-  reader keep Claude's real row, `ctl image` shows the footer as the window does.
-  The facts come from files Claude keeps (its `sessions/<pid>.json`, the transcript,
-  `.git/HEAD`), read for THIS process only — a resumed session shows no model until
-  it answers. Lights appear beside it ONLY when a setting differs from what you
+  In a window, aterm writes `◆ <model> <effort>   ⌂ <path>   ⎇ <branch>   Σ <tokens>`
+  into the rule under Claude Code's input box, right-aligned the way Claude writes
+  its own effort tag into the rule above it (the path with home as `~`).
+  `Σ opus 48M in 310k out` is the session's tokens per model (input counts cache
+  reads and writes), folded live from its transcript and its subagents' — the whole
+  conversation's, a resumed one's earlier turns included; at most three models are
+  named (`+2` more), and a subagent file it could not count is said (`+1 unread`).
+  While a limit the session HIT stands, the facts OPEN with `⧗ 5h limit · resets
+  3pm`: read from the notice Claude Code wrote into the transcript, placed from that
+  row's own time, gone once the reset passes or a reply is served after it. The
+  band's `limited →` reads the screen instead, so the two can differ for a notice
+  scrolled away. Only plain rule
+  glyphs are covered: Claude's own row under the rule — its mode pill, `(shift+tab
+  to cycle)`, `← for agents`, its live status and notices — is never touched, and
+  the facts show in every mode, default mode included. Where no input box is drawn
+  (a dialog or a picker is up) nothing is written. The facts fit whole at 80
+  columns: a light's title while it is pointed at, selected or switching gives
+  way first, short then gone. A light's REASON — where a mode return stopped, a
+  refusal, what Claude said — outranks the tokens, the branch and the path: once
+  the path is cut to `…/<dir>` it takes their room, never the model's, the
+  effort's or a limit's. A narrower pane then drops the tokens, cuts the path and
+  drops the branch, the path, the effort and the model, a limit standing alone
+  last (a pane too narrow even for it shows the model instead), then the chips —
+  the model last. It is GLASS ONLY: `ctl text` and every reader keep
+  Claude's real rows, `ctl image` shows the footer as the window does. The model
+  is the one THIS process runs, named the moment it is chosen: its newest answer,
+  or the result Claude writes for its own `/model`, `/effort` or `/fast` (Claude
+  Code's top-effort mode shows as `xhigh`, the level it runs at). A model switch
+  whose result names no effort keeps the effort on show only if it was read for
+  the model switched to — each model runs its own — and otherwise shows none
+  until an answer or `/effort` names it. Else what the same process chose before a
+  `/clear`; after an in-app `/resume`, the same only where the process pinned its
+  model (a `--model`, a `/model` or `/fast` choice, `ANTHROPIC_MODEL`, or an
+  earlier restore), since Claude otherwise restores the resumed conversation's
+  last model, and so does the footer. A restore pins the model, as Claude's
+  does: after one `/resume` has restored a model, or a launch with `--resume` or
+  `--continue` has (Claude restores at launch too), every later `/resume` keeps
+  it — from a conversation older than the process or one another tab began
+  since. The footer tells a `/resume` from a `/clear` by when aterm last read
+  the tab (every few seconds while Claude's screen changes): two `/resume`s
+  between two reads count as the last one alone, and what another tab wrote in
+  those moments, a conversation it began included, as this Claude's own. aterm
+  keeps what it read of a Claude Code while that Claude runs (of 64 at most);
+  after aterm itself is updated under it, a pin — a restore, or a `/model` or
+  `/fast` choice — that a `/clear` has since left behind is not known, and a
+  `/resume` can name the resumed conversation's model until Claude answers. A launch that resumes a conversation with no `--model`
+  runs the model Claude restores from it, and the footer names that model at
+  once. Else the process's own `--model` (a full model id, never an alias); else
+  the model its launch card names, read while Claude's own input box and footer
+  row are up, while nothing else has — never the model of the process before it
+  on that process's say-so. A choice whose result this build cannot read shows
+  no model until the next answer.
+  The facts come from files Claude keeps (its `sessions/<pid>.json`, the
+  transcript and its subagents', `.git/HEAD`) and its screen; nothing is written
+  to Claude's settings.
+  Lights appear left of the facts ONLY when a setting differs from what you
   expect; at rest nothing is drawn. They are:
   * the permission mode — bypass and auto are both expected. In manual, accept
-    edits, plan or don't ask a chip (`⏸ plan`) takes the place of Claude's pill; a
-    click presses shift+tab forward through Claude's own cycle to the nearest of
-    bypass and auto (from don't ask through manual), each press waiting for its
-    own answer, decided from the session itself (a background tab finishes too).
-    The click's press goes at once; aterm's next presses wait for Claude to be
-    idle, because a shift+tab that lands in a permission box answers it. One
-    that stops early names the mode it stopped in; mid-turn, click again.
+    edits, plan or don't ask a chip (`⏸ plan`) shows in the rule, Claude's own pill
+    staying on its row; a click presses shift+tab forward through Claude's own
+    cycle to the nearest of bypass and auto (from don't ask through manual), each
+    press waiting for its own answer, decided from the session itself (a
+    background tab finishes too). The click's press goes at once; aterm's next
+    presses wait for Claude to be idle, because a shift+tab that lands in a
+    permission box answers it. One that stops early names the mode it stopped in;
+    mid-turn, click again.
   * fast mode — `○ fast` while off. A click pastes `/fast on` plus Return, mid-turn
     too (only while the prompt holds exactly that command and nobody has typed
     since; taken back with one ctrl+u if it did not go; refused while a `lease`
@@ -786,12 +1054,12 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
     Claude turns auto mode off while fast mode is on (its server setting), the
     light says so the first time and stops offering fast mode in auto mode.
     Claude's answers are read from its own strings; no live run has shown them.
-  A light also shows while it switches and for a few seconds after. On macOS
+  A light also shows while it switches and for a few seconds after; its title
+  shows beside it, and a chip never moves under the pointer. On macOS
   ctrl+shift+tab reveals and selects the lights that fit the pane (Return or
   Space presses the selected one — nothing on an expected mode; ←/→ move, Escape
-  lets go). A mode row a new Claude Code draws differently makes the footer step
-  aside and is named once in aterm.log. The footer follows
-  `tab_status`.
+  lets go). A mode row a new Claude Code draws differently makes the lights step
+  aside and is named once in aterm.log. The footer follows `tab_status`.
   A restart the harness makes (relaunch, stall, memory banner, model move, upgrade)
   resumes the permission mode the session was in — the pill on its screen, else its
   transcript's last `permission-mode` row — named on the command line, and never
@@ -804,8 +1072,11 @@ WHEN TO REACH FOR IT
   says about a limit right now. `disk` before a build that needs room.
 
 GOTCHAS
-  * `usage` reads the NEWEST transcript in the working directory's project directory:
-    two Claude Code sessions in one directory share it, and the answer says so.
+  * `usage` folds the session Claude Code names in its own tools' environment
+    (CLAUDE_CODE_SESSION_ID, else CLAUDE_PID); aterm's shells carry no CLAUDE_*, so run
+    from one it reads the NEWEST transcript in the working directory's project directory
+    (under CLAUDE_CONFIG_DIR, else ~/.claude) — two sessions in one directory share it,
+    and the answer says so.
   * Nothing under ~/.claude/projects is removable by `disk` under any flag."#,
         ),
     },
@@ -1018,6 +1289,27 @@ PLUMBING (producer / operator / dev — a first hour never needs these)
                              Exits with the command's status; a TERM or HUP sent to it
                              is passed on to the command, which it waits for; a lease
                              it cannot take is said, never a reason not to run
+  aterm pkg lane (-- <command…> | - | --json <field.path>) [--cwd <dir>]
+                             read ONE shell command line the way the shell runs it (the
+                             reader `aterm help reroute` describes) and exit 2 naming the
+                             Trust spelling when it runs stock Rust — cargo, rustc,
+                             rustfmt, clippy, rustdoc — at command position, the
+                             directory's stock pin beside it; 0 when it does not, or when
+                             ATERM_STOCK_REASON='<why>' stands in front of it (one line
+                             says so); 1 when the input cannot be read. `-` reads the line
+                             from stdin, `--json` from one string field of a JSON object
+                             on stdin (the shape a hook payload carries it in); `--`
+                             joins its words with spaces, so a quoted argument loses
+                             its quotes — check a quoted command through `-`. A
+                             Trust toolchain's own rustc or rustdoc BY PATH (trustc or
+                             trustdoc beside it, e.g. build/<host>/stage2/bin/rustc) or
+                             by a Trust channel (`rustup run trust rustc`) is not stock
+                             and exits 0; its cargo is refused with that directory's
+                             targo. A relative path is read under --cwd (default: the
+                             current directory); a `cd` inside the line is not followed.
+                             Text nested past 8 levels of $( ), bash -c or eval is not
+                             parsed: a stock name in it exits 2. It installs nothing: a
+                             guard you wire yourself calls it
 
 WHEN TO REACH FOR IT
   To manage the published CLI toolchain — install / update / pin / verify — or to see
@@ -1101,14 +1393,16 @@ GOTCHAS (in the order they bite)
     PATH (opened before the install that introduced agents/, or one whose rc never sourced
     the hook) and no such stub ahead of the foreign copy:
     `aterm pkg doctor` and `aterm pkg which claude` say "SHADOWED in this shell by …" and
-    name the one fix — the same line the window's status row says for a tab from before
-    the update:
+    name the one fix — the same line the window records for tabs from before the update
+    (since 2026-09-22 an entry in `aterm ctl appstatus`, never a row on the glass):
     `. ~/.aterm/shell.d/00-atpkg.zsh` (`source …fish` for fish, `. …ps1` for pwsh),
-    typed in that shell. It moves agents/ to the front of PATH and keeps everything the
-    tab has. NOT `exec $SHELL`: inside an aterm tab the re-exec'd shell loads no shell
-    integration (measured 2026-09-16 — the zsh wrapper consumes ATERM_ORIGINAL_ZDOTDIR;
-    bash rides --rcfile), so the tab silently loses its marks, cwd tracking and the live
-    PATH re-assert. Only where no hook file exists does doctor print a PATH line instead.
+    typed in that shell. It re-reads PATH — agents/ at the front, in an aterm tab — and
+    keeps everything the tab has; setting PATH also empties zsh's command hash, so a
+    `claude` the shell had hashed to the foreign copy is looked up again.
+    NOT `exec $SHELL`: inside an aterm tab the re-exec'd shell loads no shell integration
+    (measured 2026-09-16 — the zsh wrapper consumes ATERM_ORIGINAL_ZDOTDIR; bash rides
+    --rcfile), so the tab silently loses its marks, cwd tracking and the live PATH
+    re-assert. Only where no hook file exists does doctor print a PATH line instead.
     Outside aterm (iTerm, Terminal) your own copy running is the design, not a shadow: the
     two say "not what runs outside aterm: …, this shell's own copy" as a note, stub laid
     or not, and name no fix — the hook leaves agents/ out of such a shell. `aterm claude`
@@ -1147,7 +1441,26 @@ GOTCHAS (in the order they bite)
     local pin`, a yank, a rollback) or is not known (the vendor's release channel not
     reached for a day). The ALab index can only yank a version, never supply one. Claude
     Code's own background updater is off in the managed copy (`DISABLE_AUTOUPDATER=1`: it
-    would install a copy this name never runs); aterm is its updater.
+    would install a copy this name never runs); aterm is its updater. When an update or
+    install LANDS a new build of either, aterm runs that build once in the background,
+    silently, so the vendor CLI refreshes what your account is served (its model list,
+    its feature flags) ahead of your first launch: claude in print mode on an input it
+    never sends — no prompt, no model turn, no transcript, no hooks — and `codex debug
+    models`. It runs through the managed shim (so claude's `DISABLE_AUTOUPDATER=1`
+    holds), as you, from your home directory, signed in as the program itself keeps you
+    signed in (the variables aterm strips from its shells — an ANTHROPIC_API_KEY, a
+    parent Claude session's — are not passed on, but your own CLAUDE_CONFIG_DIR,
+    CODEX_HOME, ANTHROPIC_BASE_URL and Bedrock/Vertex choice are, an identity session's
+    too), and is stopped after 30 s. It does not run claude when you have set
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, a program that has never run on this
+    account (no ~/.claude, ~/.claude.json or ~/.codex, or none where your config
+    variable points), or anything as root. Best
+    effort: a warm that fails fails nothing and is not retried (your first launch does
+    the same work), and each one is a `warm` line in the package log. It has no switch
+    of its own; it rides the landing: `[packages] enabled = false` stops the automatic
+    passes (a build you land by hand is still warmed), `[packages] exclude` keeps a
+    program aterm has not installed from arriving, `aterm pkg pin` holds one where it
+    is, and a removed or dev-linked program is never warmed. Not on Windows yet.
   * SELF-UPDATE VERBS ON THE MANAGED NAME (owner, 2026-09-19: "aterm reports that these
     packages are automatically managed by atpkg to keep to the latest version (and then
     does a check to make sure that they are updated and then actually updates) via the
@@ -1265,8 +1578,12 @@ GOTCHAS (in the order they bite)
     removed) or stopped or started being current (held, refused, failed …) is ONE line
     in packages.log beside aterm.log (~/Library/Logs/aterm on macOS): tab-separated
     `key=value` fields after a UTC stamp, credentials and control characters stripped,
-    rotated at 1 MiB with five kept. Settings ▸ Packages lists its newest 50 as Activity,
-    in local relative time, with Open Log for the whole file.
+    rotated at 1 MiB with five kept. So is each warm of a landed claude or codex build
+    (VENDOR PROGRAMS, above): a `warm` line with how it ended — `exit=<code>`,
+    `signal=<n>`, `killed` at 30 s or `spawn-failed`, or `opted-out` / `never-run` when it
+    did not run — and how long it took. Settings ▸
+    Packages shows its newest 50 events, less the warm lines, as Activity, in local
+    relative time, with Open Log for the whole file.
   * PROVENANCE (macOS): files written by some processes carry a system tag
     (`com.apple.provenance`) that release builds refuse. The package manager clears it
     automatically after every install; `aterm pkg doctor` reports any file it could not
@@ -1359,9 +1676,11 @@ THE TABLE (one row per name)
   tlc        SIGNPOST   announce, then run upstream; name `ty`; equivalence not claimed
   rustc      SIGNPOST   announce, then run upstream; `trustc <args>` /
                         `trustc -Ztrust-verify=off <args>`
-  cargo      SIGNPOST   announce, then run upstream; `targo trust <args>` /
-                        `targo --unverified <args>`; `cargo clippy`/`cargo fmt` → the one
-                        branded spelling (`targo tippy` / `targo fmt`)
+  cargo      SIGNPOST   announce, then run upstream; the verb picks the spelling targo
+                        ACCEPTS for it: build/check/test → `targo trust <args>` /
+                        `targo --unverified <args>`; run, doc, install, … (no verified
+                        lane) → `targo --unverified <args>`; metadata, tree, fmt, …
+                        (no lane) → `targo <args>`; `cargo clippy` → `targo tippy`
   z3         ORACLE     refuse (exit 2), naming the upstream z3's path — running it by
                         path reaches the real z3
   `rustup` is NOT rerouted — `rustup run trust <tool>` is the sanctioned spelling, and it
@@ -1389,6 +1708,13 @@ THE AGENT PROGRAMS (claude, codex — since 2026-09-23)
   `hash -r` (bash), once. `aterm pkg doctor --verbose` names the route (`routed
   at exec time by <prefix>/reroute/claude`); `aterm pkg which claude` shows it as
   `claude → <prefix>/reroute/claude → <prefix>/agents/claude → <store path>`.
+  The twin shares the vendor's login (~/.codex, ~/.claude): a login that expired while
+  unused fails the same way in either copy, and the twin may simply say it sooner and
+  more cryptically (measured 2026-09-24: codex 0.156 quit at startup on `workspace
+  routing discovery unauthorized (401)`, its log naming `refresh_token_expired`, where
+  the vendor's older copy failed only on the first prompt). The fix is the vendor's
+  `codex login`; codex 0.157+ also keeps an app-server daemon that must see the new
+  login (`codex app-server daemon restart`).
 
 WHAT YOU SEE — `cargo build --release` in a session prints this on stderr, and then your
 build runs:
@@ -1404,6 +1730,22 @@ build runs:
   `cargo --unverified build` exec `targo` after one line, because you already said which
   lane you meant. A DIRECT row is one line and then the tool runs — `rustfmt src/lib.rs`:
   aterm: running trustfmt, Trust's 'rustfmt'. (`aterm --no-reroute` restores upstream 'rustfmt'.)
+
+A STOCK PIN CHANGES NOTHING ABOVE. In a directory whose rust-toolchain.toml (or
+$RUSTUP_TOOLCHAIN) names a stock channel, a SIGNPOST adds one note under the lanes: the
+pin moves only rustup's proxies, never targo, so the Trust spellings still run the Trust
+toolchain there (targo, tippy, trustfmt and trustdoc are not rustup proxies; `aterm help
+rust` measures it per directory). A Trust pin, the default, adds nothing.
+
+NOTHING HERE REFUSES AN AGENT'S OWN COMMAND. A stub answers a NAME looked up on PATH, so
+it cannot tell a command an agent typed from one a tool spawned by name — aterm's own
+`xtask gate web` and `gate linux` spawn stock `cargo` with RUSTUP_TOOLCHAIN=<stable> by
+design, and every child inherits the agent's environment — so it announces and runs. And
+aterm installs nothing into an agent (decision "B"), so no hook of aterm's refuses one
+either. What CAN see an agent's own command is its text: `aterm pkg lane` reads one command
+line the way the shell runs it and exits 2 with the Trust spelling when it runs stock Rust
+at command position (`ATERM_STOCK_REASON='<why>'` in front lets it through) — the reader a
+guard you wire yourself calls (`aterm help pkg`).
 
 EXIT CODES
   The exec'd tool's own (a DIRECT row, a SIGNPOST row, an escape, a `+toolchain`
@@ -1424,8 +1766,9 @@ ESCAPES AND CONTROLS (all of them — none is an environment variable, since 202
                                cargo's own rustc/rustdoc spawns are never re-announced.
                                The claude/codex stubs do not read that marker (THE
                                AGENT PROGRAMS).
-  [reroute] announce = false   in aterm.toml (Settings ▸ Packages): run the SIGNPOST rows
-                               with no announcement at all. It silences a line and
+  [reroute] announce = false   in aterm.toml (Settings ▸ Packages): run the SIGNPOST rows,
+                               and a stock `+<channel>` on any Rust row, with no
+                               announcement at all. It silences a line and
                                nothing else — the tool was going to run either way. (It
                                does NOT silence a DIRECT row, whose announcement is the
                                promise that nothing was substituted behind your back, nor
@@ -1433,9 +1776,15 @@ ESCAPES AND CONTROLS (all of them — none is an environment variable, since 202
   /path/to/z3 …                the real z3: a path never meets a stub, and the ORACLE
                                refusal names the upstream copy's path.
   cargo +stable build          naming a non-Trust toolchain explicitly is you naming
-                               upstream: it runs, with one loud line saying nothing it
-                               produces is verified. `+trust…` keeps the lane question
-                               and is signposted like a bare cargo.
+                               upstream: it runs as named, after the Trust spelling of the
+                               same command and the fact that a stock channel moves only
+                               rustup's proxies (`announce = false` silences it). The
+                               DIRECT rows do the same since 2026-09-27: `rustfmt +1.97.1
+                               x.rs` names `trustfmt x.rs` and runs rustup's rustfmt (it
+                               used to hand `+1.97.1` to trustfmt as a file); `rustfmt
+                               +trust x.rs` runs trustfmt without the directive.
+                               `+trust…` keeps the lane question and is signposted like a
+                               bare cargo; upstream receives the `+trust` it was given.
   An absolute path (`~/.cargo/bin/cargo`) and `rustup run <toolchain> cargo` never meet a
   stub: the reroute answers a NAME looked up on PATH, nothing else.
 
@@ -1889,6 +2238,9 @@ fn overview_page() -> String {
             crate::Verb::Harness => {
                 "Claude Code's spend, limits, disk, approval ledger; `upgrade` (`aterm drive` supervises)"
             }
+            crate::Verb::Keeper => {
+                "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; opt-in)"
+            }
             crate::Verb::NewTab => "open a terminal tab (where it opens is `windowing_behavior`)",
             crate::Verb::NewWindow => "open a NEW window, always",
             crate::Verb::SplitPane => {
@@ -1944,7 +2296,7 @@ PRECEDENCE
   your shell still exports, with the key or flag that replaced it.
 
 START ONE
-  aterm --window --write-config    writes a documented starter aterm.toml — 156
+  aterm --window --write-config    writes a documented starter aterm.toml — 157
                                    keys, each with its default and a comment (not
                                    quite every key: see THE KEY ROSTER below).
   Settings are reloaded live: save the file and the running app picks it up.
@@ -1974,10 +2326,11 @@ WHAT THE DIAGNOSTIC SUBCOMMANDS COVER
   macOS consent dialog) and [machine], both macOS settings.
   On Windows, explain-config leaves those two out, prints this file's path and
   documents `shell` and `font_px`, and the shell show-config and `aterm doctor`
-  report is the one a new tab spawns, never the shell the command was typed
-  into, and each names the input that chose it: `shell` in this file, else pwsh,
-  then powershell, then %COMSPEC%, then cmd.exe (a window launched with --shell
-  uses that instead).
+  report is never the shell the command was typed into: inside an aterm tab it
+  is that tab's own shell (`shell_origin=tab`, so a window launched with --shell
+  reports that shell), and elsewhere the one a new window spawns, naming the
+  input that chose it: `shell` in this file, else pwsh, then powershell, then
+  %COMSPEC%, then cmd.exe.
 "#;
 
 /// `aterm help ship`. Advertised as a front-door verb since the roster existed;
@@ -2259,7 +2612,10 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      trust dialog, plan mode's yes that grants no standing
                      mode, the question
                      dialog's recommended answer tab by tab (not under
-                     --no-answer);
+                     --no-answer), and at every level the usage-limit
+                     dialog's "Wait here, then continue automatically" row
+                     (not under [harness] `limit_wait = false`; never a
+                     spending row, never `Stop`);
                      `--approve safe` only a box it proves safe (a read-only
                      Bash box, a Read box outside the secrets list, the rm
                      circuit breaker under a scratch root, the trust dialog for
@@ -2345,7 +2701,11 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      its time); a model bucket is waited out to its reset (the
                      window's host relaunches it on `model_fallback` instead,
                      `--model`, never `/model`; one asking consent to go on on
-                     credits is continued first); a full context `/compact`; a lost
+                     credits is continued first); a Codex goal a usage limit
+                     stopped is resumed with `/goal resume`; a Codex whose goal
+                     runs on by itself gets no continuation, and one whose
+                     thread fell into a sandbox its launch bypassed gets
+                     nothing, and one message; a full context `/compact`; a lost
                      login `/login`; a continuation the worker never takes is
                      acted again on the back-off. Nothing is typed under a box
                      or the survey, within `human_grace_s` of a person's
@@ -2455,27 +2815,28 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      instance, and a request that got no answer (`server closed
                      the connection without responding`, a refused or vanished
                      socket) or was turned away unread (`ERR control server
-                     busy; retry`, `ERR auth`) prints `RECONNECT <reason>`, then
-                     re-reads the same @sid 0.5 s apart, doubling to 8 s. When
-                     one answers it prints `RECONNECTED after <ms> ms` and looks
-                     again from a fresh read — no seq from before the handoff
-                     is waited on, the point last reported is reported once
-                     more if still showing, and a press whose answer never came
-                     is not repeated blind: the box is read and classified
-                     first. S (default 180; 0 = off) bounds the whole outage,
-                     not one ride-out: a request dropped again before the loop
-                     gets past the first is the same outage, printed once. In
-                     one, `ERR no such session` is not yet an answer (the new
-                     instance may not host the @sid yet); outside one it ends
-                     the loop at once, as `ERR exited` always does. A wait that
-                     runs out is followed by a read, so a handoff no request saw
-                     fail is caught too. The window lapsing ends it, exit 1,
-                     with `reconnect window lapsed: <the last failure>` (watch:
-                     an `EXIT` line); --max-s or --timeout running out first is
-                     the TIMEOUT, exit 124. watch prints both lines on stdout
-                     (informational), await-turn and supervise on stderr. A
-                     per-instance socket named with --socket
-                     (`aterm-<pid>.sock`) goes with its instance, so a
+                     busy; retry`, `ERR auth`, `ERR main thread stalled
+                     …; retry`, also after a verb's own `ERR <what>: `) prints
+                     `RECONNECT <reason>`, then re-reads the same @sid 0.5 s
+                     apart, doubling to 8 s. When one answers it prints
+                     `RECONNECTED after <ms> ms` and looks again from a fresh
+                     read — no seq from before the handoff is waited on, the
+                     point last reported is reported once more if still showing,
+                     and a press whose answer never came is not repeated blind:
+                     the box is read and classified first. S (default 180; 0 =
+                     off) bounds the whole outage, not one ride-out: a request
+                     dropped again before the loop gets past the first is the
+                     same outage, printed once. In one, `ERR no such session` is
+                     not yet an answer (the new instance may not host the @sid
+                     yet); outside one it ends the loop at once, as `ERR exited`
+                     always does. A wait that runs out is followed by a read, so
+                     a handoff no request saw fail is caught too. The window
+                     lapsing ends it, exit 1, with `reconnect window lapsed:
+                     <the last failure>` (watch: an `EXIT` line); --max-s or
+                     --timeout running out first is the TIMEOUT, exit 124. watch
+                     prints both lines on stdout (informational), await-turn and
+                     supervise on stderr. A per-instance socket named with
+                     --socket (`aterm-<pid>.sock`) goes with its instance, so a
                      ride-out through it lapses: leave --socket off (the
                      instance hosting this terminal, else the newest) or name
                      the `aterm.sock` alias
@@ -2595,11 +2956,17 @@ WHAT YOU ARE SEEING
   popped up\" does not mean this is not a permissions wall — and when a dialog IS raised,
   it is a system modal only a human can answer, the syscall that raised it is parked until
   they do, and it never times out.
+  Exception: under aterm's own sandbox (`--sandbox`, the same as `--containment
+  containment`, which a malformed `--containment` value also selects), a write outside the
+  temp dirs and shell history, or a read of Documents, Desktop, Downloads, Pictures, Movies,
+  Music, a credential store, or Mail, Messages or browser data, gets this same EPERM, and no
+  grant lifts it. A window under it shows `containment mode=containment` in
+  `aterm ctl privacy`.
 
 WHAT TO DO, IN ORDER
   1. `aterm ctl privacy`               the whole posture, before you retry anything.
-  2. Read `full_disk_access=`, `prompt_possible=`, and your own session's `fs_consent=`
-     and `attribution=` (`aterm ctl @<sid> status` carries the last two per session).
+  2. Read `full_disk_access=` and your own session's `attribution=` (`aterm ctl @<sid>
+     status` carries it per session).
   3. Tell your operator what you found. `full_disk_access=denied` means aterm's effective
      access check failed, NOT that the System Settings switch is off. Check the installed
      app named by `running=` in System Settings ▸ Privacy & Security ▸ Full Disk Access;
@@ -2800,7 +3167,10 @@ fn rust_page() -> String {
          \n\
          THE DEFAULT HERE IS THE TRUST TOOLCHAIN. `targo` is cargo, `trustc` is rustc, `tippy` is\n\
          clippy, `trustfmt` is rustfmt, `trustdoc` is rustdoc; `ty`, `ay`, `clean` are the verifiers.\n\
-         Those are the tools' names — use them in replies too (tippy, not clippy).\n\
+         Those are the tools' names — use them in replies too (tippy, not clippy). That holds in a\n\
+         project whose rust-toolchain.toml pins a STOCK channel too: rustup reads that pin, so it\n\
+         moves rustup's proxies (`cargo`, `rustc`, `rustfmt`, `cargo-clippy`) and never targo,\n\
+         tippy, trustfmt or trustdoc — `targo here` below measures it for THIS directory.\n\
          Stock `cargo`/`rustc` is not blocked — it is the exception, and inside a session a bare\n\
          `cargo …` prints the `targo` spelling of your command before running (`aterm help reroute`).\n\
          Name the lane; `targo` will not pick one for you:\n\
@@ -3036,6 +3406,34 @@ fn rust_page() -> String {
             let _ = writeln!(out, "  targo on PATH    {}", describe_on_path(t));
         }
     }
+    // What that `targo` compiles with HERE — the question a stock pin makes a
+    // reader ask (2026-09-23), answered from the inputs cargo actually reads
+    // ([`rustc_movers`]) rather than from the pin, which targo never reads.
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| Some(home.join(".cargo")));
+    let movers = rustc_movers(
+        cwd.as_deref(),
+        &|key| std::env::var(key).ok(),
+        cargo_home.as_deref(),
+    );
+    let _ = writeln!(
+        out,
+        "  targo here       {}",
+        targo_here_row(path_dir.as_deref(), &movers)
+    );
+    // And the two tools a stock pin is most often read as selecting, asked through
+    // targo in this directory. Bounded like every probe (measured ~30-65 ms).
+    let _ = writeln!(
+        out,
+        "  targo fmt        {}",
+        probe("targo", &["fmt", "--", "--version"])
+    );
+    let _ = writeln!(
+        out,
+        "  targo tippy      {}",
+        probe("targo", &["tippy", "--version"])
+    );
     // A version line is only evidence when it IS one: the probe's failure text, or
     // a stock cargo rejecting the flag, must not be compared as a build.
     let as_version = |line: &str| line.starts_with("targo ").then(|| line.to_string());
@@ -3318,6 +3716,18 @@ fn rust_page() -> String {
 /// `rust-toolchain.toml`, so a value there other than the pin is said instead of the
 /// pin's claim; an empty value is unset. Pure, so each shape is pinned without
 /// touching the process environment.
+///
+/// THE STOCK BRANCH IS THE 2026-09-23 INCIDENT. It read *"this project pins a
+/// NON-Trust channel. The project wins over this page; say so in your reply when
+/// you build it"*, and an orchestrating agent read that as "build this project
+/// with stock `cargo +1.97.1`", which it wrote into ~45 subagent prompts for
+/// trust-cg and trust-ir. The owner's ruling that day: on this machine Rust means
+/// the Trust toolchain everywhere, a stock-pinned project included. What such a
+/// pin does is MEASURED (2026-09-23/24, store build 9192, a crate pinning
+/// `channel = "1.97.1"`): rustup reads it, so its proxies answer 1.97.1 — while
+/// `targo --unverified check -v` ran the store's `trustc`, `targo tippy -v` its
+/// `tippy-driver`, `targo --unverified doc -v` its `trustdoc`, and `targo fmt --
+/// --version` answered `trustfmt`.
 fn rust_toolchain_row(pinned: Option<&str>, rustup_env: Option<&str>) -> String {
     let overridden = rustup_env.filter(|env| !env.is_empty() && Some(*env) != pinned);
     match (pinned, overridden) {
@@ -3332,12 +3742,136 @@ fn rust_toolchain_row(pinned: Option<&str>, rustup_env: Option<&str>) -> String 
              \x20                  no per-unit lane, no --unverified. Use `targo` so the lane is explicit."
         ),
         (Some(ch), None) => format!(
-            "  rust-toolchain   channel = \"{ch}\"  — this project pins a NON-Trust channel. The project\n\
-             \x20                  wins over this page; say so in your reply when you build it."
+            "  rust-toolchain   channel = \"{ch}\"  — a STOCK pin. rustup reads it, so it moves only rustup's\n\
+             \x20                  proxies (`cargo`, `rustc`, `rustfmt`, `cargo-clippy`, where rustup provides\n\
+             \x20                  them). targo, tippy, trustfmt and trustdoc are not rustup proxies and run the\n\
+             \x20                  Trust toolchain here too (`targo here` below). Build this project like any\n\
+             \x20                  other — `targo trust <cmd>` / `targo --unverified <cmd>`, `targo tippy`,\n\
+             \x20                  `targo fmt` — and use stock only with a reason you state."
         ),
         (None, _) => "  rust-toolchain   no channel pinned — a stock `cargo`/`rustc` here runs what rustup or\n\
              \x20                  PATH picks (the `rustc` rows below); use `targo`."
             .to_string(),
+    }
+}
+
+/// What moves a bare `targo` off the `trustc` beside it in `cwd`, in the order
+/// cargo resolves its compiler: `$RUSTC`, `$CARGO_BUILD_RUSTC`, then a
+/// `build.rustc` in a cargo config file cargo reads for `cwd` — every
+/// `.cargo/config.toml` and `.cargo/config` from `cwd` up (nearest first), then
+/// `$CARGO_HOME`'s. Each entry is `(where, value)`, highest precedence first;
+/// empty is "nothing does".
+///
+/// MEASURED 2026-09-24 on store build 9192, in a crate pinning stock 1.97.1:
+/// `RUSTC=<stock rustc> targo --unverified check -v` and `targo --unverified
+/// --config build.rustc=<stock rustc> check -v` both ran the stock compiler
+/// (which then refused targo's `-Ztrust-verify=off`), while
+/// `RUSTUP_TOOLCHAIN=1.97.1` and the pin itself left every unit on the store's
+/// `trustc`. A line-level read of each file ([`build_rustc_in`]), not a TOML
+/// parser; `targo --unverified check -v` names the compiler of every unit.
+fn rustc_movers(
+    cwd: Option<&Path>,
+    var: &dyn Fn(&str) -> Option<String>,
+    cargo_home: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for key in ["RUSTC", "CARGO_BUILD_RUSTC"] {
+        if let Some(value) = var(key).filter(|v| !v.is_empty()) {
+            found.push((format!("${key}"), value));
+        }
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dir = cwd;
+    while let Some(d) = dir {
+        files.push(d.join(".cargo").join("config.toml"));
+        files.push(d.join(".cargo").join("config"));
+        dir = d.parent();
+    }
+    if let Some(h) = cargo_home {
+        files.push(h.join("config.toml"));
+        files.push(h.join("config"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        if let Some(value) = std::fs::read_to_string(&file)
+            .ok()
+            .as_deref()
+            .and_then(build_rustc_in)
+        {
+            found.push((format!("build.rustc in {}", file.display()), value));
+        }
+    }
+    found
+}
+
+/// The `rustc` key of a cargo config file's `[build]` table (or a top-level
+/// dotted `build.rustc`), verbatim between its quotes; the last one wins, as in
+/// TOML's reading of a repeated key it would refuse. `rustc-wrapper` is not
+/// `rustc`, and a `rustc` under any other table is not the build's.
+fn build_rustc_in(text: &str) -> Option<String> {
+    let mut table = String::new();
+    let mut found = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            table = header
+                .split(']')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !((table == "build" && key == "rustc") || (table.is_empty() && key == "build.rustc")) {
+            continue;
+        }
+        let value = value.trim_start();
+        let Some(quote) = value.chars().next().filter(|q| *q == '"' || *q == '\'') else {
+            continue;
+        };
+        if let Some(end) = value[1..].find(quote) {
+            let inner = &value[1..=end];
+            if !inner.is_empty() {
+                found = Some(inner.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// The `targo here` row: the compiler a bare `targo` runs in this directory,
+/// from the directory that `targo` resolves into (`dir`) and what could move it
+/// off the `trustc` beside it ([`rustc_movers`]). PURE but for one `is_file`.
+fn targo_here_row(dir: Option<&Path>, movers: &[(String, String)]) -> String {
+    if let Some((what, value)) = movers.first() {
+        return format!(
+            "NOT trustc: {what} = {value} names the compiler targo runs here.\n\
+             \x20                  (Measured: $RUSTC and build.rustc move targo; a rust-toolchain.toml pin\n\
+             \x20                  does not.) Until it is gone the Trust spelling runs that compiler too."
+        );
+    }
+    match dir {
+        None => "unknown — no `targo` on PATH resolves to a file (the row above)".to_string(),
+        Some(d) if d.join("trustc").is_file() => format!(
+            "{} — the trustc beside targo. Nothing here names another\n\
+             \x20                  compiler ($RUSTC, $CARGO_BUILD_RUSTC and build.rustc from this directory up\n\
+             \x20                  and in $CARGO_HOME were read), and a rust-toolchain.toml pin does not move it.",
+            d.join("trustc").display()
+        ),
+        Some(d) => format!(
+            "{} holds no `trustc` — this `targo` is not the Trust cargo (`aterm pkg doctor`)",
+            d.display()
+        ),
     }
 }
 
@@ -3956,7 +4490,11 @@ HOW TO USE IT
   queues anyway: on `send` and `key` among the other options, on `hwkey`, `pointer` and
   `invoke` as the first token. The remedies are signals, which unread input never
   refuses: `signal int` interrupts, `signal term` restarts a frozen program (then resume it
-  — `claude --continue` for Claude Code), `signal cont` resumes a stopped job. A program
+  on its own conversation — the `claude --resume <id>` aterm's line names for Claude Code,
+  read from that process's own record, never the directory's newest conversation (a
+  sibling tab's where two share it); nothing to type where the window's supervisor
+  relaunches it), `signal cont` resumes a stopped job. On a peer,
+  leave them to its owner unless the human told you to. A program
   can live through `signal term` — a Node program's SIGTERM listener never runs while its
   JS thread spins — so it stays `stalled` (`input_bytes=0`), every input verb still refused,
   until it ends or shows it is alive (it draws, reads a key sent since, or stops spinning);
@@ -3967,6 +4505,20 @@ HOW TO USE IT
   term|kill|hup|quit` discards a raw-mode job's unread input first (the tty's queue and
   whatever aterm still held behind it) and says how much (`discarded=<n>`). A program that ends any other way (`signal int`, its own exit) hands
   them to the shell: read the screen before you type the resume command.
+
+  A TERMINAL LEFT STUCK (mouse reports typed at the prompt, the bell at every Ctrl chord)
+  When a program that armed the mouse, kitty keys or the alt screen loses the terminal,
+  aterm hands those modes back at the foreground change (`timeline`: `modes-restored`).
+  That handback needs a program that is GONE; modes armed before it existed, a foreground
+  change it missed, a shifted charset or a dangling OSC 8 link stay. `aterm ctl @sid
+  reset` is the escape hatch: every mode a program negotiates goes back to what the host
+  configured, a torn escape sequence is cancelled and an open link closed, the screen and
+  the scrollback are kept (leaving the alt screen shows the main screen again). The reply
+  names what moved (`OK reset reverted=<csv|-> bytes=<n>`) and `timeline` records
+  `modes-restored reason=manual`. `reset flush` then drops the input the stuck modes
+  queued (`discarded=<n>`; a partial line typed under canonical mode goes too, uncounted) —
+  on macOS only: elsewhere nothing is flushed and it says `discarded=-`, never a 0. A live
+  full-screen program loses its modes too — reset a stuck prompt, not a running editor. Edit ▸ Reset Terminal is the same act, from the menu.
 
 THE FULL, ALWAYS-CURRENT VERB CATALOG (generated from the protocol table):",
     );
@@ -4365,11 +4917,11 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING
   them `-` and sends no receipts.
 
 IN THE WINDOW (the FABRIC menu)
-  The menu bar's Fabric menu: Fleet… (opens the Sessions/Connection Map), Inbox… (this
+  The menu bar's Fabric menu: Fleet (opens the Connection Map), Inbox (this
   session's inbox as a tab, METADATA ONLY — sender, kind, trust, never a body), Ledger
   for This Session (⇧⌘L; `aterm drive ledger`), Hold This Session / Lift Hold (This
   Session) (the `hold` verb, LOCAL origin only — a fleet hold greys both rows with its
-  reason), the four connection rows, Fabric Status… (`aterm fabric` in a tab) and Turn
+  reason), the four connection rows, Fabric Status (`aterm fabric` in a tab) and Turn
   Fabric On… / Off… (`aterm fabric on|off`, behind a confirmation, Owner only). File ▸
   Driving holds the four controlled/controller spawn rows; Window ▸ Set Role… writes
   `meta role`; View ▸ Presence Band / Presence Rim switch the band and the rim and are
@@ -4947,6 +5499,12 @@ mod tests {
             "  gates' toolchain ",
             "  targo on PATH    ",
             "  PATH vs gates    ",
+            // What targo compiles with HERE, and the two tools a stock pin is read
+            // as selecting, asked through targo (2026-09-24).
+            "  targo here       ",
+            "  targo fmt        ",
+            "  targo tippy      ",
+            "pins a STOCK channel too",
             "rustc --version",
             "trust version",
             "rustc sysroot",
@@ -4967,6 +5525,11 @@ mod tests {
         }
         // Never prevented: the page may call stock the exception, not forbidden.
         assert!(!page.contains("forbidden"));
+        // And never the 2026-09-23 sentence that sent agents to stock.
+        assert!(
+            !page.contains("wins over this page"),
+            "the incident's sentence is back"
+        );
         // The bare "(wins)" implied the gates' pick is what every Rust command here
         // gets; it is not (see `rust_page`'s doc).
         assert!(!page.contains("(wins)"), "an unlabelled (wins) is back");
@@ -4978,6 +5541,169 @@ mod tests {
                 "`aterm help {alias}` must land on the rust page"
             );
         }
+    }
+
+    /// THE 2026-09-23 INCIDENT'S ROW. A stock pin used to read "The project wins
+    /// over this page; say so in your reply when you build it", and an agent built
+    /// two stock-pinned repos with `cargo +1.97.1` on the strength of it. Now the
+    /// row says what the pin moves (rustup's proxies), what it does not (targo,
+    /// tippy, trustfmt, trustdoc), and names the Trust spellings to build with.
+    #[test]
+    fn a_stock_pin_is_read_as_rustups_and_never_as_the_projects_lane() {
+        let stock = rust_toolchain_row(Some("1.97.1"), None);
+        for needle in [
+            "channel = \"1.97.1\"",
+            "a STOCK pin",
+            "moves only rustup's",
+            "targo, tippy, trustfmt and trustdoc are not rustup proxies",
+            "`targo here` below",
+            "`targo trust <cmd>` / `targo --unverified <cmd>`",
+            "`targo tippy`",
+            "`targo fmt`",
+            "stock only with a reason you state",
+        ] {
+            assert!(stock.contains(needle), "lost {needle:?}: {stock}");
+        }
+        for gone in [
+            "wins",
+            "NON-Trust",
+            "say so in your reply when you build it",
+        ] {
+            assert!(!stock.contains(gone), "{gone:?} is back: {stock}");
+        }
+        let trust = rust_toolchain_row(Some("trust"), None);
+        assert!(trust.contains("this project pins Trust"), "{trust}");
+        assert!(rust_toolchain_row(Some("trust-9192"), None).contains("this project pins Trust"));
+        assert!(rust_toolchain_row(None, None).contains("no channel pinned"));
+        // `RUSTUP_TOOLCHAIN` outranks a stock pin too, and the row says so.
+        assert!(
+            rust_toolchain_row(Some("1.97.1"), Some("stable"))
+                .contains("RUSTUP_TOOLCHAIN=stable overrides it")
+        );
+        // Every continuation line sits under the value column.
+        for row in [stock, trust] {
+            for line in row.lines().skip(1) {
+                assert!(line.starts_with(&" ".repeat(19)), "{line:?}");
+            }
+        }
+    }
+
+    /// `build.rustc` is read the way cargo's config names it: under `[build]`, or
+    /// dotted at the top level; never a wrapper, never another table's key.
+    #[test]
+    fn build_rustc_is_read_from_the_build_table_only() {
+        assert_eq!(
+            build_rustc_in("[build]\nrustc = \"/x/rustc\"\n").as_deref(),
+            Some("/x/rustc")
+        );
+        assert_eq!(
+            build_rustc_in("build.rustc = '/y/rustc' # stock\n").as_deref(),
+            Some("/y/rustc")
+        );
+        assert_eq!(
+            build_rustc_in("[build]\nrustc = \"/a/b#c\" # a comment\n").as_deref(),
+            Some("/a/b#c"),
+            "a # inside the quotes is the value's"
+        );
+        for none in [
+            "[build]\nrustc-wrapper = \"sccache\"\n",
+            "[target.aarch64-apple-darwin]\nrustc = \"/z\"\n",
+            "# [build]\n# rustc = \"/z\"\n",
+            "[build]\nrustflags = [\"-Ztrust-verify=off\"]\n",
+            "[build]\nrustc = \"\"\n",
+            "",
+        ] {
+            assert_eq!(build_rustc_in(none), None, "{none:?}");
+        }
+    }
+
+    /// What can move targo off trustc here, in cargo's precedence: `$RUSTC`, then
+    /// `$CARGO_BUILD_RUSTC`, then the nearest config file's `build.rustc`, then
+    /// `$CARGO_HOME`'s — each file read once however it is reached.
+    #[test]
+    fn what_moves_targo_off_trustc_is_read_in_cargos_order() {
+        let root = path_scratch("movers");
+        let repo = root.join("repo");
+        let deep = repo.join("crates").join("x");
+        let home = root.join("cargo-home");
+        for dir in [&deep, &repo.join(".cargo"), &home] {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        let none = |_: &str| None;
+        assert!(
+            rustc_movers(Some(&deep), &none, Some(&home)).is_empty(),
+            "nothing set, nothing moves it"
+        );
+        std::fs::write(
+            home.join("config.toml"),
+            "[build]\nrustc = \"/home/rustc\"\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join(".cargo").join("config.toml"),
+            "[build]\nrustc = \"/repo/rustc\"\n",
+        )
+        .expect("write");
+        let env = |k: &str| (k == "RUSTC").then(|| "/env/rustc".to_string());
+        let got: Vec<String> = rustc_movers(Some(&deep), &env, Some(&home))
+            .into_iter()
+            .map(|(what, value)| format!("{what}={value}"))
+            .collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0], "$RUSTC=/env/rustc");
+        assert_eq!(
+            got[1],
+            format!(
+                "build.rustc in {}=/repo/rustc",
+                repo.join(".cargo").join("config.toml").display()
+            )
+        );
+        assert_eq!(
+            got[2],
+            format!(
+                "build.rustc in {}=/home/rustc",
+                home.join("config.toml").display()
+            )
+        );
+        // An empty variable is unset.
+        let empty = |k: &str| (k == "RUSTC").then(String::new);
+        assert_eq!(rustc_movers(Some(&deep), &empty, Some(&home)).len(), 2);
+        // $CARGO_HOME reached twice — as an ancestor's `.cargo` and as itself — is
+        // one row, not two.
+        let own = repo.join(".cargo");
+        assert_eq!(rustc_movers(Some(&repo), &none, Some(&own)).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `targo here` row names the trustc beside targo when nothing moves it,
+    /// the mover when one does, and says so when that targo has no trustc.
+    #[test]
+    fn targo_here_names_the_compiler_or_what_moved_it() {
+        let root = path_scratch("targo-here");
+        std::fs::write(root.join("trustc"), "").expect("write");
+        let row = targo_here_row(Some(&root), &[]);
+        assert!(
+            row.starts_with(&format!("{}", root.join("trustc").display())),
+            "{row}"
+        );
+        assert!(row.contains("the trustc beside targo"), "{row}");
+        assert!(
+            row.contains("a rust-toolchain.toml pin does not move it"),
+            "{row}"
+        );
+        let moved = targo_here_row(
+            Some(&root),
+            &[("$RUSTC".to_string(), "/s/rustc".to_string())],
+        );
+        assert!(
+            moved.starts_with("NOT trustc: $RUSTC = /s/rustc"),
+            "{moved}"
+        );
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).expect("mkdir");
+        assert!(targo_here_row(Some(&bare), &[]).contains("holds no `trustc`"));
+        assert!(targo_here_row(None, &[]).starts_with("unknown"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The probe helper is BOUNDED: a command that never exits cannot wedge the
@@ -5000,9 +5726,8 @@ mod tests {
         );
     }
 
-    /// A scratch directory for the PATH-resolution tests, unique per test and
-    /// process, removed by the caller.
-    #[cfg(unix)]
+    /// A portable scratch directory for the toolchain and PATH-resolution tests,
+    /// unique per test and process, removed by the caller.
     fn path_scratch(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("aterm-cli-help-rust-{tag}-{}", std::process::id()));
@@ -6321,6 +7046,11 @@ mod tests {
     fn introspection_page_teaches_the_unread_input_refusal() {
         let (page, code) = render(Some("introspection"), None);
         assert_eq!(code, 0);
+        // The resume is the tab's OWN conversation (robustness backlog item
+        // 2, 2026-09-26): `claude --continue` resumes the directory's newest,
+        // a sibling tab's where two share it, and this page — its generated
+        // catalog included — never names it as a remedy.
+        assert!(!page.contains("claude --continue"), "{page}");
         let (head, catalog) = page
             .split_once("THE FULL, ALWAYS-CURRENT VERB CATALOG")
             .expect("the page ends in the generated catalog");
@@ -6346,8 +7076,11 @@ mod tests {
              `hwkey`, `pointer` and `invoke` as the first token",
             "`signal int`",
             "`signal term`",
-            "`claude --continue`",
+            "`claude --resume <id>`",
+            "never the directory's newest conversation",
             "`signal cont`",
+            // The skill's twin: a peer's remedies are its owner's to send.
+            "On a peer, leave them to its owner unless the human told you to.",
             // A program can live through the restart (third round,
             // 2026-09-25): it stays stalled, and the next remedy is named.
             "can live through `signal term`",
@@ -6375,6 +7108,54 @@ mod tests {
                 "the generated catalog no longer says {needle:?}; the paragraph above it does"
             );
         }
+    }
+
+    /// THE MANUAL RESET (2026-09-26), written where a driver meets a stuck
+    /// terminal. The audit found a live tab (window pid 6874) whose zsh prompt
+    /// had run for 97 000 s under the incident's mouse and kitty modes, armed
+    /// before the automatic handback existed, with no way back short of
+    /// closing the tab. The paragraph owes: the symptom, why the handback
+    /// cannot reach it, the verb and its reply, the timeline row, `flush`,
+    /// what is kept, the live-program caveat and the menu twin; and the verb
+    /// it names is in the generated catalog on this same page.
+    #[test]
+    fn introspection_page_teaches_the_manual_reset() {
+        let (page, code) = render(Some("introspection"), None);
+        assert_eq!(code, 0);
+        let (head, catalog) = page
+            .split_once("THE FULL, ALWAYS-CURRENT VERB CATALOG")
+            .expect("the page ends in the generated catalog");
+        let para = head
+            .split_once("A TERMINAL LEFT STUCK")
+            .expect("the HOW TO USE IT block names the stuck terminal")
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in [
+            "mouse reports typed at the prompt",
+            "needs a program that is GONE",
+            "`aterm ctl @sid reset`",
+            "`OK reset reverted=<csv|-> bytes=<n>`",
+            "`modes-restored reason=manual`",
+            "`reset flush`",
+            "`discarded=<n>`",
+            "`discarded=-`",
+            "the screen and the scrollback are kept",
+            "A live full-screen program loses its modes too",
+            "Edit ▸ Reset Terminal",
+        ] {
+            assert!(
+                para.contains(needle),
+                "the manual-reset paragraph lacks {needle:?}:\n{para}"
+            );
+        }
+        assert!(
+            catalog
+                .lines()
+                .any(|l| l.trim_start().starts_with("reset ")),
+            "the generated catalog has no `reset` row"
+        );
     }
 
     #[test]
@@ -6872,6 +7653,35 @@ mod tests {
         }
         for kept in ["aterm harness ledger", "aterm harness limits"] {
             assert!(page.contains(kept), "`{kept}` is missing:\n{page}");
+        }
+    }
+
+    /// `aterm help harness` states the disk reclaim's idle window and its
+    /// default, ONE day (`aterm_agent::harness::disk::DEFAULT_TARGET_STALE_DAYS`;
+    /// it was 14 until 2026-09-28, a window no agent's build directory ever
+    /// reached) — and what the tick does below the floor since 2026-09-28:
+    /// recent profiles too, least recently used first, until free space is
+    /// back 1 GiB above it (`PRESSURE_MARGIN_GIB`), never one built in the
+    /// last 10 min (`PRESSURE_MIN_IDLE_S`). This crate does not link
+    /// aterm-agent, so the figures are spelled here; the agent crate pins the
+    /// constants itself.
+    #[test]
+    fn the_harness_page_states_the_disk_idle_window() {
+        let (page, code) = render(Some("harness"), None);
+        assert_eq!(code, 0);
+        let flat = page.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("`[disk] target_stale_days`, default 1 day"),
+            "the idle window and its default are missing:\n{page}"
+        );
+        assert!(!flat.contains("14 days"), "{page}");
+        // Below the floor the pass goes past the window, oldest first, and
+        // stops once free space is back (decided 2026-09-28).
+        for said in [
+            "recent profiles' too, least recently used first, free space measured again before each, until it is back 1 GiB above that floor",
+            "never a profile a build holds or one built in the last 10 min",
+        ] {
+            assert!(flat.contains(said), "missing {said:?}:\n{page}");
         }
     }
 }

@@ -378,8 +378,25 @@ pub const ANCHORS: &[Anchor] = &[
         "No, continue without these permissions",
         "2.1.280",
     ),
+    // The usage-limit options dialog (the 2.1.282 binary's
+    // `rate_limit_options_menu`): its title, its "stop" row, and the one row
+    // the supervisor may choose — `Wait here, then continue automatically`
+    // followed by ` shortly`, ` at <time>` or ` when the limit resets`.
+    lit("limit.title", "What do you want to do?", "2.1.282"),
+    lit("limit.stop", "Stop and wait for limit to reset", "2.1.282"),
+    lit(
+        "limit.wait",
+        "Wait here, then continue automatically",
+        "2.1.282",
+    ),
     // The live zone.
     lit("busy.interrupt", "esc to interrupt", "2.1.267"),
+    // The pill-less footer row's left hint slot under the composer (2.1.283
+    // render code: `? for shortcuts` at rest, the escape key's `clear` hint
+    // with a draft) — a live REPL's own row where no mode pill is drawn
+    // (`aterm_agent::harness::footer::live_repl_row`).
+    lit("footer.shortcuts", "? for shortcuts", "2.1.283"),
+    hint("footer.clear", "esc to clear", "2.1.283"),
     // A turn a person stopped with Esc: the vendor's row under the last
     // message or tool row (`  ⎿  Interrupted · What should Claude do
     // instead?`, measured 2026-09-23 on the lane probe's worker).
@@ -398,6 +415,11 @@ pub const ANCHORS: &[Anchor] = &[
     // session with no turn yet (`turn::fresh`).
     lit("launch.banner", "Claude Code v", "2.1.267"),
     lit("goal.active", "/goal active", "2.1.278"),
+    // The model-refusal pause (`refusal_fallback_prompt`, read from the
+    // 2.1.282 render code; both strings in the 2.1.283 binary): its title,
+    // and its second option's head (`Edit prompt and retry with <model>`).
+    lit("paused.title", "Session paused", "2.1.282"),
+    lit("paused.edit", "Edit prompt and retry", "2.1.282"),
     lit(
         "notice.update",
         "Update installed · Restart to update",
@@ -408,6 +430,19 @@ pub const ANCHORS: &[Anchor] = &[
         "saved as your default for new sessions",
         "2.1.267",
     ),
+    // The RESULTS of Claude Code's own model and effort commands, as its
+    // transcript records them under `<local-command-stdout>` — what aterm's
+    // footer names the model and effort by the moment they are chosen
+    // (`aterm_agent::harness::footer`). Read from the 2.1.283 binary
+    // (`UEe`/`BEe`, the `/effort` messages, `mrt`/`grt`); `Set model to ` from
+    // the 2.1.201 transcripts on (its ANSI-bold form, then backticks).
+    lit("model.set", "Set model to ", "2.1.201"),
+    lit("model.kept", "Kept model as ", "2.1.283"),
+    lit("effort.set", "Set effort level to ", "2.1.283"),
+    lit("effort.current", "Current effort level: ", "2.1.283"),
+    lit("effort.auto", "Effort level set to auto", "2.1.283"),
+    lit("fast.on", "Fast mode ON", "2.1.283"),
+    lit("fast.model_set", "model set to ", "2.1.283"),
     // The walls (see `wall::PHRASES` for the whole classification table).
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
@@ -494,6 +529,66 @@ pub const CODEX_ANCHORS: &[Anchor] = &[
     // The walls' reset (`codex::WALLS` is their phrases, canaried beside
     // this table).
     lit("codex.wall.retry_at", "Try again at", "0.156.1"),
+    // The rate-limit model nudge (view `rate-limit-switch-prompt`, the same
+    // strings in the 0.157.1 and 0.158.0 binaries): its title and its two
+    // keeps. Its switch (`Switch to <model>`) is composed at run time and
+    // matched by its label's words in the decider, never anchored here. The
+    // never-show-again keep writes `[notice] hide_rate_limit_model_nudge =
+    // true` into Codex's own config.
+    lit("codex.nudge.title", "Approaching rate limits", "0.157.1"),
+    lit("codex.nudge.keep", "Keep current model", "0.157.1"),
+    lit(
+        "codex.nudge.never",
+        "Keep current model (never show again)",
+        "0.157.1",
+    ),
+    // The `/model` picker (MEASURED 2026-09-28 on 0.158.0, a private
+    // headless aterm): the model box, the effort box (titled with the model
+    // it sets), its `More reasoning…` row (composed: the ellipsis is drawn
+    // after the words) and the advanced box it opens. The effort boxes'
+    // footer offers `s session` beside `enter default`: Enter SAVES the
+    // choice as Codex's default, `s` applies it to this conversation only.
+    // The hint is anchored with the footer's tail (`… · s session · esc
+    // back`, under `enter default` and `enter apply` alike): the two words
+    // alone are a substring of every `this session` in the tree.
+    lit("codex.pick.model", "Select Model and Effort", "0.158.0"),
+    lit("codex.pick.effort", "Select Reasoning Level for", "0.158.0"),
+    lit("codex.pick.advanced", "Advanced Reasoning", "0.158.0"),
+    composed("codex.pick.more", "More reasoning…", "0.158.0"),
+    hint("codex.pick.session", "s session · esc back", "0.158.0"),
+    // The footer's goal states (the 0.157.1 and 0.158.0 binaries; `Pursuing
+    // goal (10d 3h 2m)` MEASURED on a live 0.158.0 tab, read only).
+    lit("codex.goal.pursuing", "Pursuing goal (", "0.157.1"),
+    lit("codex.goal.paused", "Goal paused (/goal resume)", "0.157.1"),
+    lit(
+        "codex.goal.limited",
+        "Goal hit usage limits (/goal resume)",
+        "0.157.1",
+    ),
+    lit(
+        "codex.goal.stalled",
+        "Goal stalled (/goal resume)",
+        "0.157.1",
+    ),
+    // A goal that ENDED (read from the vendor's source at rust-v0.157.1 and
+    // rust-v0.158.0, `tui/src/bottom_pane/footer.rs`
+    // `goal_status_indicator_line`: `Complete` → `Goal achieved (<usage>)` or
+    // `Goal achieved`, `BudgetLimited` → `Goal unmet (<usage>)` or `Goal
+    // abandoned`; every string in both store binaries): the positive reading
+    // of a goal no longer paused nor pursued.
+    lit("codex.goal.achieved", "Goal achieved", "0.157.1"),
+    lit("codex.goal.unmet", "Goal unmet (", "0.157.1"),
+    lit("codex.goal.abandoned", "Goal abandoned", "0.157.1"),
+    // The box `codex resume` draws over a PAUSED goal (the 0.157.1 and
+    // 0.158.0 binaries; openai/codex `tui/src/chatwidget/goal_menu.rs`
+    // `show_resume_paused_goal_prompt`, drawn by `app/startup.rs` for a
+    // `codex resume <thread>` with no prompt whose goal is paused, blocked or
+    // usage-limited): its title, and its two options — the first focused,
+    // which sends the same `thread/goal/set … active` as `/goal resume`, and
+    // the one that leaves it paused.
+    lit("codex.goal.resume.title", "Resume paused goal?", "0.157.1"),
+    lit("codex.goal.resume.yes", "Resume goal", "0.157.1"),
+    lit("codex.goal.resume.leave", "Leave paused", "0.157.1"),
 ];
 
 /// The text of the anchor `id`. Panics on an id the table does not have —

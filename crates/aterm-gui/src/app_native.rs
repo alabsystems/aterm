@@ -1012,6 +1012,20 @@ pub(crate) const BOOT_TRIAL_LAUNCH_LIMIT: u32 = u32::MAX;
 /// observation, and this is about as often as one arrives.
 const STRUCTURAL_TRIAL_REMEASURE: std::time::Duration = std::time::Duration::from_secs(75);
 
+/// How many due looks in a row may find the structural latch's boot trial
+/// unmeasured before the lane stops waiting for a count that is not coming
+/// (round six, finding 55; the model's `UnreadLooks`). Each look asks for an
+/// observation, and a count forgotten by a returned attempt is re-read by the
+/// very next one, so three looks in a row, each over an observation read
+/// since the one before, that found no count (about four minutes at
+/// [`STRUCTURAL_TRIAL_REMEASURE`] on an idle facts worker; longer while it is
+/// busy, since a look with no new observation counts nothing) mean the
+/// installed facts no longer name the latched activation — a channel floor
+/// raised above it drops it from them — and the wait had no bound and no
+/// notice (L5). The answer is the one a count with no room gets: hold, lose
+/// the deadline, and say so; a newer release still supersedes.
+pub(crate) const STRUCTURAL_TRIAL_UNMEASURED_LOOKS: u8 = 3;
+
 /// How long a release whose retire of a latched activation was REFUSED waits
 /// before the lane offers it again, the first time; each refusal in a row
 /// doubles it, up to [`SUPERSEDE_RETRY_CEILING`] (round three review).
@@ -1247,11 +1261,12 @@ impl PhysicalFailureShape {
     ///     none of them cared how busy the machine was;
     ///   * `PreparationFailed` — raised entirely BEFORE the spawn, and since the
     ///     2026-09-22/23 update audit (plan P1-2) its ONLY producer is the staged
-    ///     candidate failing pre-park verification. A bundle that fails
-    ///     `codesign` fails it again in six hours. Everything else that used to
-    ///     share the name — a full disk, an `EMFILE`, a 63rd tab, no private
-    ///     directory — is `ProducerFailed`, and TRANSIENT: this process's
-    ///     afternoon, not the candidate's bytes.
+    ///     candidate failing pre-park verification with a VERDICT. A bundle that
+    ///     fails `codesign` fails it again in six hours; a `codesign` that merely
+    ///     ran out of time is `ProducerFailed` (round four, plan item 2).
+    ///     Everything else that used to share the name — a full disk, an
+    ///     `EMFILE`, a 63rd tab, no private directory — is `ProducerFailed`, and
+    ///     TRANSIENT: this process's afternoon, not the candidate's bytes.
     ///
     /// TRANSIENT is the rest, and deliberately includes the two that are facts
     /// about a moment: `TimedOut` (a 15 s deadline covering a cold boot, a
@@ -1298,10 +1313,19 @@ impl PhysicalFailureShape {
     /// and DECIDE, or did something end a candidate that never got that far?
     ///
     ///   * `Exited` — the candidate reached an `exit` instruction, which a starved
-    ///     process never does. The CODE is not read: this tree's commonest refusal
-    ///     is a clean `0` (`main_entry` returns without a window when the overlap
-    ///     authority is incomplete), so treating a non-zero code as the structural
-    ///     one would classify exactly the wrong half. STRUCTURAL.
+    ///     process never does. STRUCTURAL, with ONE code read: this tree's
+    ///     commonest refusal is a clean `0` (`main_entry` returns without a window
+    ///     when the overlap authority is incomplete), so treating a non-zero code
+    ///     as the structural one would classify exactly the wrong half — but
+    ///     [`crate::seamless::EXIT_SUCCESSOR_PASSING`] (75, `EX_TEMPFAIL`) is the
+    ///     candidate saying, in a status only it can produce, that it refused
+    ///     because its boot swap was deferred for a MOMENT (a held apply lock, a
+    ///     verification past its budget). That is TRANSIENT (round four, plan
+    ///     item 2): the new image never ran, the same bytes are retried on the
+    ///     schedule that converges, and the trial launch is forgiven. Only this
+    ///     build's own image exits 75 (its swap was deferred), so the reading is
+    ///     one build's contract with itself; an older successor never produces
+    ///     it, and every other code keeps the structural verdict.
     ///   * `Signalled` — split by WHO raised it. A fault is the image executing
     ///     itself into a wall, which is the bytes; every other signal arrives from
     ///     outside the image (macOS jetsam SIGKILLs under memory pressure, which is
@@ -1329,6 +1353,11 @@ impl PhysicalFailureShape {
     pub(crate) fn of_child_death(death: crate::ChildDeathEvidence) -> Self {
         match death {
             crate::ChildDeathEvidence::Unobserved => Self::Unexplained,
+            crate::ChildDeathEvidence::Exited { code }
+                if code == crate::seamless::EXIT_SUCCESSOR_PASSING =>
+            {
+                Self::Transient
+            }
             crate::ChildDeathEvidence::Exited { .. } => Self::Structural,
             crate::ChildDeathEvidence::Signalled { signal } => {
                 if signal_is_the_image_faulting(signal) {
@@ -1337,6 +1366,32 @@ impl PhysicalFailureShape {
                     Self::Transient
                 }
             }
+        }
+    }
+
+    /// The shape of a failure booked from the CACHED pre-park verdict — the
+    /// submission-time arm's one typed fact (see `try_pending_native_auto_apply`).
+    ///
+    /// A refusal the verifier reached as a VERDICT on the bytes is STRUCTURAL,
+    /// exactly as the same verdict reached through the worker is
+    /// (`PreparationFailed`). One it did NOT reach — a helper that ran out of its
+    /// budget, the apply lock held past its wait, a helper the kernel would not
+    /// start just then ([`aterm_update::is_passing_refusal`]) — is TRANSIENT
+    /// (round four, plan item 2): booking it structural spent the artifact's two
+    /// attempts on a loaded afternoon and held a healthy build for the day's
+    /// re-sample. No cached refusal at all is the arm's own default, Transient.
+    ///
+    /// Bound to `NativeUpdateApplyLadder`'s `PassingFailure` by the Tier-1
+    /// conformance `real_passing_refusal_keeps_a_deadline_as_the_model_s_passing_failure`
+    /// (this module's tests), the way the ladder's other binds are: by driving
+    /// the real booking, with no `#[refines]` anchor — one anchor would make the
+    /// whole machine "actively bound" and owe the spec-link closure an anchor or
+    /// a waiver for each of its other actions.
+    #[must_use]
+    pub(crate) fn cached_refusal_shape(reason: Option<&str>) -> Self {
+        match reason {
+            Some(reason) if !aterm_update::is_passing_refusal(reason) => Self::Structural,
+            _ => Self::Transient,
         }
     }
 
@@ -1560,6 +1615,45 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
         (AutomaticRetryKind::PhysicalFailure, _) => 1800,
     };
     Some(std::time::Duration::from_secs(seconds))
+}
+
+/// Whether a pre-park verification of `(build, commit, artifact)` must START at
+/// `now`: not when a fresh verdict for that key is cached, and — round seven,
+/// item 36 — not while a read of that key is still in flight within its
+/// ceiling. A second `codesign` beside the first bought nothing but load on a
+/// desk already too loaded for the first to finish in time.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn preverify_read_needed(
+    cached: Option<&crate::HandoffPreverification>,
+    in_flight: Option<&crate::PreverifyInFlight>,
+    build: u64,
+    commit: &str,
+    artifact: &str,
+    now: std::time::Instant,
+) -> bool {
+    let fresh = cached.is_some_and(|entry| {
+        entry.build == build
+            && entry.commit == commit
+            && entry.artifact == artifact
+            && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
+    });
+    let running = in_flight.is_some_and(|read| {
+        read.commit == commit && read.artifact == artifact && read.running_for(build, now)
+    });
+    !fresh && !running
+}
+
+/// Raises its flag when dropped: the pre-park verification's "I have ended",
+/// on every path out of its thread, a panic included.
+#[cfg(unix)]
+struct RaiseOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(unix)]
+impl Drop for RaiseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Parse the durable artifact identity without allocating. Reducer-imported stages
@@ -5723,11 +5817,18 @@ impl App {
                             aterm_messages::Waiter::Person,
                             &post,
                         );
-                        let (said, result, ran_pass) = match ran {
-                            Ok((run, status)) => (run.said.trim().to_string(), status, run.ran()),
-                            Err(error) => (String::new(), Err(error), true),
+                        let (failure, ran_pass) = match &ran {
+                            Ok((run, status)) => (
+                                check_pass_failure(
+                                    run,
+                                    status.as_ref().copied(),
+                                    verb,
+                                    layout.as_ref(),
+                                ),
+                                run.ran(),
+                            ),
+                            Err(error) => (packages_child_failure(Err(error), verb, ""), true),
                         };
-                        let failure = packages_child_failure(result.as_ref().copied(), verb, &said);
                         tell(crate::messages_host::PersonPass::Ended(person_echo(
                             failure.is_some(),
                             ran_pass,
@@ -5964,12 +6065,11 @@ impl App {
             .map(|(_, view)| *view)
             .collect::<std::collections::BTreeSet<_>>();
         for ws in self.windows.values_mut() {
-            let shows_settings = ws.tab_set.tabs().iter().any(|tab| {
-                tab.root
-                    .leaves()
-                    .iter()
-                    .any(|view| setting_views.contains(view))
-            });
+            let shows_settings = ws
+                .tab_set
+                .tabs()
+                .iter()
+                .any(|tab| tab.root.any_leaf(&mut |view| setting_views.contains(view)));
             if shows_settings {
                 ws.last_present = None;
                 if let Some(window) = ws.os_window.as_ref() {
@@ -6052,30 +6152,37 @@ impl App {
     /// (the idle law's hidden-window rule, audit 2026-09-24); revealed, what
     /// it owes is overdue and publishes at once.
     fn settings_messages_quiet_gap(&self) -> Option<std::time::Duration> {
-        self.windows
+        let mut gap: Option<std::time::Duration> = None;
+        for tab in self
+            .windows
             .values()
             .filter(|ws| crate::messages_host::band_on_screen(ws))
             .filter_map(|ws| ws.tab_set.active())
-            .flat_map(|tab| tab.root.leaves())
-            .filter(|view| {
-                matches!(
+        {
+            // This fold runs both before parking and while selecting the next
+            // deadline. Visit the tree directly instead of counting and then
+            // allocating its leaves, including when none is on Messages.
+            tab.root.visit(&mut |view| {
+                if !matches!(
                     self.view_store.get(*view),
                     Some(crate::tab_model::View::Native(_))
-                )
-            })
-            .filter_map(|view| match self.native_runtime.view_state(view) {
-                Some(crate::native_app::AppViewState::Settings(state))
-                    if state.route == crate::native_settings::SettingsRoute::Messages =>
+                ) {
+                    return;
+                }
+                if let Some(crate::native_app::AppViewState::Settings(state)) =
+                    self.native_runtime.view_state(*view)
+                    && state.route == crate::native_settings::SettingsRoute::Messages
                 {
-                    Some(match state.messages_feedback_clock() {
+                    let next = match state.messages_feedback_clock() {
                         Some(false) => MESSAGES_PUBLISH_MIN_GAP,
                         Some(true) => MESSAGES_FEEDBACK_WAIT,
                         None => MESSAGES_PUBLISH_TICK,
-                    })
+                    };
+                    gap = Some(gap.map_or(next, |gap| gap.min(next)));
                 }
-                _ => None,
-            })
-            .min()
+            });
+        }
+        gap
     }
 
     /// Publish the shared packages projection to the Settings controller and
@@ -6516,6 +6623,20 @@ impl App {
     /// release never asks twice.
     ///
     /// Returns true when it released the latch.
+    ///
+    /// Anchored as the model's `Decide` beside the pure decision it wraps:
+    /// the bound on a count that cannot be read (round six, finding 55 — the
+    /// model's `looks` / `UnreadLooks`) is this host's, not
+    /// `structural_latch`'s, so the arm that holds and says it is bound here
+    /// (`a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound`).
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateStructuralLatch",
+            action = "Decide",
+            project = "aterm_gui::native_updater_conformance::project_structural_latch"
+        )
+    )]
     fn look_at_structural_latch(
         &mut self,
         now: std::time::Instant,
@@ -6566,6 +6687,11 @@ impl App {
             newer_download_waiting: waiting,
             trial_room: self.structural_latch_trial_room(latch),
         };
+        if facts.trial_room.is_some() && verdict.unmeasured_looks != 0 {
+            verdict.unmeasured_looks = 0;
+            verdict.unmeasured_through = 0;
+            self.auto_apply_structural_verdict = Some(verdict);
+        }
         match structural_latch(facts) {
             StructuralLatchDecision::Hold => {
                 // A look its own deadline brought — the day's re-sample, now
@@ -6624,11 +6750,51 @@ impl App {
                 // hours on a machine that is offline — and every returned
                 // attempt leaves the count unmeasured on purpose
                 // (`forget_installed_trial_count`).
-                if latch.retry_at.is_some_and(|at| now >= at) {
+                //
+                // BOUNDED (round six, finding 55): a count asked for
+                // `STRUCTURAL_TRIAL_UNMEASURED_LOOKS` times in a row and never
+                // measured is not coming, and the re-sample is held and said
+                // rather than promised every 75 s forever. Each counted look,
+                // and the decision at the bound, reads an observation read
+                // since the last counted look: a look the facts worker had
+                // nothing new for (saturated, or no observation could be asked
+                // for) is no evidence the count is gone, and spends none of
+                // the bound.
+                let due = latch.retry_at.is_some_and(|at| now >= at);
+                let read_since = self.native_installed_trial_read > verdict.unmeasured_through;
+                if due
+                    && read_since
+                    && verdict.unmeasured_looks >= STRUCTURAL_TRIAL_UNMEASURED_LOOKS
+                {
+                    verdict.resample_at = None;
+                    verdict.unmeasured_looks = 0;
+                    verdict.unmeasured_through = 0;
+                    self.auto_apply_structural_verdict = Some(verdict);
+                    self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                        retry_at: None,
+                        ..latch
+                    });
+                    self.say_structural_hold(
+                        latch.build,
+                        &format!(
+                            "automatic apply of build {} holds: the count of its boot trial's \
+                             launches could not be read after {} tries (the installed copy is \
+                             no longer reported, as when its release is withdrawn), and the \
+                             lane will not launch it blind — the Version menu moves it, and a \
+                             newer release takes its place by itself",
+                            latch.build, STRUCTURAL_TRIAL_UNMEASURED_LOOKS
+                        ),
+                    );
+                } else if due {
                     self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                         retry_at: Some(now + STRUCTURAL_TRIAL_REMEASURE),
                         ..latch
                     });
+                    if read_since {
+                        verdict.unmeasured_looks = verdict.unmeasured_looks.saturating_add(1);
+                        verdict.unmeasured_through = self.native_installed_trial_read;
+                        self.auto_apply_structural_verdict = Some(verdict);
+                    }
                     let asked =
                         self.request_native_update_reconcile(NativeUpdateReconcilePurpose::Refresh);
                     aterm_log::info!(
@@ -6702,10 +6868,16 @@ impl App {
              boot trial reverts on, and the lane will not spend that launch — the Version menu \
              moves it, and a newer release takes its place by itself"
         );
+        self.say_structural_hold(build, &reason);
+    }
+
+    /// A structural latch's hold in `reason`'s words, said where
+    /// [`Self::say_structural_hold_for_trial`] says its own.
+    fn say_structural_hold(&mut self, build: u64, reason: &str) {
         aterm_log::warn!("update auto-apply: {reason}");
         aterm_update::record_apply_refusal(
             self.native_updater_service.snapshot().current_build,
-            &reason,
+            reason,
         );
         let failures = self
             .auto_apply_physical_retry
@@ -6718,7 +6890,7 @@ impl App {
             PhysicalFailureShape::Structural,
             failures,
             None,
-            &reason,
+            reason,
         );
         // The staged row's posture is now "a person moves it": restated where it
         // is up, raised as the decision where it is not (ruling 119).
@@ -7050,7 +7222,9 @@ impl App {
     /// parked window, caching the verdict for the next handoff attempt.
     ///
     /// Idempotent and cheap to call: a fresh verdict for the same
-    /// `(build, commit)` short-circuits. A failure is cached too — a doomed
+    /// `(build, commit)` short-circuits, and so does a read of the same key
+    /// still in flight ([`preverify_read_needed`], round seven, item 36). A
+    /// failure is cached too — a doomed
     /// candidate then fails preparation immediately rather than after parking
     /// every reader and spending a third of a second on `codesign`.
     #[cfg(unix)]
@@ -7070,24 +7244,40 @@ impl App {
         let (Some(commit), Some(artifact)) = (commit, artifact) else {
             return;
         };
+        let now = std::time::Instant::now();
         {
             let cached = self
                 .handoff_preverified
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cached.as_ref().is_some_and(|entry| {
-                entry.build == build
-                    && entry.commit == commit
-                    && entry.artifact == artifact
-                    && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
-            }) {
+            if !preverify_read_needed(
+                cached.as_ref(),
+                self.handoff_preverify_in_flight.as_ref(),
+                build,
+                &commit,
+                &artifact,
+                now,
+            ) {
                 return;
             }
         }
         let slot = std::sync::Arc::clone(&self.handoff_preverified);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flight = crate::PreverifyInFlight {
+            build,
+            commit: commit.clone(),
+            artifact: artifact.clone(),
+            deadline: now + crate::HANDOFF_PREVERIFY_READ_CEILING,
+            done: std::sync::Arc::clone(&done),
+        };
         let spawned = std::thread::Builder::new()
             .name("aterm-update-preverify".to_string())
             .spawn(move || {
+                // THE READ SAYS WHEN IT ENDS (round seven, item 36), on every
+                // path — a verdict published, a check that did not finish and
+                // published nothing, a panic — and only after its verdict is in
+                // the slot, so a waiter that sees the flag sees the verdict.
+                let _ends = RaiseOnDrop(done);
                 // NO `qos::set_self` HERE, DELIBERATELY. This is the one worker of
                 // the update lane that keeps the class it inherits. It publishes
                 // into `handoff_preverified`, a mutex the UI thread takes with a
@@ -7117,6 +7307,15 @@ impl App {
                     aterm_log::warn!(
                         "update apply: {which} build {build} failed pre-park verification: {error}"
                     );
+                    // A CHECK THAT DID NOT FINISH IS NOT A VERDICT, and is not
+                    // cached as one (round four, plan item 2): a cached refusal
+                    // short-circuits every automatic attempt for ten minutes and
+                    // is read back as the verifier's word on the bytes. Leaving
+                    // the slot alone makes the next attempt verify again, on the
+                    // handoff worker, where the same moment is filed transient.
+                    if aterm_update::is_passing_refusal(error) {
+                        return;
+                    }
                 }
                 let reason = passed
                     .as_ref()
@@ -7124,13 +7323,14 @@ impl App {
                     .map(|error| format!("{which} failed pre-park verification: {error}"));
                 // THE SUCCESSOR'S HANDOFF POLICY (plan P0-5), which the verifier
                 // read only because the bundle passed; a refusal carries none.
-                let policy = passed.as_ref().ok().and_then(|read| {
+                let policy = passed.as_ref().ok().and_then(|facts| {
                     aterm_update_core::handoff_policy::adopt(
-                        read,
+                        &facts.policy,
                         current_build,
                         &format!("{which} build {build}"),
                     )
                 });
+                let grant_chunks = passed.as_ref().is_ok_and(|facts| facts.grant_chunks);
                 *slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -7142,11 +7342,13 @@ impl App {
                         passed: passed.is_ok(),
                         reason,
                         policy,
+                        grant_chunks,
                     });
             });
-        if spawned.is_err() {
+        match spawned {
+            Ok(_) => self.handoff_preverify_in_flight = Some(flight),
             // No thread: the worker simply verifies in-line as it always did.
-            aterm_log::warn!("update apply: pre-park verification thread unavailable");
+            Err(_) => aterm_log::warn!("update apply: pre-park verification thread unavailable"),
         }
     }
 
@@ -7346,6 +7548,7 @@ impl App {
                         build,
                         armed_at: now,
                         announced: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+                        restored_hold_said: false,
                     });
                 }
                 // Say so at the default log level. The automatic lane's waits and
@@ -7434,8 +7637,11 @@ impl App {
     }
 
     /// The facts about the terminal the ladder reads, sampled at `now`. The
-    /// keystroke gate and the warm-up hold are consulted only on an automatic
-    /// lane; an explicit apply never reads them and parks at once.
+    /// keystroke gate and the two bounded holds — the warm-up and a cold
+    /// restore's agents still being relaunched — are consulted only on an
+    /// automatic lane; an explicit apply never reads them and parks at once
+    /// (the successor then carries the restored agents still owed, plan item
+    /// 7).
     pub(crate) fn automatic_activity_facts(
         &self,
         mode: ApplyMode,
@@ -7447,6 +7653,11 @@ impl App {
             output_quiet: self.automatic_update_output_quiet(now),
             focused: self.any_os_window_focused(),
             consent_warmup: mode.is_automatic() && self.update_apply_warmup_holds(now),
+            harness_restored_pending: mode.is_automatic()
+                && self
+                    .harness
+                    .as_ref()
+                    .is_some_and(|host| host.restored_pending(now)),
         }
     }
 
@@ -7472,6 +7683,28 @@ impl App {
         );
     }
 
+    /// Say, once each way, that the restored agents' hold began or ended while
+    /// the automatic lane waits on this ladder's build
+    /// ([`crate::native_update_auto_intent::restored_hold_line`]): the one hold
+    /// that refuses the `Land` phase too, so without this line the log's last word
+    /// was "it lands at the next poll" and then nothing for minutes.
+    fn announce_restored_hold(&mut self, now: std::time::Instant) {
+        let holding = self
+            .harness
+            .as_ref()
+            .is_some_and(|host| host.restored_pending(now));
+        let Some(ladder) = self.auto_apply_ladder.as_mut() else {
+            return;
+        };
+        if let Some(line) = crate::native_update_auto_intent::restored_hold_line(
+            ladder.build,
+            holding,
+            &mut ladder.restored_hold_said,
+        ) {
+            aterm_log::info!("{line}");
+        }
+    }
+
     /// Attempt a retained automatic apply from an exact event or timer wake.
     /// Every caller honors the same retained deadline and activity gate, so a
     /// duplicate stage wake cannot bypass backoff or spend another attempt.
@@ -7487,6 +7720,7 @@ impl App {
         let deadline_ready = now >= intent.retry_at;
         let phase = self.automatic_apply_phase(now);
         self.announce_apply_phase(phase);
+        self.announce_restored_hold(now);
         // A SAME-IMAGE HANDOFF COUNTS AS WORK. Without this a real stage arriving while the
         // QA seam's handoff is in flight would reach `apply_staged_update_now` and be told
         // "an update handoff is already in flight" — a FAILURE that spends retry budget.
@@ -7928,11 +8162,10 @@ impl App {
                     );
                     return;
                 }
-                let shape = if cached_refusal.is_some() {
-                    PhysicalFailureShape::Structural
-                } else {
-                    PhysicalFailureShape::Transient
-                };
+                // A passing cached refusal is not the verifier's verdict: it
+                // rides the transient schedule (round four, plan item 2), and
+                // `needs_person` above is already false for it.
+                let shape = PhysicalFailureShape::cached_refusal_shape(cached_refusal.as_deref());
                 // ONE HELPER, EVERY LANE (plan P1-1(a)): the budget, the latch,
                 // the schedule's log line, its standing note for `update status`
                 // and — at convergence — the health notice are written by the
@@ -8163,10 +8396,14 @@ impl App {
         // is held as `Deferred` and replayed after it) — one launch low is the
         // launch between room and the revert.
         let trial_stale_before = self.native_installed_trial_stale_before;
+        let trial_readable = trial_stale_before.is_none_or(|stale| observed_at >= stale);
         self.native_installed_trial = installed
             .as_ref()
-            .filter(|_| trial_stale_before.is_none_or(|stale| observed_at >= stale))
+            .filter(|_| trial_readable)
             .map(|installed| (installed.build, installed.trial_launches));
+        if trial_readable {
+            self.native_installed_trial_read = self.last_native_update_reconcile_sequence;
+        }
         if let Some(durable) = durable.as_ref() {
             self.native_verified_download_on_disk =
                 crate::native_updater_service::verified_download_build(build, durable).unwrap_or(0);
@@ -8957,6 +9194,8 @@ impl App {
             newer_spent: 0,
             newer_retry: None,
             newer_refusals: 0,
+            unmeasured_looks: 0,
+            unmeasured_through: 0,
         });
         schedule
     }
@@ -9181,19 +9420,12 @@ impl App {
         );
         let title = aterm_update::health_failing_title("apply");
         let announced = self.note_update_health(title, &body);
-        // The OS notification a health announcement owes, off the UI thread and
-        // in the banner's words, exactly as `Wake::UpdateHealth` delivers it.
-        // Never from a unit test: it would post to the desktop of whoever runs
-        // the suite.
-        #[cfg(all(target_os = "macos", not(test)))]
+        // The OS notification a health announcement owes, through the one door
+        // `Wake::UpdateHealth` shares (it holds `desktop_alerts`, and never
+        // posts from a unit test).
         if announced {
-            let banner = crate::update_words::health_notification_body(&body);
-            std::thread::spawn(move || {
-                crate::notify::deliver(Some(title), &banner, false);
-            });
+            self.post_update_health_banner(title, &body);
         }
-        #[cfg(not(all(target_os = "macos", not(test))))]
-        let _ = announced;
     }
 
     /// Carry the manual-only latch across a retirement of the stage it was minted
@@ -9349,6 +9581,7 @@ impl App {
                 build,
                 armed_at: now,
                 announced: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+                restored_hold_said: false,
             });
         }
         self.auto_apply_intent = Some(crate::AutoApplyIntent {
@@ -9427,6 +9660,7 @@ impl App {
                 build,
                 armed_at: now,
                 announced: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+                restored_hold_said: false,
             });
         }
         let attempts = self
@@ -10135,6 +10369,51 @@ fn check_held_by_person_message(pid: u32) -> String {
     format!(
         "A package command running in a terminal (pid {pid}) is using the package store; \
          check again when it finishes."
+    )
+}
+
+/// The failure sentence for a Settings ▸ Packages Check or install child run the lanes' way
+/// ([`crate::run_pass_child`]), or `None` when it succeeded: [`packages_child_failure`]
+/// over its exit and stderr, except for the one ending that exit code cannot name — a
+/// pass on the CACHED INDEX.
+///
+/// THE GAP (review of 17e7bf846, 2026-09-26): atpkg exits 1 with NOTHING on stderr for a
+/// pass that did not reach the signed index and was not offline, recording the cause only
+/// in `status.toml` (`… (index from cache — GitHub rate limit hit (HTTP 403))`). 17e7bf846
+/// made a pass that QUEUED behind a sibling's such pass stand down the same way (its line
+/// on stdout, stderr silent, exit 1), so the lanes' stale-index rule would read it. But the
+/// Check runs the same argv (`--wait-lock`) and never went through that rule: it mapped
+/// exit 1 with empty stderr to the bare "atpkg update exited with exit status: 1" — where,
+/// the day before, the stand-down line on stderr had at least quoted atpkg's sentence
+/// naming the rate limit. A person who clicked Check at the moment a rate limit hit every
+/// lane at once got a failure with no reason; so did a Check whose OWN pass ran on the
+/// cached index, which never had one. Now both read the record the lanes read
+/// ([`crate::PassRun::recorded_cached_index_cause`], gated on exit 1 here) and say the
+/// cause. It stays a FAILURE: the person asked whether the packages are current, and the
+/// honest answer is that the index could not be asked — `PackagesCommandOutcome` is pinned
+/// to {none, success, failure} (see [`packages_child_failure`]).
+fn check_pass_failure(
+    run: &crate::PassRun,
+    result: Result<std::process::ExitStatus, &std::io::Error>,
+    verb: &[String],
+    layout: Option<&atpkg::store::Layout>,
+) -> Option<String> {
+    if run.code == Some(1)
+        && let Some(cause) = run.recorded_cached_index_cause(layout)
+    {
+        return Some(cached_index_check_message(&cause));
+    }
+    packages_child_failure(result, verb, run.said.trim())
+}
+
+/// The Check's sentence for a pass that ran on the cached index ([`check_pass_failure`]):
+/// the recorded cause, verbatim, and what to do — never a bare exit status. It claims
+/// nothing about what the pass installed (a pass on the verified cache may still land what
+/// that cache names), only that the index itself was not reached.
+fn cached_index_check_message(cause: &str) -> String {
+    format!(
+        "The package index could not be reached ({cause}), so the pass ran on the last \
+         verified copy of it \u{2014} try again later."
     )
 }
 
@@ -10997,6 +11276,122 @@ mod packages_argv_tests {
         );
     }
 
+    /// A SETTINGS CHECK THAT STOOD DOWN BEHIND A SIBLING'S CACHED-INDEX PASS NAMES THE CAUSE
+    /// (review of 17e7bf846, 2026-09-26). 17e7bf846 moved atpkg's stand-down line from
+    /// stderr to stdout for a holder that failed ONLY for its cached index, so the lanes'
+    /// stale-index rule reads it; the Check runs the same `--wait-lock` argv but maps its
+    /// failure through [`packages_child_failure`] over stderr alone, so it fell to the bare
+    /// "atpkg update exited with exit status: 1" — the rate-limit sentence it used to quote
+    /// gone. The child here is built from atpkg's REAL stand-down decision
+    /// (`atpkg::cli::stand_down_exit` over `atpkg::status::stale_index_only_end`) and fed to
+    /// the Check's own mapping ([`check_pass_failure`]), so the two halves are bound. Also:
+    /// the Check's OWN pass on the cached index (never had a reason before). Controls: an
+    /// unmoved record, no store, a holder that also failed a member (stderr quoted), and a
+    /// success are all what they were.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
+        use aterm_update_core::pkg_check::PassOutcome;
+        use std::os::unix::process::ExitStatusExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-gui-check-cached-index-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = atpkg::store::Layout {
+            prefix: dir.join("pkg"),
+        };
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        let cached = "up to date (index build 46) (index from cache \u{2014} GitHub rate limit \
+                      hit (HTTP 403))";
+        let cause = "GitHub rate limit hit (HTTP 403)";
+        // The sibling's pass end as atpkg records it: seq 8, failed, the cache clause, and
+        // whether it failed for its index ALONE.
+        let sibling_ended = |stale_only: bool| {
+            let status = atpkg::status::Status {
+                schema: 1,
+                outcome: cached.to_string(),
+                last_pass: PassOutcome::Failed.word().to_string(),
+                last_pass_at: "2026-09-26T10:00:00Z".to_string(),
+                pass_seq: 8,
+                stale_index_only_pass_seq: if stale_only { 8 } else { 0 },
+                ..atpkg::status::Status::default()
+            };
+            atpkg::status::write(&layout, &status).unwrap();
+            status
+        };
+        let child = |code: i32, said: String, pass_seq_before: Option<u64>, waited: bool| {
+            let run = crate::PassRun {
+                seen: crate::SeedMarkers {
+                    saw_lock_wait: waited,
+                    ..crate::SeedMarkers::default()
+                },
+                code: Some(code),
+                holder_advanced: false,
+                said,
+                pass_seq_before,
+            };
+            (run, std::process::ExitStatus::from_raw(code << 8))
+        };
+        // The Check's child: read seq 7 before the spawn, queued, stood down — its streams
+        // and exit exactly as atpkg's stand-down decides them.
+        let stood_down = |record: &atpkg::status::Status| {
+            let exit = atpkg::cli::stand_down_exit(
+                PassOutcome::Failed,
+                3,
+                &record.outcome,
+                atpkg::status::stale_index_only_end(record),
+            );
+            let said = if exit.on_stderr {
+                format!("{}\n", exit.line)
+            } else {
+                String::new()
+            };
+            child(i32::from(exit.code), said, Some(7), true)
+        };
+        let verb = vec!["update".to_string()];
+        let check = |(run, status): &(crate::PassRun, std::process::ExitStatus),
+                     layout: Option<&_>| {
+            check_pass_failure(run, Ok(*status), &verb, layout)
+        };
+        let bare = Some("atpkg update exited with exit status: 1".to_string());
+
+        // THE GAP: stood down behind a stale-index-only pass — exit 1, stderr silent.
+        let stale = stood_down(&sibling_ended(true));
+        assert!(
+            stale.0.said.is_empty(),
+            "the stand-down said nothing on stderr"
+        );
+        let said = check(&stale, Some(&layout)).expect("the Check still reports a failure");
+        assert!(said.contains(cause), "the recorded cause is named: {said}");
+        assert!(!said.contains("exit status"), "never the bare exit: {said}");
+        assert_eq!(said, cached_index_check_message(cause));
+
+        // The Check's OWN pass on the cached index: the same record, no queue.
+        let own = child(1, String::new(), Some(7), false);
+        assert_eq!(
+            check(&own, Some(&layout)),
+            Some(cached_index_check_message(cause))
+        );
+
+        // CONTROL: the record did not move past the one read before the spawn — not this
+        // child's pass (an edge refusal writes none): the bare exit, as before.
+        let unmoved = child(1, String::new(), Some(8), false);
+        assert_eq!(check(&unmoved, Some(&layout)), bare);
+        // CONTROL: no store to read.
+        assert_eq!(check(&stale, None), bare);
+        // CONTROL: the sibling also failed a member — the stand-down speaks on stderr and
+        // that line is the Check's sentence, as it always was.
+        let failed = stood_down(&sibling_ended(false));
+        let said = check(&failed, Some(&layout)).expect("a failure");
+        assert!(said.contains("the last update failed"), "{said}");
+        assert_eq!(said, failed.0.said.trim());
+        // CONTROL: success is no sentence, whatever the record says.
+        let ok = child(0, String::new(), Some(7), false);
+        assert_eq!(check(&ok, Some(&layout)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_request_reserves_its_own_busy_label() {
         assert_eq!(
@@ -11078,6 +11473,103 @@ mod packages_argv_tests {
 mod tests {
     use super::*;
     use crate::update_words::LiveHealth as _;
+
+    #[test]
+    fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
+        use crate::native_app::AppViewState;
+        use crate::native_settings::{SettingsRoute, SettingsViewState};
+        use crate::tab_model::{SplitAxis, ViewId};
+
+        fn settings(app: &mut App, view: ViewId) -> &mut SettingsViewState {
+            match app.native_runtime.view_state_mut(view).unwrap() {
+                AppViewState::Settings(state) => state,
+                _ => panic!("expected Settings"),
+            }
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let terminal = app.windows[&wid].tab_set.active().unwrap().focus;
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
+        let (instance, first) = app.active_native_view(wid).unwrap();
+        let sibling = app.view_store.insert_native(instance).unwrap();
+        let mut state =
+            SettingsViewState::from_snapshot(&app.native_config_service.snapshot()).unwrap();
+        state.navigate(SettingsRoute::Messages);
+        app.native_runtime
+            .attach_view(sibling, instance, AppViewState::Settings(Box::new(state)))
+            .unwrap();
+        let tab = app
+            .windows
+            .get_mut(&wid)
+            .unwrap()
+            .tab_set
+            .active_mut()
+            .unwrap();
+        assert!(tab.root.split_leaf(first, SplitAxis::Horizontal, terminal));
+        assert!(tab.root.split_leaf(terminal, SplitAxis::Vertical, sibling));
+        let settings_tab = tab.id;
+
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            Some(MESSAGES_PUBLISH_TICK)
+        );
+        settings(&mut app, sibling).show_messages_feedback_for_test("Copied");
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            Some(MESSAGES_PUBLISH_MIN_GAP),
+            "feedback in the last leaf beats the first leaf's minute tick"
+        );
+        app.publish_native_messages_state();
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            Some(MESSAGES_FEEDBACK_WAIT)
+        );
+        settings(&mut app, first).show_messages_feedback_for_test("Copied");
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            Some(MESSAGES_PUBLISH_MIN_GAP)
+        );
+        settings(&mut app, first).navigate(SettingsRoute::Home);
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            Some(MESSAGES_FEEDBACK_WAIT)
+        );
+
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = false;
+        assert_eq!(app.settings_messages_quiet_gap(), None, "hidden window");
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .switch_to_index(0)
+        );
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            None,
+            "background Settings tab"
+        );
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .switch_to(settings_tab)
+        );
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            Some(MESSAGES_FEEDBACK_WAIT)
+        );
+        settings(&mut app, sibling).navigate(SettingsRoute::Home);
+        assert_eq!(
+            app.settings_messages_quiet_gap(),
+            None,
+            "both views off Messages"
+        );
+    }
 
     /// Every byte of `src` that is CODE. Comments, string literals (raw ones
     /// included) and character literals become spaces; newlines survive, so a
@@ -14231,6 +14723,7 @@ mod tests {
                 },
                 passed: false,
                 reason: Some(reason.to_string()),
+                grant_chunks: false,
                 policy: None,
             });
             if case == 5 {
@@ -14348,6 +14841,7 @@ mod tests {
                     passed: true,
                     reason: None,
                     policy: None,
+                    grant_chunks: false,
                 });
                 assert_eq!(app.arm_native_auto_apply(11, &"ab".repeat(32)), case != 7);
                 assert_eq!(
@@ -16579,6 +17073,186 @@ mod tests {
         );
     }
 
+    /// The ledger reason the submission-time arm reads back from a pre-park check
+    /// that ran out of the apply budget, spelled the way the verifier and the
+    /// preverification thread spell it — with the key taken from the one constant.
+    fn passing_pre_park_reason() -> String {
+        format!(
+            "staged update failed pre-park verification: bundle policy: codesign --verify \
+             (team-pinned) ran past this apply's verification budget; treating as a rejection \
+             ({})",
+            aterm_update::PASSING_REFUSAL_KEY
+        )
+    }
+
+    /// A PASSING PRE-PARK REFUSAL IS TRANSIENT (round four of the 2026-09 update
+    /// robustness work, plan item 2). The submission-time arm used to file ANY
+    /// cached refusal STRUCTURAL (`if cached_refusal.is_some()`), so a `codesign`
+    /// that merely ran out of the apply budget spent the artifact's two attempts
+    /// and held a healthy build for the day's re-sample. `cached_refusal_shape`
+    /// did not exist, so this is compile-red on that code, and its first assertion
+    /// is what `is_some()` answered wrongly. A verdict keeps its shape.
+    #[test]
+    fn a_passing_pre_park_refusal_is_transient() {
+        assert_eq!(
+            PhysicalFailureShape::cached_refusal_shape(Some(&passing_pre_park_reason())),
+            PhysicalFailureShape::Transient,
+            "a check that did not finish is a moment, not a verdict on the bytes"
+        );
+        assert_eq!(
+            PhysicalFailureShape::cached_refusal_shape(Some(
+                "staged update failed pre-park verification: bundle policy: codesign --verify \
+                 (team-pinned requirement) failed: code object is not signed at all"
+            )),
+            PhysicalFailureShape::Structural,
+            "the verifier's verdict keeps its structural budget"
+        );
+        assert_eq!(
+            PhysicalFailureShape::cached_refusal_shape(None),
+            PhysicalFailureShape::Transient,
+            "no cached refusal is the arm's own default"
+        );
+    }
+
+    /// A SUCCESSOR THAT EXITS 75 IS TRANSIENT (round four, plan item 2). The
+    /// candidate that refuses its target because its boot swap was deferred for
+    /// a moment says so with [`crate::seamless::EXIT_SUCCESSOR_PASSING`]; every
+    /// other exit keeps the structural verdict. Before this change every
+    /// `Exited` was structural, which the first assertion fails on.
+    #[cfg(unix)]
+    #[test]
+    fn exit_75_is_transient() {
+        assert_eq!(crate::seamless::EXIT_SUCCESSOR_PASSING, 75);
+        assert_eq!(
+            PhysicalFailureShape::of_child_death(crate::ChildDeathEvidence::Exited {
+                code: crate::seamless::EXIT_SUCCESSOR_PASSING
+            }),
+            PhysicalFailureShape::Transient
+        );
+        for code in [0, 1, 71, 74, 76] {
+            assert_eq!(
+                PhysicalFailureShape::of_child_death(crate::ChildDeathEvidence::Exited { code }),
+                PhysicalFailureShape::Structural,
+                "exit {code} keeps the structural verdict"
+            );
+        }
+    }
+
+    /// Project the automatic lane after a physical failure booked for `build`
+    /// onto `NativeUpdateApplyLadder`'s latch variables, over `before` (the
+    /// model state the failure was taken from). `converged` is the structural
+    /// verdict the ladder calls it: a verdict minted for these bytes, or a latch
+    /// with no deadline at all.
+    fn project_passing_failure(
+        before: &aterm_spec::interp::State,
+        app: &App,
+        build: u64,
+        passing: bool,
+    ) -> aterm_spec::interp::State {
+        let latch = app
+            .auto_apply_manual_only
+            .filter(|latch| latch.build == build);
+        let retry_at = latch.and_then(|latch| latch.retry_at);
+        let verdict = app
+            .auto_apply_structural_verdict
+            .is_some_and(|verdict| verdict.build == build);
+        let mut state = before.clone();
+        state.insert("latched", i64::from(latch.is_some()));
+        state.insert(
+            "failures",
+            i64::from(app.auto_apply_physical_retry.is_some()),
+        );
+        state.insert("passing", i64::from(passing));
+        state.insert(
+            "due",
+            i64::from(retry_at.is_some_and(|at| at <= std::time::Instant::now())),
+        );
+        state.insert(
+            "converged",
+            i64::from(verdict || (latch.is_some() && retry_at.is_none())),
+        );
+        state
+    }
+
+    /// TIER-1: the real booking of a passing pre-park refusal IS the ladder
+    /// model's `PassingFailure` (round four, plan item 2).
+    ///
+    /// The submission-time arm's own two steps are driven — the shape read off
+    /// the cached reason (`cached_refusal_shape`) and the shared booking
+    /// (`latch_after_physical_failure`) — twice, the structural lane's whole
+    /// lifetime. Projected onto the model after the first booking, the lane must
+    /// be exactly the model's post-`PassingFailure` state (latched, a deadline
+    /// coming, no verdict), and after the second it must STILL have a deadline:
+    /// the transient lane's second rung, never the structural verdict.
+    ///
+    /// NEGATIVE CONTROL, in real code: the same reason booked the way the arm
+    /// booked it before this change — `Structural` for any cached refusal —
+    /// converges on its second failure, projects onto the mutant
+    /// `PassingFailureConverges`, and `APassingFailureNeverConverges` catches it.
+    #[test]
+    fn real_passing_refusal_keeps_a_deadline_as_the_model_s_passing_failure() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let model = aterm_spec::derive::native_update_apply_ladder_model();
+        let mut keys_only = model.init_state();
+        for _ in 0..2 {
+            keys_only = model.successors("Advance", &keys_only).remove(0);
+        }
+        let reason = passing_pre_park_reason();
+        let passing = aterm_update::is_passing_refusal(&reason);
+        assert!(passing, "PRECONDITION: the reason carries the passing key");
+
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let dmg = [0xab_u8; 32];
+        let shape = PhysicalFailureShape::cached_refusal_shape(Some(&reason));
+        let first = app.latch_after_physical_failure(build, dmg, false, shape, &reason);
+        let projected = project_passing_failure(&keys_only, &app, build, passing);
+        assert_eq!(
+            model.successors("PassingFailure", &keys_only),
+            vec![projected.clone()],
+            "the real booking must be exactly the model's PassingFailure: {first:?}"
+        );
+        for invariant in &model.invariants {
+            assert!(model.check_invariant(invariant.name, &projected));
+        }
+        let second = app.latch_after_physical_failure(build, dmg, false, shape, &reason);
+        assert!(
+            matches!(second, PhysicalFailureSchedule::Retry(_)),
+            "the structural lane's whole lifetime later, a moment still has a deadline: \
+             {second:?}"
+        );
+        assert_eq!(
+            project_passing_failure(&keys_only, &app, build, passing),
+            projected,
+            "a second moment is still the model's PassingFailure latch, never a verdict"
+        );
+
+        // NEGATIVE CONTROL: the pre-round-four booking of the same reason.
+        let mut old = App::headless_for_test();
+        for _ in 0..2 {
+            let _ = old.latch_after_physical_failure(
+                build,
+                dmg,
+                false,
+                PhysicalFailureShape::Structural,
+                &reason,
+            );
+        }
+        let held = project_passing_failure(&keys_only, &old, build, passing);
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        assert_eq!(
+            buggy.successors("PassingFailureConverges", &projected),
+            vec![held.clone()],
+            "the old booking is exactly the mutant: the latch converged on a moment"
+        );
+        assert!(!buggy.check_invariant("APassingFailureNeverConverges", &held));
+        assert_eq!(
+            latch_rung(old.auto_apply_manual_only.and_then(|latch| latch.retry_at)),
+            "resample-24h",
+            "and what it cost was the day's hold"
+        );
+    }
+
     /// The physical-failure budget must survive a latch LAPSE, or "two tries" is
     /// an unbounded ten-minute loop.
     ///
@@ -16650,6 +17324,7 @@ mod tests {
             build: 77,
             armed_at,
             announced: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+            restored_hold_said: false,
         });
 
         // Well past the ladder's rungs: EVERY completion re-arms a live intent
@@ -16716,6 +17391,7 @@ mod tests {
             build,
             armed_at,
             announced: ApplyPhase::KeysOnly,
+            restored_hold_said: false,
         });
         assert_eq!(app.automatic_apply_phase(now), ApplyPhase::KeysOnly);
 
@@ -16763,6 +17439,7 @@ mod tests {
             build,
             armed_at,
             announced: ApplyPhase::KeysOnly,
+            restored_hold_said: false,
         });
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
             retry_at: Some(now - std::time::Duration::from_secs(1)),
@@ -17114,6 +17791,7 @@ mod tests {
                     passed: true,
                     reason: None,
                     policy: None,
+                    grant_chunks: false,
                 });
         }
         let current_build = app.native_updater_service.snapshot().current_build;
@@ -17570,6 +18248,7 @@ mod tests {
             build: intent.build,
             armed_at: now - crate::native_update_auto_intent::LANDS_WITHIN,
             announced: crate::native_update_auto_intent::ApplyPhase::Land,
+            restored_hold_said: false,
         });
     }
 
@@ -18158,6 +18837,7 @@ mod tests {
                 passed: false,
                 reason: None,
                 policy: None,
+                grant_chunks: false,
             });
         assert_eq!(app.cached_handoff_preverification(&download), Some(false));
         assert_eq!(

@@ -478,7 +478,15 @@ pub struct RelayClient<S: Read + Write> {
     io: S,
     /// Bytes read past the last consumed line boundary (the next reply's prefix).
     buf: Vec<u8>,
+    /// The `OK` replies to `help <verb>` this connection has had
+    /// ([`Self::help_counted`]): a verb's help is its server build's, fixed
+    /// for the connection's life. Bounded by [`HELP_MEMO_MAX`].
+    help: Vec<(String, (String, String))>,
 }
+
+/// How many verbs' help one [`RelayClient`] remembers; past it, a verb's help
+/// is asked each time.
+const HELP_MEMO_MAX: usize = 16;
 
 impl<S: Read + Write> RelayClient<S> {
     /// Wrap an already-connected, already-authenticated transport. Callers that need
@@ -489,7 +497,31 @@ impl<S: Read + Write> RelayClient<S> {
         Self {
             io,
             buf: Vec::new(),
+            help: Vec::new(),
         }
+    }
+
+    /// `help <verb>` as [`Self::request_counted`] reads it, asked ONCE per
+    /// connection: a verb's help is what its server build speaks, and a
+    /// connection speaks to one server for its life. Only an `OK` reply is
+    /// kept — an `ERR` or an I/O error is asked again next time. The live
+    /// upgrade's typed turn asks `help turn` whether the server takes its
+    /// `if-gen=` fence (design record 2026-09-28, §3.2 C7a): asked afresh
+    /// between the screen read and the fenced `turn`, it was one more round
+    /// trip inside the window the fence refuses on, and a screen that
+    /// repainted in it typed nothing.
+    ///
+    /// # Errors
+    /// As [`Self::request_counted`].
+    pub fn help_counted(&mut self, verb: &str) -> std::io::Result<(String, String)> {
+        if let Some((_, reply)) = self.help.iter().find(|(v, _)| v == verb) {
+            return Ok(reply.clone());
+        }
+        let reply = self.request_counted(&format!("help {verb}"))?;
+        if reply.0.starts_with("OK") && self.help.len() < HELP_MEMO_MAX {
+            self.help.push((verb.to_string(), reply.clone()));
+        }
+        Ok(reply)
     }
 
     /// Read one `\n`-terminated line, returned without its trailing `\r?\n`.
@@ -856,8 +888,9 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
     to the window (a chime, a rim pulse). Only what the
     table limited, and what nothing can answer (a lost login's browser
     step, a box no reader can parse), goes to the session's attention
-    (owner=supervisor): one menu-bar row, one notification. The commands
-    below are for a manager of its own: a
+    (owner=supervisor): one menu-bar row (and one desktop notification
+    with desktop_alerts = true; default off). The commands below are for a
+    manager of its own: a
     `watch` started on a session the host holds watches only (WATCHING …),
     and one started first holds the session until it ends.
     classify [--allow-python GLOB]... <cmd...>
@@ -1016,15 +1049,22 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        Bash under any header whatever vendor note it carries,
                        Edit/Write/Read, a workflow, Fetch, a network request,
                        Chrome, a skill, Monitor, an MCP tool's box, a model's
-                       or extra usage's consent (`Continue with …`; credits the
-                       account turned off are never turned back on) — the
-                       folder-trust dialog its trust option for any folder,
-                       plan mode's approval its yes that grants no standing
-                       mode (`Yes, manually approve edits`), the model-refusal
-                       pause its `Switch to <model>` (while model_fallback is
-                       set), a box taller than the pane by its options, a held
-                       message its delivery, and a setup dialog, a proposed
-                       goal or a Computer Use grant its refusal. An option
+                       or extra usage's consent on Claude Code (`Continue with
+                       …`; credits the account turned off are never turned
+                       back on) — the folder-trust dialog its trust option for
+                       any folder, plan mode's approval its yes that grants no
+                       standing mode (`Yes, manually approve edits`), Claude
+                       Code's model-refusal pause (exactly its switch and its
+                       retry) its switch while model_fallback is set (no
+                       other box's model switch is ever pressed), Codex's
+                       rate-limit nudge its switch only when Codex's own
+                       usage reading is at 90% or more — and only to save the
+                       work, the session then put back on its own model and
+                       held until the window resets (`rate_nudge`) — else it
+                       keeps the model (never its never-show-again), a box
+                       taller than the pane by its options, a held message
+                       its delivery, and a setup dialog, a proposed goal or a
+                       Computer Use grant its refusal. An option
                        whose label OPENS with buy, add funds, upgrade or a
                        spend limit raised is never chosen: a box whose every
                        yes buys gets the option that waits, a box with no yes
@@ -1054,16 +1094,31 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        press back-off below, never before the screen held
                        still. Codex's question gets its recommended answer,
                        else its first, by its digit.
+                       Claude Code's usage-limit dialog (`What do you want to
+                       do?`) is no permission either: at every --approve level
+                       (not under [harness] limit_wait = false) it gets its
+                       `Wait here, then continue automatically …` row, chosen
+                       by its label with fenced arrows and a confirmed Enter
+                       (`limit-wait@v1`) — never stop, usage credits, an
+                       upgrade or a reset claim; with no wait row it is yours.
                        Under \"safe\" (--approve safe) only a box proven safe: a
                        Bash box whose command classifies read-only both with
                        its rows joined by newlines and by spaces, with no
                        vendor note row and outside a bypass-permissions
                        session; the rm circuit breaker (`Dangerous rm operation on possibly-empty
                        variable path`) in a bypass session,
-                       when every rm operand resolves literally under a scratch
-                       root (/private/tmp/claude-<uid>/, $TMPDIR, /tmp/<x>/,
-                       <cwd>/target*) — the session's cwd is read from its
-                       `meta`, and unknown it is yours; a Read box whose one
+                       when every rm operand resolves under a scratch root
+                       (/private/tmp/claude-<uid>/, the supervisor's $TMPDIR,
+                       /tmp/<x>/, <cwd>/target*) as written AND where its
+                       symbolic links lead, built on no variable the line
+                       does not assign (the environment's, $TMPDIR among
+                       them, are never proven) and on no $(mktemp -d) that
+                       can reach it empty — or is a directory the line's own
+                       mktemp -d made: \"$D\" or a path under it, every $D
+                       double-quoted, behind a guard (&&, || exit, ${D:?}) —
+                       the session's cwd is read from its `meta`, and unknown
+                       it is yours (with the retired rm_breaker = false, no
+                       rm is proven at all); a Read box whose one
                        absolute path is outside the secrets list (.ssh, .aws,
                        Keychains, *.pem, .env, *.token, …); and the folder-
                        trust dialog when its folder is exactly the session's cwd
@@ -1313,8 +1368,12 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        back at the reset — and one that asks consent to go on
                        on usage credits is continued first
                        (`consent-accept@v1`; the confirm is a box answered
-                       with its yes); a full context `/compact`, then a
-                       continuation; a
+                       with its yes); a Codex goal a usage limit stopped is
+                       resumed with `/goal resume` at the reset; a Codex whose
+                       goal runs on by itself gets no continuation, and one
+                       whose thread fell into a sandbox its launch bypassed
+                       gets nothing and one message naming the fix; a full
+                       context `/compact`, then a continuation; a
                        lost login `/login` and the one escalation nothing can
                        answer (finish sign-in in the browser). A continuation
                        whose `❯` row the worker never takes (no spinner in 30
@@ -1625,23 +1684,24 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        a request in flight may get no answer (`server closed the
                        connection without responding`; a socket refused, gone,
                        reset or timed out) or be turned away unread (`ERR control
-                       server busy; retry`, `ERR auth`). That OUTAGE is ridden
-                       out, not the end: one line `RECONNECT <reason>` (cut at
-                       160 characters), then a screen read of the same @sid,
-                       retried 0.5 s apart doubling to 8 s, until one answers —
-                       `RECONNECTED after <ms> ms` — and the loop looks again
-                       from a fresh read. S (default 180; 0 = off, the failure
-                       ends the loop) bounds the whole outage, from its first
-                       unserved request until the loop gets past it (that kind
-                       of request served again, the screen seen to move, or a
-                       whole look done): a request dropped again after the
-                       RECONNECTED is the same outage — nothing more is printed,
-                       the retries keep backing off, the window keeps running.
-                       While an outage lasts, `ERR no such session` is not yet
-                       an answer (the new instance may not host the @sid yet);
-                       outside one it ends the loop at once, and `ERR exited`
-                       always does. After the outage no seq from before is
-                       waited on (the content seq starts over on the new
+                       server busy; retry`, `ERR auth`, `ERR main thread stalled
+                       …; retry`, also after a verb's own `ERR <what>: `). That
+                       OUTAGE is ridden out, not the end: one line `RECONNECT
+                       <reason>` (cut at 160 characters), then a screen read of
+                       the same @sid, retried 0.5 s apart doubling to 8 s, until
+                       one answers — `RECONNECTED after <ms> ms` — and the loop
+                       looks again from a fresh read. S (default 180; 0 = off,
+                       the failure ends the loop) bounds the whole outage, from
+                       its first unserved request until the loop gets past it
+                       (that kind of request served again, the screen seen to
+                       move, or a whole look done): a request dropped again after
+                       the RECONNECTED is the same outage — nothing more is
+                       printed, the retries keep backing off, the window keeps
+                       running. While an outage lasts, `ERR no such session` is
+                       not yet an answer (the new instance may not host the @sid
+                       yet); outside one it ends the loop at once, and `ERR
+                       exited` always does. After the outage no seq from before
+                       is waited on (the content seq starts over on the new
                        instance), the point reported before it is reported once
                        more if it is still showing, and a press whose answer
                        never came is not repeated blind or counted as an
@@ -1742,9 +1802,9 @@ OPTIONS
     --ready REGEX   The prompt-ready row pattern for the BEST-EFFORT settle confirm
                     after idle. Default matches a Claude input caret, which is only
                     right when the driven program IS Claude — point it at your own
-                    REPL's prompt otherwise, or pass '' for idle-only. Also settable
-                    as $ATERM_DRIVE_READY (the flag wins). A non-matching pattern
-                    costs a bounded extra wait, never a failed turn.
+                    REPL's prompt otherwise, or pass '' for idle-only. A
+                    non-matching pattern costs a bounded extra wait, never a
+                    failed turn.
 
 WHICH `await` TO USE
     * A TUI with an animated spinner → `prompt` (idle works: the spinner keeps the
@@ -1792,6 +1852,100 @@ GOTCHA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THIS CRATE'S SOURCE↔SPEC CLOSURE (AGENTS.md, "Formal models are
+    /// DERIVED", step 3): every `#[refines]` and `#[spec_unmodeled]` this
+    /// crate carries names a registered machine and one of its actions, and
+    /// each machine it binds — the live upgrade's ladder and its goal pause,
+    /// the Claude Code footer's reader, the Codex rate-limit nudge — is
+    /// ACTIVE and fully
+    /// bound-or-waived, as aterm-gui's `spec_xref_closure` gate demands of
+    /// every machine it collects (it links this crate with `spec-anchors`).
+    /// Proved here too, so a waiver dropped or an action added to one of
+    /// these models is caught by this crate's own tests.
+    ///
+    /// SCOPED TO THIS CRATE (the merge gate's run of 2026-09-28): the
+    /// anchors are collected from every crate LINKED into the test binary,
+    /// and a build that tests this crate beside aterm-gui (`targo test
+    /// --workspace`) unifies features, so aterm-core's and aterm-gui's own
+    /// anchors land here too — naming machines (`alt_screen`,
+    /// `PressCustody`, …) that are aterm-gui's gate's to resolve, not this
+    /// one's. So only the anchors written in this crate (`AGENT_SOURCE`)
+    /// and the machines it binds (`AGENT_MACHINES`) are judged: each of
+    /// those anchors names one of those machines and one of its actions, and
+    /// each of those machines is active and fully bound-or-waived, whatever
+    /// else the binary links. (The unscoped judgement failed the merge
+    /// gate's `--workspace` run on aterm-core's and aterm-gui's anchors,
+    /// while `-p aterm-agent` alone passed.)
+    #[test]
+    fn the_crates_anchors_close_over_the_machines_they_bind() {
+        use aterm_spec::xref::{self, SpecModule};
+        /// Where this crate's own anchors are written (`file!()` of each).
+        const AGENT_SOURCE: &str = "crates/aterm-agent/";
+        /// The machines this crate's anchors bind.
+        const AGENT_MACHINES: [&str; 4] = [
+            "ClaudeFooterModel",
+            "HarnessUpgradeGoalPause",
+            "HarnessUpgradeLadder",
+            "SupervisorCodexRateNudge",
+        ];
+        let modules: Vec<SpecModule> = xref::model_registry()
+            .into_iter()
+            .map(SpecModule::Embedded)
+            .collect();
+        let report = xref::check_closure(&modules);
+        // An anchor's own violations (obligations 1 and 4) name its site;
+        // a machine's coverage (obligation 3) names the machine.
+        let ours: Vec<String> = report
+            .violations
+            .iter()
+            .filter(|v| {
+                if v.obligation == 3 {
+                    AGENT_MACHINES
+                        .iter()
+                        .any(|m| v.message.contains(&format!("machine `{m}`")))
+                } else {
+                    v.message.contains(AGENT_SOURCE)
+                }
+            })
+            .map(|v| format!("[obligation {}] {}", v.obligation, v.message))
+            .collect();
+        assert!(ours.is_empty(), "{}", ours.join("\n"));
+        // Every anchor this crate carries binds one of its own machines.
+        let sites: Vec<(&str, &str)> = xref::refinements()
+            .map(|r| (r.location, r.machine))
+            .chain(xref::waivers().map(|w| (w.location, w.machine)))
+            .filter(|(at, _)| at.starts_with(AGENT_SOURCE))
+            .collect();
+        assert!(!sites.is_empty(), "this crate's anchors are linked");
+        for (at, machine) in &sites {
+            assert!(
+                AGENT_MACHINES.contains(machine),
+                "{at} binds `{machine}`, none of this crate's machines"
+            );
+        }
+        let active: Vec<&str> = report
+            .coverage
+            .iter()
+            .filter(|c| c.active && AGENT_MACHINES.contains(&c.machine.as_str()))
+            .map(|c| c.machine.as_str())
+            .collect();
+        let mut sorted = active.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, AGENT_MACHINES, "{active:?}");
+        for c in report
+            .coverage
+            .iter()
+            .filter(|c| AGENT_MACHINES.contains(&c.machine.as_str()))
+        {
+            assert!(
+                c.uncovered.is_empty() && c.ratio() >= 1.0,
+                "{} uncovered: {:?}",
+                c.machine,
+                c.uncovered
+            );
+        }
+    }
 
     /// A mock transport recording the driven verbs and returning a canned screen.
     struct MockClient {

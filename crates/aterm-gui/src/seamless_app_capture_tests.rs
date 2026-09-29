@@ -1315,3 +1315,533 @@ fn a_successor_policy_of_repaint_carries_every_session_blank_and_every_one_adopt
     ptys.release(app);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// One park of `app` written out as the worker writes it — the held panes'
+/// screens included — and read back by a successor of `shape`: what it made
+/// of the handoff, and the proof the parent waits for.
+fn hand_over_held(
+    app: &mut crate::App,
+    shape: ReceiverShape,
+    at: &str,
+) -> (
+    crate::app_update_handoff::ParkedDeskForTest,
+    IncomingHandoff,
+    String,
+    AdoptionProof,
+) {
+    let build = crate::running_build_number();
+    let parked = app
+        .park_desk_for_test(None)
+        .unwrap_or_else(|failure| panic!("{at}: the park refused: {failure}"));
+    let layout_digest = parked.layout_digest.expect("the layout commits");
+    let adoption: Vec<(u64, i32, i32)> = parked
+        .live
+        .iter()
+        .map(|(local_id, master, _)| {
+            // SAFETY: duplicates a live, test-owned PTY master as a fresh
+            // close-on-exec descriptor numbered 3 or above.
+            let duplicate = unsafe { libc::fcntl(*master, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(duplicate >= 3, "{at}: F_DUPFD_CLOEXEC");
+            (
+                *local_id,
+                duplicate,
+                40_000 + i32::try_from(*local_id).expect("a small id"),
+            )
+        })
+        .collect();
+    let fds = HandoffFds {
+        entries: adoption.clone(),
+    };
+    let nonce = mint_outgoing_nonce();
+    let outgoing = write_outgoing_with_held(
+        &parked.manifest,
+        &fds,
+        &parked.screens,
+        &parked.repaint,
+        parked.window.clone(),
+        &[],
+        &parked.held,
+        &nonce,
+    )
+    .unwrap_or_else(|failure| panic!("{at}: the manifest writer refused the park: {failure}"));
+    assert_eq!(
+        outgoing.screen_digest, parked.screen_digest,
+        "{at}: the held panes are outside the committed screen digest"
+    );
+    let layout_path = std::path::Path::new(&outgoing.manifest_path).with_extension("layout.toml");
+    crate::restore::write_once_to(&layout_path, &parked.layout).expect("the layout sidecar");
+    let expected = adoption_proof(
+        &nonce,
+        build,
+        crate::build_info::GIT_COMMIT,
+        &layout_digest,
+        &parked.screen_digest,
+        &adoption,
+    )
+    .expect("the parent's expectation");
+    let (_ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, _commit_write) = pipe_pair("commit");
+    // SAFETY: `getppid` is a side-effect-free libc getter.
+    let parent_pid = unsafe { libc::getppid() };
+    aterm_log::env::set(ENV_MANIFEST, &outgoing.manifest_path);
+    aterm_log::env::set(ENV_NONCE, &outgoing.nonce);
+    aterm_log::env::set(ENV_FDS, &outgoing.fds_wire);
+    aterm_log::env::set(ENV_LAYOUT, &layout_path);
+    aterm_log::env::set(ENV_READY_FD, ready_write.to_string());
+    aterm_log::env::set(ENV_COMMIT_FD, commit_read.to_string());
+    aterm_log::env::set(ENV_PARENT_PID, parent_pid.to_string());
+    match read_process_birth(parent_pid) {
+        Some(birth) => aterm_log::env::set(ENV_PARENT_BIRTH, birth.to_wire()),
+        None => aterm_log::env::unset(ENV_PARENT_BIRTH),
+    }
+    aterm_log::env::set(
+        ENV_TARGET,
+        encode_target_identity(build, crate::build_info::GIT_COMMIT),
+    );
+    let incoming = take_incoming_as(shape);
+    (parked, incoming, nonce, expected)
+}
+
+/// Every visible row of `terminal`, one line each.
+fn screen_text(terminal: &aterm_core::terminal::Terminal) -> String {
+    (0..usize::from(terminal.rows()))
+        .filter_map(|row| terminal.row_text(row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every file of attempt `nonce` still in the control dir with `suffix`.
+fn attempt_files(nonce: &str, suffix: &str) -> Vec<std::path::PathBuf> {
+    let dir = crate::control_auth::socket_dir().expect("the scratch control dir");
+    std::fs::read_dir(&dir)
+        .expect("the control dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.to_string_lossy();
+            name.contains(nonce) && name.ends_with(suffix)
+        })
+        .collect()
+}
+
+/// ROUND FIVE, ITEM 19: a pane kept open by `--hold` after its command exited
+/// keeps its final screen across an update while another session is live.
+///
+/// Before, it was not a handed session (it has no process to carry), so its
+/// screen stayed behind with the old process and the successor showed a
+/// "not carried" placeholder in its place. Now the park carries its visible
+/// screen as the manifest's side list, and the successor shows it read-only
+/// in that pane: the same text, no link to click, no process, `Exited`.
+/// Typing into it goes nowhere; closing it closes it.
+///
+/// THE OLDER SUCCESSOR, played by the receiver built before the carries
+/// (`ReceiverShape::PreCarry`), reads the same kind of manifest, skips the side
+/// list, adopts every live session exactly and proves: the held screens move
+/// no digest. Their sidecars are then retired with the control carry's.
+///
+/// AND AS THE PANE IT WAS (round six of the update audit, findings 46, 49 and
+/// 35): drawn in the successor's configured theme, not the engine's built-in
+/// colours; exited in the status observer, with the exit status its command
+/// ended with (2), not re-read from its screen as an idle prompt; and wearing
+/// the `meta set` identity and spawn identity the person gave it. RED before
+/// the fix on each: the engine's default background, a phase that was not
+/// `Exited`, and no user title.
+#[test]
+fn a_held_exited_pane_keeps_its_screen() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let scratch = enter_scratch("held-pane");
+    let mut app = crate::App::headless_for_test();
+    app.hold = true;
+    let wid = WindowId(0);
+    let held_id = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(held_id));
+    let mut ptys = DeskPtys::default();
+    ptys.attach_rest(&mut app);
+    {
+        let held = app.pool.get(held_id).expect("the held pane").term.clone();
+        let mut t = crate::term_lock(&held);
+        t.process(b"\x1b]0;make\x07$ make\r\n");
+        t.process(b"see \x1b]8;;https://example.com/log\x07the log\x1b]8;;\x07\r\n");
+        t.process(b"build finished\r\n");
+        assert!(
+            t.checkpoint_carry_abandoning_partial(0)
+                .0
+                .grid
+                .windows(b"example.com".len())
+                .any(|w| w == b"example.com"),
+            "PRECONDITION: the held screen holds a link"
+        );
+    }
+    {
+        let live = app.pool.get(0).expect("session 0").term.clone();
+        crate::term_lock(&live).process(b"$ still running\r\n");
+    }
+    // What the reader's EOF does under `--hold`: the pane stays, exited.
+    app.store
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_state(held_id, crate::session_store::SessionState::Exited);
+    // Its command ended with status 2, collected at the exit; the person had
+    // named it, and it was spawned under an identity.
+    {
+        let pooled = &mut app
+            .pool
+            .sessions
+            .get_mut(&held_id)
+            .expect("the held pane")
+            .session;
+        // As `Session::reap_child` keeps it: the status, and the reap latched.
+        let _ = pooled.child_exit.set(aterm_pty::ChildExit::Code(2));
+        pooled
+            .child_reaped
+            .store(true, std::sync::atomic::Ordering::Release);
+        pooled.identity = Some("worker".to_string());
+        let mut meta = pooled
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _ = meta.set("title", Some("build log".to_string()));
+        let _ = meta.set("icon", Some("hammer".to_string()));
+        let _ = meta.set("role", Some("ci".to_string()));
+    }
+
+    // THE OLDER SUCCESSOR first: it skips the side list and adopts exactly.
+    let at = "an older successor";
+    let (parked, old, nonce, expected) = hand_over_held(&mut app, ReceiverShape::PreCarry, at);
+    assert_eq!(
+        parked.live.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+        vec![0],
+        "{at}: only the live session is handed"
+    );
+    assert_eq!(
+        parked
+            .held
+            .iter()
+            .map(|pane| pane.local_id)
+            .collect::<Vec<_>>(),
+        vec![held_id],
+        "{at}: the park captured the held pane's screen"
+    );
+    assert!(
+        old.held.is_empty(),
+        "{at}: an older reader has no held panes"
+    );
+    assert_eq!(
+        old.adopted.iter().map(|a| a.local_id).collect::<Vec<_>>(),
+        vec![0],
+        "{at}: every live session adopts"
+    );
+    let ((proof, ready, _), adopted) = child_proof_from(old).expect("the older successor proves");
+    assert_eq!(proof, expected, "{at}: the held screens moved no digest");
+    drop((ready, adopted));
+    assert_eq!(
+        attempt_files(&nonce, HELD_GRID_SUFFIX).len(),
+        1,
+        "{at}: an older reader leaves the held sidecar unread"
+    );
+    retire_outgoing_controls(&nonce);
+    assert!(
+        attempt_files(&nonce, HELD_GRID_SUFFIX).is_empty(),
+        "{at}: and the parent retires it once the proof checks out"
+    );
+
+    // THIS BUILD'S SUCCESSOR.
+    let at = "this build's successor";
+    let (_parked, mut incoming, nonce, expected) =
+        hand_over_held(&mut app, ReceiverShape::Current, at);
+    assert!(
+        attempt_files(&nonce, HELD_GRID_SUFFIX).is_empty(),
+        "{at}: the successor took the held sidecar"
+    );
+    assert_eq!(
+        incoming
+            .adopted
+            .iter()
+            .map(|a| a.local_id)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "{at}: the live session adopts"
+    );
+    let held = std::mem::take(&mut incoming.held);
+    assert_eq!(
+        held.iter().map(|pane| pane.local_id).collect::<Vec<_>>(),
+        vec![held_id],
+        "{at}: the held pane's screen crossed"
+    );
+    let layout = incoming.layout.clone().expect("the layout is placed");
+    let ((proof, ready, _), adopted) = child_proof_from(incoming).expect("the successor proves");
+    assert_eq!(
+        proof, expected,
+        "{at}: the held screen is outside the proof"
+    );
+    drop((ready, adopted));
+    let carried = &held[0].checkpoint;
+    assert!(
+        carried.current_working_directory.is_none() && carried.shell_integration_nonce.is_none(),
+        "{at}: nothing that acts rides a held screen"
+    );
+    assert!(
+        !carried
+            .grid
+            .windows(b"example.com".len())
+            .any(|w| w == b"example.com"),
+        "{at}: the link was dropped"
+    );
+
+    // The successor's restore: session 0 adopts shell 0; the held pane's
+    // placeholder shows its screen. Its theme is not the engine's default.
+    let themed_bg = aterm_types::Rgb { r: 1, g: 2, b: 3 };
+    let themed_fg = aterm_types::Rgb {
+        r: 250,
+        g: 240,
+        b: 230,
+    };
+    let mut new = crate::App::headless_for_test();
+    new.session_factory.terminal_config = Some(aterm_core::config::TerminalConfig {
+        default_background: themed_bg,
+        default_foreground: themed_fg,
+        ..aterm_core::config::TerminalConfig::default()
+    });
+    new.handoff_successor = true;
+    new.pool
+        .sessions
+        .get_mut(&0)
+        .expect("session 0")
+        .session
+        .handoff_local_id = Some(0);
+    new.seamless_held = held;
+    new.restore_into_window(wid, layout.windows[0].clone());
+    assert!(
+        new.seamless_held.is_empty(),
+        "{at}: the placeholder took it"
+    );
+    let shown: Vec<u64> = new.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .flat_map(|tab| tab.root.leaves())
+        .filter_map(|view| {
+            new.view_store
+                .get(view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+        })
+        .collect();
+    assert_eq!(
+        shown.len(),
+        2,
+        "{at}: two terminal panes, no placeholder: {shown:?}"
+    );
+    let restored = *shown
+        .iter()
+        .find(|id| **id != 0)
+        .expect("the held pane's terminal");
+    // 49: exited, with its status, and a sweep does not re-read it as idle.
+    new.observe_session_statuses(std::time::Instant::now() + std::time::Duration::from_secs(2));
+    assert_eq!(
+        new.session_status
+            .status(restored)
+            .map(|status| (status.phase, status.last_outcome)),
+        Some((
+            crate::session_status::Phase::Exited,
+            crate::session_status::Outcome::Failure { exit_code: 2 }
+        )),
+        "{at}: THE STATUS SAYS EXITED, WITH THE STATUS IT ENDED WITH"
+    );
+    let session = new.pool.get(restored).expect("pooled");
+    let text = screen_text(&crate::term_lock(&session.term));
+    assert!(
+        text.contains("build finished") && text.contains("the log"),
+        "{at}: THE FINAL SCREEN IS SHOWN, not the placeholder: {text:?}"
+    );
+    assert_eq!(crate::term_lock(&session.term).title(), "make");
+    assert_eq!(
+        (session.master, session.pid),
+        (-1, -1),
+        "{at}: no PTY, no process"
+    );
+    // 46: the configured theme.
+    {
+        let t = crate::term_lock(&session.term);
+        assert_eq!(
+            (t.default_background(), t.default_foreground()),
+            (themed_bg, themed_fg),
+            "{at}: THE HELD PANE IS DRAWN IN THIS BUILD'S THEME"
+        );
+    }
+    // 35: its user identity.
+    {
+        let meta = session
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            (
+                meta.user_title.as_deref(),
+                meta.icon.as_deref(),
+                meta.role.as_deref()
+            ),
+            (Some("build log"), Some("hammer"), Some("ci")),
+            "{at}: THE NAME THE PERSON GAVE IT CROSSED"
+        );
+    }
+    assert_eq!(
+        session.identity.as_deref(),
+        Some("worker"),
+        "{at}: and its spawn identity"
+    );
+
+    assert_eq!(
+        new.store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_local(restored)
+            .map(|handle| handle.state),
+        Some(crate::session_store::SessionState::Exited),
+        "{at}: the pane is exited, as it was"
+    );
+    assert!(
+        !new.handoff_live_sessions()
+            .iter()
+            .any(|(id, _, _)| *id == restored),
+        "{at}: and the next update does not hand it"
+    );
+    // Typing into it goes nowhere, harmlessly.
+    assert!(
+        session.ctx.sink.write_frame(b"ls\r").is_err(),
+        "{at}: a keystroke reaches no descriptor"
+    );
+    assert!(
+        screen_text(&crate::term_lock(&session.term)).contains("build finished"),
+        "{at}: and changes nothing on it"
+    );
+    // Closing it closes it.
+    assert!(new.close_session_by_id(restored).is_ok(), "{at}: it closes");
+    assert!(new.pool.get(restored).is_none(), "{at}: and is gone");
+
+    ptys.release(app);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// The CONTROL for [`a_held_exited_pane_keeps_its_screen`]: the same held
+/// pane with NO screen carried — an older producer, whose manifest has no
+/// `held` key — is the placeholder it always was, and the restore places
+/// everything else exactly.
+#[test]
+fn an_older_producers_held_pane_is_still_its_placeholder() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let scratch = enter_scratch("held-pane-old");
+    let mut app = crate::App::headless_for_test();
+    app.hold = true;
+    let wid = WindowId(0);
+    let held_id = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(held_id));
+    let mut ptys = DeskPtys::default();
+    ptys.attach_rest(&mut app);
+    crate::term_lock(&app.pool.get(held_id).expect("held").term).process(b"build finished\r\n");
+    app.store
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_state(held_id, crate::session_store::SessionState::Exited);
+    let at = "an older producer";
+    // The older producer's manifest: the same park, written with no held panes.
+    let parked = app.park_desk_for_test(None).expect("the park");
+    let adoption: Vec<(u64, i32, i32)> = parked
+        .live
+        .iter()
+        .map(|(local_id, master, _)| {
+            // SAFETY: duplicates a live, test-owned PTY master as a fresh
+            // close-on-exec descriptor numbered 3 or above.
+            let duplicate = unsafe { libc::fcntl(*master, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(duplicate >= 3);
+            (*local_id, duplicate, 40_000)
+        })
+        .collect();
+    let nonce = mint_outgoing_nonce();
+    let outgoing = write_outgoing(
+        &parked.manifest,
+        &HandoffFds {
+            entries: adoption.clone(),
+        },
+        &parked.screens,
+        &parked.repaint,
+        parked.window.clone(),
+        &[],
+        &nonce,
+    )
+    .expect("the writer");
+    let wire = std::fs::read_to_string(&outgoing.manifest_path).expect("the manifest");
+    assert!(
+        !wire.contains("[[held]]"),
+        "{at}: PRECONDITION — no `held` key: {wire}"
+    );
+    let layout_path = std::path::Path::new(&outgoing.manifest_path).with_extension("layout.toml");
+    crate::restore::write_once_to(&layout_path, &parked.layout).expect("the layout sidecar");
+    let expected = adoption_proof(
+        &nonce,
+        crate::running_build_number(),
+        crate::build_info::GIT_COMMIT,
+        &parked.layout_digest.expect("digest"),
+        &parked.screen_digest,
+        &adoption,
+    )
+    .expect("the parent's expectation");
+    let (_ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, _commit_write) = pipe_pair("commit");
+    // SAFETY: `getppid` is a side-effect-free libc getter.
+    let parent_pid = unsafe { libc::getppid() };
+    aterm_log::env::set(ENV_MANIFEST, &outgoing.manifest_path);
+    aterm_log::env::set(ENV_NONCE, &outgoing.nonce);
+    aterm_log::env::set(ENV_FDS, &outgoing.fds_wire);
+    aterm_log::env::set(ENV_LAYOUT, &layout_path);
+    aterm_log::env::set(ENV_READY_FD, ready_write.to_string());
+    aterm_log::env::set(ENV_COMMIT_FD, commit_read.to_string());
+    aterm_log::env::set(ENV_PARENT_PID, parent_pid.to_string());
+    match read_process_birth(parent_pid) {
+        Some(birth) => aterm_log::env::set(ENV_PARENT_BIRTH, birth.to_wire()),
+        None => aterm_log::env::unset(ENV_PARENT_BIRTH),
+    }
+    aterm_log::env::set(
+        ENV_TARGET,
+        encode_target_identity(crate::running_build_number(), crate::build_info::GIT_COMMIT),
+    );
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert!(incoming.held.is_empty(), "{at}: nothing held crossed");
+    let layout = incoming.layout.clone().expect("the layout is placed");
+    let ((proof, ready, _), adopted) = child_proof_from(incoming).expect("adopts and proves");
+    assert_eq!(proof, expected, "{at}: adopts exactly");
+    drop((ready, adopted));
+    let mut new = crate::App::headless_for_test();
+    new.handoff_successor = true;
+    new.pool
+        .sessions
+        .get_mut(&0)
+        .expect("session 0")
+        .session
+        .handoff_local_id = Some(0);
+    new.restore_into_window(wid, layout.windows[0].clone());
+    let terminals = new.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .flat_map(|tab| tab.root.leaves())
+        .filter(|view| {
+            new.view_store
+                .get(*view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                .is_some()
+        })
+        .count();
+    assert_eq!(
+        (new.windows[&wid].tab_set.tabs().len(), terminals),
+        (2, 1),
+        "{at}: the live pane and the placeholder, as before"
+    );
+    ptys.release(app);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

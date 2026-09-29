@@ -150,7 +150,7 @@ impl CandidateSource {
 ///
 /// This is the SINGLE source of the forward literal scan: the batch path drives
 /// it across the index's candidate lines via [`SearchMatchIterator`], and the
-/// budgeted engine drives it over the one row it just indexed. Keeping one body
+/// budgeted engine drives it over the supplied row. Keeping one body
 /// is what makes budgeted results equal to one-shot results by construction
 /// rather than by reimplementation.
 ///

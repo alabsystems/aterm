@@ -7,8 +7,8 @@
 //! `a7_keyboard_shift` SMT bundle).
 
 use super::{
-    Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key, encode_key_with_event,
-    encode_kitty, shifted_character, write_u32,
+    Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, conhost_holds_once_switched, encode_key,
+    encode_key_with_event, encode_key_with_layout, encode_kitty, shifted_character, write_u32,
 };
 
 // =========================================================================
@@ -1209,11 +1209,17 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
 // of place is a different key.
 // =========================================================================
 
-/// The key-down/key-up pair for `VK_RETURN` with `UnicodeChar = uc` and
-/// `dwControlKeyState = cs` — the oracle the assertions below compare against,
-/// written out from the spec rather than from the encoder's own builder.
+/// The key-down/key-up record pair `CSI vk;sc;uc;Kd;cs;1 _` — the oracle the
+/// assertions below compare against, written out from the spec rather than
+/// from the encoder's own builder.
+fn win32_pair(vk: u32, sc: u32, uc: u32, cs: u32) -> Vec<u8> {
+    format!("\x1b[{vk};{sc};{uc};1;{cs};1_\x1b[{vk};{sc};{uc};0;{cs};1_").into_bytes()
+}
+
+/// The pair for `VK_RETURN` (scan 28) with `UnicodeChar = uc` and
+/// `dwControlKeyState = cs`.
 fn win32_enter_pair(uc: u32, cs: u32) -> Vec<u8> {
-    format!("\x1b[13;28;{uc};1;{cs};1_\x1b[13;28;{uc};0;{cs};1_").into_bytes()
+    win32_pair(13, 28, uc, cs)
 }
 
 const WIN32: KeyboardMode = KeyboardMode::WIN32_INPUT;
@@ -1453,22 +1459,51 @@ fn win32_outranks_xterm_modify_other_keys() {
 }
 
 #[test]
-fn win32_touches_only_enter_chords() {
-    // Everything that is not an Enter chord is byte-identical with 9001 on:
-    // the mode is a narrow fix for the one key legacy VT cannot spell.
+fn win32_keys_conhost_still_reads_keep_their_bytes() {
+    // Every key conhost reads correctly from legacy VT — before AND after its
+    // parser has seen a record — is byte-identical with 9001 on. Each case
+    // below was fed raw into a ConPTY tab after one Shift+Enter record
+    // (2026-09-27, conhost 10.0.26200) and arrived as its key in `ReadKey`:
+    // ESC + a letter / digit / most punctuation / a C0 is Alt+that key, and a
+    // complete CSI or SS3 sequence is its key.
     let cases: &[(Key, Modifiers)] = &[
         (Key::Named(NamedKey::Tab), Modifiers::SHIFT),
         (Key::Named(NamedKey::Tab), Modifiers::CTRL),
+        (Key::Named(NamedKey::Tab), Modifiers::ALT),
         (Key::Named(NamedKey::Backspace), Modifiers::CTRL),
         (Key::Named(NamedKey::Space), Modifiers::CTRL),
+        (Key::Named(NamedKey::Space), Modifiers::ALT),
+        (Key::Named(NamedKey::ArrowUp), Modifiers::empty()),
         (Key::Named(NamedKey::ArrowUp), Modifiers::SHIFT),
+        (Key::Named(NamedKey::ArrowUp), Modifiers::ALT),
+        (Key::Named(NamedKey::ArrowRight), Modifiers::CTRL),
+        (Key::Named(NamedKey::Home), Modifiers::empty()),
+        (Key::Named(NamedKey::End), Modifiers::empty()),
+        (Key::Named(NamedKey::PageUp), Modifiers::empty()),
+        (Key::Named(NamedKey::Delete), Modifiers::empty()),
+        (Key::Named(NamedKey::F1), Modifiers::empty()),
+        (Key::Named(NamedKey::F5), Modifiers::empty()),
         (Key::Named(NamedKey::F5), Modifiers::CTRL),
+        (Key::Named(NamedKey::F12), Modifiers::empty()),
         (Key::Character('a'), Modifiers::CTRL),
         (Key::Character('a'), Modifiers::SHIFT),
+        (Key::Character('a'), Modifiers::ALT),
+        (Key::Character('a'), Modifiers::ALT | Modifiers::SHIFT),
+        (Key::Character('a'), Modifiers::ALT | Modifiers::CTRL),
         (Key::Character('c'), Modifiers::CTRL),
+        (Key::Character('.'), Modifiers::ALT),
+        (Key::Character('-'), Modifiers::ALT),
+        (Key::Character('/'), Modifiers::ALT),
+        (Key::Character('\\'), Modifiers::ALT),
+        (Key::Character('1'), Modifiers::ALT | Modifiers::SHIFT),
+        (Key::Character('['), Modifiers::ALT | Modifiers::SHIFT),
+        (Key::Character('é'), Modifiers::ALT),
         (Key::Named(NamedKey::NumpadEnter), Modifiers::empty()),
         (Key::Named(NamedKey::NumpadEnter), Modifiers::ALT),
         (Key::Named(NamedKey::Numpad5), Modifiers::SHIFT),
+        // `ESC ESC [ E`: conhost drops it before the switch and after it alike,
+        // and poisons nothing either way — not a key the switch broke.
+        (Key::Named(NamedKey::NumpadBegin), Modifiers::ALT),
     ];
     for (key, mods) in cases {
         assert_eq!(
@@ -1482,6 +1517,406 @@ fn win32_touches_only_enter_chords() {
         encode_key(&Key::Character('c'), Modifiers::CTRL, WIN32),
         b"\x03"
     );
+    // DECCKM's SS3 arrows too.
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::ArrowUp),
+            Modifiers::empty(),
+            WIN32 | KeyboardMode::APP_CURSOR
+        ),
+        b"\x1bOA"
+    );
+}
+
+#[test]
+fn conhost_holds_exactly_the_measured_forms() {
+    // The measured table (2026-09-27, conhost 10.0.26200, each form fed raw
+    // then `z`, after one Shift+Enter record). HELD: nothing arrived, or the
+    // `z` arrived as Alt+Z, or the `z` vanished into an opened sequence.
+    for held in [
+        &b"\x1b"[..],
+        b"\x1b\x1b",
+        b"\x1b\x7f",
+        b"\x1b[",
+        b"\x1bO",
+        b"\x1bP",
+        b"\x1b]",
+        b"\x1bX",
+        b"\x1b^",
+        b"\x1b_",
+    ] {
+        assert!(conhost_holds_once_switched(held), "{held:?} is held");
+    }
+    // READ: arrived as its key, the `z` after it plain.
+    for read in [
+        &b"\x1ba"[..],
+        b"\x1bQ",
+        b"\x1b ",
+        b"\x1b.",
+        b"\x1b-",
+        b"\x1b!",
+        b"\x1b/",
+        b"\x1b\\",
+        b"\x1b`",
+        b"\x1b{",
+        b"\x1b~",
+        b"\x1b\r",
+        b"\x1b\t",
+        b"\x1b\x08",
+        b"\x1b\x00",
+        b"\x1b\x01",
+        b"\x1b\x1f",
+        "\x1bé".as_bytes(),
+        b"\x1b[A",
+        b"\x1bOP",
+        b"\x1b[1;5C",
+        b"\x1b[1;3A",
+        b"\x1b[H",
+        b"\x1b[15~",
+        b"\x1b[Z",
+        b"\x1b\x1b[E",
+        b"a",
+        b"\r",
+        b"",
+    ] {
+        assert!(!conhost_holds_once_switched(read), "{read:?} is read");
+    }
+}
+
+/// Parse a win32-input-mode record pair into its two six-field records, so a
+/// sweep can check SHAPE without restating every key's fields.
+fn parse_win32_pair(bytes: &[u8]) -> Option<[[u32; 6]; 2]> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut records = text.strip_suffix('_')?.split('_');
+    let mut parse = || -> Option<[u32; 6]> {
+        let body = records.next()?.strip_prefix("\x1b[")?;
+        let fields: Vec<u32> = body
+            .split(';')
+            .map(|f| f.parse().ok())
+            .collect::<Option<_>>()?;
+        fields.try_into().ok()
+    };
+    let pair = [parse()?, parse()?];
+    records.next().is_none().then_some(pair)
+}
+
+#[test]
+fn win32_escape_is_a_record_pair() {
+    // The regression: after one Shift+Enter record, a lone ESC never reached
+    // `ReadKey` again (6 s idle: nothing; the next `a` arrived as Alt+A) —
+    // PSReadLine's RevertLine, vim's leave-insert and Claude Code's
+    // Esc-to-interrupt all died. The record arrives as `Escape CHAR=0x1B`
+    // whether or not the parser has switched (measured 2026-09-27).
+    let esc = Key::Named(NamedKey::Escape);
+    assert_eq!(
+        encode_key(&esc, Modifiers::empty(), WIN32),
+        b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_"
+    );
+    assert_eq!(
+        encode_key(&esc, Modifiers::SHIFT, WIN32),
+        win32_pair(27, 1, 27, 0x10),
+        "measured: Escape MODS=Shift CHAR=0x1B"
+    );
+    // Ctrl+Escape and Alt+Escape carry their modifiers like any key. conhost
+    // drops both (measured: nothing reached `ReadKey`, the next key arrived
+    // plain) — its Start-menu / window-cycling rule for any terminal's
+    // records — where the legacy `ESC` / `ESC ESC` would poison the next key.
+    assert_eq!(
+        encode_key(&esc, Modifiers::CTRL, WIN32),
+        win32_pair(27, 1, 27, 0x08)
+    );
+    assert_eq!(
+        encode_key(&esc, Modifiers::ALT, WIN32),
+        win32_pair(27, 1, 27, 0x02)
+    );
+    // Lock state is not a chord modifier here either.
+    assert_eq!(
+        encode_key(&esc, Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK, WIN32),
+        win32_pair(27, 1, 27, 0)
+    );
+    // The pair carries its own key-up: the Release adds nothing, a Repeat is
+    // another key-down pair.
+    assert!(
+        encode_key_with_event(&esc, Modifiers::empty(), WIN32, KeyEventType::Release).is_empty()
+    );
+    assert_eq!(
+        encode_key_with_event(&esc, Modifiers::empty(), WIN32, KeyEventType::Repeat),
+        win32_pair(27, 1, 27, 0)
+    );
+    // Without 9001 (Unix, and a conhost that never asked) nothing changed.
+    assert_eq!(
+        encode_key(&esc, Modifiers::empty(), KeyboardMode::empty()),
+        b"\x1b"
+    );
+    assert_eq!(
+        encode_key(&esc, Modifiers::ALT, KeyboardMode::empty()),
+        b"\x1b\x1b"
+    );
+}
+
+#[test]
+fn win32_ctrl_bracket_and_ctrl_3_are_records_of_their_own_key() {
+    // Ctrl+[ is a lone ESC in legacy VT, so it dies with Escape; its record is
+    // the physical key, VK_OEM_4 / scan 0x1A, with the ESC char a Windows
+    // keyboard gives it. Measured: `Oem4 MODS=Control CHAR=0x1B`, which vim
+    // (Git's, through the MSYS console reader) takes as ESC — and which
+    // PSReadLine's Windows mode, with nothing bound to Ctrl+[, inserts as `^[`
+    // (it used to revert the line when conhost read the lone ESC as Escape).
+    let bracket = Key::Character('[');
+    assert_eq!(
+        encode_key_with_layout(
+            &bracket,
+            Modifiers::CTRL,
+            WIN32,
+            KeyEventType::Press,
+            Some('[')
+        ),
+        b"\x1b[219;26;27;1;8;1_\x1b[219;26;27;0;8;1_"
+    );
+    // A controller's `key ctrl+[` names no physical key: the character's own
+    // US key answers.
+    assert_eq!(
+        encode_key(&bracket, Modifiers::CTRL, WIN32),
+        win32_pair(219, 26, 27, 0x08)
+    );
+    // Measured: `Oem4 MODS=Shift, Control CHAR=0x1B` and
+    // `Oem4 MODS=Alt, Control CHAR=0x1B`.
+    assert_eq!(
+        encode_key(&bracket, Modifiers::CTRL | Modifiers::SHIFT, WIN32),
+        win32_pair(219, 26, 27, 0x18)
+    );
+    assert_eq!(
+        encode_key(&bracket, Modifiers::CTRL | Modifiers::ALT, WIN32),
+        win32_pair(219, 26, 27, 0x0a)
+    );
+    // Ctrl+3 is xterm's other ESC. Measured: `D3 MODS=Control CHAR=0x1B`.
+    assert_eq!(
+        encode_key(&Key::Character('3'), Modifiers::CTRL, WIN32),
+        win32_pair(51, 4, 27, 0x08)
+    );
+    // Without 9001 both stay the legacy ESC.
+    assert_eq!(
+        encode_key(&bracket, Modifiers::CTRL, KeyboardMode::empty()),
+        b"\x1b"
+    );
+    assert_eq!(
+        encode_key(&Key::Character('3'), Modifiers::CTRL, KeyboardMode::empty()),
+        b"\x1b"
+    );
+}
+
+#[test]
+fn win32_alt_chords_that_open_a_sequence_are_records() {
+    // Alt+<key> is `ESC <key>`, which conhost still reads as Alt+key after the
+    // switch — except where <key> opens a sequence (`[ O P ] X ^ _`) or is DEL.
+    // Each record below was fed after the switch and read back as the key
+    // conhost itself decoded the legacy pair to before it (2026-09-27).
+    let alt = Modifiers::ALT;
+    let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
+    let rec = |key: Key, mods: Modifiers, base: Option<char>| {
+        encode_key_with_layout(&key, mods, WIN32, KeyEventType::Press, base)
+    };
+    // `Oem4 MODS=Alt CHAR=0x5B`, `Oem6 MODS=Alt CHAR=0x5D`.
+    assert_eq!(
+        rec(Key::Character('['), alt, Some('[')),
+        b"\x1b[219;26;91;1;2;1_\x1b[219;26;91;0;2;1_"
+    );
+    assert_eq!(
+        rec(Key::Character(']'), alt, Some(']')),
+        win32_pair(221, 27, 93, 0x02)
+    );
+    // Alt+Shift+O / P / X: `O MODS=Alt, Shift CHAR=0x4F`, `P …0x50`, `X …0x58`
+    // — whether the host names the base letter or the shifted one.
+    for key in [Key::Character('o'), Key::Character('O')] {
+        assert_eq!(rec(key, alt_shift, Some('o')), win32_pair(79, 24, 79, 0x12));
+    }
+    assert_eq!(
+        rec(Key::Character('p'), alt_shift, Some('p')),
+        win32_pair(80, 25, 80, 0x12)
+    );
+    assert_eq!(
+        rec(Key::Character('x'), alt_shift, Some('x')),
+        win32_pair(88, 45, 88, 0x12)
+    );
+    // Alt+^ and Alt+_: `D6 MODS=Alt, Shift CHAR=0x5E`,
+    // `OemMinus MODS=Alt, Shift CHAR=0x5F`.
+    assert_eq!(
+        rec(Key::Character('6'), alt_shift, Some('6')),
+        win32_pair(54, 7, 94, 0x12)
+    );
+    assert_eq!(
+        rec(Key::Character('-'), alt_shift, Some('-')),
+        win32_pair(189, 12, 95, 0x12)
+    );
+    // A controller's `key alt+_` names the glyph with no SHIFT and no physical
+    // key: the US key that types `_` supplies both.
+    assert_eq!(
+        rec(Key::Character('_'), alt, None),
+        win32_pair(189, 12, 95, 0x12)
+    );
+    // The PHYSICAL key wins over the glyph: on AZERTY `_` is the unshifted
+    // 8 key, and a real record names that key (scan 0x09) with no Shift.
+    assert_eq!(
+        rec(Key::Character('_'), alt, Some('8')),
+        win32_pair(56, 9, 95, 0x02)
+    );
+    // Alt+Backspace is `ESC DEL`: `Backspace MODS=Alt CHAR=0x8`, the char a
+    // Windows keyboard gives Backspace (and the one conhost decoded before).
+    let bksp = Key::Named(NamedKey::Backspace);
+    assert_eq!(rec(bksp.clone(), alt, None), win32_pair(8, 14, 8, 0x02));
+    // Ctrl+Alt+8 is `ESC DEL` too: `D8 MODS=Alt, Control CHAR=0x7F`.
+    assert_eq!(
+        rec(Key::Character('8'), Modifiers::CTRL | alt, Some('8')),
+        win32_pair(56, 9, 127, 0x0a)
+    );
+    // Forms that do not dangle keep their bytes: DECBKM's Alt+Backspace is
+    // `ESC BS` (read as `Backspace MODS=Alt, Control` either side of the
+    // switch), and with altSendsEscape reset (DECRST 1039) Alt+[ is a bare
+    // `[` — no prefix, nothing held.
+    assert_eq!(
+        encode_key(&bksp, alt, WIN32 | KeyboardMode::BACKARROW_SENDS_BS),
+        b"\x1b\x08"
+    );
+    assert_eq!(
+        encode_key(&Key::Character('['), alt, WIN32 | KeyboardMode::ALT_NO_ESC),
+        b"["
+    );
+    // Without 9001 every one of them is its legacy pair.
+    assert_eq!(
+        encode_key(&Key::Character('['), alt, KeyboardMode::empty()),
+        b"\x1b["
+    );
+    assert_eq!(encode_key(&bksp, alt, KeyboardMode::empty()), b"\x1b\x7f");
+}
+
+#[test]
+fn win32_escape_records_outrank_kitty_and_modify_other_keys() {
+    // conhost drops the protocol spellings of these keys exactly as it drops
+    // `CSI 13;2 u` — measured 2026-09-27: `CSI 27 u` (kitty Escape),
+    // `CSI 99;5 u`, `CSI 97;3 u` and `CSI 27;5;91 ~` (xterm Ctrl+[) all reached
+    // `ReadKey` as nothing — so under 9001 the record goes first, as it does
+    // for the Enter chords.
+    let esc = Key::Named(NamedKey::Escape);
+    let disambiguate = WIN32 | KeyboardMode::DISAMBIGUATE_ESC_CODES;
+    assert_eq!(
+        encode_key(&esc, Modifiers::empty(), disambiguate),
+        win32_pair(27, 1, 27, 0)
+    );
+    assert_eq!(
+        encode_key(&Key::Character('['), Modifiers::CTRL, disambiguate),
+        win32_pair(219, 26, 27, 0x08)
+    );
+    // A release stays silent where kitty would have reported one.
+    let events = WIN32 | KeyboardMode::REPORT_EVENT_TYPES | KeyboardMode::DISAMBIGUATE_ESC_CODES;
+    assert!(
+        encode_key_with_event(&esc, Modifiers::empty(), events, KeyEventType::Release).is_empty()
+    );
+    let l1 = WIN32 | KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
+    assert_eq!(
+        encode_key(&esc, Modifiers::CTRL, l1),
+        win32_pair(27, 1, 27, 0x08)
+    );
+    // Without 9001 the protocols answer exactly as before.
+    assert_eq!(
+        encode_key(
+            &esc,
+            Modifiers::empty(),
+            KeyboardMode::DISAMBIGUATE_ESC_CODES
+        ),
+        b"\x1b[27u"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Character('['),
+            Modifiers::CTRL,
+            KeyboardMode::DISAMBIGUATE_ESC_CODES
+        ),
+        b"\x1b[91;5u"
+    );
+    assert_eq!(
+        encode_key(
+            &esc,
+            Modifiers::CTRL,
+            KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1
+        ),
+        b"\x1b[27;5;27~"
+    );
+}
+
+#[test]
+fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
+    // The sweep behind the rule: for every printable character key and every
+    // named key, under every Shift/Ctrl/Alt combination, 9001 either leaves
+    // the legacy bytes alone or — exactly when conhost would hold them —
+    // replaces them with ONE well-formed down/up record pair. (Enter chords
+    // are their own family, pinned above.)
+    let mods_list = [
+        Modifiers::empty(),
+        Modifiers::SHIFT,
+        Modifiers::CTRL,
+        Modifiers::ALT,
+        Modifiers::SHIFT | Modifiers::ALT,
+        Modifiers::CTRL | Modifiers::ALT,
+        Modifiers::CTRL | Modifiers::SHIFT,
+        Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT,
+    ];
+    let mut keys: Vec<Key> = (' '..='~').map(Key::Character).collect();
+    keys.extend(
+        [
+            NamedKey::Escape,
+            NamedKey::Backspace,
+            NamedKey::Tab,
+            NamedKey::Space,
+            NamedKey::ArrowUp,
+            NamedKey::Home,
+            NamedKey::F1,
+            NamedKey::F5,
+            NamedKey::Insert,
+            NamedKey::Numpad5,
+            NamedKey::NumpadBegin,
+            NamedKey::NumpadDecimal,
+        ]
+        .map(Key::Named),
+    );
+    let mut routed = 0;
+    for key in &keys {
+        for mods in mods_list {
+            let legacy = encode_key(key, mods, KeyboardMode::empty());
+            let win = encode_key(key, mods, WIN32);
+            if !conhost_holds_once_switched(&legacy) {
+                assert_eq!(win, legacy, "{key:?}+{mods:?} must keep its bytes");
+                continue;
+            }
+            routed += 1;
+            let [down, up] = parse_win32_pair(&win)
+                .unwrap_or_else(|| panic!("{key:?}+{mods:?}: {win:?} is not a record pair"));
+            assert_eq!(down[3], 1, "{key:?}+{mods:?}: key-down first");
+            assert_eq!(up[3], 0, "{key:?}+{mods:?}: key-up second");
+            assert_eq!(
+                (down[0], down[1], down[2], down[4], down[5]),
+                (up[0], up[1], up[2], up[4], up[5]),
+                "{key:?}+{mods:?}: both halves name the same key"
+            );
+            // The char the legacy bytes carried survives (Backspace excepted:
+            // its Windows char is BS, not the DEL aterm writes).
+            if *key != Key::Named(NamedKey::Backspace) {
+                assert_eq!(
+                    down[2],
+                    u32::from(*legacy.last().unwrap()),
+                    "{key:?}+{mods:?}: UnicodeChar"
+                );
+            }
+            // ALT is set exactly when the legacy form carried the ESC prefix.
+            assert_eq!(
+                down[4] & 0x02 != 0,
+                legacy.len() == 2,
+                "{key:?}+{mods:?}: ALT bit"
+            );
+        }
+    }
+    // Escape ×8, Backspace+Alt ×2, and the character chords that dangle —
+    // non-zero is the non-vacuity check; the exact count is not the contract.
+    assert!(routed > 20, "only {routed} keys were routed");
 }
 
 #[test]

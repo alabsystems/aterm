@@ -47,6 +47,9 @@ impl Terminal {
     /// policy: conhost repaints the alt screen exactly as it repaints the main
     /// one, and the saved grid must keep the same seam law for when it returns.
     pub fn resize_with_policy(&mut self, rows: u16, cols: u16, policy: ResizePolicy) {
+        // The resize journal's pre-resize facts (geometry, screen, open 2026
+        // frame), consumed by `finalize_resize` — see `resize_journal`.
+        let origin = self.resize_origin();
         // Captured BEFORE the resize: afterwards both grids carry the new width.
         let cols_changed = self.grid.cols() != cols;
         // Likewise the height: `finalize_resize` needs the SHRINK amount, and the
@@ -75,7 +78,7 @@ impl Terminal {
                 alt.resize_no_reflow_with_policy(rows, cols, policy);
             }
         }
-        self.finalize_resize(cols_changed, rows_before);
+        self.finalize_resize(cols_changed, rows_before, origin);
     }
 
     /// Resize, but move the width-change off-screen scrollback rewrap OFF the
@@ -110,6 +113,7 @@ impl Terminal {
         policy: ResizePolicy,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
         // Captured BEFORE the resize, as in `resize`.
+        let origin = self.resize_origin();
         let cols_changed = self.grid.cols() != cols;
         let rows_before = self.grid.rows();
         // Same image pin as the synchronous path: the offloaded resize still
@@ -134,7 +138,7 @@ impl Terminal {
             }
             pending
         };
-        self.finalize_resize(cols_changed, rows_before);
+        self.finalize_resize(cols_changed, rows_before, origin);
         pending
     }
 
@@ -246,13 +250,26 @@ impl Terminal {
     }
 
     /// Shared post-resize side effects for [`resize`](Self::resize) and the
-    /// offloaded path: selection invalidation, the DEC-2048 in-band size report,
-    /// and the debug structural-invariant self-check.
+    /// offloaded path: the resize journal entry, selection invalidation, the
+    /// DEC-2048 in-band size report, and the debug structural-invariant
+    /// self-check.
     ///
-    /// `cols_changed` and `rows_before` are both captured by the caller BEFORE the
-    /// resize: by the time this runs the grids carry the new geometry and the old
-    /// one is unrecoverable.
-    fn finalize_resize(&mut self, cols_changed: bool, rows_before: u16) {
+    /// `cols_changed`, `rows_before` and `origin` are all captured by the caller
+    /// BEFORE the resize: by the time this runs the grids carry the new geometry
+    /// and the old one is unrecoverable.
+    fn finalize_resize(
+        &mut self,
+        cols_changed: bool,
+        rows_before: u16,
+        origin: super::resize_journal::ResizeOrigin,
+    ) {
+        // Read before the journal drains the shape: a grow that handed a whole
+        // resize undo back puts the pre-flap selection back below.
+        let undone = self.grid.last_resize_shape().undone;
+        // Journal first, from the ACTIVE grid's own row accounting. It is a
+        // separate record from `take_last_resize_row_shift` below, so the
+        // selection custody that drains that one is untouched.
+        self.journal_resize(origin);
         // SELECTION CUSTODY Phase 3: only a WIDTH change invalidates coordinates.
         //
         // This used to clear unconditionally, on the reasoning that "reflow
@@ -270,6 +287,8 @@ impl Terminal {
         // time we run, both grids already carry the new width and the old one is
         // gone.
         if cols_changed {
+            // A width change never keeps a grid resize undo, so none is open.
+            self.resize_undo_selection = None;
             self.text_selection.clear();
             // The PARKED selection (see `post_process`) is anchored in the other
             // grid, which this resize rewrapped too. It must go for the same reason
@@ -310,6 +329,7 @@ impl Terminal {
             // and a delta of 0 left it that many rows off its content — silently, and
             // in the wrong-copy direction. `adjust_for_rows_shrink` is that piecewise
             // map; see its doc for the three regimes.
+            let selection_before = self.text_selection.clone();
             let revealed = i32::from(self.grid.take_last_resize_row_shift());
             let max_rows = i32::from(self.grid.rows());
             let demoted = i32::from(rows_before.saturating_sub(self.grid.rows()));
@@ -326,6 +346,14 @@ impl Terminal {
                 self.text_selection
                     .adjust_for_scroll(-revealed, max_rows, floor);
             }
+            // THE RESIZE UNDO's host half: the transform above clamps an anchor
+            // on a row the alt grid demoted (no history to anchor it in), so the
+            // grow's reveal lands it a row low even though the grid put every
+            // cell back. The selection the first shrink found is kept and put
+            // back when the grid hands its undo back whole. Active screen only:
+            // the parked selection is the MAIN screen's, which keeps history and
+            // never opens an undo.
+            self.follow_resize_undo_selection(selection_before, undone);
             // The parked selection gets the identical treatment against the OTHER
             // grid — `resize` resized both, and each recorded its own shift. Its
             // floor must come from that grid: while alt is up the ACTIVE grid's

@@ -81,7 +81,7 @@ const CELLS: [(&str, &str); 5] = [
     ("aterm-gpu-web", "wasm32-unknown-unknown"),
 ];
 
-/// Short cell names, matching `cargo forge`'s.
+/// Short cell names, matching `targo --unverified forge`'s.
 const CELL_NAMES: [&str; 5] = ["mac-arm", "linux", "win", "wasm-cpu", "wasm-gpu"];
 
 /// Every `module::Type` this shim exports. A `once_cell::…` path found in a

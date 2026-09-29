@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLAUDE CODE LIGHTS — lights at the end of aterm's footer for the
+//! THE CLAUDE CODE LIGHTS — lights beside aterm's footer for the
 //! settings the owner always expects on (owner direction, 2026-09-24): the
 //! permission mode and fast mode. The effort tag Claude Code writes into its
 //! own top rule already shows itself, so it has no light of ours (owner,
@@ -13,8 +13,9 @@
 //! what the owner expects ([`Expect`], [`deviates`]; owner, 2026-09-27: "I
 //! don't want to show the state of parameters that I always expect to be
 //! on") — or while a toggle of it is in flight, or its answer is on show.
-//! At rest, everything as expected, nothing is drawn and the footer has the
-//! whole row. Hover a drawn light to read its title; click it to toggle.
+//! At rest, everything as expected, nothing is drawn beside the footer's
+//! facts in the composer's bottom rule, and Claude's own rows are whole.
+//! Hover a drawn light to read its title; click it to toggle.
 //!
 //! ONE PERMISSION-MODE LIGHT. Auto-approve (`bypass permissions`) and auto
 //! mode are two positions of Claude Code's ONE permission mode, not two
@@ -429,9 +430,14 @@ pub fn read(screen: Option<&Screen>) -> Reading {
         mode: s.mode,
         // `↯`, or the words `fast mode` (the vendor's narrow-terminal
         // spelling, `fast mode (cooling down)` included).
-        fast: on(has("\u{21AF}") || s.tags.windows(2).any(|w| w[0] == "fast" && w[1] == "mode")),
+        fast: on(has(FAST_ICON) || s.tags.windows(2).any(|w| w[0] == "fast" && w[1] == "mode")),
     }
 }
+
+/// Claude Code's fast-mode icon, `↯` (2.1.284's `mre`): on the composer's
+/// top rule while fast mode is on, and at the head of its `Fast mode ON`
+/// answers ([`fast_answer_of`]).
+const FAST_ICON: &str = "\u{21AF}";
 
 /// How to toggle a light: Claude Code's own inputs, and what must hold before
 /// the host may send them.
@@ -644,18 +650,30 @@ const FAST_REFUSALS: [(&str, FastRefusal); 11] = [
 ];
 
 /// What one line of Claude's says about fast mode, if it is an answer to
-/// `/fast`. The vendor wraps its availability refusals as `Fast mode
-/// unavailable: <reason>`; the prefix is taken off first, and a wrapped
-/// reason this build does not know is still a refusal ([`FastRefusal::Other`]).
+/// `/fast`. Claude opens every `Fast mode ON` answer — `/fast on`'s and the
+/// picker's, and `Kept Fast mode ON` — with its fast-mode icon `↯` and a
+/// space (2.1.284: `${icon} Fast mode ON…`, the icon in its theme's
+/// fast-mode colour), so the answer is read the way the vendor's own
+/// classifier reads its result: colour sequences stripped, then the icon.
+/// The vendor wraps its availability refusals as `Fast mode unavailable:
+/// <reason>`; the prefix is taken off first, and a wrapped reason this build
+/// does not know is still a refusal ([`FastRefusal::Other`]).
 #[must_use]
 pub fn fast_answer_of(text: &str) -> Option<FastAnswer> {
+    let text = crate::harness::upgrade_models::strip_sgr(text);
     let text = text.trim();
+    let text = text.strip_prefix(FAST_ICON).map_or(text, str::trim_start);
     let (text, wrapped) = match text.strip_prefix("Fast mode unavailable: ") {
         Some(rest) => (rest.trim(), true),
         None => (text, false),
     };
-    if text.starts_with("Fast mode ON") || text.starts_with("Kept Fast mode ON") {
-        return Some(if text.contains("model set to") {
+    let on = aterm_phase::anchor("fast.on");
+    if text.starts_with(on)
+        || text
+            .strip_prefix("Kept ")
+            .is_some_and(|t| t.starts_with(on))
+    {
+        return Some(if text.contains(aterm_phase::anchor("fast.model_set")) {
             FastAnswer::OnModelMoved
         } else {
             FastAnswer::On
@@ -708,8 +726,8 @@ impl FastAnswers {
 
 /// Every answer to `cmd` on this screen. Claude answers a `/fast` in one of
 /// two places: at idle, the `⎿` line(s) under the transcript's echo of the
-/// command (`❯ /fast on`), above the composer; mid-turn, a notification
-/// under the composer's bottom rule. The ECHO COUNT is what makes a
+/// command (`❯ /fast on`), above the composer; mid-turn, a notification on
+/// the row above the composer's top rule (measured) or under its bottom rule. The ECHO COUNT is what makes a
 /// transcript answer this toggle's: the host notes it at the click, and only
 /// an echo beyond it — never one already on screen from an earlier try —
 /// resolves the toggle. The notification is judged apart (the host notes the
@@ -754,12 +772,32 @@ pub fn fast_answers(rows: &[String], cmd: &str) -> FastAnswers {
             newest = Some(answer);
         }
     }
-    let notice = below.iter().find_map(|row| {
-        ["Kept Fast mode", "Fast mode", "Checking fast mode"]
+    // Mid-turn Claude draws its notification on the row directly ABOVE the
+    // composer's top rule (measured 2.1.283, 2026-09-27: right-aligned at
+    // 144 columns, from column 2 and cut to fit at 80), for about 8 s; under
+    // the composer only where the layout differs. Only that one row above
+    // the rule, and only its vendor words, count.
+    let above = match aterm_phase::phase::composer_rules(rows) {
+        Some((top, _)) if top > 0 => &rows[top - 1..top],
+        _ => &rows[..0],
+    };
+    let heads = ["Kept Fast mode", "Fast mode", "Checking fast mode"];
+    let above_notice = above.iter().find_map(|row| {
+        let t = row.trim();
+        heads
             .iter()
-            .filter_map(|head| row.find(head))
-            .min()
-            .and_then(|at| fast_answer_of(&row[at..]))
+            .any(|head| t.starts_with(head))
+            .then(|| fast_answer_of(t))
+            .flatten()
+    });
+    let notice = above_notice.or_else(|| {
+        below.iter().find_map(|row| {
+            heads
+                .iter()
+                .filter_map(|head| row.find(head))
+                .min()
+                .and_then(|at| fast_answer_of(&row[at..]))
+        })
     });
     FastAnswers {
         echoed: count,
@@ -840,7 +878,8 @@ mod tests {
 
     /// A row under the composer that names no pill this build knows is NOT
     /// read as some mode: the mode lights are Unknown, so nothing is pressed
-    /// on the strength of a guess (a renamed pill, a wrapped hint).
+    /// on the strength of a guess (a renamed pill). A hint a narrow pane cut
+    /// is no guess: the next test.
     #[test]
     fn a_pill_this_build_does_not_know_is_unknown() {
         for row in ["  ? for shortcuts", "  \u{23F5}\u{23F5} turbo mode on"] {
@@ -851,6 +890,30 @@ mod tests {
                 LightState::Unknown,
                 "{row:?}"
             );
+        }
+    }
+
+    /// A narrow pane cuts the `(shift+tab to cycle)` hint between words
+    /// (2.1.284, footer's NARROW PANES): the pill still names the mode, so the
+    /// lights read it, and a plan-mode pill is still one the light cycles
+    /// away from.
+    #[test]
+    fn a_narrow_panes_cut_hint_still_names_the_mode() {
+        let rule = "\u{2500}".repeat(38);
+        let cases = [
+            (
+                "  \u{23F5}\u{23F5} bypass permissions on (shift+tab",
+                Mode::Bypass,
+            ),
+            ("  \u{23F5}\u{23F5} auto mode on (shift+tab to", Mode::Auto),
+            ("  \u{23F8} plan mode on (shift+tab to", Mode::Plan),
+        ];
+        for (row, mode) in cases {
+            let s = read_screen(&screen(&rule, row)).expect("a composer");
+            assert_eq!(s.mode, Some(mode), "{row:?}");
+            let r = read(Some(&s));
+            let cycle = (!mode.is_expected()).then_some(Drive::CycleMode);
+            assert_eq!(drive(Light::Mode, &r), cycle, "{row:?}");
         }
     }
 
@@ -1053,10 +1116,10 @@ mod tests {
     /// THE DRIFT CANARY. Every recorded FOOTER screen of every Claude Code
     /// build in the corpus (`claude-<version>-footer-*.txt` in aterm-phase's
     /// fixtures, recorded by `tools/capture-claude-screens.sh`) has a composer
-    /// this build's reader sees, a mode row the footer plans, and a pill the
-    /// footer AND the lights read as a mode. So a new Claude Code, captured
-    /// before sessions run on it, that draws its mode row differently fails
-    /// here — by file and build — where the running window could only step
+    /// this build's reader sees, a mode row under it, and a pill the footer
+    /// AND the lights read as a mode. So a new Claude Code, captured before
+    /// sessions run on it, that draws its mode row differently fails here —
+    /// by file and build — where the running window's lights could only step
     /// aside and name it in aterm.log. The directory is read, not listed: a new
     /// build's captures are judged the moment they land.
     #[test]
@@ -1088,7 +1151,7 @@ mod tests {
             let screen = read_screen(&rows)
                 .unwrap_or_else(|| panic!("{name}: no composer this build's reader sees"));
             let row = footer::mode_row(&rows)
-                .unwrap_or_else(|| panic!("{name}: no mode row the footer plans"));
+                .unwrap_or_else(|| panic!("{name}: no mode row the lights read"));
             assert!(
                 footer::pill_indicator(&rows[row]).is_some(),
                 "{name}: the mode pill is not one this build reads: {:?}",
@@ -1184,9 +1247,11 @@ mod tests {
                 LightState::Off,
                 "{name}: an effort tag is not fast mode"
             );
+            let rule = aterm_phase::phase::composer_bottom(&rows)
+                .unwrap_or_else(|| panic!("{name}: the composer's bottom rule"));
             assert!(
-                footer::mode_row(&rows).is_some_and(|r| footer::plan_row(&rows[r]).is_some()),
-                "{name}: the footer rewrites its mode row"
+                footer::mode_row(&rows).is_some_and(|r| r > rule),
+                "{name}: the mode row is read under the rule the footer writes into"
             );
         }
     }
@@ -1320,6 +1385,88 @@ mod tests {
         }
     }
 
+    /// MEASURED mid-turn (2026-09-27, 80 columns): the refusal is no echo but
+    /// a notification on the row directly ABOVE the composer's top rule, for
+    /// about 8 s, cut to fit — read as a refusal. CONTROLS: the
+    /// 144-column capture, read after the notice had gone, has none; a
+    /// notice-worded row two rows above the rule (worker prose) is none.
+    #[test]
+    fn the_measured_mid_turn_fast_refusal_is_the_row_above_the_rule() {
+        use aterm_phase::prompt::fixtures::{
+            FAST_REFUSED_BUSY_80_MEASURED, FAST_REFUSED_BUSY_MEASURED, screen,
+        };
+        let rows = screen(FAST_REFUSED_BUSY_80_MEASURED);
+        let got = fast_answers(&rows, "/fast on");
+        assert_eq!(
+            (got.echoed, got.echo, got.notice),
+            // Cut to fit at 80 columns (`… connectivity is…`): the vendor's
+            // reason no longer reads, so it is the generic refusal.
+            (0, None, Some(FastAnswer::Refused(FastRefusal::Other)))
+        );
+        let gone = screen(FAST_REFUSED_BUSY_MEASURED);
+        assert_eq!(fast_answers(&gone, "/fast on"), FastAnswers::default());
+        let (top, _) = aterm_phase::phase::composer_rules(&rows).expect("a composer");
+        let mut prose = rows.clone();
+        prose.swap(top - 1, top - 2);
+        assert_eq!(fast_answers(&prose, "/fast on"), FastAnswers::default());
+    }
+
+    /// MEASURED at 144 columns (2026-09-28, 2.1.284): mid-turn the refusal is
+    /// on the row BELOW the mode row — under the composer, right-aligned —
+    /// where the 80-column capture had it above the top rule. Both layouts
+    /// read, and this one in full: the network refusal, its reason intact.
+    /// CONTROL: no echo, so no transcript answer.
+    #[test]
+    fn the_measured_wide_mid_turn_fast_refusal_is_read_under_the_composer() {
+        use aterm_phase::prompt::fixtures::{FAST_REFUSED_BUSY_UNDER_COMPOSER_MEASURED, screen};
+        let rows = screen(FAST_REFUSED_BUSY_UNDER_COMPOSER_MEASURED);
+        let got = fast_answers(&rows, "/fast on");
+        assert_eq!(
+            (got.echoed, got.echo, got.notice),
+            (0, None, Some(FastAnswer::Refused(FastRefusal::Network)))
+        );
+        let s = read_screen(&rows).expect("a composer");
+        assert!(s.busy, "{s:?}");
+    }
+
+    /// MEASURED (2026-09-27, a scratch Claude config whose base URL cannot
+    /// resolve, so `/fast on` is refused and nothing is written): at idle the
+    /// answer is the `⎿` row right under the echo — no blank row between —
+    /// read as the network refusal through the vendor's doubled prefix, and
+    /// at 80 columns its wrapped tail (`     issues`) is joined. A transient
+    /// refusal: the light may ask again. The plan-mode screen of the same
+    /// session reads plan, idle, fast off, with no tag on the rule.
+    #[test]
+    fn the_measured_idle_fast_refusal_is_read_under_its_echo() {
+        use aterm_phase::prompt::fixtures::{
+            FAST_REFUSED_IDLE_80_MEASURED, FAST_REFUSED_IDLE_MEASURED,
+            FOOTER_PLAN_API_KEY_MEASURED, screen,
+        };
+        let network = Some(FastAnswer::Refused(FastRefusal::Network));
+        for (name, text) in [
+            ("144", FAST_REFUSED_IDLE_MEASURED),
+            ("80", FAST_REFUSED_IDLE_80_MEASURED),
+        ] {
+            let rows = screen(text);
+            let got = fast_answers(&rows, "/fast on");
+            assert_eq!(
+                (got.echoed, got.echo, got.notice),
+                (1, network, None),
+                "{name}"
+            );
+            assert!(!FastRefusal::Network.lasting(), "{name}");
+            let s = read_screen(&rows).unwrap_or_else(|| panic!("{name}: a composer"));
+            assert_eq!((s.mode, s.busy), (Some(Mode::Auto), false), "{name}");
+            // NEGATIVE CONTROL: another command's echo carries no answer.
+            assert_eq!(fast_answers(&rows, "/fast off"), FastAnswers::default());
+        }
+        let rows = screen(FOOTER_PLAN_API_KEY_MEASURED);
+        let s = read_screen(&rows).expect("a composer");
+        assert_eq!((s.mode, s.busy), (Some(Mode::Plan), false));
+        assert!(s.tags.is_empty(), "{:?}", s.tags);
+        assert_eq!(read(Some(&s)).fast, LightState::Off);
+    }
+
     /// SYNTHETIC SCREENS — assembled from the 2.1.283 vendor strings on the
     /// measured footer captures' geometry, NOT captured live (a live `/fast
     /// on` writes `fastMode` into the owner's shared settings). At idle the
@@ -1409,6 +1556,63 @@ mod tests {
             "  Turning fast mode on\u{2026}".to_owned(),
         ];
         assert_eq!(fast_answers(&applying, cmd), FastAnswers::default());
+    }
+
+    /// Claude opens every `Fast mode ON` answer with its fast-mode icon
+    /// (2.1.284: `${icon} Fast mode ON${model set to …} · <price>…` for
+    /// `/fast on`, `${icon} Kept Fast mode ON` for the picker), so the idle
+    /// ECHO's `⎿` row reads `↯ Fast mode ON · …`, and the transcript row
+    /// carries the icon in its colour. Both are read as the vendor reads its
+    /// own result: colour stripped, then the icon. NEGATIVE CONTROL: the
+    /// row's text does not open with the phrase, which the reader before
+    /// this took as no answer at all.
+    #[test]
+    fn a_fast_answer_led_by_claudes_icon_is_read() {
+        use FastAnswer::{On, OnModelMoved};
+        for (text, want) in [
+            (
+                "\u{21AF} Fast mode ON \u{00B7} model set to Opus 5.5 \u{00B7} $30/$150 per Mtok",
+                OnModelMoved,
+            ),
+            ("\u{21AF} Fast mode ON \u{00B7} $30/$150 per Mtok", On),
+            ("\u{21AF} Kept Fast mode ON", On),
+            (
+                "\u{1b}[38;2;255;106;0m\u{21AF}\u{1b}[39m Fast mode ON \u{00B7} $30/$150 per Mtok",
+                On,
+            ),
+        ] {
+            assert_eq!(fast_answer_of(text), Some(want), "{text:?}");
+            assert!(
+                !text.starts_with(aterm_phase::anchor("fast.on")),
+                "the control: the phrase is not first: {text:?}"
+            );
+        }
+        let rule = "\u{2500}".repeat(60);
+        let rows: Vec<String> = [
+            "\u{276F} /fast on",
+            "  \u{23BF}  \u{21AF} Fast mode ON \u{00B7} model set to Opus 5.5 \u{00B7} $30/$150 per",
+            "     Mtok",
+            "",
+            &rule,
+            "\u{276F} ",
+            &rule,
+            "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(
+            fast_answers(&rows, "/fast on"),
+            FastAnswers {
+                echoed: 1,
+                echo: Some(OnModelMoved),
+                notice: None,
+            },
+            "the idle echo's answer, icon first"
+        );
+        // Only the icon is taken off: another glyph before the phrase is
+        // still not an answer.
+        assert_eq!(fast_answer_of("\u{2605} Fast mode ON"), None);
     }
 
     #[test]

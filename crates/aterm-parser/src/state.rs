@@ -57,6 +57,33 @@ impl State {
     /// Total number of states (for table sizing).
     pub const COUNT: usize = 14;
 
+    /// Every state, in discriminant order (`State::ALL[s as usize] == s`).
+    pub const ALL: [State; State::COUNT] = [
+        State::Ground,
+        State::Escape,
+        State::EscapeIntermediate,
+        State::CsiEntry,
+        State::CsiParam,
+        State::CsiIntermediate,
+        State::CsiIgnore,
+        State::DcsEntry,
+        State::DcsParam,
+        State::DcsIntermediate,
+        State::DcsPassthrough,
+        State::DcsIgnore,
+        State::OscString,
+        State::SosPmApcString,
+    ];
+
+    /// The state whose [`State::name`] is `name`, or `None` for any other
+    /// string — how a state crosses a text wire (the seamless-update parser
+    /// carry, [`crate::ParserCarry`]) without a numeric discriminant a later
+    /// build might renumber.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<State> {
+        State::ALL.into_iter().find(|state| state.name() == name)
+    }
+
     /// Returns true if this is a ground state.
     #[inline]
     pub const fn is_ground(self) -> bool {

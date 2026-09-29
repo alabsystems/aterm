@@ -151,7 +151,7 @@ fn log_posture_is_neutral_not_denial() {
         "spawn",
         "os-network-sandbox",
         ContainmentMode::Containment,
-        "OS sandbox ACTUATED",
+        "OS sandbox applied",
     );
 
     let records = captured().lock().unwrap();

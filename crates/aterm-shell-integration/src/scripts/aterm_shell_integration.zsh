@@ -17,6 +17,10 @@
 # - A LOADER and a BODY (2026-09-26): the shell that is ALREADY RUNNING takes a newer
 #   build's integration at its next prompt, when the host that owns it points it there
 #   (see "THE LOADER" below)
+# - The tty settings, KEPT (2026-09-26): a raw-mode program that dies without restoring
+#   them no longer leaves Ctrl-C and Enter broken for every later command (`ttyctl -f`,
+#   with `stty`/`reset`/`tset` thawing it — see "The tty settings the shell keeps"
+#   below)
 #
 # Compatible with: zsh 5.0+
 
@@ -710,6 +714,141 @@ __aterm_mark_integration_rev() {
     __aterm_osc "633;P;AtermIntegration=${__aterm_body_rev}${__aterm_id_suffix_str}"
 }
 
+# ─── The tty settings the shell keeps (2026-09-26) ───
+#
+# THE DEFECT. zsh ADOPTS whatever terminal settings the last foreground job left
+# behind: when a job ends, an unfrozen zsh re-reads the tty and runs every later
+# command under what it found. A raw-mode program that dies without restoring
+# them — SIGKILLed, or exiting after `tty.setraw` without a `finally` — therefore
+# leaves every command after it with `-isig -iexten -icrnl -ixon -opost`: Ctrl-C
+# no longer interrupts anything (it arrives as a literal ^C byte), Enter sends a
+# bare CR that ends no line (`read x`, a password prompt: "hello^M", and only
+# Ctrl-J finishes it), and output staircases. The zle prompt itself looks fine —
+# zle sets its own modes to edit — which is why it reads as "Ctrl-C is broken in
+# this tab" and nothing else. Measured 2026-09-26 on zsh 5.9, this file sourced,
+# in a pty: a python `tty.setraw` child that died by SIGKILL, `os._exit(1)` or
+# `os._exit(0)`, and a node `setRawMode` child SIGKILLed (the Claude Code shape),
+# all left it; Ctrl-C sent 0.4 s into `sleep 3` ended it at 3.04–3.09 s. And it
+# was seen for real: a SIGKILLed Claude Code 2.1.283 in a headless aterm left the
+# integrated login zsh exactly so ("sleep STILL RUNNING 1s after ctrl+c",
+# `read x` returning `hello\r` only on Ctrl-J). The terminal-mode handback
+# (f7757d04b) repairs what the dead program told the TERMINAL; this is what it
+# told the TTY DRIVER, which only the shell that owns the tty can keep straight —
+# a repair from the pty master does not stick, because zsh re-applies the state
+# it adopted after the next job.
+#
+# THE FIX, in two parts, armed once per shell at the first prompt this body runs
+# (`__aterm_tty_arm`, from `__aterm_body_precmd`): after every rc file has had its
+# say, and — through the loader's body pointer — also in a shell that was already
+# running, possibly already broken, when this body reached it.
+#
+#  1. REPAIR FIRST: when the tty is in a dead raw program's state (ISIG off —
+#     every raw mode clears it, and nobody keeps it off at a prompt on purpose,
+#     since it disables Ctrl-C and Ctrl-Z), turn back on what raw modes turn off:
+#     `isig icanon iexten echo icrnl opost`. IXON is deliberately NOT touched: a
+#     raw mode clears it too, but so does a user's own `stty -ixon`, and which of
+#     the two cleared it cannot be told apart — so a deliberate `stty -ixon`
+#     survives. Freezing a tab that is already broken would lock the broken state
+#     in; that is why the repair comes first.
+#  2. FREEZE (`ttyctl -f`, zsh's own mechanism for exactly this): from now on the
+#     shell does not adopt a job's tty changes; it puts back what it had after
+#     every job, exactly — IXON included. Fork-free at every prompt. What a user
+#     changes ON PURPOSE must still stick, so `stty`, `reset` and `tset` become
+#     thin functions that thaw the tty, run the real command, and freeze what it
+#     left (`__aterm_tty_thaw_run`) — typed at the prompt, from an alias, or in a
+#     sourced file alike. What a freeze does undo is a change made by a CHILD
+#     process on its own (a script running `stty`, `command stty`, `/bin/stty`):
+#     `ttyctl -u` thaws for the rest of the shell.
+#
+# Measured with exactly this code (2026-09-26, zsh 5.9, pty): all five dying
+# children above leave `isig iexten icrnl ixon opost` and Ctrl-C ends `sleep 3`
+# in 0.46–0.54 s; `read -r x` ends on Enter; `stty -ixon` typed before the kill
+# survives it; a shell that was ALREADY broken when the body arrived is repaired
+# at that prompt and stays repaired across the next kill; `reset` still works.
+#
+# RESPECTING THE USER. The freeze and the wrappers are skipped — the shell keeps
+# zsh's adopting behaviour — when the user's rc defines ANY of `stty`, `reset`,
+# `tset` as a function or an alias: their definition would bypass the thaw, and a
+# frozen tty would then silently undo what it does. (That is also the way to keep
+# zsh's own behaviour on purpose; there is deliberately no environment switch —
+# the owner's rule of 2026-09-22 is one batteries-included default, not knobs.
+# `ttyctl -u` at a prompt thaws the tty for the rest of that shell.) Such a shell
+# still gets the repair: after every command that FAILED (status non-zero — a
+# SIGKILL is 137), one `stty -a` fork, and the repair only when the raw signature
+# is there. What that fallback cannot catch is a raw program that exits 0 without
+# restoring; the freeze catches that too.
+#
+# Kept across a live re-source: a newer body arriving through the pointer finds
+# the shell already armed and changes nothing about it.
+typeset -gi __aterm_tty_armed="${__aterm_tty_armed:-0}"
+typeset -gi __aterm_tty_frozen="${__aterm_tty_frozen:-0}"
+
+# The repair (part 1 above). One fork to read the tty, a second only when it is
+# in a dead raw program's state. Silent when stdin is not a terminal.
+__aterm_tty_repair() {
+    emulate -L zsh
+    local __aterm_tty_state=""
+    __aterm_tty_state="$(command stty -a 2>/dev/null)" || return 0
+    local -a __aterm_tty_words
+    __aterm_tty_words=(${=__aterm_tty_state})
+    (( ${__aterm_tty_words[(Ie)-isig]} )) || return 0
+    command stty isig icanon iexten echo icrnl opost 2>/dev/null
+    return 0
+}
+
+# Run a tty-changing command with the tty THAWED, so the shell adopts what it
+# leaves, then freeze that (part 2 above). `builtin`/`command` so no alias or
+# function of the user's, and not these wrappers themselves, is reached.
+#
+# The re-freeze MUST run on every way out, because `__aterm_tty_frozen` stays 1
+# and so keeps the fallback repair off: a wrapper that leaves the tty thawed
+# brings back the whole defect, silently, for the rest of the shell. Two ways out
+# skipped it until the review of 2026-09-26, both measured in a pty:
+#  - a user's `setopt err_return`: this function ran under the USER's options,
+#    so a failing command (`stty bogusflag`, a typo) returned before `ttyctl -f`.
+#    `ttyctl` then said "tty is not frozen" with `__aterm_tty_frozen=1`, and a
+#    raw child's `exit 1` left `-isig -iexten -icrnl -opost -ixon` (Ctrl-C into
+#    `sleep 3` took 3.03-4.04 s). `emulate -L zsh` closes that.
+#  - Ctrl-C while the command runs (`tset`'s "TERM = (unknown)?" question,
+#    `reset`'s pause): zsh abandons the rest of a function whose foreground child
+#    died by SIGINT, `emulate` or not. The `always` block runs on that path too.
+# The command's own status is still what the wrapper returns (130 for the ^C).
+__aterm_tty_thaw_run() {
+    emulate -L zsh
+    local -i __aterm_tty_rc=0
+    {
+        builtin ttyctl -u
+        command "$@"
+        __aterm_tty_rc=$?
+    } always {
+        builtin ttyctl -f
+    }
+    return $__aterm_tty_rc
+}
+
+# Once per shell, at the first prompt this body runs. The wrappers are spelled
+# with the `function` keyword: a user's alias for the name would otherwise be
+# expanded when a live body is parsed and define something else entirely.
+__aterm_tty_arm() {
+    emulate -L zsh
+    __aterm_tty_armed=1
+    __aterm_tty_repair
+    local __aterm_tty_name
+    for __aterm_tty_name in stty reset tset; do
+        (( ${+aliases[$__aterm_tty_name]} )) && return 0
+        if (( ${+functions[$__aterm_tty_name]} )) &&
+           [[ "${functions[$__aterm_tty_name]}" != *__aterm_tty_thaw_run* ]]; then
+            return 0
+        fi
+    done
+    function stty { __aterm_tty_thaw_run stty "$@"; }
+    function reset { __aterm_tty_thaw_run reset "$@"; }
+    function tset { __aterm_tty_thaw_run tset "$@"; }
+    builtin ttyctl -f
+    __aterm_tty_frozen=1
+    return 0
+}
+
 # precmd - runs before each prompt, from the loader's trampoline, which hands it
 # the status the command before it left.
 __aterm_body_precmd() {
@@ -717,6 +856,12 @@ __aterm_body_precmd() {
 
     # A waiting re-key first, so every mark this prompt emits carries it.
     __aterm_rekey_check
+
+    # The tty settings (see "The tty settings the shell keeps" above): armed once;
+    # after that, fork-free while frozen, and one probe after a failed command
+    # where the user's own definitions ruled the freeze out.
+    (( __aterm_tty_armed )) || __aterm_tty_arm
+    (( __aterm_tty_frozen || last_status == 0 )) || __aterm_tty_repair
 
     # The managed dirs, live (see "LIVE" above): one stat, one readdir, an assign
     # (or a rehash) only on a change.

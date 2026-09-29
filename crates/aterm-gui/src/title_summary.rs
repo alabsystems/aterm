@@ -250,7 +250,7 @@ impl Snapshot {
                     .filter(|text| !text.is_empty())
                     .unwrap_or_default();
                 (
-                    activity_state(block.state),
+                    block_activity(term, block),
                     block.exit_code,
                     command,
                     // A block's cwd is the OSC 7 URI path (`/C:/Users//x` on
@@ -633,7 +633,15 @@ fn shed_place<'a>(title: &str, description: &'a str) -> &'a str {
     // must not lose it. And only the LAST token: a `~` anywhere else
     // (`~/aterm`, `x~`) names some other directory and is not read as home.
     let at_home = state == description::READY && tokens.clone().next() == Some("~");
-    let names_place = at_home || tokens.any(|token| !token.is_empty() && token == place);
+    // A place with a SPACE in it is no single token: `C:\Program Files\Common
+    // Files\microsoft shared` still painted `· Ready in microsoft shared`
+    // (measured, 2026-09-27) beside siblings reading their path alone. A title
+    // that ENDS in the place, at a separator, names it too.
+    let ends_in_place = title
+        .strip_suffix(place)
+        .is_some_and(|before| before.is_empty() || before.ends_with(['/', '\\', ' ', ':']));
+    let names_place =
+        at_home || ends_in_place || tokens.any(|token| !token.is_empty() && token == place);
     if names_place { state } else { description }
 }
 
@@ -1769,37 +1777,72 @@ impl App {
     /// A changed deterministic description immediately fans out to every tab/window
     /// that labels the session; optional inference is merely queued behind it.
     pub(crate) fn note_title_activity(&mut self, session: u64) {
+        if self.observe_title_subject(session) {
+            self.refresh_title_presentation(session);
+        }
+        self.sync_settings_title_summary_health();
+    }
+
+    /// [`Self::note_title_activity`] without its chrome refresh: observe
+    /// `session`'s block and reconcile the settled-phase verdict, and return
+    /// whether the PRESENTED subject moved. For the two callers that refresh
+    /// this session's chrome themselves right after — the published-status
+    /// fan-out (`refresh_session_status_chrome`) and the title/cwd drift flush
+    /// (`flush_title_drift`) — so one pass carries the new subject and the
+    /// new title together instead of refreshing every labelling window twice.
+    ///
+    /// THOSE TWO CALLERS ARE WHAT A BACKGROUND TAB HAS. Its output wakes skip
+    /// the smart-title observation (`on_output_wake`'s visibility gate), so a
+    /// job that ended while its tab was in the background kept its
+    /// `· Running ping` for as long as the tab stayed quiet — measured on
+    /// 0.95.0 (2026-09-27): 90–145 s after `ping` returned, `status` saying
+    /// `phase=idle`, and re-selecting the tab changed nothing. Both edges fire
+    /// on the transition itself — the prompt's title/cwd write, and the phase
+    /// publish — so the phrase now clears in the same refresh that repaints
+    /// the title, background and active tabs alike.
+    pub(crate) fn observe_title_subject(&mut self, session: u64) -> bool {
         if !smart_titles_enabled(&self.config) {
             // This gate precedes both pool lookup and terminal locking. Disabled
             // smart titles cannot add parser-lock traffic, and an old contention
             // retry is retired immediately.
             self.title_summaries.observation_succeeded(session);
-            return;
+            return false;
         }
         let active = self
             .frontmost_window
             .and_then(|wid| self.focused_session_id(wid))
             == Some(session);
-        let changed = {
-            let Some(live) = self.pool.get(session) else {
+        let changed = match self.pool.get(session) {
+            None => {
                 self.title_summaries.observation_succeeded(session);
-                return;
-            };
-            let term = match live.term.try_lock() {
-                Ok(term) => term,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                // Another renderer/control/parser access won the mutex race. Defer
-                // through the event loop's deadline fold so a one-shot OSC/block
-                // transition is never lost, while UI latency still wins.
-                Err(std::sync::TryLockError::WouldBlock) => {
+                false
+            }
+            Some(live) => {
+                let term = match live.term.try_lock() {
+                    Ok(term) => Some(term),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                };
+                if let Some(term) = term {
+                    self.title_summaries.observation_succeeded(session);
+                    self.title_summaries.observe(
+                        session,
+                        &term,
+                        &self.config,
+                        active,
+                        Instant::now(),
+                    )
+                } else {
+                    // Another renderer/control/parser access won the mutex
+                    // race. Defer through the event loop's deadline fold so a
+                    // one-shot OSC/block transition is never lost, while UI
+                    // latency still wins. The verdict below takes no terminal
+                    // lock, so it is reconciled either way.
                     self.title_summaries
                         .defer_observation(session, Instant::now());
-                    return;
+                    false
                 }
-            };
-            self.title_summaries.observation_succeeded(session);
-            self.title_summaries
-                .observe(session, &term, &self.config, active, Instant::now())
+            }
         };
         // Reconcile the settled-phase decay against the CURRENT published
         // verdict on every observation, not only at publish edges: a session
@@ -1816,10 +1859,7 @@ impl App {
             .status(session)
             .is_some_and(crate::session_status::Status::settled_idle);
         let decayed = self.title_summaries.note_phase_settled(session, idle);
-        if changed || decayed {
-            self.refresh_title_presentation(session);
-        }
-        self.sync_settings_title_summary_health();
+        changed || decayed
     }
 
     pub(crate) fn poll_title_summaries(&mut self) {
@@ -2005,12 +2045,47 @@ fn activity_state(state: BlockState) -> ActivityState {
     }
 }
 
+/// The activity `block` reads as for the title: [`activity_state`], except
+/// that an `EnteringCommand` block whose cursor still sits EXACTLY on the
+/// command-start mark (OSC 133;B) has had nothing typed, so it is a shell at
+/// its prompt — [`ActivityState::Prompt`], never "Typing a command".
+///
+/// WHY THE CURSOR. `EnteringCommand` is the shell's state from the end of the
+/// prompt to the submit, so it is the steady state of EVERY idle prompt, and
+/// the command text itself arrives only at the submit (OSC 633;E). Read as
+/// "typing", it put `· Typing a command` on every new tab and split for
+/// ~250 ms with nothing typed, and on the active tab for seconds after every
+/// job — until the classifier's settled-idle verdict decayed it (measured on
+/// 0.95.0, 2026-09-27). The engine records the mark at the cursor, and every
+/// integration script writes it after the prompt text (a recorded Windows pwsh
+/// session reads `133;A`, `PS C:\…> `, `133;B` in one write, through ConPTY),
+/// so an untouched prompt leaves the cursor on the mark; a keystroke's echo
+/// moves it off, and erasing the line brings it back. No clock and no classifier
+/// verdict is involved, so a background tab no keystroke can reach reads the
+/// same as the one in front. Where the mark and the cursor disagree for any
+/// other reason (a reflow that re-wrapped the prompt) this is the old
+/// `Entering`, and the settled-idle decay still answers it.
+fn block_activity(term: &Terminal, block: &aterm_types::OutputBlock) -> ActivityState {
+    let state = activity_state(block.state);
+    if state != ActivityState::Entering {
+        return state;
+    }
+    let cursor = term.cursor();
+    let on_mark = block.command_start_col == Some(cursor.col)
+        && block.command_start_row == Some(term.grid().visible_to_absolute(cursor.row));
+    if on_mark {
+        ActivityState::Prompt
+    } else {
+        state
+    }
+}
+
 /// Allocation-free semantic key for the hot Output-wake gate. Terminal title/cwd/
 /// command bytes are hashed while borrowed; the bounded owned snapshot is built only
 /// when this key changes or an inference refresh is actually due.
 fn semantic_stamp(term: &Terminal) -> SemanticStamp {
     let block = term.current_block().or_else(|| term.all_blocks().last());
-    let state = block.map_or(ActivityState::Unknown, |block| activity_state(block.state));
+    let state = block.map_or(ActivityState::Unknown, |block| block_activity(term, block));
     let command = block
         .and_then(|block| block.commandline.as_deref())
         .unwrap_or_default();
@@ -2403,6 +2478,25 @@ mod tests {
             shed_place_already_in_title("C:\\Users\\x\\aterm", "Ready in aterm"),
             ""
         );
+        // A place with a space in it is named by a title that ENDS in it
+        // (measured: `… · Ready in microsoft shared`) — and only at a
+        // separator, so a title that merely ends in the same letters keeps
+        // the sentence.
+        assert_eq!(
+            shed_place_already_in_title(
+                "C:\\Program Files\\Common Files\\microsoft shared",
+                "Ready in microsoft shared"
+            ),
+            ""
+        );
+        assert_eq!(
+            shed_place_already_in_title("~/my notes", "Ready in my notes"),
+            ""
+        );
+        assert_eq!(
+            shed_place_already_in_title("~/unshared", "Ready in shared"),
+            "Ready in shared"
+        );
         // HOME is spelled `~`, never by its name: a prompt at home says the
         // place the description names, so an idle shell there is its title
         // alone like every other idle shell.
@@ -2511,8 +2605,12 @@ mod tests {
                 .send(b"SENSITIVE-TERMINAL-CONTEXT")
                 .expect_err("a revoked epoch must fail the request");
             assert!(error.is_revoked(), "{error:?}");
+            // Wait for the listener's whole read — it ends at the client's
+            // close, at once — a minute: a hang detector. A short wait was the
+            // weak side of this check, not its budget: one that ran out on a
+            // loaded machine read as an empty `seen`, and a leaked body passed.
             let seen = rx
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(std::time::Duration::from_secs(60))
                 .unwrap_or_default();
             assert!(
                 !seen.windows(26).any(|w| w == b"SENSITIVE-TERMINAL-CONTEXT"),
@@ -3907,16 +4005,19 @@ mod tests {
             .expect("front terminal")
             .term
             .clone();
-        // The shell sits at a prompt with command input open (OSC 133 A + B):
-        // the audit's exact stuck shape — block Entering, nothing typed.
+        // The shell sits at a prompt with command input open (OSC 133 A + B)
+        // and a half-typed, abandoned line: the audit's stuck shape — block
+        // Entering, its cursor off the command-start mark. (An untouched
+        // prompt is `Ready` on its own, with no verdict needed:
+        // `an_untouched_prompt_is_ready_and_typing_is_the_cursor_leaving_the_mark`.)
         term.lock()
             .unwrap()
-            .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+            .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\git st");
 
         // The classifier publishes Idle BEFORE any title observation exists.
         let evidence = Evidence {
-            pin: None,
             shell: Some(ShellEvidence::Entering),
+            completed_block: None,
             lifecycle: None,
             foreground_job: Some(false),
             activity: ActivitySample {
@@ -3957,9 +4058,10 @@ mod tests {
         let mut coordinator = Coordinator::new(None);
         let config = Config::default(); // builtin provider, descriptive titles on
         let mut term = Terminal::new(4, 40);
-        // OSC 133 A (prompt) then B (command input): the block is now
-        // EnteringCommand with no commandline, the audit's exact stuck shape.
-        term.process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+        // OSC 133 A (prompt) then B (command input), then a half-typed line:
+        // the block is EnteringCommand with no commandline and the cursor off
+        // the command-start mark — the audit's stuck shape.
+        term.process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\git st");
         coordinator.observe(7, &term, &config, true, Instant::now());
         assert_eq!(coordinator.activity(7, &config), Some("Typing a command"));
         let revision_before = coordinator.activity_revision(7);
@@ -3995,6 +4097,138 @@ mod tests {
         assert_eq!(coordinator.activity(7, &config), Some("Typing a command"));
         assert!(coordinator.note_phase_settled(7, true));
         assert_eq!(coordinator.activity(7, &config), Some("Ready"));
+    }
+
+    /// THE PHANTOM "Typing a command" (re-verification of 0.95.0, 2026-09-27):
+    /// `~\aterm · Typing a command` for ~250 ms after every new tab and split
+    /// with nothing typed, and for seconds on the active tab after every job,
+    /// until the classifier's settled-idle verdict decayed it. A prompt with
+    /// its cursor still on the command-start mark has had nothing typed, so it
+    /// is `Ready` with NO verdict at all — none is pushed anywhere in this
+    /// test, which is the state of a fresh tab (phase `starting`) and of a tab
+    /// whose job just ended (phase still `running` for the dwell). Typing is
+    /// the cursor leaving the mark; erasing the line is it coming back.
+    #[test]
+    fn an_untouched_prompt_is_ready_and_typing_is_the_cursor_leaving_the_mark() {
+        let mut coordinator = Coordinator::new(None);
+        let config = Config::default();
+        let mut term = Terminal::new(4, 40);
+        let prompt = b"\x1b]133;A\x1b\\PS C:\\> \x1b]133;B\x1b\\";
+        term.process(prompt);
+        coordinator.observe(7, &term, &config, true, Instant::now());
+        assert_eq!(
+            coordinator.activity(7, &config),
+            Some("Ready"),
+            "a fresh prompt with nothing typed is not typing"
+        );
+
+        // The first keystroke's echo moves the cursor off the mark.
+        term.process(b"l");
+        coordinator.observe(7, &term, &config, true, Instant::now());
+        assert_eq!(coordinator.activity(7, &config), Some("Typing a command"));
+        // Erasing it (PSReadLine/readline: BS, space, BS) brings it back.
+        term.process(b"\x08 \x08");
+        coordinator.observe(7, &term, &config, true, Instant::now());
+        assert_eq!(coordinator.activity(7, &config), Some("Ready"));
+
+        // A job runs and ends: the NEXT prompt is untouched, so the subject
+        // is the prompt's at once — not "Typing a command" until a verdict.
+        term.process(b"ls\r\n\x1b]633;E;ls\x1b\\\x1b]133;C\x1b\\a  b\r\n\x1b]133;D;0\x1b\\");
+        term.process(prompt);
+        coordinator.observe(7, &term, &config, true, Instant::now());
+        assert_eq!(coordinator.activity(7, &config), Some("Ready"));
+
+        // NEGATIVE CONTROL: the engine's own block state IS `EnteringCommand`
+        // here — the reading, not the terminal, is what changed.
+        assert_eq!(
+            term.current_block().map(|block| block.state),
+            Some(BlockState::EnteringCommand)
+        );
+    }
+
+    /// A BACKGROUND tab's finished job clears from its label in the refresh
+    /// that repaints its title, driving the REAL output arm. Measured on
+    /// 0.95.0 (2026-09-27): `~\aterm · Running ping` held for 90–145 s on an
+    /// idle background tab because its output wakes skip the smart-title
+    /// observation, and nothing else re-observed it. The prompt's title write
+    /// moves the drift epoch, and the drift flush now re-observes the block.
+    #[test]
+    fn a_background_tabs_finished_job_leaves_its_label_with_the_prompt() {
+        let mut app = crate::App::headless_for_test();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        // The shape of aterm's own pwsh integration: the prompt titles the tab
+        // with the cwd, the submit hook retitles it with the command line
+        // (`633;E`, `0;<line>`, `133;C`), and the next prompt titles it back.
+        term.lock().unwrap().process(
+            b"\x1b]0;~/aterm\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\ping x\r\n\
+              \x1b]633;E;ping x\x1b\\\x1b]0;ping x\x1b\\\x1b]133;C\x1b\\",
+        );
+        let t0 = Instant::now();
+        app.on_output_wake(0, t0);
+        assert_eq!(
+            app.title_summary_activity(0),
+            Some("Running ping"),
+            "fixture: the job is observed while its tab is in front"
+        );
+
+        // A second tab takes the front; session 0 is now a background tab.
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(1));
+        assert_eq!(app.focused_session_id(crate::WindowId(0)), Some(1));
+        assert!(
+            !app.is_visible_session(0),
+            "fixture: tab 0 is in the background"
+        );
+
+        // The job ends behind it: completion, the prompt's title, a new prompt.
+        term.lock().unwrap().process(
+            b"reply\r\n\x1b]133;D;0\x1b\\\x1b]0;~/aterm\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\",
+        );
+        app.on_output_wake(0, t0 + crate::DRIFT_REFRESH_MIN_INTERVAL * 2);
+        assert_eq!(
+            app.title_summary_activity(0),
+            Some("Ready"),
+            "the finished job's phrase must clear on the background tab"
+        );
+        // What the strip was last HANDED for that chip — written by the
+        // refresh itself, so this proves the repaint carried the new subject.
+        let label = app.windows[&crate::WindowId(0)]
+            .tab_chrome_titles
+            .get(&0)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            label, "~/aterm",
+            "the background chip repaints without the stale phrase"
+        );
+    }
+
+    /// ...and where no title moves (a shell that sets none, or
+    /// `ATERM_DISABLE_PROMPT_TITLES`), the phase publish is the edge: the
+    /// published-status fan-out re-observes the background tab's block.
+    #[test]
+    fn a_status_publish_re_observes_a_background_tabs_block() {
+        let mut app = crate::App::headless_for_test();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term.lock().unwrap().process(
+            b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\sleep 9\r\n\x1b]633;E;sleep 9\x1b\\\x1b]133;C\x1b\\",
+        );
+        app.note_title_activity(0);
+        assert_eq!(app.title_summary_activity(0), Some("Running sleep"));
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(1));
+        assert!(
+            !app.is_visible_session(0),
+            "fixture: tab 0 is in the background"
+        );
+
+        term.lock()
+            .unwrap()
+            .process(b"\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\");
+        app.refresh_session_status_chrome(0);
+        assert_eq!(
+            app.title_summary_activity(0),
+            Some("Ready"),
+            "the publish carries the finished job off the background tab"
+        );
     }
 
     /// Regression: a managed-runtime exit re-arms every session at `now`, so the

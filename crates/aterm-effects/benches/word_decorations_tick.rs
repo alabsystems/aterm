@@ -785,7 +785,6 @@ fn cfg_off() -> DecoConfig {
         profanity: false,
         feline: false,
         canine: false,
-        orca: false,
         emphasis: false,
         ink_enabled: false,
         ..DecoConfig::default()

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-winsign` — the `cargo winsign` alias. All parsing, dispatch and the
+//! `aterm-winsign` — the `targo --unverified winsign` alias. All parsing, dispatch and the
 //! exit code live in the library so the whole surface is testable; this stays
 //! thin forever.
 

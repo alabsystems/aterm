@@ -106,22 +106,37 @@
 
 extern crate alloc;
 
+use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ===========================================================================
 // Tripwires — the runtime half of the contract
 // ===========================================================================
 
-/// Bumped once per real evaluation of [`tripwire`].
-static EVALUATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Bumped once per real evaluation of [`tripwire`] ON THIS THREAD.
+    ///
+    /// Per thread, because the tests run in parallel and one of them —
+    /// `tripwires_are_live` — bumps it on purpose. A process-wide counter read
+    /// before and after cannot tell that legitimate bump from an evaluation:
+    /// it landed between another test's two reads and failed a merge-contract
+    /// run on 2026-09-28 (`consumer_forms_run_without_evaluating_anything`,
+    /// `left: before + 1`). A macro evaluates its arguments on the caller's
+    /// thread, so each test sees exactly its own.
+    static EVALUATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// This thread's evaluation count.
+fn evaluations() -> usize {
+    EVALUATIONS.with(Cell::get)
+}
 
 /// An identity function with an observable side effect.
 ///
 /// Placed in macro argument positions. If either shim ever evaluated its
 /// arguments, the counter would move.
 fn tripwire<T>(value: T) -> T {
-    EVALUATIONS.fetch_add(1, Ordering::SeqCst);
+    EVALUATIONS.with(|n| n.set(n.get() + 1));
     value
 }
 
@@ -354,11 +369,11 @@ mod wgpu_core_borrow_shape {
 /// claim about a counter that may simply be broken.
 #[test]
 fn tripwires_are_live() {
-    let before = EVALUATIONS.load(Ordering::SeqCst);
+    let before = evaluations();
     let value = tripwire("armed");
     assert_eq!(value, "armed");
     assert_eq!(
-        EVALUATIONS.load(Ordering::SeqCst),
+        evaluations(),
         before + 1,
         "the evaluation counter must move on a direct call, or every \
          'arguments were not evaluated' assertion below is vacuous"
@@ -379,11 +394,11 @@ fn tripwires_are_live() {
 /// Neither this shim nor upstream's empty backend evaluates an argument.
 ///
 /// Every arm of every macro, fired at both tripwires at once. The counter is
-/// read before and after so a concurrently-running test that legitimately calls
-/// `tripwire` cannot make this pass by accident.
+/// read before and after, and it is per thread, so a concurrently-running test
+/// that legitimately calls `tripwire` can neither pass nor fail it.
 #[test]
 fn macros_never_evaluate_their_arguments() {
-    let before = EVALUATIONS.load(Ordering::SeqCst);
+    let before = evaluations();
 
     // `scope!`, both arms, both implementations.
     profiling::scope!(tripwire(detonate()));
@@ -406,7 +421,7 @@ fn macros_never_evaluate_their_arguments() {
     crate::upstream_empty_impl::finish_frame!();
 
     assert_eq!(
-        EVALUATIONS.load(Ordering::SeqCst),
+        evaluations(),
         before,
         "a profiling macro evaluated its argument"
     );
@@ -420,13 +435,13 @@ fn macros_never_evaluate_their_arguments() {
 /// type-checked.
 #[test]
 fn consumer_forms_run_without_evaluating_anything() {
-    let before = EVALUATIONS.load(Ordering::SeqCst);
+    let before = evaluations();
 
     wgpu_api_queue::forms();
     wgpu_hal_backends::forms();
     wgpu_core_two_arg::forms();
 
-    assert_eq!(EVALUATIONS.load(Ordering::SeqCst), before);
+    assert_eq!(evaluations(), before);
 }
 
 /// The two borrowing call sites, run for real.

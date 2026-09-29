@@ -19,7 +19,7 @@
 //!   SPLASHES — the bead erupts to foam-white and the widest rings roll out
 //!   while it calms back down to still water.
 //!
-//! Text-safe by construction, mirroring [`crate::cursor_fireball`]: the block
+//! Text-safe by construction, mirroring [`crate::cursor_rainbow`]: the block
 //! FILL is returned for the renderer's `floor_cursor_fill` contrast floor (the
 //! cut-out glyph stays razor-sharp), and the bead/drips/rings are purely
 //! additive [`GlowQuad`] light with capped coverage. Like its siblings it is a
@@ -65,7 +65,7 @@ const RADIUS_MAX: f32 = 0.78;
 const COV_IDLE: f32 = 60.0;
 const COV_MAX: f32 = 148.0;
 /// Per-quad additive coverage ceiling — the same text-safety band as the
-/// fireball's (the readable-at-full-blaze live-review tuning). Inner discs
+/// light rod's (the readable-at-full-blaze live-review tuning). Inner discs
 /// saturate here (they sit over the cursor cell itself); the wide rim quads and
 /// ripple rings that actually overlap neighbouring glyphs run at a fraction of
 /// the core and stay a tint.
@@ -161,7 +161,7 @@ impl CursorDroplet {
         let e = (surge.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         // Fully inert — byte-identical to the plain themed cursor — when off, when
         // the geometry is degenerate, or when the amplitude is zero (reduced
-        // motion / load-shed), mirroring the fireball's "0 ⇒ off" contract.
+        // motion / load-shed), mirroring the rainbow block's "0 ⇒ off" contract.
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.surge = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);

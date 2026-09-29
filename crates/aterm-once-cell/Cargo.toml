@@ -25,7 +25,7 @@ name = "once_cell"
 # warning from cargo. Nothing else pins a `1.x` `once_cell` here — see
 # `[dev-dependencies]` for why this crate deliberately takes no oracle — so the
 # shim is the only candidate and every `^1.12`…`^1.21.4` consumer resolves to
-# it. `cargo forge check` fails the build if that ever stops being true.
+# it. `targo --unverified forge check` fails the build if that ever stops being true.
 version = "1.21.4"
 edition.workspace = true
 license.workspace = true
@@ -79,7 +79,7 @@ portable-atomic = []
 # `once_cell` is named in NO manifest anywhere in this repository — not in the
 # workspace, not under vendor/, tools/ or apps/, not in the separate
 # libc-oracle workspace — so nothing this patch row redirects was ever a
-# differential reference. `cargo forge check` reports [OB-15]'s OK arm ("no
+# differential reference. `targo --unverified forge check` reports [OB-15]'s OK arm ("no
 # patched package is held as a dev-dependency oracle"), not its NOTE and not
 # its FAIL.
 #

@@ -22,10 +22,7 @@ fn init_from_flag_uses_the_flag_over_default() {
     // Capabilities should match Safety policy.
     let caps =
         aterm_containment::ContainmentPolicy::capabilities(aterm_containment::current_mode());
-    assert_eq!(
-        caps.network,
-        aterm_containment::NetworkCapability::Allowlist
-    );
+    assert_eq!(caps.network, aterm_containment::NetworkCapability::Full);
     assert_eq!(
         caps.process,
         aterm_containment::ProcessCapability::Restricted

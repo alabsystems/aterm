@@ -1,0 +1,30 @@
+# codex 0.158.0 · HAND-BUILT 2026-09-28 from the vendor's own render of this box (openai/codex rust-v0.158.0 `tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__resume_paused_goal_prompt.snap`, the same at rust-v0.157.1: `show_resume_paused_goal_prompt`, drawn by `codex resume <thread>` with no prompt over a paused goal) with its strings as both store binaries hold them (`Resume paused goal?`, `Resume goal` [Mark it active and continue when idle], `Leave paused` [Keep it paused; use /goal resume later]) on the list-selection geometry MEASURED on 0.158.0's `/model` boxes (title and subtitle at column 2 over two blank rows, `› 1.` options at column 0, descriptions two columns past the longest label, `enter select · esc back` at column 2 as the last row) under a resumed conversation's last rows · no screen of this box was captured: it needs a paused goal taken back by `codex resume`
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• The parser's error recovery is tested and published; the next step is the lexer's recovery hooks.
+
+  Worked for 22m 18s · 9:17 AM
+
+
+  Resume paused goal?
+  Goal: Finish the parser's error recovery and publish it.
+
+
+› 1. Resume goal   Mark it active and continue when idle
+  2. Leave paused  Keep it paused; use /goal resume later
+
+  enter select · esc back

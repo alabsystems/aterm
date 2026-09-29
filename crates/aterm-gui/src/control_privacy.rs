@@ -58,6 +58,7 @@ use aterm_containment::consent::{
 use aterm_control::wire::{json_ok, json_str_field, pct_encode};
 use winit::event_loop::EventLoopProxy;
 
+use crate::control::control_media::MainHopError;
 use crate::{App, Wake};
 
 /// The TCC service classes a Full Disk Access grant is claimed — by Apple, not
@@ -846,7 +847,8 @@ pub(crate) struct PrivacySnapshot {
     folder_source: String,
     observer_fda: &'static str,
     observer_responsible: &'static str,
-    reset_command: Option<String>,
+    /// The `observer log=` token: `off` unless `[privacy] observer` asked.
+    observer_log: &'static str,
     /// Every bundle on disk claiming this process's `CFBundleIdentifier`
     /// (`aterm_containment::consent`, "The claimant census") and the answer's
     /// age. The only row about the TCC record rather than this process.
@@ -1015,13 +1017,10 @@ fn opt(value: Option<&str>) -> String {
     value.map_or_else(|| "-".to_string(), pct_encode)
 }
 
-/// The closing prose row. It states the two things a reader otherwise infers
-/// wrongly. Documented app-data coverage applies only to the scope named by
-/// this host's completed FDA observation, never to adopted sessions by inference.
-const NOTE: &str = "per-folder state is unknown by construction: reading a folder is the act \
-                    that raises the prompt; app-data coverage uses Apple's documented FDA rule \
-                    and the observed fda_scope; adopted-session access is not established, \
-                    so prompt_possible may remain yes";
+/// The closing prose row: what a `folder` value of `unknown` means, which a
+/// reader otherwise takes for a denial.
+const NOTE: &str =
+    "unknown means not observed, not denied: reading a folder is what raises the prompt";
 
 impl PrivacySnapshot {
     /// The census rows: a summary, then one line per CONFLICTING copy (at most
@@ -1065,18 +1064,24 @@ impl PrivacySnapshot {
         if !conflicting.is_empty() {
             // The same rule the panel's button is drawn from, so the note never
             // sends a reader to a button that is not there.
-            let remedy = if self.trash_tool && !census.offered_for_trash().is_empty() {
-                "Settings > Security lists it and offers to move the ad-hoc or unsigned \
-                 copies to the Trash"
+            let n = conflicting.len();
+            let (copies, them) = if n == 1 {
+                ("1 other copy of aterm is".to_string(), "it")
             } else {
-                "Settings > Security lists it"
+                (format!("{n} other copies of aterm are"), "them")
+            };
+            let remedy = if self.trash_tool && !census.offered_for_trash().is_empty() {
+                format!(
+                    "Settings \u{25b8} Security lists {them} and offers to move the ad-hoc or \
+                     unsigned ones to the Trash"
+                )
+            } else {
+                format!("Settings \u{25b8} Security lists {them}")
             };
             out.push(format!(
                 "note {}",
                 pct_encode(&format!(
-                    "another copy of this app on this disk has a different code requirement \
-                     under the same bundle id; macOS keeps ONE requirement per bundle id and \
-                     REPLACES it with whichever copy asks last, which resets the grant for \
+                    "{copies} signed differently; whichever asks macOS last resets access for \
                      every copy; {remedy}"
                 ))
             ));
@@ -1203,36 +1208,34 @@ impl PrivacySnapshot {
                 .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
         ));
         out.push(format!(
-            "observer fda={} responsible={} log=unavailable",
-            self.observer_fda, self.observer_responsible,
+            "observer fda={} responsible={} log={}",
+            self.observer_fda, self.observer_responsible, self.observer_log,
         ));
         out.push(format!(
-            "remediate fda={} files={} reset={}",
+            "remediate fda={} files={}",
             pct_encode("settings:Privacy_AllFiles"),
             pct_encode("settings:Privacy_FilesAndFolders"),
-            opt(self.reset_command.as_deref()),
         ));
         // A grant that cannot be VALIDATED is not a grant, and the rest of the
         // report cannot show it: `full_disk_access=` is the probe's answer, and
         // the probe gates on the exec-time path, which a swap leaves pointing
         // at a healthy new bundle. Say it in words, on its own row.
         if self.anchor.grant_unverifiable() {
+            let gone = if self.anchor == aterm_containment::ImageAnchor::Deleted {
+                "deleted"
+            } else {
+                "renamed"
+            };
             out.push(format!(
                 "note {}",
-                pct_encode(
-                    "the bundle this process was launched from is no longer at that name \
-                     (anchor=displaced|deleted), so macOS cannot build a code identity for it \
-                     and NO grant keyed to that identity can match — every consent decision \
-                     for this process and for the sessions it spawned falls back to asking. \
-                     Nothing in this report above measures that. Nor is the damage confined to \
-                     this process: macOS keeps ONE code requirement per bundle id, and a copy \
-                     it cannot match does not merely fail the check — it REPLACES that stored \
-                     requirement with its own and resets the grant for every copy sharing the \
-                     id. The claimants= row above is what measures THAT."
-                )
+                pct_encode(&format!(
+                    "the bundle this process started from was {gone}, so no grant can match \
+                     it: macOS asks again for everything, whatever full_disk_access= says, and \
+                     its requests clear access for every copy of aterm"
+                ))
             ));
         }
-        out.push(format!("note {NOTE}"));
+        out.push(format!("note {}", pct_encode(NOTE)));
         out
     }
 
@@ -1503,14 +1506,13 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         "\"observers\":{{{},{},{}}},",
         json_str_field("fda", snapshot.observer_fda),
         json_str_field("responsible", snapshot.observer_responsible),
-        json_str_field("log", "unavailable"),
+        json_str_field("log", snapshot.observer_log),
     );
     let _ = write!(
         body,
-        "\"remediate\":{{{},{},{}}},",
+        "\"remediate\":{{{},{}}},",
         json_str_field("fda", "settings:Privacy_AllFiles"),
         json_str_field("files", "settings:Privacy_FilesAndFolders"),
-        format_args!("\"reset\":{}", json_opt(snapshot.reset_command.as_deref())),
     );
     let _ = write!(body, "{}}}", json_str_field("note", NOTE));
     json_ok(&body)
@@ -1685,14 +1687,7 @@ impl App {
             trash_tool: crate::consent_retire::trash_tool_present(),
             observer_fda: observer_fda_value(probe.label),
             observer_responsible: observer_responsible_value(&answers),
-            // The reset recipe is built from the RUNNING bundle id, never a
-            // literal, so the dev channel can only ever name its own rows.
-            // With no bundle id there is no recipe: `-`, not a half-written
-            // command a reader could complete wrongly.
-            reset_command: identity
-                .bundle_id
-                .as_deref()
-                .map(|id| consent::tccutil_reset_command(id, Folder::Documents).join(" ")),
+            observer_log: self.privacy_observer_log(),
         };
         let lines = match form {
             PrivacyForm::Json => vec![cmd_privacy_json(&snapshot)],
@@ -2015,7 +2010,7 @@ pub(crate) fn cmd_privacy(rest: &str, proxy: &EventLoopProxy<Wake>) -> String {
 /// extend it, and failures preserve the latest honest Pending snapshot.
 fn finish_privacy_read(
     mut latest: PrivacyRead,
-    mut read: impl FnMut(Duration) -> Result<PrivacyRead, &'static str>,
+    mut read: impl FnMut(Duration) -> Result<PrivacyRead, MainHopError>,
     now: impl Fn() -> Instant,
     mut pause: impl FnMut(Duration),
 ) -> PrivacyRead {
@@ -2168,7 +2163,7 @@ mod privacy_read_tests {
             reply(FdaProbe::pending()),
             |_| {
                 reads.set(reads.get() + 1);
-                Err("event loop gone")
+                Err(MainHopError::Reason("event loop gone"))
             },
             || clock.get(),
             |delay| clock.set(clock.get() + delay),
@@ -2406,9 +2401,12 @@ pub(crate) fn cmd_await_consent(proxy: &EventLoopProxy<Wake>, session: u64, rest
             ConsentWaitDecision::TimedOut => return "OK timeout\n".to_string(),
             ConsentWaitDecision::Wait => {}
         }
-        std::thread::sleep(
+        if crate::control::caller_hung_up() {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
+        std::thread::sleep(crate::control::hangup_park(
             AWAIT_CONSENT_TICK.min(wait.deadline.saturating_duration_since(Instant::now())),
-        );
+        ));
     }
 }
 
@@ -2511,9 +2509,7 @@ mod tests {
             warmup_last_ms: None,
             observer_fda: "ok",
             observer_responsible: "ok",
-            reset_command: Some(
-                "/usr/bin/tccutil reset SystemPolicyDocumentsFolder com.aterm.aterm".to_string(),
-            ),
+            observer_log: "off",
         }
     }
 
@@ -2801,16 +2797,17 @@ mod tests {
         );
         let note = lines
             .iter()
-            .find(|l| l.starts_with("note another%20copy"))
+            .find(|l| l.contains("signed%20differently"))
             .expect("the conflicting census explains itself");
-        assert!(note.contains("REPLACES"), "{note}");
+        assert!(note.starts_with("note 2%20other%20copies"), "{note}");
+        assert!(note.contains("resets%20access"), "{note}");
         // The remedy is the panel's own rule, and it is the whole ending of the
         // note: offered here (the tool is present and an ad-hoc copy sits
         // beside a Developer-ID running one) …
-        let lists_only = pct_encode("every copy; Settings > Security lists it");
+        let lists_only = pct_encode("every copy; Settings \u{25b8} Security lists them");
         let offers = pct_encode(
-            "every copy; Settings > Security lists it and offers to move the ad-hoc or \
-             unsigned copies to the Trash",
+            "every copy; Settings \u{25b8} Security lists them and offers to move the ad-hoc \
+             or unsigned ones to the Trash",
         );
         assert!(note.ends_with(&offers), "{note}");
         // … and without the tool the note only says the panel lists it.
@@ -2819,7 +2816,7 @@ mod tests {
         let listed = without_tool
             .lines()
             .into_iter()
-            .find(|l| l.starts_with("note another%20copy"))
+            .find(|l| l.contains("signed%20differently"))
             .expect("the note");
         assert!(listed.ends_with(&lists_only), "{listed}");
         // … and with the tool but nothing offerable — the running copy is itself
@@ -2835,10 +2832,16 @@ mod tests {
         let listed = unstable
             .lines()
             .into_iter()
-            .find(|l| l.starts_with("note another%20copy"))
+            .find(|l| l.contains("signed%20differently"))
             .expect("the note");
         assert!(unstable.trash_tool, "the tool is present");
-        assert!(listed.ends_with(&lists_only), "{listed}");
+        assert!(listed.starts_with("note 1%20other%20copy%20of"), "{listed}");
+        assert!(
+            listed.ends_with(&pct_encode(
+                "every copy; Settings \u{25b8} Security lists it"
+            )),
+            "{listed}"
+        );
         // … and with the tool and a retirable copy that sits past the listed
         // rows: the panel offers only what it lists, so the note lists only.
         let mut past_the_rows = snap.clone();
@@ -2866,7 +2869,7 @@ mod tests {
         let listed = past_the_rows
             .lines()
             .into_iter()
-            .find(|l| l.starts_with("note another%20copy"))
+            .find(|l| l.contains("signed%20differently"))
             .expect("the note");
         assert!(
             listed.ends_with(&lists_only),
@@ -2896,7 +2899,7 @@ mod tests {
         assert!(
             !lines
                 .iter()
-                .any(|l| l.starts_with("claimant ") || l.starts_with("note another"))
+                .any(|l| l.starts_with("claimant ") || l.contains("signed%20differently"))
         );
     }
 
@@ -3476,6 +3479,18 @@ mod tests {
                         || l.starts_with("note ") && l.contains("NO%20grant")),
                 "{anchor:?}: {lines:?}"
             );
+            // It names which of the two happened, not both.
+            let gone = if anchor == ImageAnchor::Deleted {
+                "was%20deleted"
+            } else {
+                "was%20renamed"
+            };
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("note ") && l.contains(gone)),
+                "{anchor:?}: {lines:?}"
+            );
         }
 
         // The two non-faults never raise it: a dev run outside a bundle and a
@@ -3492,6 +3507,36 @@ mod tests {
                 "{benign:?} is not a fault"
             );
         }
+    }
+
+    /// The observer row reports the observer's own state (`off` by default,
+    /// never a fixed `unavailable`), the remediate row names only the two
+    /// Settings panes, and the closing note is pct-encoded like every other
+    /// free-text row.
+    #[test]
+    fn the_observer_remediate_and_note_rows_say_what_is_true() {
+        let lines = snapshot(1, FdaState::Denied, SpikeEvidence::UNMEASURED).lines();
+        assert!(
+            lines.contains(&"observer fda=ok responsible=ok log=off".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"remediate fda=settings:Privacy_AllFiles \
+                  files=settings:Privacy_FilesAndFolders"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(format!("note {}", pct_encode(NOTE)).as_str())
+        );
+        assert_eq!(
+            lines.last().expect("a note row").split(' ').count(),
+            2,
+            "one field after `note`"
+        );
     }
 
     /// The `--json` form carries the four sub-objects the contract names, is

@@ -35,6 +35,8 @@ struct FakeRepo {
     root: PathBuf,
     stage2: PathBuf,
     scratch: PathBuf,
+    /// The fixture's own HOME ([`common::checker_home`]).
+    home: PathBuf,
     /// The control socket the answering smoke's `aterm-gui` links to, held
     /// listening for the fixture's life.
     ctl_sock: PathBuf,
@@ -50,6 +52,8 @@ impl FakeRepo {
         for d in [&root, &stage2, &scratch] {
             fs::create_dir_all(d).expect("mkdir");
         }
+        let home = base.join("home");
+        common::checker_home(&home);
         fs::create_dir_all(root.join("tools/perf-arena")).expect("mkdir");
         fs::create_dir_all(root.join("scripts")).expect("mkdir");
         fs::create_dir_all(root.join("libc-oracle")).expect("mkdir");
@@ -61,12 +65,20 @@ impl FakeRepo {
             root,
             stage2,
             scratch,
+            home,
             ctl_sock,
             _listener,
         };
         me.script("tools/verify.sh", "exit 0");
         me.script("tools/grep_guard.sh", "echo 'GUARD: PASS'; exit 0");
         me.script("tools/license_check.sh", "echo 'LICENSE: PASS'; exit 0");
+        // The export content scan, by its stage's own name: a stand-in here,
+        // and the REAL scan over a real git tree in the tests of its own
+        // (`the_export_content_stage_…`).
+        me.script(
+            &format!("tools/{}", aterm_verify::stages::EXPORT_CONTENT_SCRIPT),
+            "echo 'EXPORT CONTENT: PASS — a stand-in'; exit 0",
+        );
         for name in aterm_verify::stages::DELIVERY_SUITES {
             me.script(&format!("tools/{name}"), "exit 0");
         }
@@ -82,6 +94,16 @@ impl FakeRepo {
             "exit 0",
         );
         me.script("tools/test-trust-contract-probe.sh", "exit 0");
+        for name in aterm_verify::stages::TRUST_LANE_SCRIPTS {
+            // The lane says what it verified on a `GATED:` line, which the stage
+            // reads; the self-test says nothing.
+            let body = if name == "trust-gate-all.sh" {
+                "echo 'GATED: 1 of 1 selected; not verified: none'; exit 0"
+            } else {
+                "exit 0"
+            };
+            me.script(&format!("tools/{name}"), body);
+        }
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
         me.script("libc-oracle/run.sh", "exit 0");
         // Every binary the gate builds and then DRIVES, from the stages' own
@@ -150,7 +172,15 @@ impl FakeRepo {
     /// for the cases that MEASURE a variable's effect instead of being at its
     /// mercy (`a_callers_job_count_caps_the_side_lane_child_it_reaches`).
     fn ctx_with(&self, mode: Mode, scope: Scope, tweak: impl FnOnce(&mut EnvSnapshot)) -> Ctx {
-        common::fixture_ctx(&self.root, &self.stage2, &self.scratch, mode, scope, tweak)
+        common::fixture_ctx(
+            &self.root,
+            &self.stage2,
+            &self.scratch,
+            &self.home,
+            mode,
+            scope,
+            tweak,
+        )
     }
 
     fn run(&self, mode: Mode, scope: Scope) -> (String, i32) {
@@ -173,12 +203,13 @@ impl Drop for FakeRepo {
 /// harness and the objc drivers' examples, named by the stages themselves.
 fn driven_stubs() -> Vec<String> {
     std::iter::once(stages::REDRAW_CONFORMANCE_BIN.to_string())
-        .chain(
-            stages::OBJC_DRIVER_EXAMPLES
-                .iter()
-                .map(|(_, example)| format!("examples/{example}")),
-        )
+        .chain(stages::OBJC_DRIVES.iter().map(|d| objc_stub(d.example)))
         .collect()
+}
+
+/// An objc driver's built example, under `target-drivers/debug/`.
+fn objc_stub(example: &str) -> String {
+    format!("examples/{example}")
 }
 
 /// The `=== … ===` headers, in the order they were printed.
@@ -533,7 +564,7 @@ fn a_burst_the_instance_mostly_refused_proves_no_wake_was_lost() {
 /// context; the toolbar's `3`: its watchdog, because a context menu that
 /// really popped would never return) as could-not-run that still fails the
 /// run — a headless box reading any of them as a pass would restore the
-/// identical silence in a new place.
+/// identical silence in a new place. The audit's `3` is a weaker PASS.
 ///
 /// The event drive is the one reading that differs: v0.72.0 died by `SIGABRT`
 /// on the first mouse move and the driver reproduces that shape, so its `3`
@@ -541,90 +572,78 @@ fn a_burst_the_instance_mostly_refused_proves_no_wake_was_lost() {
 /// could-not-run — the siblings' reading would file the crash under "decided
 /// nothing".
 ///
-/// The objc rows are macOS-only (their stages are planned there); the redraw
-/// row runs on every unix.
+/// One row per distinct reading: the redraw harness (every unix) and, on
+/// macOS, the objc drives stage through a plain driver, the audit, the
+/// toolbar and the event drive — every other objc driver passing, so the
+/// stage's verdict is that one driver's.
 #[test]
 fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
-    /// A driver outcome beyond `1` that is THE finding.
-    enum Finding {
+    /// A driver outcome beyond `1`.
+    enum Beyond {
         Exit(i32),
         /// A stand-in that dies by an untrapped signal. It dies by `SIGKILL`,
         /// not the v0.72.0 crash's `SIGABRT`: the ladder reads every signal
-        /// death alike (`objc_event_outcome(None)`), and a `SIGABRT` made macOS
-        /// write a crash report for the stub's shell on every run (grep_guard
-        /// B16).
+        /// death alike, and a `SIGABRT` made macOS write a crash report for
+        /// the stub's shell on every run (grep_guard B16).
         Signal,
+    }
+    /// What a [`Beyond`] outcome decides.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Reads {
+        Pass,
+        CouldNotRun,
+        Finding,
     }
     struct Row {
         id: StageId,
-        /// The label the stage's verdict line carries.
+        /// The label the driver's verdict line carries.
         label: &'static str,
         /// The driven binary, under `target-drivers/debug/`.
         stub: String,
-        /// Codes beyond `1` that decided nothing, and the word the line prints.
-        undecided: &'static [(i32, &'static str)],
-        /// Outcomes beyond `1` that are THE finding, and the word the line prints.
-        findings: &'static [(Finding, &'static str)],
+        /// Outcomes beyond `1`, what each decides, and the word the line prints.
+        beyond: &'static [(Beyond, Reads, &'static str)],
     }
     let mut rows = vec![Row {
         id: StageId::RedrawConformance,
         label: "aterm-redraw-conformance",
         stub: stages::REDRAW_CONFORMANCE_BIN.to_string(),
-        undecided: &[(2, "NOT RUN")],
-        findings: &[],
+        beyond: &[(Beyond::Exit(2), Reads::CouldNotRun, "NOT RUN")],
     }];
     if cfg!(target_os = "macos") {
         rows.extend([
             Row {
-                id: StageId::ObjcClassAudit,
-                label: "objc live-class audit",
-                stub: format!("examples/{}", stages::OBJC_CLASS_AUDIT_EXAMPLE),
-                undecided: &[(2, "NOT RUN")],
-                findings: &[],
+                id: StageId::ObjcDrives,
+                label: "objc_window_drive",
+                stub: objc_stub("objc_window_drive"),
+                beyond: &[(Beyond::Exit(2), Reads::CouldNotRun, "NOT RUN")],
             },
-            // A SEPARATE stage from the audit because it asks a separate
-            // question — the audit proves `WinitView` is shaped right, this
-            // proves it composes — and a separate stage is a separate exit code
-            // to misread.
+            // `3` is a PASS that claims less than `0`, in its own words.
             Row {
-                id: StageId::ObjcImeDrive,
-                label: "objc IME drive",
-                stub: format!("examples/{}", stages::OBJC_IME_DRIVE_EXAMPLE),
-                undecided: &[(2, "NOT RUN")],
-                findings: &[],
+                id: StageId::ObjcDrives,
+                label: "objc_live_class_audit",
+                stub: objc_stub("objc_live_class_audit"),
+                beyond: &[
+                    (Beyond::Exit(2), Reads::CouldNotRun, "NOT RUN"),
+                    (Beyond::Exit(3), Reads::Pass, "every registered row agrees"),
+                ],
             },
             // FOUR codes: the drive enters `-mouseDown:` IMPs directly, and a
             // hang reaching the ladder as a generic timeout would be a stage
             // that decided nothing while looking busy.
             Row {
-                id: StageId::ObjcToolbarDrive,
-                label: "objc toolbar drive",
-                stub: format!("examples/{}", stages::OBJC_TOOLBAR_DRIVE_EXAMPLE),
-                undecided: &[(2, "NOT RUN"), (3, "HUNG")],
-                findings: &[],
-            },
-            // THREE codes: no menu, no modal tracking loop to hang in.
-            Row {
-                id: StageId::ObjcWindowDrive,
-                label: "objc window drive",
-                stub: format!("examples/{}", stages::OBJC_WINDOW_DRIVE_EXAMPLE),
-                undecided: &[(2, "NOT RUN")],
-                findings: &[],
+                id: StageId::ObjcDrives,
+                label: "objc_toolbar_drive",
+                stub: objc_stub("objc_toolbar_drive"),
+                beyond: &[(Beyond::Exit(3), Reads::CouldNotRun, "HUNG")],
             },
             Row {
-                id: StageId::ObjcEventDrive,
-                label: "objc event drive",
-                stub: format!("examples/{}", stages::OBJC_EVENT_DRIVE_EXAMPLE),
-                undecided: &[(2, "NOT RUN")],
-                findings: &[(Finding::Exit(3), "ABORTED"), (Finding::Signal, "ABORTED")],
-            },
-            // The one the objc2 exit added reads exactly as the window drive.
-            Row {
-                id: StageId::ObjcBoundDrive,
-                label: "objc bound drive",
-                stub: format!("examples/{}", stages::OBJC_BOUND_DRIVE_EXAMPLE),
-                undecided: &[(2, "NOT RUN")],
-                findings: &[],
+                id: StageId::ObjcDrives,
+                label: "objc_event_drive",
+                stub: objc_stub("objc_event_drive"),
+                beyond: &[
+                    (Beyond::Exit(3), Reads::Finding, "ABORTED"),
+                    (Beyond::Signal, Reads::Finding, "ABORTED"),
+                ],
             },
         ]);
     }
@@ -640,10 +659,16 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
             .unwrap_or_else(|| panic!("{name}: the stage is planned"));
 
         repo.driver_stub(&row.stub, 0);
+        let r = stages::run_stage(&ctx, &spec);
         assert_eq!(
-            tally(&[stages::run_stage(&ctx, &spec)]),
+            tally(std::slice::from_ref(&r)),
             Tally::default(),
             "{name}: a clean driver leaves the run clean"
+        );
+        assert!(
+            r.render().contains(&format!("  ok    {name}: ")),
+            "{}",
+            r.render()
         );
 
         repo.driver_stub(&row.stub, 1);
@@ -655,36 +680,13 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
         );
         assert_eq!(t.could_not_run.len(), 0, "{name}");
 
-        for &(code, words) in row.undecided {
-            repo.driver_stub(&row.stub, code);
-            let r = stages::run_stage(&ctx, &spec);
-            let t = tally(std::slice::from_ref(&r));
-            assert_eq!(
-                t.could_not_run.len(),
-                1,
-                "{name}: exit {code} decided nothing"
-            );
-            assert_eq!(
-                t.gate_failures.len(),
-                0,
-                "{name}: …and is not a finding about the tree"
-            );
-            assert_eq!(t.skipped(), 0, "{name}: …and above all is not a quiet skip");
-            assert!(t.failed(), "{name}: so the run cannot end green");
-            assert!(
-                r.render().contains(&format!("  FAIL  {name}: {words}")),
-                "{}",
-                r.render()
-            );
-        }
-
-        for (finding, words) in row.findings {
-            let what = match finding {
-                Finding::Exit(code) => {
+        for (beyond, reads, words) in row.beyond {
+            let what = match beyond {
+                Beyond::Exit(code) => {
                     repo.driver_stub(&row.stub, *code);
                     format!("exit {code}")
                 }
-                Finding::Signal => {
+                Beyond::Signal => {
                     repo.driver_script(
                         &row.stub,
                         "echo 'stub about to die by a signal'; kill -KILL $$",
@@ -694,23 +696,78 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
             };
             let r = stages::run_stage(&ctx, &spec);
             let t = tally(std::slice::from_ref(&r));
+            let (tag, findings, undecided) = match reads {
+                Reads::Pass => ("ok  ", 0, 0),
+                Reads::CouldNotRun => ("FAIL", 0, 1),
+                Reads::Finding => ("FAIL", 1, 0),
+            };
             assert_eq!(
                 t.gate_failures.len(),
-                1,
-                "{name}: {what} is THE finding, not harness noise"
+                findings,
+                "{name}: {what} reads {reads:?}"
             );
             assert_eq!(
                 t.could_not_run.len(),
-                0,
-                "{name}: …and is never read as could-not-run"
+                undecided,
+                "{name}: {what} reads {reads:?}"
             );
-            assert!(t.failed(), "{name}: so the run cannot end green");
+            assert_eq!(
+                t.skipped(),
+                0,
+                "{name}: {what} is above all not a quiet skip"
+            );
+            assert_eq!(t.failed(), *reads != Reads::Pass, "{name}: {what}");
             assert!(
-                r.render().contains(&format!("  FAIL  {name}: {words}")),
+                r.render().contains(&format!("  {tag}  {name}: {words}")),
                 "{}",
                 r.render()
             );
         }
+        repo.driver_stub(&row.stub, 0);
+    }
+}
+
+/// THE OBJC DRIVES STAGE RUNS EVERY ROW, WHATEVER ONE ROW DID. A driver whose
+/// build failed and a driver that found a defect each leave their own rows,
+/// and every other driver still runs and says so.
+#[test]
+fn the_objc_drives_run_every_row_after_a_failure() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let [first, second, ..] = stages::OBJC_DRIVES;
+    let repo = FakeRepo::new();
+    repo.with_stage2(&format!(
+        "case \"$*\" in *{}*) {COMPILE_RED} ;; esac\nexit 0",
+        first.example
+    ));
+    repo.driver_stub(&objc_stub(second.example), 1);
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ObjcDrives)
+        .expect("planned");
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    let ladder = r.render();
+    assert_eq!(
+        t.gate_failures.len(),
+        2,
+        "the build and the finding: {ladder}"
+    );
+    assert!(
+        t.could_not_run.iter().any(|c| c.starts_with(&format!(
+            "{} — not run: the build above failed",
+            first.example
+        ))),
+        "{ladder}"
+    );
+    for drive in &stages::OBJC_DRIVES[2..] {
+        assert!(
+            ladder.contains(&format!("  ok    {}: ", drive.example)),
+            "{} ran after the failures: {ladder}",
+            drive.example
+        );
     }
 }
 
@@ -820,7 +877,8 @@ fn sh_quote(s: &str) -> String {
 /// A DRIVEN SUITE DRIVES THE BINARY ITS STAGE JUST BUILT — one law, end to end,
 /// for every row whose suite drives a binary its own stage builds (in place of
 /// a test per row since 2026-09-27): the sealed rung (`--full`), the atpkg
-/// end-to-end pack, and the foreground handback. Over a fixture whose driver
+/// end-to-end pack, the foreground handback and the render desync lane. Over a
+/// fixture whose driver
 /// writes a FRESH binary into the lane's dir, with a STALE one in
 /// `<root>/target/debug` — each suite's own fallback — and each suite
 /// resolving its binary as its harness or script does:
@@ -832,8 +890,8 @@ fn sh_quote(s: &str) -> String {
 ///
 /// Each row's NEGATIVE CONTROL is its suite run the way it ran before its row
 /// existed — alone, handed nothing — which drives the stale binary. Off macOS
-/// the handback is one named skip that builds nothing (its lane has been
-/// measured nowhere else).
+/// the handback and the render desync lane are each one named skip that builds
+/// nothing (neither lane has been measured anywhere else).
 #[test]
 fn every_driven_suite_drives_the_binary_its_stage_just_built() {
     struct Row {
@@ -868,6 +926,13 @@ fn every_driven_suite_drives_the_binary_its_stage_just_built() {
             build: "--unverified build -q -p aterm --bin aterm",
             bin: "aterm",
             suite: stages::FOREGROUND_HANDBACK_SUITE,
+        },
+        Row {
+            id: StageId::RenderDesync,
+            mode: Mode::Fast,
+            build: "--unverified build -q -p aterm --bin aterm",
+            bin: "aterm",
+            suite: stages::RENDER_DESYNC_SUITE,
         },
     ];
     for row in rows {
@@ -914,14 +979,21 @@ esac
                      echo \"suite $(\"$bin\")\" >> {tr}\nexit {suite_exit}"
                 ),
             );
-            repo.script(
-                &format!("tools/{}", stages::FOREGROUND_HANDBACK_SUITE),
-                &format!(
-                    "BIN={root}/target/debug/aterm\n\
-                     while [ $# -gt 0 ]; do case $1 in --binary) BIN=$2; shift 2 ;; *) exit 2 ;; esac; done\n\
-                     echo \"suite $(\"$BIN\")\" >> {tr}\nexit {suite_exit}"
-                ),
-            );
+            // The handback and render desync lanes take the binary the same
+            // way; each refuses an unknown argument with its own not-run code.
+            for (suite, not_run) in [
+                (stages::FOREGROUND_HANDBACK_SUITE, 2),
+                (stages::RENDER_DESYNC_SUITE, 3),
+            ] {
+                repo.script(
+                    &format!("tools/{suite}"),
+                    &format!(
+                        "BIN={root}/target/debug/aterm\n\
+                         while [ $# -gt 0 ]; do case $1 in --binary) BIN=$2; shift 2 ;; *) exit {not_run} ;; esac; done\n\
+                         echo \"suite $(\"$BIN\")\" >> {tr}\nexit {suite_exit}"
+                    ),
+                );
+            }
             fs::create_dir_all(repo.root.join("target/debug")).expect("shared target");
             repo.script(&format!("target/debug/{bin}"), "echo stale");
 
@@ -957,7 +1029,9 @@ esac
             let rendered = report.render();
             let measured = fs::read_to_string(&trace).expect("the trace");
             let result = tally(std::slice::from_ref(&report));
-            if row.id == StageId::ForegroundHandback && !cfg!(target_os = "macos") {
+            if matches!(row.id, StageId::ForegroundHandback | StageId::RenderDesync)
+                && !cfg!(target_os = "macos")
+            {
                 assert_eq!(measured, "", "{what}: {rendered}");
                 assert_eq!(result.skipped(), 1, "{what}: {rendered}");
                 assert!(!result.failed(), "{what}: {rendered}");
@@ -1412,6 +1486,7 @@ fn a_run_whose_every_red_main_already_has_claims_the_contract_against_main() {
             })
             .collect(),
         now,
+        nearest: None,
     });
 
     // The same lint at another line is another failure.
@@ -1485,6 +1560,7 @@ fn a_run_whose_every_red_main_already_has_claims_the_contract_against_main() {
             })
             .collect(),
         now,
+        nearest: None,
     });
     let t = tally(&sched::run_stages(&specs, lint(in_lib), |_, _| {}));
     let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &main_lib);
@@ -1550,6 +1626,7 @@ fn an_excused_compile_red_never_excuses_the_tests_it_kept_from_running() {
             })
             .collect(),
         now,
+        nearest: None,
     });
     let branch = run();
     let v = verdict_against(Mode::Fast, &Scope::workspace(), &branch, &main);
@@ -1602,6 +1679,7 @@ fn mains_reds(on_main: &Tally) -> aterm_verify::differential::Against {
             })
             .collect(),
         now,
+        nearest: None,
     })
 }
 
@@ -1627,9 +1705,9 @@ fn an_excused_build_red_never_excuses_the_drive_it_kept_from_running() {
     )];
     if cfg!(target_os = "macos") {
         cases.push((
-            StageId::ObjcWindowDrive,
-            format!("examples/{}", stages::OBJC_WINDOW_DRIVE_EXAMPLE),
-            stages::OBJC_WINDOW_DRIVE_EXAMPLE,
+            StageId::ObjcDrives,
+            objc_stub("objc_window_drive"),
+            "objc_window_drive",
         ));
     }
     for (id, driven, named) in cases {
@@ -1742,6 +1820,497 @@ fn an_excused_suite_red_never_excuses_the_checks_after_it() {
     );
 }
 
+/// A STAND-IN PUBLICATION ENGINE: the `bin/pub` functions
+/// `tools/export-content-scan.py` drives, each doing the least the real one
+/// does — the manifest's allowlist and `!` exclusions, `transforms.sh` sourced
+/// over the export, one line-numbered raw record per hit through
+/// `_adjudicate_forbidden`, a redacted report — so the STAGE is driven end to
+/// end, the real scan over a planted hit in a real git tree, on any machine.
+/// `tools/test-export-content-scan.sh` pins the scan against the real engine.
+const FAKE_ENGINE: &str = r##"import os, re, subprocess, sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+RUN_ERROR = 1000
+
+
+def say(msg):
+    print(f"== {msg}")
+
+
+def die(msg):
+    print(f"FAIL: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _pattern_lines(path):
+    if not path.exists():
+        return []
+    return [l.strip() for l in path.read_text().splitlines()
+            if l.strip() and not l.strip().startswith("#")]
+
+
+def manifest_specs(pub):
+    specs = []
+    for raw in (pub / "manifest.txt").read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            specs.append(":(exclude)" + line[1:] if line.startswith("!") else line)
+    return specs + [":(exclude)publish"]
+
+
+def materialize_from_commit(root, head, out, specs, inventory=None, label="manifest",
+                            allow_symlinks=True):
+    out.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, GIT_INDEX_FILE=str(out.parent / f".{out.name}.index"))
+    subprocess.run(["git", "-C", str(root), "read-tree", head], env=env, check=True)
+    paths = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", *specs], env=env,
+                           check=True, capture_output=True).stdout
+    subprocess.run(["git", "-C", str(root), "checkout-index", "-z", "--stdin",
+                    f"--prefix={out}/"], env=env, input=paths, check=True)
+    return [{"path": p} for p in paths.decode().split("\0") if p]
+
+
+def export_tree(root, head, out, specs):
+    exp = out / "export"
+    return exp, materialize_from_commit(root, head, exp, specs)
+
+
+def run_transforms(root, pub, out, exp, captured_commit):
+    env = dict(os.environ, ROOT=str(root), PUB=str(pub), OUT=str(out), EXPORT=str(exp))
+    script = 'set -euo pipefail; fail() { echo "FAIL: $*" >&2; exit 1; }; . "$PUB/transforms.sh"'
+    if subprocess.run(["bash", "-c", script], cwd=root, env=env).returncode != 0:
+        die("transforms failed")
+
+
+def reject_embedded_git_metadata(tree):
+    pass
+
+
+def org_rewrite(exp):
+    return []
+
+
+def check_symlinks(exp):
+    pass
+
+
+def _adjudicate_forbidden(tree, records):
+    return records, {}
+
+
+def scan_forbidden(tree, pub, out, label=""):
+    patterns = sorted(set(_pattern_lines(HERE / "baseline" / "forbidden-content.txt"))
+                      | set(_pattern_lines(pub / "forbidden-extra.txt")))
+    records = []
+    for path in sorted(p for p in tree.rglob("*") if p.is_file()):
+        rel = path.relative_to(tree).as_posix()
+        for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if any(re.search(p, line) for p in patterns):
+                records.append((f"{rel}:{number}:{line}",
+                                f"{rel}:{number}:[REDACTED] forbidden content", True))
+    records, _ = _adjudicate_forbidden(tree, records)
+    (out / "forbidden-hits.txt").write_text("".join(r + "\n" for _, r, _ in records))
+    say(f"GUARD FAIL: forbidden content ({len(records)} hits)" if records
+        else "guard ok: no forbidden content")
+    return not records
+
+
+def scan_private_refs(tree, out):
+    (out / "private-ref-hits.txt").write_text("")
+    return True
+
+
+def check_gitleaks_config(exp):
+    return True
+
+
+def scan_gitleaks(source, out, report_name, label=""):
+    return 0, out / report_name
+"##;
+
+/// The planted token, spelled in pieces so this file never carries it whole:
+/// the stand-in engine's baseline pattern is `PLANTED_[0-9]+`.
+fn planted(n: u32) -> String {
+    format!("{}_{n}", "PLANTED")
+}
+
+/// `git -C root …` for a fixture, with a fixture identity, which must pass.
+fn fixture_git(root: &Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+        ])
+        .args(args)
+        .status()
+        .expect("git runs");
+    assert!(st.success(), "git {args:?} in {}", root.display());
+}
+
+/// A FakeRepo that is also a git tree the REAL export content scan can judge:
+/// the scan copied in from this repository's `tools/`, a policy (`publish/`)
+/// selecting `src` and `.gitleaks.toml`, one clean committed file — and a
+/// stand-in engine ([`FAKE_ENGINE`]) beside it whose baseline has one pattern
+/// in one section, plus a stand-in `gitleaks` on the stage's PATH (the
+/// stand-in engine's gitleaks guard runs nothing). The context names the
+/// engine through `$PUBLICATION_ENGINE`, so the caller's own never leaks in.
+fn export_content_fixture() -> (FakeRepo, Ctx, PathBuf) {
+    let repo = FakeRepo::new();
+    let base = repo.root.parent().expect("the fixture base").to_path_buf();
+    let scan = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools")
+        .join(stages::EXPORT_CONTENT_SCRIPT);
+    let installed = repo.root.join("tools").join(stages::EXPORT_CONTENT_SCRIPT);
+    fs::copy(&scan, &installed).expect("copy the real scan into the fixture");
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let engine = base.join("engine");
+    fs::create_dir_all(engine.join("bin")).expect("mkdir");
+    fs::create_dir_all(engine.join("baseline")).expect("mkdir");
+    fs::write(engine.join("bin/pub"), FAKE_ENGINE).expect("write the stand-in engine");
+    fs::write(
+        engine.join("baseline/forbidden-content.txt"),
+        "# Planted tokens\nPLANTED_[0-9]+\n",
+    )
+    .expect("write the stand-in baseline");
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).expect("mkdir");
+    let gitleaks = bin.join("gitleaks");
+    fs::write(&gitleaks, "#!/bin/sh\nexit 0\n").expect("write");
+    fs::set_permissions(&gitleaks, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    for dir in ["publish", "src"] {
+        fs::create_dir_all(repo.root.join(dir)).expect("mkdir");
+    }
+    fs::write(
+        repo.root.join("publish/manifest.txt"),
+        "src\n.gitleaks.toml\n",
+    )
+    .expect("write");
+    fs::write(repo.root.join("publish/transforms.sh"), "").expect("write");
+    fs::write(
+        repo.root.join(".gitleaks.toml"),
+        "[extend]\nuseDefault = true\n",
+    )
+    .expect("write");
+    fs::write(repo.root.join("src/clean.rs"), "fn clean() {}\n").expect("write");
+    fixture_git(&repo.root, &["init", "-q", "-b", "main"]);
+    fixture_git(&repo.root, &["add", "publish", "src", ".gitleaks.toml"]);
+    fixture_git(&repo.root, &["commit", "-qm", "a clean tree"]);
+
+    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(":");
+    path.push(&ctx.path_env);
+    ctx.path_env = path;
+    ctx.child_env_add
+        .push(("PUBLICATION_ENGINE".into(), engine.clone().into_os_string()));
+    (repo, ctx, engine)
+}
+
+/// The export content stage alone, run: its report.
+fn export_content_report(ctx: &Ctx) -> Report {
+    let spec = plan::plan(ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ExportContent)
+        .expect("the export content scan is planned in the merge contract");
+    stages::run_stage(ctx, &spec)
+}
+
+/// THE EXPORT CONTENT SCAN, END TO END (2026-09-29): the real scan over a
+/// real git tree. A clean tree is `ok`; a planted hit — committed, or
+/// uncommitted work — FAILS the stage as a finding, each hit named at its
+/// SOURCE file:line with its pattern class (the pattern's own line and
+/// section), and the matched text appears nowhere in the ladder.
+#[test]
+fn the_export_content_stage_names_a_planted_hit_at_its_source_line_and_passes_a_clean_tree() {
+    let (repo, ctx, _engine) = export_content_fixture();
+    let clean = export_content_report(&ctx);
+    assert_eq!(
+        clean.outcomes().collect::<Vec<_>>(),
+        [(
+            aterm_verify::ladder::Outcome::Ok,
+            stages::EXPORT_CONTENT_SCRIPT
+        )],
+        "{}",
+        clean.render()
+    );
+    assert!(
+        clean.render().contains("EXPORT CONTENT: PASS"),
+        "{}",
+        clean.render()
+    );
+
+    fs::write(
+        repo.root.join("src/leak.rs"),
+        format!(
+            "fn a() {{}}\nfn b() {{}}\nconst T: &str = \"{}\";\n",
+            planted(7)
+        ),
+    )
+    .expect("write");
+    fixture_git(&repo.root, &["add", "src/leak.rs"]);
+    fixture_git(&repo.root, &["commit", "-qm", "a planted hit"]);
+    // …and one in uncommitted work, which the gate judges like every stage.
+    fs::write(
+        repo.root.join("src/draft.rs"),
+        format!("// {}\n", planted(8)),
+    )
+    .expect("write");
+
+    let red = export_content_report(&ctx);
+    let ladder = red.render();
+    let t = tally(std::slice::from_ref(&red));
+    assert_eq!(t.gate_failures.len(), 1, "{ladder}");
+    assert!(t.could_not_run.is_empty() && t.skips.is_empty(), "{ladder}");
+    for hit in [
+        "  src/leak.rs:3  forbidden content — Planted tokens (baseline/forbidden-content.txt:2)",
+        "  src/draft.rs:1  forbidden content — Planted tokens (baseline/forbidden-content.txt:2)",
+        "EXPORT CONTENT: FAIL",
+    ] {
+        assert!(ladder.contains(hit), "no `{hit}` in:\n{ladder}");
+    }
+    for secret in [planted(7), planted(8)] {
+        assert!(
+            !ladder.contains(&secret),
+            "the matched text was printed:\n{ladder}"
+        );
+    }
+}
+
+/// NO ENGINE, NO SCAN — AND NO PASS (2026-09-29). The patterns are the
+/// engine's, never copied here, so a machine with no engine checkout has
+/// nothing to scan with: the stage is a NAMED SKIP carrying the scan's own
+/// reason — never a finding about the tree, never a pass — and a run with it
+/// does not claim the merge contract.
+#[test]
+fn a_machine_without_the_publication_engine_skips_the_export_scan_by_name() {
+    let (repo, mut ctx, _engine) = export_content_fixture();
+    let nowhere = repo.root.parent().expect("base").join("no-engine");
+    ctx.child_env_add
+        .retain(|(k, _)| k.as_os_str() != std::ffi::OsStr::new("PUBLICATION_ENGINE"));
+    ctx.child_env_add.push((
+        "PUBLICATION_ENGINE".into(),
+        nowhere.clone().into_os_string(),
+    ));
+    let report = export_content_report(&ctx);
+    let t = tally(std::slice::from_ref(&report));
+    assert!(
+        t.gate_failures.is_empty() && t.could_not_run.is_empty(),
+        "{t:?}"
+    );
+    assert_eq!(t.skips.len(), 1, "{t:?}");
+    assert!(
+        t.skips[0].contains(&format!(
+            "NOT RUN — no publication engine checkout at {}",
+            nowhere.display()
+        )) && t.skips[0].contains("never a pass"),
+        "{t:?}"
+    );
+    let v = verdict(Mode::Fast, &Scope::workspace(), &t);
+    assert!(!v.claims_merge_contract, "{}", v.text);
+    assert!(!v.text.contains(MERGE_CONTRACT_SENTENCE), "{}", v.text);
+}
+
+/// THE SAME HITS AS MAIN ARE MAIN'S RED; A NEW ONE BLOCKS (2026-09-29). Each
+/// hit is a finding of its own, keyed by its source path and pattern class and
+/// never by its line (review of the stage): a branch whose export carries
+/// main's hits inherits them — after it added a clean file, after an edit
+/// above them moved every one, and after it cleared one of them — and a
+/// branch that adds a hit is a new failure.
+#[test]
+fn an_export_hit_main_already_has_is_inherited_and_a_new_one_blocks() {
+    use aterm_verify::verdict::verdict_against;
+    let (repo, ctx, _engine) = export_content_fixture();
+    fs::write(
+        repo.root.join("src/leak.rs"),
+        format!("// {}\nfn x() {{}}\n// {}\n", planted(1), planted(3)),
+    )
+    .expect("write");
+    fs::write(
+        repo.root.join("src/other.rs"),
+        format!("// {}\n", planted(4)),
+    )
+    .expect("write");
+    fixture_git(&repo.root, &["add", "src"]);
+    fixture_git(&repo.root, &["commit", "-qm", "main's red"]);
+    let on_main = stage_tally(&ctx, StageId::ExportContent);
+    assert_eq!(on_main.gate_failures.len(), 1, "{on_main:?}");
+    assert_eq!(
+        on_main.all_findings().count(),
+        3,
+        "one finding per hit: {on_main:?}"
+    );
+
+    fs::write(repo.root.join("src/more.rs"), "fn more() {}\n").expect("write");
+    fixture_git(&repo.root, &["add", "src/more.rs"]);
+    fixture_git(&repo.root, &["commit", "-qm", "a clean change"]);
+    let branch = stage_tally(&ctx, StageId::ExportContent);
+    let v = verdict_against(
+        Mode::Fast,
+        &Scope::workspace(),
+        &branch,
+        &mains_reds(&on_main),
+    );
+    assert_eq!(v.exit, exit::PASS, "{}", v.text);
+    assert!(v.text.contains("0 new, 3 inherited"), "{}", v.text);
+
+    // Every hit of leak.rs moved down two lines, and other.rs's is cleared.
+    fs::write(
+        repo.root.join("src/leak.rs"),
+        format!(
+            "fn a() {{}}\nfn b() {{}}\n// {}\nfn x() {{}}\n// {}\n",
+            planted(1),
+            planted(3)
+        ),
+    )
+    .expect("write");
+    fs::write(repo.root.join("src/other.rs"), "fn other() {}\n").expect("write");
+    let moved = stage_tally(&ctx, StageId::ExportContent);
+    let v = verdict_against(
+        Mode::Fast,
+        &Scope::workspace(),
+        &moved,
+        &mains_reds(&on_main),
+    );
+    assert_eq!(v.exit, exit::PASS, "{}", v.text);
+    assert!(v.text.contains("0 new, 2 inherited"), "{}", v.text);
+
+    // One more hit in leak.rs, where main has two: new.
+    fs::write(
+        repo.root.join("src/leak.rs"),
+        format!(
+            "// {}\nfn x() {{}}\n// {}\n// {}\n",
+            planted(1),
+            planted(3),
+            planted(5)
+        ),
+    )
+    .expect("write");
+    let more_of_mains = stage_tally(&ctx, StageId::ExportContent);
+    let v = verdict_against(
+        Mode::Fast,
+        &Scope::workspace(),
+        &more_of_mains,
+        &mains_reds(&on_main),
+    );
+    assert_eq!(v.exit, exit::FAILED, "{}", v.text);
+
+    fixture_git(&repo.root, &["checkout", "-q", "--", "src"]);
+    fs::write(
+        repo.root.join("src/more.rs"),
+        format!("// {}\n", planted(2)),
+    )
+    .expect("write");
+    let worse = stage_tally(&ctx, StageId::ExportContent);
+    let v = verdict_against(
+        Mode::Fast,
+        &Scope::workspace(),
+        &worse,
+        &mains_reds(&on_main),
+    );
+    assert_eq!(v.exit, exit::FAILED, "{}", v.text);
+    assert!(!v.claims_merge_contract, "{}", v.text);
+}
+
+/// AN ENGINE WHOSE API MOVED IS COULD NOT RUN, NEVER THE TREE'S FINDING
+/// (2026-09-29, review of the stage). The engine is a live checkout its
+/// owners commit to, and its functions have gained required parameters
+/// before (`run_transforms`' `captured_commit`). Measured by the review on
+/// this stand-in: `export_tree` given one more required parameter ended the
+/// scan in Python's own traceback, exit 1 — the code of a finding — and the
+/// stage failed the tree, never to be inherited. Now it is COULD NOT RUN,
+/// naming the call. So is a guard that raises.
+#[test]
+fn an_engine_whose_api_moved_is_could_not_run_never_a_finding() {
+    let (_repo, ctx, engine) = export_content_fixture();
+    for (what, from, to, says) in [
+        (
+            "a required parameter more",
+            "def export_tree(root, head, out, specs):",
+            "def export_tree(root, head, out, specs, captured):",
+            "export_tree() raised TypeError",
+        ),
+        (
+            "a guard that raises",
+            "def scan_private_refs(tree, out):\n",
+            "def scan_private_refs(tree, out):\n    raise OSError('the report moved')\n",
+            "scan_private_refs() raised OSError: the report moved",
+        ),
+    ] {
+        assert!(
+            FAKE_ENGINE.contains(from),
+            "{what}: the stand-in has no `{from}`"
+        );
+        fs::write(engine.join("bin/pub"), FAKE_ENGINE.replace(from, to)).expect("write");
+        let report = export_content_report(&ctx);
+        let t = tally(std::slice::from_ref(&report));
+        assert!(t.gate_failures.is_empty(), "{what}: {}", report.render());
+        assert_eq!(t.could_not_run.len(), 1, "{what}: {}", report.render());
+        assert!(
+            t.could_not_run[0].contains(says) && t.could_not_run[0].contains("could not be driven"),
+            "{what}: {t:?}"
+        );
+        assert!(
+            !report.render().contains("Traceback"),
+            "{what}: {}",
+            report.render()
+        );
+    }
+}
+
+/// THE SPY ON THE ENGINE'S ADJUDICATION IS TRANSPARENT (2026-09-29, review
+/// of the stage). It hard-coded `_adjudicate_forbidden(tree, records)` and
+/// three-field records, so either one changing raised inside the engine's
+/// forbidden scan and failed the tree. Here the engine calls it with one more
+/// argument and keeps its records as mappings: the scan passes both through
+/// untouched, reads the hits from the engine's redacted report instead, and
+/// names the planted hit at its line — a finding, as it is.
+#[test]
+fn the_adjudication_spy_passes_through_what_the_engine_changed() {
+    let (repo, ctx, engine) = export_content_fixture();
+    let drifted = FAKE_ENGINE
+        .replace(
+            "def _adjudicate_forbidden(tree, records):\n    return records, {}",
+            "def _adjudicate_forbidden(tree, records, label):\n    \
+             return [dict(raw=r, report=p) for r, p, _ in records], {}",
+        )
+        .replace(
+            "    records, _ = _adjudicate_forbidden(tree, records)\n    \
+             (out / \"forbidden-hits.txt\").write_text(\"\".join(r + \"\\n\" for _, r, _ in records))",
+            "    records, _ = _adjudicate_forbidden(tree, records, label)\n    \
+             (out / \"forbidden-hits.txt\").write_text(\"\".join(r[\"report\"] + \"\\n\" for r in records))",
+        );
+    assert!(
+        drifted.contains("_adjudicate_forbidden(tree, records, label)")
+            && drifted.contains("r[\"report\"]"),
+        "the stand-in's adjudication is not where this test looks for it"
+    );
+    fs::write(engine.join("bin/pub"), drifted).expect("write");
+    fs::write(
+        repo.root.join("src/leak.rs"),
+        format!("fn a() {{}}\n// {}\n", planted(6)),
+    )
+    .expect("write");
+    let report = export_content_report(&ctx);
+    let ladder = report.render();
+    let t = tally(std::slice::from_ref(&report));
+    assert_eq!(t.gate_failures.len(), 1, "{ladder}");
+    assert!(t.could_not_run.is_empty(), "{ladder}");
+    assert!(
+        ladder.contains(
+            "  src/leak.rs:2  forbidden content — Planted tokens (baseline/forbidden-content.txt:2)"
+        ),
+        "{ladder}"
+    );
+    assert!(!ladder.contains(&planted(6)), "{ladder}");
+}
+
 /// EVERY STAGE THAT DRIVES WHAT A BUILD LEAVES NAMES WHAT A FAILED BUILD KEPT
 /// FROM RUNNING (2026-09-27, fourth review) — the guard for the class the
 /// third review fixed at four sites and the fourth found at nine more. Every
@@ -1795,13 +2364,9 @@ fn every_stage_names_what_a_failed_build_kept_from_running() {
     }
     if cfg!(target_os = "macos") {
         for id in [
-            StageId::ObjcClassAudit,
-            StageId::ObjcImeDrive,
-            StageId::ObjcToolbarDrive,
-            StageId::ObjcWindowDrive,
-            StageId::ObjcEventDrive,
-            StageId::ObjcBoundDrive,
+            StageId::ObjcDrives,
             StageId::ForegroundHandback,
+            StageId::RenderDesync,
         ] {
             assert!(drove.contains(&id), "{id:?} not reached: {drove:?}");
         }

@@ -220,7 +220,22 @@ impl TerminalHandler<'_> {
 
             // --- Erase ---
             CsiHandler::EraseDisplay | CsiHandler::EraseLine => {
+                // A FULL clear (ED 2, or ED 0 from home) is the app repainting
+                // from scratch — counted for the resize journal's readers (ED 3
+                // erases only the history behind the screen). The cursor is
+                // read where the ED was issued; an ED moves none.
+                let full_clear = final_byte == b'J' && {
+                    let cursor = self.grid.cursor();
+                    super::super::resize_journal::is_full_clear(
+                        params.first().copied().unwrap_or(0),
+                        cursor.row,
+                        cursor.col,
+                    )
+                };
                 self.cursor_state().handle_erase(params, final_byte);
+                if full_clear {
+                    self.transient.full_clears = self.transient.full_clears.wrapping_add(1);
+                }
                 if final_byte == b'J' {
                     let mode = params.first().copied().unwrap_or(0);
                     // ED 3 (CSI 3 J) erases scrollback — clear shell integration
@@ -333,9 +348,18 @@ impl TerminalHandler<'_> {
             CsiHandler::BackwardTab => {
                 // CBT - Cursor Backward Tabulation
                 // CSI Ps Z - Move cursor backward Ps tab stops (default 1)
+                //
+                // The left margin binds a back tab only under ORIGIN MODE — the
+                // composition of VT510's CBT page ("the active position stays at
+                // column one") with its DECOM page ("the cursor cannot move
+                // outside of the margins"), and the gate xterm and Ghostty both
+                // implement. See `Grid::back_tab_margin`.
                 let n = params.first().copied().unwrap_or(1).max(1);
-                self.grid
-                    .back_tab_n_margin(n, self.modes.left_right_margin_mode);
+                self.grid.back_tab_n_margin(
+                    n,
+                    self.modes.left_right_margin_mode,
+                    self.modes.origin_mode,
+                );
             }
 
             CsiHandler::ForwardTab => {
@@ -492,8 +516,10 @@ impl TerminalHandler<'_> {
                 // Capability off: NO reply (an unsupporting terminal ignores the
                 // query), so apps fall back to legacy encoding — never a `?0u` ack.
                 // The answer is the kitty flag word alone: ConPTY win32-input-mode
-                // (DEC 9001) lives in `modes`, never in it, so an app under conhost
-                // still reads `?0u` until it pushes flags of its own.
+                // (DEC 9001) lives in `modes`, never in it. aterm-gui turns the
+                // capability off for every ConPTY-backed session
+                // (`spawn::apply_pty_keyboard_posture`: conhost drops CSI-u key
+                // reports), so an app under conhost gets no reply at all.
                 if self.modes.kitty_keyboard_enabled {
                     self.handle_kitty_keyboard_query(cap);
                 }

@@ -223,26 +223,34 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
 ];
 
 /// Built-in Cmd-* shortcuts hardcoded in `App::on_key` + its helpers, as
-/// (chord-string, human label). SINGLE source of truth: drives BOTH the shadow
-/// detector (diagnostics) AND the `--list-keybinds` built-in section, so the
-/// documented set cannot drift from detection. Each chord parses via `Chord::parse`
-/// (a test asserts it) in the SAME normalized (base-key + mods) space
-/// `Chord::from_event` produces, so a match here == a runtime interception. `cmd+=`
-/// and `cmd+shift+=` both map to Font Increase (zoom matches `=`|`+`, no shift gate).
+/// (chord-string, human label). SINGLE source of truth, with [`MENU_CMD_CHORDS`]
+/// beside it: drives BOTH the shadow detector (diagnostics) AND the
+/// `--list-keybinds` built-in section, so the documented set cannot drift from
+/// detection. Each chord parses via `Chord::parse` (a test asserts it) in the SAME
+/// normalized (base-key + mods) space `Chord::from_event` produces, so a match here
+/// == a runtime interception. `cmd+=` and `cmd+shift+=` both map to Increase Font
+/// Size (zoom matches `=`|`+`, no shift gate). A chord the menu bar also shows
+/// carries the menu row's words (a test holds them equal), except ⌘W: the row
+/// retitles itself Close Pane on a split tab, so the list names both effects.
 pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+c", "Copy"),
     ("cmd+v", "Paste"),
-    ("cmd+f", "Find"),
+    ("cmd+f", "Find…"),
     ("cmd+s", "Search Forward"),
     ("cmd+r", "Search Backward"),
     ("cmd+n", "New Window"),
-    ("cmd+t", "New Tab"),
-    ("cmd+w", "Close Tab"),
-    ("cmd+d", "Split Vertical"),
-    ("cmd+shift+d", "Split Horizontal"),
-    ("cmd+shift+l", "Open Session Ledger"),
-    ("cmd+shift+]", "Next Tab"),
-    ("cmd+shift+[", "Prev Tab"),
+    ("cmd+t", "New Terminal Tab"),
+    ("cmd+w", "Close Pane or Tab"),
+    ("cmd+q", "Quit aterm"),
+    ("cmd+shift+t", "Reopen Closed Tab"),
+    ("cmd+shift+n", "Move Tab to New Window"),
+    ("cmd+shift+m", "Move Tab to Next Window"),
+    ("cmd+shift+o", "Open Session in New Window"),
+    ("cmd+d", "Split Right"),
+    ("cmd+shift+d", "Split Down"),
+    ("cmd+shift+l", "Ledger for This Session"),
+    ("cmd+shift+]", "Show Next Tab"),
+    ("cmd+shift+[", "Show Previous Tab"),
     ("cmd+shift+enter", "Toggle Pane Zoom"),
     ("cmd+alt+left", "Focus Pane Left"),
     ("cmd+alt+right", "Focus Pane Right"),
@@ -253,10 +261,10 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     // `--list-keybinds` and `--validate-config`'s shadow detector read.
     ("cmd+down", "Scroll to Live"),
     ("cmd+up", "Scroll to Top"),
-    ("cmd+=", "Font Increase"),
-    ("cmd+shift+=", "Font Increase"),
-    ("cmd+-", "Font Decrease"),
-    ("cmd+0", "Font Reset"),
+    ("cmd+=", "Increase Font Size"),
+    ("cmd+shift+=", "Increase Font Size"),
+    ("cmd+-", "Decrease Font Size"),
+    ("cmd+0", "Actual Size"),
     ("cmd+1", "Switch to Tab 1"),
     ("cmd+2", "Switch to Tab 2"),
     ("cmd+3", "Switch to Tab 3"),
@@ -267,6 +275,36 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+8", "Switch to Tab 8"),
     ("cmd+9", "Switch to Tab 9"),
 ];
+
+/// The macOS menu bar's OTHER key equivalents: shortcuts `on_key` never sees,
+/// because AppKit hands a menu's key equivalent to the menu before the window
+/// gets the key. Listed by `--list-keybinds` and checked by the shadow detector
+/// on macOS only — no other platform has the menu bar. Each carries its menu
+/// row's words, and a test holds every menu key equivalent to one of these two
+/// tables.
+pub(crate) const MENU_CMD_CHORDS: &[(&str, &str)] = &[
+    ("cmd+,", "Settings…"),
+    ("cmd+o", "Open File in Editor…"),
+    ("cmd+a", "Select All"),
+    ("cmd+g", "Find Next"),
+    ("cmd+shift+g", "Find Previous"),
+    ("cmd+ctrl+f", "Enter Full Screen"),
+    ("cmd+shift+p", "Command Palette…"),
+    ("cmd+m", "Minimize"),
+];
+
+/// Whether this build has the macOS menu bar, whose key equivalents
+/// ([`MENU_CMD_CHORDS`]) are built-ins too.
+pub(crate) const MENU_BAR_CHORDS: bool = cfg!(target_os = "macos");
+
+/// Every built-in Cmd shortcut this build has, in `--list-keybinds` order:
+/// [`BUILTIN_CMD_CHORDS`], then [`MENU_CMD_CHORDS`] where `menu_bar` holds.
+pub(crate) fn builtin_cmd_chords(
+    menu_bar: bool,
+) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let menu: &'static [(&str, &str)] = if menu_bar { MENU_CMD_CHORDS } else { &[] };
+    BUILTIN_CMD_CHORDS.iter().chain(menu)
+}
 
 /// If `chord_str` names a built-in Cmd shortcut, return the built-in label it conflicts
 /// with (NOTE: macOS menu shortcuts are claimed by the menu, so the rule is shadowed BY
@@ -279,23 +317,31 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
 /// this always answers `None` there ([`builtin_shadow_label_when`]).
 #[must_use]
 pub(crate) fn builtin_shadow_label(chord_str: &str) -> Option<&'static str> {
-    builtin_shadow_label_when(chord_str, crate::app_input::HARDCODED_SUPER_CHORDS)
+    builtin_shadow_label_when(
+        chord_str,
+        crate::app_input::HARDCODED_SUPER_CHORDS,
+        MENU_BAR_CHORDS,
+    )
 }
 
-/// The testable core of [`builtin_shadow_label`] with the suite gate EXPLICIT.
+/// The testable core of [`builtin_shadow_label`] with both gates EXPLICIT.
 /// When the hardcoded Cmd/Super suite is compiled off (Linux — keyboard audit
 /// #4, `HARDCODED_SUPER_CHORDS`), `on_key` intercepts NONE of these chords, so
 /// nothing can be shadowed and every probe answers `None`: a `super+t` binding
 /// there is exactly the explicit rebind the audit promised, not a conflict —
 /// warning about it would tell a Linux user their working binding fights a
-/// built-in that does not exist on their build.
-fn builtin_shadow_label_when(chord_str: &str, suite_live: bool) -> Option<&'static str> {
+/// built-in that does not exist on their build. `menu_bar` adds the macOS
+/// menu's key equivalents ([`MENU_CMD_CHORDS`]).
+fn builtin_shadow_label_when(
+    chord_str: &str,
+    suite_live: bool,
+    menu_bar: bool,
+) -> Option<&'static str> {
     if !suite_live {
         return None;
     }
     let target = Chord::parse(chord_str).ok()?;
-    BUILTIN_CMD_CHORDS
-        .iter()
+    builtin_cmd_chords(menu_bar)
         .find(|(c, _)| Chord::parse(c).is_ok_and(|c| c == target))
         .map(|(_, label)| *label)
 }
@@ -533,6 +579,7 @@ impl Chord {
     /// trimmed; every segment but the LAST is a modifier and the last is the key.
     /// Returns `Err` (a human-readable reason) for an empty string, an unknown
     /// modifier/key, a duplicate or missing key, so the loader can warn + skip.
+    /// The reason never repeats the chord: every caller prints it beside it.
     pub fn parse(s: &str) -> Result<Chord, String> {
         let lower = s.trim().to_ascii_lowercase();
         if lower.is_empty() {
@@ -543,21 +590,21 @@ impl Chord {
         for seg in lower.split('+') {
             let seg = seg.trim();
             if seg.is_empty() {
-                return Err(format!("empty segment in {s:?}"));
+                return Err("write the + key as plus".to_string());
             }
             if key.is_some() {
                 // A token after the key segment means the key wasn't last.
-                return Err(format!("modifier after key in {s:?}"));
+                return Err("the key must come last".to_string());
             }
             if let Some(bit) = modifier_bit(seg) {
                 mods |= bit;
             } else if let Some(tok) = key_token(seg) {
                 key = Some(tok);
             } else {
-                return Err(format!("unknown chord segment {seg:?} in {s:?}"));
+                return Err(format!("unknown key or modifier {seg:?}"));
             }
         }
-        let key = key.ok_or_else(|| format!("chord {s:?} has no key"))?;
+        let key = key.ok_or_else(|| "no key".to_string())?;
         Ok(Chord { mods, key })
     }
 
@@ -1322,6 +1369,19 @@ mod tests {
         assert!(Chord::parse("cmd").is_err()); // modifier with no key
         assert!(Chord::parse("notakey").is_err()); // multi-letter non-named word
         assert!(Chord::parse("a+b").is_err()); // key not last
+        // The reasons, which callers print beside the chord they name.
+        for (chord, reason) in [
+            ("ctrl++", "write the + key as plus"),
+            ("ctrl+foo+x", "unknown key or modifier \"foo\""),
+            ("cmd", "no key"),
+            ("a+b", "the key must come last"),
+        ] {
+            assert_eq!(Chord::parse(chord), Err(reason.to_string()), "{chord}");
+        }
+        assert_eq!(
+            Chord::parse("ctrl+plus").map(|c| c.key),
+            Ok(KeyToken::Char('+'))
+        );
     }
 
     /// Action names parse, including the indexed `switch_tab_<n>` form (1..=9).
@@ -1965,8 +2025,69 @@ mod tests {
     /// Every BUILTIN_CMD_CHORDS chord string parses (drift/typo guard).
     #[test]
     fn builtin_cmd_chords_all_parse() {
-        for (chord, _label) in BUILTIN_CMD_CHORDS {
+        for (chord, _label) in builtin_cmd_chords(true) {
             assert!(Chord::parse(chord).is_ok(), "{chord} must parse");
+        }
+    }
+
+    /// Every key equivalent the menu bar shows is a built-in the list names and
+    /// the shadow detector knows — in the menu row's words — and the menu-only
+    /// table holds nothing else. `--list-keybinds` left out 13 of them (⇧⌘P,
+    /// ⌘Q, ⇧⌘T …), so a `[keybindings]` rule on one was silently dead with no
+    /// warning, and the shared chords went by other names (Split Vertical for
+    /// Split Right).
+    #[test]
+    fn every_menu_key_equivalent_is_a_listed_builtin_in_the_menus_words() {
+        use crate::menu::{MENU_MODEL, MenuAction, MenuEntry, MenuMods};
+        let lookup = |chord: &str, table: &[(&str, &'static str)]| {
+            let target = Chord::parse(chord).expect("a menu chord parses");
+            table
+                .iter()
+                .find(|(c, _)| Chord::parse(c).is_ok_and(|c| c == target))
+                .map(|(_, label)| *label)
+        };
+        let all: Vec<(&str, &'static str)> = builtin_cmd_chords(true).copied().collect();
+        let mut menu_chords = Vec::new();
+        for (label, action, key, mods) in MENU_MODEL
+            .iter()
+            .flat_map(|s| s.entries.iter())
+            .flat_map(MenuEntry::items)
+        {
+            if key.is_empty() {
+                continue;
+            }
+            let prefix = match mods {
+                MenuMods::Command => "cmd",
+                MenuMods::CommandShift => "cmd+shift",
+                MenuMods::CommandControl => "cmd+ctrl",
+                MenuMods::None => panic!("{label}: a key equivalent with no modifier"),
+            };
+            // AppKit's "+" equivalent is the `=` key (the zoom chords match both).
+            let key = if key == "+" { "=" } else { key };
+            let chord = format!("{prefix}+{key}");
+            let expected = if action == MenuAction::CloseTab {
+                "Close Pane or Tab"
+            } else {
+                label
+            };
+            assert_eq!(
+                lookup(&chord, &all),
+                Some(expected),
+                "{chord} ({label}) must be listed in the menu's words"
+            );
+            menu_chords.push(chord);
+        }
+        for &(chord, label) in MENU_CMD_CHORDS {
+            assert!(
+                menu_chords
+                    .iter()
+                    .any(|c| lookup(c, &[(chord, label)]).is_some()),
+                "{chord} ({label}) is no menu key equivalent"
+            );
+            assert!(
+                lookup(chord, BUILTIN_CMD_CHORDS).is_none(),
+                "{chord} is listed twice"
+            );
         }
     }
 
@@ -1975,21 +2096,44 @@ mod tests {
     /// so the mapping is asserted identically on every platform.
     #[test]
     fn builtin_shadow_label_maps_known_and_normalizes() {
-        assert_eq!(builtin_shadow_label_when("cmd+c", true), Some("Copy"));
         assert_eq!(
-            builtin_shadow_label_when("cmd+shift+]", true),
-            Some("Next Tab")
+            builtin_shadow_label_when("cmd+c", true, false),
+            Some("Copy")
         );
         assert_eq!(
-            builtin_shadow_label_when("cmd+1", true),
+            builtin_shadow_label_when("cmd+shift+]", true, false),
+            Some("Show Next Tab")
+        );
+        assert_eq!(
+            builtin_shadow_label_when("cmd+1", true, false),
             Some("Switch to Tab 1")
         );
         assert_eq!(
-            builtin_shadow_label_when("shift+cmd+]", true),
-            Some("Next Tab")
+            builtin_shadow_label_when("shift+cmd+]", true, false),
+            Some("Show Next Tab")
         );
-        assert_eq!(builtin_shadow_label_when("cmd+k", true), None);
-        assert_eq!(builtin_shadow_label_when("garbage++", true), None);
+        assert_eq!(builtin_shadow_label_when("cmd+k", true, false), None);
+        assert_eq!(builtin_shadow_label_when("garbage++", true, false), None);
+        // on_key's own Cmd-Shift chords and ⌘Q are built-ins everywhere the
+        // suite is live…
+        assert_eq!(
+            builtin_shadow_label_when("cmd+shift+t", true, false),
+            Some("Reopen Closed Tab")
+        );
+        assert_eq!(
+            builtin_shadow_label_when("cmd+q", true, false),
+            Some("Quit aterm")
+        );
+        // …the menu bar's key equivalents only where there is a menu bar.
+        assert_eq!(
+            builtin_shadow_label_when("cmd+shift+p", true, true),
+            Some("Command Palette…")
+        );
+        assert_eq!(builtin_shadow_label_when("cmd+shift+p", true, false), None);
+        assert_eq!(
+            builtin_shadow_label("cmd+shift+p").is_some(),
+            cfg!(target_os = "macos")
+        );
     }
 
     /// With the Cmd/Super suite compiled OFF (Linux — keyboard audit #4) NO
@@ -1998,8 +2142,8 @@ mod tests {
     /// is not there. The platform wrapper follows `HARDCODED_SUPER_CHORDS`.
     #[test]
     fn builtin_shadow_label_is_silent_when_the_suite_is_gated_off() {
-        assert_eq!(builtin_shadow_label_when("cmd+c", false), None);
-        assert_eq!(builtin_shadow_label_when("super+t", false), None);
+        assert_eq!(builtin_shadow_label_when("cmd+c", false, true), None);
+        assert_eq!(builtin_shadow_label_when("super+t", false, true), None);
         let expected = if crate::app_input::HARDCODED_SUPER_CHORDS {
             Some("Copy")
         } else {

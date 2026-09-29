@@ -120,6 +120,14 @@ const OPENS: &str = "Cmd-click opens";
 #[cfg(not(target_os = "macos"))]
 const OPENS: &str = "ctrl+click opens";
 
+/// The gesture while the program under the pointer tracks the mouse: a plain
+/// press goes to the program, and Option/Alt takes it back
+/// (`app_mouse::press_starts_selection`).
+#[cfg(target_os = "macos")]
+const OPENS_TRACKED: &str = "Cmd-Option-click opens";
+#[cfg(not(target_os = "macos"))]
+const OPENS_TRACKED: &str = "ctrl+alt+click opens";
+
 /// The lead-in for a link whose scheme `crate::is_safe_url` refuses. Saying
 /// "opens" there would be the caption's own small lie: the click is a no-op.
 const BLOCKED: &str = "blocked scheme";
@@ -376,7 +384,8 @@ pub(crate) fn caption(url: &str, max_cells: usize) -> Caption {
 ///
 /// `seam` draws the band's content-facing top edge (a bottom-anchored caption
 /// wants it; a caption flipped to the top row is already under the strip's own
-/// rule and does not).
+/// rule and does not). `tracking` says the program under the pointer tracks
+/// the mouse, so the lead-in names the gesture that still opens the link.
 ///
 /// `None` when the band is narrower than [`MIN_URL_CELLS`] leaves for the URL,
 /// or when the URL contributes no character at all. A row of the person's
@@ -388,6 +397,7 @@ pub(crate) fn caption_row(
     cols: usize,
     theme: Theme,
     seam: bool,
+    tracking: bool,
 ) -> Option<Vec<RenderCell>> {
     let body = cols.saturating_sub(MARGIN * 2);
     if body < MIN_URL_CELLS {
@@ -395,10 +405,12 @@ pub(crate) fn caption_row(
     }
     let c = chrome_band::band_colors(theme);
     let mut row = blank_row(cols, c.label, c.bar_bg, seam);
-    let lead = if crate::is_safe_url(url) {
-        OPENS
-    } else {
+    let lead = if !crate::is_safe_url(url) {
         BLOCKED
+    } else if tracking {
+        OPENS_TRACKED
+    } else {
+        OPENS
     };
     let with_lead = body.saturating_sub(lead.len() + GAP);
     let (url_col, url_cells) = if with_lead >= LEAD_IN_URL_CELLS {
@@ -435,8 +447,8 @@ pub(crate) fn caption_row(
     // stated that rule first and kept it inline; it now lives in `chrome_band` so
     // the paste banner and the find bar close their edges from the same three
     // lines (as the retired config-notice band did), and the message band closes
-    // its bottom edge with the twin, `seal_band_bottom`. See the module header
-    // for why the ink is the band's and not the text's.
+    // its bottom edge with the twin in `aterm_render::band` (`seal_stack`). See
+    // the module header for why the ink is the band's and not the text's.
     if seam {
         chrome_band::seal_band_top(&mut row, c.label);
     }
@@ -617,11 +629,12 @@ mod tests {
     fn the_painted_row_is_exactly_cols_wide_and_bolds_only_the_host() {
         let theme = Theme::default();
         for cols in [20usize, 40, 80, 200] {
-            let row =
-                caption_row("https://evil.example/steal", cols, theme, true).expect("a wide band");
+            let row = caption_row("https://evil.example/steal", cols, theme, true, false)
+                .expect("a wide band");
             assert_eq!(row.len(), cols, "cols={cols}");
         }
-        let row = caption_row("https://evil.example/steal", 80, theme, true).expect("a wide band");
+        let row =
+            caption_row("https://evil.example/steal", 80, theme, true, false).expect("a wide band");
         let text = text_of(&row);
         assert!(text.contains("https://evil.example/steal"), "{text:?}");
         assert!(text.contains(OPENS), "{text:?}");
@@ -632,8 +645,8 @@ mod tests {
             .collect();
         assert_eq!(bold, "evil.example");
         // Narrow: the hint goes, the destination stays.
-        let row =
-            caption_row("https://evil.example/steal", 26, theme, true).expect("a narrow band");
+        let row = caption_row("https://evil.example/steal", 26, theme, true, false)
+            .expect("a narrow band");
         let text = text_of(&row);
         assert!(!text.contains(OPENS), "{text:?}");
         assert!(text.contains("evil.example"), "{text:?}");
@@ -651,17 +664,17 @@ mod tests {
         // constant would follow it wherever it moved and assert nothing.
         for cols in 0..=11usize {
             assert!(
-                caption_row("https://evil.example/steal", cols, theme, true).is_none(),
+                caption_row("https://evil.example/steal", cols, theme, true, false).is_none(),
                 "cols={cols} leaves room for `\u{2026}ple\u{2026}` at best, which names \
                  no site, and must not take a row to paint it"
             );
         }
         // Twelve is the first width that shows a recognizable run of the host.
-        let row =
-            caption_row("https://evil.example/steal", 12, theme, true).expect("12 cells suffice");
+        let row = caption_row("https://evil.example/steal", 12, theme, true, false)
+            .expect("12 cells suffice");
         let seen: String = text_of(&row).chars().filter(|c| *c != ' ').collect();
         assert_eq!(seen, "…xample…", "{seen:?}");
-        let row = caption_row("https://evil.example/steal", 16, theme, true)
+        let row = caption_row("https://evil.example/steal", 16, theme, true, false)
             .expect("16 cells carry a run of the host");
         let text = text_of(&row);
         assert!(
@@ -670,7 +683,7 @@ mod tests {
         );
         // An EMPTY URL contributes no character at any width: the band would be
         // margins and nothing, so it declines the row however wide it is.
-        assert!(caption_row("", 200, theme, true).is_none());
+        assert!(caption_row("", 200, theme, true, false).is_none());
     }
 
     /// The seam is the band's content-facing EDGE, so it must run the whole
@@ -680,7 +693,8 @@ mod tests {
     #[test]
     fn the_seam_runs_unbroken_and_one_toned_across_every_cell_of_the_band() {
         let theme = Theme::default();
-        let row = caption_row("https://evil.example/steal", 80, theme, true).expect("a wide band");
+        let row =
+            caption_row("https://evil.example/steal", 80, theme, true, false).expect("a wide band");
         assert!(
             row.iter().all(|cell| cell.overline),
             "the seam breaks at columns {:?}",
@@ -713,7 +727,8 @@ mod tests {
         );
         // A caption flipped to the top row sits under the tab strip's own rule,
         // so it asks for no second one anywhere.
-        let row = caption_row("https://evil.example/steal", 80, theme, false).expect("a wide band");
+        let row = caption_row("https://evil.example/steal", 80, theme, false, false)
+            .expect("a wide band");
         assert!(row.iter().all(|cell| !cell.overline));
     }
 
@@ -740,8 +755,14 @@ mod tests {
                 c.value, c.label,
                 "{name}: two tones or there is no hierarchy to assert"
             );
-            let row = caption_row("https://google.com@evil.example/steal", 80, theme, true)
-                .expect("a wide band");
+            let row = caption_row(
+                "https://google.com@evil.example/steal",
+                80,
+                theme,
+                true,
+                false,
+            )
+            .expect("a wide band");
             let bright: String = row
                 .iter()
                 .filter(|cell| cell.fg == c.value)
@@ -778,7 +799,7 @@ mod tests {
             cap.host_text()
         );
         assert_eq!(cap.emphasis_text(), "evil.example");
-        let row = caption_row(&url, 64, Theme::default(), true).expect("a wide band");
+        let row = caption_row(&url, 64, Theme::default(), true, false).expect("a wide band");
         let bold: String = row
             .iter()
             .filter(|cell| cell.bold)
@@ -826,11 +847,34 @@ mod tests {
     /// does not promise a click will do anything.
     #[test]
     fn a_blocked_scheme_is_disclosed_without_promising_to_open_it() {
-        let row =
-            caption_row("file:///etc/passwd", 80, Theme::default(), true).expect("a wide band");
+        let row = caption_row("file:///etc/passwd", 80, Theme::default(), true, false)
+            .expect("a wide band");
         let text = text_of(&row);
         assert!(text.contains(BLOCKED), "{text:?}");
         assert!(!text.contains(OPENS), "{text:?}");
         assert!(text.contains("file:///etc/passwd"), "{text:?}");
+    }
+
+    /// While the program under the pointer tracks the mouse, a plain modifier
+    /// press goes to the program (`app_mouse::press_starts_selection`), so the
+    /// caption names the gesture that still opens the link.
+    #[test]
+    fn a_tracked_pane_names_the_gesture_that_still_opens_the_link() {
+        let row = caption_row(
+            "https://evil.example/steal",
+            80,
+            Theme::default(),
+            true,
+            true,
+        )
+        .expect("a wide band");
+        let text = text_of(&row);
+        assert!(text.contains(OPENS_TRACKED), "{text:?}");
+        assert!(!text.contains(OPENS), "{text:?}");
+        assert!(crate::app_mouse::press_starts_selection(true, true));
+        assert!(!crate::app_mouse::press_starts_selection(true, false));
+        let row = caption_row("file:///etc/passwd", 80, Theme::default(), true, true)
+            .expect("a wide band");
+        assert!(text_of(&row).contains(BLOCKED));
     }
 }

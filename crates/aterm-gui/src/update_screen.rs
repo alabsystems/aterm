@@ -742,8 +742,8 @@ impl UpdateState {
     fn detail(&self) -> Option<String> {
         if self.linux_host {
             // The ledger's own sentence names the version and the one next step — a
-            // download and the verb that installs it, an install and the window launch
-            // that finishes it, `aterm update enable` for a copy not enrolled — so a
+            // download and the verb that installs it, an install and the start of aterm
+            // (a window or a terminal session) that finishes it, `aterm update enable` for a copy not enrolled — so a
             // healthy page shows it alone. A failure's sentence names neither: only
             // beside one (or where there is no sentence) does the page add what the
             // headline names and the one step, and a copy that cannot update gets no
@@ -973,9 +973,9 @@ mod tests {
     /// The held download's ledger sentence (`aterm_update::linux`).
     const LINUX_HELD: &str = "aterm 0.5.15 is downloaded \u{2014} `aterm update apply` installs it (`[update] \
          auto_apply` is off)";
-    /// A replaced executable's ledger sentence while it waits for its first window.
-    const LINUX_PENDING: &str = "aterm 0.5.15 is installed \u{2014} launch an aterm window once \
-                                 to finish; existing sessions continue unchanged";
+    /// A replaced executable's ledger sentence while it waits for its first start.
+    const LINUX_PENDING: &str = "aterm 0.5.15 is installed \u{2014} the next aterm you start \
+                                 finishes it; existing sessions continue unchanged";
 
     #[test]
     fn linux_update_status_download_is_read_only_and_directs_manual_apply() {

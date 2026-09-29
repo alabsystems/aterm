@@ -99,6 +99,7 @@ impl Grid {
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
                 ring_extras: VecDeque::new(),
+                resize_undo: None,
                 generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows),
                 // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
@@ -125,6 +126,7 @@ impl Grid {
                         selection_damage: crate::SelectionDamage::None,
                         last_output_damage_abs: None,
                         last_resize_row_shift: 0,
+                        last_resize_shape: crate::ResizeShape::default(),
                         coordinates_invalidated: false,
                         row_band_moves: crate::RowBandMoves::default(),
                         pending_absolute_row_update: None,
@@ -214,6 +216,7 @@ impl Grid {
                 history_renumber_epoch: 0,
                 history_reveal_gen: 0,
                 ring_extras: VecDeque::new(),
+                resize_undo: None,
                 generations: GenerationTracker::new(),
                 absolute_row_counter: u64::from(rows).saturating_add(carried),
                 // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
@@ -240,6 +243,7 @@ impl Grid {
                         selection_damage: crate::SelectionDamage::None,
                         last_output_damage_abs: None,
                         last_resize_row_shift: 0,
+                        last_resize_shape: crate::ResizeShape::default(),
                         coordinates_invalidated: false,
                         row_band_moves: crate::RowBandMoves::default(),
                         pending_absolute_row_update: None,

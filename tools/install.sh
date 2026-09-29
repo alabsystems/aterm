@@ -4,14 +4,13 @@
 #
 # install.sh — the aterm install: the released aterm.app AND the `aterm`
 # command (ONE name on PATH; it fronts every verb — aterm help / ctl / pkg /
-# fleet / drive), in one command. Every release is ONE lean app: a ~27 MB
-# download, aterm opens immediately, and the ALab toolchain installs itself on
-# first launch with live progress. Flags only EXCLUDE. (--batteries — the
-# batteries-included DMG pair, seeded offline
-# from a sealed payload — was RETIRED 2026-08-26: no release cuts that pair
-# any more, and the bare aterm-<v>.dmg is the same lean app as the zip. The
-# flag is still parsed so an old command line fails loudly, exit 2, naming
-# its next act.)
+# fleet / drive), in one command. Every release is ONE lean app: aterm opens
+# immediately, and the ALab toolchain installs itself on first launch with live
+# progress. Flags only EXCLUDE. (--batteries — the batteries-included DMG pair,
+# seeded offline from a sealed payload — was RETIRED 2026-08-26: no release
+# cuts that pair any more, and the bare aterm-<v>.dmg is the same lean app as
+# the zip. The flag is still parsed so an old command line fails loudly, exit
+# 2, naming its next act.)
 #
 # The download source is the PUBLIC release repo (alabsystems/aterm; a run
 # from a checkout derives the slug from its Cargo.toml, ATERM_REPO_SLUG names
@@ -100,10 +99,10 @@
 # whatever app is installed, and the cargo fallback always builds the checkout.
 #
 # Usage:
-#   tools/install.sh                                  # the recommended install: ~27 MB
-#                                                     # download. aterm opens immediately;
-#                                                     # the ALab toolchain installs itself
-#                                                     # on first launch with live progress
+#   tools/install.sh                                  # the recommended install: aterm
+#                                                     # opens immediately; the ALab
+#                                                     # toolchain installs itself on
+#                                                     # first launch with live progress
 #   tools/install.sh --no-cli                         # exclude the `aterm` command
 #   tools/install.sh --no-app                         # exclude the app
 #   tools/install.sh --no-toolchain                   # lean zip, toolset excluded — and it
@@ -113,7 +112,9 @@
 #                                                     # value already there), so the app does not
 #                                                     # install the ALab toolset on its own — and
 #                                                     # an installed toolset gets no new member
-#   tools/install.sh --no-path                        # don't touch the shell profile
+#   tools/install.sh --no-path                        # skip this script's PATH block (the
+#                                                     # toolset still adds its own to an
+#                                                     # existing shell rc)
 #   tools/install.sh --version 0.5.0                  # pin the app release
 #   tools/install.sh --dry-run                        # print the whole install plan —
 #                                                     # elected release, asset + size,
@@ -155,7 +156,9 @@ On Linux the app is the signed `aterm` binary, which updates itself (aterm updat
   --no-cli          leave the `aterm` command alone
   --no-toolchain    skip the ALab toolset, and keep it skipped: writes
                     [packages] auto_install = false into ~/.config/aterm/aterm.toml
-  --no-path         leave your shell profile alone
+  --no-path         skip this script's PATH block (the toolset still adds its
+                    own to an existing shell rc; delete it and it stays deleted;
+                    `aterm pkg repair` puts it back)
   --version X.Y.Z   install that release instead of the latest
   --dry-run         print the plan and change nothing
   --uninstall       remove what install.sh installed
@@ -989,7 +992,7 @@ random_suffix() {
 
 # --- container election: which macOS release asset an install downloads -------
 # Every release is ONE lean app (2026-08-26). The LEAN container
-# (`aterm-<v>-mac.zip`, ~27 MB) is the default on EVERY CPU: aterm opens
+# (`aterm-<v>-mac.zip`) is the default on EVERY CPU: aterm opens
 # immediately, and the ALab toolchain installs itself on first launch — per
 # program, resumable, with live progress
 # (docs/DESIGN-streaming-batteries-2026-08-23.md §7). The bare `aterm-<v>.dmg`
@@ -1630,6 +1633,9 @@ cargo_build_pinned() { # <root>
 	fi
 }
 # <<< cargo-pin gate
+# PUBLIC BOUNDARY: the rustup lane in the block above is the PUBLIC snapshot's source
+# build (its export pins stock Rust; publish/transforms.sh). The dev tree builds with
+# the aterm-managed Trust targo only — tools/dev-app.sh refuses the rustup lane.
 
 # Does <name> parse as a rustup DIST toolchain, one `rustup toolchain install`
 # can fetch? rustup's grammar (`rustup help toolchain`, 1.29.1):

@@ -72,6 +72,16 @@
 //! * OB-6  no main-thread-reachable fn may call a registered unbounded sink
 //!   DIRECTLY (e.g. `reflow_scrollback_lines(..)`), bypassing the Terminal hop
 //!   entirely.
+//! * OB-22 ([`held_guard`]) the per-SITE half of the same class, reachability
+//!   aside: no shipped line of `crates/aterm-gui/src` or
+//!   `crates/aterm-control/src` does O(history) work (`.resize(` `.reflow(`
+//!   `.rewrap(` `.take_scrollback(` `.decompress(` `.hydrate(`
+//!   `.rebuild_index(`, `zstd`) while the `term` guard is held — through
+//!   `term_lock[_ui]`, a guard bound by `let` (typed, destructured, reborrowed,
+//!   paren-dereffed, reached through accessor hops, wrapped by rustfmt), or
+//!   aterm-control's `SessionHost::with_terminal[_mut]` closure. Until
+//!   2026-09-28 this was `tools/grep_guard.sh`'s L0 family, an awk walk with
+//!   planted fixtures; the fixtures are its unit cases now.
 //! * OB-7  LOCK-ORDER CENSUS ([`lock_order`], `run_lock_order_census`) — the
 //!   lock-graph sense of the RFC §2.1c L0-DEADLOCK entry: every
 //!   acquire-while-holding pair across the GUI-process crates, the global lock
@@ -97,6 +107,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+mod held_guard;
 mod lazy_init;
 mod lock_order;
 pub mod scan_set;
@@ -120,6 +131,34 @@ pub struct CensusOutcome {
     pub ok: bool,
     /// The complete diagnostic transcript (GREEN summary or `[OB-n]` failures).
     pub log: String,
+    /// Each registered STANDING FINDING this run re-detected, as the full block
+    /// the log carries — a real hazard kept on record, never a waiver. Only the
+    /// wasm-process and scope-cardinality censuses keep such a registry (both
+    /// empty today). Returned apart from `log` because the build gate shows a
+    /// GREEN build's reader only its `cargo:warning` lines, and forwards these
+    /// there: the transcript itself goes to stderr, which cargo prints only when
+    /// the build fails.
+    pub standing: Vec<String>,
+}
+
+impl CensusOutcome {
+    /// A census that found a violation.
+    pub(crate) fn red(log: String) -> Self {
+        Self {
+            ok: false,
+            log,
+            standing: Vec::new(),
+        }
+    }
+
+    /// A census whose every obligation held, with no standing finding.
+    pub(crate) fn green(log: String) -> Self {
+        Self {
+            ok: true,
+            log,
+            standing: Vec::new(),
+        }
+    }
 }
 
 /// The honest limits of the walker, printed verbatim in every RED diagnostic
@@ -135,7 +174,8 @@ pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of th
         can evade it; the realistic regression — reverting an offloaded resize
         to a synchronous `term_lock(..).resize(..)` on a main-thread path — is
         caught, with the reachability path printed.
-      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` ONLY —
+      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` ONLY
+        (OB-22's per-site walk adds `crates/aterm-control/src`) —
         test/bench FILES dropped by path, and in-file items whose `cfg` gate
         ENTAILS `test`/`kani` (`all(test, ..)` yes; `any(test, unix)` and
         `not(test)` no) blanked before segmentation, so a gate that does not
@@ -908,7 +948,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     let mut failures = 0usize;
     let _ = writeln!(
         log,
-        "=== gate mainloop (main-loop completeness census: L0 freeze CLASS) ===\n\
+        "=== main-loop census (L0 freeze class) ===\n\
          \x20   root: {}",
         root.display()
     );
@@ -927,9 +967,9 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
                  determine the aterm-gui process closure from the workspace manifests, so \
                  it refuses to sweep a guessed marker scope (fail-closed).\n\
                  \x20       {e}\n\
-                 gate mainloop: FAILED — 1 obligation violation(s)."
+                 main-loop census: FAILED — 1 obligation violation(s)."
             );
-            return CensusOutcome { ok: false, log };
+            return CensusOutcome::red(log);
         }
     };
     let _ = writeln!(
@@ -1071,10 +1111,10 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             log,
             "  ✗ FAIL [OB-2] no MAIN_THREAD_ROOTS resolved — the census walked nothing \
              (parser broke, or this root is not an aterm checkout?).\n\
-             gate mainloop: FAILED — {} obligation violation(s).",
+             main-loop census: FAILED — {} obligation violation(s).",
             failures + 1
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
     while let Some(cur) = queue.pop_front() {
         for callee in &edges[cur] {
@@ -1164,6 +1204,46 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         }
     }
 
+    // [OB-22] No unbounded work under a held `term` guard at ANY shipped site
+    // of the GUI's code, reachable from a root or not (see `held_guard`).
+    let held = match held_guard::scan_tree(root) {
+        Ok(scan) => {
+            if scan.acquires == 0 {
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-22] the held-guard walk read {} file(s) and saw ZERO `term` \
+                     acquires — a blind walk, not a clean one (renamed acquire, or a parser \
+                     regression).",
+                    scan.files
+                );
+                failures += 1;
+            }
+            for f in &scan.findings {
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-22] L0 OBLIGATION VIOLATED — unbounded work while the \
+                     per-session `term` guard is held.\n\
+                     \x20   SITE:  {}\n\
+                     \x20   LINE:  {}",
+                    f.span, f.line
+                );
+                append_why_and_repair(&mut log);
+                failures += 1;
+                hazard_hits += 1;
+            }
+            Some((scan.files, scan.acquires))
+        }
+        Err(e) => {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-22] the held-guard walk could not run: {e} (scope: {}).",
+                held_guard::HELD_GUARD_SCOPE.join(", ")
+            );
+            failures += 1;
+            None
+        }
+    };
+
     // [OB-4] The offload boundary must still hold the line somewhere in the GUI.
     if offload_sites == 0 {
         let _ = writeln!(
@@ -1184,15 +1264,15 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         let _ = writeln!(
             log,
             "gate mainloop: FAILED — {failures} obligation violation(s) ({hazard_hits} \
-             main-thread-reachable unbounded-work site(s)). This census blocks BOTH \
+             unbounded-work site(s)). This census blocks BOTH \
              `targo --unverified run -p aterm-census -- --mainloop` and the build of \
              tools/freeze-safety-gate."
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
     let _ = writeln!(
         log,
-        "gate mainloop: GREEN — {} fn(s) walked from {roots_found} main-thread root(s); \
+        "main-loop census: GREEN — {} fn(s) walked from {roots_found} main-thread root(s); \
          no synchronous reach to an UNBOUNDED sink; {offload_sites} offload boundary call(s) \
          ({}) hold the line; {} sink(s) marked + registered; {} boundaries defined + \
          justified; {} out-of-closure marker(s) reported.",
@@ -1202,6 +1282,13 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         OFFLOAD_ALLOWLIST.len(),
         out_markers.len(),
     );
+    let (held_files, held_acquires) = held.unwrap_or_default();
+    let _ = writeln!(
+        log,
+        "    [OB-22] no unbounded work under a held `term` guard: {held_files} file(s) of {} \
+         read, {held_acquires} acquiring line(s).",
+        held_guard::HELD_GUARD_SCOPE.join(" + ")
+    );
     let _ = writeln!(
         log,
         "    scope: lexical name-based walk of crates/aterm-gui/src + one term_lock hop; \
@@ -1209,7 +1296,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
          (precision limits: docs/temporal-safety-gate.md).",
         scan.scan_dirs.len()
     );
-    CensusOutcome { ok: true, log }
+    CensusOutcome::green(log)
 }
 
 fn allowlist_symbols() -> Vec<&'static str> {
@@ -1394,6 +1481,11 @@ mod tests {
                 "crates/aterm-grid/src/grid/scrollback_offload.rs".to_string(),
                 "pub fn reattach_reflowed_scrollback() {}\n".to_string(),
             ),
+            // OB-22's second scope directory.
+            (
+                "crates/aterm-control/src/lib.rs".to_string(),
+                "// stub\n".to_string(),
+            ),
         ]
     }
 
@@ -1452,7 +1544,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "expected GREEN, got:\n{}", out.log);
         assert!(
-            out.log.contains("gate mainloop: GREEN"),
+            out.log.contains("main-loop census: GREEN"),
             "log:\n{}",
             out.log
         );

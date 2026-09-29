@@ -838,9 +838,6 @@ pub enum DecoGlyph {
     Plus,
     /// A cat's paw print (the feline mark).
     Paw,
-    /// A water droplet / teardrop (the orca "splash" mark): a round bulb low in the
-    /// cell tapering to a point at the top.
-    Droplet,
     /// An annulus-arc ring segment filling the cell (Sparkle Words v2, the
     /// SINGULARITY nova's darkening ring): the supernova's additive streams can
     /// only brighten (`nova_add` is One/One), so the magic Singularity variant's
@@ -2511,7 +2508,10 @@ impl Clone for RenderInput {
 
 /// Content equality for the per-row inline-image placements (the `images`
 /// clause of [`RenderInput`]'s `PartialEq`), with cross-`Arc` payload verdicts
-/// memoized per CALL (IMG-1).
+/// memoized per CALL (IMG-1). CONTENT: column, tile and payload — the derived
+/// `ImageRef` equality minus `ImageRef::kitty`, the Kitty placement tag, which
+/// is a placement's identity for delete selectors and draws no pixel (a re-put
+/// onto the same cells under a new serial is the same frame).
 ///
 /// WHY: `ImageRef`'s derived `Eq` deep-compares `ImageData` — `bytes` included
 /// — whenever the two `Arc`s are pointer-DISTINCT (std's `Arc` eq only
@@ -2551,7 +2551,7 @@ fn images_eq(
             return verdict;
         }
         // The one deep compare this pair pays — the UNCHANGED derived
-        // `ImageData` equality (bytes + format + cols + rows + z).
+        // `ImageData` equality (the payload and every layout field).
         let verdict = **x == **y;
         verdicts.insert(key, verdict);
         verdict
@@ -2756,6 +2756,27 @@ impl Default for RenderInput {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// Where a host row prepend's WINDOW-SPACE effect streams (`cursor_glow_add`,
+/// `glow_under`, `fire_patch`, `glow_halo` and the `fx_clip` box) were placed
+/// by their producers — the one thing
+/// [`RenderInput::prepend_host_rows`] must be told, because the two hosts
+/// that prepend rows place them differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRowPixels {
+    /// ALREADY PLACED below the prepended rows: the producers' origin
+    /// includes them (the native window, whose `effects_origin_win` counts
+    /// the strip and the band), so the pixels ride untouched and only the
+    /// damage row tags are re-derived from them.
+    Placed,
+    /// Placed against the frame WITHOUT the prepended rows (the web module,
+    /// whose effects pipeline has one chrome origin, `(pad, pad + head)`):
+    /// every pixel `y` those streams carry moves down by `rows · cell_h`
+    /// first — a quad's top, a flame's root, a halo's centre, the clip box —
+    /// so each keeps its distance from the grid, and then the tags are
+    /// re-derived exactly as under [`Self::Placed`].
+    Translate,
 }
 
 impl RenderInput {
@@ -3148,6 +3169,245 @@ impl RenderInput {
         // is the one thing a composite is not.
         self.composed_fill_seq = 0;
         true
+    }
+
+    /// PREPEND `strip` host rows (the chrome a host puts above the terminal —
+    /// a tab strip, a message band, a presence row) to this snapshot: every
+    /// per-row channel, the cursor, the selections and every row-tagged effect
+    /// stream move down by `strip` rows, the chrome rows are copied in from
+    /// `strip_rows` (BORROWED — a host's per-window row cache survives for the
+    /// next present), and the D-2 revision lane is spliced to match
+    /// ([`note_host_row_prepend`](Self::note_host_row_prepend)), so
+    /// [`undo_host_row_prepend`](Self::undo_host_row_prepend) can take it off
+    /// again before the next refill. `strip` is how many rows `strip_rows`
+    /// yields, so a caller stacking a row from one cache above rows from
+    /// another passes both without collecting them into a fresh `Vec` per
+    /// frame.
+    ///
+    /// `cell_h` is the pixel cell height, needed to shift the GRID streams'
+    /// pixel quads down with the grid. `grid_top` is the frame's grid-interior
+    /// top before the prepend (`pad_top + head`): a WINDOW-SPACE quad above
+    /// `grid_top + strip·cell_h` (terminal row 0's top) re-derives its damage
+    /// tag onto a chrome row. `pixels` says where the window-space streams'
+    /// producers put them ([`HostRowPixels`]).
+    ///
+    /// `pool` is the caller's resident row buffer pool: the only
+    /// heap-allocating rows are `cells`, so each cell row is built by popping a
+    /// reclaimed buffer and refilling it from the cached row (capacity
+    /// retained, zero fresh alloc after warmup). An empty pool falls back to a
+    /// fresh copy, so the spliced bytes are identical either way. Each
+    /// container is shifted with a single `splice` — one O(rows) header move
+    /// per container per frame, not one per chrome row — because this runs on
+    /// the latency-gating present path.
+    ///
+    /// Moved verbatim from `aterm-gui`'s `prepend_strip_row_slices` (design
+    /// ruling 331 of docs/DESIGN-unified-messages-2026-09-21.md), which is now
+    /// a wrapper passing [`HostRowPixels::Placed`], so the web host composes
+    /// its band through the same splice.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        reason = "moved verbatim from aterm-gui's splice (ruling 331), whose crate does not run \
+                  these pedantic lints: one pass over every channel, and a row tag is a u16 by the \
+                  stream contract — a frame has far fewer than 65,536 rows"
+    )]
+    pub fn prepend_host_rows<'a>(
+        &mut self,
+        strip: usize,
+        strip_rows: impl Iterator<Item = &'a [RenderCell]>,
+        cell_h: usize,
+        grid_top: usize,
+        pool: &mut Vec<Vec<RenderCell>>,
+        pixels: HostRowPixels,
+    ) {
+        if strip == 0 {
+            return;
+        }
+        // D-2 SPLICE: the prepend shifts every per-row channel down by `strip`, so
+        // terminal row `r` becomes frame row `r + strip`. The revision lane is
+        // stamped in ENGINE row space, so it must be shifted BY THE SAME OPERATION
+        // or it would answer row `r`'s revision against row `r + strip`'s content.
+        // `note_host_row_prepend` (below, after every channel has moved) does that:
+        // it prepends `strip` UNKNOWN sentinels for the chrome rows and re-arms the
+        // provenance token. The blessing is read HERE, before anything moves,
+        // because it is a statement about the snapshot the prepend is applied to.
+        let blessed = self.host_prepend_blessing();
+        self.cells.splice(
+            0..0,
+            strip_rows.map(|src| match pool.pop() {
+                Some(mut buf) => {
+                    buf.clear();
+                    buf.extend_from_slice(src);
+                    buf
+                }
+                None => src.to_vec(),
+            }),
+        );
+        // Per-row sparse / sized data: prepend empty/default rows so indices stay aligned
+        // with `cells`. `clusters`/`combining`/`images` are sparse (empty vecs);
+        // `line_sizes` defaults to single-width. `(0..strip).map` keeps the iterators
+        // exact-size so each splice shifts the tail exactly once.
+        self.clusters.splice(0..0, (0..strip).map(|_| Vec::new()));
+        self.combining.splice(0..0, (0..strip).map(|_| Vec::new()));
+        self.images.splice(0..0, (0..strip).map(|_| Vec::new()));
+        self.line_sizes
+            .splice(0..0, (0..strip).map(|_| LineSize::SingleWidth));
+        self.line_size_spans
+            .splice(0..0, (0..strip).map(|_| Vec::new()));
+        self.default_bg_spans
+            .splice(0..0, (0..strip).map(|_| Vec::new()));
+        // The band's pixel-resolution chrome rows are row-tagged: they move down
+        // with the rows they belong to.
+        for m in &mut self.chrome_rasters {
+            m.row = m
+                .row
+                .saturating_add(u16::try_from(strip).unwrap_or(u16::MAX));
+        }
+        // The cursor (terminal-grid row) is now `strip` rows lower in the window;
+        // the selection anchors and motion-trail cells move down with it so they
+        // stay on terminal content instead of repainting the new strip row.
+        self.cursor_row += strip;
+        self.selection
+            .translate_rows_for_presentation(i32::try_from(strip).unwrap_or(i32::MAX));
+        if let Some(clip) = &mut self.selection_clip {
+            clip.translate_rows_down(strip);
+        }
+        // Every PANE's selection moves with the splice too, for the same reason and
+        // by the same arithmetic — a split frame's highlights are carried by the
+        // entry list, and translating only the scalar would leave each pane's band
+        // `strip` rows above the cells it belongs to.
+        for pane in &mut self.selections {
+            pane.selection
+                .translate_rows_for_presentation(i32::try_from(strip).unwrap_or(i32::MAX));
+            pane.clip.translate_rows_down(strip);
+        }
+        for t in &mut self.cursor_trail {
+            t.row += strip;
+        }
+        // WINDOW-SPACE streams: under `Placed` the pixel coordinates are
+        // window-absolute and their producers' `origin_y` already includes the
+        // strip band — do NOT shift them. Only the damage row TAG moves with the
+        // splice, and it is RE-DERIVED from the pixel y against the COMPOSED
+        // frame's bands (row r spans `grid_top + r·cell_h ..`, row 0 opening to
+        // the window top): a quad above the terminal grid may land in a STRIP
+        // row's band (strip_rows ≥ 2 puts composed rows 1..strip above the
+        // terminal grid — adversarial review caught the old pin-to-0 rule
+        // leaving those bands' damage stale), and an in-grid quad lands exactly
+        // on its strip-shifted terminal row. Deriving from the pixel makes both
+        // cases one law.
+        let dy = u16::try_from(strip * cell_h).unwrap_or(u16::MAX);
+        let shift_tag = |_row: u16, y: usize| (y.saturating_sub(grid_top) / cell_h.max(1)) as u16;
+        // Under `Translate` their producers placed them against the frame
+        // WITHOUT these rows (the web pipeline's one chrome origin), so every
+        // pixel y they carry — each quad's top, a flame's root, a halo's centre,
+        // the focused pane's effect clip — first moves down with the grid:
+        // their distance from the grid is kept, and the tag law below then
+        // lands each on the row it lies in, exactly as a `Placed` producer's.
+        if pixels == HostRowPixels::Translate {
+            for q in &mut self.cursor_glow_add {
+                q.y = q.y.saturating_add(dy);
+            }
+            for q in &mut self.glow_under {
+                q.y = q.y.saturating_add(dy);
+            }
+            for q in &mut self.fire_patch {
+                q.y = q.y.saturating_add(dy);
+                q.base_y = q.base_y.saturating_add(dy);
+            }
+            for h in &mut self.glow_halo {
+                h.y = h.y.saturating_add(dy);
+                h.cy = h.cy.saturating_add(dy);
+            }
+            if let Some((_, y0, _, y1)) = &mut self.fx_clip {
+                *y0 = y0.saturating_add(dy);
+                *y1 = y1.saturating_add(dy);
+            }
+        }
+        // The LUMEN aurora quads are window-absolute pixel rects tagged with a row.
+        for q in &mut self.cursor_glow_add {
+            q.row = shift_tag(q.row, q.y as usize);
+        }
+        // Under-ink flame body (EMBERFORGE dark cores): same pixel-rect shape as
+        // the aurora.
+        for q in &mut self.glow_under {
+            q.row = shift_tag(q.row, q.y as usize);
+        }
+        // Per-pixel fire patches (campaign 2): window-absolute quad + flame-root
+        // pixels ride untouched; only the row tag moves.
+        for q in &mut self.fire_patch {
+            q.row = shift_tag(q.row, q.y as usize);
+        }
+        // Charred-ink overrides are cell-tagged like ink (a GRID stream): shift the
+        // row down.
+        for c in &mut self.char_fg {
+            c.row = c.row.saturating_add(strip as u16);
+        }
+        // Fire contrast-halo strengths are cell-tagged like char_fg (a GRID
+        // stream): shift the row down so the ring stays under its glyph.
+        for c in &mut self.fire_halo {
+            c.row = c.row.saturating_add(strip as u16);
+        }
+        // Radial cursor-effect halos (EMBERFORGE round light): window-absolute quad
+        // + falloff centre ride untouched; only the row tag moves.
+        for h in &mut self.glow_halo {
+            h.row = shift_tag(h.row, h.y as usize);
+        }
+        // Sparkle-word decorations are cell-row tagged (no pixel y); shift the row down.
+        for d in &mut self.word_decorations {
+            d.row = d.row.saturating_add(strip as u16);
+        }
+        // Animated-ink overrides are cell-row tagged too; emitted pre-splice (the one
+        // splice rule) so the uniform shift keeps them on their matched glyphs.
+        for c in &mut self.ink {
+            c.row = c.row.saturating_add(strip as u16);
+        }
+        // Peeking-cat quads carry a row band AND a pixel-y dest rect (like the
+        // aurora): shift both by the strip — the same single splice rule.
+        for q in &mut self.cat_quads {
+            q.row = q.row.saturating_add(strip as u16);
+            q.y = q.y.saturating_add(dy);
+        }
+        // Free-overlay sprites (overlay Phase 3 / v3 §5) are pure pixel rects
+        // with NO row tag: shift the signed dest y alone by the strip — the
+        // FreeSprite arm of the same single splice rule. (The dirty row-union
+        // re-derives the covered bands from the shifted extent.)
+        let dy_free = i32::from(dy);
+        for s in &mut self.free_sprites {
+            s.y = s.y.saturating_add(dy_free);
+        }
+        // Supernova additive quads stay a GRID stream (their word_decorations
+        // producer emits grid-relative pixels; the renderers add the grid origin):
+        // shift BOTH the row tag and the pixel y — the historical splice rule.
+        for q in &mut self.nova_add {
+            q.row = q.row.saturating_add(strip as u16);
+            q.y = q.y.saturating_add(dy);
+        }
+        // PHOSPHOR rain sprites carry a row band AND a pixel-y dest rect (like the
+        // cat quads): shift both by the strip — the same single splice rule.
+        for q in &mut self.rain_quads {
+            q.row = q.row.saturating_add(strip as u16);
+            q.y = q.y.saturating_add(dy);
+        }
+        // Rain bright-head halos are row-tagged pixel rects like the nova quads —
+        // plus a falloff CENTRE (cx, cy) that must ride the same vertical shift, or
+        // the radial light misregisters against its shifted quad.
+        for q in &mut self.rain_add {
+            q.row = q.row.saturating_add(strip as u16);
+            q.y = q.y.saturating_add(dy);
+            q.cy = q.cy.saturating_add(dy);
+        }
+        self.rows += strip;
+        // The strip changes the presented pixels; bump the snapshot seq so the renderer's
+        // content cache sees the new frame.
+        self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
+        // …and, with every channel now shifted and the bump applied, record the
+        // prepend on the snapshot: the lane gains `strip` leading UNKNOWNs and the
+        // D-2 provenance token follows `snapshot_seq` — but ONLY under the blessing
+        // read at the top. Unblessed (some host had already overwritten engine
+        // cells before this ran), the lane is disowned exactly as it was before the
+        // splice existed. Either way `row_shift` records the physical prepend, so
+        // the frontend's un-splice knows what to remove.
+        self.note_host_row_prepend(strip, blessed);
     }
 
     /// Whether ANY selection is live on this frame — the scalar one or any pane
@@ -4502,12 +4762,15 @@ mod line_size_run_tests {
 #[cfg(test)]
 mod z_index_tests {
     use super::RenderInput;
-    use aterm_grid::{ImageData, ImageFormat, ImageRef};
+    use aterm_grid::{ImageData, ImageFormat, ImageRef, ImageScaling, KittyPlacementTag};
+    use std::num::NonZeroU32;
     use std::sync::Arc;
 
     /// IMG-1 DIFFERENTIAL ORACLE for [`super::images_eq`]: the memoized
     /// whole-field compare must agree with the derived `Vec<Vec<…>>` equality
-    /// on every shape — and the two load-bearing directions are pinned at the
+    /// of the placements with their Kitty tags stripped, on every shape — a
+    /// tag-only difference included, which is EQUAL (the tag is identity, not
+    /// pixels) — and the two load-bearing directions are pinned at the
     /// `RenderInput` level: a re-transmit (fresh `Arc`s, identical bytes)
     /// still compares EQUAL (repaint suppression preserved), while a one-byte
     /// payload change still compares UNEQUAL (the deep compare is priced per
@@ -4523,7 +4786,8 @@ mod z_index_tests {
                 rows: 2,
                 z_index: z,
                 band_lift_px: 0,
-                pixel_exact: false,
+                scaling: ImageScaling::Fit,
+                source_rect: None,
             })
         };
         let fill = |img: &Arc<ImageData>| -> Vec<Vec<(usize, ImageRef)>> {
@@ -4537,6 +4801,7 @@ mod z_index_tests {
                                     image: img.clone(),
                                     cell_row: r,
                                     cell_col: c,
+                                    kitty: None,
                                 },
                             )
                         })
@@ -4548,21 +4813,55 @@ mod z_index_tests {
         let a = fill(&base);
         let mut flipped = payload.clone();
         flipped[17] ^= 0x80;
+        // The same cells stamped by a Kitty placement: identity, not pixels.
+        let tagged = |serial: u32| {
+            let mut t = a.clone();
+            for (_, iref) in t.iter_mut().flatten() {
+                iref.kitty = Some(KittyPlacementTag {
+                    image_id: 1,
+                    placement_id: 0,
+                    serial: NonZeroU32::new(serial).unwrap(),
+                });
+            }
+            t
+        };
+        let untagged = |rows: &[Vec<(usize, ImageRef)>]| {
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(c, iref)| {
+                            (
+                                *c,
+                                ImageRef {
+                                    kitty: None,
+                                    ..iref.clone()
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
         let cases = [
             Vec::new(),                     // empty vs covered
             a.clone(),                      // same Arcs (ptr_eq path)
             fill(&mk(payload.clone(), 0)),  // re-transmit: distinct Arc, equal bytes
             fill(&mk(flipped, 0)),          // one payload byte differs
             fill(&mk(payload.clone(), -1)), // z-only difference
+            tagged(7),                      // tag-only difference — EQUAL
             a[..1].to_vec(),                // row-count mismatch
         ];
         for (i, b) in cases.iter().enumerate() {
             assert_eq!(
                 super::images_eq(&a, b),
-                a == *b,
+                untagged(&a) == untagged(b),
                 "case {i}: memoized equality must match the derived equality"
             );
         }
+        // A Kitty re-put under a new serial is EQUAL, though the derived
+        // `ImageRef` equality (which sees the tag) says otherwise.
+        assert!(super::images_eq(&tagged(7), &tagged(8)));
+        assert_ne!(tagged(7), tagged(8), "the tag is part of derived equality");
 
         // RenderInput-level pin of both directions.
         let mut left = RenderInput::empty();
@@ -4592,10 +4891,12 @@ mod z_index_tests {
                 rows: 1,
                 z_index: z,
                 band_lift_px: 0,
-                pixel_exact: false,
+                scaling: ImageScaling::Fit,
+                source_rect: None,
             }),
             cell_row: 0,
             cell_col: 0,
+            kitty: None,
         }
     }
 
@@ -5609,6 +5910,149 @@ mod rain_channel_tests {
                 .same_content(&changed.glow_under_damage),
             Some(false),
             "the compact damage revision must detect a payload change"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_row_prepend_tests {
+    use super::{FirePatch, GlowQuad, HostRowPixels, RainHalo, RenderInput};
+    use crate::terminal::RenderCell;
+
+    const CH: usize = 10;
+    const TOP: usize = 6;
+
+    /// Window y of terminal row `row`'s top, before any prepend.
+    fn y(row: usize) -> u16 {
+        u16::try_from(TOP + row * CH).expect("small")
+    }
+
+    /// A 4-row frame whose window-space streams each carry a quad on a
+    /// terminal row (and the aurora one above the grid too), plus the
+    /// focused pane's effect clip.
+    fn frame() -> RenderInput {
+        let blank = RenderCell {
+            ch: ' ',
+            ..Default::default()
+        };
+        RenderInput {
+            rows: 4,
+            cols: 3,
+            cells: vec![vec![blank; 3]; 4],
+            cursor_glow_add: vec![
+                GlowQuad {
+                    row: 2,
+                    y: y(2) + 1,
+                    h: 4,
+                    ..Default::default()
+                },
+                GlowQuad {
+                    row: 0,
+                    y: 2,
+                    h: 3,
+                    ..Default::default()
+                },
+            ],
+            glow_under: vec![GlowQuad {
+                row: 2,
+                y: y(2),
+                h: 4,
+                ..Default::default()
+            }],
+            fire_patch: vec![FirePatch {
+                row: 2,
+                y: y(2),
+                h: 10,
+                base_y: y(3),
+                ..Default::default()
+            }],
+            glow_halo: vec![RainHalo {
+                row: 1,
+                y: y(1),
+                h: 10,
+                cy: y(1) + 5,
+                rx: 1,
+                ry: 1,
+                ..Default::default()
+            }],
+            fx_clip: Some((0, y(0), 30, y(4))),
+            ..Default::default()
+        }
+    }
+
+    /// `f`'s window-space pixels moved down by `dy` — what a producer whose
+    /// origin already counted the prepended rows would have emitted.
+    fn placed_below(mut f: RenderInput, dy: u16) -> RenderInput {
+        for q in &mut f.cursor_glow_add {
+            q.y += dy;
+        }
+        for q in &mut f.glow_under {
+            q.y += dy;
+        }
+        for q in &mut f.fire_patch {
+            q.y += dy;
+            q.base_y += dy;
+        }
+        for h in &mut f.glow_halo {
+            h.y += dy;
+            h.cy += dy;
+        }
+        if let Some((_, y0, _, y1)) = &mut f.fx_clip {
+            *y0 += dy;
+            *y1 += dy;
+        }
+        f
+    }
+
+    /// TRANSLATE IS "PLACED BELOW, THEN PLACED" (design ruling 331): a web
+    /// frame whose producers never counted the prepended rows comes out of the
+    /// splice exactly as a native frame whose producers did — every stream,
+    /// every tag, the clip — and `Placed` moves no window-space pixel at all.
+    /// The negative control: `Placed` on the web frame leaves the aurora on
+    /// its OLD row, which is the misregistration `Translate` exists to stop.
+    #[test]
+    fn translate_is_the_native_splice_of_a_frame_placed_below_the_rows() {
+        let strip = 2;
+        let dy = u16::try_from(strip * CH).expect("small");
+        let rows = vec![vec![RenderCell::default(); 3]; strip];
+        let prepend = |mut f: RenderInput, pixels| {
+            f.prepend_host_rows(
+                strip,
+                rows.iter().map(Vec::as_slice),
+                CH,
+                TOP,
+                &mut Vec::new(),
+                pixels,
+            );
+            f
+        };
+        let web = prepend(frame(), HostRowPixels::Translate);
+        let native = prepend(placed_below(frame(), dy), HostRowPixels::Placed);
+        assert!(web == native, "every channel the splice moves");
+        assert_eq!(web.cursor_glow_add, native.cursor_glow_add);
+        assert_eq!(web.glow_under, native.glow_under);
+        assert_eq!(web.fire_patch, native.fire_patch);
+        assert_eq!(web.glow_halo, native.glow_halo);
+        assert_eq!(web.fx_clip, native.fx_clip);
+        // Every in-grid quad lands on its terminal row, now `strip` lower; the
+        // aurora above the grid lands on the chrome row its pixel lies in.
+        assert_eq!(web.cursor_glow_add[0].row, 4);
+        assert_eq!(web.cursor_glow_add[1].row, 1);
+        assert_eq!(web.glow_under[0].row, 4);
+        assert_eq!(web.fire_patch[0].row, 4);
+        assert_eq!(web.fire_patch[0].base_y, y(3) + dy);
+        assert_eq!(web.glow_halo[0].row, 3);
+        assert_eq!(web.glow_halo[0].cy, y(1) + 5 + dy);
+        let placed = prepend(frame(), HostRowPixels::Placed);
+        assert_eq!(
+            placed.cursor_glow_add[0].y,
+            y(2) + 1,
+            "Placed moves no pixel"
+        );
+        assert_eq!(placed.fx_clip, frame().fx_clip);
+        assert_eq!(
+            placed.cursor_glow_add[0].row, 2,
+            "the negative control: the web frame under Placed keeps its old row"
         );
     }
 }

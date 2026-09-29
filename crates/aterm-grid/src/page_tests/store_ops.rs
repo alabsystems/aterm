@@ -267,3 +267,61 @@ fn page_used_bytes_tracked_correctly() {
     assert_eq!(store.free_pages(), 2);
     assert_eq!(store.tracked_page_count(), 0); // Cleared after reset
 }
+
+#[test]
+fn recycled_row_cells_are_cleared_unique_and_width_matched() {
+    use crate::{Cell, Row};
+    let mut pages = PageStore::new();
+    // SAFETY: all rows below are dropped before their owning pages.
+    let mut old = unsafe { Row::new(80, &mut pages) };
+    old.set(0, Cell::new('X'));
+    let old_ptr = old.as_slice().as_ptr();
+    let page_bytes = pages.total_memory();
+    // SAFETY: old belongs to pages and is consumed, so its range is unaliased.
+    unsafe { old.recycle(&mut pages) };
+    assert!(
+        pages.total_memory() > page_bytes,
+        "returned-token metadata is charged"
+    );
+    let allocated = pages.stats().allocations;
+    // SAFETY: same owning arena, outliving both returned rows.
+    let mut other = unsafe { Row::new(81, &mut pages) };
+    assert_ne!(other.as_slice().as_ptr(), old_ptr);
+    assert_eq!(
+        pages.recycled_rows(),
+        1,
+        "a different width cannot consume it"
+    );
+    // SAFETY: same owning arena, outliving the returned row.
+    let mut recycled = unsafe { Row::new(80, &mut pages) };
+    assert_eq!(recycled.as_slice().as_ptr(), old_ptr);
+    assert_eq!(pages.stats().allocations, allocated + 1);
+    assert_eq!(recycled.len(), 0);
+    assert!(recycled.as_slice().iter().all(|cell| *cell == Cell::EMPTY));
+    recycled.set(0, Cell::new('A'));
+    other.set(0, Cell::new('B'));
+    assert_eq!(recycled.get(0).unwrap().char(), 'A');
+    assert_eq!(other.get(0).unwrap().char(), 'B');
+}
+
+#[test]
+fn resetting_pages_discards_recycled_handles_before_page_reuse() {
+    use crate::{Cell, Row};
+    let mut pages = PageStore::new();
+    // SAFETY: the row is consumed before reset invalidates any cell ranges.
+    let row = unsafe { Row::new(80, &mut pages) };
+    // SAFETY: pages owns row, consumed here without retained references.
+    unsafe { row.recycle(&mut pages) };
+    assert_eq!(pages.recycled_rows(), 1);
+    pages.reset();
+    assert_eq!(pages.recycled_rows(), 0);
+    // SAFETY: both new rows are dropped before pages, with fresh unique ranges.
+    let mut first = unsafe { Row::new(80, &mut pages) };
+    // SAFETY: same owning arena, outliving the returned row.
+    let mut second = unsafe { Row::new(80, &mut pages) };
+    assert_ne!(first.as_slice().as_ptr(), second.as_slice().as_ptr());
+    first.set(0, Cell::new('A'));
+    second.set(0, Cell::new('B'));
+    assert_eq!(first.get(0).unwrap().char(), 'A');
+    assert_eq!(second.get(0).unwrap().char(), 'B');
+}

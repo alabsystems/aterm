@@ -58,6 +58,38 @@ fn file_with_cell_dimensions_covers_exact_footprint() {
     assert_eq!(image.image.rows, 3);
 }
 
+/// `preserveAspectRatio=0` is iTerm2's "stretch to fill, ignore the inherent
+/// ratio": the placement must CARRY that request to the renderer, or an
+/// explicit stretch draws exactly like the default fit. The default (and an
+/// explicit `=1`) stays FIT.
+#[test]
+fn preserve_aspect_ratio_zero_carries_stretch_and_the_default_fits() {
+    use aterm_grid::ImageScaling;
+    let payload = [PNG_MAGIC, &[0u8; 16][..]].concat();
+    for (args, want) in [
+        ("inline=1;width=4;height=3", ImageScaling::Fit),
+        (
+            "inline=1;width=4;height=3;preserveAspectRatio=1",
+            ImageScaling::Fit,
+        ),
+        (
+            "inline=1;width=4;height=3;preserveAspectRatio=0",
+            ImageScaling::Stretch,
+        ),
+    ] {
+        let mut term = Terminal::new(10, 20);
+        term.process(&osc_1337_file(args, &payload));
+        let grid = term.grid();
+        let image = grid
+            .cell_extra(0, 0)
+            .and_then(|extra| extra.image())
+            .unwrap_or_else(|| panic!("{args}: placed"));
+        assert_eq!(image.image.scaling, want, "{args}");
+        assert_eq!(image.image.source_rect, None, "{args}: iTerm2 never crops");
+        assert_eq!(image.kitty, None, "{args}: not a Kitty placement");
+    }
+}
+
 #[test]
 fn tile_coordinates_increase_across_the_footprint() {
     let mut term = Terminal::new(10, 20);

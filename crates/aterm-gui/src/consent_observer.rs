@@ -234,10 +234,10 @@ impl ObserverAvailability {
     }
 
     /// The `observer log=` token.
-    #[cfg(test)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
+            #[cfg(any(target_os = "macos", test))]
             Self::Ok => "ok",
             Self::Unavailable(_) => "unavailable",
         }
@@ -877,7 +877,6 @@ impl ObserverState {
     }
 
     /// The `observer log=` value right now.
-    #[cfg(test)]
     pub(crate) const fn availability(&self) -> ObserverAvailability {
         self.availability
     }
@@ -1114,17 +1113,32 @@ pub(crate) struct ObservedPrompt {
 impl ObservedPrompt {
     /// The one native notification this prompt earns.
     pub(crate) fn notice(&self) -> AttentionNotice {
+        use aterm_containment::consent::Folder;
         let short = self
             .service
             .trim()
             .strip_prefix("kTCCService")
             .unwrap_or(self.service.trim());
+        // The folder's own name where the service is one of aterm's, the drive
+        // or library in words where aterm knows it, and any other service as
+        // macOS names it.
+        let what = match Folder::ALL.iter().find(|f| f.tcc_service() == short) {
+            Some(Folder::AppData) => "other applications' data",
+            Some(folder) => folder.label(),
+            None => match short {
+                "SystemPolicyNetworkVolumes" => "network drives",
+                "SystemPolicyRemovableVolumes" => "removable drives",
+                "MediaLibrary" => "the music and media library",
+                "Photos" => "the Photos library",
+                other => other,
+            },
+        };
         AttentionNotice {
             session: self.session,
             title: ATTENTION_TITLE,
             body: format!(
-                "A macOS permission dialog is waiting for an answer ({short}). \
-                 Only a human can answer it, and it does not time out."
+                "macOS is asking for access to {what}. The program that asked waits until \
+                 you answer."
             ),
         }
     }
@@ -1283,12 +1297,25 @@ impl AttentionGate {
             notice: Some(AttentionNotice {
                 session: session.unwrap_or(0),
                 title: ATTENTION_TITLE,
-                body: "macOS refused aterm access to a protected folder. Only a human can \
-                       clear it: grant access in System Settings ▸ Privacy & Security."
-                    .to_owned(),
+                body: format!(
+                    "macOS denied aterm access to protected files. Turn on aterm in {} (use + \
+                     to add it if it is not listed).",
+                    crate::menu::privacy_settings_path_words(
+                        crate::menu::PrivacyPane::FullDiskAccess
+                    )
+                ),
             }),
             refresh_status_item: true,
         }
+    }
+}
+
+impl crate::App {
+    /// The `privacy` verb's `observer log=` value: a read of the observer's
+    /// state, never a start. It lives here so that no control module names the
+    /// observer (`consent_retire`'s fence).
+    pub(crate) fn privacy_observer_log(&self) -> &'static str {
+        self.consent_observer.availability().as_str()
     }
 }
 
@@ -1316,6 +1343,13 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    /// An observer nobody started reports `off`, the `privacy` verb's default
+    /// `observer log=` value.
+    #[test]
+    fn an_unstarted_observer_reports_off() {
+        assert_eq!(ObserverState::inert().availability().as_str(), "off");
+    }
 
     /// The module's SHIPPING source: everything before the first TOP-LEVEL
     /// `#[cfg(test)]` attribute, which is the test-seam block's (an indented one
@@ -1909,11 +1943,34 @@ mod tests {
         );
         let notice = first[0].notice();
         assert_eq!(notice.session, 4);
-        assert!(
-            notice.body.contains("SystemPolicyDocumentsFolder"),
-            "the body names the service: {}",
-            notice.body
+        assert_eq!(
+            notice.body,
+            "macOS is asking for access to Documents. The program that asked waits until \
+             you answer.",
+            "the body names the folder in words"
         );
+        for (service, what) in [
+            ("kTCCServiceSystemPolicyNetworkVolumes", "network drives"),
+            (
+                "kTCCServiceSystemPolicyRemovableVolumes",
+                "removable drives",
+            ),
+            ("kTCCServiceAddressBook", "AddressBook"),
+        ] {
+            let prompt = ObservedPrompt {
+                session: 4,
+                blocked_on: String::new(),
+                service: service.to_owned(),
+            };
+            assert_eq!(
+                prompt.notice().body,
+                format!(
+                    "macOS is asking for access to {what}. The program that asked waits until \
+                     you answer."
+                ),
+                "{service} is named in words where aterm knows it"
+            );
+        }
 
         assert!(
             observer.take_new_verdicts(later, sessions, pgid).is_empty(),
@@ -2097,6 +2154,16 @@ mod tests {
             assert!(
                 lower.contains("system settings"),
                 "it must name where a human can act: {}",
+                notice.body
+            );
+            assert!(
+                notice.body.contains("Full Disk Access"),
+                "it names the Full Disk Access pane: {}",
+                notice.body
+            );
+            assert!(
+                notice.body.contains("use + to add it if it is not listed"),
+                "it says how to add aterm when the pane does not list it: {}",
                 notice.body
             );
             assert_eq!(notice.title, ATTENTION_TITLE);

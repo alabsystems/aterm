@@ -155,8 +155,9 @@ pub const DEADLINES_KEEP: usize = 4096;
 /// once and kept forever; meanwhile `Bridge::pinned_node_for` re-reads and
 /// re-parses the whole file on every such post and `pin` rewrites and `fsync`s
 /// it whenever a new sid appears. A busy orchestrator reached six figures of
-/// lines in a month, with §11.2's `aterm-link pin` override unimplemented and
-/// no operator undo but deleting the file by hand.
+/// lines in a month. (§11.2's `aterm-link pin` override was cut unbuilt in
+/// 622e40af6: deleting `<state>/pins` is the operator's remedy, and the TOFU rule
+/// makes it safe — the next sight of each peer re-pins it.)
 ///
 /// EVICTION IS BY FIRST SIGHT, NOT BY USE, and the file is kept in first-sight
 /// order to make that possible. Recency would mean a durable rewrite per post
@@ -1046,9 +1047,9 @@ mod tests {
     ///
     /// It was the one durable structure in the crate with no cap and no prune,
     /// growing one line per remote sid ever addressed while `pinned_node_for`
-    /// re-read and re-parsed the whole file before every post — and §11.2's
-    /// `aterm-link pin` override is unimplemented, so an operator's only remedy
-    /// was deleting the file by hand.
+    /// re-read and re-parsed the whole file before every post. (The operator's
+    /// remedy is deleting the file — §11.2's `aterm-link pin` override was cut
+    /// unbuilt in 622e40af6 — and the next sight of each peer re-pins it.)
     #[test]
     fn the_pin_table_is_bounded_and_evicts_the_oldest_first_sight() {
         let dir = scratch("pins-bound");

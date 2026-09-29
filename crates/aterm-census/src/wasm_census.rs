@@ -334,7 +334,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
     let mut failures = 0usize;
     let _ = writeln!(
         log,
-        "=== gate wasmloop (wasm-process census: L0 freeze CLASS, browser-tab analog) ===\n\
+        "=== wasm-process census (L0 freeze class, browser-tab analog) ===\n\
          \x20   root: {}",
         root.display()
     );
@@ -350,9 +350,9 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
                  determine the wasm-process closure from the workspace manifests, so it \
                  refuses to sweep a guessed scope (fail-closed).\n\
                  \x20       {e}\n\
-                 gate wasmloop: FAILED — 1 obligation violation(s)."
+                 wasm-process census: FAILED — 1 obligation violation(s)."
             );
-            return CensusOutcome { ok: false, log };
+            return CensusOutcome::red(log);
         }
     };
     let _ = writeln!(
@@ -472,10 +472,10 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
             log,
             "  ✗ FAIL [OB-9] no public entry points resolved across any wasm root crate — \
              the census walked nothing.\n\
-             gate wasmloop: FAILED — {} obligation violation(s).",
+             wasm-process census: FAILED — {} obligation violation(s).",
             failures + 1
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
 
     // BFS from every public entry point (same merged-name posture as the
@@ -517,6 +517,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
     // registered STANDING FINDING (reported) or an OB-10 violation (RED).
     let mut matched_hazards: std::collections::BTreeSet<usize> = Default::default();
     let mut standing_reported = 0usize;
+    let mut standing: Vec<String> = Vec::new();
     let mut hazard_hits = 0usize;
     for idx in 0..fns.len() {
         if !parent.contains_key(&idx) {
@@ -532,8 +533,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
                 matched_hazards.insert(hi);
                 standing_reported += 1;
                 let h = &WASM_STANDING_HAZARDS[hi];
-                let _ = writeln!(
-                    log,
+                let block = format!(
                     "  • STANDING FINDING [OB-10/OB-11] CANDIDATE L0-FREEZE (browser-tab \
                      analog) — registered, reported every run, NOT a waiver:\n\
                      \x20   PATH:  {}\n\
@@ -555,6 +555,8 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
                     sink_file("resize_with_reflow_mode"),
                     h.finding,
                 );
+                let _ = writeln!(log, "{block}");
+                standing.push(block);
             } else {
                 let _ = writeln!(
                     log,
@@ -674,22 +676,20 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         }
         let _ = writeln!(
             log,
-            "gate wasmloop: FAILED — {failures} obligation violation(s) ({hazard_hits} \
+            "wasm-process census: FAILED — {failures} obligation violation(s) ({hazard_hits} \
              unregistered synchronous unbounded reach(es)). This census blocks BOTH \
              `targo --unverified run -p aterm-census -- --wasm` and the build of \
              tools/freeze-safety-gate."
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
     let _ = writeln!(
         log,
-        "gate wasmloop: GREEN — {} fn(s) walked from {} public entry point(s) across {} \
-         wasm root crate(s); {} STANDING candidate-L0 finding(s) reported above \
-         (registered findings, re-detected and reprinted every run — not waivers); no \
-         UNregistered synchronous reach to an UNBOUNDED sink; {}/{} registered sink(s) \
-         inside this closure marked; 0 thread-spawn token(s) in the shipped closure — \
-         single-threaded posture holds, so the lock-order obligation is VACUOUS for \
-         this process (documented above, no dead machinery).",
+        "wasm-process census: GREEN — {} fn(s) walked from {} public entry point(s) across {} \
+         wasm root crate(s); {} standing finding(s); no UNregistered synchronous reach \
+         to an UNBOUNDED sink; {}/{} registered sink(s) inside this closure marked; 0 \
+         thread-spawn token(s) in the shipped closure, so it stays single-threaded and \
+         the lock-order obligation is VACUOUS here.",
         parent.len(),
         roots.len(),
         WASM_ROOT_CRATES.len(),
@@ -704,7 +704,11 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
          closure (precision limits: docs/temporal-safety-gate.md).",
         scan.scan_dirs.len()
     );
-    CensusOutcome { ok: true, log }
+    CensusOutcome {
+        ok: true,
+        log,
+        standing,
+    }
 }
 
 #[cfg(test)]
@@ -891,8 +895,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "expected GREEN, got:\n{}", out.log);
         assert!(
-            out.log
-                .contains("0 STANDING candidate-L0 finding(s) reported"),
+            out.log.contains("0 standing finding(s);"),
             "the offloaded shape must report ZERO standing findings; log:\n{}",
             out.log
         );
@@ -1159,6 +1162,13 @@ mod tests {
     /// `aterm-tempfile` left with aterm-grid's unused normal edge (it served
     /// only a never-constructed disk-spill budget), and `aterm-ffi-types` with
     /// aterm-selection's unused edge (its unused C-ABI mirror types).
+    ///
+    /// # `aterm-messages` ENTERED the closure, 2026-09-28 (38 -> 39)
+    ///
+    /// Real browser code, not an over-approximation: the web CPU module now
+    /// draws the message band (`aterm-wasm/src/messages_api.rs`), and
+    /// aterm-render composes the band's rows for both hosts (`src/band.rs`).
+    /// The provenance sits on the entry.
     #[test]
     fn derived_wasm_closure_matches_the_pinned_canary() {
         const PINNED: &[&str] = &[
@@ -1182,6 +1192,16 @@ mod tests {
             "crates/aterm-lexicon/src",
             "crates/aterm-log/src",
             "crates/aterm-lz4/src",
+            // Entered 2026-09-28 when aterm-render took the message band's
+            // composition (round 26, design ruling 331 of
+            // docs/DESIGN-unified-messages-2026-09-21.md) and aterm-wasm its
+            // `notice`/`messages` exports: clockless (its own fence greps its
+            // sources for a clock read), no thread vocabulary (OB-12 scans it
+            // here), zero `COST: UNBOUNDED` markers (OB-8), and every new
+            // export bounded by the engine's caps — three live rows, the
+            // 512-record ring, 60 mints a minute (OB-10). Its one dependency,
+            // aterm-time, was already pinned.
+            "crates/aterm-messages/src",
             "crates/aterm-objc/src",
             "crates/aterm-parser/src",
             // Entered the closure when the first-party PNG codec replaced

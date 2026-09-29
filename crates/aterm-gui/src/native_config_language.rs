@@ -168,6 +168,9 @@ pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyM
 pub(crate) fn is_compatibility_only_key(key: &str) -> bool {
     COMPATIBILITY_ONLY_KEYS.contains(&key)
         || retired_config_key(key).is_some()
+        // The orca class was deleted on 2026-09-27 (it had been suspended): a
+        // leftover `[sparkle_words.orca]` subtree is kept and reported, never
+        // honoured.
         || key == "sparkle_words.orca"
         || key.starts_with("sparkle_words.orca.")
 }
@@ -369,13 +372,8 @@ impl ConfigAnalysis {
         let omitted = if self.omitted_diagnostics == 0 {
             String::new()
         } else {
-            let noun = if self.omitted_diagnostics == 1 {
-                "diagnostic"
-            } else {
-                "diagnostics"
-            };
             format!(
-                " · {} additional {noun} omitted by the bounded validator",
+                " · {} more not listed (only the first {MAX_DIAGNOSTICS} are shown)",
                 self.omitted_diagnostics,
             )
         };
@@ -928,6 +926,23 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["upgrade", "signing", "team", "development"],
         true,
     ),
+    // The `[keeper]` table (PTY keeper P3, opt-in): whether the window
+    // registers its terminals with the keeper. Read at launch; no Settings row
+    // while the feature is opt-in.
+    manual(
+        "keeper",
+        "PTY keeper",
+        ConfigSchemaKind::Table,
+        &["keeper", "crash", "recover", "pty", "session"],
+        false,
+    ),
+    manual(
+        "keeper.enabled",
+        "Keep shells alive across a crash",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["keeper", "crash", "recover", "pty", "session"],
+        true,
+    ),
     // The `[reroute]` table: its one Bool leaf rides the native registry
     // (`prefs::NESTED_LEAVES`); this header is what lets Manual complete `[reroute]`.
     manual(
@@ -1044,10 +1059,38 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "harness.limit_wait",
+        "Wait out a usage limit and continue automatically",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "supervisor",
+            "usage limit",
+            "rate limit",
+            "continue",
+            "wait",
+        ],
+        true,
+    ),
+    manual(
         "harness.model_fallback",
-        "Model to relaunch on at a model limit",
+        "Claude Code: model to relaunch on at a model limit",
         ConfigSchemaKind::Scalar(EditKind::Text),
         &["supervisor", "model", "limit", "opus"],
+        true,
+    ),
+    manual(
+        "harness.rate_nudge",
+        "Codex near its usage limit: save the work on the cheaper model, then wait on its own",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "supervisor",
+            "codex",
+            "model",
+            "limit",
+            "usage",
+            "rate",
+            "luna",
+        ],
         true,
     ),
     manual(
@@ -1062,6 +1105,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Relaunch an agent that exited on its own",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["supervisor", "relaunch", "restart", "exit"],
+        true,
+    ),
+    manual(
+        "harness.stall_term_after_s",
+        "Seconds a frozen agent stands before it is ended for its relaunch (0: never)",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["supervisor", "frozen", "stall", "relaunch"],
         true,
     ),
     // The live agent upgrade's switch (`aterm harness upgrade`, and the
@@ -1112,14 +1162,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "disk.target_stale_days",
-        "Days before a build directory counts as stale",
+        "Days a cargo profile goes unbuilt before it counts as idle: its incremental cache goes first, whole (below the floor, recent ones follow, least recently used first; none built in the last 10 min, even at 0)",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["disk", "target", "stale", "cargo"],
         true,
     ),
     manual(
         "disk.auto_free_gib",
-        "Free GiB below which stale build directories are removed automatically (0: off)",
+        "Free GiB below which cargo profiles' incremental caches are reclaimed automatically: idle ones, then least recently used first until 1 GiB above it, or until the bytes freed cover the shortfall (0: off)",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["disk", "free space", "target", "cleanup", "automatic"],
         true,
@@ -1143,6 +1193,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Package index account (development)",
         ConfigSchemaKind::Scalar(EditKind::Text),
         &["atpkg", "owner", "github", "development"],
+        true,
+    ),
+    manual(
+        "packages.prefix",
+        "Package store prefix (development)",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["atpkg", "store", "path", "development"],
         true,
     ),
     manual(
@@ -1430,27 +1487,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Ignored kitty words",
         ConfigSchemaKind::StringList,
         &["cat", "lexicon", "exclude"],
-        true,
-    ),
-    manual(
-        "sparkle_words.orca",
-        "Orca words",
-        ConfigSchemaKind::Table,
-        &["whale", "splash", "words"],
-        false,
-    ),
-    manual(
-        "sparkle_words.orca.extra_words",
-        "Additional orca words",
-        ConfigSchemaKind::StringList,
-        &["whale", "lexicon", "include"],
-        true,
-    ),
-    manual(
-        "sparkle_words.orca.ignore_words",
-        "Ignored orca words",
-        ConfigSchemaKind::StringList,
-        &["whale", "lexicon", "exclude"],
         true,
     ),
     // The typed-word dog cameo and the kitty commands (`SparkleCanineConfig`,
@@ -2038,7 +2074,7 @@ pub(crate) fn ignored_key_warnings(source: &str) -> Vec<String> {
 /// (`app_config::collect_key_notices`). `retired` holds the retired and
 /// deprecated spellings and the keys a removed feature left behind
 /// ([`ConfigAnalysis::retired_spellings`]); `ignored`
-/// holds every other line, the bounded validator's roll-up included. Each half
+/// holds every other line, the roll-up of lines past the cap included. Each half
 /// keeps source order.
 pub(crate) fn key_warnings(source: &str) -> KeyWarnings {
     let Some(analysis) = key_analysis(source) else {
@@ -2089,7 +2125,7 @@ fn key_warning_line(diagnostic: &ConfigDiagnostic) -> String {
 fn omitted_key_line(analysis: &ConfigAnalysis) -> Option<String> {
     (analysis.omitted_diagnostics > 0).then(|| {
         format!(
-            "{} further ignored key(s) not listed by the bounded validator",
+            "… and {} more not listed (only the first {MAX_DIAGNOSTICS} are shown)",
             analysis.omitted_diagnostics
         )
     })
@@ -3137,7 +3173,7 @@ fn warn_unknown_item(
             range.clone(),
             format!(
                 "`{path}` is deprecated; rename it to `{current}` (the old key still \
-                 applies — the faces are named for the letterform now, not a game)",
+                 works)",
                 current = crate::prefs::EDIT_DISPLAY_FONT
             ),
         );
@@ -3189,14 +3225,12 @@ fn warn_unknown_item(
         return;
     }
     if schema.is_none() {
-        // Forward compatibility is the honest reading of a key from a NEWER
-        // aterm, and it is the wrong first sentence for a typo: the key is
-        // preserved either way, but only one of the two readings has a
-        // recovery. So the two readings get two shapes, and the near miss goes
-        // FIRST when there is one — the in-window banner paints one line per
-        // notice and truncates at the terminal width, and on an 80-column window
-        // a spelling that trails the forward-compatibility clause is the exact
-        // half that falls off the end.
+        // A key from a NEWER aterm and a typo both do nothing here, but only
+        // the typo has a recovery. So the two readings get two shapes, and the
+        // near miss goes FIRST when there is one — the in-window banner paints
+        // one line per notice and truncates at the terminal width, and on an
+        // 80-column window a spelling that trails the no-effect clause is the
+        // exact half that falls off the end.
         push_diagnostic(
             analysis,
             source,
@@ -3205,13 +3239,8 @@ fn warn_unknown_item(
                 .unwrap_or(0..source.len().min(1)),
             ConfigDiagnosticSeverity::Warning,
             match nearest_config_key(path) {
-                Some(near) => format!(
-                    "{path} — did you mean {near:?}? (unknown to this aterm build; \
-                     preserved for forward compatibility)"
-                ),
-                None => format!(
-                    "{path} is unknown to this aterm build; it will be preserved for forward compatibility"
-                ),
+                Some(near) => format!("{path} — did you mean {near:?}? (no effect in this build)"),
+                None => format!("{path} is unknown to this build and has no effect"),
             },
         );
     }
@@ -3284,9 +3313,7 @@ fn warn_unknown_structured_item(
                 .or_else(|| item.span())
                 .unwrap_or(0..source.len().min(1)),
             ConfigDiagnosticSeverity::Warning,
-            format!(
-                "{path} is unknown in [[{record_path}]] record {record}; it will be preserved for forward compatibility"
-            ),
+            format!("{path} is unknown in [[{record_path}]] record {record} and has no effect"),
         );
         return;
     }
@@ -4437,6 +4464,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
     } else if setting.key == "packages.account" {
         "GitHub owner slug (letters, digits, dot, underscore, or hyphen); a development build only"
             .to_string()
+    } else if setting.key == "packages.prefix" {
+        "absolute or ~/ store path; a development build only (a shipped build installs nothing \
+         automatically while this names another store)"
+            .to_string()
     } else if setting.key == "packages.links" {
         "named absolute/~/ checkout paths (dev links), or owner/repo slugs (a development build only)"
             .to_string()
@@ -4560,6 +4591,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         crate::prefs::EDIT_ALLOW_NOTIFICATIONS => {
             " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
         }
+        crate::prefs::EDIT_DESKTOP_ALERTS => {
+            " · aterm's OWN alerts (the menu bar's escalations, the operator, update health) as system notifications — macOS through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon; none on other platforms · off keeps every one in the message band, the menu bar and messages.log · program notifications (OSC 9/99/777) are allow_notifications'"
+        }
         crate::prefs::EDIT_ALLOW_OSC52_QUERY => {
             if cfg!(target_os = "linux") {
                 " · an authorized query reads back only the clipboard selections aterm itself owns (a foreign app's X11 selection is not readable today); rate/budget gates still apply"
@@ -4571,7 +4605,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             if cfg!(target_os = "linux") {
                 " · manipulations (iconify, maximize, fullscreen, resize — move stays denied) apply to the window; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
             } else {
-                " · the GUI answers the XTWINOPS window-title, text-grid-size, text-area-pixels and cell-size reports; host manipulation and window/screen position and size requests are ignored"
+                " · answers the window-title, text-grid-size, text-area-pixels and cell-size reports only; window changes (iconify, maximize, fullscreen, resize, move) and position and screen-size reports are ignored on this platform"
             }
         }
         crate::prefs::EDIT_SEARCH_HISTORY_LINES => {
@@ -4595,6 +4629,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "update.require_team_id" => {
             " · a development build only; a shipped build's compiled Team ID always wins"
         }
+        "keeper.enabled" => {
+            " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"
+        }
         "update.auto_apply" => {
             " · off, a downloaded build installs only when you ask — Update to Latest Now on macOS, `aterm update apply` on Linux · the native updater runs on macOS and Linux"
         }
@@ -4613,10 +4650,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · 64 hex SHA-256 digits, optionally prefixed sha256:; invalid pins refuse dialing"
         }
         "net.connections.sid" => {
-            " · stored for compatibility but currently inert; the shipping rebind check is nonce-only"
+            " · the remote session whose launch nonce expect_nonce pins; no effect without expect_nonce"
         }
         "net.connections.expect_nonce" => {
-            " · currently fails closed because the shipping wire cannot verify a remote launch nonce"
+            " · dialing refuses the remote unless this launch nonce matches"
         }
         "sparkle_words.ink.sweep_ms" => " · loop = true raises the effective minimum to 600 ms",
         "matrix_rain.head_alpha" => " · effective minimum follows the resolved matrix_rain.alpha",
@@ -5397,8 +5434,8 @@ mod tests {
     /// the only consequence is a warning naming the current spelling.
     ///
     /// "Deprecated" and "unknown" must not BOTH be said: the key still applies,
-    /// and "unknown to this build; preserved for forward compatibility" reads
-    /// like the setting stopped working.
+    /// and "unknown to this build and has no effect" says the setting stopped
+    /// working.
     #[test]
     fn the_deprecated_display_font_key_warns_with_the_new_spelling_and_never_errors() {
         for value in crate::prefs::LEGACY_DISPLAY_FONT_IDS
@@ -5890,7 +5927,7 @@ intensity = 0.25
         out
     }
 
-    /// Whether Manual tells `path` any story but "unknown to this aterm build":
+    /// Whether Manual tells `path` any story but "unknown to this build":
     /// a schema entry, a compatibility-only or retired key, or one of the old
     /// spellings `warn_unknown_item` renames by name.
     fn manual_knows(path: &str) -> bool {
@@ -6015,11 +6052,11 @@ intensity = 0.25
     /// THE FAMILY INVARIANT, stated once over the whole registry rather than three
     /// times over three families. Every retired key is a key from the PAST, so the one
     /// sentence it must never be given is the one reserved for a key from the FUTURE:
-    /// "unknown to this aterm build … preserved for forward compatibility" is the
-    /// walk's fall-through, and a key that reaches it has no recovery in its story. The
-    /// three families that were each missed in turn — the Scene band, the floating
-    /// progress card, the bottom HUD — all failed in exactly this way, so the check
-    /// belongs to the list and not to any one of them.
+    /// "unknown to this build and has no effect" is the walk's fall-through, and a
+    /// key that reaches it has no recovery in its story. The three families that
+    /// were each missed in turn — the Scene band, the floating progress card, the
+    /// bottom HUD — all failed in exactly this way, so the check belongs to the
+    /// list and not to any one of them.
     ///
     /// Then each family that real `aterm.toml` files still carry, as authored: it
     /// loads byte-for-byte, every key warns once with its own feature's removal story,
@@ -6268,6 +6305,26 @@ home = "~/aterm"
         );
     }
 
+    /// `[packages] prefix` is atpkg's: a development build moves the store, and
+    /// a shipped one installs nothing automatically while it names another. So
+    /// it is never called unknown or without effect.
+    #[test]
+    fn package_prefix_is_a_known_key_whose_help_says_what_it_does() {
+        let analysis = analyze("[packages]\nprefix = \"/opt/aterm/pkg\"\n");
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("packages.prefix")),
+            "{:?}",
+            analysis.diagnostics
+        );
+        assert!(
+            setting_help(config_schema_entry("packages.prefix").unwrap())
+                .contains("installs nothing automatically")
+        );
+    }
+
     #[test]
     fn host_analysis_resolves_assets_off_the_pure_language_path() {
         let source = concat!(
@@ -6285,7 +6342,7 @@ home = "~/aterm"
             .iter()
             .find(|diagnostic| {
                 diagnostic.message.starts_with("theme:")
-                    && diagnostic.message.contains("does not resolve")
+                    && diagnostic.message.contains("is unavailable")
             })
             .expect("host reports the loader's theme fallback")
             .clone();
@@ -6785,9 +6842,9 @@ home = "~/aterm"
         // with its near miss so the spelling survives the banner's truncation,
         // and the property under test is the WALK reaching the leaf either way.
         let named_as_unknown = |path: &str| {
-            messages.iter().any(|message| {
-                message.starts_with(path) && message.contains("unknown to this aterm build")
-            })
+            messages
+                .iter()
+                .any(|message| message.starts_with(path) && message.contains("no effect"))
         };
         assert!(named_as_unknown("sparkle_words.enabld"), "{messages:?}");
         assert!(
@@ -6796,8 +6853,10 @@ home = "~/aterm"
         );
 
         let allowed = [
+            // A chord no built-in claims: ⇧⌘T is Reopen Closed Tab, and a rule
+            // there rightly warns that it conflicts.
             r#"[keybindings]
-"cmd+shift+t" = "new_tab"
+"cmd+shift+k" = "new_tab"
 [key_sequences]
 "shift+enter" = '\e[13;2u'
 "#,
@@ -7065,7 +7124,7 @@ expect_nonce = "pin"
         assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
 
         for (message_fragment, token) in [
-            ("font_px is", "201"),
+            ("font_px: 201.0 is not accepted", "201"),
             ("font_variation[0]", "\"bad-axis\""),
             ("font_features[1]", "\"toolong\""),
             ("update.owner value", "\"bad/owner\""),
@@ -7075,10 +7134,9 @@ expect_nonce = "pin"
             ("record 2 is inert", "0"),
             ("record 1 must be a nonempty", "\"bad/name\""),
             ("record 1 must be 64 hexadecimal", "\"wrong\""),
-            ("record 1 is stored but currently inert", "\"legacy\""),
+            ("record 1 has no effect without expect_nonce", "\"legacy\""),
             ("record 2 is blank", "\" \""),
             ("record 3 duplicates", "\"work\""),
-            ("record 3 currently makes dialing fail closed", "\"pin\""),
         ] {
             let diagnostic = analysis
                 .diagnostics
@@ -7152,7 +7210,7 @@ expect_nonce = "pin"
         let window_ops_phrase = if cfg!(target_os = "linux") {
             "text-area-pixels and cell-size reports are answered"
         } else {
-            "text-area-pixels and cell-size fallback reports"
+            "text-area-pixels and cell-size reports only"
         };
         // The OSC 52 caveat states the widest grant per platform: the system
         // clipboard off-Linux (what the Query arm answers with), the
@@ -7187,6 +7245,17 @@ expect_nonce = "pin"
             help_for("allow_notifications")
                 .contains("desktop delivery is implemented on macOS and Windows")
         );
+        // `desktop_alerts` says whose alerts it governs, what off keeps, and
+        // that a program's are the other key's.
+        let alerts = help_for("desktop_alerts");
+        for needle in [
+            "aterm's OWN alerts",
+            "Script Editor",
+            "messages.log",
+            "allow_notifications",
+        ] {
+            assert!(alerts.contains(needle), "{needle:?} in {alerts}");
+        }
         assert!(help_for("option_as_meta").contains("types your keyboard layout's characters"));
         // The native updater runs on macOS AND Linux (`aterm_update::enabled`): the
         // `[update]` help names both and each platform's own manual lane, never
@@ -7238,7 +7307,7 @@ expect_nonce = "pin"
             window_ops_help.contains(if cfg!(target_os = "linux") {
                 "window/screen position and screen-size reports remain unanswered"
             } else {
-                "window/screen position and size requests are ignored"
+                "position and screen-size reports are ignored on this platform"
             }),
             "{window_ops_help}"
         );
@@ -7594,14 +7663,14 @@ ink = { colorway = "twotone:#112233,#445566,#778899" }
             analysis
                 .summary()
                 .unwrap()
-                .contains("1 additional diagnostic omitted")
+                .contains(" · 1 more not listed (only the first 32 are shown)")
         );
         analysis.omitted_diagnostics = 2;
         assert!(
             analysis
                 .summary()
                 .unwrap()
-                .contains("2 additional diagnostics omitted")
+                .contains(" · 2 more not listed (only the first 32 are shown)")
         );
     }
 
@@ -7645,6 +7714,22 @@ ink = { colorway = "twotone:#112233,#445566,#778899" }
                     .contains("packages.links.ay must be text")
         }));
         assert!(analysis.omitted_diagnostics > 0);
+    }
+
+    /// Past the cap the key lines end in one count, which says only that more
+    /// exist: they are not all ignored keys (type errors and retired spellings
+    /// that still apply count too).
+    #[test]
+    fn key_lines_past_the_cap_end_in_one_count() {
+        let source = (0..MAX_DIAGNOSTICS + 3)
+            .map(|i| format!("qqq_unknown_{i} = 1\n"))
+            .collect::<String>();
+        let lines = ignored_key_warnings(&source);
+        assert_eq!(lines.len(), MAX_DIAGNOSTICS + 1, "{lines:?}");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("… and 3 more not listed (only the first 32 are shown)")
+        );
     }
 
     #[test]
@@ -8842,15 +8927,15 @@ sty"#;
         );
     }
 
-    /// The forward-compatibility promise is the honest reading of a key from a
-    /// NEWER aterm, and it must not be dressed up as a typo. Nothing in the
-    /// registry is near this name, so no rename may be guessed.
+    /// A key from a NEWER aterm has no effect in this build, and it must not be
+    /// dressed up as a typo. Nothing in the registry is near this name, so no
+    /// rename may be guessed.
     #[test]
-    fn a_key_from_a_future_build_is_preserved_without_a_guessed_rename() {
+    fn a_key_from_a_future_build_has_no_effect_and_no_guessed_rename() {
         let message = only_message("quantum_flux_capacitor_mode = true\n");
-        assert!(
-            message.contains("preserved for forward compatibility"),
-            "{message}"
+        assert_eq!(
+            message,
+            "quantum_flux_capacitor_mode is unknown to this build and has no effect"
         );
         assert!(!message.contains("did you mean"), "{message}");
     }
@@ -9235,8 +9320,8 @@ sty"#;
 
     /// The `[disk]` keys (`aterm_agent::harness::disk::KEYS`) are the config
     /// language's. The window's harness host READS `auto_free_gib` — `0` is
-    /// the documented off switch of its automatic removal of stale build
-    /// directories — and this checker called it "unknown to this aterm build",
+    /// the documented off switch of its automatic reclaim of idle build
+    /// caches — and this checker called it "unknown to this aterm build",
     /// with an Open aterm.toml action: a person told the line does nothing
     /// deletes it, and the removal is back on. Each key is served with its
     /// default; a negative is warned with the reader's own reading.
@@ -9265,6 +9350,29 @@ sty"#;
         );
         let help = setting_help(config_schema_entry("disk.auto_free_gib").unwrap());
         assert!(help.contains("default 10 (0: off)"), "{help}");
+        // Below the floor the pass goes past the idle window, oldest first,
+        // and stops a stated margin above it (2026-09-28): the line says so,
+        // and the margin it states is the reader's own.
+        assert!(
+            help.contains("least recently used first until")
+                && help.contains(&format!(
+                    "{} GiB above it",
+                    aterm_agent::harness::disk::PRESSURE_MARGIN_GIB
+                )),
+            "{help}"
+        );
+        // The idle window's default is ONE day (it was 14): the line serves
+        // the reader's own default, not a copy of it.
+        let help = setting_help(config_schema_entry("disk.target_stale_days").unwrap());
+        assert!(help.contains(" \u{b7} default 1"), "{help}");
+        // What the window still decides, now that below the floor recent
+        // profiles go too: the idle ones go first, whole.
+        assert!(
+            help.contains("counts as idle: its incremental cache goes first")
+                && help.contains("recent ones follow, least recently used first"),
+            "{help}"
+        );
+        assert!(!help.contains("default 14"), "{help}");
         // A negative floor is OFF, and the line says so (the reader's words).
         let negative = analyze("[disk]\nauto_free_gib = -1\n");
         assert!(

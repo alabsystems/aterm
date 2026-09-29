@@ -5,7 +5,8 @@
 //! as [`Class::Animal`], carries a species id that resolves to its sprite key,
 //! and rides `ambiguous = true` (the live-caret deferral + fold-collision-gate
 //! exemption the group's design depends on). Existing classes keep their
-//! homograph wins: `cat`/`kitty` stay feline, `orca` stays the splash.
+//! homograph wins: `cat`/`kitty` stay feline. `orca` is no class's word: the
+//! orca class was deleted (2026-09-27) and the animal roster did not take it.
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
@@ -56,8 +57,9 @@ fn animal_surfaces_scan_with_their_species() {
 #[test]
 fn animal_class_never_steals_existing_families() {
     let lex = Lexicon::builtin();
-    // orca outranks animal; the generic whale is the animal sprite.
-    assert_eq!(scan_one(lex, "orca").class, Class::Orca);
+    // The generic whale is the animal sprite; `orca` (the deleted orca class's
+    // word) decorates nothing rather than falling through to it.
+    assert!(lex.scan("orca", &ScanOptions::default()).is_empty());
     assert_eq!(scan_one(lex, "whale").class, Class::Animal);
     // kitty stays feline (rank), and bare `cat` stays the short-feline opt-in.
     assert_eq!(scan_one(lex, "kitty").class, Class::Feline);
@@ -68,7 +70,7 @@ fn animal_class_never_steals_existing_families() {
 fn non_animal_matches_carry_no_species() {
     let lex = Lexicon::builtin();
     assert_eq!(scan_one(lex, "kitty").species, None);
-    assert_eq!(scan_one(lex, "orca").species, None);
+    assert_eq!(scan_one(lex, "doggo").species, None);
 }
 
 /// Whole-word law, restated for the new group: animal nouns inside longer

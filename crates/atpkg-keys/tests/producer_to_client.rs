@@ -738,7 +738,7 @@ fn an_index_signed_by_an_unrostered_key_fails_the_self_check() {
 /// `verify-index`'s failure says only "no machine on that roster signed this index" — true,
 /// and useless to an operator whose real problem is that their machine was never added.
 ///
-/// Each refusal must name the exact command that fixes it, and none may write an index.
+/// Each refusal must name the fix that works, and none may write an index.
 #[test]
 fn a_machine_the_roster_does_not_name_is_refused_before_anything_is_signed() {
     let prefix = Prefix::provision("unrostered-identity");
@@ -767,16 +767,19 @@ fn a_machine_the_roster_does_not_name_is_refused_before_anything_is_signed() {
     assert!(!out.status.success(), "{}", text(&out));
     let log = text(&out);
     assert!(log.contains("is NOT on the roster"), "{log}");
+    // `join` refuses to run while a key exists at its --key path, so the command names a
+    // new one, and the publish must then be pointed at it.
     assert!(
-        log.contains("atpkg-keys join --id m99"),
+        log.contains("atpkg-keys join --id m99 --key <new path>"),
         "the refusal must name the command that fixes it: {log}"
     );
+    assert!(log.contains("MACHINE_KEY=<new path>"), "{log}");
     assert!(
         !prefix.out.join("index.toml").exists(),
         "a refused run must not leave a signed index behind"
     );
 
-    // A MISSING key, and a MISSING roster, refuse the same way: with the mint command.
+    // A MISSING key refuses with the mint command; a MISSING roster with where to copy it.
     let out = prefix.run_indexer(
         &tracked_indexer(),
         &[("MACHINE_KEY", &s(&prefix.home.join("nope.key")))],
@@ -804,6 +807,30 @@ fn a_machine_the_roster_does_not_name_is_refused_before_anything_is_signed() {
         "{}",
         text(&out)
     );
+    // `join` needs the roster to exist, so it is no remedy for a missing one.
+    assert!(!text(&out).contains("atpkg-keys join"), "{}", text(&out));
+
+    // A MISSING machine record beside a present key: `join` cannot restore it (it refuses
+    // while the key exists, and would mint a new one), so the refusal gives the record's
+    // lines, the key's own public half included.
+    let record = std::fs::read_to_string(prefix.home.join(".aterm/machine.toml")).unwrap();
+    let pubkey_line = record
+        .lines()
+        .find(|l| l.starts_with("pubkey = "))
+        .expect("setup writes a pubkey line");
+    let out = prefix.run_indexer(
+        &tracked_indexer(),
+        &[("MACHINE_PUB", &s(&prefix.home.join("no-such-record.toml")))],
+    );
+    assert!(!out.status.success());
+    let log = text(&out);
+    assert!(log.contains("no machine record"), "{log}");
+    assert!(
+        log.contains(pubkey_line),
+        "the refusal must give the key's pubkey line: {log}"
+    );
+    assert!(!log.contains("atpkg-keys join"), "{log}");
+    assert!(!prefix.out.join("index.toml").exists());
 
     // NON-VACUITY: the same prefix, with its OWN identity, publishes fine.
     assert!(prefix.run_indexer(&tracked_indexer(), &[]).status.success());
@@ -1203,7 +1230,7 @@ fn a_revoked_machine_is_diagnosed_as_revoked_and_not_sent_to_rejoin() {
         "and must say that re-joining is not the fix:\n{log}"
     );
     assert!(
-        log.contains("join --id <new-machine-id>"),
+        log.contains("join --id <new-machine-id> --key <new path>"),
         "the remedy is a NEW id, not the revoked one:\n{log}"
     );
     assert!(!prefix.out.join("index.toml").exists());

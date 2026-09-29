@@ -68,6 +68,8 @@ use aterm_effects::kitty_registry::{
 use aterm_lexicon::{LangSet, Lexicon, primary_lang};
 use serde::{Deserialize, Serialize};
 
+use crate::native_document_host::HeldAdvisoryLock;
+
 /// The ledger's filename, a sibling of `aterm.toml` (see the module doc for
 /// why it must never live INSIDE the user's config file).
 const KITTY_LOG_FILE: &str = "kitty-log.toml";
@@ -1145,16 +1147,29 @@ fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Best-effort sibling lock (`kitty-log.toml.lock`) guarding a whole
 /// read→merge→write. Every failure, including another process owning the lock,
-/// returns immediately. Held for the guard's lifetime; the kernel releases the
-/// advisory lock on drop/exit.
-fn try_lock(path: &Path) -> Option<std::fs::File> {
+/// returns immediately. Held for the guard's lifetime and released by `LOCK_UN`
+/// when it drops ([`HeldAdvisoryLock`]), not by the close: every take here is a
+/// SINGLE try, and a child any thread forks while the lock is held — a shell's
+/// pty fork, a sibling test's spawn — keeps a copy of the lock's description
+/// until it execs. Released by the close alone, the lock stayed taken in that
+/// copy, so the next flush, the startup read's repair, and the exit flush's
+/// few tries were refused for a lock nobody held.
+fn try_lock(path: &Path) -> Option<HeldAdvisoryLock> {
     let lock_path = path.with_extension("toml.lock");
     let file = open_lock(&lock_path).ok()?;
     file.try_lock().ok()?;
-    Some(file)
+    #[cfg(all(test, unix))]
+    crate::parked_fork::fork_if_armed();
+    Some(HeldAdvisoryLock::adopt(file))
 }
 
-fn lock_pair(legacy_path: &Path, sidecar_path: &Path) -> Option<(std::fs::File, std::fs::File)> {
+/// Both ledger locks, legacy first (the order every writer takes them in). A
+/// refused sidecar lock drops the legacy guard already taken, which releases it
+/// by `LOCK_UN` too.
+fn lock_pair(
+    legacy_path: &Path,
+    sidecar_path: &Path,
+) -> Option<(HeldAdvisoryLock, HeldAdvisoryLock)> {
     let legacy = try_lock(legacy_path)?;
     let sidecar = try_lock(sidecar_path)?;
     Some((legacy, sidecar))
@@ -1962,6 +1977,11 @@ mod tests {
         text
     }
 
+    /// Startup plus exit on a thread of its own, waited for a minute: a hang
+    /// detector, not a latency budget. Every hostile target these tests plant
+    /// (a writerless FIFO, a lock another holder keeps until after this
+    /// returns) blocks a regressed host FOREVER, so a minute catches it as
+    /// surely as 3 s did, and a loaded machine cannot fail the bounded path.
     fn host_startup_and_exit(config_path: PathBuf) -> (u64, usize) {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1974,7 +1994,7 @@ mod tests {
             let _ = done_tx.send(startup);
         });
         done_rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(60))
             .expect("host startup plus background flush/exit must be bounded")
     }
 
@@ -2171,9 +2191,7 @@ mod tests {
     #[test]
     fn held_sibling_lock_never_parks_flush_exit() {
         let legacy = tmp("held-lock");
-        let lock_path = legacy.with_extension("toml.lock");
-        let held = open_lock(&lock_path).expect("open first regular lock handle");
-        held.try_lock().expect("hold sibling lock");
+        let held = try_lock(&legacy).expect("hold sibling lock");
 
         assert_eq!(
             host_startup_and_exit(legacy.with_file_name("aterm.toml")),
@@ -2210,6 +2228,67 @@ mod tests {
             "the same retained batch is writable after contention clears"
         );
         assert_eq!(KittyLog::read(&legacy).sightings, 1);
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    /// THE LEDGER LOCKS ARE FREE THE MOMENT A FLUSH ENDS, even while a child
+    /// forked under them has yet to exec. A child any thread forks — a shell's
+    /// pty fork, a sibling test's spawn — holds a copy of both locks'
+    /// descriptions until its `execve`; released by the close alone they stayed
+    /// taken there, and the next single-try take (the next flush, the startup
+    /// read's sidecar repair, each of the exit flush's four tries) was refused
+    /// for a lock nobody held. The fork is made for real, inside the first
+    /// flush's hold of BOTH locks, and parked short of its exec while the next
+    /// flush runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_frees_both_locks_while_a_child_forked_under_them_has_yet_to_exec() {
+        let legacy = tmp("fork-window");
+        let lex = Lexicon::builtin();
+        let mut first = KittyLog::default();
+        first.record(&sighting(21), lex, "2026-07-21T00:00:00Z");
+        let armed = crate::parked_fork::arm_at(2); // the sidecar take: both held
+        assert!(KittyLog::flush_merge(&legacy, &first), "uncontended flush");
+        let child = armed.child();
+        assert!(child.still_parked(), "forked under the first flush's locks");
+
+        let mut second = KittyLog::default();
+        second.record(&sighting(22), lex, "2026-07-21T00:00:01Z");
+        assert!(
+            KittyLog::flush_merge(&legacy, &second),
+            "the next single-try flush takes both locks"
+        );
+        assert!(child.still_parked(), "…while the child had yet to exec");
+        child.release();
+        assert_eq!(KittyLog::read_with_sidecar(&legacy).sightings, 2);
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    /// A HALF-TAKEN PAIR FREES THE LEGACY LOCK TOO. When the sidecar lock is
+    /// refused, the legacy lock already taken is dropped on the way out of
+    /// `lock_pair` — by `LOCK_UN`, so a child forked while it was held does not
+    /// keep it, and the next pair take is not refused for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_sidecar_frees_the_legacy_lock_while_a_child_forked_under_it_has_yet_to_exec() {
+        let legacy = tmp("fork-window-half");
+        let sidecar = collectibles_path(&legacy);
+        // The peer lets go by `LOCK_UN` whatever `try_lock` returns, so only the
+        // legacy lock's release is on trial.
+        let peer = open_lock(&sidecar.with_extension("toml.lock")).expect("open");
+        peer.try_lock().expect("a peer holds the sidecar lock");
+        let peer = HeldAdvisoryLock::adopt(peer);
+        let armed = crate::parked_fork::arm_at(1); // the legacy take: legacy only
+        assert!(lock_pair(&legacy, &sidecar).is_none(), "sidecar refused");
+        let child = armed.child();
+        drop(peer);
+        assert!(child.still_parked(), "forked under the legacy lock");
+        assert!(
+            lock_pair(&legacy, &sidecar).is_some(),
+            "the next pair take finds the legacy lock free"
+        );
+        assert!(child.still_parked(), "…while the child had yet to exec");
+        child.release();
         let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
     }
 
@@ -2269,9 +2348,7 @@ mod tests {
         validate("BeginExit", &drained, &exiting);
 
         let legacy = tmp("exit-retry-conformance");
-        let lock_path = legacy.with_extension("toml.lock");
-        let held = open_lock(&lock_path).expect("open first regular lock handle");
-        held.try_lock().expect("hold sibling lock");
+        let held = try_lock(&legacy).expect("hold sibling lock");
         let mut delta = KittyLog::default();
         delta.record(&sighting(8), Lexicon::builtin(), "2026-07-21T00:00:00Z");
         let result = flush_pending_at_exit(&legacy, &delta);

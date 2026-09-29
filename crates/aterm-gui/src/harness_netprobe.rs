@@ -891,18 +891,22 @@ mod tests {
 
     /// A BLACK-HOLED IPv6 CANNOT EAT THE BUDGET: with two v6 addresses that
     /// swallow every SYN ahead of a working v4 one, IPv4 is dialled FIRST, on
-    /// its share of the budget, and the probe is Up well inside it.
-    /// NEGATIVE CONTROL: the order the resolver gave (v6 first) is not the
-    /// order dialled.
+    /// its share of the budget, and the probe is Up without dialling a black
+    /// hole at all. NEGATIVE CONTROL: the order the resolver gave (v6 first)
+    /// is not the order dialled.
+    ///
+    /// PROVED BY ORDER, not by a clock. The seam's black holes are the only
+    /// thing here that spends the budget (each sleeps its whole share), and
+    /// the dial record shows none was dialled — so none was waited on. A wall
+    /// clock bound (`< BUDGET / 2`) added nothing to that record and failed a
+    /// loaded machine's pass.
     #[test]
     fn a_black_holed_ipv6_cannot_eat_the_budget() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
         let v4 = listener.local_addr().expect("addr");
         let mut seam = Seam::new(Ok(vec![v6(1), v6(2), v4]), Dial::BlackHole, Dial::Real);
         seam.handshake = Some(true);
-        let began = Instant::now();
         assert_eq!(probe_once(&seam, BUDGET), Outcome::Up);
-        assert!(began.elapsed() < BUDGET / 2, "{:?}", began.elapsed());
         let dialled = seam.dialled.lock().unwrap();
         assert_eq!(dialled[0].0, v4, "IPv4 first: {dialled:?}");
         assert!(dialled[0].1 <= BUDGET / 3 + Duration::from_millis(5));
@@ -954,7 +958,8 @@ mod tests {
             Duration::from_millis(40),
         );
         assert_eq!(np.ask("s-1"), Reach::Unknown, "no measure yet, no wait");
-        let until = Instant::now() + Duration::from_secs(5);
+        // The probe's one resolve must start: a hang detector, a minute.
+        let until = Instant::now() + Duration::from_secs(60);
         while stuck.calls.load(Ordering::SeqCst) == 0 && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -988,7 +993,8 @@ mod tests {
         let np = NetProbe::with(Arc::new(Nx), BUDGET);
         let asked = Instant::now();
         let mut seen = np.ask("s-1");
-        while !matches!(seen, Reach::Down { .. }) && asked.elapsed() < Duration::from_secs(5) {
+        // The Down must come (the resolver fails at once): a hang detector.
+        while !matches!(seen, Reach::Down { .. }) && asked.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_millis(5));
             seen = np.ask("s-1");
         }

@@ -20,11 +20,13 @@
 //!   formatter reads the former. Tippy is not here: the gate's Tippy stage
 //!   drives it directly.
 //! - `forge`: the third-party surface policy, [`aterm_forge::check::check_report`]
-//!   — the same function `cargo forge check` runs, so the gate and the hand-run
+//!   — the same function `targo --unverified forge check` runs, so the gate and the hand-run
 //!   tool cannot disagree. `tools/forge-budget.tsv` is the authority on the
 //!   numbers it ratchets.
 //! - `cells [--cell NAME]…`: every forge cell, type-checked by a compiler for its
-//!   own triple, under the policy in `tools/cross-cell-gate.tsv`.
+//!   own triple, with the build-script shims `tools/cross-cell-gate.tsv` lists.
+//!   The host cell runs on the pinned toolchain (`driver.rs`), the cross cells on
+//!   rustup's `stable`.
 //! - `cells-foreign`: `cells` narrowed to the cells no box in this fleet hosts
 //!   ([`FLEET_HOST_TRIPLES`]), whose verdict is the same wherever it runs.
 //!
@@ -34,7 +36,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use crate::driver::{DRIVER_REMEDY, cargo_driver, export_driver_as_cargo, rustc_host_triple};
+use crate::driver::{CargoDriver, export_driver_as_cargo, rustc_host_triple};
 use crate::workspace_root;
 
 /// A gate verb: its name, and the check it runs on the arguments after it.
@@ -55,13 +57,38 @@ pub(crate) fn verb_names() -> Vec<&'static str> {
     VERBS.iter().map(|(name, _)| *name).collect()
 }
 
+/// The census verbs retired on 2026-09-27, each with the `aterm-census` flag
+/// that runs it now, so a caller still typing the old name is told where it went.
+const RETIRED_CENSUS_VERBS: &[(&str, &str)] = &[
+    ("mainloop", "--mainloop"),
+    ("lockorder", "--locks"),
+    ("wasmloop", "--wasm"),
+    ("scope", "--scope"),
+    ("lazyinit", "--lazy-init"),
+];
+
+/// What `xtask gate` says when `check` names no verb it dispatches: the usage
+/// line for a bare `gate`, the verb list for an unknown one, and the new home
+/// of a retired census verb.
+fn unknown_verb_message(check: Option<&str>) -> String {
+    let Some(verb) = check else {
+        return format!("usage: xtask gate <{}>", verb_names().join("|"));
+    };
+    let moved = RETIRED_CENSUS_VERBS
+        .iter()
+        .find(|(old, _)| *old == verb)
+        .map(|(_, flag)| format!(" (now: targo --unverified run -p aterm-census -- {flag})"))
+        .unwrap_or_default();
+    format!(
+        "xtask gate: no verb `{verb}`{moved} — verbs: {}",
+        verb_names().join(", ")
+    )
+}
+
 /// `rest` is everything after the verb name.
 pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
     let Some((_, verb)) = VERBS.iter().find(|(name, _)| Some(*name) == check) else {
-        eprintln!(
-            "usage: xtask gate <{}>\n(unknown check {check:?})",
-            verb_names().join("|")
-        );
+        eprintln!("{}", unknown_verb_message(check));
         return ExitCode::FAILURE;
     };
     if verb(rest) {
@@ -76,14 +103,17 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
 // ---------------------------------------------------------------------------
 //
 // `crates/aterm-forge` owns the obligations (`[OB-1]`..`[OB-15]`, see its crate
-// docs); this verb and `cargo forge check` both call `check::check_report`. It
+// docs); this verb and `targo --unverified forge check` both call `check::check_report`. It
 // compiles nothing: it reads `Cargo.lock`, `vendor/`, `vendor/forge.toml`,
 // `tools/forge-budget.tsv` and one offline `cargo tree` per cell.
 
 fn gate_forge() -> bool {
-    // forge resolves its cells with `$CARGO tree`; hand it the host driver when
-    // this process was started without one (crate::driver documents the case).
-    export_driver_as_cargo();
+    // forge resolves its cells with `$CARGO tree`; hand it the pinned driver
+    // when this process was started without one.
+    if let Err(why) = export_driver_as_cargo() {
+        eprintln!("gate forge: COULD NOT RUN — {why}");
+        return false;
+    }
     let (ok, log) = aterm_forge::check::check_report(&workspace_root());
     eprint!("{log}");
     ok
@@ -128,6 +158,8 @@ pub(crate) fn trust_toolchain() -> aterm_verify::Toolchain {
 
 /// Run a tool capturing BOTH streams, teeing each so the operator sees the
 /// report exactly as a hand-run prints it. Returns `(exit-ok, stdout, stderr)`.
+/// The command itself is not echoed: a clean pass prints nothing, and every
+/// other outcome's line names the program.
 ///
 /// Both streams, drained CONCURRENTLY by `Command::output()`: the formatter's
 /// findings land on stdout and its environment faults on stderr, and draining
@@ -140,7 +172,6 @@ fn run_capturing_both(
     path_prefix: &Path,
     cwd: &Path,
 ) -> (bool, String, String) {
-    eprintln!("  $ {} {}", program.display(), args.join(" "));
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd);
     let existing = std::env::var_os("PATH").unwrap_or_default();
@@ -170,22 +201,92 @@ fn run_capturing_both(
     }
 }
 
-/// Is `bin` resolvable on `PATH`?
-fn on_path(bin: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {bin}"))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Where [`find_rustup`] looks after PATH, for the sentence a gate prints when it
+/// finds none. ONE copy, so the skip cannot name a place the search does not visit.
+pub(crate) const RUSTUP_LOOKED: &str = "on PATH, in $CARGO_HOME/bin, in ~/.cargo/bin and in \
+                                        Homebrew's rustup keg (/opt/homebrew/opt/rustup/bin)";
+
+/// THIS BOX'S `rustup`, by path — PATH first, then where rustup installs itself.
+///
+/// rustup-init puts `rustup` in `$CARGO_HOME/bin` (`~/.cargo/bin` by default) and
+/// leaves PATH to the shell's rc files, and a machine provisioned the product's way
+/// (atpkg's store, which is why `rust-toolchain.toml` needs no rustup) has no reason
+/// to put that directory on PATH at all. The cross gates asked PATH alone until
+/// 2026-09-27. Measured on the owner's Mac that day, rustup in `~/.cargo/bin` and all
+/// four foreign stds installed in `stable`: `gate cells-foreign` printed five
+/// `SKIPPED(no-std)` rows, each telling the reader to `rustup target add` a std that
+/// was already there, and `tools/verify.sh` withheld the merge contract on every run
+/// — a skip whose named fix could not clear it.
+pub(crate) fn find_rustup() -> Option<PathBuf> {
+    find_rustup_in(
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("CARGO_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
-/// A neutral build cwd for a cross-compile, because cargo discovers config by walking
-/// the cwd upward and `.cargo/config.toml` carries `-Ztrust-verify=off` for the native
-/// triple — a flag upstream stable rejects as an unknown `-Z` on every HOST unit (build
-/// script, proc macro) of a `--target` build. `tools/wasm-bench/run.sh` uses the same
-/// trick for the same reason. Load-bearing: without it these gates go red with a
-/// flag-parse error that names no crate of ours.
+/// [`find_rustup`] over the environment it is handed: the first EXECUTABLE
+/// candidate, as `command -v` and `execvp` pick — a stray non-executable file named
+/// `rustup` early on PATH is passed over, not handed to every rustup call as an
+/// EACCES that turns a box fact into a FAILED gate.
+fn find_rustup_in(
+    path: Option<&std::ffi::OsStr>,
+    cargo_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    rustup_candidates(path, cargo_home, home)
+        .into_iter()
+        .find(|p| is_executable_file(p))
+}
+
+/// Would `execvp` run `p`: a regular file with an execute bit.
+fn is_executable_file(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// [`find_rustup`]'s search order, from the environment it is handed. Relative PATH
+/// entries are dropped: a rustup found through one would depend on the cwd the gate
+/// happened to run in.
+fn rustup_candidates(
+    path: Option<&std::ffi::OsStr>,
+    cargo_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = path
+        .map(|p| {
+            std::env::split_paths(p)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join("rustup"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let absolute = |v: Option<&std::ffi::OsStr>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(cargo_home) = absolute(cargo_home) {
+        out.push(cargo_home.join("bin/rustup"));
+    }
+    if let Some(home) = absolute(home) {
+        out.push(home.join(".cargo/bin/rustup"));
+    }
+    out.push(PathBuf::from("/opt/homebrew/opt/rustup/bin/rustup"));
+    out
+}
+
+/// A neutral build cwd for a cross-compile, because cargo discovers config — and
+/// rustup its toolchain pin — by walking the cwd upward, and both of this repo's are
+/// Trust's: the pin names the Trust toolchain and `.cargo/config.toml` carries
+/// Trust-only `-Z` flags. The config's table is `cfg(trust_verify)`-scoped since
+/// 2026-08-30, so an upstream compiler no longer sees its flags; when it was a
+/// per-triple table, an in-repo `--target` build died at flag-parse on its first HOST
+/// unit with an error that named no crate of ours. `tools/wasm-bench/run.sh` uses the
+/// same trick. Kept: an upstream lane owes nothing to this repo's Trust settings.
 fn neutral_build_cwd(gate: &str) -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(format!("aterm-{gate}-{}", std::process::id()));
     match std::fs::create_dir_all(&dir) {
@@ -210,81 +311,40 @@ fn toolchain_lists_target(listing: &str, target: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// G-CELLS (the five forge cells, TYPE-CHECKED for their own triples)
+// G-CELLS: every forge cell, type-checked by a compiler for its own triple
 // ---------------------------------------------------------------------------
 
-/// The policy `gate cells` reads: the excused C dependencies and the per-cell
-/// coverage floors. Workspace-relative, and NEVER written by this gate — the
-/// floors are hand-edited, because `tools/trust-gate-all.sh`'s `--update-ratchet`
-/// is the recorded case of a writer flag letting the one run that DETECTED a
-/// regression erase the floor it had just tripped over.
+/// The build-script overrides `gate cells` may apply. Workspace-relative, and
+/// read-only to this gate.
 const CELL_GATE_POLICY: &str = "tools/cross-cell-gate.tsv";
 
-/// One `cdep` row: a package whose build script cannot run on this box.
-struct ExcusedCDep {
-    package: String,
-    /// The triple the excuse is scoped to, or `*` for every triple.
-    triple: String,
-    why: String,
-}
-
-/// One `cshim` row: a C-bearing build script this gate REPLACES, for the length
-/// of one `cargo check` and on ONE named triple, with a cargo build-script
-/// override passed on the command line.
-///
-/// A `cdep` row buys silence; a `cshim` row buys COVERAGE. Where a `cdep` says
-/// "this box cannot run that build script, so forgive the closure it takes with
-/// it", a `cshim` says "that build script emits nothing a compiler reads, so
-/// cargo may skip it and type-check the Rust anyway". The second is only honest
-/// when the claim inside it is TRUE, which is why the row pins the exact
-/// `name@version` it was read against: a bump makes the row dead, and a dead row
-/// fails the gate rather than silently shimming a build script nobody re-read.
+/// One `cshim` row: a C-bearing build script this gate REPLACES, for one
+/// `cargo check` on ONE triple, with cargo's own build-script override passed on
+/// the command line. Honest only where the script emits nothing a compiler reads
+/// (no `rustc-cfg`, no `rustc-env`, no generated source): the type-check is then
+/// the one a cross C toolchain would give, because `cargo check` never links.
+/// The row pins `name@version`, so a bump makes it dead and a dead row fails the
+/// gate until somebody reads the new script.
 struct CBuildShim {
     package: String,
-    /// The exact version the build script was read at. A row for a version the
-    /// graph does not carry is DEAD.
     version: String,
-    /// The one triple this override applies to. Never `*`: an override is a
-    /// claim about what a build script emits FOR A TARGET, and `zstd-sys` is the
-    /// standing proof that the answer differs by target.
+    /// Never `*`: faithfulness is a claim about what a script emits FOR A TARGET.
     triple: String,
-    /// The package's `links` key, which is the name cargo's
-    /// `[target.<triple>.<links>]` override table is addressed by.
+    /// The package's `links` key, which cargo's override table is addressed by.
     links: String,
-    why: String,
-}
-
-/// One `floor` row: the coverage high-water mark for a cell.
-struct CoverageFloor {
-    cell: String,
-    packages: usize,
+    // The row's 5th column, its reason, is required by the parser and read by
+    // whoever edits the file; the gate's log points at the file instead of
+    // reprinting a paragraph per shim per cell on every run.
 }
 
 /// [`CELL_GATE_POLICY`], parsed.
 struct CellPolicy {
-    cdeps: Vec<ExcusedCDep>,
     cshims: Vec<CBuildShim>,
-    floors: Vec<CoverageFloor>,
 }
 
 impl CellPolicy {
-    /// Is `package` excused on `triple`?
-    fn excuse(&self, package: &str, triple: &str) -> Option<&ExcusedCDep> {
-        self.cdeps
-            .iter()
-            .find(|c| c.package == package && (c.triple == "*" || c.triple == triple))
-    }
-
-    fn floor(&self, cell: &str) -> Option<usize> {
-        self.floors
-            .iter()
-            .find(|f| f.cell == cell)
-            .map(|f| f.packages)
-    }
-
-    /// The build-script overrides this policy declares for `triple`, each with
-    /// its row index so the dead-row audit can tell two rows for one package on
-    /// two triples apart.
+    /// The overrides this policy declares for `triple`, each with its row index
+    /// (two rows for one package on two triples are two obligations).
     fn shims_for(&self, triple: &str) -> Vec<(usize, &CBuildShim)> {
         self.cshims
             .iter()
@@ -294,28 +354,11 @@ impl CellPolicy {
     }
 }
 
-/// WHERE A BUILD-SCRIPT OVERRIDE IS NOT ALLOWED TO BE USED ANYWHERE, named
-/// rather than assumed.
-///
-/// An override is faithful exactly when the build script it replaces emits
-/// nothing that changes how the compiler reads the crate — no `rustc-cfg`, no
-/// `rustc-env`, no generated source. That is a claim about a build script AND a
-/// target, and `zstd-sys` is the proof it can differ by target: its `main` emits
-/// `cargo:rustc-cfg=feature="std"` when `CARGO_CFG_TARGET_ARCH` is `wasm32` or
-/// `CARGO_CFG_TARGET_OS` is `hermit`, and nothing on any other target. Shimming
-/// it there would type-check a DIFFERENT crate and call the result coverage.
-///
-/// So the two triples where the one shipped shim is known to be unfaithful are
-/// refused by the parser itself, and a policy row that names one is a hard error
-/// rather than a silently-wrong green.
-///
-/// EVERYTHING REFUSED HERE IS REFUSED ON EVERY BOX, and that is the rule for
-/// what may live in this function. The policy file is committed and read on
-/// macOS, Linux and Windows alike, so a refusal that depends on which machine
-/// is reading cannot be a parse error about the FILE — it would make a portable
-/// row unwritable and take the whole verb down with it. The host's own triple
-/// is exactly such a refusal, and it lives in `host_shim_refusal`, applied to
-/// the one cell it is about.
+/// The triples where an override is refused on EVERY box: `zstd-sys` emits
+/// `rustc-cfg=feature="std"` for wasm32 and hermit and nothing elsewhere, so a
+/// shim there would type-check a different crate. Only box-independent
+/// refusals live here — the host's own triple is [`host_shim_refusal`], asked
+/// per cell, because the committed file is read on every box.
 fn shim_refusal(triple: &str) -> Option<String> {
     if triple.starts_with("wasm32") || triple.contains("hermit") {
         return Some(format!(
@@ -327,31 +370,11 @@ fn shim_refusal(triple: &str) -> Option<String> {
     None
 }
 
-/// WHERE A BUILD-SCRIPT OVERRIDE IS NOT ALLOWED TO BE APPLIED ON *THIS* BOX.
-///
-/// A judge proved this one: triple-scoping does NOT exclude the host. The
-/// native cell runs with no `--target`, and cargo applies a
-/// `[target.<host-triple>.<links>]` override there too — so a committed row
-/// naming `aarch64-apple-darwin` made `gate cells --cell mac-arm` print
-/// `SHIMMED … 114/114 … 69/69` and exit 0 on an Apple box while zstd-sys's
-/// build script never ran.
-///
-/// The principle: a cell that can RUN a build script has no need of an
-/// override. The shim exists only because no cross C toolchain is installed;
-/// on the host, one is.
-///
-/// WHICH TRIPLE IS THE HOST IS A FACT ABOUT THE MACHINE, NOT ABOUT THE FILE,
-/// and reading it as a fact about the file is what this function exists to
-/// stop. The refusal used to fire inside `parse_cell_policy`, before a single
-/// cell had been selected, so the two committed `x86_64-unknown-linux-gnu`
-/// rows — correct rows, measured on m21 where Linux is a CROSS cell — made
-/// `gate cells --cell win` print `COULD NOT RUN` on every Linux box and never
-/// reach the `win` cell at all: the only gate that compiles aterm for Windows,
-/// unstartable on a Linux box, so no Windows break authored on one could turn
-/// it red. So the answer is per-cell. The row is CARRIED, the cell whose triple
-/// is the host declines to apply it and says so, and every other cell gets its
-/// overrides. Such a row is not a dead row either — the box that needs it is
-/// some other box.
+/// The cell whose triple is this box's own declines its overrides: it can RUN
+/// the build script, and cargo applies a `[target.<host>.<links>]` override to
+/// the native (no `--target`) cell too, so applying one would suppress the real
+/// script and call the result coverage. Every other cell keeps its overrides,
+/// and the row stays live — the box that needs it is some other box.
 fn host_shim_refusal(triple: &str, host: &str) -> Option<String> {
     (triple == host).then(|| {
         format!(
@@ -362,118 +385,68 @@ fn host_shim_refusal(triple: &str, host: &str) -> Option<String> {
     })
 }
 
-/// Parse [`CELL_GATE_POLICY`]. Strict on purpose: an unreadable row is a
-/// COULD-NOT-RUN, never a silently ignored line, because every row of this file
-/// either excuses a failure or sets a floor — both are ways for the gate to
-/// pass while proving less, which is exactly what it exists to prevent.
+/// Parse [`CELL_GATE_POLICY`]: `cshim <name>@<version> <triple> <links> <why>`,
+/// TAB-separated, `#` comments and blank lines ignored. Strict on purpose: a
+/// row this cannot read is a COULD-NOT-RUN, never a silently skipped line.
 fn parse_cell_policy(text: &str) -> Result<CellPolicy, String> {
-    let mut cdeps = Vec::new();
     let mut cshims = Vec::new();
-    let mut floors = Vec::new();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
-        // `cshim` carries one more column than the others — the package's
-        // `links` key, which is the only name cargo's override table answers to
-        // and which cannot be derived from the package name (`zstd-sys` links
-        // `zstd`).
-        let want = if cols.first() == Some(&"cshim") { 5 } else { 4 };
-        if cols.len() < want {
+        if cols[0] != "cshim" {
             return Err(format!(
-                "{CELL_GATE_POLICY}:{}: a `{}` row takes {want} TAB-separated columns, found {}",
+                "{CELL_GATE_POLICY}:{}: unknown row kind `{}` — the only kind is `cshim`",
                 n + 1,
-                cols.first().copied().unwrap_or(""),
+                cols[0]
+            ));
+        }
+        if cols.len() < 5 {
+            return Err(format!(
+                "{CELL_GATE_POLICY}:{}: a `cshim` row takes 5 TAB-separated columns, found {}",
+                n + 1,
                 cols.len()
             ));
         }
-        match cols[0] {
-            "cdep" => cdeps.push(ExcusedCDep {
-                package: cols[1].to_string(),
-                triple: cols[2].to_string(),
-                why: cols[3].to_string(),
-            }),
-            "cshim" => {
-                // `name@version`. The version is not decoration: it is the
-                // whole reason a reader can trust the row. It says WHICH build
-                // script was read, so a bump retires the claim instead of
-                // inheriting it.
-                let Some((package, version)) = cols[1].split_once('@') else {
-                    return Err(format!(
-                        "{CELL_GATE_POLICY}:{}: a `cshim` key is `name@version` (the exact version \
-                         whose build script was read), not `{}`",
-                        n + 1,
-                        cols[1]
-                    ));
-                };
-                if cols[2] == "*" {
-                    return Err(format!(
-                        "{CELL_GATE_POLICY}:{}: `cshim` rows name ONE triple — an override is a \
-                         claim about what a build script emits FOR A TARGET, and `zstd-sys` emits \
-                         a different set on wasm32 than anywhere else.",
-                        n + 1
-                    ));
-                }
-                if let Some(why) = shim_refusal(cols[2]) {
-                    return Err(format!(
-                        "{CELL_GATE_POLICY}:{}: refusing the `cshim` row for `{package}` — {why}.",
-                        n + 1
-                    ));
-                }
-                cshims.push(CBuildShim {
-                    package: package.to_string(),
-                    version: version.to_string(),
-                    triple: cols[2].to_string(),
-                    links: cols[3].to_string(),
-                    why: cols[4].to_string(),
-                });
-            }
-            "floor" => {
-                let packages = cols[2].parse::<usize>().map_err(|e| {
-                    format!(
-                        "{CELL_GATE_POLICY}:{}: floor for `{}` is `{}`, not a package count ({e})",
-                        n + 1,
-                        cols[1],
-                        cols[2]
-                    )
-                })?;
-                floors.push(CoverageFloor {
-                    cell: cols[1].to_string(),
-                    packages,
-                });
-            }
-            other => {
-                return Err(format!(
-                    "{CELL_GATE_POLICY}:{}: unknown row kind `{other}` — the kinds are `cdep`, \
-                     `cshim` and `floor`",
-                    n + 1
-                ));
-            }
+        let Some((package, version)) = cols[1].split_once('@') else {
+            return Err(format!(
+                "{CELL_GATE_POLICY}:{}: a `cshim` key is `name@version` (the exact version whose \
+                 build script was read), not `{}`",
+                n + 1,
+                cols[1]
+            ));
+        };
+        if cols[2] == "*" {
+            return Err(format!(
+                "{CELL_GATE_POLICY}:{}: `cshim` rows name ONE triple — an override is a claim \
+                 about what a build script emits FOR A TARGET, and `zstd-sys` emits a different \
+                 set on wasm32 than anywhere else.",
+                n + 1
+            ));
         }
+        if let Some(why) = shim_refusal(cols[2]) {
+            return Err(format!(
+                "{CELL_GATE_POLICY}:{}: refusing the `cshim` row for `{package}` — {why}.",
+                n + 1
+            ));
+        }
+        cshims.push(CBuildShim {
+            package: package.to_string(),
+            version: version.to_string(),
+            triple: cols[2].to_string(),
+            links: cols[3].to_string(),
+        });
     }
-    Ok(CellPolicy {
-        cdeps,
-        cshims,
-        floors,
-    })
+    Ok(CellPolicy { cshims })
 }
 
-/// The package name inside a cargo `package_id`, which comes in three shapes
-/// and has exactly one trap.
-///
-/// `registry+https://…#serde@1.0.228` and `path+file:///…/foo#bar@0.1.0` both
-/// carry `name@version` after the `#`. But a PATH package whose directory is
-/// already its name abbreviates to `path+file:///…/serde#1.0.228` — no name at
-/// all, just a version. Reading the fragment as the name there yields `1.0.228`,
-/// and every package that shape covers silently vanishes from the coverage
-/// count. THIS IS NOT HYPOTHETICAL: the first measurement taken for this gate
-/// reported `indexmap`, `winit`, `libm`, `smol_str` and every `aterm-*` crate as
-/// unchecked on Linux — 42 phantom holes — for exactly this reason, and the
-/// conclusion drawn from it (that `--keep-going` stops scheduling after a
-/// failure) was false. The name is the last path segment when the fragment has
-/// no `@`.
+/// The package name inside a cargo `package_id`. `registry+…#serde@1.0.228` and
+/// `path+…/foo#bar@0.1.0` carry `name@version` after the `#`, but a path package
+/// whose directory IS its name abbreviates to `path+…/serde#1.0.228` — no name,
+/// just a version — so the name is then the last path segment. Reading the
+/// version as the name once scored 42 packages as never-checked.
 fn package_id_name(id: &str) -> &str {
     let Some((url, frag)) = id.rsplit_once('#') else {
         // Cargo's older opaque form: `name version (source)`.
@@ -489,27 +462,8 @@ fn package_id_name(id: &str) -> &str {
         .trim_end_matches(".git")
 }
 
-/// The package named by cargo's ``error: failed to run custom build command for
-/// `NAME vX.Y.Z (…)` `` line, or `None` for any other line.
-///
-/// Anchored at the whole prefix rather than a `contains`, because this string is
-/// the ONE failure this gate is allowed to excuse — a looser match would let an
-/// arbitrary error carrying that phrase in a diagnostic body buy an excuse.
-fn build_script_failure(line: &str) -> Option<&str> {
-    let rest = line
-        .trim()
-        .strip_prefix("error: failed to run custom build command for `")?;
-    let inner = rest.strip_suffix('`').unwrap_or(rest);
-    // `NAME vX.Y.Z` or `NAME vX.Y.Z (/path)`.
-    inner.rsplit_once(" v").map(|(name, _)| name)
-}
-
-/// The toolchain names in `rustup toolchain list`'s stdout.
-///
-/// The active one is printed as `trust (active, default)`, so a caller that
-/// takes the line verbatim asks rustup for a toolchain called
-/// `trust (active, default)` and gets a "not installed" error it will read as
-/// "this box cannot build that cell".
+/// The toolchain names in `rustup toolchain list`'s stdout, without the
+/// ` (active, default)` marker rustup prints on the same line.
 fn parse_toolchain_names(listing: &str) -> Vec<String> {
     listing
         .lines()
@@ -519,60 +473,41 @@ fn parse_toolchain_names(listing: &str) -> Vec<String> {
         .collect()
 }
 
-// This compiler's own host triple — `crate::driver::rustc_host_triple`, imported
-// above. Used to tell the HOST cell from the four cross cells — never a name
-// comparison, because the cell list is forge's and this gate may not encode a
-// second opinion about which row is native. Until 2026-09-18 it was a bare
-// `rustc -vV` here, which is `None` on every box provisioned with `aterm pkg
-// install trust` and nothing else (no rustup, no `rustc` on PATH — the owner's
-// Mac that day): `gate cells` COULD NOT RUN and three tests below panicked. The
-// ladder now asks `$RUSTC`, then `$CARGO`'s sibling `rustc`/`trustc`, then the
-// store's `trustc`, then bare `rustc` last; the module documents each rung.
+/// Which compiler checks a cell: the pinned host driver for the box's own
+/// triple, a rustup toolchain carrying the triple's std for every other.
+#[derive(Clone, Copy)]
+enum CellCompiler<'a> {
+    Host(&'a CargoDriver),
+    Cross(&'a RustupToolchain),
+}
 
-/// The `check` command for ONE cell, shaped by whether the cell is this box's
-/// own triple. Both cell passes (library and test-target) build theirs here, so
-/// they cannot disagree about it.
+/// The `check` command for ONE cell. Both cell passes build theirs here, so they
+/// cannot disagree about it.
 ///
-/// THE HOST CELL goes through the host driver (`crate::driver::cargo_driver`:
-/// `$CARGO`, the store's targo, a prefix-resolving PATH targo, bare `cargo`)
-/// with NO `RUSTUP_TOOLCHAIN` and NO `--target`. Both halves are load-bearing,
-/// not tidiness. `RUSTUP_TOOLCHAIN` is a rustup-proxy variable: targo ignores
-/// it, and the value the host cell used to export — the literal string `repo
-/// pin (rust-toolchain.toml)`, a LABEL — would have sent a rustup-proxied cargo
-/// looking for a toolchain of that name. And `--target <native triple>` is the
-/// COROLLARY `.cargo/config.toml` spells out: any explicit target makes cargo
-/// withhold the `[target.'cfg(trust_verify)']` rustflags (`-Ztrust-verify=off`)
-/// from host units — build scripts, proc macros and their dependencies — which
-/// then verify STRICTLY and fail the build. Plain `check` applies them to every
-/// unit. The library pass had this right from the start; the test-target pass
-/// exported both until 2026-09-18 (reachable only through `TestPassJob`, whose
-/// one caller exempts the host cell — a latent shape, fixed by construction).
-///
-/// A CROSS CELL is the other lane entirely: the `cargo` of the rustup toolchain
-/// carrying the cell's std ([`RustupToolchain::cargo`]) with `--target <triple>`,
-/// from a neutral cwd. That lane is upstream stable BY DESIGN (rust-toolchain.toml's
-/// header).
-fn cell_check_command(is_host: bool, toolchain: Option<&RustupToolchain>, triple: &str) -> Command {
-    if is_host {
-        cargo_driver().command("check")
-    } else {
-        let mut cmd = toolchain.map_or_else(|| Command::new("cargo"), RustupToolchain::cargo);
-        cmd.arg("check").arg("--target").arg(triple);
-        cmd
+/// THE HOST CELL goes through the pinned driver with NO `RUSTUP_TOOLCHAIN` and
+/// NO `--target`: an explicit target makes cargo withhold `.cargo/config.toml`'s
+/// `[target.'cfg(trust_verify)']` rustflags (`-Ztrust-verify=off`) from host
+/// units, which then verify strictly and fail. A CROSS CELL is the toolchain's
+/// own `cargo` with `--target <triple>`, run from a neutral cwd — a STOCK
+/// EXCEPTION, because the Trust sysroot carries only the host std (measured
+/// 2026-09-28: `targo --unverified check --target <wasm32|windows-gnu|
+/// *-linux-gnu|x86_64-apple-darwin>` stops at error[E0463], no `std`/`core`).
+fn cell_check_command(compiler: CellCompiler<'_>, triple: &str) -> Command {
+    match compiler {
+        CellCompiler::Host(driver) => driver.command("check"),
+        CellCompiler::Cross(toolchain) => {
+            let mut cmd = toolchain.cargo();
+            cmd.arg("check").arg("--target").arg(triple);
+            cmd
+        }
     }
 }
 
-/// A rustup toolchain resolved to its OWN drivers, by path.
-///
-/// NOT `cargo` off PATH with `RUSTUP_TOOLCHAIN` exported, which is what every cross
-/// lane here did until 2026-09-24: that variable is read only by rustup's proxies,
-/// and whatever `cargo` wins PATH first ignores it and compiles with its own
-/// `rustc`. Measured on m7 that day, where Homebrew's cargo sits behind aterm's
-/// reroute stub ahead of `~/.cargo/bin`: `gate cells` printed
-/// `stable-aarch64-apple-darwin` for wasm-cpu, wasm-gpu and mac-x64, and all three
-/// died E0463 ("can't find crate for `std`") under Homebrew's 1.95, which carries
-/// no cross std — while `stable` carried both. `RUSTC` pins the compiler for cargo
-/// and for every build script it runs.
+/// A rustup toolchain resolved to its OWN drivers, by path — never a `cargo`
+/// off PATH trusted to honour `RUSTUP_TOOLCHAIN`, which only rustup's proxies
+/// read (Homebrew's cargo ahead of `~/.cargo/bin` compiled three cells with no
+/// cross std, 2026-09-24). `RUSTC` pins the compiler for cargo and for every
+/// build script it runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RustupToolchain {
     name: String,
@@ -581,10 +516,11 @@ struct RustupToolchain {
 }
 
 impl RustupToolchain {
-    /// `name`'s `cargo` and `rustc`, as `rustup which --toolchain` answers them.
-    fn resolve(name: &str) -> Result<Self, String> {
+    /// `name`'s `cargo` and `rustc`, as `rustup which --toolchain` answers them —
+    /// asked of the `rustup` at [`find_rustup`]'s path, never of PATH's.
+    fn resolve(rustup: &Path, name: &str) -> Result<Self, String> {
         let which = |tool: &str| -> Result<PathBuf, String> {
-            let out = Command::new("rustup")
+            let out = Command::new(rustup)
                 .args(["which", "--toolchain", name, tool])
                 .output()
                 .map_err(|e| format!("could not ask rustup for `{name}`'s {tool} ({e})"))?;
@@ -622,12 +558,12 @@ impl RustupToolchain {
 /// a lane nobody asked for. With no override the installed toolchains are asked
 /// in rustup's own listing order and the first match is used and PRINTED, so the
 /// answer is reproducible and quotable rather than implicit.
-fn cell_toolchain(triple: &str) -> Result<Option<RustupToolchain>, String> {
-    if !on_path("rustup") {
-        return Ok(None);
-    }
+fn cell_toolchain(triple: &str) -> Result<CellToolchain, String> {
+    let Some(rustup) = find_rustup() else {
+        return Ok(CellToolchain::NoRustup);
+    };
     let carries = |tc: &str| -> bool {
-        Command::new("rustup")
+        Command::new(&rustup)
             .args(["target", "list", "--installed", "--toolchain", tc])
             .output()
             .map(|o| {
@@ -638,7 +574,7 @@ fn cell_toolchain(triple: &str) -> Result<Option<RustupToolchain>, String> {
     };
     if let Ok(pinned) = std::env::var("ATERM_CELL_TOOLCHAIN") {
         return if carries(&pinned) {
-            RustupToolchain::resolve(&pinned).map(Some)
+            RustupToolchain::resolve(&rustup, &pinned).map(CellToolchain::Found)
         } else {
             Err(format!(
                 "$ATERM_CELL_TOOLCHAIN names `{pinned}`, which has no {triple} std. Install it \
@@ -647,7 +583,7 @@ fn cell_toolchain(triple: &str) -> Result<Option<RustupToolchain>, String> {
             ))
         };
     }
-    let list = Command::new("rustup")
+    let list = Command::new(&rustup)
         .args(["toolchain", "list"])
         .output()
         .map_err(|e| format!("could not ask rustup which toolchains are installed ({e})"))?;
@@ -664,11 +600,41 @@ fn cell_toolchain(triple: &str) -> Result<Option<RustupToolchain>, String> {
     // choice is printed, and $ATERM_CELL_TOOLCHAIN overrides it.
     let mut names = parse_toolchain_names(&String::from_utf8_lossy(&list.stdout));
     names.sort_by_key(|tc| u8::from(tc.starts_with("nightly")));
-    names
-        .into_iter()
-        .find(|tc| carries(tc))
-        .map(|tc| RustupToolchain::resolve(&tc))
-        .transpose()
+    match names.into_iter().find(|tc| carries(tc)) {
+        Some(tc) => RustupToolchain::resolve(&rustup, &tc).map(CellToolchain::Found),
+        None => Ok(CellToolchain::NoStd),
+    }
+}
+
+/// What [`cell_toolchain`] found for a cross cell. `NoStd` and `NoRustup` are both
+/// skips — nothing is compiled — but they are different facts with different fixes,
+/// and one `Option` spelled them the same: a box with no rustup was told to
+/// `rustup target add` (see [`find_rustup`]).
+#[derive(Debug)]
+enum CellToolchain {
+    /// An installed toolchain carries the triple's std.
+    Found(RustupToolchain),
+    /// rustup is here, and none of its toolchains carries the triple's std.
+    NoStd,
+    /// No rustup anywhere [`find_rustup`] looks, so no toolchain could be asked.
+    NoRustup,
+}
+
+/// Why a cell was SKIPPED — the two ways nothing can be compiled for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SkipCause {
+    NoStd,
+    NoRustup,
+}
+
+impl SkipCause {
+    /// The STATUS column word for a row skipped for this cause.
+    const fn status(self) -> &'static str {
+        match self {
+            Self::NoStd => SKIPPED_NO_STD,
+            Self::NoRustup => SKIPPED_NO_RUSTUP,
+        }
+    }
 }
 
 /// The STATUS word a cell wears when no installed toolchain carries its std.
@@ -676,41 +642,24 @@ fn cell_toolchain(triple: &str) -> Result<Option<RustupToolchain>, String> {
 /// ([`CellReport::skipped`]) and read by the tests that hold the row to it.
 const SKIPPED_NO_STD: &str = "SKIPPED(no-std)";
 
-/// What one cell's run DECIDED. THREE-VALUED, for the reason [`LaneVerdict`] is.
-///
-/// This field was a `bool` named `ok`, and a cell for which NO COMPILER EVER
-/// STARTED carried `ok: true` beside `status: "SKIPPED(no-std)"`. Measured on
-/// 2026-09-17, on a box with no cross std installed and no native cell —
-/// `xtask gate cells`, five cells, zero compilers, exit 0:
-///
-/// ```text
-/// mac-arm  aarch64-apple-darwin  -  0  121  0/76  1  -  0  SKIPPED(no-std)
-/// …
-/// gate cells: GREEN — all 5 cells type-check, with nothing excused or shimmed:
-/// 0 of 312 in-repo crate-instances read; 312 NOT; test targets compiled for 0
-/// of 0 member-instances (5 not owed a test pass: mac-arm, linux, win, …).
-/// ```
-///
-/// "All 5 cells type-check" is the quotable sentence, and it was true of no
-/// cell in that run. A skip is NOT a pass.
-///
-/// It is not a failure either, and that half is a decision this type pins
-/// rather than a convenience. An uninstalled std is a fact about the BOX,
-/// repairable by one `rustup target add`, identical on every checkout of the
-/// tree — so blocking on it would be a red that no change to this repository
-/// could clear, and [`LaneVerdict`] records what a permanent red costs
-/// (three lint-red commits reached `main` under a gate that could not pass).
-/// So: exit 0, and the MATRIX CLAIM is forfeit — the same discipline
-/// `aterm_verify::verdict` holds for the run as a whole, where a skipped stage
-/// keeps exit 0 and loses `merge contract satisfied`.
+/// The STATUS word a cell wears when there is no rustup to ask for a toolchain.
+const SKIPPED_NO_RUSTUP: &str = "SKIPPED(no-rustup)";
+
+/// What one cell's run DECIDED. Three-valued, like [`LaneVerdict`]: a cell no
+/// compiler started for once carried `ok: true`, and five of them printed
+/// `GREEN — all 5 cells type-check` (2026-09-17). A skip is NOT a pass — and not
+/// a failure either: an uninstalled std is a fact about the box that no change
+/// to the tree can clear, so the run exits 0 and forfeits the matrix claim, as
+/// `aterm_verify::verdict` does for a skipped stage.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CellOutcome {
     /// A compiler read this cell's graph FOR THE CELL'S OWN TRIPLE, and every
     /// obligation the policy file records for it held.
     Checked,
-    /// No installed toolchain carries this triple's std. NOTHING was compiled:
-    /// neither a pass nor a finding, because nothing about the tree was learned.
-    Skipped,
+    /// No toolchain here can compile this triple — no installed std, or no rustup
+    /// to select one with ([`SkipCause`]). NOTHING was compiled: neither a pass nor
+    /// a finding, because nothing about the tree was learned.
+    Skipped(SkipCause),
     /// A compiler ran and the cell did not hold. Blocks.
     Failed,
 }
@@ -723,14 +672,12 @@ struct CellReport {
     /// Packages of the cell's OWN graph that got a target artifact.
     checked: usize,
     graph: usize,
-    excused: Vec<String>,
     /// Build scripts replaced by a [`CBuildShim`] on this cell.
     shimmed: Vec<String>,
     /// IN-REPO packages of this cell's graph that a compiler read, over the
-    /// number it could read at all. THE NUMBER THIS GATE IS ABOUT: a cell can
-    /// be at its coverage floor with every line of aterm's own platform code
-    /// unread, which is exactly the state the Linux and Windows cells shipped
-    /// in, and `206/253` does not say so.
+    /// number it could read at all. THE NUMBER THIS GATE IS ABOUT: `linux
+    /// 206/253` once read GREEN with every line of aterm's own platform code
+    /// unread.
     own_checked: usize,
     own_total: usize,
     /// In-repo packages that CANNOT produce an artifact for a cross triple
@@ -768,6 +715,7 @@ impl CellReport {
         graph: usize,
         own_total: usize,
         own_proc_macros: usize,
+        cause: SkipCause,
     ) -> Self {
         Self {
             cell: cell.name.clone(),
@@ -775,7 +723,6 @@ impl CellReport {
             toolchain: "-".to_string(),
             checked: 0,
             graph,
-            excused: Vec::new(),
             shimmed: Vec::new(),
             own_checked: 0,
             own_total,
@@ -785,8 +732,8 @@ impl CellReport {
             tests_note: Some("nothing was compiled for this cell at all".to_string()),
             secs: 0,
             disk: None,
-            status: SKIPPED_NO_STD.to_string(),
-            outcome: CellOutcome::Skipped,
+            status: cause.status().to_string(),
+            outcome: CellOutcome::Skipped(cause),
         }
     }
 }
@@ -1039,17 +986,12 @@ struct TestPass {
 struct TestPassJob<'a> {
     root: &'a Path,
     cell: &'a aterm_forge::model::Cell,
-    /// Is this the box's own triple? Decides the whole command shape — see
-    /// [`cell_check_command`].
-    is_host: bool,
-    /// The rustup toolchain the library pass selected for a CROSS cell;
-    /// `None` for the host cell, which has no rustup toolchain to name (the
-    /// host driver IS the pin).
-    toolchain: Option<&'a RustupToolchain>,
+    /// The compiler the library pass checked this cell with.
+    compiler: CellCompiler<'a>,
     target_dir: &'a Path,
     /// The `--config` build-script overrides this cell's `cshim` rows put in
     /// force, verbatim: a second pass compiling the same graph without them
-    /// would die on the same C build scripts the first pass was excused from.
+    /// would die on the same C build scripts the first pass shimmed.
     shim_args: &'a [String],
     members: &'a std::collections::BTreeSet<String>,
     graph_names: &'a std::collections::BTreeSet<String>,
@@ -1073,14 +1015,14 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
     let TestPassJob {
         root,
         cell,
-        is_host,
-        toolchain,
+        compiler,
         target_dir,
         shim_args,
         members,
         graph_names,
         proc_macros,
     } = *job;
+    let is_host = matches!(compiler, CellCompiler::Host(_));
     let patched = patched_crate_names(root)?;
     let (selected, excluded) = cell_test_selection(members, graph_names, &patched);
     // A SELECTION THAT CAME OUT EMPTY IS A FAILURE, NOT A GREEN PASS. If the
@@ -1111,7 +1053,7 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
         )
     };
     let cwd = neutral.clone().unwrap_or_else(|| root.to_path_buf());
-    let mut cmd = cell_check_command(is_host, toolchain, &cell.triple);
+    let mut cmd = cell_check_command(compiler, &cell.triple);
     cmd.current_dir(&cwd)
         .env("CARGO_TARGET_DIR", target_dir)
         .arg("--locked")
@@ -1198,10 +1140,9 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
             _ => {}
         }
     }
-    // Same column-zero rule as the pass above, and for the same reason: an
-    // excused build script re-emits its own output INDENTED under `Caused by:`,
-    // and `error: could not compile` is cargo's summary of diagnostics already
-    // counted through the JSON stream.
+    // Same column-zero rule as the pass above: a failing build script re-emits
+    // its own output INDENTED under `Caused by:`, and `error: could not compile`
+    // is cargo's summary of diagnostics already counted through the JSON stream.
     let cargo_errors: Vec<String> = stderr
         .lines()
         .filter(|l| l.starts_with("error") && !l.starts_with("error: could not compile"))
@@ -1225,51 +1166,15 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
 // THE CROSS-TRIPLE COMPILE THAT IS ALWAYS ON
 // ---------------------------------------------------------------------------
 
-/// THE TRIPLES SOME BOX IN THIS FLEET RUNS NATIVELY. A claim about MACHINES,
-/// not about targets, and the whole reason [`gate_cells_foreign`] can run on
-/// every tier of the merge gate on a day when `cells` itself cannot.
-///
-/// A cell whose triple somebody HOSTS is a cell whose `gate cells` verdict
-/// depends on who is asking — measured on 2026-09-17, not reasoned about:
-///
-///   * its `cshim` rows are DECLINED by the box that hosts the triple
-///     (`host_shim_refusal`) and applied by every other box, so a host run and
-///     a cross run of the same cell do not reach the same packages;
-///   * its `floor` row is whatever the box that recorded it could count, and a
-///     HOST run counts artifacts — proc macros, host-only build deps — that a
-///     CROSS run cannot produce at all.
-///
-/// Both halves are live on this tree TODAY, which is why this const exists
-/// rather than a comment saying "should be fine". `gate cells` is GREEN on the
-/// macOS boxes, where `mac-arm` is native, and RED on m17-tower, where it is the
-/// cross cell and no policy row covers `aarch64-apple-darwin`:
-/// `mac-arm  aarch64-apple-darwin  …  90  121  58/76  …  BUILD-SCRIPT(ring)` —
-/// `ring` and `zstd-sys` die in cc-rs for want of an Apple SDK and take eighteen
-/// of aterm's own crates down with them. In the same run the `linux` cell, whose
-/// floor of 230 was recorded as a CROSS cell on the Mac, reached 266 as the HOST
-/// cell here and printed `gained coverage … raise it by hand` — and raising it
-/// would fail the Mac. A gate that cannot pass on a whole platform for ANY
-/// input is a verdict that carries no information, which is the disease
-/// [`LaneVerdict`] was written to end.
-///
-/// So the always-on subset is the cells NO box hosts, and this const is the half
-/// of that sentence no compiler can derive. It is checked from whichever machine
-/// runs the tests, by `no_cell_this_box_runs_natively_is_in_the_always_on_subset`:
-/// a box whose own `rustc -vV` host triple is a cell's triple and is missing
-/// here FAILS that test rather than quietly making this gate mean something
-/// else.
-///
-/// `x86_64-apple-darwin` joined on 2026-09-19, by that test doing exactly its
-/// job. `mac-x64` was not a cell until `fa57c6f97` (`the six triples atpkg
-/// publishes are the six a compiler reads`) added it with `linux-arm` and
-/// `win-arm`, and the fleet's Intel Mac HOSTS that triple — so from the day the
-/// cell arrived, `cells-foreign` was cross-compiling on the other boxes a cell
-/// this one builds natively, which is the host-vs-cross divergence the two
-/// bullets above describe. Measured on that box (macOS 13.7.8, 4-core x86_64) in
-/// the merge gate's own test stage: the test failed naming this const and the
-/// triple to add. The subset it leaves is `win`, `wasm-cpu`, `wasm-gpu`,
-/// `linux-arm` and `win-arm` — still non-empty, and still carrying the Windows
-/// and wasm32 cells that are the gate's reason to exist.
+/// THE TRIPLES SOME BOX IN THIS FLEET RUNS NATIVELY — a claim about machines,
+/// not targets. A cell somebody HOSTS gets a different verdict on the box that
+/// hosts it (its `cshim` rows are declined there, and a native run counts host
+/// artifacts a cross run cannot produce), so only the cells no box hosts can
+/// ride every tier of the merge gate as [`gate_cells_foreign`].
+/// `no_cell_this_box_runs_natively_is_in_the_always_on_subset` checks this list
+/// from whichever machine runs the tests, and
+/// `the_libc_oracle_cell_table_agrees_with_the_fleet` holds it to the oracle's
+/// own table.
 const FLEET_HOST_TRIPLES: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -1277,11 +1182,7 @@ const FLEET_HOST_TRIPLES: &[&str] = &[
 ];
 
 /// The cells [`gate_cells_foreign`] compiles: every forge cell whose triple is
-/// in nobody's [`FLEET_HOST_TRIPLES`]. DERIVED from
-/// [`aterm_forge::resolve::default_cells`] rather than typed out, so a sixth
-/// cell joins the always-on set on the day it joins the matrix — a hand-typed
-/// list is exactly how this file's own header came to say "the four" while the
-/// dispatch already said five.
+/// in nobody's [`FLEET_HOST_TRIPLES`], derived from forge's own cell list.
 fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
     aterm_forge::resolve::default_cells()
         .into_iter()
@@ -1289,92 +1190,16 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
         .collect()
 }
 
-/// `xtask gate cells-foreign` — the cross-triple compile every tier of the
-/// merge gate runs (`StageId::ForeignCells` in `crates/aterm-verify`).
-///
-/// THE HOLE THIS FILLS. `cells` was the only thing in this tree that compiles
-/// aterm for a triple the box is not, and it was OPT-IN: `tools/verify.sh
-/// --full` and nothing else, while nothing automatic runs `--full`. The bill
-/// came on 2026-09-16, as four commits in one day — `aterm-gui` did not compile
-/// for Windows at all (36c0d4c44, 0f4e44d25), `atpkg` neither, and its unit
-/// tests did not build off macOS (693f1c331), and `aterm-verify`'s test target
-/// could not BUILD for Windows (b436bd4ff) — every one of them found by a human
-/// who went looking, none by a gate, while every other gate in the tree called
-/// the tree green. 36c0d4c44's own body names the mechanism in one sentence:
-/// "From a Unix box the build is clean, which is exactly why it landed".
-///
-/// WHAT IT RUNS, AND WHY NOT THE WHOLE MATRIX. [`foreign_cells`] — `win`,
-/// `wasm-cpu`, `wasm-gpu`, `linux-arm` and `win-arm` on today's matrix (the
-/// first three until 2026-09-18): the cells no box in this fleet runs
-/// natively, which is exactly the set whose verdict is the SAME wherever it is
-/// run. `mac-arm`, `mac-x64` and `linux` stay behind the opt-in `cells` verb
-/// because each is native on some box — where the ordinary test and tippy
-/// lanes and the shipped release already compile it — and cross on another,
-/// and the gate's verdict for them differs between the two. The two
-/// mechanisms, and the red one of them is in right now, are in
-/// [`FLEET_HOST_TRIPLES`].
-///
-/// THE COST, MEASURED, because "it cross-checks several triples" was the entire
-/// argument for keeping it out. m17-tower (Ryzen 9900X3D, 24 threads, x86_64
-/// Linux), load average ~6, the debug `xtask` binary, `$ATERM_CELL_TARGET_DIR`
-/// outside the repo, `/usr/bin/time -p`, 2026-09-17, when the matrix had five
-/// cells and this subset three:
-///
-/// ```text
-///   RUN                      COLD      WARM (no edit)          AFTER ONE CORE EDIT
-///   gate cells (5 cells)    235.7 s    2.10 / 2.15 / 2.25 s    55.7 s
-///   gate cells-foreign (3)   90.5 s    1.21 / 1.24 s           16.6 s
-/// ```
-///
-/// RE-MEASURED 2026-09-27 with the subset's FIVE cells, on m7 (M5 Max) at load
-/// average 40-65 from other sessions — wall seconds, each run into its own
-/// `$ATERM_CELL_TARGET_DIR`, and `CARGO_INCREMENTAL` both ways because
-/// `tools/verify.sh`'s children run with it off:
-///
-/// ```text
-///   RUN                              COLD     WARM (no edit)   AFTER ONE CORE EDIT   DISK
-///   cells-foreign (5), incremental   394 s    —                75 s                  12.1 GiB
-///   cells-foreign (5), CARGO_INC=0   432 s    8 s              278 s                  2.6 GiB
-/// ```
-///
-/// Three quarters of the incremental cache is `incremental/`. The 2026-09-17
-/// row and these are not comparable box to box; the load here was 7-10x.
-///
-/// ("one core edit" is `touch crates/aterm-grid/src/lib.rs`, a crate most of the
-/// tree sits above.) The 39 s the subset drops is almost all the HOST cell, and
-/// the host cell is the one that buys the least: its triple is the one every
-/// other stage of `tools/verify.sh` already compiles, and it pays for it a
-/// second time because this verb never shares the repo's `target/`.
-///
-/// THE OTHER COST, since it is not seconds. The three cells of 2026-09-17 left
-/// 5.0 GB of target directories behind (win 3.6 G — it is the one owed the
-/// test-target pass — wasm-gpu 824 M, wasm-cpu 620 M); the five of 2026-09-27
-/// leave 12.1 GiB with incremental on and 2.6 GiB with it off (the table
-/// above). That used to land in the system temp
-/// dir, which is a RAM-backed tmpfs on this box, and this paragraph used to tell
-/// the reader to point `$ATERM_CELL_TARGET_DIR` at a disk themselves — which is
-/// how a `/tmp/aterm-cells` reached 13.6 GB here and took the swap with it.
-/// [`cell_target_dir`] now defaults to the disk-backed cache dir, so the cache
-/// lands on a disk without anyone being told to arrange it.
-///
-/// WHAT IT STILL DOES NOT CATCH, said here rather than left for a reader to
-/// discover. A break visible only on `aarch64-apple-darwin` or only on
-/// `x86_64-unknown-linux-gnu` reaches this gate on NO box, because those two
-/// cells are not in it; they are covered by the native lanes of whichever box
-/// hosts them, and by `cells` under `tools/verify.sh --full`. What is new is
-/// that Windows and wasm are compiled on EVERY box, on every gate run, instead
-/// of on whoever remembered to type `--full`.
-///
-/// AND WHO RUNS IT: `StageId::ForeignCells` in `crates/aterm-verify`'s FAST
-/// plan, decided 2026-09-25 under the owner's standing direction on the
-/// 2026-09-17 numbers;
-/// its real cost is the `CARGO_INC=0` row above (8 s when nothing changed,
-/// 278 s after a core edit on a loaded M5 Max, 2.6 GiB cold). A snapshot's run
-/// builds into the snapshot's own cells lane beside it
-/// (`aterm_verify::disk::cells_lane`), which the verify disk preflight counts
-/// and caps, not into the per-checkout cache under `~/.cache/aterm/cells`.
-/// It needs rustup's `stable` with the four foreign std targets; without them
-/// this verb exits 0 naming the missing std and the verify stage is a SKIP.
+/// `xtask gate cells-foreign` — the cross-triple compile every run of the merge
+/// gate makes (`StageId::ForeignCells` in `crates/aterm-verify`): `gate cells`
+/// narrowed to [`foreign_cells`], the cells whose verdict is the same wherever it
+/// runs. Windows and wasm are compiled on every box, on every gate run; the
+/// natively-hosted cells stay behind the opt-in `cells` (`tools/verify.sh
+/// --full`), covered day to day by the native lanes of the boxes that host them.
+/// It needs rustup's `stable` with the foreign std targets; without them this
+/// exits 0 naming the missing std, and the verify stage is a SKIP. Measured cost
+/// (2026-09-27, M5 Max under load, `CARGO_INCREMENTAL=0`): 432 s and 2.6 GiB
+/// cold, 8 s warm, 278 s after a core edit.
 fn gate_cells_foreign() -> bool {
     let cells = foreign_cells();
     // FAIL-CLOSED, and this is not a theoretical arm: `gate_cells` reads an
@@ -1407,177 +1232,32 @@ fn gate_cells_foreign() -> bool {
     gate_cells(&args)
 }
 
-/// THE MATRIX AUDIT — the half of `gate cells` that needs no compiler, asks its
-/// question of forge's WHOLE cell list, and therefore answers the same on a
-/// narrowed run: every cell has a `floor` row, every `floor` row still has a
-/// cell, and no cell has two.
+/// `xtask gate cells` — every forge cell ([`aterm_forge::resolve::default_cells`]
+/// itself, not a copy), type-checked BY A COMPILER for its own target triple.
 ///
-/// It is a function rather than three loops inside a 900-line verb because a
-/// check nobody has ever seen fail is a check nobody has verified. Inline, the
-/// only way to drive it was to compile five triples; out here
-/// `a_shrunken_matrix_or_a_missing_floor_fails_the_cells_audit` plants all three
-/// violations and asserts a RED verdict in `targo --unverified test -p xtask`.
+/// Each cell's ROOT PACKAGE is checked, so the feature set is cargo's own
+/// resolution for that root on that triple. The HOST cell runs on the pinned
+/// toolchain from the repo root with no `--target`; a CROSS cell runs on a
+/// rustup toolchain carrying the triple's std, from a neutral cwd (cargo reads
+/// config, and rustup the toolchain pin, from the cwd upward, and both of this
+/// repo's are Trust's: [`neutral_build_cwd`]). Nothing is written inside the repo: [`cell_target_dir`]
+/// refuses a target dir there, `--locked` keeps `Cargo.lock`, and the policy
+/// file is read-only here.
 ///
-/// Returns one line per violation — empty means discharged.
-fn cell_matrix_audit(
-    all_cells: &[aterm_forge::model::Cell],
-    floors: &[CoverageFloor],
-) -> Vec<String> {
-    let mut out = Vec::new();
-    // THE DIRECTION A SHRUNKEN MATRIX WALKS THROUGH, and it used to be
-    // narrow-sensitive: "which cells have no floor row" was asked inside the
-    // per-cell loop, so a run narrowed with `--cell linux` never noticed that
-    // `wasm-cpu` had lost its floor — exit 0, nothing said. A judge measured
-    // exactly that. Both lists are known in full here regardless of narrowing.
-    for cell in all_cells {
-        if !floors.iter().any(|f| f.cell == cell.name) {
-            out.push(format!(
-                "gate cells: FAILED — {CELL_GATE_POLICY} records no `floor` row for cell `{}`, \
-                 which `aterm_forge::resolve::default_cells()` carries. A cell with no floor can \
-                 shrink to nothing without the gate saying a word, and a narrowed run must not be \
-                 able to hide that. Add:\n\
-                 gate cells:   floor\t{}\t<packages>\t<why this is the number>",
-                cell.name, cell.name
-            ));
-        }
-    }
-    for floor in floors {
-        if !all_cells.iter().any(|c| c.name == floor.cell) {
-            out.push(format!(
-                "gate cells: FAILED — {CELL_GATE_POLICY} records a floor of {} for cell `{}`, \
-                 which `aterm_forge::resolve::default_cells()` no longer has. Either the cell was \
-                 dropped from the matrix — say so by deleting the row, in the same commit — or \
-                 the row is a typo. A floor with no cell is a shrunken matrix passing silently.",
-                floor.packages, floor.cell
-            ));
-        }
-    }
-    // Two rows for the same cell would make `floor()` (a `find`) silently honour
-    // the first and ignore the second, so the lower number could be hidden
-    // behind the higher one.
-    for (i, floor) in floors.iter().enumerate() {
-        if floors[..i].iter().any(|f| f.cell == floor.cell) {
-            out.push(format!(
-                "gate cells: FAILED — {CELL_GATE_POLICY} records more than one `floor` row for \
-                 cell `{}`. Only the first is ever read; delete the others.",
-                floor.cell
-            ));
-        }
-    }
-    out
-}
-
-/// `xtask gate cells` — every forge cell, type-checked BY A COMPILER for its own
-/// target triple.
+/// A cell OWES, and is red without: every in-repo non-proc-macro crate in its
+/// graph read by the compiler for its triple (a package count once read GREEN
+/// at `linux 206/253` with none of aterm's own crates compiled); every shimmed
+/// package type-checked (a mis-keyed `links` is silently ignored by cargo); no
+/// cargo error at all (a C build script this box cannot run is shimmed by a
+/// `cshim` row or it fails the cell); and, off the host and wasm32, a second
+/// pass compiling every target — tests, benches, examples — of every workspace
+/// member in its graph ([`run_cell_test_pass`]), because a `#[cfg(test)]`
+/// line was otherwise never compiled for a triple the box is not.
 ///
-/// THE HOLE THIS FILLS, in the words of the judge who found it. aterm resolves
-/// five cells; this machine's default toolchain compiles one. Reviewing the
-/// `once_cell` row on 2026-09-01 that judge wrote: "the linux, win, wasm-cpu and
-/// wasm-gpu cells cannot be COMPILED here — no cross std is installed — so ten
-/// of the thirteen consumers are held by source reading and by
-/// tests/consumers.rs, never by a type checker. BOTH DEFECTS ABOVE LIVED IN
-/// EXACTLY THAT GAP." Cargo resolved all five cells offline and `forge`
-/// measured all five, and nothing compiled any of them: every claim about the
-/// other four was a claim about a graph, not about a program.
-///
-/// THE PREMISE THAT TURNED OUT TO BE FALSE is the reason this verb can exist.
-/// "No cross std is installed" was true of the toolchain `rust-toolchain.toml`
-/// pins — the Trust fork's stage2 sysroot carries `aarch64-apple-darwin` and
-/// nothing else — and false of the box: `1.95.0` carries std for both Linux
-/// triples, both `windows-msvc` triples and `wasm32-unknown-unknown`. So the
-/// four cells were never uncheckable; they were unchecked.
-///
-/// WHAT EACH CELL RUNS. The cell list is [`aterm_forge::resolve::default_cells`]
-/// itself — not a copy — so the thing that is measured and the thing that is
-/// compiled cannot drift into disagreeing about what a cell is. Each cell's
-/// ROOT PACKAGE is checked, which is what makes the FEATURE set exact: it is
-/// cargo's own resolution for that root on that triple, not a hand-assembled
-/// package list whose members would each arrive with their default features.
-///
-///   * The HOST cell runs on the repo's own pinned toolchain from the repo root
-///     and passes NO `--target`, because `.cargo/config.toml`'s corollary is
-///     explicit that pinning `--target` to the native triple makes cargo
-///     withhold the `-Ztrust-verify=off` table from host units, which then
-///     verify strictly and fail. It is also the only cell that CANNOT ride the
-///     upstream toolchain: `crates/trust-gate`'s build script refuses a non-Trust
-///     compiler when HOST == TARGET, measured here as a hard stop 16 s into a
-///     `+1.95.0` run.
-///   * The four CROSS cells run on a toolchain that carries the triple, from a
-///     NEUTRAL cwd — cargo discovers config by walking the cwd upward, and
-///     `-Ztrust-verify=off` is a flag only Trust understands, so an in-repo cwd
-///     kills an upstream cross build at flag-parse on its first unit. Same
-///     reason, same trick, as `tools/wasm-bench/run.sh`.
-///
-/// NOTHING IS WRITTEN INSIDE THE REPO. The cells never build into
-/// `<repo>/target`, and the verb refuses to start if `$ATERM_CELL_TARGET_DIR`
-/// points inside the workspace. `--locked`
-/// keeps `Cargo.lock` untouched, and the policy file is read-only to this gate.
-///
-/// THE C DEPENDENCIES, AND WHY THEY ARE NO LONGER AN EXCUSE. Two dependencies
-/// bundle C and build it with `cc-rs` — `ring` and `zstd-sys` — and this box has
-/// no cross C toolchain, so on the Linux and Windows cells their build scripts
-/// die before any Rust is read, taking their whole upward closure with them
-/// (`zstd -> aterm-scrollback -> aterm-core`, and `ring -> rustls`). Until
-/// 2026-09-01 both were EXCUSED by name from [`CELL_GATE_POLICY`], and the cost
-/// of that excuse was not visible in the number the verb printed: `linux
-/// 206/253` was at its floor, GREEN, and had not read one line of `aterm-gui`,
-/// `aterm-core`, `atpkg` or the other fifteen first-party crates above the
-/// engine — where 1,164 of the workspace's 1,910 `windows`/`linux`/`unix` `cfg`
-/// sites live. A bare `E0308` planted under `#[cfg(target_os = "linux")]` in
-/// `crates/aterm-gui/src/control.rs` left this verb GREEN at exit 0, and the
-/// same under `#[cfg(windows)]` likewise.
-///
-/// They are SHIMMED now instead. A `cshim` row hands cargo its own build-script
-/// override for that package's `links` key on ONE triple, passed with `--config`
-/// on the command line so nothing is written and nothing can leak, and cargo
-/// skips the script and type-checks the Rust. That is only honest where the
-/// script emits nothing a compiler reads — no `rustc-cfg`, no `rustc-env`, no
-/// generated source — which is true of both of these and is written out, with
-/// line numbers, in the rows themselves. `shim_refusal` hard-refuses the two
-/// triples where it is false (`zstd-sys` emits `rustc-cfg=feature="std"` for
-/// wasm32 and hermit). Both plants go RED now, and linux went 206 -> 230, win
-/// 123 -> 147, with every remaining unreached package on both a host-only proc
-/// macro or a build dep of one.
-///
-/// A row naming THE READER'S OWN TRIPLE is a third case, and it is answered per
-/// cell rather than per file (`host_shim_refusal`): that cell declines the
-/// override and compiles with the real build script, every other cell keeps
-/// its overrides, and the row is live rather than dead. Refusing it at parse
-/// time instead — which this verb did until the rows for a cross Linux cell
-/// met a Linux host — took down `--cell win` along with it.
-///
-/// TWO PASSES PER CELL SINCE 2026-09-16, and the second is the one this gate
-/// had been missing. Pass one checks `-p <cell package>` — libraries, the cell's
-/// root binary, and everything beneath them. Pass two checks `--workspace
-/// --all-targets` minus the members this cell's graph does not carry, so every
-/// workspace member's TESTS, benches and examples are read by a compiler for the
-/// cell's triple too. Until it existed, no compiler anywhere read a
-/// `#[cfg(test)]` line for a triple that was not the box's own, and three crates
-/// shipped test binaries that did not BUILD off the author's machine — `atpkg`
-/// off macOS, `aterm-gui` and `aterm-verify` for Windows — each found by hand,
-/// none by a gate. `test_pass_exemption` names the two cells that are not owed
-/// the pass and why, in the run's own output.
-///
-/// WHAT IT STILL DOES NOT COVER, said out loud in the verdict rather than left
-/// to a reader. A shimmed cell TYPE-CHECKS; it never links the bundled C — nor
-/// does any other cell, because `cargo check` does not link — and no cell runs a
-/// binary, so cross-compiler codegen, C ABI breakage and every runtime behaviour
-/// are out of reach. The cells are rooted at `aterm`, `aterm-wasm` and
-/// `aterm-gpu-web`, so a crate in no cell's graph (`aterm-release`,
-/// `atpkg-keys`, `aterm-conformance`, `aterm-nest`, `aterm-effects-web`, …) is
-/// not covered here at all. That is a scope statement, not a hole: those are
-/// host-only publisher, key and conformance crates which SHIP to no triple —
-/// the release cutter refuses to run anywhere but a macOS arm64 host
-/// (`aterm_release::gates`) — and the workspace test stage compiles every one
-/// of them on whatever box runs it (`cargo … --workspace`, see
-/// `aterm_verify::stages`). What the matrix owes is the six triples aterm's
-/// artifacts are PUBLISHED for, and since 2026-09-18 it carries all six.
-/// Measured on 2026-09-01, over the 3,245 platform
-/// `cfg` attribute sites under `crates/`: 2,143 were reachable by some cell
-/// before this change and 2,894 after — of the 351 that remain, 232 are in
-/// crates no cell's graph carries and 119 are predicates no cell's triple can
-/// satisfy (BSD/Android arms, `not(any(unix, windows))` fallbacks, and the
-/// `all(test, not(target_arch = "wasm32"))` guards in the two wasm crates).
+/// NOT COVERED, and said in the verdict: a shimmed cell never links the bundled
+/// C, no cell links or runs anything, and a crate in no cell's graph (the
+/// host-only publisher, key and conformance crates) is left to the workspace
+/// test stage.
 fn gate_cells(rest: &[String]) -> bool {
     let mut wanted: Vec<String> = Vec::new();
     let mut args = rest.iter();
@@ -1593,7 +1273,7 @@ fn gate_cells(rest: &[String]) -> bool {
             other => {
                 eprintln!(
                     "gate cells: unknown argument `{other}`.\n\
-                     usage: xtask gate cells [--cell NAME]…   (repeatable; no --cell means all five)"
+                     usage: xtask gate cells [--cell NAME]…   (repeatable; default: every cell)"
                 );
                 return false;
             }
@@ -1621,21 +1301,22 @@ fn gate_cells(rest: &[String]) -> bool {
     cells_under_policy(&root, &policy, &wanted)
 }
 
-/// The verb's whole body once [`CELL_GATE_POLICY`] is read — split out (2026-09-24) so
-/// a fixture can drive the verb, compile and verdict included, under a policy it
-/// states: `a_foreign_cell_under_its_floor_fails_the_cells_verb`.
+/// The verb's whole body once [`CELL_GATE_POLICY`] is read.
 fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bool {
     let root = root.to_path_buf();
 
     // THE WORKSPACE MEMBER LIST, read once and shared by every cell: the
     // test-target pass selects `--workspace` minus the members a cell's graph
-    // does not carry, and `--exclude` takes package NAMES, not directories.
-    // Through the host driver (crate::driver) — `metadata` takes no lane flag
-    // from targo, and the driver knows that. Announced once, with its source,
-    // so the log says which toolchain read the manifest. Exported as `$CARGO`
-    // too, because forge's per-cell `cargo tree` (step 1 below) reads that and
-    // nothing else.
-    let driver = export_driver_as_cargo();
+    // does not carry, and `--exclude` takes package NAMES. Through the pinned
+    // driver, which is also exported as `$CARGO` for forge's per-cell `cargo
+    // tree` (step 1 below).
+    let driver = match export_driver_as_cargo() {
+        Ok(d) => d,
+        Err(why) => {
+            eprintln!("gate cells: COULD NOT RUN — {why}");
+            return false;
+        }
+    };
     let metadata_args = [
         "--no-deps",
         "--locked",
@@ -1643,17 +1324,7 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         "--format-version",
         "1",
     ];
-    eprintln!(
-        "gate cells: host driver: {} ({})",
-        driver.program.display(),
-        driver.source
-    );
-    // A toolchain the discovery REFUSED is skipped by the ladder, never
-    // adopted; say so beside the driver that answered instead, so the reader
-    // knows why the store rung did not fire (2026-09-18).
-    if let Some(why) = &driver.refused {
-        eprintln!("gate cells: note — the pinned-toolchain rung was skipped: {why}");
-    }
+    eprintln!("gate cells: host driver: {}", driver.program.display());
     eprintln!("  $ {}", driver.display("metadata", &metadata_args));
     let members = match driver
         .command("metadata")
@@ -1683,7 +1354,7 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         }
         Err(e) => {
             eprintln!(
-                "gate cells: COULD NOT RUN — could not run `{} metadata` ({e}); {DRIVER_REMEDY}.",
+                "gate cells: COULD NOT RUN — could not run `{} metadata` ({e}).",
                 driver.program.display()
             );
             return false;
@@ -1710,24 +1381,20 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         all_cells.len()
     );
 
-    let host = rustc_host_triple();
-    if host.is_none() {
+    let Some(host) = rustc_host_triple() else {
         eprintln!(
-            "gate cells: COULD NOT RUN — no compiler on the host ladder ($RUSTC, $CARGO's sibling \
-             rustc/trustc, the store's trustc, bare rustc) reported a host triple, so the native \
-             cell cannot be told from the cross ones; {DRIVER_REMEDY}."
+            "gate cells: COULD NOT RUN — {} did not report a host triple (`-vV`), so the native \
+             cell cannot be told from the cross ones.",
+            driver.trustc.display()
         );
         return false;
-    }
-    let host = host.unwrap_or_default();
+    };
 
     let mut reports: Vec<CellReport> = Vec::new();
     let mut fail = false;
-    // Every cdep row must describe a package that is REALLY in the graph of a
-    // cell it claims to be about, checked across the whole run. Indexed by the
-    // row's position so two rows for the same package on two triples are two
-    // separate obligations.
-    let mut cdep_row_used: Vec<bool> = vec![false; policy.cdeps.len()];
+    // Every `cshim` row must name a package really in some graph for its triple,
+    // audited across the whole run (by row index: one package on two triples
+    // is two obligations).
     let mut cshim_row_used: Vec<bool> = vec![false; policy.cshims.len()];
 
     for cell in &selected {
@@ -1753,13 +1420,6 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         eprint!("{resolve_log}");
         let graph_names: std::collections::BTreeSet<String> =
             graph.nodes.iter().map(|p| p.name.clone()).collect();
-        for (i, cdep) in policy.cdeps.iter().enumerate() {
-            if (cdep.triple == "*" || cdep.triple == cell.triple)
-                && graph_names.contains(&cdep.package)
-            {
-                cdep_row_used[i] = true;
-            }
-        }
 
         // 1b. THE CELL'S OWN CODE. `checked/graph` counts PACKAGES, and a
         //     package count is the number a reader will quote while the thing
@@ -1858,15 +1518,16 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                 cell.triple, shim.links, shim.links
             ));
             shimmed.push(shim.package.clone());
-            // The justification is PRINTED where the override is really applied
-            // — just before cargo runs — and not here. A cell can still SKIP
-            // between this point and that one (no installed std for its triple),
-            // and "SHIMMED …" followed by "nothing was compiled" reads as though
-            // the shim bought something on a box where it bought nothing.
+            // PRINTED where the override is really applied — just before cargo
+            // runs — and not here. A cell can still SKIP between this point and
+            // that one (no installed std for its triple), and "SHIMMED …"
+            // followed by "nothing was compiled" reads as though the shim bought
+            // something on a box where it bought nothing. The row's reason lives
+            // in the policy file, not in every run's log.
             shim_notes.push(format!(
-                "gate cells: cell `{}` — `{}@{}`'s build script SHIMMED (cargo skips it; \
-                 `--config target.{}.{}`): {}",
-                cell.name, shim.package, shim.version, cell.triple, shim.links, shim.why
+                "gate cells: cell `{}` — `{}@{}`'s build script SHIMMED (`--config \
+                 target.{}.{}`; why: {CELL_GATE_POLICY})",
+                cell.name, shim.package, shim.version, cell.triple, shim.links
             ));
         }
         if shim_dead {
@@ -1874,19 +1535,15 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         }
 
         // 2. THE TOOLCHAIN. A SKIP is a fact about the BOX, decided before
-        //    anything compiles, it says out loud that nothing was compiled, and
-        //    it is NOT a pass — see [`CellOutcome`] for the run this sentence
-        //    used to end in `GREEN — all 5 cells type-check`.
-        //    THE HOST CELL NAMES NO RUSTUP TOOLCHAIN: the host driver is the
-        //    pin (see [`cell_check_command`]). Until 2026-09-18 this arm held
-        //    the label `repo pin (rust-toolchain.toml)`, which the test-target
-        //    pass then exported as a literal `RUSTUP_TOOLCHAIN`.
+        //    anything compiles; it says nothing was compiled, and it is NOT a
+        //    pass ([`CellOutcome`]). The host cell names no rustup toolchain:
+        //    the pinned driver is its compiler.
         let toolchain: Option<RustupToolchain> = if is_host {
             None
         } else {
-            match cell_toolchain(&cell.triple) {
-                Ok(Some(tc)) => Some(tc),
-                Ok(None) => {
+            let skip = match cell_toolchain(&cell.triple) {
+                Ok(CellToolchain::Found(tc)) => Ok(tc),
+                Ok(CellToolchain::NoStd) => {
                     eprintln!(
                         "gate cells: cell `{}` SKIPPED — no installed toolchain carries a {} std, \
                          so NOTHING WAS COMPILED for it.\n\
@@ -1895,38 +1552,49 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                          Trust fork, which refuses `rustup target add`.)",
                         cell.name, cell.triple, cell.triple
                     );
-                    reports.push(CellReport::skipped(
-                        cell,
-                        graph_names.len(),
-                        own.difference(&own_proc_macros).count(),
-                        own_proc_macros.len(),
-                    ));
-                    continue;
+                    Err(SkipCause::NoStd)
+                }
+                Ok(CellToolchain::NoRustup) => {
+                    eprintln!(
+                        "gate cells: cell `{}` SKIPPED — no rustup on this box (looked \
+                         {RUSTUP_LOOKED}), so no toolchain could be asked for a {} std and \
+                         NOTHING WAS COMPILED for it.\n\
+                         gate cells:   install rustup (https://rustup.rs), then:  rustup target \
+                         add {} --toolchain stable",
+                        cell.name, cell.triple, cell.triple
+                    );
+                    Err(SkipCause::NoRustup)
                 }
                 Err(e) => {
                     eprintln!("gate cells: FAILED — cell `{}`: {e}", cell.name);
                     fail = true;
                     continue;
                 }
+            };
+            match skip {
+                Ok(tc) => Some(tc),
+                Err(cause) => {
+                    reports.push(CellReport::skipped(
+                        cell,
+                        graph_names.len(),
+                        own.difference(&own_proc_macros).count(),
+                        own_proc_macros.len(),
+                        cause,
+                    ));
+                    continue;
+                }
             }
         };
 
-        // The TOOLCHAIN column: a cross cell's rustup toolchain name; for the
-        // host cell, the driver that IS the pin here (`host driver (targo)`),
-        // instead of the old label a reader could mistake for a rustup name.
+        let compiler = match &toolchain {
+            Some(tc) => CellCompiler::Cross(tc),
+            None => CellCompiler::Host(driver),
+        };
+        // The TOOLCHAIN column: a cross cell's rustup toolchain, or the host's
+        // pinned driver.
         let toolchain_label = toolchain
             .as_ref()
-            .map(|tc| tc.name.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "host driver ({})",
-                    driver
-                        .program
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| driver.program.display().to_string())
-                )
-            });
+            .map_or_else(|| "host driver (targo)".to_string(), |tc| tc.name.clone());
 
         // 3. WHERE IT RUNS AND WHERE IT WRITES. Never inside the repo.
         let target_dir = match cell_target_dir(&root, &cell.name) {
@@ -1949,23 +1617,19 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             }
         };
 
-        let mut cmd = cell_check_command(is_host, toolchain.as_ref(), &cell.triple);
+        let mut cmd = cell_check_command(compiler, &cell.triple);
         cmd.current_dir(&cwd)
             .env("CARGO_TARGET_DIR", &target_dir)
             .arg("--locked")
             // Without this, one dead build script hides every type error behind
-            // it; with it, the compiler reads everything it still can and the
-            // excuse costs only the closure it really blocks.
+            // it; with it, the compiler reads everything it still can.
             .arg("--keep-going")
             .arg("--message-format=json")
             .args(["-p", cell.package.as_str()])
             .arg("--manifest-path")
             .arg(root.join("Cargo.toml"));
-        // ON THE COMMAND LINE, NOT IN A FILE. `--config` takes the same table a
-        // `.cargo/config.toml` would carry, so the override lives for exactly
-        // one process, is visible in the command a reader runs, and cannot be
-        // left behind for a real build to pick up. It is also TRIPLE-SCOPED, so
-        // even a leaked copy could not touch a native build.
+        // ON THE COMMAND LINE, NOT IN A FILE: the override lives for one
+        // process, shows in the command, and is triple-scoped.
         for arg in &shim_args {
             cmd.arg("--config").arg(arg);
         }
@@ -1989,10 +1653,9 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             }
         };
 
-        // 4. THE VERDICT, read from cargo's own JSON rather than from its exit
-        //    code alone: with an excused build script the exit code is 101 on a
-        //    perfectly clean cell, and a run whose units were all fresh prints
-        //    no `Checking` line at all while still reporting every artifact.
+        // 4. THE VERDICT, read from cargo's own JSON: a run whose units were all
+        //    fresh prints no `Checking` line at all while still reporting every
+        //    artifact.
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let filter = if is_host {
@@ -2070,58 +1733,13 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             }
         }
 
-        // 5. THE EXCUSES. Every cargo-level error must be a build script this
-        //    policy names; anything else fails the cell.
-        let mut excused: Vec<String> = Vec::new();
+        // 5. ANY OTHER `error:` cargo printed — a build script this box cannot
+        //    run, a rejected flag, a broken manifest — fails the cell with its
+        //    own line. COLUMN ZERO IS THE TEST: a failing build script's output
+        //    is re-emitted INDENTED under `Caused by:`, and `error: could not
+        //    compile` is cargo's summary of diagnostics the JSON already carried.
         for line in stderr.lines() {
-            let Some(pkg) = build_script_failure(line) else {
-                continue;
-            };
-            match policy.excuse(pkg, &cell.triple) {
-                Some(cdep) => {
-                    if !excused.contains(&cdep.package) {
-                        // SAY WHY, HERE, where the excuse is granted. A verdict
-                        // that prints a package name and nothing else makes the
-                        // reader go and find the policy file to learn whether
-                        // the forgiveness was reasonable — which is exactly the
-                        // moment nobody does.
-                        eprintln!(
-                            "gate cells: cell `{}` — `{}` EXCUSED: {}",
-                            cell.name, cdep.package, cdep.why
-                        );
-                        excused.push(cdep.package.clone());
-                    }
-                }
-                None => {
-                    cell_ok = false;
-                    if status == "GREEN" {
-                        status = format!("BUILD-SCRIPT({pkg})");
-                    }
-                    eprintln!(
-                        "\ngate cells: cell `{}` FAILED — `{pkg}`'s build script did not run, and \
-                         no `cdep` row in {CELL_GATE_POLICY} excuses it on {}. Either fix the \
-                         build, or add a row saying why this box cannot run it.",
-                        cell.name, cell.triple
-                    );
-                }
-            }
-        }
-        // Any OTHER `error:` cargo printed — a rejected flag, a broken
-        // manifest, a missing std — is a failure with its own line, never
-        // silence. A run that could not start must not read as a clean cell.
-        // COLUMN ZERO IS THE WHOLE TEST. Cargo prints its own errors unindented;
-        // a failing build script's captured stdout/stderr is re-emitted INDENTED
-        // under `Caused by:`. Trimming first made every `  error occurred in
-        // cc-rs: …` line inside an already-excused build-script failure into a
-        // second, unexcused cargo error, and both cross cells went red for the
-        // failure the policy had just excused. `error: could not compile` is
-        // cargo's summary of diagnostics already reported through the JSON
-        // stream, so counting it would double-report a type error.
-        for line in stderr.lines() {
-            if line.starts_with("error")
-                && build_script_failure(line).is_none()
-                && !line.starts_with("error: could not compile")
-            {
+            if line.starts_with("error") && !line.starts_with("error: could not compile") {
                 cell_ok = false;
                 if status == "GREEN" {
                     status = "CARGO-ERROR".to_string();
@@ -2130,35 +1748,9 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             }
         }
 
-        // 6. AN EXCUSE THAT WAS NOT NEEDED HERE. A NOTE, deliberately, and not
-        //    a failure: an excuse says "THIS BOX cannot run that build script",
-        //    and a box that CAN — one carrying cargo-zigbuild, a Linux sysroot
-        //    or an MSVC image — is more capable, not out of policy. Failing the
-        //    better machine would teach people to uninstall the cross
-        //    toolchain, which is the opposite of what this gate is for. The
-        //    teeth for this direction are machine-independent and live
-        //    elsewhere: the floor below fails a run that checks FEWER packages,
-        //    and the dead-row audit at the end fails a row no cell's graph can
-        //    justify at all.
-        for cdep in &policy.cdeps {
-            if (cdep.triple == "*" || cdep.triple == cell.triple) && checked.contains(&cdep.package)
-            {
-                eprintln!(
-                    "gate cells: NOTE — {CELL_GATE_POLICY} excuses `{}` on {}, and it type-checked \
-                     here anyway: this box carries what that build script needs. The cell is WIDER \
-                     than the policy assumes — raise the floor, and delete the row once no box \
-                     needs it.",
-                    cdep.package, cell.triple
-                );
-            }
-        }
-
-        // 6b. DID THE SHIM ACTUALLY BUY ANYTHING? A row that skips a build
-        //     script and then does not get the package type-checked is worse
-        //     than no row: it has spent the reader's trust on nothing. This
-        //     fires when the override is mis-keyed (a wrong `links` name is
-        //     silently ignored by cargo) as well as when the package failed for
-        //     some other reason.
+        // 6. DID THE SHIM ACTUALLY BUY ANYTHING? It fires when the override is
+        //    mis-keyed (cargo silently ignores a wrong `links` name) as well as
+        //    when the package failed for some other reason.
         for pkg in &shimmed {
             if !checked.contains(pkg) {
                 cell_ok = false;
@@ -2175,14 +1767,9 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             }
         }
 
-        // 6c. THE CELL'S OWN CODE, OWED RATHER THAN REPORTED. Every in-repo
-        //     package in this cell's graph that is not a proc macro must have
-        //     been read by a compiler for this triple. This is the obligation
-        //     that the package-count floor could not express: `linux 206/253`
-        //     was at its floor, GREEN, and had not compiled one line of
-        //     `aterm-gui`, where 940 of the workspace's platform `cfg` sites
-        //     live. Machine-independent on purpose — unlike an excuse, it does
-        //     not get easier on a better-equipped box.
+        // 7. THE CELL'S OWN CODE, OWED RATHER THAN REPORTED: every in-repo
+        //    package in this cell's graph that is not a proc macro, read by a
+        //    compiler for this triple. Machine-independent on purpose.
         let own_owed: Vec<&String> = own.difference(&own_proc_macros).collect();
         let own_missing: Vec<&&String> =
             own_owed.iter().filter(|n| !checked.contains(**n)).collect();
@@ -2208,13 +1795,9 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             );
         }
 
-        // 6d. THE TEST TARGETS. Everything above this line reads LIBRARIES: the
-        //     first pass checks `-p <cell package>` with no `--all-targets`, so
-        //     for four days running, three separate crates shipped a test
-        //     binary that did not COMPILE for a triple nobody here can see, and
-        //     every gate in the tree was green through all of it. A
-        //     `#[cfg(test)]` module is part of its crate's compilation unit, so
-        //     the unit of loss is the crate's whole test binary.
+        // 8. THE TEST TARGETS. Everything above reads LIBRARIES; a
+        //    `#[cfg(test)]` module is part of its crate's compilation unit, so
+        //    one unix-only name costs the crate's whole test binary elsewhere.
         let test_note = test_pass_exemption(&cell.triple, is_host);
         let (tests_checked, tests_owed) = match &test_note {
             Some(why) => {
@@ -2239,8 +1822,7 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             None => match run_cell_test_pass(&TestPassJob {
                 root: &root,
                 cell,
-                is_host,
-                toolchain: toolchain.as_ref(),
+                compiler,
                 target_dir: &target_dir,
                 shim_args: &shim_args,
                 members: &members,
@@ -2349,55 +1931,10 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             },
         };
 
-        // 7. THE FLOOR.
-        match policy.floor(&cell.name) {
-            None => {
-                cell_ok = false;
-                if status == "GREEN" {
-                    status = "NO-FLOOR".to_string();
-                }
-                eprintln!(
-                    "gate cells: cell `{}` FAILED — {CELL_GATE_POLICY} records no `floor` row for \
-                     it, so this run's {} checked package(s) can be compared with nothing. Add:\n\
-                     gate cells:   floor\t{}\t{}\t<why this is the number>",
-                    cell.name,
-                    checked.len(),
-                    cell.name,
-                    checked.len()
-                );
-            }
-            Some(floor) if checked.len() < floor => {
-                cell_ok = false;
-                if status == "GREEN" {
-                    status = format!("COVERAGE-DROP(<{floor})");
-                }
-                eprintln!(
-                    "gate cells: cell `{}` FAILED — {} of its {} packages type-checked, below the \
-                     recorded floor of {floor}. Something stopped being compiled for {}; find out \
-                     what before lowering the floor.",
-                    cell.name,
-                    checked.len(),
-                    graph_names.len(),
-                    cell.triple
-                );
-            }
-            Some(floor) if checked.len() > floor => {
-                eprintln!(
-                    "gate cells: cell `{}` gained coverage — {} checked, floor {floor}. Raise it \
-                     by hand:  floor\t{}\t{}\t<why>",
-                    cell.name,
-                    checked.len(),
-                    cell.name,
-                    checked.len()
-                );
-            }
-            Some(_) => {}
-        }
-
         if cell_ok {
             eprintln!(
                 "gate cells: cell `{}` ({}) GREEN on `{}` — {}/{} packages type-checked in {}s, \
-                 INCLUDING {}/{} of aterm's own compiled crates{}{}.",
+                 INCLUDING {}/{} of aterm's own compiled crates{}.",
                 cell.name,
                 cell.triple,
                 toolchain_label,
@@ -2419,11 +1956,6 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
-                },
-                if excused.is_empty() {
-                    String::new()
-                } else {
-                    format!(", {} excused: {}", excused.len(), excused.join(", "))
                 }
             );
         } else {
@@ -2435,7 +1967,6 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             toolchain: toolchain_label,
             checked: checked.len(),
             graph: graph_names.len(),
-            excused,
             shimmed,
             own_checked,
             own_total: own_owed.len(),
@@ -2456,43 +1987,15 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         });
     }
 
-    // 8. DEAD POLICY ROWS.
-    //
-    //    THE `floor` HALF IS NOT NARROW-SENSITIVE, AND THAT MATTERS. A `cdep` or
-    //    `cshim` row is audited against the GRAPHS this run resolved, so a
-    //    narrowed run genuinely has not looked. A `floor` row is audited against
-    //    forge's CELL LIST, which every run holds in full — so it is checked
-    //    always, by [`cell_matrix_audit`], which is also the one half of this
-    //    verb a test can drive without compiling five triples. That asymmetry is
-    //    the point: deleting `wasm-cpu` from `default_cells()` used to leave
-    //    `gate cells` printing "GREEN — all 4 cells type-check" with an orphaned
-    //    `floor wasm-cpu 54` row nobody mentioned. A verification floor whose own
-    //    matrix can be quietly shrunk is not a floor, and the verdict sentence
-    //    was the part that was wrong.
-    for line in cell_matrix_audit(&all_cells, &policy.floors) {
-        fail = true;
-        eprintln!("{line}");
-    }
-    // The `cdep`/`cshim` half IS narrow-sensitive: a run that skipped a cell has
-    // not resolved the graph a row might be justified by.
+    // DEAD `cshim` ROWS — audited against the graphs this run resolved, so a
+    // narrowed run, which has not resolved every cell, says it did not look.
     if narrowed {
         eprintln!(
-            "gate cells: NOTE — narrowed to {}; the `cdep` and `cshim` rows were not audited \
-             against the cells this run skipped.",
+            "gate cells: NOTE — narrowed to {}; the `cshim` rows were not audited against the \
+             cells this run skipped.",
             wanted.join(", ")
         );
     } else {
-        for (i, cdep) in policy.cdeps.iter().enumerate() {
-            if !cdep_row_used[i] {
-                fail = true;
-                eprintln!(
-                    "gate cells: FAILED — {CELL_GATE_POLICY} excuses `{}` on {}, and no cell with \
-                     that triple has it in its graph. A dead excuse is an excuse nobody can see \
-                     expire: delete the row.",
-                    cdep.package, cdep.triple
-                );
-            }
-        }
         for (i, shim) in policy.cshims.iter().enumerate() {
             if !cshim_row_used[i] {
                 fail = true;
@@ -2531,13 +2034,11 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
         "DISK"
     );
     for r in &reports {
-        let mut tail = String::new();
-        if !r.excused.is_empty() {
-            tail.push_str(&format!(" (excused: {})", r.excused.join(", ")));
-        }
-        if !r.shimmed.is_empty() {
-            tail.push_str(&format!(" (shimmed: {})", r.shimmed.join(", ")));
-        }
+        let tail = if r.shimmed.is_empty() {
+            String::new()
+        } else {
+            format!(" (shimmed: {})", r.shimmed.join(", "))
+        };
         eprintln!(
             "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5} {:>9}  {}{}",
             r.cell,
@@ -2627,7 +2128,7 @@ fn cells_verdict(
     }
     let skipped: Vec<&CellReport> = reports
         .iter()
-        .filter(|r| r.outcome == CellOutcome::Skipped)
+        .filter(|r| matches!(r.outcome, CellOutcome::Skipped(_)))
         .collect();
 
     // SAY WHICH GREEN, AND SAY HOW MUCH. The sentence a reader quotes has to be
@@ -2678,9 +2179,7 @@ fn cells_verdict(
     // reader of the policy file. A shimmed cell never links the C library the
     // shim stands in for, and no cell here RUNS anything.
     let scope = if reports.iter().any(|r| !r.shimmed.is_empty()) {
-        "\ngate cells: SCOPE — a shimmed cell is TYPE-CHECKED and nothing more; it does not LINK \
-         the bundled C (`cargo check` never links on any cell) and no cell runs a binary. \
-         Cross-compiler-specific codegen and C ABI breakage stay out of reach here."
+        "\ngate cells: shimmed cells are type-checked, not linked; no cell runs a binary."
     } else {
         ""
     };
@@ -2692,17 +2191,42 @@ fn cells_verdict(
             .collect::<Vec<_>>()
             .join(", ");
         let ran = reports.len() - skipped.len();
+        // THE CAUSE AND ITS FIX, NAMED TOGETHER, with the triples filled in (the
+        // per-cell lines above name the same `--toolchain stable`). With no rustup
+        // at all, "no installed std … `rustup target add`" sends the reader to a
+        // fix that cannot clear it.
+        let install = skipped
+            .iter()
+            .map(|r| r.triple.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let add = format!("`rustup target add {install} --toolchain stable`");
+        let no_rustup = skipped
+            .iter()
+            .any(|r| r.outcome == CellOutcome::Skipped(SkipCause::NoRustup));
+        let (had, fix) = if no_rustup {
+            (
+                format!(
+                    "could not be compiled — this box has no rustup (looked {RUSTUP_LOOKED}), so \
+                     no toolchain could be asked for their std"
+                ),
+                format!("Install rustup (https://rustup.rs), then {add}"),
+            )
+        } else {
+            (
+                "had no installed std".to_string(),
+                format!("Install: {add}"),
+            )
+        };
         return CellsVerdict {
             text: format!(
-                "{} — {} of the {} cell(s) this run selected had no installed std, so NO COMPILER \
-                 READ THEM: {names}. {ran} cell(s) were checked: {coverage}. This run does NOT \
-                 make the matrix claim about forge's {forge_cells} cells.\n\
-                 gate cells: exit 0 on purpose — an uninstalled std is a fact about this box, not \
-                 a finding about the tree, and a red no change to this repository can clear is how \
-                 an operator learns to stop reading a gate. Install it \
-                 (`rustup target add <triple> --toolchain <channel>`) and run again to earn the \
-                 claim; until then `tools/verify.sh` counts this stage as a SKIP and withholds \
-                 `{}`.{scope}",
+                "{} — {} of the {} cell(s) this run selected {had}, so NO COMPILER READ THEM: \
+                 {names}. {ran} cell(s) were checked: {coverage}. This run does NOT make the \
+                 matrix claim about forge's {forge_cells} cells.\n\
+                 gate cells: {fix}, then run again. Exits 0; `tools/verify.sh` counts it a SKIP \
+                 and withholds `{}`.{scope}",
                 aterm_verify::stages::CELLS_NOT_PROVEN,
                 skipped.len(),
                 reports.len(),
@@ -2725,16 +2249,11 @@ fn cells_verdict(
             ok: true,
         };
     }
-    let mut how = String::new();
-    if reports.iter().any(|r| !r.excused.is_empty()) {
-        how.push_str(", with the C dependencies excused above");
-    }
-    if reports.iter().any(|r| !r.shimmed.is_empty()) {
-        how.push_str(", with the C build scripts shimmed above");
-    }
-    if how.is_empty() {
-        how.push_str(", with nothing excused or shimmed");
-    }
+    let how = if reports.iter().any(|r| !r.shimmed.is_empty()) {
+        ", with the C build scripts shimmed above"
+    } else {
+        ", with nothing shimmed"
+    };
     // EARNED: every cell forge ships, every one of them read by a compiler for
     // its own triple. The only branch that may spell [`MATRIX_CLAIM`].
     CellsVerdict {
@@ -3003,8 +2522,15 @@ const LINT_VERDICT_FAILED: &str = "gate lint: FAILED";
 const LINT_VERDICT_NO_VERDICT: &str = "gate lint: COULD NOT RUN";
 const LINT_VERDICT_GREEN: &str = "gate lint: GREEN";
 
+/// The formatter's three passes, by the names the COULD NOT RUN verdict uses.
+const FMT_PASS_WORKSPACE: &str = "targo-fmt --all";
+const FMT_PASS_SWEEP: &str = "trustfmt sweep";
+const FMT_PASS_EDITIONS: &str = "fmt editions";
+
 /// `gate lint` and `gate lint --fmt-only` — the same run: the formatter's three
-/// passes over the tree, from THE toolchain ([`trust_toolchain`]).
+/// passes over the tree, from THE toolchain ([`trust_toolchain`]). A pass prints
+/// a line only when it found drift or could not run; a green run prints the
+/// verdict alone.
 fn gate_lint(args: &[String]) -> bool {
     if let Some(bad) = args.iter().find(|a| a.as_str() != "--fmt-only") {
         eprintln!(
@@ -3013,50 +2539,111 @@ fn gate_lint(args: &[String]) -> bool {
         );
         return false;
     }
-    eprintln!("=== gate lint (targo-fmt --all + the per-file trustfmt sweep + fmt editions) ===");
     let root = workspace_root();
     let toolchain = trust_toolchain();
     // A refused directory holds a `targo` that is not the pinned toolchain; its
     // formatter is not the one the tree is held to, so it is not run at all.
-    let verdict = if toolchain.refused.is_some() {
+    let (verdict, not_run) = if toolchain.refused.is_some() {
         eprintln!(
             "  trustfmt: NOT RUN — {}. Nothing was format-checked.",
             toolchain.missing_targo_label()
         );
-        LaneVerdict::NotRun
+        (
+            LaneVerdict::NotRun,
+            vec![FMT_PASS_WORKSPACE, FMT_PASS_SWEEP, FMT_PASS_EDITIONS],
+        )
     } else {
         fmt_lane(&root, &toolchain.stage2_dir)
     };
-    lint_verdict(verdict)
+    let fix = missing_fmt_tools_fix(&toolchain);
+    lint_verdict(verdict, &not_run, fix.as_deref())
+}
+
+/// The ONE fix for a stage2 that lacks `targo-fmt` or `trustfmt`, printed on
+/// the verdict line (each pass's NOT RUN line only names what is missing).
+/// `None` when both are there, and for a refused toolchain, whose own line
+/// already carries its fix.
+///
+/// An explicit `$TRUST_STAGE2_BIN` is never fallen back from, so installing
+/// the store's build changes nothing there: the fix is to that variable.
+fn missing_fmt_tools_fix(toolchain: &aterm_verify::Toolchain) -> Option<String> {
+    let dir = &toolchain.stage2_dir;
+    let complete = [TRUSTFMT_DRIVER, TRUSTFMT_BIN]
+        .iter()
+        .all(|tool| dir.join(tool).is_file());
+    if toolchain.refused.is_some() || complete {
+        return None;
+    }
+    Some(if toolchain.store_bin.is_none() {
+        format!(
+            "TRUST_STAGE2_BIN={} has no {TRUSTFMT_DRIVER}/{TRUSTFMT_BIN}: point it at a stage2 \
+             that has them, or unset it",
+            dir.display()
+        )
+    } else {
+        "`aterm pkg install trust`, then re-run".to_string()
+    })
 }
 
 /// The three passes, every one run whatever the others found, folded with
-/// [`LaneVerdict::worst`].
-fn fmt_lane(root: &Path, tools: &Path) -> LaneVerdict {
-    fmt_workspace_pass(root, tools)
-        .worst(fmt_sweep(root, tools))
-        .worst(fmt_edition_agreement(root))
+/// [`LaneVerdict::worst`], plus the names of the passes that reached no verdict.
+fn fmt_lane(root: &Path, tools: &Path) -> (LaneVerdict, Vec<&'static str>) {
+    let passes = [
+        (FMT_PASS_WORKSPACE, fmt_workspace_pass(root, tools)),
+        (FMT_PASS_SWEEP, fmt_sweep(root, tools)),
+        (FMT_PASS_EDITIONS, fmt_edition_agreement(root)),
+    ];
+    let verdict = passes
+        .iter()
+        .fold(LaneVerdict::Clean, |acc, (_, v)| acc.worst(*v));
+    let not_run = passes
+        .iter()
+        .filter(|(_, v)| *v == LaneVerdict::NotRun)
+        .map(|(name, _)| *name)
+        .collect();
+    (verdict, not_run)
 }
 
-/// Print the verdict line for `verdict`; `true` only for [`LaneVerdict::Clean`].
-fn lint_verdict(verdict: LaneVerdict) -> bool {
+/// The verdict line for `verdict`, naming the passes in `not_run` and the
+/// `fix` ([`missing_fmt_tools_fix`]) — on a FAILED line too, since a finding
+/// outranks a pass that did not run and would otherwise hide it.
+///
+/// The GREEN claim is scoped to what the passes read: `vendor/` is outside
+/// every pass ([`tracked_rs_files`]), and the sweep skips
+/// [`FMT_SWEEP_EXCLUSIONS`].
+fn lint_verdict_line(verdict: LaneVerdict, not_run: &[&str], fix: Option<&str>) -> String {
     match verdict {
-        LaneVerdict::Clean => {
-            eprintln!("{LINT_VERDICT_GREEN}");
-            true
+        LaneVerdict::Clean => format!(
+            "{LINT_VERDICT_GREEN} — every tracked `.rs` file outside vendor/ is formatted at its \
+             crate's edition, bar the {} in FMT_SWEEP_EXCLUSIONS, and rustfmt reads the same \
+             editions",
+            FMT_SWEEP_EXCLUSIONS.len()
+        ),
+        LaneVerdict::Finding if not_run.is_empty() => {
+            format!("{LINT_VERDICT_FAILED} — formatting drift, named above")
         }
-        LaneVerdict::Finding => {
-            eprintln!("{LINT_VERDICT_FAILED} — formatting drift, named above");
-            false
-        }
-        LaneVerdict::NotRun => {
-            eprintln!(
-                "{LINT_VERDICT_NO_VERDICT} — a formatter pass never ran, so NOTHING was learned \
-                 about the tree. This is not a finding and it is not a clean tree."
-            );
-            false
-        }
+        LaneVerdict::Finding => format!(
+            "{LINT_VERDICT_FAILED} — formatting drift, named above; {} did not run.{}",
+            not_run.join(", "),
+            fix_clause(fix)
+        ),
+        LaneVerdict::NotRun => format!(
+            "{LINT_VERDICT_NO_VERDICT} — {} did not run (above).{}",
+            not_run.join(", "),
+            fix_clause(fix)
+        ),
     }
+}
+
+/// ` Fix: <fix>.`, or nothing.
+fn fix_clause(fix: Option<&str>) -> String {
+    fix.map(|f| format!(" Fix: {f}.")).unwrap_or_default()
+}
+
+/// Print the verdict line; `true` only for [`LaneVerdict::Clean`].
+fn lint_verdict(verdict: LaneVerdict, not_run: &[&str], fix: Option<&str>) -> bool {
+    eprintln!("{}", lint_verdict_line(verdict, not_run, fix));
+    verdict == LaneVerdict::Clean
 }
 
 /// PASS ONE: `targo-fmt --all --check`, cargo's own target discovery over the
@@ -3068,9 +2655,7 @@ fn fmt_workspace_pass(root: &Path, tools: &Path) -> LaneVerdict {
     if !driver.is_file() {
         // Checked BEFORE spawning: the answer is a stat().
         eprintln!(
-            "  trustfmt: NOT RUN — no `{TRUSTFMT_DRIVER}` in {}. FORMATTING WAS NOT CHECKED. This \
-             is a missing toolchain, NOT a clean tree and NOT a finding: `aterm pkg install \
-             trust`, or point TRUST_STAGE2_BIN at a built stage2, and re-run.",
+            "  trustfmt: NOT RUN — no `{TRUSTFMT_DRIVER}` in {}.",
             tools.display()
         );
         return LaneVerdict::NotRun;
@@ -3078,10 +2663,6 @@ fn fmt_workspace_pass(root: &Path, tools: &Path) -> LaneVerdict {
     let (ok, stdout, stderr) =
         run_capturing_both("trustfmt", &driver, &["--all", "--check"], tools, root);
     if ok {
-        eprintln!(
-            "  trustfmt: clean — every target `targo-fmt --all` discovers across the workspace \
-             is formatted. That is the WORKSPACE, not the tree; the sweep below covers the rest."
-        );
         LaneVerdict::Clean
     } else if stdout.contains(FMT_DIFF_MARKER) {
         // A NON-ZERO EXIT IS NOT YET A FINDING: `targo-fmt` exits 1 both for
@@ -3092,7 +2673,7 @@ fn fmt_workspace_pass(root: &Path, tools: &Path) -> LaneVerdict {
         eprintln!(
             "  trustfmt: FINDING — drift at {paths} path(s) (an upper bound on files). The diff \
              is printed above. Fix the whole tree with `{} --all` from {}.",
-            driver.display(),
+            shell_word(&driver.to_string_lossy()),
             root.display()
         );
         LaneVerdict::Finding
@@ -3148,10 +2729,6 @@ const FMT_SWEEP_EXCLUSIONS: &[&str] = &[
     "crates/aterm-effects/src/dog_glyphs_gen.rs",
     "crates/aterm-effects/src/pet_glyphs_gen.rs",
     "crates/aterm-effects/src/robi_glyphs_gen.rs",
-    // grep_guard L0 fixtures whose line breaks are the case under test.
-    "tools/grep-guard-fixtures/must_fire/alias_then_call_same_line.rs",
-    "tools/grep-guard-fixtures/must_fire/split_receiver_chain.rs",
-    "tools/grep-guard-fixtures/must_silent/wrapped_chain_offload.rs",
 ];
 
 /// Every TRACKED `*.rs` path outside `vendor/`, repo-relative, sorted.
@@ -3164,7 +2741,7 @@ const FMT_SWEEP_EXCLUSIONS: &[&str] = &[
 ///
 /// `vendor/` is excluded because it is third-party source aterm mirrors rather
 /// than authors; holding a fork to aterm's formatter would produce a diff
-/// against upstream on every file and make `cargo forge attest`'s `[OB-7]`
+/// against upstream on every file and make `targo --unverified forge attest`'s `[OB-7]`
 /// fork-vs-upstream diff unreadable.
 fn tracked_rs_files(root: &Path) -> Result<Vec<String>, String> {
     let out = Command::new("git")
@@ -3364,11 +2941,6 @@ fn fmt_edition_agreement(root: &Path) -> LaneVerdict {
         }
     }
     if wanted.is_empty() {
-        eprintln!(
-            "  fmt editions: clean — every one of {} tracked `.rs` file(s) resolves the same \
-             edition through `rustfmt.toml` as its manifest declares.",
-            files.len()
-        );
         return LaneVerdict::Clean;
     }
     eprintln!(
@@ -3457,9 +3029,7 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
     let bin = tools.join(TRUSTFMT_BIN);
     if !bin.is_file() {
         eprintln!(
-            "  trustfmt sweep: NOT RUN — no `{TRUSTFMT_BIN}` in {}. The files `--all` cannot \
-             reach (include!-only sources and the crates outside the workspace) were NOT \
-             checked. Build the Trust stage2 and re-run.",
+            "  trustfmt sweep: NOT RUN — no `{TRUSTFMT_BIN}` in {}.",
             tools.display()
         );
         return LaneVerdict::NotRun;
@@ -3505,9 +3075,7 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
     // `error:` lines trustfmt wrote about files it could NOT read, in batches where
     // some other file did produce a diff. Non-empty means the sweep is not a sweep.
     let mut unread: Vec<String> = Vec::new();
-    let mut editions: Vec<String> = Vec::new();
     for (edition, group) in &by_edition {
-        editions.push(format!("{edition}:{}", group.len()));
         for chunk in group.chunks(CHUNK) {
             let mut cmd = Command::new(&bin);
             cmd.current_dir(root)
@@ -3578,39 +3146,59 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
         }
         return LaneVerdict::NotRun;
     }
-    let findings: Vec<&String> = drifted
+    // Each finding with the edition its crate declares, grouped, so the fix is
+    // one runnable command per edition rather than a template to fill in.
+    let mut findings: std::collections::BTreeMap<String, Vec<&String>> = Default::default();
+    for path in drifted
         .iter()
         .filter(|p| !FMT_SWEEP_EXCLUSIONS.contains(&p.as_str()))
-        .collect();
+    {
+        findings
+            .entry(crate_edition(root, path))
+            .or_default()
+            .push(path);
+    }
     if findings.is_empty() {
-        eprintln!(
-            "  trustfmt sweep: clean — {} tracked `.rs` file(s) checked per-file at their own \
-             crate edition ({}), including every source `targo-fmt --all` cannot reach \
-             ({} excluded by FMT_SWEEP_EXCLUSIONS).",
-            files.len(),
-            editions.join(", "),
-            FMT_SWEEP_EXCLUSIONS.len()
-        );
         return LaneVerdict::Clean;
     }
     eprintln!(
-        "  trustfmt sweep: FINDING — {} of {} tracked `.rs` file(s) are unformatted and are NOT \
-         reachable by `targo-fmt --all`, so nothing else in this repository was ever going to \
-         report them:",
-        findings.len(),
+        "  trustfmt sweep: FINDING — {} of {} tracked `.rs` file(s) are unformatted:",
+        findings.values().map(Vec::len).sum::<usize>(),
         files.len()
     );
-    for path in &findings {
-        eprintln!("      {path}");
+    for (edition, paths) in &findings {
+        for path in paths {
+            eprintln!("      {path} (edition {edition})");
+        }
     }
-    eprintln!(
-        "    Fix each with `{} --edition <that crate's edition> --unstable-features \
-         --skip-children <path>` (drop `--check` to write). FMT_SWEEP_EXCLUSIONS is for a \
-         fixture or a generator's output whose layout the formatter would destroy, and \
-         nothing else.",
-        bin.display()
-    );
+    eprintln!("    Fix, from {}:", root.display());
+    for (edition, paths) in &findings {
+        eprintln!(
+            "      {} --edition {edition} --unstable-features --skip-children {}",
+            shell_word(&bin.to_string_lossy()),
+            paths
+                .iter()
+                .map(|p| shell_word(p))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     LaneVerdict::Finding
+}
+
+/// `word` as one shell word: unchanged when it is plain, single-quoted
+/// otherwise, so a printed fix command runs as pasted — the store's `trustfmt`
+/// lives under `Application Support`.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+=:@%,".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 #[cfg(test)]
@@ -3737,9 +3325,9 @@ mod tests {
     /// once dropped this lane, now has nothing left to drop).
     #[test]
     fn a_lane_that_never_ran_is_blocked_with_no_verdict_not_a_pass() {
-        assert!(lint_verdict(LaneVerdict::Clean));
-        assert!(!lint_verdict(LaneVerdict::Finding));
-        assert!(!lint_verdict(LaneVerdict::NotRun));
+        assert!(lint_verdict(LaneVerdict::Clean, &[], None));
+        assert!(!lint_verdict(LaneVerdict::Finding, &[], None));
+        assert!(!lint_verdict(LaneVerdict::NotRun, &[FMT_PASS_SWEEP], None));
         assert_eq!(
             LaneVerdict::Clean.worst(LaneVerdict::NotRun),
             LaneVerdict::NotRun,
@@ -3764,7 +3352,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&root);
         let _ = std::fs::create_dir_all(&tools);
         let workspace = fmt_workspace_pass(&root, &tools);
-        let lane = fmt_lane(&root, &tools);
+        let (lane, not_run) = fmt_lane(&root, &tools);
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(
             workspace,
@@ -3772,6 +3360,147 @@ mod tests {
             "a missing formatter must not report clean formatting"
         );
         assert_eq!(lane, LaneVerdict::NotRun);
+        assert_eq!(
+            not_run,
+            vec![FMT_PASS_WORKSPACE, FMT_PASS_SWEEP, FMT_PASS_EDITIONS],
+            "every pass that reached no verdict is named"
+        );
+    }
+
+    /// The COULD NOT RUN verdict names the passes that did not run, and only
+    /// those. It said "NOTHING was learned about the tree" even when the
+    /// editions pass (which needs no toolchain) had run clean beside a missing
+    /// `trustfmt`.
+    #[test]
+    fn the_could_not_run_verdict_names_only_the_passes_that_did_not_run() {
+        let line = lint_verdict_line(
+            LaneVerdict::NotRun,
+            &[FMT_PASS_WORKSPACE, FMT_PASS_SWEEP],
+            None,
+        );
+        assert_eq!(
+            line,
+            "gate lint: COULD NOT RUN — targo-fmt --all, trustfmt sweep did not run (above)."
+        );
+        assert!(!line.contains(FMT_PASS_EDITIONS), "{line}");
+        assert!(line.starts_with(LINT_VERDICT_NO_VERDICT));
+        let green = lint_verdict_line(LaneVerdict::Clean, &[], None);
+        assert!(green.starts_with(LINT_VERDICT_GREEN));
+        // The claim is scoped to what the passes read: never "every tracked
+        // file" while vendor/ and the exclusions go unread.
+        assert!(green.contains("outside vendor/"), "{green}");
+        assert!(
+            green.contains(&format!("bar the {} in", FMT_SWEEP_EXCLUSIONS.len())),
+            "{green}"
+        );
+        assert!(
+            lint_verdict_line(LaneVerdict::Finding, &[], None).starts_with(LINT_VERDICT_FAILED)
+        );
+    }
+
+    /// A stage2 without the formatter gets its fix ONCE, on the verdict line,
+    /// and the fix fits where the stage2 came from: an explicit
+    /// `$TRUST_STAGE2_BIN` is never fallen back from, so `aterm pkg install
+    /// trust` would change nothing there.
+    #[test]
+    fn the_missing_formatter_fix_is_printed_once_and_fits_the_toolchain_source() {
+        let tmp = std::env::temp_dir().join(format!("aterm-gate-lint-fix-{}", std::process::id()));
+        let empty = tmp.join("empty-stage2");
+        let _ = std::fs::create_dir_all(&empty);
+        let toolchain = |store_bin: Option<PathBuf>| aterm_verify::Toolchain {
+            stage2_dir: empty.clone(),
+            targo: empty.join("targo"),
+            trustdoc: empty.join("trustdoc"),
+            tippy: None,
+            refused: None,
+            store_bin,
+            demoted: None,
+        };
+        let explicit = missing_fmt_tools_fix(&toolchain(None));
+        let discovered = missing_fmt_tools_fix(&toolchain(Some(tmp.join("store"))));
+        let refused = missing_fmt_tools_fix(&aterm_verify::Toolchain {
+            refused: Some(tmp.join("wrong")),
+            ..toolchain(Some(tmp.join("store")))
+        });
+        std::fs::write(empty.join(TRUSTFMT_DRIVER), "").unwrap();
+        std::fs::write(empty.join(TRUSTFMT_BIN), "").unwrap();
+        let complete = missing_fmt_tools_fix(&toolchain(Some(tmp.join("store"))));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let explicit = explicit.expect("an explicit stage2 without the formatter has a fix");
+        assert!(
+            explicit.starts_with(&format!("TRUST_STAGE2_BIN={}", empty.display())),
+            "{explicit}"
+        );
+        assert!(explicit.contains("or unset it"), "{explicit}");
+        assert!(!explicit.contains("aterm pkg install"), "{explicit}");
+        assert_eq!(
+            discovered.as_deref(),
+            Some("`aterm pkg install trust`, then re-run")
+        );
+        assert_eq!(
+            refused, None,
+            "a refused toolchain's own line carries its fix"
+        );
+        assert_eq!(complete, None);
+
+        let line = lint_verdict_line(
+            LaneVerdict::NotRun,
+            &[FMT_PASS_WORKSPACE, FMT_PASS_SWEEP],
+            discovered.as_deref(),
+        );
+        assert_eq!(line.matches("aterm pkg install trust").count(), 1, "{line}");
+        // A finding elsewhere outranks the pass that did not run; the fix
+        // still reaches the verdict line.
+        let failed = lint_verdict_line(
+            LaneVerdict::Finding,
+            &[FMT_PASS_WORKSPACE, FMT_PASS_SWEEP],
+            discovered.as_deref(),
+        );
+        assert!(failed.starts_with(LINT_VERDICT_FAILED), "{failed}");
+        assert!(
+            failed.contains("trustfmt sweep did not run. Fix: `aterm pkg install trust`"),
+            "{failed}"
+        );
+    }
+
+    /// A printed fix command must run as pasted: the store's `trustfmt` sits
+    /// under `~/Library/Application Support`, and an unquoted space split it.
+    #[test]
+    fn a_printed_fix_command_quotes_what_the_shell_would_split() {
+        assert_eq!(shell_word("crates/x/src/y.rs"), "crates/x/src/y.rs");
+        assert_eq!(
+            shell_word("/Users//me/Library/Application Support/aterm/bin/trustfmt"),
+            "'/Users//me/Library/Application Support/aterm/bin/trustfmt'"
+        );
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+        assert_eq!(shell_word(""), "''");
+    }
+
+    /// A bare `xtask gate` prints the usage line and an unknown verb the verb
+    /// list — never a Rust `Option` — and a census verb retired on 2026-09-27
+    /// says where it went.
+    #[test]
+    fn an_unknown_gate_verb_names_the_verbs_and_the_new_home_of_a_retired_one() {
+        assert_eq!(
+            unknown_verb_message(None),
+            "usage: xtask gate <lint|forge|cells|cells-foreign>"
+        );
+        assert_eq!(
+            unknown_verb_message(Some("nope")),
+            "xtask gate: no verb `nope` — verbs: lint, forge, cells, cells-foreign"
+        );
+        assert_eq!(
+            unknown_verb_message(Some("mainloop")),
+            "xtask gate: no verb `mainloop` (now: targo --unverified run -p aterm-census -- \
+             --mainloop) — verbs: lint, forge, cells, cells-foreign"
+        );
+        for (old, flag) in RETIRED_CENSUS_VERBS {
+            assert!(
+                unknown_verb_message(Some(old)).contains(&format!("aterm-census -- {flag})")),
+                "{old}"
+            );
+        }
     }
 
     /// PASS THREE, IN BOTH DIRECTIONS: a crate whose `rustfmt.toml` edition
@@ -4009,7 +3738,7 @@ mod tests {
         assert_eq!(
             crate_edition(
                 &root,
-                "tools/grep-guard-fixtures/must_fire/split_receiver_chain.rs"
+                "tools/grep-guard-fixtures/b9f/must_fire/test_sends_the_door_itself.rs"
             ),
             workspace_edition(&root),
             "a file under no manifest falls back to the workspace edition"
@@ -4183,42 +3912,6 @@ mod tests {
         );
     }
 
-    /// The excuse is anchored at column zero and at the whole prefix, because it
-    /// is the ONE failure this gate forgives. An indented `error occurred in
-    /// cc-rs:` line is the *body* of a build-script failure cargo has already
-    /// reported — counting it as a second, unexcused error turned both cross
-    /// cells red for the very failure the policy had just excused.
-    #[test]
-    fn only_cargos_own_build_script_line_buys_an_excuse() {
-        assert_eq!(
-            super::build_script_failure(
-                "error: failed to run custom build command for `ring v0.17.14`"
-            ),
-            Some("ring")
-        );
-        assert_eq!(
-            super::build_script_failure(
-                "error: failed to run custom build command for `zstd-sys v2.0.16+zstd.1.5.7 (/p)`"
-            ),
-            Some("zstd-sys")
-        );
-        // Not cargo's line: a diagnostic that merely mentions it.
-        assert_eq!(
-            super::build_script_failure(
-                "  note: error: failed to run custom build command for `evil v1.0.0`"
-            ),
-            None
-        );
-        assert_eq!(
-            super::build_script_failure("  error occurred in cc-rs: nope"),
-            None
-        );
-        assert_eq!(
-            super::build_script_failure("error[E0277]: the trait bound"),
-            None
-        );
-    }
-
     /// `rustup toolchain list` marks the active one, and the marker is on the
     /// same line: a caller that takes the line verbatim asks rustup for a
     /// toolchain called `trust (active, default)` and reads the resulting "not
@@ -4258,51 +3951,22 @@ mod tests {
         assert!(super::artifact_is_for(None, &[]));
     }
 
-    /// AN EXCUSE IS SCOPED TO A TRIPLE, and the first draft of the policy file
-    /// was not: two `*` rows for `ring` and `zstd-sys` matched the mac-arm cell
-    /// too, where both packages compile perfectly — so the gate's own audit
-    /// caught the native cell being excused for something it does not need, on
-    /// the very first full run. (That audit is a NOTE now, not a failure: a box
-    /// that CAN run the build script is more capable, not out of policy. The
-    /// scoping is still what makes the note mean anything.)
-    #[test]
-    fn an_excuse_only_applies_to_the_triple_it_names() {
-        let policy = super::parse_cell_policy(
-            "# comment\n\
-             \n\
-             cdep\tring\tx86_64-pc-windows-msvc\tno Windows SDK\n\
-             cdep\tzstd-sys\t*\tbundled C\n\
-             floor\twin\t123\tmeasured\n",
-        )
-        .expect("this policy parses");
-        assert!(policy.excuse("ring", "x86_64-pc-windows-msvc").is_some());
-        assert!(policy.excuse("ring", "aarch64-apple-darwin").is_none());
-        // `*` is still available for a package no triple can build.
-        assert!(policy.excuse("zstd-sys", "aarch64-apple-darwin").is_some());
-        assert!(policy.excuse("nothing", "x86_64-pc-windows-msvc").is_none());
-        assert_eq!(policy.floor("win"), Some(123));
-        assert_eq!(policy.floor("linux"), None);
-    }
-
-    /// A row this parser cannot read is a COULD-NOT-RUN, never a skipped line:
-    /// every row either forgives a failure or sets a floor, and both are ways
-    /// for the gate to pass while proving less.
+    /// A row the parser cannot read is a COULD-NOT-RUN, never a skipped line —
+    /// including the retired `cdep` and `floor` kinds, which would otherwise be
+    /// read as policy nobody enforces.
     #[test]
     fn an_unreadable_policy_row_stops_the_gate_rather_than_being_ignored() {
-        assert!(super::parse_cell_policy("cdep\tring\tonly-three-columns\n").is_err());
-        assert!(super::parse_cell_policy("floor\tlinux\tlots\twhy\n").is_err());
-        assert!(super::parse_cell_policy("cdpe\tring\t*\ttypo in the kind\n").is_err());
-        // Four columns of the known kinds, and nothing else, is the file — five
-        // for `cshim`, which carries the `links` key as well.
-        assert!(super::parse_cell_policy("floor\tlinux\t206\twhy\n").is_ok());
+        assert!(super::parse_cell_policy("cdep\tring\t*\tbundled C\n").is_err());
+        assert!(super::parse_cell_policy("floor\tlinux\t206\twhy\n").is_err());
+        assert!(super::parse_cell_policy("cshmi\tring@0.17.14\tx\ty\twhy\n").is_err());
         assert!(
             super::parse_cell_policy(
-                "cshim\tring@0.17.14\tx86_64-unknown-linux-gnu\tring_core_0_17_14_\twhy\n"
+                "# comment\n\ncshim\tring@0.17.14\tx86_64-unknown-linux-gnu\tring_core_0_17_14_\twhy\n"
             )
-            .is_ok()
+            .is_ok_and(|p| p.cshims.len() == 1)
         );
         // Four columns is a `cshim` row missing the one column that cannot be
-        // derived from anything else.
+        // derived from anything else: the `links` key.
         assert!(
             super::parse_cell_policy("cshim\tring@0.17.14\tx86_64-unknown-linux-gnu\twhy\n")
                 .is_err()
@@ -4423,6 +4087,17 @@ mod tests {
             }),
             "this test needs at least one `cshim` row to audit"
         );
+        // Every row names a triple some cell resolves for: a row written against
+        // a triple this matrix has never had is dead on every box.
+        for shim in &policy.cshims {
+            assert!(
+                cells.iter().any(|c| c.triple == shim.triple),
+                "{} shims `{}` on `{}`, which is no cell's triple",
+                super::CELL_GATE_POLICY,
+                shim.package,
+                shim.triple
+            );
+        }
         for pretend_host in cells.iter().map(|c| c.triple.as_str()) {
             for cell in &cells {
                 if cell.triple == pretend_host {
@@ -4488,7 +4163,6 @@ mod tests {
             toolchain: "stable".to_string(),
             checked: 100,
             graph: 100,
-            excused: Vec::new(),
             shimmed: Vec::new(),
             own_checked: 40,
             own_total: 40,
@@ -4525,7 +4199,13 @@ mod tests {
             &[
                 checked_cell("mac-arm", "aarch64-apple-darwin"),
                 checked_cell("linux", "x86_64-unknown-linux-gnu"),
-                super::CellReport::skipped(&cell("win", "x86_64-pc-windows-msvc"), 161, 74, 1),
+                super::CellReport::skipped(
+                    &cell("win", "x86_64-pc-windows-msvc"),
+                    161,
+                    74,
+                    1,
+                    super::SkipCause::NoStd,
+                ),
                 checked_cell("wasm-cpu", "wasm32-unknown-unknown"),
                 checked_cell("wasm-gpu", "wasm32-unknown-unknown"),
             ],
@@ -4546,8 +4226,47 @@ mod tests {
             v.text
         );
         assert!(v.text.contains("NO COMPILER READ THEM"), "{}", v.text);
-        // And the repair is in the sentence, not in a wiki.
-        assert!(v.text.contains("rustup target add"), "{}", v.text);
+        // And the repair is in the sentence, runnable as printed: the skipped
+        // triple, never a `<triple>` / `<channel>` placeholder.
+        assert!(
+            v.text
+                .contains("`rustup target add x86_64-pc-windows-msvc --toolchain stable`"),
+            "{}",
+            v.text
+        );
+        assert!(
+            !v.text.contains('<'),
+            "a placeholder in the fix: {}",
+            v.text
+        );
+    }
+
+    /// ONE COMMAND FOR EVERY SKIPPED TRIPLE, each named once: the two wasm cells
+    /// share `wasm32-unknown-unknown`, and `rustup target add` takes a list.
+    #[test]
+    fn the_skip_fix_names_each_skipped_triple_once() {
+        let skip = |name: &str, triple: &str| {
+            super::CellReport::skipped(&cell(name, triple), 54, 20, 1, super::SkipCause::NoStd)
+        };
+        let v = super::cells_verdict(
+            &[
+                checked_cell("mac-arm", "aarch64-apple-darwin"),
+                skip("win", "x86_64-pc-windows-msvc"),
+                skip("wasm-cpu", "wasm32-unknown-unknown"),
+                skip("wasm-gpu", "wasm32-unknown-unknown"),
+            ],
+            4,
+            false,
+            false,
+        );
+        assert!(
+            v.text.contains(
+                "Install: `rustup target add wasm32-unknown-unknown x86_64-pc-windows-msvc \
+                 --toolchain stable`, then run again."
+            ),
+            "{}",
+            v.text
+        );
     }
 
     /// THE COST LINE sums what was COMPILED: the seconds and target-dir bytes
@@ -4562,8 +4281,13 @@ mod tests {
         let mut arm = checked_cell("linux-arm", "aarch64-unknown-linux-gnu");
         arm.secs = 12;
         arm.disk = Some((1 << 30) + (1 << 29));
-        let skipped =
-            super::CellReport::skipped(&cell("wasm-cpu", "wasm32-unknown-unknown"), 54, 20, 1);
+        let skipped = super::CellReport::skipped(
+            &cell("wasm-cpu", "wasm32-unknown-unknown"),
+            54,
+            20,
+            1,
+            super::SkipCause::NoStd,
+        );
         assert_eq!(skipped.disk, None);
         assert_eq!(
             super::cells_cost_line(&[win, skipped, arm]),
@@ -4581,8 +4305,13 @@ mod tests {
     /// costs. So a skip exits 0 — and a cell that RAN and failed does not.
     #[test]
     fn a_skip_does_not_block_a_checkout_and_a_cell_that_ran_and_failed_does() {
-        let skipped =
-            super::CellReport::skipped(&cell("win", "x86_64-pc-windows-msvc"), 161, 74, 1);
+        let skipped = super::CellReport::skipped(
+            &cell("win", "x86_64-pc-windows-msvc"),
+            161,
+            74,
+            1,
+            super::SkipCause::NoStd,
+        );
         assert!(super::cells_verdict(&[skipped], 5, false, false).ok);
 
         let mut failed = checked_cell("linux", "x86_64-unknown-linux-gnu");
@@ -4610,7 +4339,13 @@ mod tests {
         let v = super::cells_verdict(
             &[
                 exempt,
-                super::CellReport::skipped(&cell("win", "x86_64-pc-windows-msvc"), 161, 74, 1),
+                super::CellReport::skipped(
+                    &cell("win", "x86_64-pc-windows-msvc"),
+                    161,
+                    74,
+                    1,
+                    super::SkipCause::NoStd,
+                ),
             ],
             5,
             false,
@@ -4647,6 +4382,7 @@ mod tests {
                             266,
                             79,
                             2,
+                            super::SkipCause::NoStd,
                         );
                     }
                     let v = super::cells_verdict(&reports, 2, narrowed, gate_failed);
@@ -4669,7 +4405,13 @@ mod tests {
         ];
         let skipped = vec![
             checked_cell("mac-arm", "aarch64-apple-darwin"),
-            super::CellReport::skipped(&cell("linux", "x86_64-unknown-linux-gnu"), 266, 79, 2),
+            super::CellReport::skipped(
+                &cell("linux", "x86_64-unknown-linux-gnu"),
+                266,
+                79,
+                2,
+                super::SkipCause::NoStd,
+            ),
         ];
         assert_ne!(
             super::cells_verdict(&complete, 2, false, false).text,
@@ -4698,13 +4440,153 @@ mod tests {
     /// so the constructor is what is held to it.
     #[test]
     fn a_skipped_row_says_skipped_in_both_the_column_and_the_verdict() {
-        let r = super::CellReport::skipped(&cell("win", "x86_64-pc-windows-msvc"), 161, 74, 1);
+        let r = super::CellReport::skipped(
+            &cell("win", "x86_64-pc-windows-msvc"),
+            161,
+            74,
+            1,
+            super::SkipCause::NoStd,
+        );
         assert_eq!(r.status, super::SKIPPED_NO_STD);
-        assert_eq!(r.outcome, super::CellOutcome::Skipped);
+        assert_eq!(
+            r.outcome,
+            super::CellOutcome::Skipped(super::SkipCause::NoStd)
+        );
         assert_ne!(r.outcome, super::CellOutcome::Checked);
         // Nothing was compiled, so nothing may be counted as compiled.
         assert_eq!((r.checked, r.own_checked, r.tests_checked), (0, 0, 0));
         assert!(r.tests_note.is_some());
+    }
+
+    /// PATH FIRST, then where rustup installs itself, then Homebrew's keg — and a
+    /// relative PATH entry is never a candidate (it would resolve against whatever
+    /// cwd the gate ran in).
+    #[test]
+    fn rustup_is_looked_for_on_path_then_where_rustup_installs_itself() {
+        use std::ffi::OsStr;
+        let got = super::rustup_candidates(
+            Some(OsStr::new("/p/one:rel/dir:/p/two")),
+            Some(OsStr::new("/ch")),
+            Some(OsStr::new("/h")),
+        );
+        let want: Vec<PathBuf> = [
+            "/p/one/rustup",
+            "/p/two/rustup",
+            "/ch/bin/rustup",
+            "/h/.cargo/bin/rustup",
+            "/opt/homebrew/opt/rustup/bin/rustup",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(got, want);
+        // An unset or relative CARGO_HOME / HOME adds nothing.
+        let bare = super::rustup_candidates(None, Some(OsStr::new("ch")), None);
+        assert_eq!(
+            bare,
+            vec![PathBuf::from("/opt/homebrew/opt/rustup/bin/rustup")]
+        );
+    }
+
+    /// THE BOX THIS WAS MEASURED ON (2026-09-27): rustup in `~/.cargo/bin`, that
+    /// directory not on PATH. The search finds it; the PATH-only question the cross
+    /// gates asked until that day — the negative control — does not.
+    #[test]
+    fn a_rustup_off_path_in_cargo_home_is_found() {
+        let root = std::env::temp_dir().join(format!("aterm-find-rustup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let path_dir = root.join("bin");
+        std::fs::create_dir_all(home.join(".cargo/bin")).expect("mkdir cargo bin");
+        std::fs::create_dir_all(&path_dir).expect("mkdir path dir");
+        let rustup = home.join(".cargo/bin/rustup");
+        std::fs::write(&rustup, b"#!/bin/sh\n").expect("write rustup");
+        // A STRAY `rustup` EARLY ON PATH that cannot be executed (a renamed
+        // download nobody chmodded): `execvp` passes over it, so the search must.
+        let stray = path_dir.join("rustup");
+        std::fs::write(&stray, b"not a program\n").expect("write stray");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod rustup");
+            std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod stray");
+        }
+        let path = path_dir.clone().into_os_string();
+        let found = super::find_rustup_in(Some(&path), None, Some(home.as_os_str()));
+        // The negative control, the question the cross gates asked until that day:
+        // PATH alone, as `command -v` answers it.
+        let path_only = std::env::split_paths(&path)
+            .map(|d| d.join("rustup"))
+            .find(|p| super::is_executable_file(p));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(rustup));
+        assert_eq!(
+            path_only, None,
+            "the negative control: PATH alone misses it"
+        );
+    }
+
+    /// A box with NO rustup is told so, and is not sent to `rustup target add` as
+    /// if a std were all it lacked — and the sentence still opens with the sentinel
+    /// `tools/verify.sh` reads, so the stage is still a SKIP, never a pass.
+    #[test]
+    fn a_cell_skipped_for_no_rustup_names_rustup_not_a_std() {
+        let r = super::CellReport::skipped(
+            &cell("win", "x86_64-pc-windows-msvc"),
+            161,
+            74,
+            1,
+            super::SkipCause::NoRustup,
+        );
+        assert_eq!(r.status, super::SKIPPED_NO_RUSTUP);
+        let v = super::cells_verdict(
+            &[checked_cell("mac-arm", "aarch64-apple-darwin"), r],
+            2,
+            false,
+            false,
+        );
+        assert!(v.ok, "a box fact never blocks: {}", v.text);
+        assert!(
+            v.text.starts_with(aterm_verify::stages::CELLS_NOT_PROVEN),
+            "{}",
+            v.text
+        );
+        assert!(v.text.contains("no rustup"), "{}", v.text);
+        assert!(v.text.contains(super::RUSTUP_LOOKED), "{}", v.text);
+        assert!(
+            v.text.contains(
+                "Install rustup (https://rustup.rs), then `rustup target add \
+                 x86_64-pc-windows-msvc --toolchain stable`"
+            ),
+            "{}",
+            v.text
+        );
+        assert!(!v.text.contains("had no installed std"), "{}", v.text);
+        assert!(!v.text.contains(super::MATRIX_CLAIM), "{}", v.text);
+        // The std-only cause keeps its own words.
+        let std_only = super::cells_verdict(
+            &[
+                checked_cell("mac-arm", "aarch64-apple-darwin"),
+                super::CellReport::skipped(
+                    &cell("win", "x86_64-pc-windows-msvc"),
+                    161,
+                    74,
+                    1,
+                    super::SkipCause::NoStd,
+                ),
+            ],
+            2,
+            false,
+            false,
+        );
+        assert!(
+            std_only.text.contains("had no installed std"),
+            "{}",
+            std_only.text
+        );
+        assert!(!std_only.text.contains("no rustup"), "{}", std_only.text);
     }
 
     /// `cargo tree` prints the path it resolved and `workspace_root()` returns
@@ -4720,199 +4602,9 @@ mod tests {
         assert!(!super::path_is_inside(std::path::Path::new("/"), &root));
     }
 
-    /// THE LIVE FILE, against THE LIVE CELL LIST. A cell with no floor cannot be
-    /// compared with anything, and `gate cells` would fail at run time — this
-    /// fails in `cargo test -p xtask` instead, the moment forge gains a cell.
-    #[test]
-    fn every_forge_cell_has_a_floor_in_the_shipped_policy() {
-        let root = crate::workspace_root();
-        let text = std::fs::read_to_string(root.join(super::CELL_GATE_POLICY))
-            .expect("tools/cross-cell-gate.tsv is shipped");
-        let policy = super::parse_cell_policy(&text).expect("the shipped policy parses");
-        for cell in aterm_forge::resolve::default_cells() {
-            assert!(
-                policy.floor(&cell.name).is_some(),
-                "cell `{}` has no `floor` row in {}",
-                cell.name,
-                super::CELL_GATE_POLICY
-            );
-        }
-        // Every excuse names a triple some cell actually resolves for, so a row
-        // cannot be written against a triple this matrix has never had.
-        let triples: Vec<String> = aterm_forge::resolve::default_cells()
-            .into_iter()
-            .map(|c| c.triple)
-            .collect();
-        for cdep in &policy.cdeps {
-            assert!(
-                cdep.triple == "*" || triples.contains(&cdep.triple),
-                "{} excuses `{}` on `{}`, which is no cell's triple",
-                super::CELL_GATE_POLICY,
-                cdep.package,
-                cdep.triple
-            );
-        }
-        for shim in &policy.cshims {
-            assert!(
-                triples.contains(&shim.triple),
-                "{} shims `{}` on `{}`, which is no cell's triple",
-                super::CELL_GATE_POLICY,
-                shim.package,
-                shim.triple
-            );
-        }
-    }
-
-    /// THE AUDIT THE OTHER DIRECTION, which is the one a shrunken matrix walks
-    /// through. `every_forge_cell_has_a_floor_in_the_shipped_policy` fails when a
-    /// cell has no floor; this one fails when a FLOOR HAS NO CELL. Deleting
-    /// `wasm-cpu` from `default_cells()` used to leave `gate cells` exiting 0 and
-    /// printing "GREEN — all 4 cells type-check" while the orphaned
-    /// `floor wasm-cpu 54` row went unmentioned — a verification floor whose own
-    /// matrix can be quietly shrunk. `gate cells` fails on this at run time now;
-    /// this fails in `cargo test -p xtask` first, and without compiling a cell.
-    #[test]
-    fn no_floor_row_outlives_the_cell_it_measures() {
-        let root = crate::workspace_root();
-        let text = std::fs::read_to_string(root.join(super::CELL_GATE_POLICY))
-            .expect("tools/cross-cell-gate.tsv is shipped");
-        let policy = super::parse_cell_policy(&text).expect("the shipped policy parses");
-        let cells = aterm_forge::resolve::default_cells();
-        for floor in &policy.floors {
-            assert!(
-                cells.iter().any(|c| c.name == floor.cell),
-                "{} records a floor of {} for cell `{}`, which forge no longer has",
-                super::CELL_GATE_POLICY,
-                floor.packages,
-                floor.cell
-            );
-        }
-        // And exactly one row per cell: `floor()` is a `find`, so a second row
-        // would be read by nobody and could hide a lower number behind a higher.
-        for (i, floor) in policy.floors.iter().enumerate() {
-            assert!(
-                !policy.floors[..i].iter().any(|f| f.cell == floor.cell),
-                "{} records more than one floor for cell `{}`",
-                super::CELL_GATE_POLICY,
-                floor.cell
-            );
-        }
-    }
-
     // -----------------------------------------------------------------------
     // G-CELLS, THE ALWAYS-ON SUBSET
     // -----------------------------------------------------------------------
-
-    /// THE RED FIXTURE FOR `cells-foreign`, AT THE VERB. [`super::cells_under_policy`]
-    /// is `gate cells`' whole body — the member list, forge's per-cell graph, the cross
-    /// compile for the cell's own triple and the verdict — driven here for ONE foreign
-    /// cell, `wasm-cpu` (the cheapest to compile, and one `cells-foreign` compiles on every
-    /// box). GREEN under the shipped policy first, so the red is about the plant; then
-    /// RED with that cell's floor raised past its graph — a count only the COMPILE can
-    /// fall short of, so the verb itself decides. SKIPS, loudly, on a box whose toolchains
-    /// carry no std for the cell: nothing can be learned there either way (the fmt-sweep
-    /// fixture's posture).
-    #[test]
-    fn a_foreign_cell_under_its_floor_fails_the_cells_verb() {
-        let cell = super::foreign_cells()
-            .into_iter()
-            .find(|c| c.name == "wasm-cpu")
-            .expect("wasm-cpu is foreign on every box in the fleet");
-        if !matches!(super::cell_toolchain(&cell.triple), Ok(Some(_))) {
-            eprintln!(
-                "SKIP a_foreign_cell_under_its_floor_fails_the_cells_verb: no installed \
-                 toolchain carries a {} std (`rustup target add {} --toolchain stable`) — this \
-                 box cannot show the verb red or green.",
-                cell.triple, cell.triple
-            );
-            return;
-        }
-        let root = crate::workspace_root();
-        let text = std::fs::read_to_string(root.join(super::CELL_GATE_POLICY))
-            .expect("tools/cross-cell-gate.tsv is shipped");
-        let wanted = [cell.name.clone()];
-        let shipped = super::parse_cell_policy(&text).expect("the shipped policy parses");
-        assert!(
-            super::cells_under_policy(&root, &shipped, &wanted),
-            "`{}` must be GREEN under the shipped policy before this fixture plants anything",
-            cell.name
-        );
-        let mut raised = super::parse_cell_policy(&text).expect("the shipped policy parses");
-        for floor in &mut raised.floors {
-            if floor.cell == cell.name {
-                floor.packages = 1_000_000;
-            }
-        }
-        assert!(
-            !super::cells_under_policy(&root, &raised, &wanted),
-            "a cell whose compile reaches fewer packages than its floor must fail the VERB"
-        );
-    }
-
-    /// The COMPONENT fixture beside it: `cell_matrix_audit`, the half of the verb that
-    /// needs no compiler and that every run — narrowed or not — asks of forge's whole
-    /// cell list, so it is shown red on every box, cross std or not.
-    ///
-    /// GREEN FIRST, over the shipped policy and the shipped matrix, so a run
-    /// where the audit could not fail for some unrelated reason cannot be read
-    /// as proof. Then RED three ways, one per thing the audit is for.
-    #[test]
-    fn a_shrunken_matrix_or_a_missing_floor_fails_the_cells_audit() {
-        let root = crate::workspace_root();
-        let text = std::fs::read_to_string(root.join(super::CELL_GATE_POLICY))
-            .expect("tools/cross-cell-gate.tsv is shipped");
-        let policy = super::parse_cell_policy(&text).expect("the shipped policy parses");
-        let cells = aterm_forge::resolve::default_cells();
-        assert!(
-            super::cell_matrix_audit(&cells, &policy.floors).is_empty(),
-            "the shipped policy must be CLEAN before this fixture plants anything — otherwise \
-             the red below proves nothing about the plant"
-        );
-        let clone = |fs: &[super::CoverageFloor]| -> Vec<super::CoverageFloor> {
-            fs.iter()
-                .map(|f| super::CoverageFloor {
-                    cell: f.cell.clone(),
-                    packages: f.packages,
-                })
-                .collect()
-        };
-
-        // ONE: the matrix loses a cell and its floor row is orphaned. This is
-        // the exact silence a judge measured — `gate cells` printing
-        // "GREEN — all 4 cells type-check" over a five-cell policy file.
-        let shrunk: Vec<_> = cells
-            .iter()
-            .filter(|c| c.name != "wasm-cpu")
-            .cloned()
-            .collect();
-        let red = super::cell_matrix_audit(&shrunk, &policy.floors);
-        assert!(
-            !red.is_empty() && red.iter().any(|l| l.contains("wasm-cpu")),
-            "a floor row whose cell left the matrix must FAIL and name it: {red:?}"
-        );
-
-        // TWO: the cell keeps its place and loses its floor, so its coverage
-        // could fall to nothing with nothing to compare it against.
-        let mut floorless = clone(&policy.floors);
-        floorless.retain(|f| f.cell != "win");
-        let red = super::cell_matrix_audit(&cells, &floorless);
-        assert!(
-            !red.is_empty() && red.iter().any(|l| l.contains("win")),
-            "a cell with no floor row must FAIL and name it: {red:?}"
-        );
-
-        // THREE: two rows for one cell, where `floor()` is a `find` and only the
-        // first is ever read — so the lower number hides behind the higher.
-        let mut doubled = clone(&policy.floors);
-        doubled.push(super::CoverageFloor {
-            cell: "win".to_string(),
-            packages: 1,
-        });
-        assert!(
-            !super::cell_matrix_audit(&cells, &doubled).is_empty(),
-            "a second floor row for one cell must FAIL: only the first is read"
-        );
-    }
 
     /// THE DECISION OF 2026-09-17, PINNED: the always-on cross-triple compile is
     /// exactly forge's cells whose triple no box in this fleet runs natively,
@@ -4970,10 +4662,8 @@ mod tests {
     /// that can check it are the machines. If this box runs a cell's triple
     /// natively and that triple is not in the const, the always-on gate is
     /// compiling a NATIVE cell here and a CROSS cell elsewhere — different
-    /// `cshim` decisions, a `floor` that counts host artifacts — and the merge
-    /// gate would be answering a different question depending on who ran it. That
-    /// is the state the whole matrix is in today, and this test is what keeps the
-    /// subset out of it.
+    /// `cshim` decisions, different artifacts counted — and the merge gate would
+    /// be answering a different question depending on who ran it.
     #[test]
     fn no_cell_this_box_runs_natively_is_in_the_always_on_subset() {
         let host = super::rustc_host_triple().expect("`rustc -vV` reports a host triple");
@@ -5104,7 +4794,12 @@ mod tests {
     /// and this holds that place to its own doc comment.
     #[test]
     fn the_host_cell_command_names_no_rustup_toolchain_and_no_target() {
-        let host = super::cell_check_command(true, None, "aarch64-apple-darwin");
+        let driver = crate::driver::CargoDriver {
+            program: PathBuf::from("/s/targo"),
+            trustc: PathBuf::from("/s/trustc"),
+        };
+        let host =
+            super::cell_check_command(super::CellCompiler::Host(&driver), "aarch64-apple-darwin");
         let args: Vec<String> = host
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -5115,16 +4810,9 @@ mod tests {
             host.get_envs().all(|(k, _)| k != "RUSTUP_TOOLCHAIN"),
             "the host cell must not export RUSTUP_TOOLCHAIN"
         );
-        assert_eq!(args.last().map(String::as_str), Some("check"));
-        // The program is the host driver, never a bare `cargo` (the store's
-        // targo on a box with no cargo at all); under targo the lane is named.
-        let driver = crate::driver::cargo_driver();
+        // The pinned driver, with the lane named.
+        assert_eq!(args, ["--unverified", "check"]);
         assert_eq!(host.get_program(), driver.program.as_os_str());
-        assert_eq!(
-            args.iter().any(|a| a == "--unverified"),
-            driver.is_targo,
-            "{args:?} vs {driver:?}"
-        );
 
         // A cross cell drives THE TOOLCHAIN'S OWN cargo and rustc, by path — never
         // a `cargo` off PATH trusted to honour RUSTUP_TOOLCHAIN (Homebrew's does not).
@@ -5133,7 +4821,10 @@ mod tests {
             cargo: PathBuf::from("/r/toolchains/stable/bin/cargo"),
             rustc: PathBuf::from("/r/toolchains/stable/bin/rustc"),
         };
-        let cross = super::cell_check_command(false, Some(&stable), "x86_64-unknown-linux-gnu");
+        let cross = super::cell_check_command(
+            super::CellCompiler::Cross(&stable),
+            "x86_64-unknown-linux-gnu",
+        );
         let args: Vec<String> = cross
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

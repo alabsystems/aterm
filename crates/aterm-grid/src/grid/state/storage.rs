@@ -217,6 +217,11 @@ pub struct GridStorage {
     /// plain-text row. `None` = no overflow data (common case, 8 bytes).
     /// `Some(Box<..>)` = has overflow data (rare, heap-allocated).
     pub ring_extras: VecDeque<Option<Box<ScrolledRowExtras>>>,
+    /// The alt-screen resize undo: what the last rows-only shrink(s) of a grid
+    /// that keeps no history took off the screen, for a grow back with nothing
+    /// drawn in between to hand back exactly (`grid::resize_undo`). `None`
+    /// outside such a flap. Session-only: never checkpointed.
+    pub(crate) resize_undo: Option<Box<super::super::resize_undo::ResizeUndo>>,
     /// Generation tracker for pin invalidation.
     /// Tracks page evictions to detect stale pins.
     pub generations: GenerationTracker,
@@ -322,6 +327,16 @@ impl DerefMut for GridStorage {
 }
 
 impl GridStorage {
+    /// Remove rows after their content/extras have been preserved, returning
+    /// their cell allocations to the SAME arena for future row construction.
+    pub(crate) fn recycle_rows(&mut self, range: std::ops::Range<usize>) {
+        for row in self.rows.drain(range) {
+            // SAFETY: every row in GridStorage is allocated by its own pages;
+            // drain transfers ownership and removes all access through rows.
+            unsafe { row.recycle(&mut self.pages) };
+        }
+    }
+
     #[cfg(kani)]
     pub(crate) fn kani_stub(
         pages: PageStore,
@@ -352,6 +367,7 @@ impl GridStorage {
             history_renumber_epoch: 0,
             history_reveal_gen: 0,
             ring_extras: VecDeque::new(),
+            resize_undo: None,
             generations: GenerationTracker::new(),
             absolute_row_counter: u64::from(visible_rows),
             // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).

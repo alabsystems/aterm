@@ -58,8 +58,9 @@ pub struct CutOptions {
     /// Requested operator apply floor / yank. The emitted floor is the maximum
     /// of this value and the newest live channel manifest's carried floor.
     pub min_build: Option<u64>,
-    /// Additionally run `tools/verify.sh --full` inline after the gates —
-    /// opt-in, never mandatory (spec decisions 15/22).
+    /// Additionally run `tools/verify.sh --full` and the whole-tree
+    /// `tools/trust-gate-all.sh` inline after the gates — opt-in, never
+    /// mandatory (spec decisions 15/22); the receipts they file are required.
     pub gate: bool,
     /// "OWNER/REPO": a full real cut published to a scratch channel with a
     /// provisional (never-pushed) ledger number (spec decision 17). Like every
@@ -70,6 +71,17 @@ pub struct CutOptions {
     /// Both native Linux workers' handoff directory, fixed before claim.
     pub linux_artifacts: Option<PathBuf>,
     pub linux_targets: Vec<String>,
+    /// `--linux-worker ARCH=DESTINATION:REPOSITORY` specs: native hosts the
+    /// cutter drives itself after the claim ([`buildplan::linux::Worker`]).
+    pub linux_workers: Vec<String>,
+    /// `--mac-only`: the operator's explicit statement that this cut ships no
+    /// Linux build. A real or rehearsal cut must say either this or
+    /// `--linux-artifacts` ([`cli`]'s parse refuses the silence), because a cut
+    /// that simply omitted Linux left every Linux install stranded on its old
+    /// build — v0.86.0 through v0.93.0 all shipped that way unnoticed. Checked by
+    /// the cutter the operator ran; never forwarded to a handed-off cutter
+    /// ([`cut_args`]), which an older tree would refuse it as unknown.
+    pub mac_only: bool,
     /// `--no-paint-smoke`: skip the self-check's paint smoke (the 29-keystroke
     /// pixel proof against the just-built bundle). An EMERGENCY escape, refused
     /// on a notarized real cut unless [`NO_PAINT_SMOKE_ACK_VAR`] carries the
@@ -515,7 +527,7 @@ pub fn unix_now() -> u64 {
 // gh plumbing (3 retries with backoff — spec §7)
 // ---------------------------------------------------------------------------
 
-/// The release-org token, read from disk. Without it `cargo ship cut` authenticates
+/// The release-org token, read from disk. Without it `targo --unverified ship cut` authenticates
 /// EVERY call with `gh auth token` — the dev account, which has no push on the public
 /// release channel, so the cut refuses at [`preflight_channel_target`] before its claim.
 ///
@@ -661,7 +673,7 @@ pub const RECOVERY_STOPPED_PROCESS_FLAG: &str = "--old-publisher-stopped";
 /// and an ABSENT release object then means one of two things a machine cannot tell
 /// apart: no create POST was ever issued, or one was issued and has not become
 /// visible yet. Refusing (the safe reading) left no command that could release
-/// `refs/tags/aterm-release-lease`, so every later `cargo ship cut` refused on every
+/// `refs/tags/aterm-release-lease`, so every later `targo --unverified ship cut` refused on every
 /// machine and the refs had to be deleted by hand — the pipeline stayed wedged by a
 /// safety rule protecting against a draft that did not exist.
 ///
@@ -2770,7 +2782,7 @@ pub enum DraftCleanupDecision {
 /// unrecoverable rather than merely careful: a publisher that died between creating
 /// its draft and publishing it left a draft no machine could clean and
 /// `refs/tags/aterm-release-lease` held by a process that no longer exists. Every
-/// later `cargo ship cut` refused at `preflight_release_lease`, `--abandon` refused
+/// later `targo --unverified ship cut` refused at `preflight_release_lease`, `--abandon` refused
 /// for want of the same journal, and the only remedy was deleting refs by hand.
 ///
 /// When the remote binds the draft to this claim, the missing local intent adds
@@ -3845,7 +3857,7 @@ pub fn verify_channel_head_signature_with(
     })
 }
 
-/// Live wrapper used by `cargo ship verify` and a yank's successor proof.
+/// Live wrapper used by `targo --unverified ship verify` and a yank's successor proof.
 ///
 /// Tier REPO model: with no configured/journaled update key the channel is
 /// unsigned and published signature history NEVER forces a signed successor.
@@ -5005,7 +5017,7 @@ const UPDATER_MAX_DMG_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOU
 /// all", the other "is this the one lean download we promised". A seeded image
 /// answers yes to the first and no to the second, which is precisely why
 /// v0.63.0 sailed through — 1.07 GB is comfortably inside 2 GiB. The lean image
-/// is ~31 MB, so 200 MB is roughly six times the real figure: loose enough that
+/// was 40.6 MB at v0.98.0, so 200 MB is about five times it: loose enough that
 /// ordinary growth never trips it, tight enough that a seeded container cannot.
 ///
 /// Deliberately no environment opt-out, for the reason recorded on
@@ -5013,23 +5025,33 @@ const UPDATER_MAX_DMG_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOU
 /// cut too, which is the failure mode the check exists to prevent.
 const LEAN_DMG_CEILING_BYTES: u64 = 200 * 1000 * 1000;
 
-/// Refuse a macOS image that is not the lean download.
+/// The size half of a lean-ceiling refusal, `None` up to and including the
+/// ceiling. Each checkpoint adds its own next step: what went wrong differs
+/// between a fresh build, a mutated `dist/` and a release already on the channel.
+fn lean_dmg_overweight(size: u64) -> Option<String> {
+    (size > LEAN_DMG_CEILING_BYTES).then(|| {
+        format!(
+            "{:.2} GB ({size} bytes), over the {} MB lean ceiling",
+            size as f64 / 1e9,
+            LEAN_DMG_CEILING_BYTES / 1_000_000,
+        )
+    })
+}
+
+/// Refuse a macOS image, just packaged, that is not the lean download.
 ///
 /// Pure, so the boundary is a unit test rather than a 31 MB build: `Ok(())` up
 /// to and including the ceiling, an error naming both figures past it.
-pub fn validate_lean_dmg_size(size: u64) -> Result<()> {
-    if size > LEAN_DMG_CEILING_BYTES {
-        return Err(Error::new(format!(
-            "aterm-<version>.dmg is {:.2} GB ({size} bytes), over the {} MB lean ceiling — \
-             this is a seeded image, not the one lean download.\n\
-             fix:  cargo clean -p aterm-release, confirm dist/toolchain-seed is absent, re-cut\n\
-             why:  v0.63.0 shipped exactly this and nothing at cut time objected; the client's \
-             {UPDATER_MAX_DMG_BYTES}-byte bound is about downloadability, not leanness",
-            size as f64 / 1e9,
-            LEAN_DMG_CEILING_BYTES / 1_000_000,
-        )));
-    }
-    Ok(())
+pub fn validate_lean_dmg_size(version: &str, size: u64) -> Result<()> {
+    let Some(overweight) = lean_dmg_overweight(size) else {
+        return Ok(());
+    };
+    Err(Error::new(format!(
+        "aterm-{version}.dmg is {overweight}.\n\
+         fix:  `{CUT_COMMAND} --abandon v{version}`, find what the bundle gained, cut again\n\
+         why:  v0.63.0 shipped exactly this and nothing at cut time objected; the client's \
+         {UPDATER_MAX_DMG_BYTES}-byte bound is about downloadability, not leanness"
+    )))
 }
 
 /// Apply the lean-image contract to the bytes that actually exist on disk.
@@ -5039,7 +5061,9 @@ pub fn validate_lean_dmg_size(size: u64) -> Result<()> {
 /// published recovery downloads a fresh object. Reading metadata at each
 /// publication boundary makes the ceiling stable across both paths without
 /// hashing or buffering a potentially gigabyte-sized seeded image first.
-fn validate_lean_dmg_on_disk(path: &Path, checkpoint: &str) -> Result<()> {
+///
+/// `fix` is the checkpoint's own next step, when it has one.
+fn validate_lean_dmg_on_disk(path: &Path, checkpoint: &str, fix: Option<&str>) -> Result<()> {
     let metadata = fs::metadata(path).map_err(|error| {
         Error::new(format!(
             "{checkpoint}: read on-disk DMG metadata {}: {error}",
@@ -5052,12 +5076,14 @@ fn validate_lean_dmg_on_disk(path: &Path, checkpoint: &str) -> Result<()> {
             path.display()
         )));
     }
-    validate_lean_dmg_size(metadata.len()).map_err(|error| {
-        Error::new(format!(
-            "{checkpoint}: on-disk DMG {}: {error}",
-            path.display()
-        ))
-    })
+    let Some(overweight) = lean_dmg_overweight(metadata.len()) else {
+        return Ok(());
+    };
+    let fix = fix.map(|fix| format!("\nfix:  {fix}")).unwrap_or_default();
+    Err(Error::new(format!(
+        "{checkpoint}: {} is {overweight}.{fix}",
+        path.display()
+    )))
 }
 
 /// Retain a digest-verified published DMG, then judge the retained file rather
@@ -5069,7 +5095,8 @@ where
     F: FnOnce(&Path) -> Result<VerifiedReleaseAsset>,
 {
     let asset = download(destination)?;
-    validate_lean_dmg_on_disk(destination, "published recovery")?;
+    // The release is already public, and `--abandon` refuses a published release.
+    validate_lean_dmg_on_disk(destination, "published recovery", None)?;
     Ok(asset)
 }
 static RELEASE_ASSET_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -7283,7 +7310,7 @@ fn recovered_roster_asset_names(manifest: &Manifest) -> Vec<&'static str> {
 /// true, which puts both roster names into `channel_asset_paths`. `publish` hard-errors
 /// on any release asset that is not a local file. Reconstructing the DMG, the zip, the
 /// appcast, its signature and the provenance but not these two therefore left
-/// `cargo ship recover-lost` unable to complete on the armed path: it failed with
+/// `targo --unverified ship recover-lost` unable to complete on the armed path: it failed with
 /// "…dist/ artifacts are gone… recover the cut rather than mirroring different bytes",
 /// whose advice is the command that was already running. The release stayed live on the
 /// publish repo and absent from the public channel the fleet actually reads.
@@ -7325,7 +7352,7 @@ fn recovered_roster_asset_names(manifest: &Manifest) -> Vec<&'static str> {
 /// key. It fails with "manifest signature does not verify under the channel public
 /// key", the release never reaches the public channel, and
 /// `refs/tags/aterm-release-lease` stays held by the dead machine — so every later
-/// `cargo ship cut` refuses at `preflight_release_lease` with no command able to
+/// `targo --unverified ship cut` refuses at `preflight_release_lease` with no command able to
 /// un-wedge it.
 ///
 /// On the armed path the release names its own signer and the master-signed roster
@@ -7461,7 +7488,7 @@ fn reconstruct_roster_assets(
     )?;
     refuse_roster_downgrade(dist, incoming_seq)?;
     // Through the roster PAIR's writer lock and redo transaction, not two bare writes:
-    // this is the same `dist/aterm-machines.toml` + `.sig` that `cargo ship provision`
+    // this is the same `dist/aterm-machines.toml` + `.sig` that `targo --unverified ship provision`
     // seeds and the mint re-signs, and a death between two `fs::write`s left exactly the
     // torn pair — new document, old signature — that no client verifies and every
     // operator reads as a bad phrase. `crate::provision::publish_proven_pair` takes the
@@ -7945,6 +7972,26 @@ pub fn fresh_cut_journal_triage(existing: Option<&JournalHeader>, kind: CutKind)
 /// the cutter for its own child — never an operator knob.
 const REBUILT_FOR_ENV: &str = "ATERM_CUT_REBUILT_FOR";
 
+/// The [`REBUILT_FOR_ENV`] marker this process was started with — `Some` only
+/// in a cutter another cutter handed a cut to.
+fn rebuilt_for() -> Option<std::ffi::OsString> {
+    std::env::var_os(REBUILT_FOR_ENV)
+}
+
+/// Whether this process is a cutter another cutter handed its cut to. Such a
+/// cutter takes its arguments from its parent, which already held them to the
+/// operator-facing rules (`--mac-only`), so it does not ask for them again.
+///
+/// Any marker counts, not only one naming this binary's own commit: a rebuilt
+/// cutter that is still not its tree's own must reach [`tree_cutter`]'s loop
+/// refusal, not a `--mac-only` one its parent already settled. The marker is an
+/// internal parent-to-child channel; an operator who sets it by hand has chosen
+/// to skip the check, which is not the silent omission it exists to stop.
+#[must_use]
+pub fn is_handed_off_cutter() -> bool {
+    rebuilt_for().is_some()
+}
+
 /// What [`run_as_the_trees_cutter`] does, decided purely.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TreeCutter {
@@ -8095,7 +8142,7 @@ pub fn run_as_the_trees_cutter(
     args: Vec<std::ffi::OsString>,
 ) -> Result<Cutter> {
     let closure = gates::cutter_source_closure(&GitCli::new(tree), gates::BUILD_COMMIT, commit);
-    let rebuilt_for = std::env::var_os(REBUILT_FOR_ENV);
+    let rebuilt_for = rebuilt_for();
     match tree_cutter(
         gates::BUILD_COMMIT,
         commit,
@@ -8139,6 +8186,8 @@ pub fn cut_args(opts: &CutOptions) -> Vec<std::ffi::OsString> {
         arm64_only,
         linux_artifacts,
         linux_targets,
+        linux_workers,
+        mac_only: _,
         no_paint_smoke,
     } = opts;
     let mut args: Vec<std::ffi::OsString> = vec!["cut".into()];
@@ -8172,6 +8221,12 @@ pub fn cut_args(opts: &CutOptions) -> Vec<std::ffi::OsString> {
         let arch = triple.split('-').next().unwrap_or(triple);
         args.extend(["--linux-target".into(), arch.into()]);
     }
+    for spec in linux_workers {
+        args.extend(["--linux-worker".into(), spec.into()]);
+    }
+    // `mac_only` is deliberately not spelled: the cutter the operator ran has
+    // already held the cut to it, and the tree's cutter this goes to is exempt
+    // ([`is_handed_off_cutter`]) — an older one would refuse the flag.
     args
 }
 
@@ -8231,7 +8286,7 @@ pub fn recover_args(
     args
 }
 
-/// The whole `cargo ship cut` (spec §7 order): gates → claim → build+package
+/// The whole `targo --unverified ship cut` (spec §7 order): gates → claim → build+package
 /// → self-check → origin tag → the ONE publication onto the channel.
 ///
 /// The version is `[workspace.package] version` as written
@@ -8419,7 +8474,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let linux = opts
         .linux_artifacts
         .as_deref()
-        .map(|directory| buildplan::linux::Handoff::new(directory, &opts.linux_targets))
+        .map(|directory| {
+            buildplan::linux::Handoff::new(directory, &opts.linux_targets, &opts.linux_workers)
+        })
         .transpose()?;
     let apple = resolve_apple_tier(aterm_update_core::pins::APPLE_TEAM_ID, credentials)?;
 
@@ -8535,6 +8592,14 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     step(
         "",
         &format!(
+            "handoff fixture guard: {} test(s) passed in the cut tree (every shipped \
+             producer's desks adopted by this build's consumer)",
+            gr.fixture_guard_tests
+        ),
+    );
+    step(
+        "",
+        &format!(
             "handoff policy sealed into the bundle: {}",
             gr.handoff_policy
         ),
@@ -8594,6 +8659,15 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // one — and refuses pre-claim without one. A dry run or rehearsal states
     // the answer.
     step("gate", &gates::measure_gate(&git, kind == CutKind::Real)?);
+    // NOTHING SHIPS UNVERIFIED BY THE WHOLE-TREE TRUST LANE (2026-09-27): the
+    // merge contract verifies only the libraries a change touched, the heaviest
+    // excepted, so a real cut requires a PASS trust receipt for the tree it
+    // builds, from the prover it builds with — the deep gate's whole-tree run
+    // files one — and refuses pre-claim without one.
+    step(
+        "gate",
+        &gates::trust_receipt_gate(&git, kind == CutKind::Real)?,
+    );
 
     if kind == CutKind::Real {
         preflight_release_lease(&git)?;
@@ -8624,7 +8698,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // it is the last of the pre-claim gates and it sits BEFORE the ledger claim a few
     // lines below. A claim burns a single-use build number and is pushed to origin, so
     // a refusal after it costs a number that can never be reused and leaves a dangling
-    // claim for `cargo ship status` to explain. Everything the roster gate needs is
+    // claim for `targo --unverified ship status` to explain. Everything the roster gate needs is
     // local — a file, a signature, a clock — so there is no reason for it to happen
     // one line later than the cheapest gates, and every reason for it not to.
     let signature_verdict = preflight_signature_policy(credentials, RosterDuty::Sign)?;
@@ -9655,22 +9729,32 @@ fn run_freeze_safety_gate(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Opt-in deep gate: `tools/verify.sh --full`, streamed (spec decisions 15/22).
-/// Its receipt is also a MEASURE receipt, so a green one satisfies
-/// [`gates::measure_gate`], which runs right after it.
+/// Opt-in deep gate: `tools/verify.sh --full`, then the whole-tree Trust
+/// advisory lane `tools/trust-gate-all.sh`, each streamed (spec decisions 15/22).
+/// The first's receipt is also a MEASURE receipt and the second files a TRUST
+/// receipt for the tree, so green runs satisfy [`gates::measure_gate`] and
+/// [`gates::trust_receipt_gate`], which run right after.
 fn run_gate_script(repo: &Path) -> Result<()> {
-    step("gate", "tools/verify.sh --full (opt-in deep gate)");
-    let status = Command::new(repo.join("tools/verify.sh"))
-        .arg("--full")
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .status()
-        .map_err(|e| Error::new(format!("spawn tools/verify.sh: {e}")))?;
-    if !status.success() {
-        return Err(Error::new(
-            "tools/verify.sh --full FAILED — fix the tree; nothing was claimed or committed"
-                .to_string(),
-        ));
+    for (script, args, what) in [
+        ("tools/verify.sh", &["--full"][..], "tools/verify.sh --full"),
+        (
+            "tools/trust-gate-all.sh",
+            &[][..],
+            "tools/trust-gate-all.sh (the whole-tree Trust advisory lane)",
+        ),
+    ] {
+        step("gate", &format!("{what} (opt-in deep gate)"));
+        let status = Command::new(repo.join(script))
+            .args(args)
+            .current_dir(repo)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map_err(|e| Error::new(format!("spawn {script}: {e}")))?;
+        if !status.success() {
+            return Err(Error::new(format!(
+                "{what} FAILED — fix the tree; nothing was claimed or committed"
+            )));
+        }
     }
     Ok(())
 }
@@ -9841,6 +9925,7 @@ pub fn notarize_and_package(
 /// outputs are all functions of (version, build_number, claim commit).
 fn step_build(ctx: &mut CutCtx) -> Result<()> {
     if let Some(handoff) = &mut ctx.linux {
+        handoff.run_workers(&ctx.version, ctx.build, &ctx.commit)?;
         handoff.import(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
         // Freeze before any signing or upload. A resume cannot exchange one
         // worker's bytes or provenance for another under an old proof.
@@ -9970,14 +10055,14 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // The DMG must clear the client's own download bound before anything is
     // hashed into a manifest: a cut that packages past it publishes a release
     // no client can download. (The seeded dual-arch image once reached 97.3%
-    // of the 2 GiB `RELEASE_ASSET_DOWNLOAD_BOUND`; the lean image is ~28 MB,
+    // of the 2 GiB `RELEASE_ASSET_DOWNLOAD_BOUND`; the lean one was 40.6 MB at v0.98.0,
     // and the check stays because the bound is the client's, not ours.)
     validate_release_asset_download_size(dmg_size)?;
     // ...and the SHAPE question the bound above cannot answer: a seeded image is
     // perfectly downloadable and still the wrong artifact. Checked here, on the
     // bytes just produced, so a stale cutter's output is refused on the cutting
     // machine rather than discovered on the download page.
-    validate_lean_dmg_size(dmg_size)?;
+    validate_lean_dmg_size(&ctx.version, dmg_size)?;
     // The stable download twins are copied only HERE, after
     // `notarize_and_package` has produced the FINAL container bytes
     // (codesign/staple rewrites included), so each twin is byte-identical to
@@ -10650,7 +10735,15 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     // A resume may skip `step_build`, and dist/ is intentionally mutable. Re-read
     // the artifact itself before any publication-facing step can trust the
     // historical packager result journaled by the original process.
-    validate_lean_dmg_on_disk(&ctx.dmg_path(), "self-check")?;
+    // A fresh cut rebuilds dist/, so abandoning this one is the whole remedy.
+    validate_lean_dmg_on_disk(
+        &ctx.dmg_path(),
+        "self-check",
+        Some(&format!(
+            "`{CUT_COMMAND} --abandon v{}` and cut again",
+            ctx.version
+        )),
+    )?;
 
     let provenance = fs::read(ctx.provenance_path())
         .map_err(|error| Error::new(format!("read release provenance: {error}")))?;
@@ -11340,7 +11433,7 @@ fn step_publish(ctx: &mut CutCtx) -> Result<()> {
 }
 
 /// THE ROSTER THE SIGNED APPCAST NAMES. The pair in `dist/` is the one file a separate,
-/// un-lease-gated ceremony (`atpkg-keys join`, `cargo ship provision`) may rewrite
+/// un-lease-gated ceremony (`atpkg-keys join`, `targo --unverified ship provision`) may rewrite
 /// between `build` and a resumed `publish`; uploading it unchecked could publish a
 /// roster the appcast's own attribution contradicts — a revoked signer, or an older
 /// generation — which every armed client refuses before any artifact crypto, with no
@@ -11918,11 +12011,9 @@ pub fn prove_assets_download_anonymously(
                      above passed, so the release and its assets exist — they are simply \
                      invisible to real installs (GitHub answers 404 on this host for a \
                      private repository), or the upload never completed. That is the silent \
-                     never-updates state the pointer gate exists to prevent. Make {slug} public \
-                     (or repoint `{table} {key}`), then `{CUT_COMMAND} --resume`.",
+                     never-updates state the pointer gate exists to prevent. Make {slug} public, \
+                     then `{CUT_COMMAND} --resume`.",
                     u64::from(ANON_PROBE_ATTEMPTS) * ANON_PROBE_DELAY.as_secs(),
-                    table = channel::CHANNEL_TABLE,
-                    key = channel::CHANNEL_KEY,
                 )));
             }
             AssetHead::Inconclusive(detail) => {
@@ -13524,7 +13615,7 @@ mod lean_dmg_ceiling_tests {
 
     #[test]
     fn the_lean_image_passes_with_room_to_spare() {
-        assert!(validate_lean_dmg_size(LEAN_0_67_0).is_ok());
+        assert!(validate_lean_dmg_size("0.67.0", LEAN_0_67_0).is_ok());
         // ~6x headroom: ordinary growth must never trip this.
         let measured_size = std::hint::black_box(LEAN_0_67_0);
         assert!(measured_size * 6 < LEAN_DMG_CEILING_BYTES);
@@ -13534,16 +13625,25 @@ mod lean_dmg_ceiling_tests {
     /// packaging step, on the cutting machine.
     #[test]
     fn the_v0_63_0_image_is_refused_naming_both_figures() {
-        let err =
-            validate_lean_dmg_size(SEEDED_0_63_0).expect_err("a seeded image must be refused");
+        // A later version, so the `v0.63.0` below can only come from the why line.
+        let err = validate_lean_dmg_size("0.95.0", SEEDED_0_63_0)
+            .expect_err("a seeded image must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("1.07 GB"), "{msg}");
+        assert!(msg.contains("aterm-0.95.0.dmg is 1.07 GB"), "{msg}");
         assert!(msg.contains("200 MB"), "{msg}");
-        assert!(msg.contains("seeded image"), "{msg}");
+        // The claim is spent, so the next step is to abandon the cut, not resume it.
+        assert!(
+            msg.contains("tools/cut-launch.sh --abandon v0.95.0"),
+            "{msg}"
+        );
         assert!(
             msg.contains("v0.63.0"),
             "the refusal should say why it exists: {msg}"
         );
+        // The seed lane is retired and the cutter rebuilds itself for the tree it
+        // cuts, so neither a staged seed nor a manual clean is a remedy.
+        assert!(!msg.contains("toolchain-seed"), "{msg}");
+        assert!(!msg.contains("targo clean"), "{msg}");
     }
 
     /// The client's bound cannot answer this question — which is exactly how
@@ -13554,15 +13654,15 @@ mod lean_dmg_ceiling_tests {
             validate_release_asset_download_size(SEEDED_0_63_0).is_ok(),
             "the 2 GiB client bound accepts a 1.07 GB image — that is the gap"
         );
-        assert!(validate_lean_dmg_size(SEEDED_0_63_0).is_err());
+        assert!(validate_lean_dmg_size("0.63.0", SEEDED_0_63_0).is_err());
     }
 
     #[test]
     fn the_boundary_is_inclusive() {
-        assert!(validate_lean_dmg_size(LEAN_DMG_CEILING_BYTES).is_ok());
-        assert!(validate_lean_dmg_size(LEAN_DMG_CEILING_BYTES + 1).is_err());
+        assert!(validate_lean_dmg_size("0.64.0", LEAN_DMG_CEILING_BYTES).is_ok());
+        assert!(validate_lean_dmg_size("0.64.0", LEAN_DMG_CEILING_BYTES + 1).is_err());
         // A zero-byte image is the download bound's business, not this one's.
-        assert!(validate_lean_dmg_size(0).is_ok());
+        assert!(validate_lean_dmg_size("0.64.0", 0).is_ok());
         assert!(validate_release_asset_download_size(0).is_err());
     }
 
@@ -13572,10 +13672,11 @@ mod lean_dmg_ceiling_tests {
     #[test]
     fn an_oversized_resumed_dmg_is_refused_from_the_actual_file() {
         let (_dir, path) = sparse_dmg("resume", LEAN_DMG_CEILING_BYTES + 1);
-        let err = validate_lean_dmg_on_disk(&path, "self-check")
+        let err = validate_lean_dmg_on_disk(&path, "self-check", Some("abandon"))
             .expect_err("resume must re-check the current dist DMG");
         let message = err.to_string();
         assert!(message.contains("self-check"), "{message}");
+        assert!(message.ends_with("\nfix:  abandon"), "{message}");
         assert!(
             message.contains(&(LEAN_DMG_CEILING_BYTES + 1).to_string()),
             "the refusal must report the observed on-disk size: {message}"
@@ -13613,6 +13714,8 @@ mod lean_dmg_ceiling_tests {
         .expect_err("recovery must reject the retained seeded image");
         let message = err.to_string();
         assert!(message.contains("published recovery"), "{message}");
+        // `--abandon` refuses a published release, so it is never offered here.
+        assert!(!message.contains("--abandon"), "{message}");
         assert!(
             message.contains(&(LEAN_DMG_CEILING_BYTES + 1).to_string()),
             "the refusal must report the retained file's size: {message}"
@@ -13902,6 +14005,9 @@ mod anonymous_readability_tests {
         assert_eq!(asked.len(), ANON_PROBE_ATTEMPTS as usize);
         assert_eq!(slept.len(), ANON_PROBE_ATTEMPTS as usize - 1);
         assert!(error.contains("404") && error.contains("public"), "{error}");
+        // Every install reads the channel compiled into it, so repointing the
+        // workspace's channel key is never the remedy.
+        assert!(!error.contains("repoint"), "{error}");
     }
 
     /// The classification table, including what is NOT readable: a 200 (GitHub never
@@ -14280,12 +14386,13 @@ mod tree_cutter_tests {
                     "x86_64-unknown-linux-gnu".into(),
                     "aarch64-unknown-linux-gnu".into(),
                 ],
+                linux_workers: vec!["aarch64=builder@buildhost:~/aterm".into()],
                 ..Default::default()
             },
         ];
         for opts in cases {
             let argv = strings(cut_args(&opts));
-            match crate::cli::parse(&argv) {
+            match crate::cli::parse_handed_off(&argv) {
                 Ok(crate::cli::Cmd::Cut {
                     opts: parsed,
                     abandon: None,
@@ -14301,7 +14408,7 @@ mod tree_cutter_tests {
         };
         let mut argv = strings(cut_args(&floored));
         argv.truncate(1);
-        match crate::cli::parse(&argv) {
+        match crate::cli::parse_handed_off(&argv) {
             Ok(crate::cli::Cmd::Cut { opts, .. }) => assert_ne!(opts, floored),
             other => panic!("{other:?}"),
         }

@@ -49,6 +49,40 @@
 //! never bumps a revision, never re-grids and never arms
 //! [`MessageCenter::deadline`]; [`MessageCenter::busy_on_glass`] says whether
 //! a committed row is busy.
+//!
+//! A host runs all of it through ONE driver, [`drive`] (design ruling 336):
+//! the step (settle, commit, drain, the wire's paced paint), each view's
+//! layout, motion frame, next change and paint key, and the deadline folds —
+//! the host injects the clock, the afford, the freeze and each view's look.
+//!
+//! # The presence row
+//!
+//! The same chrome carries one more row: the per-tab PRESENCE row (who is
+//! driving the session, what its agent is doing, its mail and its link) and
+//! the window's rim. Its pure core is [`presence`] (design ruling 348): the
+//! facts a host gathers, the per-session slot and its story, the levels, the
+//! words and their width law, the tones, the painted cells and the
+//! per-window view. What only a host can know — an agent wall's vocabulary,
+//! its published input stall, its own harness's name and the wire's percent
+//! codec — comes in through [`presence::Host`], implemented on a host-local
+//! marker; the host reads the screen, the leases and the fabric, and hands
+//! the facts in. Its sequencing is one driver as well, [`presence::drive`]
+//! (design ruling 353), over the host's [`presence::drive::Desk`].
+//!
+//! # The Settings ▸ Messages page
+//!
+//! The log's page is a MODEL here and a layout in the host: [`page`] (design
+//! ruling 382) builds the projection ONCE over the center
+//! ([`page::MessagesState::of`]) — every record newest first in the wire's
+//! own state words, the live rows' current words, the band row each is on,
+//! which authored intents can still be pressed, the tags in the chips' order
+//! — and holds the page's words (its chrome's too, ruling 395), its filter,
+//! its day clock and the feedback line for a press. What only a host
+//! can know — its clock, its log folder, whether the log is saved, its UTC
+//! offset, the staged build, whether a log file is there, which agent
+//! upgrades stand and take a word, and how many detail lines a reporter's
+//! record spends on its sentence — comes in through [`page::Host`]; the host
+//! lays the page out and paints it.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -70,12 +104,15 @@ pub use aterm_time::Instant;
 pub mod animate;
 pub(crate) mod carry;
 pub(crate) mod center;
+pub mod drive;
 pub(crate) mod glass;
 pub mod ink;
 pub mod log;
 pub(crate) mod model;
+pub mod page;
 pub mod paint;
 pub mod palette;
+pub mod presence;
 pub mod progress;
 pub mod strain;
 pub mod text;
@@ -495,7 +532,15 @@ mod tests {
         ("waits.rs", include_str!("waits.rs")),
         ("palette.rs", include_str!("palette.rs")),
         ("paint.rs", include_str!("paint.rs")),
+        ("page.rs", include_str!("page.rs")),
         ("ink.rs", include_str!("ink.rs")),
+        ("drive.rs", include_str!("drive.rs")),
+        ("presence/mod.rs", include_str!("presence/mod.rs")),
+        ("presence/model.rs", include_str!("presence/model.rs")),
+        ("presence/words.rs", include_str!("presence/words.rs")),
+        ("presence/paint.rs", include_str!("presence/paint.rs")),
+        ("presence/view.rs", include_str!("presence/view.rs")),
+        ("presence/drive.rs", include_str!("presence/drive.rs")),
     ];
 
     /// Invariant 1: the engine never samples a clock. Family C's C3 walks only
@@ -531,8 +576,21 @@ mod tests {
             hits.join("\n")
         );
         // The fence is complete by construction: every shipped `mod x;` of this
-        // file names a source in SOURCES, so a new shipped module cannot
-        // arrive unscanned (the `#[cfg(test)]` modules are not shipped).
+        // file names a source in SOURCES — `x.rs`, or a directory module's
+        // `x/mod.rs` together with every `mod y;` that file declares
+        // (`x/y.rs`) — so a new shipped module cannot arrive unscanned (the
+        // `#[cfg(test)]` modules are not shipped).
+        let decls = |src: &'static str| -> Vec<&'static str> {
+            src.lines()
+                .filter_map(|l| {
+                    l.strip_prefix("pub mod ")
+                        .or_else(|| l.strip_prefix("pub(crate) mod "))
+                        .or_else(|| l.strip_prefix("mod "))?
+                        .strip_suffix(';')
+                })
+                .collect()
+        };
+        let source = |file: &str| SOURCES.iter().find(|(name, _)| *name == file);
         let modules: Vec<&str> = include_str!("lib.rs")
             .lines()
             .filter_map(|l| {
@@ -541,17 +599,29 @@ mod tests {
                     .strip_suffix(';')
             })
             .collect();
-        assert_eq!(modules.len(), 15, "{modules:?}");
+        assert_eq!(modules.len(), 18, "{modules:?}");
+        let mut scanned = 1;
         for m in &modules {
-            let file = format!("{m}.rs");
-            assert!(
-                SOURCES.iter().any(|(name, _)| *name == file),
-                "{file} is a shipped module outside the clock fence"
-            );
+            let flat = format!("{m}.rs");
+            let dir = format!("{m}/mod.rs");
+            let Some((name, src)) = source(&flat).or_else(|| source(&dir)) else {
+                panic!("{flat} is a shipped module outside the clock fence");
+            };
+            scanned += 1;
+            if *name == dir {
+                for sub in decls(src) {
+                    let file = format!("{m}/{sub}.rs");
+                    assert!(
+                        source(&file).is_some(),
+                        "{file} is a shipped module outside the clock fence"
+                    );
+                    scanned += 1;
+                }
+            }
         }
         assert_eq!(
             SOURCES.len(),
-            modules.len() + 1,
+            scanned,
             "lib.rs plus every shipped module, nothing else"
         );
     }
@@ -588,6 +658,14 @@ mod round13_tests;
 #[cfg(test)]
 mod round14_tests;
 
+#[cfg(test)]
+mod drive_tests;
+#[cfg(test)]
+mod page_tests;
+#[cfg(test)]
+mod presence_drive_tests;
+#[cfg(test)]
+mod presence_tests;
 #[cfg(test)]
 mod round15_tests;
 #[cfg(test)]

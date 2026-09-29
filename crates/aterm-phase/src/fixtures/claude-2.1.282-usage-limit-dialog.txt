@@ -1,0 +1,12 @@
+# claude-code 2.1.282 · HAND-BUILT 2026-09-24: the title, the three option rows (the `›` cursor included) and the footer are the owner's screen of 2026-09-24 02:28 (a weekly limit) as reported, not captured; the frame is read from the 2.1.282 source, not measured: the rate-limit menu renders through `ge`, which wraps its content in `Do` (paddingTop 1, then a `vl` rule, then the padded content: the title, a gap of one row, the numbered Select whose focused row the vendor draws with `X.pointer` `❯`, then a marginTop-1 input guide `Enter to confirm · Esc to cancel`), so a blank row, the rule, the title at column one, a blank row, the options, a blank row, the footer; the transcript rows above are assembled · OPEN: replace with an `aterm ctl text` capture of the dialog · the usage-limit options dialog
+⏺ Suites are running; I'll report the number when it lands.
+  ⎿  You've hit your weekly limit · resets Sep 27 at 7pm (America/Los_Angeles)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ What do you want to do?
+
+ › 1. Stop and wait for limit to reset
+   2. Wait here, then continue automatically at Sep 27 at 7pm
+   3. Switch to usage credits
+
+ Enter to confirm · Esc to cancel

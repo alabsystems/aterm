@@ -17,6 +17,7 @@ use wasm_bindgen::prelude::*;
 
 mod dirty_band_present_api;
 mod effects_api;
+mod messages_api;
 mod notifications_api;
 mod predict_api;
 mod scroll_input_api;
@@ -174,6 +175,13 @@ pub struct AtermTerminal {
     // wired at construction and drained by `take_notifications`. pub(crate)
     // so the notifications_api module reaches it (the effects-field posture).
     pub(crate) notifications: notifications_api::NotificationQueue,
+    // The MESSAGE BAND (the unified message engine's rows, composed above
+    // the grid through the renderer's `band` module — the same composition
+    // the native window runs). Empty until a `notice` posts a row; with no
+    // committed row `render()` is byte-identical to a band-less build.
+    // pub(crate) so the messages_api module (and tests) reach it (the
+    // effects-field posture).
+    pub(crate) band: messages_api::WebBand,
     // Sub-row scroll input accumulator (fractional/pixel wheel deltas): whole
     // rows flip into `scroll_display`, the residual presents as the M1b band
     // shift at render time. pub(crate) so the scroll_input_api module (and
@@ -444,6 +452,7 @@ impl AtermTerminal {
             theme_fg: fg & 0x00FF_FFFF,
             theme_bg: bg & 0x00FF_FFFF,
             notifications,
+            band: messages_api::WebBand::new(aterm_time::Instant::now(), fg, bg, cursor),
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
             pred_row_scratch: Vec::new(),
@@ -662,6 +671,8 @@ impl AtermTerminal {
     pub fn set_palette_color(&mut self, index: u8, r: u8, g: u8, b: u8) {
         self.force_full_repaint = true;
         self.term.set_palette_color_components(index, r, g, b);
+        // Slots 4 and 6 are the hues a near-grey cursor's band meter borrows.
+        self.band.set_palette_color(index, [r, g, b]);
     }
 
     /// Authorize OSC 52 clipboard *write* (set) so the engine queues OSC 52
@@ -892,6 +903,8 @@ impl AtermTerminal {
         // against; a new theme retires it (the native palette-authority edge)
         // while the cat's behaviour, position and breed carry on.
         self.effects.invalidate_companion_colors();
+        // The band's inks derive from the theme (the next frame repaints it).
+        self.band.set_theme(fg, bg, cursor);
         apply_terminal_theme_colors(&mut self.term, fg, bg, cursor, selection);
         self.renderer.set_theme(Theme {
             fg,
@@ -1198,18 +1211,35 @@ impl AtermTerminal {
         // advances the epoch the frame gate compares. aterm-render never reads
         // the tracker (it diffs snapshots), and this render loop is the
         // engine's only damage consumer here.
+        // THE BAND'S UN-SPLICE (DMG-1): take last frame's band rows off the
+        // kept scratch, so the refill below may re-resolve only the damaged
+        // rows under a band instead of refilling every row. Refused (nothing
+        // changed) when nothing was prepended or anything else touched it — the
+        // refill then takes its full arm, which is always sound.
+        let _ = self.band.undo(&mut self.frame_scratch, self.rows);
         self.refill_frame_scratch();
         // Fill the overlay channels (aurora/trail/sparkle) for the host-advanced
         // instant. With every effect off this only clears the channels a reused
         // scratch may carry — byte-identical to the pre-effects render.
         let (cw, ch) = self.renderer.cell_size();
+        // The band's rows land above the grid AFTER `apply` (the compose
+        // below); the pipeline must read the page's pointer against the grid
+        // where this frame draws it, so it learns their height first.
+        self.hand_band_to_effects();
         self.effects
             .apply(&mut self.term, &mut self.frame_scratch, cw, ch);
-        // Present the banked sub-row scroll residual via the M1b band translate
-        // (the whole canvas frame is grid — no spliced chrome rows). Stamped
-        // every frame: the KEPT scratch would otherwise carry a stale shift.
+        // Present the banked sub-row scroll residual via the M1b band translate.
+        // The stamp sets the grid band to the whole frame `[0, rows)`;
+        // `compose_band_into_frame` below then moves it down below any
+        // committed message-band rows. Stamped every frame: the KEPT scratch
+        // would otherwise carry a stale shift.
         self.scroll_input
             .stamp(&mut self.frame_scratch, self.rows, ch);
+        // THE MESSAGE BAND: its committed rows prepended above the grid (every
+        // window-space effect stream translated down with the grid), the grid
+        // band moved below them, and their gutters handed to the renderer.
+        // No committed row: nothing moves and the bleed stays `None`.
+        self.compose_band_into_frame();
         // Dirty-band present (audit E3): a frame carrying (or releasing) a
         // sub-row translate shifts the whole grid band, so it full-expands
         // from the TRANSLATED view while the borrow is live; every other
@@ -1294,6 +1324,31 @@ impl AtermTerminal {
     /// (selection ops) simply buy one render, never a stale skip.
     pub(crate) fn note_host_visual_change(&mut self) {
         self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
+    }
+
+    /// THE BAND'S HOST HOOKS (`messages_api`, which the GPU module carries
+    /// line for line): the CPU face's cell, pad and grid-top metrics.
+    pub(crate) fn band_metrics(&self) -> messages_api::BandMetrics {
+        let (cell_w, cell_h) = self.renderer.cell_size();
+        messages_api::BandMetrics {
+            cell_w,
+            cell_h,
+            pad: self.renderer.pad(),
+            grid_top: self.renderer.grid_top(),
+        }
+    }
+
+    /// The band's gutters for the frame being composed, handed to the
+    /// rasterizer.
+    pub(crate) fn set_band_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
+        self.renderer.set_chrome_bleed(bleed);
+    }
+
+    /// The band changed: reopen the frame gate for one frame. The CPU frame
+    /// is sized from the rows it composes, so a moved row count needs
+    /// nothing more here.
+    pub(crate) fn note_band_change(&mut self, _rows_moved: bool) {
+        self.note_host_visual_change();
     }
 
     /// Last-rendered framebuffer width in pixels.
@@ -2732,6 +2787,12 @@ impl AtermTerminal {
             theme_fg: theme.fg & 0x00FF_FFFF,
             theme_bg: theme.bg & 0x00FF_FFFF,
             notifications,
+            band: messages_api::WebBand::new(
+                aterm_time::Instant::now(),
+                theme.fg,
+                theme.bg,
+                theme.cursor,
+            ),
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
             pred_row_scratch: Vec::new(),

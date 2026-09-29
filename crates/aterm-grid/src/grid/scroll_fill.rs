@@ -276,6 +276,7 @@ impl Grid {
                                 image: Arc::clone(&span.image),
                                 cell_row,
                                 cell_col,
+                                kitty: None,
                             },
                         );
                         any_image = true;

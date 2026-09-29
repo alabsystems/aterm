@@ -739,7 +739,7 @@ fn reported_cwd_is_storable(path: &str) -> bool {
 /// filter (handler_write.rs, #7913), so the strip is unconditional here —
 /// matching the sibling unconditional strip in `handler_osc_notify.rs` for
 /// OSC 9 / Terminal notifications.
-fn sanitize_title(title: &str) -> String {
+pub(super) fn sanitize_title(title: &str) -> String {
     title
         .chars()
         .filter(|&c| {

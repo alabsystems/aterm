@@ -78,28 +78,25 @@ fn merged_ligature_gpu_matches_cpu() {
     let px = 18.0;
 
     // Discovers the font once per process (see merged_ligature_font) and builds
-    // BOTH renderers on it.
-    let Some(font) = merged_ligature_font().and_then(std::path::Path::to_str) else {
+    // BOTH renderers on it, font-settled by the kit (`common::font_settled`).
+    let Some(font) = merged_ligature_font() else {
         eprintln!("SKIP: no merged-ligature font (set ATERM_MERGED_FONT)");
         return;
     };
-
-    let mut gpu = match aterm_gpu::GpuRenderer::new_with_family(Some(font), px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system_with_family(Some(font), px, theme) else {
-        eprintln!("SKIP: no system font");
+    let Some((mut cpu, mut gpu)) = common::backends_with_font(font, px, theme) else {
         return;
     };
     // A CPU renderer with the merge DECLINED, to prove the sliced frame is not
-    // vacuously equal (the font really collapses `fi`/`fl`/`ffi`).
-    let Some(mut cpu_off) = Renderer::from_system_with_family(Some(font), px, theme) else {
+    // vacuously equal (the font really collapses `fi`/`fl`/`ffi`). Settled on
+    // the same terms as the kit's pair, so a chain landing between the arms
+    // cannot fake (or mask) the difference.
+    let Some(mut cpu_off) = font
+        .to_str()
+        .and_then(|family| Renderer::from_system_with_family(Some(family), px, theme))
+    else {
         return;
     };
+    cpu_off.debug_block_on_lazy_fallbacks();
     gpu.set_text_shaping(shaping(true));
     cpu.set_text_shaping(shaping(true));
     cpu_off.set_text_shaping(shaping(false));
@@ -146,20 +143,13 @@ fn merged_ligature_cursor_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Same once-per-process discovery as the sibling test.
-    let Some(font) = merged_ligature_font().and_then(std::path::Path::to_str) else {
+    // Same once-per-process discovery and font-settled pair as the sibling test
+    // (this one renders the CPU twice and the GPU once).
+    let Some(font) = merged_ligature_font() else {
         eprintln!("SKIP: no merged-ligature font");
         return;
     };
-    let mut gpu = match aterm_gpu::GpuRenderer::new_with_family(Some(font), px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system_with_family(Some(font), px, theme) else {
-        eprintln!("SKIP: no system font");
+    let Some((mut cpu, mut gpu)) = common::backends_with_font(font, px, theme) else {
         return;
     };
     gpu.set_text_shaping(shaping(true));

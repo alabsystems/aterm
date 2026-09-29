@@ -707,8 +707,9 @@ impl Terminal {
             return;
         }
         // A Kitty Unicode placeholder can only resolve to a stored image, and
-        // `placeholder_image_ref` ends in `self.transient.kitty_images.get(&id)?`
-        // — so with no images transmitted it is provably `None` for every cell.
+        // `placeholder_image_ref` starts its lookup with
+        // `self.transient.kitty_images.get(&image_id)?` — so with no images
+        // transmitted it is provably `None` for every cell.
         // Hoisting the emptiness test skips its `resolved_char` probe entirely;
         // `transient` cannot change under this `&self` borrow, so the gate is
         // behaviour-identical.
@@ -818,7 +819,7 @@ impl Terminal {
         // coincide when the viewport is at the bottom.
         let max_screen_row = usize::from(grid.rows());
         // With no transmitted Kitty images, `placeholder_image_ref` is provably
-        // `None` for every entry (its only `Some` return threads through
+        // `None` for every entry (every `Some` return threads through
         // `self.transient.kitty_images.get(&image_id)?`), so the whole
         // placeholder branch — a `resolved_char` row lookup + cell read PER
         // non-image extra, i.e. per hyperlink, combining mark and underline
@@ -853,49 +854,53 @@ impl Terminal {
     }
 
     /// If the cell at (`row`,`col`) is a Kitty Unicode placeholder (U+10EEEE),
-    /// decode its diacritics (row, col, image-id-high) + fg-color (image-id-low)
-    /// and return an [`ImageRef`](aterm_grid::ImageRef) into the stored image. The
-    /// pixel-exact sub-tile blit is the renderer's existing ImageRef job, so a
-    /// virtual placement reuses the proven direct-placement compositor. Returns
-    /// `None` for any non-placeholder cell or an unknown image id.
+    /// decode it ([`decode_cell`](super::kitty_placeholder::decode_cell)) and
+    /// return an [`ImageRef`](aterm_grid::ImageRef) into the image its virtual
+    /// placement shows. The pixel-exact sub-tile blit is the renderer's existing
+    /// ImageRef job, so a virtual placement reuses the proven direct-placement
+    /// compositor. Returns `None` for any non-placeholder cell, an unknown image
+    /// id, or a placement id the image has no virtual placement for.
     fn placeholder_image_ref(
         &self,
         row: u16,
         col: u16,
         extra: &aterm_grid::CellExtra,
     ) -> Option<aterm_grid::ImageRef> {
-        use super::kitty_placeholder::{PLACEHOLDER, diacritic_value};
-        // The placeholder is non-BMP, so it always resolves via the overflow table.
-        if self.grid().resolved_char(row, col) != Some(PLACEHOLDER) {
-            return None;
-        }
-        let comb = extra.combining();
-        let row_val = comb.first().and_then(|&c| diacritic_value(c)).unwrap_or(0);
-        let col_val = comb.get(1).and_then(|&c| diacritic_value(c)).unwrap_or(0);
-        let id_high = comb.get(2).and_then(|&c| diacritic_value(c)).unwrap_or(0) & 0xFF;
-        let image_id = (id_high << 24) | self.cell_fg_image_id(row, col);
-        let image = self.transient.kitty_images.get(&image_id)?.clone();
+        let cell = super::kitty_placeholder::decode_cell(self.grid(), row, col, extra)?;
+        let image = self.kitty_placeholder_image(cell.image_id, cell.placement_id)?;
         Some(aterm_grid::ImageRef {
-            image,
-            cell_row: u16::try_from(row_val).unwrap_or(0),
-            cell_col: u16::try_from(col_val).unwrap_or(0),
+            image: std::sync::Arc::clone(image),
+            cell_row: cell.row,
+            cell_col: cell.col,
+            kitty: None,
         })
     }
 
-    /// The low 24 bits of a Kitty image id, encoded in a cell's foreground color:
-    /// an RGB fg is `(r<<16)|(g<<8)|b`; an indexed fg is the palette index; a
-    /// default fg is 0 (matching kitty's `colorToId`).
-    fn cell_fg_image_id(&self, row: u16, col: u16) -> u32 {
-        if let Some([r, g, b]) = self.grid().fg_rgb_at(row, col) {
-            return (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+    /// The image a placeholder naming image `image_id` and virtual placement
+    /// `placement_id` draws: that placement's (laid out by its `U=1` put); for
+    /// placement `0`, the image's newest virtual placement — kitty lets the
+    /// terminal choose — or, when it has none, the stored image as its transmit
+    /// laid it out. A placement id the image has no virtual placement for
+    /// draws nothing.
+    fn kitty_placeholder_image(
+        &self,
+        image_id: u32,
+        placement_id: u32,
+    ) -> Option<&std::sync::Arc<aterm_grid::ImageData>> {
+        let stored = self.transient.kitty_images.get(&image_id)?;
+        let virtuals = self
+            .transient
+            .kitty_virtual
+            .get(&image_id)
+            .map_or(&[][..], Vec::as_slice);
+        if placement_id != 0 {
+            return virtuals
+                .iter()
+                .rev()
+                .find(|v| v.placement_id == placement_id)
+                .map(|v| &v.image);
         }
-        if let Some(cell) = self.grid().cell(row, col) {
-            let colors = cell.colors();
-            if colors.fg_is_indexed() {
-                return u32::from(colors.fg_index());
-            }
-        }
-        0
+        Some(virtuals.last().map_or(stored, |v| &v.image))
     }
 
     /// Build the engine's render SNAPSHOT for one frame (`read_image`, REARCH A-3):

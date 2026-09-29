@@ -768,6 +768,42 @@ impl TerminalHandler<'_> {
         }
     }
 
+    /// The cell a ZERO-WIDTH MARK attaches to — always some cell, never nothing.
+    ///
+    /// Normally [`Self::preceding_cell`]. When there is no preceding cell at all
+    /// — column 0 of a row that is not a soft-wrapped continuation, the origin
+    /// included — the target is the cell UNDER THE CURSOR.
+    ///
+    /// That fallback is xterm's rule. charproc.c takes
+    /// `use_col = char_was_written ? last_written_col : cur_col`, and every
+    /// cursor motion clears `char_was_written` through `ResetWrap` (ptyx.h;
+    /// `CarriageReturn` ends with it, cursor.c). So after `printf 'abc\r'` xterm
+    /// resolves a following U+0301 against `cur_col` = 0, finds the 'a', and
+    /// accents it. aterm used to answer `None` there and DISCARD the mark — the
+    /// owner's measured data loss: "abc" rendered with the accent simply gone.
+    ///
+    /// Nothing sanctions the discard. Unicode 16.0 §3 D57 calls a combining
+    /// sequence with no base DEFECTIVE and says in the same breath that such
+    /// sequences "are not ill-formed", and that a process "may present a
+    /// combining character without graphical combination; that is, it may
+    /// present it as if it were a base character". iTerm2 reaches the same end
+    /// from the other side, materialising a space to carry the mark rather than
+    /// dropping it (`VT100ScreenMutableState.m`, the space-augmentation path).
+    /// Ghostty and kitty do drop it — but on a rule they justify by declaring
+    /// the input malformed, which Unicode explicitly does not.
+    ///
+    /// Only the ATTACH POINT moves. Everything that folds a VISIBLE, cursor-
+    /// advancing character into an existing cell — the ZWJ continuation, the
+    /// skin-tone modifier, the regional-indicator pair, and the VS16/VS15 width
+    /// mutations — keeps asking [`Self::preceding_cell`], because "there is a
+    /// real grapheme to my left" is a different question from "where does this
+    /// mark land", and folding a printable into a cell that is not its
+    /// predecessor has no implementation or spec behind it.
+    fn combining_target_cell(&self) -> (u16, u16) {
+        self.preceding_cell()
+            .unwrap_or((self.grid.cursor_row(), self.grid.cursor_col()))
+    }
+
     /// Find the previous effective cell, skipping wide continuation cells.
     ///
     /// Returns `None` at position (0, 0) where no previous cell exists.
@@ -777,7 +813,12 @@ impl TerminalHandler<'_> {
     ///
     /// When `pending_wrap` is set, the cursor sits ON the last written
     /// character (not one past it), so the target is the cursor cell itself.
-    fn previous_effective_cell(&self) -> Option<(u16, u16)> {
+    ///
+    /// This is the STRICT question — "is there a grapheme immediately before the
+    /// cursor?" — and it still answers `None` when there is not. A zero-width
+    /// mark must not vanish when the answer is `None`, so it uses
+    /// [`Self::combining_target_cell`] instead.
+    fn preceding_cell(&self) -> Option<(u16, u16)> {
         let row = self.grid.cursor_row();
         let col = self.grid.cursor_col();
 
@@ -821,15 +862,14 @@ impl TerminalHandler<'_> {
         Some((final_row, final_col))
     }
 
-    /// Add a combining character to the previous cell.
+    /// Add a combining character to the cell it belongs to.
     ///
     /// Combining characters (like accents) attach to the base character in the
     /// previous cell. For wide characters, we attach to the main cell (not the
-    /// continuation).
+    /// continuation). With no previous cell the mark lands on the cell under the
+    /// cursor rather than being discarded — see [`Self::combining_target_cell`].
     fn add_combining_to_previous_cell(&mut self, combining: char) {
-        let Some((row, col)) = self.previous_effective_cell() else {
-            return;
-        };
+        let (row, col) = self.combining_target_cell();
         self.grid.cell_extra_mut(row, col).add_combining(combining);
         // Combining marks, variation selectors, and joined emoji change the
         // grapheme even when no base cell is rewritten or cursor advanced.
@@ -843,7 +883,7 @@ impl TerminalHandler<'_> {
     fn should_combine_with_previous_zwj(&self) -> bool {
         const ZWJ: char = '\u{200D}';
 
-        let Some((row, col)) = self.previous_effective_cell() else {
+        let Some((row, col)) = self.preceding_cell() else {
             return false;
         };
 
@@ -864,7 +904,7 @@ impl TerminalHandler<'_> {
     /// 3. Writes a WIDE_CONTINUATION spacer in the next column
     /// 4. Advances the cursor to account for the extra column consumed
     fn widen_previous_cell_for_vs16(&mut self) {
-        let Some((row, col)) = self.previous_effective_cell() else {
+        let Some((row, col)) = self.preceding_cell() else {
             return;
         };
 
@@ -1031,7 +1071,7 @@ impl TerminalHandler<'_> {
     /// 3. Sets the continuation cell (spacer) to EMPTY
     /// 4. Does NOT change the cursor position (VS15 is width 0)
     fn narrow_previous_cell_for_vs15(&mut self) {
-        let Some((row, col)) = self.previous_effective_cell() else {
+        let Some((row, col)) = self.preceding_cell() else {
             return;
         };
 
@@ -1080,7 +1120,7 @@ impl TerminalHandler<'_> {
     /// 2-cell wide characters. Returns `true` if the modifier was combined,
     /// `false` if it should fall through to normal rendering.
     fn try_combine_skin_tone_modifier(&mut self, modifier: char) -> bool {
-        let Some((row, col)) = self.previous_effective_cell() else {
+        let Some((row, col)) = self.preceding_cell() else {
             return false;
         };
 
@@ -1116,7 +1156,7 @@ impl TerminalHandler<'_> {
     /// LONE regional indicator — one still waiting for its partner — so RIs pair
     /// left to right and a third RI starts a fresh pair (Unicode GB12/GB13).
     fn try_combine_regional_indicator(&mut self, ri: char) -> bool {
-        let Some((row, col)) = self.previous_effective_cell() else {
+        let Some((row, col)) = self.preceding_cell() else {
             return false;
         };
         let Some(cell) = self.grid.cell(row, col) else {
@@ -1236,6 +1276,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A combining mark with NO cell to its left lands on the cell under the
+    /// cursor. It must never vanish.
+    ///
+    /// The owner's measured case is the first row: `printf 'abc\r'` then
+    /// U+0301. aterm used to render "abc" with the accent simply GONE — the
+    /// mark resolved to "no previous cell" at column 0 and was discarded.
+    ///
+    /// xterm puts it on the 'a'. charproc.c resolves the attach column as
+    /// `char_was_written ? last_written_col : cur_col`, and `CarriageReturn`
+    /// clears `char_was_written` via `ResetWrap` (ptyx.h), so after a CR the
+    /// column is the cursor's own — which holds the 'a'. Nothing anywhere
+    /// sanctions the drop: Unicode 16.0 §3 D57 calls a base-less combining
+    /// sequence DEFECTIVE but "not ill-formed", and says a process "may present
+    /// a combining character without graphical combination; that is, it may
+    /// present it as if it were a base character". iTerm2 keeps it too, by
+    /// materialising a space to carry it.
+    #[test]
+    fn a_combining_mark_with_no_cell_to_its_left_lands_on_the_cursor_cell() {
+        // (input, the cell it must land on, the base that cell shows)
+        for (input, col, base) in [
+            // CR sends the cursor back over the 'a' — the measured case.
+            ("abc\r\u{301}", 0u16, 'a'),
+            // CUP home, same story, reached without a CR.
+            ("abc\u{1b}[1;1H\u{301}", 0, 'a'),
+            // Nothing written at all: the mark still lands, on the blank cell.
+            ("\u{301}", 0, ' '),
+        ] {
+            let mut term = Terminal::new(1, 8);
+            term.process(input.as_bytes());
+            assert_eq!(
+                term.grid().cell(0, col).map(|c| c.char()),
+                Some(base),
+                "{input:?}: the base cell is untouched"
+            );
+            assert_eq!(
+                term.grid().cell_extra(0, col).map(|e| e.combining()),
+                Some(['\u{301}'].as_slice()),
+                "{input:?}: the mark attached to the cell under the cursor \
+                 instead of being discarded"
+            );
+            assert_eq!(
+                term.cursor().col,
+                col,
+                "{input:?}: a zero-width mark never moves the cursor"
+            );
+        }
+    }
+
+    /// After a cursor motion that still leaves a cell to the left, the mark goes
+    /// to THAT cell — the positional rule — and this is a deliberate divergence
+    /// from xterm.
+    ///
+    /// `abc` then CUB CUB leaves the cursor over the 'b'. xterm accents the 'b':
+    /// the motion cleared `char_was_written`, so its attach column becomes
+    /// `cur_col`. iTerm2 (`coordinateBefore:`), Ghostty (`cursorCellLeft(1)`)
+    /// and kitty all accent the 'a' instead, because none of them tracks a
+    /// last-written position at all. aterm follows that majority: it is the
+    /// behaviour aterm already had, and adopting xterm's would mean threading a
+    /// "a glyph was just written" flag through every cursor-motion site for a
+    /// case where the three most-cited modern terminals disagree with xterm.
+    /// Only the no-cell-to-the-left FALLBACK was taken from xterm, because there
+    /// the alternative was losing the mark entirely.
+    #[test]
+    fn a_combining_mark_after_a_cursor_motion_uses_the_cell_to_the_left() {
+        let mut term = Terminal::new(1, 8);
+        term.process("abc\u{1b}[2D\u{301}".as_bytes());
+        assert_eq!(term.cursor().col, 1, "the cursor sits over the 'b'");
+        assert_eq!(
+            term.grid().cell_extra(0, 0).map(|e| e.combining()),
+            Some(['\u{301}'].as_slice()),
+            "the mark accents the 'a', the cell to the LEFT (iTerm2/Ghostty/kitty); \
+             xterm would accent the 'b' here"
+        );
+        assert!(
+            term.grid().cell_extra(0, 1).is_none(),
+            "the cell under the cursor is untouched while a left cell exists"
+        );
+    }
+
+    /// The mark lands on the cell under the cursor only when there is NO cell to
+    /// the left. Wherever there is one, it still wins — the attach point did not
+    /// move, only the fallback did.
+    #[test]
+    fn a_combining_mark_still_prefers_the_cell_to_its_left() {
+        let mut term = Terminal::new(1, 8);
+        term.process("ab\u{301}".as_bytes());
+        assert_eq!(
+            term.grid().cell_extra(0, 1).map(|e| e.combining()),
+            Some(['\u{301}'].as_slice()),
+            "the mark attaches to 'b', the cell left of the cursor"
+        );
+        assert!(
+            term.grid().cell_extra(0, 0).is_none(),
+            "and not to the cell under the cursor, which is past the text"
+        );
     }
 
     /// England: 🏴 + gbeng + CANCEL TAG is ONE two-cell grapheme whose six

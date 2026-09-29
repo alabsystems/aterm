@@ -103,8 +103,9 @@ pub enum WallKind {
     /// `Repeated 529 Overloaded errors`, `Opus is experiencing high load`).
     Overloaded,
     /// Claude Code's critical-memory banner: the vendor's own word that its
-    /// process is past saving and must be restarted (resumed with
-    /// [`crate::reader::resume_hint`]). Not a turn's end at all — measured
+    /// process is past saving and must be restarted, then resumed on its own
+    /// conversation (`claude --resume <id>`, never the banner's own `claude
+    /// --continue`: [`memory_banner_head`]). Not a turn's end at all — measured
     /// 2026-09-24 on a worker whose spinner still ran 36 minutes into a turn
     /// while it read no input for 2h41m — so it is read by position
     /// ([`memory_wall`]), and the reader keeps it under a hard busy, where it
@@ -558,6 +559,25 @@ pub fn login_restored(rows: &[String]) -> bool {
 /// indicator, a hint), never the transcript above them.
 const MEMORY_ROWS: usize = 6;
 
+/// The FACT half of a [`memory_wall`]'s message — `Critical memory usage
+/// (140.4GB)` — without the vendor's remedy tail after its ` — `
+/// (`restart and resume with claude --continue`); the whole message when it
+/// has no such tail.
+///
+/// WHY (robustness backlog item 2, 2026-09-26): `claude --continue` resumes
+/// the NEWEST conversation filed under the working directory, and four live
+/// Claude Code processes shared one directory on the owner's Mac that day —
+/// a person following the banner's words in one tab resumes a sibling's
+/// conversation. aterm names the tab's own (`aterm_agent::harness::resume`),
+/// so whatever of the banner it quotes stops at the fact.
+#[must_use]
+pub fn memory_banner_head(message: &str) -> &str {
+    message
+        .split_once(" \u{2014} ")
+        .map_or(message, |(head, _)| head)
+        .trim_end()
+}
+
 /// Claude Code's critical-memory banner, as a [`WallKind::Memory`] wall.
 ///
 /// The 2026-09-24 incident: a worker's spinner read `· Gesticulating… (36m
@@ -841,7 +861,9 @@ mod tests {
 
     use crate::phase::{Phase, limit_notice, worker_phase};
     use crate::prompt::fixtures::{
-        API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_ENOTFOUND_80, API_ERROR_SLEEP, END_529,
+        API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_ENOTFOUND_80,
+        API_ERROR_ENOTFOUND_80_MEASURED, API_ERROR_ENOTFOUND_MEASURED,
+        API_ERROR_QUEUED_SENT_MEASURED, API_ERROR_SLEEP, API_ERROR_TWICE_MEASURED, END_529,
         END_OFFER, END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, rows, screen,
     };
 
@@ -1447,12 +1469,16 @@ mod tests {
     /// sixteen times. It is a wall — at 144 columns, at 80 where
     /// `(ENOTFOUND)` wraps onto the second row, without a done row, with the
     /// `●` off macOS, and under the vendor's expand hint — and the message is
-    /// the whole of it, joined.
+    /// the whole of it, joined. The SYNTHETIC rows were MEASURED live on
+    /// 2026-09-27 word for word, at both widths and under an earlier error.
     #[test]
     fn a_283_api_error_message_row_is_a_wall_at_every_width() {
         for (name, r) in [
             ("144", screen(API_ERROR_ENOTFOUND)),
             ("80", screen(API_ERROR_ENOTFOUND_80)),
+            ("144 measured", screen(API_ERROR_ENOTFOUND_MEASURED)),
+            ("80 measured", screen(API_ERROR_ENOTFOUND_80_MEASURED)),
+            ("two errors measured", screen(API_ERROR_TWICE_MEASURED)),
         ] {
             assert_eq!(worker_phase(&r), Phase::Idle, "{name}");
             let w = wall(&r).unwrap_or_else(|| panic!("{name}: the wall"));
@@ -1461,6 +1487,22 @@ mod tests {
             assert_eq!(w.message, ENOTFOUND, "{name}");
             assert!(r[w.row].starts_with("⏺ API Error"), "{name}");
         }
+        // Two errors on screen (a queued message was sent under the first):
+        // the wall is the LAST one, the turn's end.
+        let twice = screen(API_ERROR_TWICE_MEASURED);
+        let last = twice
+            .iter()
+            .rposition(|r| r.starts_with("⏺ API Error"))
+            .expect("the second error");
+        assert_eq!(wall(&twice).map(|w| w.row), Some(last));
+        assert!(twice[..last].iter().any(|r| r.starts_with("⏺ API Error")));
+        // NEGATIVE CONTROL, measured: the retries spent with a message
+        // queued, which Claude sends under the error at once — the error is
+        // history, the next turn retrying: busy, no wall.
+        let sent = screen(API_ERROR_QUEUED_SENT_MEASURED);
+        assert!(sent.iter().any(|r| r.starts_with("⏺ API Error")));
+        assert_eq!(worker_phase(&sent), Phase::Busy);
+        assert_eq!(wall(&sent), None);
         let variants = [
             framed(&["⏺ Working.", "", &format!("⏺ {ENOTFOUND}"), ""], FOOTER),
             framed(&["● Working.", "", &format!("● {ENOTFOUND}"), ""], FOOTER),

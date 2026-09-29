@@ -8,7 +8,7 @@
 //                      working tree had uncommitted changes); "unknown" w/o git.
 //   ATERM_BUILD_NUMBER monotonic build number (ordering is independent of the
 //                      display/source version): SOURCE_DATE_EPOCH — the ledger
-//                      claim `cargo ship cut` exports — wins when set; else HEAD's
+//                      claim `targo --unverified ship cut` exports — wins when set; else HEAD's
 //                      committer Unix epoch (dev builds); "0" only w/o git.
 //   ATERM_BUILD_TIME   UTC build timestamp (RFC3339), or "unknown".
 //
@@ -172,7 +172,7 @@ fn main() {
     // Fits a single sub-2^32 CFBundleVersion component (~1.78e9 today, valid past 2100).
     //
     // COORDINATION: `SOURCE_DATE_EPOCH`, when a valid epoch, WINS over the live `git`
-    // read — it is the release PIN. `cargo ship cut` (crates/aterm-release) claims the
+    // read — it is the release PIN. `targo --unverified ship cut` (crates/aterm-release) claims the
     // build number from the append-only `RELEASES.ledger` (`n = max(tail+1, unix_now)`,
     // the same epoch scale as the dev fallback) and exports it ONCE, so this binary's
     // `ATERM_BUILD_NUMBER`, the bundle's sealed CFBundleVersion, and the release

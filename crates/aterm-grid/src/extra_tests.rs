@@ -130,14 +130,16 @@ fn cell_extra_extended_flags() {
 fn cell_extra_size_optimized() {
     let size = std::mem::size_of::<CellExtra>();
     assert!(
-        size <= 72,
-        "CellExtra should be <= 72 bytes, got {size} bytes"
+        size <= 64,
+        "CellExtra should be <= 64 bytes, got {size} bytes"
     );
-    // 72 bytes: 64 (after boxing the rare complex_char Arc<str>) plus the
+    // 64 bytes: 56 (after boxing the rare complex_char Arc<str>) plus the
     // niche-optimized `image: Option<Box<ImageRef>>` field (8 bytes) for inline
-    // images (iTerm2 OSC 1337). CellExtra is allocated only for cells that have
-    // extras at all (rare), so the 8-byte growth is paid by those cells only.
-    assert_eq!(size, 72, "CellExtra should be exactly 72 bytes");
+    // images (iTerm2 OSC 1337). A Kitty Unicode placeholder costs no field: it
+    // is decoded from the cell's char, marks and colours (the never-written
+    // `kitty_placeholder` box it once had is gone). CellExtra is allocated only
+    // for cells that have extras at all (rare).
+    assert_eq!(size, 64, "CellExtra should be exactly 64 bytes");
 }
 
 #[test]
@@ -164,12 +166,14 @@ fn cell_extra_with_image() {
         rows: 2,
         z_index: 0,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: ImageScaling::Fit,
+        source_rect: None,
     });
     extra.set_image(Some(ImageRef {
         image: Arc::clone(&image),
         cell_row: 1,
         cell_col: 2,
+        kitty: None,
     }));
 
     assert!(extra.has_data(), "an image makes the extra non-empty");

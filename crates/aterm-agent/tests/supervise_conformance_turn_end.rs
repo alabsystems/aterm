@@ -174,11 +174,19 @@ fn reading(
         interrupted: false,
         // The window's host: its walls here are retried, never restarted.
         restartable: true,
+        resume: None,
         upgrading: false,
         taskless,
         person: (st["person"] == 1).then_some(JUST_TYPED),
         reach: Default::default(),
         login_back: false,
+        program: aterm_phase::Program::Claude,
+        goal: None,
+        model_field: None,
+        limits: Default::default(),
+        sandbox_fell: None,
+        thread_model: None,
+        upgrade_goal: false,
     }
 }
 

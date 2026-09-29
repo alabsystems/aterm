@@ -150,15 +150,38 @@ impl Grid {
         self.storage.cursor.col = 0;
     }
 
-    /// Margin-aware back tab (DECLRMM).
+    /// Margin-aware back tab (CBT) — ORIGIN MODE decides whether the left
+    /// margin binds, not DECLRMM.
     ///
-    /// Per VT510: when DECLRMM is active and the cursor is within the
-    /// horizontal margin region, CBT stops at the left margin instead
-    /// of column 0. When the cursor is outside the margins, CBT uses
-    /// column 0 as the boundary — matching CUB behavior (#7461).
+    /// VT510 states CBT's floor without ever naming a margin: "If an attempt is
+    /// made to move the active position past the first character position on the
+    /// line, then the active position stays at column one." DECOM is the page
+    /// that turns "column one" into "the left margin" — set, "the cursor cannot
+    /// move outside of the margins"; reset, "the cursor can move outside of the
+    /// margins". Composing the two gives the gate directly, and it is the gate
+    /// xterm implements (tabs.c `TabToPrevStop` clamps to `ScrnLeftMargin` only
+    /// inside `if (xw->flags & ORIGIN)`) and the one Ghostty spells out in a
+    /// comment: `// With origin mode enabled, our leftmost limit is the left
+    /// margin.` (`horizontalTabBack`). xterm's `ScrnLeftMargin` is itself 0
+    /// unless DECLRMM is on, so BOTH flags must be set for the margin to bind —
+    /// hence the two parameters here.
+    ///
+    /// This used to gate on DECLRMM alone, justified as "matching CUB behavior".
+    /// That is the inference xterm and Ghostty both declined to make: each
+    /// clamps CUB on the left margin unconditionally and still leaves CBT
+    /// origin-gated, a few hundred lines away in the same file. CUB is a
+    /// cursor-motion primitive; CBT is defined against tab stops and column one.
+    ///
+    /// A cursor ALREADY LEFT of the left margin is not dragged right onto it.
+    /// xterm does drag it — `if (next_column < left) next_column = left;` then
+    /// `set_cur_col` — which makes a BACKWARD tab move the cursor forward.
+    /// Ghostty cannot, because its bound is a loop guard (`if (x <= left_limit)
+    /// return;`), and it pins the case in `test "Terminal: horizontal tab back
+    /// with cursor before left margin"`. CBT is backward motion by definition,
+    /// so we follow Ghostty and stand still.
     #[inline]
-    pub fn back_tab_margin(&mut self, left_right_margin_mode: bool) {
-        if !left_right_margin_mode {
+    pub fn back_tab_margin(&mut self, left_right_margin_mode: bool, origin_mode: bool) {
+        if !(left_right_margin_mode && origin_mode) {
             self.back_tab();
             return;
         }
@@ -166,17 +189,11 @@ impl Grid {
         let margins = self.storage.horizontal_margins();
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);
-        // Only constrain to margins when cursor is inside the margin region.
-        // When outside, use column 0 (matching cursor_backward_margin).
-        let in_margins =
-            current >= usize::from(margins.left) && current <= usize::from(margins.right);
-        let left_bound = if in_margins {
-            usize::from(margins.left)
-        } else {
-            0
-        };
+        let left_bound = usize::from(margins.left);
         if current <= left_bound {
-            return; // Already at or left of boundary
+            // At the margin, or already outside it to the left: a BACKWARD tab
+            // never moves the cursor forward (Ghostty's guard, not xterm's clamp).
+            return;
         }
         for col in (left_bound..current).rev() {
             if self.storage.tab_stops[col] {
@@ -201,11 +218,12 @@ impl Grid {
         }
     }
 
-    /// Margin-aware back tab by n stops (DECLRMM).
+    /// Margin-aware back tab by n stops — see [`Grid::back_tab_margin`] for why
+    /// the left margin binds only under origin mode.
     #[inline]
-    pub fn back_tab_n_margin(&mut self, n: u16, left_right_margin_mode: bool) {
+    pub fn back_tab_n_margin(&mut self, n: u16, left_right_margin_mode: bool, origin_mode: bool) {
         for _ in 0..n {
-            self.back_tab_margin(left_right_margin_mode);
+            self.back_tab_margin(left_right_margin_mode, origin_mode);
         }
     }
 

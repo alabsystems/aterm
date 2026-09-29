@@ -239,6 +239,10 @@ pub fn connect(
 /// peer needs to drain a queued tail, short enough to bound the join.
 const RELAY_DRAIN_MAX: Duration = Duration::from_secs(5);
 
+/// How often a relay whose local peer half-closed checks that the peer is still
+/// there to read the answer (`aterm_uds::hangup::peer_closed`).
+const RELAY_HANGUP_POLL: Duration = Duration::from_millis(200);
+
 /// The rustls connection plus relay coordination flags, guarded by one mutex and
 /// signaled through one [`Condvar`] (see [`RelayShared`]). No thread performs
 /// blocking I/O while holding the lock.
@@ -523,6 +527,39 @@ where
             } else {
                 std::net::Shutdown::Both
             });
+            // THE LOCAL PEER'S HANGUP AFTER ITS EOF. The EOF above is only
+            // directional — a client that sent its request and shut its write
+            // side still waits for the answer, so it stays a graceful
+            // half-close (and a local SERVICE that answered and closed has
+            // already had every byte drained above, under `close_notify`). But
+            // once the local end is gone entirely, nothing more can ever be
+            // delivered to it, and nothing else would notice: this thread no
+            // longer reads, and the downloader is parked on the TCP read until
+            // the remote's own verb ends — up to its 600 s clamp, holding the
+            // lane of a dead `dial` client. Watch for it until the relay ends,
+            // and end the relay when it happens.
+            if half_close {
+                loop {
+                    let g = shared.lock();
+                    if g.done {
+                        break;
+                    }
+                    let (g, _) = shared
+                        .cv
+                        .wait_timeout(g, RELAY_HANGUP_POLL)
+                        .unwrap_or_else(|p| p.into_inner());
+                    if g.done {
+                        break;
+                    }
+                    drop(g);
+                    if aterm_uds::hangup::peer_closed(&local_up) {
+                        shared.lock().done = true;
+                        shared.cv.notify_all();
+                        let _ = tcp_up.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+                }
+            }
         })
     };
 

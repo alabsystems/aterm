@@ -868,7 +868,10 @@ fn a_late_ready_whose_restart_waits_keeps_its_gates_word() {
         assert_eq!(kept.release, "gave-up", "{name}: still owed");
         assert_eq!(kept.markers.len(), 4, "{name}: the READY still heard");
         if word == "wait:settling" {
-            assert!(owns_turn_ends(&r.step, 0), "the host owns the turn ends");
+            assert!(
+                owns_turn_ends(&r.step, 0, 120),
+                "the host owns the turn ends"
+            );
         } else {
             assert_eq!(after(&r.step, 9), After::Later(HOLD_LOOK));
         }
@@ -1132,6 +1135,105 @@ fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A DROPPED RELEASE LEAVES NO OWED WAIT BEHIND (the review of the upgrade's
+/// leftovers, 2026-09-28). A pending round owing the line (`retargeted`),
+/// whose last look recorded the release's own gate (`wait=release:attended`),
+/// is visited with no build to move to while the notice's process no longer
+/// holds the conversation: the release is no longer the upgrade's to type and
+/// is dropped (`release-dropped:other-process`). Its gate's word went with it
+/// only in the ledger — the record kept `wait=release:attended`, `--status`
+/// read `wait=release:attended … release=-` on one line, and the owner was
+/// told the agent "is owed the line telling it to carry on", which nothing
+/// owed any more, visit after visit. Now the drop is the visit's step and
+/// clears the wait: the row reads what main read, how long it is behind.
+#[cfg(unix)]
+#[test]
+fn a_dropped_release_leaves_no_owed_wait_behind() {
+    let now = now_s();
+    let st = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        phase: Phase::Pending,
+        pending_since: now - 7 * 3_600,
+        release: "retargeted".to_string(),
+        wait: "release:attended".to_string(),
+        wait_since: now - 600,
+        ..St::default()
+    };
+    let dir = scratch("rel-dropped-wait");
+    let (sock, asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    write_transcript(&opts, &[said_by_agent("Working.")]);
+    let agent = Agent::start(&opts, &st);
+    let mut moved = load(&opts, SESSION).expect("state");
+    moved.notice_pid = dead_pid();
+    save(&opts, SESSION, &moved);
+    let current = Targets {
+        managed: None,
+        native: None,
+        unanswered: false,
+    };
+    let shell = dead_pid();
+    let table = vec![(shell, 1, "zsh".to_string())];
+    let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
+    let files = session_files(&opts.home);
+    let visit = || {
+        visit_with_claim(
+            &opts,
+            &agent.sf,
+            files.as_deref(),
+            &table,
+            &current,
+            &Script::new(shell, usize::MAX, None),
+            Some(&args),
+            None,
+        )
+    };
+    let first = visit();
+    let kept = load(&opts, SESSION).expect("state");
+    let again = visit();
+    let kept_again = load(&opts, SESSION).expect("state");
+    let (rows, vetted) = upgrade_status::status_rows(&opts);
+    let at = now_s();
+    let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).unwrap_or_default();
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(turns(&asked), 0, "nothing typed");
+    assert_eq!(
+        (first.step.as_str(), again.step.as_str()),
+        ("current", "current")
+    );
+    assert_eq!(
+        ledger
+            .matches(r#""step":"release-dropped:other-process""#)
+            .count(),
+        1,
+        "{ledger}"
+    );
+    assert!(kept.release.is_empty(), "the release was dropped");
+    assert_eq!(
+        (kept.wait.as_str(), kept.wait_since),
+        ("", 0),
+        "the dropped release's gate goes with it"
+    );
+    assert_eq!(kept_again.wait, "", "and stays gone");
+    assert!(vetted);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let line = rows[0].line(at);
+    assert!(line.contains(" wait=- "), "{line}");
+    assert!(line.contains(" release=- "), "{line}");
+    assert_eq!(
+        rows[0].stall_words(at).as_deref(),
+        Some("behind for 7 h"),
+        "{line}"
+    );
 }
 
 /// A LATE READY THE RESTART'S GATE HOLDS PAST THE DRAIN IS VOIDED, through
@@ -2396,6 +2498,53 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     assert!(upgrade::retry_due(&old.phase, old.failed_for(T0), false));
 }
 
+/// A VOID NEVER SHORTENS THE REST A REPEATED STOP EARNED (round six, F27).
+/// Three give-ups in a row stretch the rest to `4 × RETRY_S`
+/// ([`upgrade::rest_extension`]); a late READY the agent's own work outlives
+/// is voided half an hour on, and the rest begins again at the void — as
+/// long as the streak makes it, never a bare `RETRY_S` from there.
+///
+/// FAILS WITHOUT THE FIX: the void stamped `failed_at = now`, and the next
+/// round was due `RETRY_S` after the void, six hours before the rest the
+/// streak had earned ran out.
+#[test]
+fn a_void_never_shortens_the_rest_a_repeated_stop_earned() {
+    const T: u64 = 1_790_000_000;
+    let mut st = St::default();
+    for _ in 0..3 {
+        st.give_up(T);
+    }
+    let before = st.failed_at;
+    assert_eq!(before, T + 3 * upgrade::RETRY_S);
+    let void_at = T + 1_800;
+    st.void(void_at);
+    assert!(
+        st.failed_at >= before,
+        "a void never shortens the rest a repeated stop earned: {} < {before}",
+        st.failed_at
+    );
+    assert_eq!(
+        st.failed_at,
+        void_at + 3 * upgrade::RETRY_S,
+        "begun again at the void, stretched by the streak"
+    );
+    assert!(
+        !upgrade::retry_due(&st.phase, st.failed_for(void_at + upgrade::RETRY_S), false),
+        "not due a bare RETRY_S after the void"
+    );
+    // NEGATIVE CONTROL: a first stop's void rests a plain RETRY_S from the
+    // void, as the rule has always said.
+    let mut first = St::default();
+    first.give_up(T);
+    first.void(void_at);
+    assert_eq!(first.failed_at, void_at);
+    assert!(upgrade::retry_due(
+        &first.phase,
+        first.failed_for(void_at + upgrade::RETRY_S),
+        false
+    ));
+}
+
 /// THE LONGEST SILENCE, through the real record and the real reducer (the
 /// no-stall review of 2026-09-27: `REASK_S + RETRY_S` was claimed as its
 /// bound, but a void begins the rest again). A round's last notice goes out;
@@ -2403,8 +2552,9 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
 /// its rest runs out and holds the rest where it is, at an idle point and at
 /// a break alike; the agent's own work outlives the answer, and the void
 /// comes `DRAIN_S` after it, beginning the rest again; the new round starts
-/// `RETRY_S` after the void. Five hours today after a first stop, eleven
-/// after one repeated to the cap, as `upgrade::RETRY_S` says — and without
+/// a rest after the void, as long as the streak makes it (round six, F27).
+/// Five hours today after a first stop, seventeen after one repeated to the
+/// cap, as `upgrade::RETRY_S` says — and without
 /// the late READY, two and a half and eight and a half.
 #[test]
 fn the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest() {
@@ -2415,7 +2565,7 @@ fn the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest() {
         (0, false, 5 * H / 2),
         (0, true, 5 * H),
         (upgrade::RETRY_BACKOFF_MAX_SHIFT, false, 17 * H / 2),
-        (upgrade::RETRY_BACKOFF_MAX_SHIFT, true, 11 * H),
+        (upgrade::RETRY_BACKOFF_MAX_SHIFT, true, 17 * H),
     ] {
         let case = format!("{prior_stops} stop(s) before, late READY {with_ready}");
         let last_notice = T0;

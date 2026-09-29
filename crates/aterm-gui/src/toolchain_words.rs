@@ -771,7 +771,7 @@ pub(crate) struct TabsBehind {
     /// there), told to source the hook once the agent exits.
     pub(crate) frozen_agents: usize,
     /// Running Claude Code sessions the live upgrade moves onto THE VERSION
-    /// THIS RECORD NAMES at their next turn end, on its own (its relaunch
+    /// THIS RECORD NAMES as moving onto it on their own (its relaunch
     /// line sources the hook too, so a frozen tab among them heals with the
     /// move). Never a stalled one (review of 2026-09-25: an overdue session
     /// was said to move "at its next turn end" here while the band showed it
@@ -906,12 +906,15 @@ pub(crate) fn managed_current_words_for(
     } else if frozen_tabs == 0 && tabs.frozen_agents == 0 && tabs.shadowed == 0 {
         pieces.push("used in every tab".to_string());
     }
+    // "On its own", never "at its next turn end" (the owner, 2026-09-28): the
+    // live upgrade starts at a quiet moment, and a goal-mode session's turns
+    // never end.
     if tabs.agents_behind > 0 {
         let n = tabs.agents_behind;
         pieces.push(if n == 1 {
-            "1 running Claude Code session moves onto it at its next turn end".to_string()
+            "1 running Claude Code session moves onto it on its own".to_string()
         } else {
-            format!("{n} running Claude Code sessions move onto it at their next turn end")
+            format!("{n} running Claude Code sessions move onto it on their own")
         });
     }
     if tabs.agents_held > 0 {
@@ -1183,7 +1186,7 @@ pub(crate) fn snapshot_words(
     });
     // A program verifying or linking HOLDS its share (500‰, 990‰) with no
     // meter of its own: a minute of verify is the plan, not a stall (design
-    // ruling 266, until the owner rules on ruling 265's question).
+    // ruling 266, the answer to ruling 265's question).
     let held = f
         .programs
         .values()
@@ -2261,7 +2264,7 @@ mod tests {
         assert_eq!(title, "Claude Code 2.1.282 and Codex 0.157.0 installed");
         assert_eq!(
             detail,
-            "used in every tab · 2 running Claude Code sessions move onto it at their next turn end"
+            "used in every tab · 2 running Claude Code sessions move onto it on their own"
         );
         let (_, detail) = words(TabsBehind {
             frozen_agents: 1,

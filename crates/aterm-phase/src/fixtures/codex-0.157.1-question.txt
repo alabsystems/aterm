@@ -1,0 +1,41 @@
+# codex 0.157.1 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm 120x40 (tools/test-codex-live-upgrade.sh lane G: network denied, a loopback Responses API calling `request_user_input` in Plan mode) · Plan mode's question tool: one question, option 1 marked (Recommended), before the supervisor answered it
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.157.1)                 │
+│                                            │
+│ model:       fake-model   /model to change │
+│ directory:   /private/tmp/cxlive.xxxx/work │
+│ permissions: YOLO mode                     │
+╰────────────────────────────────────────────╯
+
+
+› say hello
+
+
+• ok
+
+  8:15 PM
+
+• Model changed to fake-model medium for Plan mode.
+
+
+› PLANQ: add a subtract function to calc.py
+
+
+
+
+
+
+
+
+
+
+
+  Question 1/1 (1 unanswered)
+  What should the new subtraction function be called?
+
+  › 1. subtract (Recommended)  A clear, self-explanatory name.
+    2. sub                     A shorter name.
+    3. None of the above       Optionally, add details in notes (tab)
+
+  tab to add notes | enter to submit answer | esc to interrupt
+

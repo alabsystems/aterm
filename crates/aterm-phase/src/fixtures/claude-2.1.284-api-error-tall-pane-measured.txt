@@ -1,0 +1,51 @@
+# claude-code 2.1.284 · MEASURED 2026-09-28, `aterm ctl text` of a private headless aterm (144x50) on origin/main 7da5912bc, the managed 2.1.284 launched by path with a scratch `CLAUDE_CONFIG_DIR`, a dummy `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL=https://api.invalid` with `CLAUDE_CODE_MAX_RETRIES=0` · a SHORT transcript in a TALL pane: the error row is on row 8, the composer pinned on rows 45-47, so 36 blank rows lie between the turn's done row and the composer — the error is more than 40 rows above the last drawn row (the status sweep's live zone cut it: `agent=idle`, no wall) · user, host and scratch path redacted
+
+ ▐▛███▛█   Claude Code v2.1.284
+▝▜██████▀  Opus 5.5 (1M context) · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/proj
+
+
+❯ say hi
+
+⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)
+
+✻ Worked for 0s · done 6:23 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

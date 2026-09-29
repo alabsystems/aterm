@@ -26,9 +26,9 @@
 //! * `live == ceiling` → GREEN, at ceiling.
 //! * `live > ceiling` → RED. Raising needs `--update --allow-regress "<reason>"`
 //!   with at least [`MIN_REASON_CHARS`] characters of actual prose, and the
-//!   accepted reason is written as a trailing column and REPRINTED by every
-//!   subsequent run — so a regression stays visible forever instead of being
-//!   absorbed by the next `--update`.
+//!   accepted reason is written as the 4th column; every run counts the raised
+//!   ceilings and points at the file, so a regression stays on record instead
+//!   of being absorbed by the next `--update`.
 //!
 //! # Why build scripts and proc macros are rows, not decoration
 //!
@@ -88,9 +88,10 @@ const LOCK_METRICS: &[&str] = &["packages", "third_party_packages"];
 /// and demand an 80-character justification for it — the exact failure the
 /// `shipped.<triple> packages` and `lock packages` rows are left unseeded to
 /// avoid (see the module docs above). A first-party replacement is still
-/// checked end to end elsewhere: `cargo forge attest` [OB-1]/[OB-2] and
-/// `cargo forge check` [OB-12] hold it to existing and to being live in every
-/// cell, and a NOT-LIVE note is emitted below for every patch entry alike.
+/// checked end to end elsewhere: `targo --unverified forge attest` [OB-1]/[OB-2] and
+/// `targo --unverified forge check` [OB-12] hold it to existing and to being live (a dead
+/// patch fails, one only some cells pull in is a note), and a NOT-LIVE note is
+/// emitted below for every patch entry alike.
 const PATCH_METRICS: &[&str] = &["entries", "live_entries"];
 
 /// One ratchet row.
@@ -101,7 +102,7 @@ pub struct Row {
     pub metric: String,
     /// The recorded high-water mark. Live may equal it; never exceed it.
     pub ceiling: u64,
-    /// The accepted `--allow-regress` prose, reprinted on every run thereafter.
+    /// The accepted `--allow-regress` prose, recorded in the file's 4th column.
     pub regress_reason: Option<String>,
 }
 
@@ -128,7 +129,7 @@ pub fn load(root: &Path) -> Result<Vec<Row>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(
             "cannot read {} ({e}) — fix the permissions, or delete the file and re-seed it \
-             with `cargo forge budget --update`",
+             with `targo --unverified forge budget --update`",
             root.join(BUDGET_PATH).display()
         )),
     }
@@ -433,8 +434,8 @@ fn measure(root: &Path) -> Result<Live, String> {
     for p in patches.iter().filter(|p| !p.is_vendored()) {
         live.notes.push(format!(
             "FIRST-PARTY PATCH (not counted in the `patch` ratchet, which bounds third-party \
-             fork surface): {} → {} at {}, {}. It is aterm's own crate; `cargo forge attest` \
-             [OB-1]/[OB-2] and `cargo forge check` [OB-12] are what hold it to being present \
+             fork surface): {} → {} at {}, {}. It is aterm's own crate; `targo --unverified forge attest` \
+             [OB-1]/[OB-2] and `targo --unverified forge check` [OB-12] are what hold it to being present \
              and live.",
             p.name,
             p.path,
@@ -448,7 +449,7 @@ fn measure(root: &Path) -> Result<Live, String> {
         if !p.is_live() {
             live.notes.push(format!(
                 "PATCH NOT LIVE: {} is vendored at {} but the lock resolved {:?} — the fix in \
-                 {} compiles into nothing (`cargo forge attest` has the repair)",
+                 {} compiles into nothing (`targo --unverified forge attest` has the repair)",
                 p.name, p.manifest_version, p.lock_version, p.path
             ));
         }
@@ -543,16 +544,16 @@ fn validate_reason(update: bool, reason: Option<&str>) -> Result<Option<String>,
     if !update {
         return Err(format!(
             "`--allow-regress` was given without `--update`, so nothing would be written. \
-             Run: cargo forge budget --update --allow-regress \"{r}\""
+             Run: targo --unverified forge budget --update --allow-regress \"{r}\""
         ));
     }
     let len = r.chars().count();
     if len < MIN_REASON_CHARS {
         return Err(format!(
             "the --allow-regress reason is {len} characters; raising a ceiling needs at least \
-             {MIN_REASON_CHARS}. It is written into {BUDGET_PATH} and reprinted on every run \
-             forever, so write the sentence that will still make sense in a year: what grew, \
-             why it had to, and what would shrink it again"
+             {MIN_REASON_CHARS}. It is written into {BUDGET_PATH} for good, so write the \
+             sentence that will still make sense in a year: what grew, why it had to, and what \
+             would shrink it again"
         ));
     }
     if r.contains('\t') || r.contains('\n') {
@@ -682,7 +683,7 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
     }
     s.push_str(
         "      forge does not record the package SET a ceiling was taken over, so it cannot \
-         name what is NEW. `git diff -- Cargo.lock | grep '^+name'` does, and `cargo forge \
+         name what is NEW. `git diff -- Cargo.lock | grep '^+name'` does, and `targo --unverified forge \
          survey --cell <name>` ranks what it costs by dominator.\n",
     );
     // RULE OUT THE CACHE BEFORE BELIEVING THE DRIFT. Only `third_party_loc`
@@ -701,14 +702,14 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
              cargo-tree hint, so it is measured from its real directory only because an \
              unpublished crate has no registry copy to shadow it. These are the complete \
              retained package sources, including tests and \
-             examples, not only local edits or reachable code. `cargo forge attest` checks \
+             examples, not only local edits or reachable code. `targo --unverified forge attest` checks \
              fork obligations and the astream submodule's gitlink pin.",
             d.vendored_measured.join(", ")
         );
     }
     let _ = write!(
         s,
-        "      Either shrink it back, or record the regression:\n        cargo forge budget \
+        "      Either shrink it back, or record the regression:\n        targo --unverified forge budget \
          --update --allow-regress \"<at least {MIN_REASON_CHARS} characters: what grew, why it \
          had to, what would shrink it again>\"",
     );
@@ -771,23 +772,18 @@ pub fn run(root: &Path, update: bool, allow_regress: Option<&str>) -> Result<Out
         );
     }
 
-    let recorded: Vec<&Row> = plan
+    // A count and the file, not the reasons: 21 of them came to 55 KB, and the
+    // gate printed every byte on every merge-contract run.
+    let recorded = plan
         .rows
         .iter()
         .filter(|r| r.regress_reason.is_some())
-        .collect();
-    if !recorded.is_empty() {
-        log.push_str("\n    RECORDED REGRESSIONS (reprinted every run, by design):\n");
-        for r in recorded {
-            let _ = writeln!(
-                log,
-                "      {} {} = {}\n        {}",
-                r.scope,
-                r.metric,
-                r.ceiling,
-                r.regress_reason.as_deref().unwrap_or_default()
-            );
-        }
+        .count();
+    if recorded > 0 {
+        let _ = writeln!(
+            log,
+            "\n    {recorded} ceiling(s) carry a recorded raise — reasons in {BUDGET_PATH}."
+        );
     }
 
     if !live.notes.is_empty() {
@@ -815,7 +811,7 @@ pub fn run(root: &Path, update: bool, allow_regress: Option<&str>) -> Result<Out
                 log,
                 "    COULD NOT MEASURE {scope} — {why}\n      Resolution needs no toolchain \
                  for the target, so this is a real failure, not a missing cross-compiler. \
-                 Re-run `cargo forge survey --cell <name>` to see it directly."
+                 Re-run `targo --unverified forge survey --cell <name>` to see it directly."
             );
         }
     }
@@ -894,7 +890,7 @@ fn unarmed(root: &Path, live: &Live, update: bool) -> Outcome {
     }
     let _ = writeln!(
         log,
-        "    The live surface measures:\n\n{}\n    Arm it with `cargo forge budget --update`, \
+        "    The live surface measures:\n\n{}\n    Arm it with `targo --unverified forge budget --update`, \
          which writes exactly those rows. Until then this verb ratchets nothing, so it \
          reports RED rather than a pass.",
         indent(&body)
@@ -1158,7 +1154,7 @@ mod tests {
         assert_eq!(p.rows[0].ceiling, 9);
         assert_eq!(p.rows[0].regress_reason.as_deref(), Some(REASON_80));
         assert_eq!(p.raised, 1);
-        // And it survives into the file, to be reprinted forever.
+        // And it survives into the file, where it stays on record.
         assert!(render(&p.rows).contains(REASON_80));
     }
 

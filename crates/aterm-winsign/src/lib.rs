@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo winsign` — Authenticode signing and verification of THE shipped
+//! `targo --unverified winsign` — Authenticode signing and verification of THE shipped
 //! Windows executable, and the Windows half of the identity tier the mac lane
 //! already has (`crates/aterm-release/src/sign.rs`, Tier APPLE).
 //!
@@ -812,10 +812,10 @@ pub const USAGE: &str =
     "aterm-winsign — Authenticode signing of the shipped Windows exe (Tier WINDOWS)
 
 USAGE
-  cargo winsign sign   [options] <exe>...   sign, then read the signature back and judge it
-  cargo winsign verify [options] <exe>...   read the signature back and judge it (no signing)
-  cargo winsign doctor [options]            what this machine can sign with, and what is missing
-  cargo winsign help
+  targo --unverified winsign sign   [options] <exe>...   sign, then read the signature back and judge it
+  targo --unverified winsign verify [options] <exe>...   read the signature back and judge it (no signing)
+  targo --unverified winsign doctor [options]            what this machine can sign with, and what is missing
+  targo --unverified winsign help
 
 OPTIONS (flag > ATERM_WINSIGN_<KEY> > credentials profile `winsign_<key> = \"…\"`)
   --credentials <file>   a release-credentials profile to read winsign_* keys from
@@ -1165,7 +1165,7 @@ fn doctor(host: &dyn Host, tier: &Tier, config: &Config) -> i32 {
     println!(
         "{}",
         if ok {
-            "READY: `cargo winsign sign <exe>` will run."
+            "READY: `targo --unverified winsign sign <exe>` will run."
         } else {
             "NOT READY — see the lines above; apps/aterm-win/SIGNING.md is the runbook."
         }

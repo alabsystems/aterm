@@ -18,7 +18,7 @@
 //! exact three-way `unix` / `windows` / `not(any(unix, windows))` partition, is exempt,
 //! as is one with any declaration carrying no platform cfg.
 //!
-//! `cargo xtask gate cells` really cross-compiles and stays the authority; this rides along
+//! `targo --unverified run -p xtask -- gate cells` really cross-compiles and stays the authority; this rides along
 //! with `cargo test -p atpkg`, reading only committed sources under `CARGO_MANIFEST_DIR`.
 //! Only `crate::`-qualified paths are judged (a bare name needs a real resolver), only
 //! `atpkg`, and the cfg algebra is shallow: anything subtler than `all`/`any` split into

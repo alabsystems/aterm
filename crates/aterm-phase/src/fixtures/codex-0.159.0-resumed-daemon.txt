@@ -1,0 +1,41 @@
+# codex 0.159.0 · MEASURED 2026-09-29, `aterm ctl text` of a private headless aterm 120x40 (tools/test-codex-live-upgrade.sh lane A: network denied, a loopback Responses API; read only, cursor=36,2) · a daemon-mode client the live upgrade relaunched (`codex resume <thread>` onto 0.159.0): the session card with no box corners, the conversation redrawn with each end row drawn `Worked for <1s • 2:58 AM` (U+2022, where 0.158.0 drew ` · `), the `›` composer with its placeholder, and the two-row footer (`fake-model default · <cwd>` over `← for agents · ? for shortcuts`)
+
+  >_ OpenAI Codex (v0.159.0)
+     /private/tmp/cxlive.xxxx/work
+  permissions: YOLO mode
+
+
+› start bg 7771 please
+
+
+• ok
+
+• Failed (exit -1) sleep 7771
+  └ (no output)
+
+  Worked for <1s • 2:58 AM
+
+
+› say hello
+
+
+• ok
+
+  Worked for <1s • 2:58 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  fake-model default · /private/tmp/cxlive.xxxx/work
+  ← for agents · ? for shortcuts

@@ -64,12 +64,14 @@ use aterm_log::{LevelFilter, Log, Metadata, Record};
 /// start this is, for the crash marker ([`crate::crash_signal::Arming`]).
 pub(crate) fn init(arming: crate::crash_signal::Arming) {
     let Some(dir) = log_dir() else {
-        // `logs_dir` resolves nothing when HOME is unset or ATERM_STATE_HOME
-        // is set to something that is not an absolute path (empty included):
-        // name both, so a refused state root is not a silently lost log.
+        // Name the one cause that applies, so a refused folder is not a
+        // silently lost log.
         crate::logging::stderr_line!(
-            "aterm-gui: no private log dir (HOME unset, ATERM_STATE_HOME not an absolute \
-             path, or the dir cannot be made private); logging + crash reports disabled"
+            "aterm-gui: {}; crash reports and aterm.log are off",
+            no_log_dir_reason(
+                aterm_types::dev_seam!("ATERM_STATE_HOME").as_deref(),
+                aterm_types::dirs::logs_dir(),
+            )
         );
         return;
     };
@@ -231,19 +233,32 @@ fn file_panic_report(
     // launch would banner a crash that never happened).
     if is_harness_thread(thread_name) {
         let path = dir.join(format!("harness-fault-{}.log", std::process::id()));
-        let _ = write_harness_fault(&path, thread_name.unwrap_or(""), info, backtrace);
-        crate::logging::stderr_line!(
-            "aterm-gui: supervisor fault on {} — recorded at {}",
-            thread_name.unwrap_or("?"),
-            path.display()
-        );
+        match write_harness_fault(&path, thread_name.unwrap_or(""), info, backtrace) {
+            Ok(()) => crate::logging::stderr_line!(
+                "aterm-gui: supervisor fault on {} — recorded at {}",
+                thread_name.unwrap_or("?"),
+                path.display()
+            ),
+            Err(e) => crate::logging::stderr_line!(
+                "aterm-gui: supervisor fault on {} — not recorded ({}: {e})",
+                thread_name.unwrap_or("?"),
+                path.display()
+            ),
+        }
         return None;
     }
     // Allocation-light: the small path string and the captured backtrace
     // are the only buffers; the report streams straight to the fd.
     let path = dir.join(format!("crash-{}.log", std::process::id()));
-    let _ = write_crash_report(&path, info, backtrace);
-    crate::logging::stderr_line!("aterm-gui: panic — crash report at {}", path.display());
+    match write_crash_report(&path, info, backtrace) {
+        Ok(()) => {
+            crate::logging::stderr_line!("aterm-gui: panic — crash report at {}", path.display());
+        }
+        Err(e) => crate::logging::stderr_line!(
+            "aterm-gui: panic — no crash report ({}: {e})",
+            path.display()
+        ),
+    }
     Some(path)
 }
 
@@ -555,6 +570,27 @@ fn prune_seen_crash_reports(dir: &Path, named: Option<&Path>) {
     }
 }
 
+/// Why [`log_dir`] found no folder: a development `ATERM_STATE_HOME` that is
+/// not absolute (empty included), no home folder at all, or the folder named
+/// with the error that refused it (on Unix, one that cannot be made
+/// owner-only).
+fn no_log_dir_reason(state_home: Option<&std::ffi::OsStr>, dir: Option<PathBuf>) -> String {
+    if state_home.is_some_and(|root| !std::path::Path::new(root).is_absolute()) {
+        return "ATERM_STATE_HOME is not an absolute path".to_string();
+    }
+    let Some(dir) = dir else {
+        return "no home folder found".to_string();
+    };
+    #[cfg(unix)]
+    let made = crate::control_auth::ensure_private_dir(&dir);
+    #[cfg(not(unix))]
+    let made = std::fs::create_dir_all(&dir);
+    match made {
+        Err(e) => format!("cannot use {} ({e})", dir.display()),
+        Ok(()) => format!("cannot use {}", dir.display()),
+    }
+}
+
 /// Resolve the per-user log dir, created `0700` (owner-only, like the
 /// control-socket dir — denial records name what a program attempted). WHERE is
 /// [`aterm_types::dirs::logs_dir`]'s one rule — `~/Library/Logs/aterm` on macOS
@@ -661,11 +697,15 @@ pub(crate) enum Rotation {
 /// Every aterm process that logs appends to the same file, so the rename
 /// happens under the sibling [`lock_path`], taken WITHOUT waiting: loggers run
 /// on the main thread, and a busy lock means another process is rotating, so
-/// this one skips and the next look tries again. (A child being spawned while
-/// the lock was held also keeps it until it execs; that too costs only the
-/// retry.) Under the lock the file is looked at again, because another writer
-/// may have rotated it between the caller's look and the lock. Nothing here
-/// syncs to disk.
+/// this one skips and the next look tries again. Under the lock the file is
+/// looked at again, because another writer may have rotated it between the
+/// caller's look and the lock. The lock is released by `LOCK_UN` on every
+/// return ([`HeldAdvisoryLock`]), not by the close: a child any thread forks
+/// while it is held keeps a copy of its description until it execs, and a lock
+/// released by the close alone stayed taken there, turning the next rotation —
+/// in this process or another — into a skip. Nothing here syncs to disk.
+///
+/// [`HeldAdvisoryLock`]: crate::native_document_host::HeldAdvisoryLock
 pub(crate) fn rotate_if_oversized(path: &Path, rotate_at: u64, ours: FileId) -> Rotation {
     // The ascription is the lock-order census's evidence that this is a
     // cross-process file lock, not an in-process mutex.
@@ -676,6 +716,9 @@ pub(crate) fn rotate_if_oversized(path: &Path, rotate_at: u64, ours: FileId) -> 
     if lock.try_lock().is_err() {
         return Rotation::Kept;
     }
+    #[cfg(all(test, unix))]
+    crate::parked_fork::fork_if_armed();
+    let _held = crate::native_document_host::HeldAdvisoryLock::adopt(lock);
     let Ok(meta) = std::fs::metadata(path) else {
         return Rotation::Kept;
     };
@@ -689,7 +732,7 @@ pub(crate) fn rotate_if_oversized(path: &Path, rotate_at: u64, ours: FileId) -> 
         Ok(()) => Rotation::Rotated,
         Err(_) => Rotation::Kept,
     }
-    // `lock` drops here, after the rename: that is the release.
+    // `_held` drops here, after the rename: that is the release.
 }
 
 /// An append-only log file that rotates itself. Opened with `O_APPEND`, so
@@ -955,15 +998,19 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    /// Serializes the tests that rotate, here and in `rotation_conformance`
-    /// (which spawns `ty`): a process forked while a lock file is open holds
-    /// that lock until it execs, which would turn a rotation a test expects
-    /// into a skip.
-    pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
-        static ROTATION_TESTS: Mutex<()> = Mutex::new(());
-        ROTATION_TESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The startup line names the one cause that applies, not a list of
+    /// three the code can tell apart.
+    #[test]
+    fn a_missing_log_dir_names_its_one_cause() {
+        assert_eq!(
+            no_log_dir_reason(Some(std::ffi::OsStr::new("relative-state")), None),
+            "ATERM_STATE_HOME is not an absolute path"
+        );
+        assert_eq!(
+            no_log_dir_reason(Some(std::ffi::OsStr::new("")), None),
+            "ATERM_STATE_HOME is not an absolute path"
+        );
+        assert_eq!(no_log_dir_reason(None, None), "no home folder found");
     }
 
     /// A private scratch dir per test, removed on drop.
@@ -1042,8 +1089,6 @@ mod tests {
     /// may still be appending to it.
     #[test]
     fn oversized_log_rotates_on_open_and_keeps_the_old_lines() {
-        let _serial = serial();
-
         let dir = Scratch::new("rot");
         let path = dir.log();
         open_append_0600(&path)
@@ -1066,8 +1111,6 @@ mod tests {
     /// ONE older copy is ever kept.
     #[test]
     fn rotates_while_running_and_keeps_one_older_copy() {
-        let _serial = serial();
-
         let dir = Scratch::new("run");
         let path = dir.log();
         let mut f = RotatingFile::open(path.clone(), tiny(40)).unwrap();
@@ -1082,7 +1125,9 @@ mod tests {
         names.sort();
         assert_eq!(names, ["aterm.log", "aterm.log.1", "aterm.log.lock"]);
         // A look comes before every write after the first here, so a file ends
-        // one line past the cap at most.
+        // one line past the cap at most. Nothing else takes this lock, and a
+        // child a concurrent test forks while it is held no longer keeps it
+        // (it is released by `LOCK_UN`), so no look finds it busy.
         for p in [&path, &rotated_path(&path)] {
             let len = std::fs::metadata(p).unwrap().len();
             assert!(len <= 40 + 8, "{} is {len} bytes", p.display());
@@ -1108,31 +1153,61 @@ mod tests {
     /// the lock is free rotates.
     #[test]
     fn a_busy_lock_skips_the_rotation_without_waiting() {
-        let _serial = serial();
-
         let dir = Scratch::new("busy");
         let path = dir.log();
         let mut f = RotatingFile::open(path.clone(), tiny(4)).unwrap();
         let holder = open_lock_0600(&lock_path(&path)).unwrap();
         holder.try_lock().unwrap();
+        // The other process lets go by `LOCK_UN`, as this one does.
+        let holder = crate::native_document_host::HeldAdvisoryLock::adopt(holder);
         for line in ["one\n", "two\n", "three\n"] {
             f.append(line.as_bytes(), note);
         }
         assert!(!rotated_path(&path).exists());
         assert_eq!(read(&path), "one\ntwo\nthree\n");
         drop(holder);
-        // The next look rotates — or, if a child spawned elsewhere in this
-        // process still holds the lock until it execs, a later one does.
-        for n in 0.. {
-            assert!(n < 200, "no rotation after the lock was released");
-            f.append(format!("four {n}\n").as_bytes(), note);
-            if rotated_path(&path).exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(read(&rotated_path(&path)).starts_with("one\ntwo\nthree\n"));
-        assert!(read(&path).starts_with("NOTE aterm.log.1\nfour "));
+        // The next look rotates.
+        f.append(b"four\n", note);
+        assert_eq!(read(&rotated_path(&path)), "one\ntwo\nthree\n");
+        assert_eq!(read(&path), "NOTE aterm.log.1\nfour\n");
+    }
+
+    /// THE ROTATION LOCK IS FREE THE MOMENT A ROTATION ENDS, even while a child
+    /// forked under it has yet to exec. A child any thread forks — a shell's pty
+    /// fork, a sibling test's spawn — holds a copy of the lock's description
+    /// until its `execve`; released by the close alone the lock stayed taken
+    /// there, and the next rotation, in this process or another, found it busy
+    /// and skipped. The fork is made for real, inside the first rotation's hold,
+    /// and parked short of its exec while the next rotation runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_frees_its_lock_while_a_child_forked_under_it_has_yet_to_exec() {
+        let dir = Scratch::new("fork-window");
+        let path = dir.log();
+        open_append_0600(&path)
+            .unwrap()
+            .write_all(b"first\n")
+            .unwrap();
+        let armed = crate::parked_fork::arm_at(1);
+        assert_eq!(rotate_if_oversized(&path, 4, None), Rotation::Rotated);
+        let child = armed.child();
+        assert!(
+            child.still_parked(),
+            "forked under the first rotation's lock"
+        );
+
+        open_append_0600(&path)
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+        assert_eq!(
+            rotate_if_oversized(&path, 4, None),
+            Rotation::Rotated,
+            "the next rotation takes the lock"
+        );
+        assert!(child.still_parked(), "…while the child had yet to exec");
+        child.release();
+        assert_eq!(read(&rotated_path(&path)), "second\n");
     }
 
     /// Two writers interleaving across several rotations: every line appears
@@ -1140,8 +1215,6 @@ mod tests {
     /// retired lines are exactly the oldest ones.
     #[test]
     fn rotation_never_loses_or_duplicates_a_line() {
-        let _serial = serial();
-
         let dir = Scratch::new("once");
         let path = dir.log();
         let mut a = RotatingFile::open(path.clone(), tiny(64)).unwrap();
@@ -1700,8 +1773,6 @@ mod rotation_conformance {
 
     #[test]
     fn two_real_writers_conform_through_rotation_follow_and_restart() {
-        let _serial = super::tests::serial();
-
         let dir = scratch("trace");
         let path = dir.join("aterm.log");
         let model = aterm_spec::interp::with_consts(&log_rotation_model(), OVERRIDES);
@@ -1756,8 +1827,6 @@ mod rotation_conformance {
     /// refuse it as a restart and name the lost lines.
     #[test]
     fn the_truncating_start_this_replaced_is_refused() {
-        let _serial = super::tests::serial();
-
         let dir = scratch("neg");
         let path = dir.join("aterm.log");
         let model = aterm_spec::interp::with_consts(&log_rotation_model(), OVERRIDES);

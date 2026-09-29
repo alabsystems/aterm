@@ -13,8 +13,8 @@
 //! toolbar`, `Wake` and `WindowId` are all library-private, so the body lives
 //! in `aterm_gui::toolbar_drive` and this file supplies only the main thread
 //! and the exit code. The contract those codes carry (`0` pass / `1` finding /
-//! `2` NOT RUN / `3` hung) is stated there and read by
-//! `aterm_verify::stages::objc_toolbar_outcome`.
+//! `2` NOT RUN / `3` hung) is stated there and read through this driver's
+//! row in `aterm_verify::stages::OBJC_DRIVES`.
 
 /// The drive could not execute here. NOT a pass — see the module docs in
 /// `aterm_gui::toolbar_drive`.

@@ -44,7 +44,8 @@ pub(crate) struct TurnRecord {
     /// Whether a submit keypress VERIFIABLY landed (content advanced). `false`
     /// for `submit=none` and for a swallowed submit that never took.
     pub submitted: bool,
-    /// The settle verdict: `settled` (went quiet) or `timeout` (deadline hit).
+    /// The settle verdict: `settled` (went quiet), `timeout` (deadline hit) or
+    /// `hangup` (the caller hung up during the settle, so it was not awaited).
     pub status: &'static str,
     /// The submitted message, truncated to [`MAX_TEXT`] bytes on a char boundary.
     pub text: String,
@@ -213,12 +214,13 @@ impl TurnLedger {
     }
 }
 
-/// A carried record's `status` word as the one this build prints: `settled`
-/// or `timeout` (what `cmd_turn` records); `None` for any other word.
+/// A carried record's `status` word as the one this build prints: `settled`,
+/// `timeout` or `hangup` (what `cmd_turn` records); `None` for any other word.
 pub(crate) fn status_word(word: &str) -> Option<&'static str> {
     match word {
         "settled" => Some("settled"),
         "timeout" => Some("timeout"),
+        "hangup" => Some("hangup"),
         _ => None,
     }
 }

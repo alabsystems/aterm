@@ -145,19 +145,6 @@ impl App {
         }
     }
 
-    /// Open the inline pin editor over `tab` of `window`, editing that tab's
-    /// FOCUSED pane's session. Returns whether an edit is now live.
-    ///
-    /// Seeding comes from HERE, not from the strip: the chip only knows its
-    /// COMPOSED label (and paints a further ⌘-hinted decoration of it), so
-    /// seeding from the view would let the first Return pin an OSC-derived
-    /// display string as if the user had typed it. The field is seeded with the
-    /// PIN (empty when unpinned) and placeheld with the resolved label, so an
-    /// empty field visibly means "fall back to that".
-    ///
-    /// A second begin over a live edit is idempotent when it names the same
-    /// session, and replaces the edit otherwise (committing nothing — the user
-    /// moved on deliberately).
     /// Whether `window` can PRESENT an inline rename editor at all. macOS has a
     /// native field; everywhere else the editor is painted by the tab strip, so
     /// a window running with `tab_strip_rows = 0` has nowhere to put it. Surfaces
@@ -172,6 +159,20 @@ impl App {
             .is_some_and(|handle| self.apprt.can_present_tab_rename(handle))
     }
 
+    /// Open the inline pin editor over `tab` of `window`, editing that tab's
+    /// FOCUSED pane's session. Returns whether an edit is now live.
+    ///
+    /// Seeding comes from HERE, not from the strip: the chip only knows its
+    /// COMPOSED label (and paints a further ⌘-hinted decoration of it), so
+    /// seeding from the view would let the first Return pin an OSC-derived
+    /// display string as if the user had typed it. The field is seeded with the
+    /// PIN (empty when unpinned) and placeheld with the resolved label, so an
+    /// empty field visibly means "fall back to that".
+    ///
+    /// A second begin over a live edit is idempotent when it names the same
+    /// session, chip and field, and otherwise SETTLES (commits) the live edit
+    /// before opening the new one — the commit convention every other exit
+    /// keeps ([`Self::begin_session_meta_edit`]).
     pub(crate) fn begin_session_rename(&mut self, window: WindowId, tab: TabId) -> bool {
         self.begin_session_meta_edit(window, tab, MetaField::Title)
     }
@@ -631,14 +632,26 @@ mod tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.tab_strip_rows = 1;
-        assert!(app.begin_active_session_rename(wid));
+        let first = app.windows[&wid].tab_set.tabs()[0].id;
+        assert!(app.begin_session_rename(wid, first));
         app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("x".to_string()));
 
         // Re-opening over the SAME chip is a no-op that keeps the caret, so the
-        // replace path needs a genuinely different target: end and reopen.
-        app.settle_rename_edit(wid);
-        assert_eq!(pin(&app, 0).as_deref(), Some("x"), "settling commits");
-        assert_eq!(app.rename_edit_session(wid), None);
+        // replace path needs a genuinely different target: a second tab, begun
+        // through the same entry point every command spelling reaches.
+        app.push_stub_tab(wid, crate::stub_session(1));
+        let second = app.windows[&wid].tab_set.tabs()[1].id;
+        assert!(app.begin_session_rename(wid, second));
+        assert_eq!(
+            pin(&app, 0).as_deref(),
+            Some("x"),
+            "the replaced edit was committed, not dropped"
+        );
+        assert_eq!(
+            app.rename_edit_session(wid),
+            Some(1),
+            "the new edit is live on the second tab"
+        );
     }
 
     /// CANCEL: Escape writes nothing, records nothing, and closes the editor —

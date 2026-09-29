@@ -183,6 +183,519 @@ pub fn harness_codex_daemon_update_model() -> Model {
     }
 }
 
+/// THE LIVE UPGRADE'S LADDER (the owner's decision of 2026-09-28, after a
+/// Codex upgrade sat behind in tab 1 for ten hours and the owner asked "do I
+/// need to do something? … I want upgrades to be applied automatically"):
+/// "Time ladder — prefer a natural pause; the longer it has been behind, the
+/// less it waits: after 20 min a pause that only looks quiet counts, after 1 h
+/// 'you're at the tab' means only that you typed in the last 20 s, and by
+/// about 2 h it moves at the first such pause. It never types over a draft, a
+/// dialog or running work." `aterm_agent::harness::upgrade::gate` and
+/// `upgrade::rung`, `upgrade_drive::St::still`, `upgrade_codex::daemon_turn`
+/// and `upgrade_codex::daemon_step`, as the daemon-mode Codex client the
+/// incident was (its move is one typed `/exit`).
+///
+/// THE LANE. `rung` (0 Prefer, 1 Settled, 2 KeysOnly, 3 Land) climbs with the
+/// clock (`Advance`) while a move is owed (`behind`). `Move` is the step: never
+/// while a turn runs that may be THIS client's own (`work`: 1 its root's —
+/// the agent's own on its screen, its own thread's in its Codex daemon — or
+/// 2 one this screen never draws and the lane never places, below), a draft
+/// stands (`draft`) or a box is up (`dialog`); never while the screen's mark (`glyph`: 0 `›`, 1 Codex 0.158.0's `»`) is one the reader
+/// cannot read (`reads`); a person holds it — anyone near the tab (`keys` 1:
+/// within `human_grace_s`) until KeysOnly, then only a keystroke within 20 s
+/// (`keys` 2); and it waits for a settle — the screen's own quiet (`quiet`,
+/// which a repaint ends: `Repaint`), or from Settled the reader's run of idle
+/// looks at the same last words (`seen` 2, two `Look`s; a repaint leaves it),
+/// and at Land none. A turn in ANOTHER session on the same daemon (`other`
+/// 1: another conversation's ROOT, with another Codex attached to the
+/// daemon) holds this client only until it is PLACED there: the kernel names
+/// a client's own conversation only where every thread of its daemon hangs
+/// from one root and it is the daemon's one client, so with another session
+/// on the daemon the lane places a running root by this screen — two looks of
+/// one still run, `QUIET_S` (20 s) apart, that found it running (`other_seen`
+/// 2) — a turn of this client's own root would have drawn on it (a status
+/// row, streaming words, a finished turn's rows), so a root that ran through
+/// 20 s of it is another session's, and holds nothing more. What the lane
+/// can NEVER place holds it for as long as it runs (`work` 2, `HiddenStarts`):
+/// a SUBAGENT's turn — its turns draw on no main screen, its own
+/// conversation's included; the third review of 2026-09-28 found three
+/// subagents of the owner's tab's own conversation on its daemon, running on
+/// their own after their spawn — whether the kernel names this client's
+/// conversation (then it IS this client's) or not; and a root's with this
+/// client the daemon's only Codex (a thread no tab shows — or this client's
+/// own conversation while its screen shows another thread, a subagent's or
+/// a `/side` fork's — not provably another session's). The screen reads idle
+/// at the same words through it, so the looks go on (`Look`).
+/// THAT PLACEMENT IS AN ASSUMPTION, and the model states where it fails:
+/// under a GOAL this screen's footer shows (`goal`: `Pursuing goal (…)`), a
+/// turn of this client's own may run where the screen reads idle — the goal's
+/// next turn streams under the last turn's end row with no status row, the
+/// last words standing (measured 2026-09-28, `GOAL_NEXT_TURN_0_158`) — so
+/// such a turn (`TurnStarts` under `goal`) keeps the still run going and the
+/// looks reading it, and the lane places NOTHING under a goal (`other_seen`
+/// counts no look there). `Move`'s own-work clause is the real rule as it
+/// sees it — no turn of this client's, or one the still run placed with no
+/// goal on the screen — so `NoRunningWorkInterrupted` rests on the
+/// assumption, not on the model's knowledge of whose turn it is: a turn of
+/// this client's own that no goal hides draws on its screen and begins the
+/// run again (`TurnStarts` without `goal`), and the goal's footer stands
+/// until its hidden turn has ended (`GoalPaused` between turns).
+/// Where a root IS placed the assumption stays one: that this client's screen
+/// draws its own root's turn — not true where it shows a subagent's or a
+/// `/side` fork's thread, or pursues a goal with no status line configured
+/// (its footer draws the goal only through one); unmeasured, and not in this
+/// model, whose `TurnStarts` without a goal always draws.
+/// `Pin` is the daemon's pin (it restarts the daemon, so it waits
+/// for every thread idle, this client's and every other's); a current client
+/// on an unpinned daemon keeps its tab due for it (`kept`) — main's rule,
+/// which the owner never dropped (the vendor's armed updater restarted that
+/// daemon mid-turn at 06:05:45Z). The environment: turns start and end
+/// (`TurnStarts`, `TurnEnds` — a goal-mode Codex starts the next at once;
+/// `HiddenStarts`, `HiddenEnds`; `OtherStarts`, `OtherEnds`),
+/// a goal is pursued and paused (`GoalPursued`,
+/// `GoalPaused`), repaints, a person types, pauses and leaves, drafts and
+/// boxes come and go, and the mark changes.
+///
+/// SAFETY, each with its `Buggy` member (the ratchet's non-vacuity, and each
+/// dead action caught ALONE — `verify::audit_dead_negative_controls`):
+/// `NeverOverADraft` (`MoveOverADraft`), `NeverOverABox` (`MoveOverABox`),
+/// `NeverWithinKeysGap` (`NowWaivesThePerson`: the owner's `--now` as it was
+/// until 2026-09-28, which waived the person outright), and
+/// `NoRunningWorkInterrupted` (`MoveMidTurn`: a daemon-mode client ended while
+/// its own thread runs a turn — the report's proposed repaint-proof move;
+/// Codex 0.158.0's binary holds `Disconnected from this task. The current
+/// turn was stopped.` for some case of an `/exit`, unmeasured which; and
+/// `PlacedUnderAGoal`: the still run placing this client's own goal turn —
+/// the second review of 2026-09-28, which drove the incident's goal looks
+/// with one more thread on the daemon through that rule, and it typed
+/// `/exit` at 06:12:42Z, mid-goal; and `PlacedAsItRan`: the still run
+/// placing whatever ran through two of its looks — a subagent of this
+/// client's own conversation, another's subagent, a root with no other Codex
+/// attached — the third review of 2026-09-28, whose probe drove the owner's
+/// shape, one conversation and its subagents under one TUI, through that
+/// rule, and it typed `/exit` while a subagent of the tab's own ran) — the
+/// moves record what stood when they were taken (`at_*`).
+/// `QuietPauseCounts`
+/// (`SeqSettle`): a look at a pause the ladder counts from Settled never waits
+/// `settling` for a screen that only repainted — the incident's 120
+/// `wait:settling`. And each of the LIVELOCKS below is also a bad STATE the
+/// moment its mutant decides it, so no mutant is caught by the liveness alone:
+/// `TheGraceNarrowsAtKeysOnly` (`AttendedWithoutLadder`: a pause from
+/// KeysOnly on, nothing standing but a person merely near the tab, waited
+/// on), `EitherMarkIsRead` (`BlindReader`: an idle `»` screen not read),
+/// `AnotherSessionsTurnHoldsNothing` (`OtherTurnHolds`: this branch's first
+/// cut, which held an idle client for every thread of its daemon — another
+/// tab's goal included, placed or not — deciding so where no goal shows here)
+/// and `AnUnpinnedDaemonKeepsItsTabDue` (`PinDropsDue`:
+/// this branch's first cut again, which let a current client on an unpinned
+/// daemon go, so nothing in the window pinned it). Each mutant fires only
+/// from a state no mutant has touched (`slipped`): one slip per behaviour —
+/// what "caught ALONE" asks — which also keeps the `Buggy = 1` space inside
+/// the interpreter's budget (`non_vacuity_ratchet`'s
+/// `every_buggy_space_fits_the_interpreter`).
+///
+/// LIVENESS: [`harness_upgrade_ladder_liveness`].
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_ladder_model() -> Model {
+    crate::ty_model! {
+        HarnessUpgradeLadder {
+            const Buggy = 0;
+            const LandRung = 3;
+            var rung = 0;
+            var behind = 1;
+            var pinned = 0;
+            var kept = 1;
+            var work = 0;
+            var other = 0;
+            var other_seen = 0;
+            var goal = 0;
+            var scoped = 1;
+            var quiet = 0;
+            var seen = 0;
+            var keys = 0;
+            var draft = 0;
+            var dialog = 0;
+            var glyph = 0;
+            var reads = 1;
+            var narrows = 1;
+            var moved = 0;
+            var missed = 0;
+            var at_draft = 0;
+            var at_box = 0;
+            var at_keys = 0;
+            var at_work = 0;
+            var slipped = 0;
+
+            // The wall clock, while a move is owed: the ladder's rung.
+            action Advance when (behind == 1 && rung <= LandRung - 1) {
+                rung = rung + 1;
+            }
+            // A turn of this client's own root: on its screen, or its own
+            // thread's in its daemon. Not guarded on `behind`: a thread runs
+            // on after its client moved. It draws on its screen (a status row,
+            // streaming words), which begins the still run again — except
+            // under a goal, whose next turn may run where the screen reads the
+            // last one ENDED at the same words.
+            action TurnStarts when (work == 0) {
+                work = 1;
+                quiet = 0;
+                seen = if goal == 1 { seen } else { 0 };
+                other_seen = 0;
+            }
+            action TurnEnds when (work == 1) {
+                work = 0;
+            }
+            // A turn the lane can NEVER place: a SUBAGENT's — one this
+            // client's conversation spawned (the owner's daemon, 2026-09-28:
+            // three of them, their turns begun after the spawn), or another
+            // conversation's — or a root's with this client the daemon's only
+            // Codex. It never draws on this screen, which reads idle at the
+            // same words look after look: nothing of it moves. Before the
+            // move (after it, a turn anywhere is `TurnStarts` or `OtherStarts`
+            // to the pin).
+            action HiddenStarts when (behind == 1 && work == 0) {
+                work = 2;
+            }
+            action HiddenEnds when (work == 2) {
+                work = 0;
+            }
+            // A turn in another session on the same daemon (a goal's thread
+            // in another tab: it ends and starts again at once), another Codex
+            // attached: nothing of this client's screen moves.
+            action OtherStarts when (other == 0) {
+                other = 1;
+            }
+            action OtherEnds when (other == 1) {
+                other = 0;
+            }
+            // The footer says a goal is pursued (`Pursuing goal (…)`), and
+            // stops saying so — paused, achieved, cleared — between its turns:
+            // a hidden turn ends first (an Esc interrupts it, which draws).
+            // Nothing is placed under a goal, so its run of placing looks ends.
+            action GoalPursued when (behind == 1 && goal == 0) {
+                goal = 1;
+                other_seen = 0;
+            }
+            action GoalPaused when (behind == 1 && goal == 1 && work == 0) {
+                goal = 0;
+            }
+            // A redraw with no new words (a footer clock, a goal's counter).
+            action Repaint when (behind == 1) {
+                quiet = 0;
+            }
+            action Still when (behind == 1 && work == 0 && quiet == 0) {
+                quiet = 1;
+            }
+            // A look at an idle screen the reader trusts — while a turn it
+            // never draws runs too (`work` 2), and under a goal while its own
+            // root's turn does (neither shows): the run of looks at the same
+            // last words grows, and so does the run of looks that found
+            // another session's root running through it (`other_seen`: two
+            // PLACE it — a turn of this client's own root would have drawn on
+            // its screen, which stood still); a look that finds none running
+            // ends that run, and so does one under a goal, which places
+            // nothing.
+            action Look when (
+                behind == 1 && (work == 0 || work == 2 || goal == 1) &&
+                (glyph == 0 || reads == 1) &&
+                (seen <= 1 || (other == 1 && goal == 0 && other_seen <= 1))
+            ) {
+                seen = if seen <= 1 { seen + 1 } else { 2 };
+                other_seen = if other == 1 && goal == 0 { other_seen + 1 } else { 0 };
+            }
+            action Type when (behind == 1) {
+                keys = 2;
+            }
+            action KeysPause when (behind == 1 && keys == 2) {
+                keys = 1;
+            }
+            action KeysAway when (behind == 1 && keys == 1) {
+                keys = 0;
+            }
+            action DraftTyped when (behind == 1 && draft == 0) {
+                draft = 1;
+            }
+            action DraftCleared when (behind == 1 && draft == 1) {
+                draft = 0;
+            }
+            action BoxUp when (behind == 1 && dialog == 0) {
+                dialog = 1;
+            }
+            action BoxDown when (behind == 1 && dialog == 1) {
+                dialog = 0;
+            }
+            action MarkChanges when (behind == 1) {
+                glyph = if glyph == 0 { 1 } else { 0 };
+            }
+            // The daemon's pin: it restarts the daemon, so every thread idle,
+            // this client's and every other session's; taken by a step of a
+            // tab that is due — for its move, or, current on an unpinned
+            // daemon, for the pin alone (`kept`).
+            action Pin when (
+                pinned == 0 && work == 0 && other == 0 && (behind == 1 || kept == 1)
+            ) {
+                pinned = 1;
+            }
+            // The step, as the real rule sees the daemon: no turn of this
+            // client's own — or its root's the still run placed, which it does
+            // only with no goal on the screen (a subagent's, never) — and
+            // another session's turn holds it unless the still run placed it,
+            // which it does only for a root with another Codex attached and no
+            // goal on the screen.
+            action Move when (
+                behind == 1 && (work == 0 || (work == 1 && goal == 0 && seen == 2)) &&
+                draft == 0 && dialog == 0 &&
+                (glyph == 0 || reads == 1) &&
+                (keys == 0 || (rung > 1 && narrows == 1 && keys <= 1)) &&
+                (other == 0 || (scoped == 1 && goal == 0 && other_seen == 2)) &&
+                (rung == LandRung || quiet == 1 || (rung > 0 && seen == 2))
+            ) {
+                behind = 0;
+                moved = 1;
+                at_draft = draft;
+                at_box = dialog;
+                at_keys = keys;
+                at_work = work;
+            }
+            // THE MUTANTS, each its own dead action. The incident's settle: a
+            // look at a pause the ladder counts that waits `settling` because
+            // the screen repainted.
+            action SeqSettle when (
+                Buggy == 1 && slipped == 0 &&
+                behind == 1 && work == 0 && draft == 0 && dialog == 0 &&
+                (glyph == 0 || reads == 1) &&
+                (keys == 0 || (rung > 1 && narrows == 1 && keys <= 1)) &&
+                rung > 0 && rung <= LandRung - 1 && seen == 2 && quiet == 0 && missed == 0
+            ) {
+                slipped = 1;
+                missed = 1;
+            }
+            // A person near the tab holds it at every rung (`human_grace_s`
+            // never narrows): the upgrade before the ladder, deciding so at a
+            // pause from KeysOnly on where nothing else stands.
+            action AttendedWithoutLadder when (
+                Buggy == 1 && slipped == 0 &&
+                narrows == 1 && behind == 1 && rung > 1 && keys == 1 &&
+                work == 0 && draft == 0 && dialog == 0
+            ) {
+                slipped = 1;
+                narrows = 0;
+            }
+            // The reader of the incident: `›` alone, blind to 0.158.0's `»`,
+            // deciding so at an idle `»` screen.
+            action BlindReader when (
+                Buggy == 1 && slipped == 0 && reads == 1 && behind == 1 && glyph == 1 && work == 0
+            ) {
+                slipped = 1;
+                reads = 0;
+            }
+            // Every thread of the daemon holds the client (this branch's first
+            // cut), deciding so at an idle client whose screen has placed
+            // another session's running turn.
+            action OtherTurnHolds when (
+                Buggy == 1 && slipped == 0 &&
+                scoped == 1 && behind == 1 && other == 1 && other_seen == 2 &&
+                goal == 0 && work == 0
+            ) {
+                slipped = 1;
+                scoped = 0;
+            }
+            // A current client on an unpinned daemon let go (this branch's
+            // first cut): nothing in the window pins that daemon.
+            action PinDropsDue when (
+                Buggy == 1 && slipped == 0 && kept == 1 && behind == 0 && pinned == 0
+            ) {
+                slipped = 1;
+                kept = 0;
+            }
+            // The owner's `--now` as it was: the person waived outright.
+            action NowWaivesThePerson when (
+                Buggy == 1 && slipped == 0 &&
+                behind == 1 && work == 0 && draft == 0 && dialog == 0 &&
+                keys == 2 && rung == LandRung
+            ) {
+                slipped = 1;
+                behind = 0;
+                moved = 1;
+                at_draft = draft;
+                at_box = dialog;
+                at_keys = keys;
+                at_work = work;
+            }
+            action MoveOverADraft when (
+                Buggy == 1 && slipped == 0 &&
+                behind == 1 && work == 0 && draft == 1 && rung == LandRung
+            ) {
+                slipped = 1;
+                behind = 0;
+                moved = 1;
+                at_draft = draft;
+                at_box = dialog;
+                at_keys = keys;
+                at_work = work;
+            }
+            action MoveOverABox when (
+                Buggy == 1 && slipped == 0 &&
+                behind == 1 && work == 0 && dialog == 1 && rung == LandRung
+            ) {
+                slipped = 1;
+                behind = 0;
+                moved = 1;
+                at_draft = draft;
+                at_box = dialog;
+                at_keys = keys;
+                at_work = work;
+            }
+            // A daemon-mode client ended while its own thread runs a turn.
+            action MoveMidTurn when (
+                Buggy == 1 && slipped == 0 &&
+                behind == 1 && work == 1 && rung == LandRung
+            ) {
+                slipped = 1;
+                behind = 0;
+                moved = 1;
+                at_draft = draft;
+                at_box = dialog;
+                at_keys = keys;
+                at_work = work;
+            }
+            // The still run placing through a goal (the round before the
+            // second review of 2026-09-28): the goal's own hidden turn ran
+            // through two looks of this screen's run, as another session's
+            // would, and the client was ended mid-goal.
+            action PlacedUnderAGoal when (
+                Buggy == 1 && slipped == 0 && behind == 1 && work == 1 && goal == 1 && seen == 2 &&
+                draft == 0 && dialog == 0 && keys == 0 && rung > 0
+            ) {
+                slipped = 1;
+                behind = 0;
+                moved = 1;
+                at_draft = draft;
+                at_box = dialog;
+                at_keys = keys;
+                at_work = work;
+            }
+
+            // The still run placing whatever ran through two of its looks (the
+            // round before the third review of 2026-09-28): a turn the lane
+            // can never place — a subagent of this client's own conversation,
+            // whose turns never drew here, another's subagent, a root with no
+            // other Codex attached — taken for another session's, and the
+            // client ended over it. The model counts no looks of such a turn
+            // (`other_seen` counts another session's root's), so here it slips
+            // wherever one runs under a still run of two looks.
+            action PlacedAsItRan when (
+                Buggy == 1 && slipped == 0 && behind == 1 && goal == 0 &&
+                work == 2 && other == 0 && seen == 2 &&
+                draft == 0 && dialog == 0 && keys == 0 && rung > 0 &&
+                (glyph == 0 || reads == 1)
+            ) {
+                slipped = 1;
+                behind = 0;
+                moved = 1;
+                at_draft = draft;
+                at_box = dialog;
+                at_keys = keys;
+                at_work = work;
+            }
+
+            invariant NeverOverADraft: at_draft == 0;
+            invariant NeverOverABox: at_box == 0;
+            invariant NeverWithinKeysGap: at_keys <= 1;
+            invariant NoRunningWorkInterrupted: at_work == 0;
+            invariant QuietPauseCounts: missed == 0;
+            invariant TheGraceNarrowsAtKeysOnly: narrows == 1;
+            invariant EitherMarkIsRead: reads == 1;
+            invariant AnotherSessionsTurnHoldsNothing: scoped == 1;
+            invariant AnUnpinnedDaemonKeepsItsTabDue: kept == 1;
+        }
+    }
+}
+
+/// "THE UPGRADE LANDS" — the ladder's law as a property of whole behaviours
+/// (the owner, 2026-09-28: "I want upgrades to be applied automatically"; the
+/// law of aterm's own update ladder: ACTIVITY DELAYS; IT NEVER DISABLES):
+/// `[]<>(moved-and-pinned \/ a-floor-stands)` — again and again, the move is
+/// done and the daemon pinned (`behind = 0 /\ pinned = 1`); or, while the
+/// move is owed, one of the floors no rung relaxes stands: a turn running
+/// that may be this client's own (`work > 0`: its root's, or one the lane
+/// never places — a subagent's, a root's with this client the daemon's only
+/// Codex), a draft, a box, a keystroke within 20 s (`keys = 2`), or another
+/// session's turn while this screen's footer shows a goal of its own
+/// (`goal = 1 /\ other = 1`: nothing is placed under a goal, whose own turns
+/// run unseen) — never another session's root's turn otherwise, which the
+/// lane places and passes; or, the move done, the pin's own floor stands: a
+/// turn running anywhere on the daemon (`work`, `other`). A behaviour that
+/// leaves it for
+/// good is one with no floor ever again and still no move or no pin — the
+/// ladder waiting on comfort for ever, an idle client held for another
+/// session's turn, or an unpinned daemon nobody visits.
+///
+/// THE ENVIRONMENT IS NOT FAIR: turns (this client's and other sessions'),
+/// repaints, keystrokes, a person coming back, drafts, boxes and the mark are
+/// the world's, and any may go on for ever — a goal-mode Codex turn included,
+/// which is why a floor that keeps standing satisfies the goal (the upgrade
+/// does not move over this client's running work: a daemon-mode client in
+/// goal mode waits for its goal to pause, which the owner's decision of
+/// 2026-09-28 will let aterm do briefly itself — the named `goal` wait is
+/// that seam). What the verdict ASSUMES, and nothing more:
+///
+/// * `Advance`, weakly fair — the wall clock moves;
+/// * `Look`, weakly fair — the lane keeps looking at an idle screen it can
+///   read (the host looks again at every idle point, and on its re-look
+///   ladder), which is what places another session's running turn;
+/// * `Move`, STRONGLY fair — the look IS the move wherever the gate it
+///   computes is open, so a gate the world keeps re-opening is caught open:
+///   another session's goal idle between its turns, say, where the look that
+///   finds its thread idle moves (the model splits the look from the move;
+///   the apply ladder's `Park` is strongly fair for the same reason);
+/// * `Pin`, weakly fair — a tab kept due is looked at again (at most every
+///   `upgrade_drive::codex::PIN_LOOK_S` for the pin alone), and its step pins
+///   a daemon every thread of which stays idle.
+///
+/// The mutants that break it, each alone: `AttendedWithoutLadder` (a person
+/// back within `human_grace_s` for ever holds the move for ever),
+/// `BlindReader` (a `»` the reader never reads: no step at all — the
+/// incident's last hour), `OtherTurnHolds` (an idle client held for as long
+/// as another tab's goal runs) and `PinDropsDue` (a current, unpinned daemon
+/// nobody's step visits: the vendor's updater stays armed). Livelocks all:
+/// nothing is ever stuck, so no deadlock check sees them.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_ladder_liveness() -> Liveness {
+    Liveness {
+        name: "TheUpgradeLands",
+        goal: or_(
+            and_(
+                eq(var("behind"), int(0)),
+                or_(
+                    eq(var("pinned"), int(1)),
+                    or_(gt(var("work"), int(0)), eq(var("other"), int(1))),
+                ),
+            ),
+            and_(
+                eq(var("behind"), int(1)),
+                or_(
+                    or_(
+                        or_(gt(var("work"), int(0)), eq(var("draft"), int(1))),
+                        or_(eq(var("dialog"), int(1)), eq(var("keys"), int(2))),
+                    ),
+                    and_(eq(var("goal"), int(1)), eq(var("other"), int(1))),
+                ),
+            ),
+        ),
+        weak: vec!["Advance", "Look", "Pin"],
+        strong: vec!["Move"],
+        mutants: vec![
+            "AttendedWithoutLadder",
+            "BlindReader",
+            "OtherTurnHolds",
+            "PinDropsDue",
+        ],
+    }
+}
+
 /// A READY answer is usable only by the process and tab that received the
 /// notice, with a unique live owner of that conversation and a complete
 /// session-file scan. The process-start token represents the kernel PID-reuse
@@ -926,6 +1439,180 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             invariant NoDropOverAHold: dropheld == 0;
             invariant NoRestartOverDirection: overrode == 0;
             invariant NeverStalls: stalled == 0;
+        }
+    }
+}
+
+/// THE END OF THE AGENT'S OWN WORK IS THE UPGRADE'S POINT (aterm-agent
+/// `harness/upgrade.rs`, `next_step` over `Facts::work_ended`;
+/// `harness/upgrade_drive.rs`, `St::work_seen`, `St::time_work` and the visit's
+/// same-visit re-arm). The incident (2026-09-28, s-692e6 "Free disk space"):
+/// the agent answered every notice within seconds — "I can't stop yet, my
+/// workflow is still running; ask again later" — so the round asked four
+/// times at breaks of that work, gave up, rested two hours, re-armed and asked
+/// again, round after round. The one moment the move could finish is the
+/// first idle point after the work, with nothing under the agent — and there
+/// the round waited `awaiting-ready` (announced within its window) or `failed`
+/// (resting): words that own no turn end, so the loop's `keep going` took the
+/// point and a new multi-hour workflow began. The rest cycles only while the
+/// point the "not yet" waited for keeps going to the loop.
+///
+/// AND NO WAIT THERE OUTLIVES THE RE-ASK'S WINDOW (the review of 2026-09-28):
+/// the ask at the end of the work goes once the RESTART's gate is open but for
+/// the READY, and that gate never reads past Claude's status — a `shell` or
+/// `busy` left over the idle screen after the agent's background shell ended
+/// waits `status-stale` at every look. Held there whatever the window, the
+/// round stayed announced for ever: no re-ask, no give-up, no new round. Inside
+/// the window the gate's wait holds the point; past it the re-ask decides — a
+/// line through the lag (the notice's own gate reads it past), or, its asks
+/// spent, the give-up.
+///
+/// `phase` 1 announced with no READY, 2 resting after a give-up (a round that
+/// gave up hears its late READY as ever: out of the model); `asks` the round's
+/// notices (`Cap` is `MAX_ASKS`, the Tier-1 shifting the model's count onto
+/// the real one); `worked` the agent's own work seen since the latest notice;
+/// `screen` 0 an idle point with nothing under the agent, 1 a break of its own
+/// work; `lag` Claude's status reads its own work over that idle screen and
+/// never catches up (the restart's gate waits, a line's does not); `late` the
+/// re-ask's window since the latest notice has passed; `looked` the host has
+/// taken its step at this point (it goes first: `IdleHost::at_idle`), `owns`
+/// that step owns the point. `HostAsks` is the notice at the end of the work
+/// (from a rest, re-armed: its asks start again); `HostHolds` the restart
+/// gate's wait there; `HostReasks` and `HostGivesUp` the re-ask past the
+/// window; `HostWaits` the quiet word owning nothing. Three ghosts: `handed`,
+/// the loop continued the agent at an idle point after its work was seen and
+/// ended, the restart's gate open, while the round was open; `nagged`, an ask
+/// at the end of work no look saw — the one extra ask per end of its work,
+/// never a notice on a clock of its own; `stuck`, an announced round's look
+/// past its window waited the restart gate's word. DIALS, each caught alone:
+/// `Buggy = 1` every build before (the quiet word there, an ask anywhere, the
+/// wait past the window); `Nag = 1` an ask with no work seen since the notice;
+/// `Hold = 1` the wait at the end of the work holds past the window (the
+/// first build of the ask at the end of the work, before that review).
+///
+/// Tier-1: aterm-agent's `harness::upgrade` tests
+/// (`the_work_end_reducer_is_bound_to_its_model`) drive the real `next_step`
+/// over every reachable idle point of this model: it asks (`Announce`, or
+/// `Rearm` from a rest) exactly where `HostAsks` or `HostReasks` is enabled,
+/// gives up exactly where `HostGivesUp` is, waits the restart gate's word
+/// exactly where `HostHolds` is, and its quiet word exactly where `HostWaits`
+/// is.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_work_end_model() -> Model {
+    crate::ty_model! {
+        HarnessUpgradeWorkEnd {
+            const Buggy = 0;
+            const Nag = 0;        // 1: the ask needs no work seen since the notice
+            const Hold = 0;       // 1: the wait at the end of the work outlives the window
+            const Cap = 3;        // MAX_ASKS: the re-ask past it gives up
+            var phase = 1;
+            var asks = 1;
+            var worked = 0;
+            var screen = 0;
+            var lag = 0;
+            var late = 0;
+            var looked = 0;
+            var owns = 0;
+            var handed = 0;
+            var nagged = 0;
+            var stuck = 0;
+
+            // The agent's own work runs: a break of it, seen by the round's
+            // look there.
+            action WorkRuns when (screen == 0) {
+                screen = 1;
+                worked = 1;
+                looked = 0;
+                owns = 0;
+            }
+            // Its work ends: an idle point with nothing under the agent.
+            action WorkEnds when (screen == 1) {
+                screen = 0;
+                looked = 0;
+                owns = 0;
+            }
+            // Claude's status keeps reading its own work over the idle screen,
+            // and never catches up: the next look reads it.
+            action StatusLags when (screen == 0 && lag == 0) {
+                lag = 1;
+                looked = 0;
+                owns = 0;
+            }
+            // The re-ask's window since the latest notice runs out: the next
+            // look reads it.
+            action WindowPasses when (phase == 1 && late == 0) {
+                late = 1;
+                looked = 0;
+                owns = 0;
+            }
+            // Asked four times at breaks, the round gives up and rests.
+            action GivesUp when (phase == 1 && screen == 1) {
+                phase = 2;
+            }
+            // The host's step at the end of the work, the restart's gate open:
+            // the notice (a rest re-armed first), owning the point.
+            action HostAsks when (
+                screen == 0 && looked == 0 && lag == 0 &&
+                (worked == 1 || Nag == 1 || Buggy == 1)
+            ) {
+                nagged = if worked == 0 { 1 } else { nagged };
+                asks = if phase == 2 { 1 } else if asks <= Cap - 1 { asks + 1 } else { asks };
+                phase = 1;
+                worked = 0;
+                late = 0;
+                looked = 1;
+                owns = 1;
+            }
+            // The restart's gate waits there (the status lags): a settle's
+            // word, owning the point — inside the window, or through a rest.
+            action HostHolds when (
+                screen == 0 && looked == 0 && worked == 1 && lag == 1 &&
+                (phase == 2 || late == 0 || Hold == 1 || Buggy == 1)
+            ) {
+                stuck = if (phase == 1 && late == 1) { 1 } else { stuck };
+                looked = 1;
+                owns = 1;
+            }
+            // Past the window the re-ask: its line goes through the lag.
+            action HostReasks when (
+                phase == 1 && screen == 0 && looked == 0 && late == 1 && asks <= Cap - 1 &&
+                (worked == 0 || (lag == 1 && Hold == 0))
+            ) {
+                asks = asks + 1;
+                worked = 0;
+                late = 0;
+                looked = 1;
+                owns = 1;
+            }
+            // Or, its asks spent, the give-up: the round rests.
+            action HostGivesUp when (
+                phase == 1 && screen == 0 && looked == 0 && late == 1 && asks > Cap - 1 &&
+                (worked == 0 || (lag == 1 && Hold == 0))
+            ) {
+                phase = 2;
+                late = 0;
+                looked = 1;
+                owns = 0;
+            }
+            // Or its quiet word — `awaiting-ready`, `failed` — owning nothing.
+            action HostWaits when (
+                screen == 0 && looked == 0 && (worked == 0 || Buggy == 1) &&
+                (phase == 2 || late == 0)
+            ) {
+                looked = 1;
+                owns = 0;
+            }
+            // The loop continues the agent at a point its host owns nothing
+            // of; the next point comes after that turn.
+            action LoopContinues when (screen == 0 && looked == 1 && owns == 0) {
+                handed = if (worked == 1 && lag == 0) { 1 } else { handed };
+                looked = 0;
+            }
+
+            invariant TheEndOfItsWorkIsTheUpgrades: handed == 0;
+            invariant AnAskFollowsWorkItSaw: nagged == 0;
+            invariant NoWaitOutlivesTheReaskWindow: stuck == 0;
         }
     }
 }

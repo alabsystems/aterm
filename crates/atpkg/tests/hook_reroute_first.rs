@@ -220,8 +220,12 @@ fn run(
     env: &[(&str, &str)],
 ) -> Output {
     let mut cmd = Command::new(exe);
+    // The fixture's own home as the working directory: a signpost names the channel a
+    // `rust-toolchain.toml` up the tree pins (`atpkg::reroute::Pin`), so a shell left in
+    // the checkout would read whatever the checkout pins.
     cmd.args(args)
         .arg(script)
+        .current_dir(&fx.home)
         .env_clear()
         .env("HOME", &fx.home)
         .env("XDG_CONFIG_HOME", &fx.config_home)

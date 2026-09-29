@@ -200,6 +200,52 @@ pub(crate) enum ShowOp<W> {
     EnterFullScreen(W),
 }
 
+impl<W: Copy + Eq> ShowPlan<W> {
+    /// Key the window the person TYPED into before the stack went on (round
+    /// six, finding 45) — the most recent of `typed` this plan raises —
+    /// instead of the carried key window: it becomes the plan's key, raised
+    /// last, entered into full screen last and last in the focus seed.
+    /// Returns it when the key moved.
+    ///
+    /// The reveal leaves some carried window key, and it takes keys from the
+    /// moment it is on glass while the proof — which the stack waits for — can
+    /// be seconds away. A stack that raised the carried key window last over
+    /// it took the keyboard from under the person mid-command, and Commit,
+    /// seeing typing "elsewhere", only declined to raise the carried key
+    /// window again: "git pu" went to one shell and "sh⏎" ran in another.
+    ///
+    /// A window carried MINIMIZED counts too: it is on glass from its reveal
+    /// until the stack, and the reveal order can leave it key. The person
+    /// un-minimized it by using it, so it leaves `minimize` for the end of
+    /// `raise` — the stack must not send the window being typed into to the
+    /// Dock and hand the keyboard to another.
+    pub(crate) fn key_typed_window(&mut self, typed: &[W]) -> Option<W> {
+        let window = *typed
+            .iter()
+            .rev()
+            .find(|window| self.raise.contains(window) || self.minimize.contains(window))?;
+        if let Some(at) = self
+            .minimize
+            .iter()
+            .position(|candidate| *candidate == window)
+        {
+            self.minimize.remove(at);
+            self.raise.push(window);
+        }
+        if self.key == Some(window) {
+            return None;
+        }
+        self.key = Some(window);
+        for list in [&mut self.raise, &mut self.fullscreen, &mut self.focus_seed] {
+            if let Some(at) = list.iter().position(|candidate| *candidate == window) {
+                let window = list.remove(at);
+                list.push(window);
+            }
+        }
+        Some(window)
+    }
+}
+
 impl<W: Copy> ShowPlan<W> {
     /// Stage 1, the stack: minimize first, so the key window the raises settle
     /// on is the last window AppKit was told to key, then raise back to front.
@@ -412,6 +458,12 @@ impl crate::App {
     /// [`Self::settle_carried_window_show`]'s body; `may_stack` is whether this
     /// caller may apply the stack.
     fn settle_carried_window_show_as(&mut self, may_stack: bool) -> Vec<ShowOp<WindowId>> {
+        if self.carried_window_show.is_none() {
+            return Vec::new();
+        }
+        // Where the person typed while the update finished (round six,
+        // finding 45): the stack keys that window, not the carried one.
+        let typed = self.pre_commit_typed_windows();
         let Some(carried) = self.carried_window_show.as_mut() else {
             return Vec::new();
         };
@@ -443,6 +495,15 @@ impl crate::App {
                 return performed;
             }
             carried.stacked = true;
+            if !carried.committed
+                && let Some(typed_into) = carried.plan.key_typed_window(&typed)
+            {
+                aterm_log::info!(
+                    "window show: typing reached window {} before the stack, so the stack keys \
+                     it rather than the carried key window",
+                    typed_into.0
+                );
+            }
             let ops = carried.plan.stacking_ops();
             let seed = carried.plan.focus_seed.clone();
             let key = carried.plan.key;
@@ -485,6 +546,24 @@ impl crate::App {
         }
         performed.extend(self.enter_carried_fullscreen_if_due());
         performed
+    }
+
+    /// The carried windows keys or text were typed into while the update
+    /// finished — the pre-Commit queue (`handoff_deferred_input`), in the
+    /// order they were typed. What the stack and Commit read to leave the
+    /// keyboard where the person is working.
+    pub(crate) fn pre_commit_typed_windows(&self) -> Vec<WindowId> {
+        self.handoff_deferred_input
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    winit::event::WindowEvent::KeyboardInput { .. }
+                        | winit::event::WindowEvent::Ime(_)
+                )
+            })
+            .filter_map(|(winit_id, _)| self.winit_to_window.get(winit_id).copied())
+            .collect()
     }
 
     /// The update has committed: this process owns every window now. Make the
@@ -1018,6 +1097,131 @@ mod tests {
             "the user typed into window 0 before Commit: it keeps the keyboard"
         );
         assert!(app.carried_window_show.is_none());
+    }
+
+    /// ROUND SIX, FINDING 45: keys typed into a revealed window BEFORE the
+    /// stack keep that window's keyboard. Every window is revealed and the
+    /// reveal order left window 2 key; the person types into it while the
+    /// proof is still owed. The stack used to raise the carried key window 1
+    /// last over it, and Commit — seeing typing "elsewhere" — only declined to
+    /// raise window 1 again, so the replayed keys went to window 2 and every
+    /// key after Commit to window 1. Now the stack keys window 2, and Commit
+    /// leaves it there. NEGATIVE CONTROL: with nothing typed, the carried key
+    /// window is keyed, as before.
+    #[test]
+    fn keys_typed_before_the_stack_keep_their_window_through_commit() {
+        let windows = |[w0, w1, w2]: [WindowId; 3]| {
+            [
+                (w0, show(2, false)),
+                (w1, show(0, true)),
+                (w2, show(1, false)),
+            ]
+        };
+        for typed in [false, true] {
+            let (mut app, ids) = three_windows();
+            carry(&mut app, ShowLane::Handoff, &windows(ids));
+            // The reveal order: the last window revealed holds the keyboard.
+            app.frontmost_window = Some(ids[2]);
+            app.incoming_handoff_pending = true;
+            if typed {
+                let winit_id = winit::window::WindowId::from(2u64);
+                app.winit_to_window.insert(winit_id, ids[2]);
+                app.queue_pre_commit_input(
+                    winit_id,
+                    winit::event::WindowEvent::Ime(winit::event::Ime::Commit("git pu".into())),
+                );
+            }
+            let stack = app.settle_carried_window_show_at_proof();
+            let key = if typed { ids[2] } else { ids[1] };
+            assert_eq!(
+                stack.last(),
+                Some(&ShowOp::Raise(key)),
+                "typed={typed}: the stack raises the window to key last: {stack:?}"
+            );
+            let typed_into = app.pre_commit_typed_windows();
+            let commit = app.commit_carried_window_show(&typed_into);
+            assert_eq!(
+                commit,
+                vec![ShowOp::Raise(key)],
+                "typed={typed}: Commit keys it again"
+            );
+            assert_eq!(
+                app.frontmost_window,
+                Some(key),
+                "typed={typed}: the keyboard is where the person was typing"
+            );
+        }
+    }
+
+    /// ROUND SIX, FINDING 45, THE MINIMIZED CASE. Window 2 was minimized at
+    /// the park, but every carried window is on glass from its reveal until
+    /// the stack, and the reveal left window 2 key. The person typed into it.
+    /// The stack used to consider only the windows it raises, so it sent
+    /// window 2 — the one being typed into — to the Dock and raised window 1
+    /// last: the replayed keys went to window 2, every later key to window 1,
+    /// and Commit logged that window 2 kept a keyboard it no longer had. The
+    /// person un-minimized window 2 by using it: the stack now leaves it on
+    /// glass, raises it last and keys it, and Commit keys it again.
+    /// NEGATIVE CONTROL: with nothing typed, window 2 goes to the Dock and
+    /// window 1 is keyed, as carried.
+    #[test]
+    fn keys_typed_into_a_window_carried_minimized_keep_it_out_of_the_dock() {
+        let windows = |[w0, w1, w2]: [WindowId; 3]| {
+            let mut minimized = show(1, false);
+            minimized.minimized = Some(true);
+            [(w0, show(2, false)), (w1, show(0, true)), (w2, minimized)]
+        };
+        for typed in [false, true] {
+            let (mut app, ids) = three_windows();
+            carry(&mut app, ShowLane::Handoff, &windows(ids));
+            app.frontmost_window = Some(ids[2]);
+            app.incoming_handoff_pending = true;
+            if typed {
+                let winit_id = winit::window::WindowId::from(2u64);
+                app.winit_to_window.insert(winit_id, ids[2]);
+                app.queue_pre_commit_input(
+                    winit_id,
+                    winit::event::WindowEvent::Ime(winit::event::Ime::Commit("git pu".into())),
+                );
+            }
+            let stack = app.settle_carried_window_show_at_proof();
+            if typed {
+                assert!(
+                    !stack.contains(&ShowOp::Minimize(ids[2])),
+                    "the window typed into is not sent to the Dock: {stack:?}"
+                );
+                assert_eq!(
+                    stack.last(),
+                    Some(&ShowOp::Raise(ids[2])),
+                    "it is raised last, so it keeps the keyboard: {stack:?}"
+                );
+                assert_eq!(
+                    app.focus_order.last(),
+                    Some(&ids[2]),
+                    "the focus seed puts it most recent"
+                );
+            } else {
+                assert_eq!(
+                    stack.first(),
+                    Some(&ShowOp::Minimize(ids[2])),
+                    "nothing typed: it goes back to the Dock: {stack:?}"
+                );
+                assert_eq!(stack.last(), Some(&ShowOp::Raise(ids[1])), "{stack:?}");
+            }
+            let key = if typed { ids[2] } else { ids[1] };
+            let typed_into = app.pre_commit_typed_windows();
+            let commit = app.commit_carried_window_show(&typed_into);
+            assert_eq!(
+                commit,
+                vec![ShowOp::Raise(key)],
+                "typed={typed}: Commit keys it again"
+            );
+            assert_eq!(
+                app.frontmost_window,
+                Some(key),
+                "typed={typed}: the keyboard is where the person was typing"
+            );
+        }
     }
 
     /// Stage 2: full screen waits for Commit AND for aterm to be in front, and

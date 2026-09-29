@@ -57,6 +57,12 @@ fn wedged_socket() -> (Arc<SinkWriter>, UnixStream, usize) {
     (sink, reader, filled)
 }
 
+/// How long every test here waits for what MUST happen — the accepted bytes,
+/// the drained spill, the retyped key, a paste reaching `Writing`, a sever
+/// releasing its writer, a reply read back: a hang detector, never a latency
+/// budget.
+const MUST_HAPPEN: Duration = Duration::from_secs(60);
+
 /// Poll `done` until it holds or `limit` passes.
 fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + limit;
@@ -67,6 +73,30 @@ fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(2));
     }
     done()
+}
+
+/// THE PARK WITNESS for the never-parks tests: a thread that reads the
+/// program's input out ONLY if `done` is not set within a minute, and says
+/// whether it had to. A dispatch that parks on the wedged fd returns only once
+/// this watchdog has unwedged it, so `true` is the park, decided by order; a
+/// dispatch that returns by itself sets `done` first, however loaded the
+/// machine. The minute is a hang detector — never a latency budget, which a
+/// loaded machine's pass once crossed (a 2 s bound on the dispatch's wall
+/// clock against this watchdog's 20 s unwedge).
+fn park_witness(reader: i32, done: Arc<AtomicBool>) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                // The dispatch parked: unwedge it so the test can fail.
+                let mut buf = [0u8; 65536];
+                while unsafe { libc::read(reader, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    })
 }
 
 /// Enqueue `ev` for `sink` on the ordered writer, borrowing the terminal,
@@ -110,11 +140,11 @@ fn left_press() -> InputEvent {
     }
 }
 
-/// Read the `O_NONBLOCK` read end `fd` until `want` bytes arrived, or ten
-/// seconds passed (then whatever did).
+/// Read the `O_NONBLOCK` read end `fd` until `want` bytes arrived, or
+/// [`MUST_HAPPEN`] passed (then whatever did).
 fn read_until(fd: i32, want: usize) -> Vec<u8> {
     let mut got = Vec::with_capacity(want);
-    wait_until(Duration::from_secs(10), || {
+    wait_until(MUST_HAPPEN, || {
         let mut buf = [0u8; 65536];
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
@@ -147,8 +177,8 @@ fn close_pipe(pipe: [i32; 2]) {
 /// before: the key parked the UI thread in `write_frame_after_reserve` until
 /// the program read.
 ///
-/// A watchdog reads the pipe out after 20 s, so a regression FAILS the
-/// elapsed-time assertion instead of hanging the suite.
+/// A watchdog reads the pipe out after a minute ([`park_witness`]), so a
+/// regression FAILS on the watchdog's word instead of hanging the suite.
 #[test]
 fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -175,22 +205,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     }
 
     let done = Arc::new(AtomicBool::new(false));
-    let watchdog = {
-        let done = Arc::clone(&done);
-        let reader = pipe[0];
-        std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !done.load(Ordering::Acquire) {
-                if Instant::now() >= deadline {
-                    // The dispatch parked: unwedge it so the test can fail.
-                    let mut buf = [0u8; 65536];
-                    while unsafe { libc::read(reader, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
+    let watchdog = park_witness(pipe[0], Arc::clone(&done));
     let refused_before = crate::metrics::input_refused();
     let session = app
         .front_terminal_mirror(WindowId(0))
@@ -209,10 +224,10 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     let second = app.input(WindowId(0), InputEvent::Text("k".into()), Source::Human);
     let took = t0.elapsed();
     done.store(true, Ordering::Release);
-    watchdog.join().expect("watchdog");
     assert!(
-        took < Duration::from_secs(2),
-        "the key parked the event loop for {took:?}"
+        !watchdog.join().expect("watchdog"),
+        "the key parked the event loop until the watchdog read the program's \
+         input out ({took:?})"
     );
     assert_eq!(
         outcome,
@@ -230,7 +245,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     let expect = filled + accepted.iter().map(Vec::len).sum::<usize>();
     let mut got = Vec::with_capacity(expect);
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until(MUST_HAPPEN, || {
             let mut buf = [0u8; 65536];
             let n = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
@@ -249,11 +264,11 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     assert!(!got.contains(&b'k'), "the refused key was never delivered");
 
     // The spill has drained: the retyped key goes through.
-    assert!(wait_until(Duration::from_secs(5), || sink.egress_drained_to_kernel()));
+    assert!(wait_until(MUST_HAPPEN, || sink.egress_drained_to_kernel()));
     let outcome = app.input(WindowId(0), InputEvent::Text("z".into()), Source::Human);
     assert_eq!(outcome, InputOutcome::Ok);
     let mut z = Vec::new();
-    assert!(wait_until(Duration::from_secs(5), || {
+    assert!(wait_until(MUST_HAPPEN, || {
         let mut buf = [0u8; 16];
         let n = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
@@ -304,7 +319,7 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
     }
     assert_eq!(refused, 6);
     assert!(
-        wait_until(Duration::from_secs(5), || meters[0].progress().state
+        wait_until(MUST_HAPPEN, || meters[0].progress().state
             == BulkState::Writing),
         "the first paste is being written"
     );
@@ -318,7 +333,7 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
 
     sink.sever_input();
     assert!(
-        wait_until(Duration::from_secs(5), || sink.ordered_egress_count() == 0),
+        wait_until(MUST_HAPPEN, || sink.ordered_egress_count() == 0),
         "the sever unblocked the writer"
     );
     for meter in &meters {
@@ -348,9 +363,8 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
 fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     let (app, _app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
     let (reader, writer) = UnixStream::pair().expect("socketpair");
-    reader
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("timeout");
+    // Every read below is of bytes that must arrive: a hang detector.
+    reader.set_read_timeout(Some(MUST_HAPPEN)).expect("timeout");
     writer.set_nonblocking(true).expect("nonblocking master");
     let owned: std::os::fd::OwnedFd = writer.into();
     let sink = Arc::new(SinkWriter::new_owned(owned));
@@ -415,7 +429,7 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     drop(replies);
     drop(sink);
     assert!(
-        wait_until(Duration::from_secs(5), || reply_writer.is_finished()),
+        wait_until(MUST_HAPPEN, || reply_writer.is_finished()),
         "the reply writer ends with its lane and sink"
     );
     drop(app);
@@ -453,7 +467,7 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     );
     assert!(!receipt.input_queue_full());
     let mut got = Vec::new();
-    assert!(wait_until(Duration::from_secs(5), || {
+    assert!(wait_until(MUST_HAPPEN, || {
         let mut buf = [0u8; 8];
         let n = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
@@ -509,7 +523,7 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     assert_eq!(app.input(wid, key, Source::Human), InputOutcome::Ok);
     // The writer takes the key and writes it (the pin holds only its slot).
     let mut got = Vec::new();
-    assert!(wait_until(Duration::from_secs(5), || {
+    assert!(wait_until(MUST_HAPPEN, || {
         let mut buf = [0u8; 8];
         let n = unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
@@ -518,9 +532,7 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
         !got.is_empty()
     }));
     assert_eq!(got, b"q");
-    assert!(wait_until(Duration::from_secs(5), || sink
-        .ordered_egress_count()
-        == 1));
+    assert!(wait_until(MUST_HAPPEN, || sink.ordered_egress_count() == 1));
     app.echo_probe_close(probe);
     let echo = crate::echo_rtt::snapshot();
     assert_eq!(echo.arms, 1, "the writer armed the deferred key: {echo:?}");
@@ -578,7 +590,7 @@ fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     }
     assert!(sink.is_severed(), "Session::drop severed its input");
     assert!(
-        wait_until(Duration::from_secs(5), || sink.ordered_egress_count() == 0),
+        wait_until(MUST_HAPPEN, || sink.ordered_egress_count() == 0),
         "the parked paste and the queued key were released"
     );
     assert_eq!(paste_order::admitted_for_test(&sink), (0, 0));
@@ -625,7 +637,7 @@ fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
     // Teardown releases what the parked writer and the queue still hold.
     sink.sever_input();
     assert!(
-        wait_until(Duration::from_secs(5), || sink.reply_reserved() == 0),
+        wait_until(MUST_HAPPEN, || sink.reply_reserved() == 0),
         "every held reply byte came back"
     );
     drop(replies);
@@ -746,8 +758,7 @@ fn a_mouse_report_waits_behind_the_pastes_queued_before_it() {
     )
     .expect("paste B");
     assert!(
-        wait_until(Duration::from_secs(5), || meter.progress().state
-            == BulkState::Writing),
+        wait_until(MUST_HAPPEN, || meter.progress().state == BulkState::Writing),
         "paste A is being written"
     );
     // A parks on the full pipe, holding the fd lock; B waits in the FIFO.
@@ -825,8 +836,7 @@ fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
     )
     .expect("paste B");
     assert!(
-        wait_until(Duration::from_secs(5), || meter.progress().state
-            == BulkState::Writing),
+        wait_until(MUST_HAPPEN, || meter.progress().state == BulkState::Writing),
         "paste A is being written"
     );
     std::thread::sleep(Duration::from_millis(100));
@@ -919,8 +929,7 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     )
     .expect("the paste");
     assert!(
-        wait_until(Duration::from_secs(5), || meter.progress().state
-            == BulkState::Writing),
+        wait_until(MUST_HAPPEN, || meter.progress().state == BulkState::Writing),
         "the paste is being written"
     );
 
@@ -976,7 +985,7 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     // under it (the 2026-09-27 flake; see
     // `a_sinks_admission_never_reads_an_fd_number_twins_serializer`).
     assert!(
-        wait_until(Duration::from_secs(5), || sink.ordered_egress_count() == 0),
+        wait_until(MUST_HAPPEN, || sink.ordered_egress_count() == 0),
         "the sever released the paste, the flood and the key"
     );
     drop(mirror);
@@ -1020,8 +1029,7 @@ fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
     )
     .expect("the paste");
     assert!(
-        wait_until(Duration::from_secs(5), || meter.progress().state
-            == BulkState::Writing),
+        wait_until(MUST_HAPPEN, || meter.progress().state == BulkState::Writing),
         "the paste is parked on the full pipe"
     );
     let (jobs, bytes) = paste_order::admitted_for_test(&owner);
@@ -1041,7 +1049,7 @@ fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
 
     owner.sever_input();
     assert!(
-        wait_until(Duration::from_secs(5), || owner.ordered_egress_count() == 0),
+        wait_until(MUST_HAPPEN, || owner.ordered_egress_count() == 0),
         "the sever released the parked paste"
     );
     assert_eq!(paste_order::admitted_for_test(&owner), (0, 0));
@@ -1061,8 +1069,8 @@ fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
 /// waited at the spill cap until the program read — the event loop, and
 /// every window, parked for as long as the program stayed frozen.
 ///
-/// A watchdog reads the pipe out after 20 s, so a regression FAILS the
-/// elapsed-time assertion instead of hanging the suite.
+/// A watchdog reads the pipe out after a minute ([`park_witness`]), so a
+/// regression FAILS on the watchdog's word instead of hanging the suite.
 #[test]
 fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -1090,29 +1098,15 @@ fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
     }
 
     let done = Arc::new(AtomicBool::new(false));
-    let watchdog = {
-        let done = Arc::clone(&done);
-        let reader = pipe[0];
-        std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !done.load(Ordering::Acquire) {
-                if Instant::now() >= deadline {
-                    let mut buf = [0u8; 65536];
-                    while unsafe { libc::read(reader, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
+    let watchdog = park_witness(pipe[0], Arc::clone(&done));
     let t0 = Instant::now();
     app.apply_os_color_scheme(WindowId(0), aterm_types::Appearance::Light);
     let took = t0.elapsed();
     done.store(true, Ordering::Release);
-    watchdog.join().expect("watchdog");
     assert!(
-        took < Duration::from_secs(2),
-        "the appearance change parked the event loop for {took:?}"
+        !watchdog.join().expect("watchdog"),
+        "the appearance change parked the event loop until the watchdog read the \
+         program's input out ({took:?})"
     );
 
     let expect = filled + accepted.iter().map(Vec::len).sum::<usize>();

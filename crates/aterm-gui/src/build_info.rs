@@ -51,7 +51,7 @@ pub(crate) const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
 
 /// Monotonic build number, stamped by `build.rs`. The updater's ordering lives
 /// here in metadata, independent of the app/source display version above. For a
-/// RELEASE this is the number `cargo ship cut` claims in the append-only
+/// RELEASE this is the number `targo --unverified ship cut` claims in the append-only
 /// `RELEASES.ledger` (`max(last + 1, unix_now)` — strictly increasing by
 /// construction, epoch-scale) and pins via `SOURCE_DATE_EPOCH`; a dev build
 /// falls back to HEAD's committer Unix epoch — the same seconds scale, so dev
@@ -66,7 +66,7 @@ pub(crate) const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const DEV_COMMITS: &str = env!("ATERM_DEV_COMMITS");
 
-/// Whether a release lane produced this binary. `cargo ship cut` (both
+/// Whether a release lane produced this binary. `targo --unverified ship cut` (both
 /// architecture builds) and the Linux release lane set `ATERM_RELEASE_BUILD`
 /// for the build, and no ordinary build does, so its presence at compile time
 /// IS the release/dev discriminator — read by display surfaces only (the menu

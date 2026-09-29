@@ -510,11 +510,139 @@ pub fn dial_and_relay_pinned<A: ToSocketAddrs>(
         local,
         HANDSHAKE_TIMEOUT,
         pin.clone(),
+        None,
         move |transport| match &pin {
             Some(pin) => observe_launch_nonce(pin, transport),
             None => Ok(None),
         },
     )
+}
+
+/// A dialer's CONNECT PROBE: one request the remote's control server answers at
+/// once, sent after the capability is accepted and before any of the caller's
+/// bytes, whose one-line reply must arrive within `within`. The reply is
+/// consumed, never relayed. It proves the remote is SERVING the connection —
+/// not merely that its TLS listener answered while its own control socket
+/// queues connections nobody accepts — so a dial into such a remote fails in
+/// seconds, by name, instead of holding the caller for a verb's deadline.
+///
+/// The drive stays protocol-agnostic: the caller supplies the request and says
+/// which replies are refusals rather than answers.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectProbe {
+    /// The request line, newline included.
+    pub request: &'static [u8],
+    /// How long the one-line reply may take.
+    pub within: Duration,
+    /// Whether a reply (newline stripped) refuses the connection.
+    pub is_refusal: fn(&str) -> bool,
+}
+
+/// [`dial_and_relay_pinned`], proving with `probe` that the remote serves the
+/// connection before `prebuffer` or any relayed byte is sent.
+///
+/// # Errors
+/// Every error of [`dial_and_relay_pinned`], plus: no reply to the probe
+/// within its bound (`ErrorKind::TimedOut`, "the remote accepted no connection
+/// within Ns"), the remote closing first, or a reply `probe` calls a refusal —
+/// all before any of the caller's bytes were sent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "dial_and_relay_pinned's contract plus the probe"
+)]
+pub fn dial_and_relay_probed<A: ToSocketAddrs>(
+    addr: A,
+    config: Arc<ClientConfig>,
+    src: &str,
+    op: &str,
+    token: &EdgeToken,
+    prebuffer: &[u8],
+    local: CtlStream,
+    pin: Option<RemoteEndpoint>,
+    probe: ConnectProbe,
+) -> io::Result<()> {
+    dial_and_relay_pinned_inner(
+        addr,
+        config,
+        src,
+        op,
+        token,
+        prebuffer,
+        local,
+        HANDSHAKE_TIMEOUT,
+        pin.clone(),
+        Some(probe),
+        move |transport| match &pin {
+            Some(pin) => observe_launch_nonce(pin, transport),
+            None => Ok(None),
+        },
+    )
+}
+
+/// Send `probe` and read its one-line reply within its bound (see
+/// [`ConnectProbe`]). Byte at a time, so nothing past the line is consumed.
+fn expect_probe_answer(
+    transport: &mut TlsTransport<rustls::ClientConnection>,
+    probe: ConnectProbe,
+) -> io::Result<()> {
+    use std::io::{Read, Write};
+    let stream = transport.stream();
+    stream.write_all(probe.request)?;
+    stream.flush()?;
+    let deadline = Instant::now() + probe.within;
+    let not_accepted = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the remote accepted no connection within {}s",
+                probe.within.as_secs().max(1)
+            ),
+        )
+    };
+    let mut line = Vec::with_capacity(160);
+    let mut byte = [0u8; 1];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(not_accepted());
+        }
+        // One deadline across every read: a remote that dribbles cannot
+        // stretch it.
+        stream.get_mut().set_read_timeout(Some(deadline - now))?;
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the remote closed the connection before answering",
+                ));
+            }
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if line.len() >= 4096 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "runaway probe reply",
+                ));
+            }
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(not_accepted());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    stream.get_mut().set_read_timeout(None)?;
+    let line = String::from_utf8_lossy(&line);
+    let line = line.trim_end_matches('\r');
+    if (probe.is_refusal)(line) {
+        return Err(io::Error::other(format!("the remote answered {line:?}")));
+    }
+    Ok(())
 }
 
 /// The most sessions, and the longest row, [`observe_launch_nonce`] reads.
@@ -601,6 +729,7 @@ fn dial_and_relay_pinned_inner<A: ToSocketAddrs, N>(
     local: CtlStream,
     handshake_timeout: Duration,
     pin: Option<RemoteEndpoint>,
+    probe: Option<ConnectProbe>,
     observe_nonce: N,
 ) -> io::Result<()>
 where
@@ -694,6 +823,11 @@ where
                 ));
             }
         }
+    }
+
+    // Prove the remote serves the connection before any of the caller's bytes.
+    if let Some(probe) = probe {
+        expect_probe_answer(&mut transport, probe)?;
     }
 
     if !prebuffer.is_empty() {
@@ -860,6 +994,124 @@ mod tests {
             }
         );
         driver.join().unwrap().ok();
+        echo.join().ok();
+    }
+
+    /// Stand up a one-connection listener whose "local control socket" is
+    /// `service`, and dial it with `probe`. Returns the dial's result and the
+    /// driver's local client end.
+    fn dial_probed(
+        service: CtlStream,
+        probe: ConnectProbe,
+        prebuffer: &'static [u8],
+    ) -> (
+        std::thread::JoinHandle<io::Result<()>>,
+        CtlStream,
+        std::thread::JoinHandle<io::Result<Granted>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+        let token = EdgeToken::generate();
+        let service = Arc::new(Mutex::new(Some(service)));
+        let host = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            accept_and_relay(
+                tcp,
+                scfg,
+                |src, op| (src == "driver-1" && op == "drive").then_some(token),
+                || Ok(service.lock().unwrap().take().unwrap()),
+            )
+        });
+        let (drv_local, drv_client) = CtlStream::pair().unwrap();
+        let driver = std::thread::spawn(move || {
+            dial_and_relay_probed(
+                addr, ccfg, "driver-1", "drive", &token, prebuffer, drv_local, None, probe,
+            )
+        });
+        (driver, drv_client, host)
+    }
+
+    /// THE WEDGED REMOTE. The remote's TLS listener accepts and verifies, but
+    /// its local control socket never answers (the 2026-09-25 state: queued,
+    /// never accepted). The probed dial reports it within the probe's bound,
+    /// by name, and never sends the caller's bytes.
+    #[test]
+    fn a_probed_dial_into_a_remote_that_serves_nothing_fails_fast() {
+        let (svc_a, svc_b) = CtlStream::pair().unwrap();
+        let probe = ConnectProbe {
+            request: b"version\n",
+            within: Duration::from_millis(400),
+            is_refusal: |_| false,
+        };
+        let started = Instant::now();
+        let (driver, drv_client, host) = dial_probed(svc_a, probe, b"secret-verb\n");
+        let error = driver
+            .join()
+            .unwrap()
+            .expect_err("nothing served the probe");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            error.to_string().contains("accepted no connection"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the probe bound held: {:?}",
+            started.elapsed()
+        );
+        // The remote's local socket saw the probe and nothing of the caller's.
+        // (Read before the host is joined: its relay ends only once this
+        // local end closes too.)
+        svc_b
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut heard = Vec::new();
+        let _ = (&svc_b).read_to_end(&mut heard);
+        assert_eq!(heard, b"version\n", "only the probe reached the remote");
+        drop(svc_b);
+        drop(drv_client);
+        let _ = host.join();
+    }
+
+    /// The served case (the negative control): the remote answers the probe,
+    /// the answer is consumed rather than relayed, and the caller's bytes then
+    /// flow as before. A reply the probe calls a refusal fails the dial.
+    #[test]
+    fn a_probed_dial_consumes_the_answer_and_honours_a_refusal() {
+        let (svc_a, svc_b) = CtlStream::pair().unwrap();
+        let echo = spawn_echo(svc_b);
+        let probe = ConnectProbe {
+            request: b"PING\n",
+            within: Duration::from_secs(5),
+            is_refusal: |line| line.starts_with("ERR"),
+        };
+        let (driver, mut drv_client, host) = dial_probed(svc_a, probe, b"PRE\n");
+        let mut pre = [0u8; 4];
+        drv_client.read_exact(&mut pre).unwrap();
+        assert_eq!(&pre, b"PRE\n", "the probe's answer is not relayed");
+        drv_client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(drv_client);
+        driver.join().unwrap().ok();
+        let _ = host.join();
+        echo.join().ok();
+
+        let (svc_a, svc_b) = CtlStream::pair().unwrap();
+        let echo = spawn_echo(svc_b);
+        let refused = ConnectProbe {
+            request: b"ERR control server busy; retry\n",
+            within: Duration::from_secs(5),
+            is_refusal: |line| line.starts_with("ERR control server busy"),
+        };
+        let (driver, drv_client, host) = dial_probed(svc_a, refused, b"PRE\n");
+        let error = driver
+            .join()
+            .unwrap()
+            .expect_err("a refusal fails the dial");
+        assert!(error.to_string().contains("busy"), "{error}");
+        drop(drv_client);
+        let _ = host.join();
         echo.join().ok();
     }
 
@@ -1105,6 +1357,7 @@ mod tests {
             b"",
             drv_local,
             Duration::from_millis(300),
+            None,
             None,
             |_t| Ok(None),
         );
@@ -1661,6 +1914,7 @@ mod tests {
                 drv_local,
                 HANDSHAKE_TIMEOUT,
                 Some(pin),
+                None,
                 move |_t| Ok(observed.map(str::to_owned)),
             )
         });
@@ -1722,6 +1976,7 @@ mod tests {
                 drv_local,
                 HANDSHAKE_TIMEOUT,
                 Some(pin),
+                None,
                 move |_t| Ok(Some("nonce-live".to_owned())),
             )
         });

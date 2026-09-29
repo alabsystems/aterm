@@ -57,6 +57,11 @@ pub enum Lane {
     /// directory: the main lane's children never open this one, so priming it
     /// contends with nothing the test compile is doing.
     ConformanceRelease,
+    /// `target-trust/` — the Trust verification lane's slots
+    /// (`tools/trust-gate-all.sh --target-root`, one target dir per slot under
+    /// it). Verified artifacts are built with different flags from every other
+    /// lane's, so they share none of them.
+    TrustTarget,
 }
 
 /// Every stage of the gate.
@@ -74,6 +79,10 @@ pub enum StageId {
     Tippy,
     Formatting,
     GrepGuards,
+    /// The publication engine's own content guards — forbidden content,
+    /// private references, gitleaks — over the export `pub stage` would build
+    /// from this tree (`tools/export-content-scan.py`, `stages::export_content`).
+    ExportContent,
     /// The offline suites over the scripts that build, sign, install and
     /// publish the app and its toolchain packages (`stages::DELIVERY_SUITES`):
     /// every one runs on stubs of its own making.
@@ -82,6 +91,12 @@ pub enum StageId {
     /// the `atpkg` this stage builds first. A DRIVER-lane stage.
     AtpkgTooling,
     TrustContractProbe,
+    /// The Trust verification lane, advisory (2026-09-27): the script's own
+    /// verdict self-test, the ratchet's up-only check, then
+    /// `tools/trust-gate-all.sh --per-commit` over the libraries and admitted
+    /// forks the change touched, held to the ratchet floor
+    /// (`stages::trust_advisory`). The whole tree is the release's trust receipt.
+    TrustAdvisory,
     /// `--full` only: the startup-comparison harness's own test.
     StartCompare,
     LibcOracle,
@@ -101,15 +116,15 @@ pub enum StageId {
     ControlSocketSmoke,
     GuiSmoke,
     RedrawConformance,
-    ObjcClassAudit,
-    ObjcImeDrive,
-    ObjcToolbarDrive,
-    ObjcWindowDrive,
-    ObjcEventDrive,
-    ObjcBoundDrive,
+    /// The objc drivers (`stages::OBJC_DRIVES`), one row each, on macOS.
+    ObjcDrives,
     /// The foreground handback lane (`stages::FOREGROUND_HANDBACK_SUITE`): a
     /// real shell's job control, in a private headless `aterm` this run built.
     ForegroundHandback,
+    /// The render desync lane (`stages::RENDER_DESYNC_SUITE`): a net-zero
+    /// alternate-screen flap an app cannot see, read by `status`, `resizes`
+    /// and `cast drift` in a private headless `aterm` this run built.
+    RenderDesync,
     KaniFloor,
     CrossCells,
     /// `xtask gate forge`, every tier (2026-09-25).
@@ -239,6 +254,7 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         // `crates/aterm-conformance/tests/support/mod.rs`), so a hand run of
         // paint or spin and the gate share one warm artifact.
         Lane::ConformanceRelease => under_root("target/conformance-release"),
+        Lane::TrustTarget => under_root("target-trust"),
     }
 }
 
@@ -368,6 +384,22 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
         "grep guards and license headers",
         Lane::Pure,
     ));
+    // EXPORT CONTENT (2026-09-29) — the publication engine's content guards
+    // over the export of this tree, run by the engine's own code
+    // (`tools/export-content-scan.py`). Export blockers stopped five releases in
+    // a row (0.94, 0.95, 0.98, 0.99 twice), each found only by the release
+    // preflight's dry run, because the commits that carried them landed through
+    // a contract that never ran the scan. `Lane::Pure`, at t0: it greps an
+    // export in a scratch directory and compiles nothing, so it overlaps the
+    // test compile the way the grep guards do. Measured on 18 cores: 19-22 s
+    // at load ~11 and 43 s at load ~110, ~165 CPU-seconds either way — most of
+    // them the engine's own one grep per pattern, per pass, over the ~150 MB
+    // export, with gitleaks running beside it.
+    v.push(spec(
+        StageId::ExportContent,
+        "export content (the publication engine's forbidden-content, private-reference and gitleaks guards over this tree's export)",
+        Lane::Pure,
+    ));
     // DELIVERY TOOLING — every offline suite over the scripts that take the
     // app and its toolchain packages to someone's machine, each on stubs of its
     // own making (`stages.rs` section 3.5 has the roster and the reasons). The
@@ -376,13 +408,27 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
     // `atpkg` (the pack, below) and held the test run's start with it.
     v.push(spec(
         StageId::DeliveryTooling,
-        "delivery tooling (installer channel and guards, cargo pin, export policy, release preflight, shape and after-cut, site sync, dev signing identity, fabric demo cleanup, atpkg index and publish producers; offline)",
+        "delivery tooling (installer channel and guards, cargo pin, export policy and content scan, release preflight, shape and after-cut, site sync, dev signing identity, fabric demo cleanup, atpkg index and publish producers, publisher bootstrap; offline)",
         Lane::Pure,
     ));
     v.push(spec(
         StageId::TrustContractProbe,
         "trust contract probe (self-field ensures proves; off-switch no ICE)",
         Lane::Pure,
+    ));
+    // THE TRUST VERIFICATION LANE (2026-09-27), advisory, beside the probe it
+    // belongs with — a LAND-tier stage, so the merge contract runs it. Its own
+    // lane, at t0, waiting on nothing: it compiles in its own target dirs and
+    // verifies, so it overlaps the test compile and run, and the exclusive tail
+    // waits for it the way it waits for every stage declared before it. In every
+    // mode it verifies the libraries and admitted forks a change touched, the
+    // heaviest named and left to the release's whole-tree run
+    // (`stages::trust_advisory` says why, with the measurement); the row's own
+    // verdict line names what it verified and what it did not.
+    v.push(spec(
+        StageId::TrustAdvisory,
+        "trust advisory lane (targo trust check --lib --allow-l0-gaps: the libraries a change touched, the heaviest left to the release's whole-tree run; the up-only ratchet floor)",
+        Lane::TrustTarget,
     ));
     v.push(spec(
         StageId::LibcOracle,
@@ -534,105 +580,26 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
         "control redraw conformance (a select repaints a real window)",
         Lane::DriverTarget,
     ));
-    // AND THE OTHER THING ONLY A `fn main` CAN SEE. `vendor/winit`'s
-    // `WinitWindowDelegate` is declared by `aterm_objc::declare_class!` since
-    // W3, and NOTHING IN CI READ THE REGISTERED CLASS: two compile-verified
-    // plants — an argument retyped `Id` -> `Bool`, and `NSWindowDelegate`
-    // deleted from the `protocols:` list — each left `cargo build` at exit 0,
-    // `cargo test -p aterm-objc --test winit_seam` at 6/6, and the DRIVEN EVENT
-    // LOG byte-identical to clean head. libtest cannot host AppKit
-    // (`pthread_main_np()` is 0 on every worker, `--test-threads=1` included),
-    // so the auditor is an `[[example]]` and this is what invokes it. Never
-    // conditional on the scope, for the same reason the redraw gate is not.
+    // THE OBJC DRIVES, one stage over `stages::OBJC_DRIVES`, unconditional for
+    // the redraw gate's reason. libtest cannot host AppKit, so each driver is
+    // an `[[example]]` owning `fn main` and this is what invokes it:
+    // - `objc_live_class_audit`: the registered WinitWindowDelegate and
+    //   WinitView against the runtime's own authority;
+    // - `objc_ime_drive`: a composition through WinitView's NSTextInputClient rows;
+    // - `objc_toolbar_drive`: the real tab strip, 27 drawn states, four classes;
+    // - `objc_window_drive`: the real window's whole surface;
+    // - `objc_event_drive`: a real NSEvent of every type through every
+    //   event-taking row and `sendEvent:` (the v0.72.0 crash class).
+    // (The MainThreadBound container drive left this stage on 2026-09-28: it is
+    // `aterm-objc`'s `harness = false` test `main_thread_bound_drive`, which
+    // the test run runs.)
     v.push(spec(
-        StageId::ObjcClassAudit,
-        "objc live-class audit (the registered WinitWindowDelegate and WinitView, against the runtime)",
+        StageId::ObjcDrives,
+        "objc drives (live-class audit, IME, toolbar, window and event, on a real AppKit)",
         Lane::DriverTarget,
     ));
-    // The auditor's twin, and a SEPARATE stage because it asks a separate
-    // question. The audit proves the ported `WinitView` is SHAPED right — 44
-    // registered encodings against the runtime's own authority. It cannot prove
-    // the class BEHAVES right, and `view.rs`'s eleven `NSTextInputClient` rows
-    // are a state machine an input method drives: a port that registers all
-    // eleven correctly and still drops a preedit, mis-clamps a cursor range or
-    // forwards UTF-16 indices where winit's API promises UTF-8 byte offsets
-    // passes every shape check in the tree. This drives a whole composition
-    // through the registered IMPs and reads the `WindowEvent::Ime` sequence that
-    // comes out.
-    v.push(spec(
-        StageId::ObjcImeDrive,
-        "objc IME drive (a composition through the ported WinitView's NSTextInputClient rows)",
-        Lane::DriverTarget,
-    ));
-    // AND THE SAME OBLIGATION, ONE FILE OVER. Both stages above audit
-    // `vendor/winit`; `crates/aterm-gui/src/toolbar.rs` is the LARGEST ported
-    // file in the tree — four declared classes, and after W7 every AppKit
-    // binding call in it — and until this stage NOTHING IN THE TREE DROVE IT.
-    // Its classes were checked by `#[cfg(test)] mod objc_tests`, whose central
-    // case is thirty-two registered encodings against a literal written in the
-    // same file: a plant that registered `controlTextDidChange:` as `v@:B` AND
-    // edited the table to agree left that test GREEN. The driver installs the
-    // real toolbar in a real NSWindow, enters the registered IMPs through
-    // AppKit's own dispatch, captures 27 drawing states with
-    // `-cacheDisplayInRect:`, and reads all four classes off the live objects.
-    // On its first run it found a defect no encoding check could see — the
-    // rename editor posting a spurious commit at open, which killed both of its
-    // exits — so it is not conditional on the scope either.
-    v.push(spec(
-        StageId::ObjcToolbarDrive,
-        "objc toolbar drive (the real tab strip: 27 drawn states, and all four declared classes off live objects)",
-        Lane::DriverTarget,
-    ));
-    // THE WINDOW DRIVER (W8), and it is unconditional for the same reason its
-    // three siblings are. `window_delegate.rs` is the largest file in the
-    // mac-arm endgame and W8 moved all 177 of its AppKit binding calls off
-    // `objc2-app-kit`; on its first run it SEGFAULTED on a use-after-free that
-    // had compiled clean and passed every test in the tree. Nothing else in the
-    // ladder touches the window surface.
-    v.push(spec(
-        StageId::ObjcWindowDrive,
-        "objc window drive (the real window: title, style mask, geometry, limits, theme, tabs, drag-and-drop, close and fullscreen)",
-        Lane::DriverTarget,
-    ));
-    // THE EVENT DRIVER, unconditional for the same reason as its three
-    // siblings — and it is the row they were missing. The auditor proved the
-    // ported `WinitView` was SHAPED right, the IME drive composed through it,
-    // the window drive resized and focused it, and v0.72.0 still aborted on
-    // the FIRST `mouseMoved:` AppKit delivered: `update_modifiers` sent
-    // `-keyCode` to a mouse event, AppKit raised, and the trampoline's
-    // `catch_unwind` cannot catch a foreign exception. No gate had ever sent
-    // a mouse event through a mouse IMP. This one builds a real `NSEvent` of
-    // every type each event-taking row can receive, enters the IMP as AppKit
-    // does, sends the same shapes through `-[NSApplication sendEvent:]`, and
-    // re-executes itself as a control child that makes the v0.72.0 send
-    // inside a trampoline and must die by SIGABRT. Measured against the
-    // v0.72.0 `view.rs`: exit 134 at the first `mouseMoved:`.
-    v.push(spec(
-        StageId::ObjcEventDrive,
-        "objc event drive (every NSEvent-taking WinitView row and sendEvent:, with a real NSEvent of every type AppKit can deliver)",
-        Lane::DriverTarget,
-    ));
-    // (The modal and swizzle drivers were rows here until 2026-09-27. The
-    // swizzle's one live proof — the IMP's image leaving AppKit — is the
-    // window drive's stage 15, and the event drive sends every NSEvent shape
-    // through the swizzled `sendEvent:`; the modal driver sent every message
-    // as a raw `objc_msgSend`, so it drove AppKit's facts, not aterm's.)
-    //
-    // THE CONTAINER DRIVER (W12), unconditional because its obligation has no
-    // type-system half. `MainThreadBound<T>` is `Send + Sync` for every `T`
-    // on the strength of a `Drop` that reschedules to the main thread, and
-    // libtest cannot exercise that in either direction: it runs every test on
-    // a worker and parks its main thread. This one measures the thread the
-    // destructor lands on — against an UNSOUND twin declared in the same file
-    // that lands it on the worker — with a plain `T` and with a declared
-    // class whose `-dealloc` carries a Rust destructor, and proves the
-    // `needs_drop` short-circuit is load-bearing with a child that must hang.
-    v.push(spec(
-        StageId::ObjcBoundDrive,
-        "objc bound drive (MainThreadBound's main-thread drop against an unsound twin, a declared class's -dealloc, and the needs_drop hang differential)",
-        Lane::DriverTarget,
-    ));
-    // THE FOREGROUND HANDBACK (2026-09-26), the last row of the driver lane.
+    // THE FOREGROUND HANDBACK (2026-09-26), a row of the driver lane behind the
+    // smokes (the render desync lane, below, was added after it on 2026-09-28).
     // `tools/test-foreground-handback.sh` drives a private headless `aterm` —
     // THE one binary, which no other stage builds — and until this row nothing
     // ran it: by hand it found no `<root>/target/debug/aterm` and answered with
@@ -653,6 +620,27 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ForegroundHandback,
         "foreground handback (a real shell's job control, driving a private headless aterm built this run)",
+        Lane::DriverTarget,
+    ));
+    // THE RENDER DESYNC LANE (2026-09-28), the handback lane's sibling in
+    // shape and in place: `tools/test-render-desync.sh` drives a private
+    // headless `aterm` built this run (the same build child, a fingerprint
+    // no-op by now), so it sits in this lane behind the smokes' barrier and is
+    // never removed by a narrowing. It reproduces the incident a live tab hit —
+    // a 64 -> 63 -> 64 flap on the alternate screen shifts the screen up one
+    // row, and a Claude Code that read an unchanged size drew diffs onto it
+    // for good — with a stand-in app whose SIGWINCH is blocked across the two
+    // resizes, so the MASK orders the race, not a sleep; and it proves the
+    // three surfaces that exist to see it (`status` render=, `resizes`,
+    // `cast drift`) name it, name a healed flap as healed, and name a flap
+    // with nothing between its halves as undone by the engine, and name a flap
+    // whose halves 1.6 s split as one return (`cast drift`). ~12 s. The unit,
+    // model and Tier-1 lanes drive the engine and the ledger in process; only
+    // this one drives the ctl `resize` path, the PTY and the cast recorder
+    // together.
+    v.push(spec(
+        StageId::RenderDesync,
+        "render desync (a net-zero alt-screen flap an app cannot see, read by status, resizes and cast drift in a private headless aterm built this run)",
         Lane::DriverTarget,
     ));
     // THE `--full`-ONLY STAGES ([`FULL_ONLY`]).
@@ -819,8 +807,10 @@ mod tests {
                 StageId::Tippy,
                 StageId::Formatting,
                 StageId::GrepGuards,
+                StageId::ExportContent,
                 StageId::DeliveryTooling,
                 StageId::TrustContractProbe,
+                StageId::TrustAdvisory,
                 StageId::LibcOracle,
                 StageId::FreezeGate,
                 StageId::Forge,
@@ -830,13 +820,9 @@ mod tests {
                 StageId::DeadlineTests,
                 StageId::ControlSocketSmoke,
                 StageId::RedrawConformance,
-                StageId::ObjcClassAudit,
-                StageId::ObjcImeDrive,
-                StageId::ObjcToolbarDrive,
-                StageId::ObjcWindowDrive,
-                StageId::ObjcEventDrive,
-                StageId::ObjcBoundDrive,
+                StageId::ObjcDrives,
                 StageId::ForegroundHandback,
+                StageId::RenderDesync,
             ]
         );
     }
@@ -1172,6 +1158,10 @@ mod tests {
         assert_eq!(
             dir(&c, Lane::LibcOracleTarget).as_deref(),
             Some("/repo/libc-oracle/target")
+        );
+        assert_eq!(
+            dir(&c, Lane::TrustTarget).as_deref(),
+            Some("/repo/target-trust")
         );
         // The driven binaries never share the main lane's directory: the test
         // run would relink them under a smoke, a rung or a pack that is

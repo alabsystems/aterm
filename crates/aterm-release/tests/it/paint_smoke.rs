@@ -565,17 +565,17 @@ fn the_selfcheck_owning_the_smoke_precedes_every_publish_step() {
 #[test]
 fn the_flag_parses_and_respects_the_exclusivity_rules() {
     let args = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
-    match cli::parse(&args(&["cut", "--no-paint-smoke"])) {
+    match cli::parse(&args(&["cut", "--mac-only", "--no-paint-smoke"])) {
         Ok(cli::Cmd::Cut { opts, .. }) => {
             assert!(opts.no_paint_smoke, "--no-paint-smoke must set its option")
         }
         other => panic!("cut --no-paint-smoke must parse as a cut: {other:?}"),
     }
-    match cli::parse(&args(&["cut"])) {
+    match cli::parse(&args(&["cut", "--mac-only"])) {
         Ok(cli::Cmd::Cut { opts, .. }) => {
             assert!(!opts.no_paint_smoke, "the default is a running smoke")
         }
-        other => panic!("bare cut must parse: {other:?}"),
+        other => panic!("a plain Mac-only cut must parse: {other:?}"),
     }
     assert!(
         cli::parse(&args(&["cut", "--resume", "--no-paint-smoke"])).is_err(),

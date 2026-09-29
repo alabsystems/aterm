@@ -302,14 +302,18 @@ fn backtrack_match(
 /// show significant improvement though.
 // Intentionally avoid inlining.
 // Empirical tests revealed it to be rarely better but often significantly detrimental.
-// Skip: the encode HOT LOOP's ten Overflow(Sub) obligations (`cur - anchor`
-// class offsets/match-lengths at :504-:602) are loop-carried arithmetic that
-// needs LOOP-INVARIANT SYNTHESIS — the loop-CHC engine lane (encoder built
-// and solver-validated on branch validate-engine; compiler wiring pending).
-// Source rewrites here were measured NET-NEGATIVE by the ratchet (C7) and
-// reverted. Same classification as the skip'd DECODE hot loop
-// (decompress_internal): byte-exact round-trip property tests + the fuzz
-// corpus cover both. Droppable when the loop-CHC wiring lands.
+// Skip: the encode HOT LOOP's `cur - anchor` class offsets/match-lengths are
+// loop-carried arithmetic that needs LOOP-INVARIANT SYNTHESIS. The loop-CHC
+// safety-query scaffolding is in the installed seal (trust 81743ae977 and
+// 2e78b3049c, both ancestors of 321aaeda7), but it does not discharge these:
+// measured 2026-09-27 with this skip removed (`targo trust check -p aterm-lz4
+// --lib --allow-l0-gaps`), this function reads INCONCLUSIVE — 21 obligations,
+// 8 proved, 13 unknown. Source rewrites here were measured NET-NEGATIVE by the
+// ratchet (C7) and reverted. Same classification as the skip'd DECODE hot
+// loop (decompress_internal): byte-exact round-trip property tests + the fuzz
+// corpus cover both. Needed from $HOME/trust, in a promoted seal: loop-invariant
+// discharge of these rows; re-measure with the command above after each
+// `aterm pkg update trust`.
 #[cfg_attr(trust_verify, trust::skip)]
 #[inline(never)]
 pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(

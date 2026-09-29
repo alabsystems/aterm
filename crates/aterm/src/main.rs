@@ -17,8 +17,8 @@
 //! aterm --window            the window, explicitly, from anywhere
 //! ```
 //!
-//! ARGV0 COMPAT: the bundle ships symlinks (`aterm-ctl`, `atpkg`,
-//! `aterm-fleet`, `aterm-drive`, `aterm-gui`, `aterm-cli`) onto this binary,
+//! ARGV0 COMPAT: the bundle ships symlinks (`aterm-ctl`, `atpkg`, `aterm-fleet`,
+//! `aterm-drive`, `aterm-link`, `aterm-gui`, `aterm-cli`) onto this binary,
 //! and old installs symlinked `~/.local/bin/aterm` at a bundled `aterm-cli`.
 //! Invoked through any of those names, main dispatches as that tool — so
 //! every pre-one-binary script, PATH entry, sibling `aterm-ctl` lookup, and in-app
@@ -72,6 +72,70 @@ fn link_unavailable(verb: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// The `aterm ctl` verbs this binary answers IN-PROCESS because it links the
+/// terminal engine. `aterm-ctl` is the dependency-free client and takes them as
+/// plain functions ([`aterm_ctl::LocalVerbs`]); both routes into it (the `ctl`
+/// verb and the `aterm-ctl` argv0 alias) pass this.
+const CTL_LOCAL: aterm_ctl::LocalVerbs = aterm_ctl::LocalVerbs {
+    cast_drift: Some(ctl_cast_drift),
+};
+
+/// `cast drift` computed by the CLIENT: against a server that predates the verb
+/// (from the `cast`, `text`, `cursor` and `modes` it fetched; a racy cut is
+/// answered by the replays against each other, as the server answers it), or
+/// offline over saved files. The analysis is `aterm_control::cast_drift` — the code the
+/// server runs — so the report is the server's, with `computed=client` on its
+/// header. The seam policy is `Native`: the client cannot see which PTY backs
+/// the session (a Windows ConPTY session would replay a rows-grow differently,
+/// and its fidelity gate says so rather than accusing a resize). The engine's
+/// resize undo is dropped for an aterm older than the verb (older than the
+/// undo too, so a flap with nothing between its halves shifted its screen) and
+/// matched against the screen for a saved recording (`undo=off` when dropped).
+fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
+    use aterm_control::cast_drift::{self as drift, Cut, DriftArgs, LiveScreen, Undo};
+    let mut args = DriftArgs::parse(job.args).map_err(str::to_string)?;
+    args.undo = match job.peer {
+        aterm_ctl::DriftPeer::PreUndo => Undo::Drop,
+        aterm_ctl::DriftPeer::Unknown => Undo::Match,
+    };
+    let mut cast = drift::parse_asciicast(job.cast).map_err(|e| format!("cast drift: {e}"))?;
+    if let Some(until) = job.until {
+        cast = cast.until(until);
+    }
+    let live = job.screen.map(|rows| LiveScreen {
+        rows: rows.to_vec(),
+        cursor: job.cursor,
+        alt: job.alt,
+    });
+    let started = std::time::Instant::now();
+    // A screen that would not hold still is compared with nothing: the
+    // replays against each other, seeded from its buffer (the server's rule).
+    let mut report = if job.cut == aterm_ctl::DriftCut::Racy {
+        drift::analyze_replay(
+            &cast.header,
+            &cast.events,
+            job.alt,
+            &args,
+            drift::ResizePolicy::Native,
+        )
+    } else {
+        drift::analyze(
+            &cast.header,
+            &cast.events,
+            live.as_ref(),
+            &args,
+            drift::ResizePolicy::Native,
+        )
+    };
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    report.settle_cut(match job.cut {
+        aterm_ctl::DriftCut::Quiescent => Cut::Quiescent,
+        aterm_ctl::DriftCut::Racy => Cut::Racy,
+        aterm_ctl::DriftCut::File => Cut::File,
+    });
+    Ok(report.render(ms, Some("client")))
+}
+
 // `pub(crate)`, not private: `src/windowed.rs` includes this file as a module
 // and calls this `main` from its own — a parent module cannot reach a child's
 // private items, and rustc accepts any visibility on a bin root's `main`.
@@ -116,7 +180,7 @@ pub(crate) fn main() -> ExitCode {
         .map(|a| a.to_string_lossy().into_owned())
         .unwrap_or_default();
     match alias_route(argv0, &first) {
-        AliasRoute::Ctl => return aterm_ctl::main_entry(rest),
+        AliasRoute::Ctl => return aterm_ctl::main_entry_with(rest, CTL_LOCAL),
         AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
@@ -184,7 +248,7 @@ pub(crate) fn main() -> ExitCode {
         // `get(1..)` for the reason recorded on the `AliasWindowVerb` arm.
         let forwarded = rest.get(1..).unwrap_or(&[]).to_vec();
         return match verb {
-            aterm_cli::Verb::Ctl => aterm_ctl::main_entry(forwarded),
+            aterm_cli::Verb::Ctl => aterm_ctl::main_entry_with(forwarded, CTL_LOCAL),
             // Session connections (SESSION_CONNECTIONS.md §6.1): the human
             // front door for the standing pull/push wiring — presentation over
             // the same control-socket verbs `ctl` speaks, hence it lives in
@@ -258,6 +322,10 @@ pub(crate) fn main() -> ExitCode {
             // installed, with the payload on a pipe — must reach the same code
             // and its silent exit 0 (decision "B").
             aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
+            // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md): `serve` is
+            // what launchd will run (P4) and `status` is typed at a prompt, so it
+            // is routed above the mode fork like every verb. Inert in P2.
+            aterm_cli::Verb::Keeper => aterm_keeper::cli::main_entry(forwarded),
             // `agents` is parsed by aterm-cli itself (it prints and exits), so routing
             // it means handing the WHOLE operand list back to that parser.
             aterm_cli::Verb::Agents => {
@@ -571,8 +639,14 @@ pub(crate) fn main() -> ExitCode {
     // cost the shared GitHub budget one check per interval, not ten. On macOS,
     // APPLY stays with the window entry: applying re-execs the process, and the
     // trial/rollback health confirmation is anchored in the window's steady
-    // state. Linux replaces only the on-disk binary; this session lane checks
-    // and stages without replacing it or gambling a live PTY. A staged build is
+    // state. On Linux this lane DOES install: with `[update] auto_apply` on (the
+    // default) its check replaces the on-disk executable — never a running
+    // process or its PTY; the next start uses the new file. That install is a trial
+    // a start must confirm, and until 2026-09-28 only a window counted or confirmed
+    // one, so a copy used only from the terminal installed one update and then waited
+    // for a window for good, checks and all. The session now counts itself and
+    // confirms once its shell speaks ([`start_linux_session_trial`]), before its
+    // checker starts. A staged build is
     // said nowhere here (Phase 2, 2026-09-22: the one-line nudge printed at every
     // launch went): `aterm update status` answers when asked. Source: the compiled
     // channel, which only a development build lets
@@ -586,6 +660,8 @@ pub(crate) fn main() -> ExitCode {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if session_lane_is_interactive() {
         let build = aterm_gui::running_build_number();
+        #[cfg(target_os = "linux")]
+        start_linux_session_trial(build);
         aterm_update::spawn_background_check_with_settings(
             build,
             std::sync::Arc::new(aterm_gui::configured_update_settings),
@@ -663,6 +739,87 @@ pub(crate) fn main() -> ExitCode {
     }
 
     session_lane(quiet)
+}
+
+/// A TERMINAL SESSION's part in a replaced Linux executable's trial (2026-09-28): count
+/// this start ([`aterm_update::linux_session_started`], synchronously, before the shell
+/// spawns, so a session that dies starting is counted), and when it is a start of the
+/// pending trial, confirm it ([`aterm_update::confirm_linux_session`]) once the
+/// session proves healthy: its shell's first output reached the terminal
+/// ([`aterm_cli::on_first_shell_output`]), or it has stayed up
+/// [`aterm_update::LINUX_SESSION_HEALTHY_AFTER`] with nothing printed. The window's rule,
+/// with a shell's prompt for its first frame: three starts that never get there roll the
+/// install back.
+///
+/// A session confirms the SESSION lane only: a window start after a session confirmed
+/// still counts toward rolling it back, from a clean count, until a window confirms.
+/// `aterm` typed into a terminal is the natural way to look into a window that crashes,
+/// and it must not be the thing that keeps that build installed; nor may one window
+/// that never drew keep healthy sessions from confirming.
+///
+/// The confirmation runs on its own thread — it takes the update lock and hashes the
+/// executable, which the passthrough loop and the shell's start must never wait on — and
+/// retries a lock that another aterm held for a moment. A session that ends before its
+/// confirmation lands leaves that one start counted and nothing else: the next start
+/// confirms. Nothing here prints; the update lane's words say where the install stands.
+#[cfg(target_os = "linux")]
+fn start_linux_session_trial(build: u64) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    static SPOKE: AtomicBool = AtomicBool::new(false);
+    static CONFIRMER: OnceLock<std::thread::Thread> = OnceLock::new();
+    let commit = aterm_gui::running_binary_identity().commit;
+    if !aterm_update::linux_session_started(build, &commit) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("aterm-linux-trial".into())
+        .spawn(move || {
+            let deadline = Instant::now() + aterm_update::LINUX_SESSION_HEALTHY_AFTER;
+            while !SPOKE.load(Ordering::Acquire) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                std::thread::park_timeout(left);
+            }
+            for attempt in 1..=3 {
+                match aterm_update::confirm_linux_session(build, &commit) {
+                    aterm_update::LinuxSessionConfirm::Done => {
+                        aterm_log::info!(
+                            "aterm-update: this session confirmed the installed update"
+                        );
+                        return;
+                    }
+                    aterm_update::LinuxSessionConfirm::Failed => {}
+                }
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+            aterm_log::warn!(
+                "aterm-update: this session could not confirm the installed update; the next \
+                 start of aterm tries again"
+            );
+        });
+    match spawned {
+        Ok(handle) => {
+            let _ = CONFIRMER.set(handle.thread().clone());
+            // Registered before `session_lane` spawns the shell, so no output can
+            // precede it; a fn pointer, because the passthrough loop calls it.
+            aterm_cli::on_first_shell_output(|| {
+                SPOKE.store(true, Ordering::Release);
+                if let Some(confirmer) = CONFIRMER.get() {
+                    confirmer.unpark();
+                }
+            });
+        }
+        Err(error) => aterm_log::warn!(
+            "aterm-update: the installed update's confirmation could not start: {error}"
+        ),
+    }
 }
 
 /// The session's head watch ([`atpkg::vendor_direct::watch::run_host`]): the window's
@@ -791,7 +948,7 @@ fn spawn_detached_machine_apply() {
         return;
     };
     let args = ["pkg", "machine", "apply"].map(std::ffi::OsString::from);
-    if let Err(error) = spawn_detached(exe.as_os_str(), &args, None) {
+    if let Err(error) = atpkg::platform::spawn_detached(exe.as_os_str(), &args, None) {
         aterm_log::warn!(
             "aterm: could not start the background `aterm pkg machine apply`: {error}"
         );
@@ -809,7 +966,8 @@ fn spawn_detached_pkg_update(layout: &atpkg::store::Layout) {
         return;
     };
     let detached = (atpkg::cli::SPAWNER_PID_ENV, atpkg::cli::SPAWNER_DETACHED);
-    if let Err(error) = spawn_detached(exe.as_os_str(), &session_pass_args(layout), Some(detached))
+    if let Err(error) =
+        atpkg::platform::spawn_detached(exe.as_os_str(), &session_pass_args(layout), Some(detached))
     {
         aterm_log::warn!("aterm: could not start the background `aterm pkg update` pass: {error}");
     }
@@ -830,59 +988,6 @@ fn session_pass_args(layout: &atpkg::store::Layout) -> Vec<std::ffi::OsString> {
         &layout.progress_file(),
     )));
     args
-}
-
-/// Start `program args` DETACHED: stdio on `/dev/null`, its own process group, and
-/// NOT this process's child. The session lane goes on to run
-/// `aterm_cli::session_main` in this same process, and its unix driver reaps the
-/// shell with `waitpid(-1)`: a finished pass left as OUR zombie could be reaped in
-/// the shell's place, and `aterm` exited with the pass's status instead of the
-/// shell's (2026-09-12 audit K9; reliably on Linux, ~6% of exits on macOS). So on
-/// unix a `/bin/sh` middle process — the group leader — backgrounds the program and
-/// exits at once, and reaping it here re-parents the pass to launchd/init.
-fn spawn_detached(
-    program: &std::ffi::OsStr,
-    args: &[std::ffi::OsString],
-    env: Option<(&str, &str)>,
-) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let mut command = std::process::Command::new("/bin/sh");
-        if let Some((name, value)) = env {
-            command.env(name, value);
-        }
-        let status = command
-            .args(["-c", "\"$@\" &", "sh"])
-            .arg(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "the detaching shell {status}"
-            )))
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let mut command = std::process::Command::new(program);
-        if let Some((name, value)) = env {
-            command.env(name, value);
-        }
-        command
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(drop)
-    }
 }
 
 /// The SESSION route as a function that RETURNS an `ExitCode`, like every other
@@ -1006,6 +1111,14 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
 /// in a dev tree), which is exactly where a window belongs — see [`run_window`]
 /// for the console image's opposite answer. That is also why nothing is handed
 /// anywhere (the empty handoff below).
+///
+/// Its PRINT-AND-EXIT flags (`aterm-gui --version`, `--help`, …) answer here too,
+/// and are not handed to the console image beside it: a prompt that returned
+/// before this GUI-subsystem process finished (pwsh and an interactive cmd do,
+/// measured 2026-09-27 on 0.95.0) would not wait for a console image it started
+/// either. The window parser writes the answer without `print!`'s panic and,
+/// when it landed on the prompt's console, names `aterm --window …` — the
+/// spelling a prompt waits for (`aterm-gui`'s `cli::answer_and_exit`).
 fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
     if let ControlFlow::Break(code) = plain_launch_policy(&rest) {
         return code;
@@ -1825,7 +1938,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             // announcing a check there is a line about work that never starts.
             if std::io::IsTerminal::is_terminal(&std::io::stderr())
                 && aterm_update::status(build).is_some_and(|st| {
-                    st.enabled && st.installable && !linux_install_waits_for_window(&st)
+                    st.enabled && st.installable && !linux_install_waits_for_a_start(&st)
                 })
             {
                 eprintln!("Checking for updates\u{2026}");
@@ -1850,10 +1963,12 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let lane = aterm_update::apply_lane_report(build);
     let (line, trouble) = update_summary(
         aterm_gui::running_version(),
         build,
         &st,
+        lane.as_ref(),
         now,
         aterm_update_core::settings::update_auto_apply(),
         aterm_update::automatic(),
@@ -1865,7 +1980,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         eprintln!("{trouble}");
     }
     if verbose {
-        print_update_detail(build, &st);
+        print_update_detail(&st, lane.as_ref());
     }
     // A check that could not do its job says so in its exit status too (a script's
     // only reading): the copy cannot update, its channel is unreadable, or checks fail.
@@ -1976,6 +2091,15 @@ const UPDATE_LOG_HINT: &str =
 const UPDATE_LOG_HINT: &str =
     "Details are in Settings \u{25b8} Messages, and in ~/.local/state/aterm/logs/aterm.log.";
 
+/// How many times the window failed to install the STAGED build: the apply lane's count
+/// for the build it last tried, and only when that build is `staged` — the escalation
+/// streak (`UpdateStatus::failing_applies`) carries a superseded build's tries onto a fresh
+/// download nothing has tried yet. `aterm pkg doctor` reads health.toml by the same rule.
+fn staged_tries(staged: u64, lane: Option<&aterm_update::ApplyLaneReport>) -> u32 {
+    lane.filter(|lane| staged > 0 && lane.last_failure_target_build == staged)
+        .map_or(0, |lane| lane.failures_for_target)
+}
+
 /// What `aterm update status|check` says: ONE plain line for stdout, and — when
 /// something is wrong — one for stderr. The version a person knows (the build number
 /// is `--version`'s and About's); what is on offer and when it installs; when the last
@@ -1983,12 +2107,18 @@ const UPDATE_LOG_HINT: &str =
 /// counters stay in `aterm ctl update status`, `-v` and the log (2026-09-23 audit).
 /// `installs_by_itself` is `[update] auto_apply`, `automatic_checks` `[update] enabled`,
 /// `dev` whether the running bundle carries the dev mark (`tools/dev-app.sh`) and, for a
-/// dev build, where it stands against the public channel ([`DevCopy`]).
+/// dev build, where it stands against the public channel ([`DevCopy`]). `lane` is the
+/// apply lane's record, which counts the installs of the staged build ([`staged_tries`]).
 /// Pure for the test.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one gathered fact; passing them in is what keeps the line pure"
+)]
 fn update_summary(
     version: &str,
     build: u64,
     st: &aterm_update::UpdateStatus,
+    lane: Option<&aterm_update::ApplyLaneReport>,
     now: i64,
     installs_by_itself: bool,
     automatic_checks: bool,
@@ -2023,12 +2153,13 @@ fn update_summary(
             None,
         );
     }
-    // A replaced Linux executable is final once an aterm window starts from it; until
-    // then a check reads no channel, so "up to date" would be a claim nothing tested.
-    if linux_install_waits_for_window(st) {
+    // A replaced Linux executable is final once aterm starts from it — a window or a
+    // terminal session; until then a check reads no channel, so "up to date" would be a
+    // claim nothing tested.
+    if linux_install_waits_for_a_start(st) {
         return (
             format!(
-                "aterm {version} is installed \u{2014} launch an aterm window once to finish; \
+                "aterm {version} is installed \u{2014} the next aterm you start finishes it; \
                  update checks wait until then"
             ),
             None,
@@ -2068,11 +2199,12 @@ fn update_summary(
             .staged_version
             .clone()
             .unwrap_or_else(|| format!("build {staged}"));
-        return if st.failing_applies > 0 {
-            let tries = if st.failing_applies == 1 {
+        let failed = staged_tries(staged, lane);
+        return if failed > 0 {
+            let tries = if failed == 1 {
                 "1 try".to_string()
             } else {
-                format!("{} tries", st.failing_applies)
+                format!("{failed} tries")
             };
             (
                 format!("aterm {next} is downloaded but didn\u{2019}t install ({tries})"),
@@ -2193,21 +2325,25 @@ fn check_trouble_words(kind: &str) -> Option<&'static str> {
 }
 
 /// The launches a pending Linux install has spent of its budget, as the -v line's
-/// tail; nothing before the first.
+/// tail; nothing before the first. A burst of session starts can count past the budget
+/// while one of them may still confirm (the rollback waits for that), so the count is
+/// said up to the budget, never "5 of 3".
 fn trial_launches_words(starts: u32) -> String {
     if starts == 0 {
         String::new()
     } else {
+        let budget = aterm_update::LINUX_TRIAL_LAUNCHES;
         format!(
-            " ({starts} of {} launches used before it rolls back)",
-            aterm_update::LINUX_TRIAL_LAUNCHES
+            " ({} of {budget} launches used before it rolls back)",
+            starts.min(budget)
         )
     }
 }
 
-/// Whether a replaced Linux executable still waits for its first window launch
-/// (`aterm_update::linux::confirm`), during which checks and applies wait too.
-fn linux_install_waits_for_window(st: &aterm_update::UpdateStatus) -> bool {
+/// Whether a replaced Linux executable still waits for its first start — a window's or
+/// a terminal session's (`aterm_update::linux::confirm`) — during which checks and
+/// applies wait too.
+fn linux_install_waits_for_a_start(st: &aterm_update::UpdateStatus) -> bool {
     st.linux.as_ref().is_some_and(|native| {
         native.trial_phase.as_deref() == Some("Installed") && !native.trial_healthy
     })
@@ -2234,7 +2370,10 @@ fn ago_words(at: i64, now: i64) -> String {
 /// last decision, when the last check completed, the failure counters when they carry
 /// news, and the apply lane's own words (2026-09-14, audit OBS-7: the reason, not just
 /// the count).
-fn print_update_detail(build: u64, st: &aterm_update::UpdateStatus) {
+fn print_update_detail(
+    st: &aterm_update::UpdateStatus,
+    lane: Option<&aterm_update::ApplyLaneReport>,
+) {
     println!("  last decision: {}", st.summary());
     // The running and installed builds are one file from this CLI; the ledger's
     // decision above already says when the installed one is newer.
@@ -2246,9 +2385,9 @@ fn print_update_detail(build: u64, st: &aterm_update::UpdateStatus) {
                 None => println!("  staged: build {staged}"),
             }
         }
-        if linux_install_waits_for_window(st) {
+        if linux_install_waits_for_a_start(st) {
             println!(
-                "  waiting for an aterm window to launch{}",
+                "  waiting for aterm to start from it{}",
                 trial_launches_words(native.trial_starts)
             );
         }
@@ -2267,13 +2406,13 @@ fn print_update_detail(build: u64, st: &aterm_update::UpdateStatus) {
             st.failing_checks
         );
     }
-    if st.failing_applies > 0 {
-        println!(
-            "  failing applies: {} — a verified build is staged but will not start",
-            st.failing_applies
-        );
+    let failed = st
+        .staged_build
+        .map_or(0, |staged| staged_tries(staged, lane));
+    if failed > 0 {
+        println!("  failing applies: {failed} — a verified build is staged but will not start");
     }
-    if let Some(report) = aterm_update::apply_lane_report(build) {
+    if let Some(report) = lane {
         if !report.last_failure.is_empty() {
             let target = if report.last_failure_target_build > 0 {
                 format!(" (build {})", report.last_failure_target_build)
@@ -2390,6 +2529,173 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
 mod tests {
     use super::*;
 
+    /// A synthetic asciicast of the incident, as `cast` prints one: an alt-screen
+    /// frame with the cursor above a non-blank footer, an 8 -> 7 -> 8 flap with a
+    /// mode set between the halves, then a diff the app sent without repainting.
+    /// The mode set is what keeps it a desync: a flap with NO output between is
+    /// undone by the engine (the grid's resize undo), so it replays clean.
+    fn flapped_cast() -> String {
+        let mut frame = String::from("\\u001b[?1049h\\u001b[2J");
+        for r in 0..8 {
+            frame.push_str(&format!("\\u001b[{};1HA{r}", r + 1));
+        }
+        frame.push_str("\\u001b[6;3H");
+        format!(
+            "{{\"version\": 2, \"width\": 20, \"height\": 8}}\n\
+             [0.100000, \"o\", \"{frame}\"]\n\
+             [1.000000, \"r\", \"20x7\"]\n\
+             [1.000300, \"o\", \"\\u001b[?1000h\"]\n\
+             [1.000700, \"r\", \"20x8\"]\n\
+             [1.005000, \"o\", \"\\u001b[3;1H\\u001b[KB2\\u001b[6;3H\"]\n"
+        )
+    }
+
+    /// `aterm ctl cast drift` computed by the client — what the one binary does
+    /// for a server that predates the verb, and offline: the SAME analysis the
+    /// server runs, parsed from the asciicast text, with `computed=client`.
+    #[test]
+    fn ctl_cast_drift_computes_the_report_client_side() {
+        let cast = flapped_cast();
+        // The screen the live engine shows after the flap: shifted up one row.
+        let screen: Vec<String> = ["A1", "A2", "B2", "A4", "A5", "A6", "A7", ""]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let job = aterm_ctl::CastDriftJob {
+            cast: &cast,
+            screen: Some(&screen),
+            cursor: Some((5, 2)),
+            alt: Some(true),
+            args: "",
+            cut: aterm_ctl::DriftCut::Quiescent,
+            until: None,
+            peer: aterm_ctl::DriftPeer::PreUndo,
+        };
+        let report = ctl_cast_drift(&job).expect("a report");
+        let head = report.lines().next().unwrap();
+        for key in [
+            "verdict=desync",
+            "fidelity=pass",
+            "culprit=1.000000",
+            "cut=quiescent",
+            "dropped=-",
+            "undo=off",
+            "computed=client",
+        ] {
+            assert!(head.split_whitespace().any(|t| t == key), "{key} in {head}");
+        }
+        assert!(report.contains("\nrow 7 live= expected=A7\n"), "{report}");
+        // Offline, no screen: the replays against each other.
+        let offline = ctl_cast_drift(&aterm_ctl::CastDriftJob {
+            screen: None,
+            cursor: None,
+            alt: None,
+            cut: aterm_ctl::DriftCut::File,
+            peer: aterm_ctl::DriftPeer::Unknown,
+            ..job
+        })
+        .expect("a report");
+        assert!(
+            offline.starts_with("OK 9 verdict=desync fidelity=- against=replay"),
+            "{offline}"
+        );
+        // Cut before the flap: nothing to find.
+        let early = ctl_cast_drift(&aterm_ctl::CastDriftJob {
+            screen: None,
+            cut: aterm_ctl::DriftCut::File,
+            until: Some(0.5),
+            peer: aterm_ctl::DriftPeer::Unknown,
+            ..job
+        })
+        .expect("a report");
+        assert!(early.starts_with("OK 0 verdict=clean"), "{early}");
+        // The grammar and a broken recording are refused, not misread.
+        let bad = ctl_cast_drift(&aterm_ctl::CastDriftJob {
+            args: "count=2",
+            ..job
+        })
+        .expect_err("usage");
+        assert!(bad.starts_with("ERR usage: cast drift"), "{bad}");
+        let broken = ctl_cast_drift(&aterm_ctl::CastDriftJob {
+            cast: "not a cast",
+            ..job
+        })
+        .expect_err("unparseable");
+        assert!(broken.contains("line 1"), "{broken}");
+    }
+
+    /// THE PEER THE FALLBACK SERVES (review of 2026-09-28): an aterm older than
+    /// `cast drift` is older than the resize undo too, so its quiet flap (the
+    /// halves 0.7 ms apart, nothing between) shifted its screen one row up and
+    /// appended a blank row. This engine's own replay undoes that flap and
+    /// cannot reproduce the screen; the client's replay of such a peer drops
+    /// the undo and names the flap (`undo=off`). A saved recording held
+    /// against the same screen picks that replay because only it reproduces
+    /// the screen; held against this engine's own screen it keeps the undo.
+    #[test]
+    fn a_quiet_flap_on_an_aterm_before_the_undo_is_named_client_side() {
+        let mut frame = String::from("\\u001b[?1049h\\u001b[2J");
+        for r in 0..8 {
+            frame.push_str(&format!("\\u001b[{};1HL{r}", r + 1));
+        }
+        frame.push_str("\\u001b[6;3H");
+        let cast = format!(
+            "{{\"version\": 2, \"width\": 20, \"height\": 8}}\n\
+             [0.100000, \"o\", \"{frame}\"]\n\
+             [1.000000, \"r\", \"20x7\"]\n\
+             [1.000700, \"r\", \"20x8\"]\n\
+             [1.005000, \"o\", \"\\u001b[3;1H\\u001b[KB2\\u001b[6;3H\"]\n"
+        );
+        let old: Vec<String> = ["L1", "L2", "B2", "L4", "L5", "L6", "L7", ""]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let job = aterm_ctl::CastDriftJob {
+            cast: &cast,
+            screen: Some(&old),
+            cursor: Some((5, 2)),
+            alt: Some(true),
+            args: "",
+            cut: aterm_ctl::DriftCut::Quiescent,
+            until: None,
+            peer: aterm_ctl::DriftPeer::PreUndo,
+        };
+        for peer in [aterm_ctl::DriftPeer::PreUndo, aterm_ctl::DriftPeer::Unknown] {
+            let report =
+                ctl_cast_drift(&aterm_ctl::CastDriftJob { peer, ..job }).expect("a report");
+            let head = report.lines().next().unwrap();
+            for key in [
+                "verdict=desync",
+                "fidelity=pass",
+                "culprit=1.000000",
+                "undo=off",
+                "computed=client",
+            ] {
+                assert!(
+                    head.split_whitespace().any(|t| t == key),
+                    "{peer:?}: {key} in {head}"
+                );
+            }
+            assert!(report.contains("\nrow 0 live=L1 expected=L0\n"), "{report}");
+        }
+        // This engine's screen of the same recording: the undo handed the
+        // row back, and a saved recording held against it keeps the undo.
+        let new: Vec<String> = ["L0", "L1", "B2", "L3", "L4", "L5", "L6", "L7"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let report = ctl_cast_drift(&aterm_ctl::CastDriftJob {
+            screen: Some(&new),
+            cut: aterm_ctl::DriftCut::File,
+            peer: aterm_ctl::DriftPeer::Unknown,
+            ..job
+        })
+        .expect("a report");
+        let head = report.lines().next().unwrap();
+        assert!(head.contains(" verdict=clean fidelity=pass "), "{head}");
+        assert!(!head.contains(" undo=off"), "{head}");
+    }
+
     fn update_status() -> aterm_update::UpdateStatus {
         aterm_update::UpdateStatus {
             linux: None,
@@ -2465,7 +2771,16 @@ mod tests {
             aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
         let now = checked + 12 * 60;
         let say = |st: &aterm_update::UpdateStatus, auto_apply: bool, automatic: bool| {
-            update_summary("0.91.0", 100, st, now, auto_apply, automatic, &DevCopy::No)
+            update_summary(
+                "0.91.0",
+                100,
+                st,
+                None,
+                now,
+                auto_apply,
+                automatic,
+                &DevCopy::No,
+            )
         };
         let healthy = update_status();
         assert_eq!(
@@ -2494,13 +2809,38 @@ mod tests {
                 .0
                 .contains("Settings \u{25b8} Software Update")
         );
-        staged.failing_applies = 2;
-        let (line, trouble) = say(&staged, true, true);
+        // The installs of THIS build failed: the apply lane's count for it, as
+        // `aterm pkg doctor` reads it.
+        let tried = |target: u64, failures: u32| aterm_update::ApplyLaneReport {
+            last_failure_target_build: target,
+            failures_for_target: failures,
+            ..Default::default()
+        };
+        let say_tried = |st: &aterm_update::UpdateStatus, lane: &aterm_update::ApplyLaneReport| {
+            update_summary("0.91.0", 100, st, Some(lane), now, true, true, &DevCopy::No)
+        };
+        let (line, trouble) = say_tried(&staged, &tried(101, 2));
         assert_eq!(
             line,
             "aterm 0.92.0 is downloaded but didn\u{2019}t install (2 tries)"
         );
         assert!(trouble.is_some_and(|t| t.contains("Settings \u{25b8} Messages")));
+        assert!(say_tried(&staged, &tried(101, 1)).0.ends_with("(1 try)"));
+        // An EARLIER build's failed installs are not this download's, whatever the
+        // escalation streak says: it is still promised.
+        staged.failing_applies = 3;
+        for lane in [tried(99, 3), tried(0, 0)] {
+            assert_eq!(
+                say_tried(&staged, &lane).0,
+                "aterm 0.92.0 is downloaded and installs within a minute while an aterm \
+                 window is open"
+            );
+        }
+        assert!(
+            say(&staged, true, true)
+                .0
+                .contains("installs within a minute")
+        );
 
         let mut failing = update_status();
         failing.failing_checks = 1;
@@ -2568,7 +2908,7 @@ mod tests {
             lag: None,
             shared_writes: None,
         };
-        let (dev, trouble) = update_summary("0.91.0", 100, &inert, now, true, true, &unread);
+        let (dev, trouble) = update_summary("0.91.0", 100, &inert, None, now, true, true, &unread);
         assert_eq!(
             dev,
             "This copy of aterm 0.91.0 is a dev build \u{2014} the updater leaves it alone"
@@ -2583,6 +2923,7 @@ mod tests {
                 "0.91.0",
                 100,
                 &inert,
+                None,
                 now,
                 true,
                 true,
@@ -2653,6 +2994,7 @@ mod tests {
             "0.91.0",
             100,
             &inert,
+            None,
             now,
             true,
             false,
@@ -2671,7 +3013,7 @@ mod tests {
         );
         // A copy that is not dev-marked is never told a standing, whatever it is.
         assert_eq!(
-            update_summary("0.91.0", 100, &inert, now, true, true, &DevCopy::No).0,
+            update_summary("0.91.0", 100, &inert, None, now, true, true, &DevCopy::No).0,
             say(&inert, true, true).0
         );
 
@@ -2687,8 +3029,10 @@ mod tests {
             "This copy of aterm 0.91.0 doesn\u{2019}t update itself"
         );
         assert!(trouble.is_some_and(|t| t.contains("aterm update enable")));
-        // A replaced executable waits for its first window, and its checks with it:
-        // never "up to date" over a check that read no channel.
+        // A replaced executable waits for its first start — a window or a terminal
+        // session — and its checks with it: never "up to date" over a check that read
+        // no channel, and never a request for a window a copy used only from the
+        // terminal will not open.
         let mut waiting = update_status();
         waiting.linux = Some(aterm_update::LinuxUpdateStatus {
             installed_build: 100,
@@ -2703,17 +3047,22 @@ mod tests {
         assert_eq!(
             say(&waiting, true, true),
             (
-                "aterm 0.91.0 is installed \u{2014} launch an aterm window once to finish; \
+                "aterm 0.91.0 is installed \u{2014} the next aterm you start finishes it; \
                  update checks wait until then"
                     .to_string(),
                 None
             )
         );
-        // -v: nothing about the budget right after the install, then how much is used.
+        // -v: nothing about the budget right after the install, then how much is used —
+        // never more than the budget, though a burst of starts counts past it.
         assert_eq!(trial_launches_words(0), "");
         assert_eq!(
             trial_launches_words(1),
             " (1 of 3 launches used before it rolls back)"
+        );
+        assert_eq!(
+            trial_launches_words(5),
+            " (3 of 3 launches used before it rolls back)"
         );
         waiting.linux.as_mut().expect("linux").trial_healthy = true;
         assert!(say(&waiting, true, true).0.contains("is up to date"));
@@ -2861,6 +3210,59 @@ mod tests {
         assert!(
             body.contains("atpkg::vendor_direct::watch::run_host("),
             "{body}"
+        );
+    }
+
+    /// THE LINUX SESSION LANE COUNTS AND CONFIRMS ITS OWN START (round four). A copy
+    /// used only from the terminal installs updates from this lane's checker, and until
+    /// 2026-09-28 nothing on it counted or confirmed the install, so it installed one and
+    /// then stopped updating for good. The counting and confirming live in `aterm-update`
+    /// (its Linux tests drive `session_started_in` and `confirm_session_in`); this pins
+    /// the wiring nothing else would notice leaving: the start is counted BEFORE the
+    /// checker starts, inside the interactive gate, and it is confirmed through the
+    /// SESSION lane's confirmation — the window's would let a terminal vouch for a
+    /// window that crashes. A scrape, in this module's idiom: the lane is Linux-only and
+    /// this box runs macOS.
+    ///
+    /// FAILS WITHOUT THE WIRING: delete `start_linux_session_trial(build);` or confirm
+    /// through `confirm_boot_health_exact` and one of the asserts below names it.
+    #[test]
+    fn the_linux_session_lane_counts_and_confirms_before_its_checker_starts() {
+        let src = include_str!("main.rs");
+        let gate = src
+            .find("if session_lane_is_interactive() {\n        let build")
+            .expect("the session lane's interactive update gate");
+        let count = src[gate..]
+            .find("start_linux_session_trial(build);")
+            .map(|at| gate + at)
+            .expect("the session lane counts its start");
+        let checker = src[gate..]
+            .find("aterm_update::spawn_background_check_with_settings(")
+            .map(|at| gate + at)
+            .expect("the session lane's checker");
+        assert!(
+            count < checker,
+            "the start is counted before the checker can install anything"
+        );
+        let body = &src[src
+            .find("fn start_linux_session_trial(")
+            .expect("the session trial")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        assert!(
+            body.contains("aterm_update::linux_session_started(build, &commit)"),
+            "{body}"
+        );
+        assert!(
+            body.contains("aterm_update::confirm_linux_session(build, &commit)"),
+            "the session confirms the SESSION lane: {body}"
+        );
+        assert!(
+            !body.contains("confirm_boot_health_exact"),
+            "a window's confirmation would let a session vouch for a window: {body}"
+        );
+        assert!(
+            body.contains("aterm_cli::on_first_shell_output("),
+            "it confirms at the shell's first output: {body}"
         );
     }
 
@@ -3069,7 +3471,7 @@ mod tests {
             env_file.display()
         );
         let args = [std::ffi::OsString::from("-c"), script.into()];
-        spawn_detached(
+        atpkg::platform::spawn_detached(
             std::ffi::OsStr::new("/bin/sh"),
             &args,
             Some(("ATPKG_SPAWNER_PID", atpkg::cli::SPAWNER_DETACHED)),

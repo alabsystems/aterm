@@ -245,6 +245,7 @@ mod tests {
             spec(StageId::Tippy, "tippy", Lane::TippyTarget, false),
             spec(StageId::Formatting, "fmt", Lane::XtaskTarget, false),
             spec(StageId::GrepGuards, "grep", Lane::Pure, false),
+            spec(StageId::ExportContent, "export", Lane::Pure, false),
             spec(StageId::DeliveryTooling, "delivery", Lane::Pure, false),
             spec(StageId::Forge, "forge", Lane::XtaskTarget, false),
             spec(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, false),
@@ -421,6 +422,8 @@ mod tests {
                 ("compile", "l0"),
                 ("compile", "libc"),
                 ("grep", "delivery"),
+                ("compile", "export"),
+                ("export", "delivery"),
                 ("compile", "fmt"),
                 ("compile", "drivers"),
             ],
@@ -450,6 +453,16 @@ mod tests {
             overlaps(at(idx("grep")), at(idx("delivery"))),
             "`Pure` is the ABSENCE of a contended resource: pure stages must \
              overlap each other too, not queue behind one another"
+        );
+        // The export content scan greps a scratch export for tens of seconds:
+        // it starts at t0, beside the compile and the other pure stages.
+        assert!(
+            overlaps(at(idx("compile")), at(idx("export"))),
+            "the export content scan must not wait for the test compile"
+        );
+        assert!(
+            overlaps(at(idx("export")), at(idx("delivery"))),
+            "the export content scan must overlap the other pure stages"
         );
         // The side lanes start at t0, beside the test compile.
         for side in ["fmt", "drivers"] {

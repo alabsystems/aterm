@@ -70,6 +70,62 @@ pub use aterm_update_core::ensure_private_dir;
 /// platforms (Unix `flock(LOCK_EX)`, Windows `share_mode(0)` with bounded retry).
 pub use aterm_update_core::FileLock;
 
+/// Start `program args` DETACHED: stdio on `/dev/null`, its own process group, and NOT
+/// the caller's child. Moved here from `crates/aterm/src/main.rs` (2026-09-23), which
+/// starts the terminal session's pass with it, so atpkg's warm of a landed agent build
+/// ([`crate::warm`]) detaches the same way. The session lane goes on to run
+/// `aterm_cli::session_main` in the same process, and its unix driver reaps the shell
+/// with `waitpid(-1)`: a finished pass left as ITS zombie could be reaped in the shell's
+/// place, and `aterm` exited with the pass's status instead of the shell's (2026-09-12
+/// audit K9; reliably on Linux, ~6% of exits on macOS). So on unix a `/bin/sh` middle
+/// process — the group leader — backgrounds the program and exits at once, and reaping
+/// it here re-parents the program to launchd/init. `env` is one variable set on it.
+///
+/// # Errors
+/// The middle shell could not be started, or did not exit 0.
+pub fn spawn_detached(
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+    env: Option<(&str, &str)>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = std::process::Command::new("/bin/sh");
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        }
+        let status = command
+            .args(["-c", "\"$@\" &", "sh"])
+            .arg(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("the detaching shell {status}")))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut command = std::process::Command::new(program);
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        }
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(drop)
+    }
+}
+
 /// Install a `bin/` shim for `tool` pointing at that tool's executable inside a build's
 /// `bin/` directory (`build_bin_dir`). `shim` is the concrete shim path — build it with
 /// [`crate::store::Layout::shim`], never by joining the tool name yourself.

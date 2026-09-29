@@ -174,25 +174,10 @@ impl BinScan {
 /// numeric one after it. `None` if the path isn't a store shim target.
 // `pub(crate)` so the GC scan reuses the exact same store-path parser.
 pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
-    // `Path::iter` / `Iter::next` / `OsStr::to_str` go via `call1`: std's INLINED
-    // `unsafe` (the `OsStr` byte-slice casts, the `from_utf8_unchecked` fast path)
-    // is otherwise attributed to this function's spans as missing-SAFETY-comment
-    // refutations under the strict Trust gate (see `lib.rs`). Same calls, same
-    // receivers; behavior identical (`collect` is exactly this push loop). The
-    // `saturating_add`s are identical too: `position` returns an in-bounds index,
-    // so `i + 2` can never approach `usize::MAX`.
-    let mut it = crate::call1(std::path::Path::iter, target);
-    let mut comps: Vec<&std::ffi::OsStr> = Vec::new();
-    while let Some(c) = crate::call1(<std::path::Iter<'_> as Iterator>::next, &mut it) {
-        comps.push(c);
-    }
+    let comps: Vec<&std::ffi::OsStr> = target.iter().collect();
     let i = comps.iter().position(|c| *c == "store")?;
-    let program: &std::ffi::OsStr = comps.get(i.saturating_add(1))?;
-    let program = crate::call1(std::ffi::OsStr::to_str, program)?.to_string();
-    let build: &std::ffi::OsStr = comps.get(i.saturating_add(2))?;
-    let build = crate::call1(std::ffi::OsStr::to_str, build)?
-        .parse::<u64>()
-        .ok()?;
+    let program = comps.get(i + 1)?.to_str()?.to_string();
+    let build = comps.get(i + 2)?.to_str()?.parse::<u64>().ok()?;
     Some((program, build))
 }
 
@@ -215,13 +200,8 @@ pub(crate) fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u6
     else {
         return None;
     };
-    // `OsStr::to_str` goes via `call1`: std's INLINED `unsafe` (the `from_utf8_unchecked`
-    // fast path) is otherwise attributed to this function's spans as missing-SAFETY-comment
-    // refutations under the strict Trust gate (see `lib.rs`). Same call, same receiver.
-    let program = crate::call1(std::ffi::OsStr::to_str, program)?.to_string();
-    let build = crate::call1(std::ffi::OsStr::to_str, build)?
-        .parse::<u64>()
-        .ok()?;
+    let program = program.to_str()?.to_string();
+    let build = build.to_str()?.parse::<u64>().ok()?;
     Some((program, build))
 }
 
@@ -395,31 +375,20 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
         if !prog.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        // `OsString::as_os_str` / `OsStr::to_str` go via `call1` (both here and
-        // in the build loop below): std's INLINED `unsafe` (the `OsString` →
-        // `OsStr` byte-slice cast, the `from_utf8_unchecked` fast path) is
-        // otherwise attributed to this function's spans as
-        // missing-SAFETY-comment refutations under the strict Trust gate (see
-        // `lib.rs`). Same calls, same receivers; behavior identical.
         let pname_os = prog.file_name();
-        let pname_str = crate::call1(std::ffi::OsString::as_os_str, &pname_os);
-        let Some(pname) = crate::call1(std::ffi::OsStr::to_str, pname_str).map(str::to_string)
-        else {
+        let Some(pname) = pname_os.to_str().map(str::to_string) else {
             continue;
         };
         if let Ok(builds) = std::fs::read_dir(prog.path()) {
             for b in builds.flatten() {
                 let bname_os = b.file_name();
-                let bname_str = crate::call1(std::ffi::OsString::as_os_str, &bname_os);
                 // The store's canonical recogniser, not a bare `u64::from_str`, which
                 // accepts a leading `+` and leading zeros the producer never writes. Not a
                 // reporting detail: the number is parsed off one directory's name and every
                 // consumer then addresses another (`Layout::build_dir` renders the canonical
                 // spelling), so a lenient read let the completeness gate vouch for `+19/`
                 // while gc's reclaim loop acted on `19/` and deleted a real build.
-                if let Some(n) = crate::call1(std::ffi::OsStr::to_str, bname_str)
-                    .and_then(crate::store::parse_build_name)
-                {
+                if let Some(n) = bname_os.to_str().and_then(crate::store::parse_build_name) {
                     // Only COMPLETE builds count. A build dir left partial by a crash
                     // mid-extract has no completeness marker; counting it as installed
                     // would make the manager report up-to-date and never repair it.

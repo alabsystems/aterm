@@ -43,6 +43,7 @@
 //! (`CtlReply::is_err("busy")`) retries it rather than treating it as a hard
 //! failure.
 
+use aterm_agent::harness::resume::{AfterRestart, RELAUNCH_WORDS};
 use aterm_session::input_backlog::{self, InputBacklog, InputWord, Liveness};
 use aterm_session::sink::SinkWriter;
 use aterm_types::keyboard::KeyboardMode;
@@ -124,8 +125,10 @@ pub(crate) fn refusal(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: bool)
             .agent()
             .input
             .clone();
-        if let Some(fact) = published.filter(|fact| restart_held_now(fact, &ctx.sink)) {
-            return (!signals()).then(|| restart_refusal_text(&backlog, fact.restart.survived));
+        if let Some((fact, held)) =
+            published.and_then(|fact| held_now(&fact, &ctx.sink).map(|held| (fact, held)))
+        {
+            return (!signals()).then(|| held_refusal_text(&backlog, held, fact.restart.survived));
         }
     }
     if backlog.queued == 0 {
@@ -207,7 +210,7 @@ fn written_bytes(verb: &str, rest: &str, mode: KeyboardMode) -> Option<Vec<u8>> 
 /// how long the oldest has waited. ONE remedy: a stopped job is resumed; a
 /// refused `^C` (`interrupt`) names `signal int`; a published stall is
 /// restarted (the attention line's remedy — a program that lives through it
-/// earns [`restart_refusal_text`]'s `signal kill`); input not yet a stall is
+/// earns [`held_refusal_text`]'s `signal kill`); input not yet a stall is
 /// retried. `unread=ok` stays in `help key`.
 pub(crate) fn refusal_text(b: &InputBacklog, word: InputWord, interrupt: bool) -> String {
     let wait_ms = b.wait.as_millis();
@@ -229,18 +232,30 @@ pub(crate) fn refusal_text(b: &InputBacklog, word: InputWord, interrupt: bool) -
     )
 }
 
-/// The refusal line while a stall is HELD through a restart ([`Restart`]):
-/// the same `ERR busy input-unread … input=stalled` shape, so every driver's
-/// back-off and the supervisor's hold read it as they read the other. It
-/// names `signal kill` once the program has `survived` [`RESTART_GRACE`]
-/// ([`Restart::survived`]), as [`attention_text`] then does. Before that it
-/// alone asks for a retry, while a handler may still be ending the program:
-/// the attention line keeps its `signal term` words through the grace. PURE.
-pub(crate) fn restart_refusal_text(b: &InputBacklog, survived: bool) -> String {
-    let why = if survived {
-        "the program is still running after its restart signal; end it: signal kill"
-    } else {
-        "the program has not ended since its restart signal; retry in a moment"
+/// The refusal line while a stall is HELD through a drop aterm made
+/// ([`Restart`]): the same `ERR busy input-unread … input=stalled` shape, so
+/// every driver's back-off and the supervisor's hold read it as they read
+/// the other, with what is true and the one remedy it has come to. PURE.
+///
+/// `held` says which drop ([`Held`]). Only a restart's drop may say a restart
+/// signal was sent: the queue `reset flush` emptied had no signal behind it,
+/// and its refusal once said "the program has not ended since its restart
+/// signal" all the same (robustness review of the manual reset, 2026-09-26),
+/// pointing the reader at `signal kill` for a program never sent SIGTERM. A
+/// restart names `signal kill` once the program has `survived`
+/// [`RESTART_GRACE`] ([`Restart::survived`]), as [`attention_text`] then
+/// does; before that it asks for a retry, while a handler may still be ending
+/// the program, and the attention line keeps its `signal term` words.
+pub(crate) fn held_refusal_text(b: &InputBacklog, held: Held, survived: bool) -> String {
+    let why = match held {
+        Held::Restart if survived => {
+            "the program is still running after its restart signal; end it: signal kill"
+        }
+        Held::Restart => "the program has not ended since its restart signal; retry in a moment",
+        Held::Flush => {
+            "the program has read no input since reset flush dropped its queue; restart it: \
+             signal term"
+        }
     };
     format!(
         "ERR busy input-unread bytes={} wait_ms={} input={} ({why})\n",
@@ -315,13 +330,21 @@ pub(crate) fn discard_before_signal(
     let echo = aterm_pty::tty_echo(master)?;
     // A spill the probe could not read (its mutex busy) counts as input.
     let unread = sink.input_backlog()?;
-    if unread.queued == 0 && unread.spilled == Some(0) {
-        return None;
-    }
     if echo.canonical && !fg_stopped(master) {
         return None;
     }
-    sink.discard_unread_input()
+    // The drop runs on an EMPTY queue too: it is also the mark that this
+    // signal was sent ([`Discard::Restart`] moves the restart count the
+    // watch's hold and [`RESTART_GRACE`] read). Skipping it when nothing was
+    // queued — after a `reset flush`, or a stall entered on a queue since read
+    // — left a program that ignores SIGTERM on "restart it: … signal term"
+    // for good (review of the manual reset, 2026-09-27). The reply still
+    // names a count only when bytes were dropped.
+    let dropped = sink.discard_unread_input(aterm_session::sink::Discard::Restart);
+    if unread.queued == 0 && unread.spilled == Some(0) {
+        return dropped.filter(|n| *n > 0);
+    }
+    dropped
 }
 
 /// After `signal term|kill|hup|quit` has been sent: wake the session's input
@@ -565,6 +588,10 @@ pub(crate) struct Activity {
     pub(crate) last_output: Option<Instant>,
     /// The sink's discard count ([`SinkWriter::discards`]).
     pub(crate) discards: u64,
+    /// How many of those were a restart's drop
+    /// ([`SinkWriter::restart_discards`]); a `reset flush` moves `discards`
+    /// alone ([`Restart::restarted`]).
+    pub(crate) restarts: u64,
     /// The program has READ input accepted after aterm's last discard
     /// ([`SinkWriter::read_since_discard`]). Asked only while a stall is
     /// published, the one case that needs it ([`Restart`]).
@@ -602,6 +629,23 @@ pub(crate) const RESTART_GRACE: Duration = Duration::from_secs(5);
 /// verb refused ([`refusal`]). A leader still there [`RESTART_GRACE`] after
 /// the drop has SURVIVED, and the attention line, the menu row and the band
 /// name `signal kill`.
+///
+/// A `reset flush` IS A DROP, NOT A RESTART (robustness review of the manual
+/// reset, 2026-09-26). The flush empties the same queue with the same sink
+/// call, and this record used to read every moved discard count as the
+/// restart signal's drop. Reproduced on a headless instance: a spinning
+/// python3 program published `input=stalled input_bytes=433`, `reset flush`
+/// answered `discarded=433` with no `signal` verb sent, and five seconds
+/// later its line read "Python is still running after its restart signal …
+/// end it: … signal kill", with `send x` refused "(the program has not ended
+/// since its restart signal …)". A supervisor acting on that line SIGKILLs a
+/// program that never got SIGTERM. So the sink counts the two drops apart
+/// ([`aterm_session::sink::Discard`]): any drop HOLDS the stall
+/// ([`Self::dropped`]) — the flushed queue is no more a read than the
+/// restart's — but only a restart's starts [`RESTART_GRACE`]
+/// ([`Self::restarted`]), and only it may end in `survived`. A stall held
+/// through a flush alone keeps its frozen line and its `signal term` remedy,
+/// and its refusal says `reset flush` dropped the input ([`Held::Flush`]).
 ///
 /// The hold ends, and the episode with it, on the first sign that the program
 /// is alive ([`InputWatches::step`]):
@@ -641,8 +685,13 @@ pub(crate) struct Restart {
     /// The sink's discard count at entry ([`SinkWriter::discards`]): one that
     /// has moved since means aterm dropped the queue.
     pub(crate) discards: u64,
+    /// The sink's RESTART discard count at entry
+    /// ([`SinkWriter::restart_discards`]): one that has moved since means the
+    /// drop was a restart signal's, and starts [`RESTART_GRACE`].
+    pub(crate) restarts: u64,
     /// The leader has outlived its restart signal by [`RESTART_GRACE`],
-    /// drawing nothing: the remedy is `signal kill` now.
+    /// drawing nothing: the remedy is `signal kill` now. Never set by a
+    /// `reset flush` alone ([`Self::restarted`]).
     pub(crate) survived: bool,
 }
 
@@ -654,10 +703,29 @@ impl Restart {
     pub(crate) fn dropped(&self, discards: u64) -> bool {
         self.leader.is_some() && discards != self.discards
     }
+
+    /// Whether one of those drops was a RESTART's — the one before `signal
+    /// term|kill|hup|quit` ([`discard_before_signal`]) — and not only
+    /// `reset flush`'s: the sink's restart count (`restarts`) has moved
+    /// since entry. Only then does [`RESTART_GRACE`] run, and only then may
+    /// the stall be called survived.
+    pub(crate) fn restarted(&self, restarts: u64) -> bool {
+        self.leader.is_some() && restarts != self.restarts
+    }
 }
 
-/// Whether `fact`'s restart hold stands NOW against `sink`, as far as one
-/// reading can tell. `status` and the refusal need this without waiting for
+/// Which drop a published stall is HELD through NOW ([`held_now`]), for the
+/// refusal's words ([`held_refusal_text`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// A restart signal's drop ([`Restart::restarted`]).
+    Restart,
+    /// `reset flush`'s drop alone: no signal was sent.
+    Flush,
+}
+
+/// Whether `fact`'s hold stands NOW against `sink`, as far as one reading
+/// can tell, and through which drop ([`Held`]). `status` and the refusal need this without waiting for
 /// the watch's next probe: a driver's `send` right behind its `signal term`
 /// is exactly the key that must not queue into the program. The discard count
 /// is checked first, so an ordinary reading pays for no process lookup.
@@ -668,15 +736,22 @@ impl Restart {
 /// publication follows within a turn instead of at its next [`RECHECK`]. The
 /// wake shares the hook's arming, so a driver polling `status` adds at most
 /// one probe per probe.
-fn restart_held_now(fact: &InputStallFact, sink: &SinkWriter) -> bool {
+fn held_now(fact: &InputStallFact, sink: &SinkWriter) -> Option<Held> {
+    // The restart count first: a restart bumps both counts at once, so one
+    // seen moved here is seen moved in `discards` below.
+    let restarted = fact.restart.restarted(sink.restart_discards());
     if !fact.restart.dropped(sink.discards()) {
-        return false;
+        return None;
     }
     if sink.read_since_discard() {
         let _ = sink.wake_input_hook();
-        return false;
+        return None;
     }
-    fg_cpu(sink.master()).map(|(pid, _)| pid) == fact.restart.leader
+    (fg_cpu(sink.master()).map(|(pid, _)| pid) == fact.restart.leader).then_some(if restarted {
+        Held::Restart
+    } else {
+        Held::Flush
+    })
 }
 
 /// Fold one CPU reading into a watch's window: `mark` is the reading the
@@ -787,6 +862,11 @@ struct InputWatch {
     /// was spinning then and is judged not spinning later has stopped
     /// spinning since.
     dropped: Option<(Instant, bool)>,
+    /// The probe that first found one of those drops to be a RESTART's
+    /// ([`Restart::restarted`]). [`RESTART_GRACE`] counts from here, not from
+    /// `dropped`: a `reset flush` that came first holds the stall without
+    /// starting the grace, and the `signal term` after it starts it.
+    restarted: Option<Instant>,
 }
 
 /// Every session's input watch. A session is watched from the first probe
@@ -846,6 +926,7 @@ impl InputWatches {
             now,
         );
         let dropped_before = prior.as_ref().and_then(|w| w.dropped);
+        let restarted_before = prior.as_ref().and_then(|w| w.restarted);
         let mut was = prior.and_then(|w| w.published);
         let wait = backlog.map_or(Duration::ZERO, |b| b.wait);
         let since = now.checked_sub(wait).unwrap_or(now);
@@ -877,6 +958,16 @@ impl InputWatches {
         // new episode's, on what the watch saw, not kept by the old one.
         let recovered = matches!(hold, Some(None));
         let dropped = hold.flatten();
+        // THE GRACE runs from a RESTART's drop only (robustness review of the
+        // manual reset, 2026-09-26). A queue `reset flush` emptied is held
+        // like a restart's — it was dropped, not read — but no signal was
+        // sent, so it is never "still running after its restart signal".
+        let restarted = dropped
+            .filter(|_| {
+                was.as_ref()
+                    .is_some_and(|fact| fact.restart.restarted(activity.restarts))
+            })
+            .map(|_| restarted_before.unwrap_or(now));
         if recovered {
             was = None;
         }
@@ -893,7 +984,7 @@ impl InputWatches {
         } else {
             input_backlog::classify(backlog, stopped, liveness)
         };
-        let survived = dropped.is_some_and(|(at, _)| now >= at + RESTART_GRACE);
+        let survived = restarted.is_some_and(|at| now >= at + RESTART_GRACE);
         let next_probe = match word {
             InputWord::Unmeasured | InputWord::Clear => None,
             InputWord::Pending => Some(
@@ -902,11 +993,9 @@ impl InputWatches {
                     .unwrap_or(now + RECHECK),
             ),
             InputWord::Typeahead | InputWord::Stalled | InputWord::Stopped => Some(
-                dropped
+                restarted
                     .filter(|_| !survived)
-                    .map_or(now + RECHECK, |(at, _)| {
-                        (at + RESTART_GRACE).min(now + RECHECK)
-                    }),
+                    .map_or(now + RECHECK, |at| (at + RESTART_GRACE).min(now + RECHECK)),
             ),
         };
         let stalled = matches!(word, InputWord::Stalled | InputWord::Stopped);
@@ -924,6 +1013,7 @@ impl InputWatches {
                     restart: Restart {
                         leader,
                         discards: activity.discards,
+                        restarts: activity.restarts,
                         survived: false,
                     },
                 };
@@ -958,6 +1048,7 @@ impl InputWatches {
                     cpu_mark,
                     spinning,
                     dropped,
+                    restarted,
                 },
             );
         }
@@ -1038,6 +1129,8 @@ pub(crate) fn probe(
     let master = sink.master();
     let unread = backlog.is_some_and(|b| b.unread() > 0);
     let stopped = unread && fg_stopped(master);
+    // The restart count before the epoch ([`SinkWriter::restart_discards`]).
+    let restarts = sink.restart_discards();
     let discards = sink.discards();
     let activity = Activity {
         cpu: ((unread || published) && !stopped)
@@ -1045,6 +1138,7 @@ pub(crate) fn probe(
             .flatten(),
         last_output,
         discards,
+        restarts,
         read_since_discard: published && discards != 0 && sink.read_since_discard(),
     };
     (backlog, stopped, activity)
@@ -1119,12 +1213,12 @@ pub(crate) fn status_fields(
 /// `meta attention` that never heard of them. A watched session is never
 /// woken from here, so a driver polling `status` adds no probes to one.
 ///
-/// `published` is the watch's stall. One whose queue aterm dropped for a
-/// restart its leader is living through reads `stalled` with nothing unread
-/// ([`Restart`]), from the drop on — not from the watch's next probe, which
+/// `published` is the watch's stall. One whose queue aterm dropped — for a
+/// restart its leader is living through, or by `reset flush` — reads
+/// `stalled` with nothing unread ([`Restart`]), from the drop on — not from the watch's next probe, which
 /// is what the supervisor's hold waits on — and its live word again from the
 /// moment the program reads a key sent since, a reading that wakes the watch
-/// to withdraw the stall ([`restart_held_now`]).
+/// to withdraw the stall ([`held_now`]).
 pub(crate) fn status_input(
     sink: &SinkWriter,
     published: Option<&InputStallFact>,
@@ -1145,7 +1239,7 @@ pub(crate) fn status_input(
     let word = match input_backlog::classify(backlog.as_ref(), stopped, liveness) {
         word @ (InputWord::Stopped | InputWord::Unmeasured) => word,
         word => {
-            if published.is_some_and(|fact| restart_held_now(fact, sink)) {
+            if published.is_some_and(|fact| held_now(fact, sink).is_some()) {
                 InputWord::Stalled
             } else {
                 word
@@ -1178,23 +1272,46 @@ pub(crate) fn since_hhmm(
 /// [`crate::session_timeline::META_ATTENTION_KEYED_MAX`] bytes once stored:
 ///
 /// ```text
-/// <prog> is frozen: not reading input since <HH:MM> (<n> B queued[, rss <x.y> GB|<n> MB]) — restart it: aterm ctl @<sid> signal term[, then claude --continue]
+/// <prog> is frozen: not reading input since <HH:MM> (<n> B queued[, rss <x.y> GB|<n> MB]) — restart it: aterm ctl @<sid> signal term[<after>]
 /// <prog> is stopped with input queued since <HH:MM> — resume it: aterm ctl @<sid> signal cont
-/// <prog> is still running after its restart signal, not reading input since <HH:MM>[ (rss …)] — end it: aterm ctl @<sid> signal kill[, then claude --continue]
+/// <prog> is still running after its restart signal, not reading input since <HH:MM>[ (rss …)] — end it: aterm ctl @<sid> signal kill[<after>]
 /// ```
 ///
 /// `program` is `status program=` (`the program` when unresolved), `clock` the
-/// [`since_hhmm`] of the stall (`for <dur>` of `waited` without one), and the
-/// resume command appears only for the agent whose reader names one
-/// ([`aterm_phase::resume_hint`] — `claude --continue` for Claude Code). The
+/// [`since_hhmm`] of the stall (`for <dur>` of `waited` without one). The
 /// third line is a stall whose program SURVIVED `signal term` by
 /// [`RESTART_GRACE`] ([`Restart::survived`]): its queue was dropped, so it
 /// counts no bytes, and the remedy moves on to the signal no handler can
 /// replace.
+///
+/// `<after>` is what follows the restart ([`AfterRestart`], [`after_restart`]):
+/// `, then claude --resume <id>` — the line that resumes THIS tab's own
+/// conversation, read off the event loop from Claude Code's own
+/// `sessions/<pid>.json` for the foreground process — the one read the
+/// footer's resolver takes for its facts (`aterm_agent::harness::footer::read_pid`,
+/// through `aterm_agent::harness::resume::of_entry`: no line where the kernel
+/// start is known and the record names no `procStart` to match it) — with
+/// its launch flags carried —
+/// or `; aterm relaunches it on its conversation` where the window's host
+/// supervises the agent under `[harness] relaunch` and will do so itself
+/// (U1), or nothing where neither is known.
+///
+/// WHY (robustness backlog item 2, 2026-09-26): this line used to end `then
+/// claude --continue` for every Claude Code. `--continue` resumes the
+/// directory's NEWEST conversation, and that day four live Claude Code
+/// processes shared `/Users//example/aterm`, each with its own conversation: a
+/// person following the remedy in one tab would have resumed a sibling's.
+///
+/// The command is never cut: the stored attention keeps
+/// [`crate::session_timeline::META_ATTENTION_KEYED_MAX`] bytes, and a cut id
+/// names no conversation (or another). Where the whole line does not fit,
+/// the carried flags go first (`claude --resume <id>`,
+/// [`aterm_agent::harness::resume::bare_of`]), then the resident size, then
+/// the command itself.
 pub(crate) fn attention_text(
     fact: &InputStallFact,
     program: Option<&str>,
-    reader: Option<aterm_phase::Program>,
+    after: &AfterRestart,
     sid: &str,
     clock: Option<&str>,
     waited: Duration,
@@ -1219,22 +1336,120 @@ pub(crate) fn attention_text(
         let tenths = (mb * 10 + 512) / 1024;
         format!("rss {}.{} GB", tenths / 10, tenths % 10)
     });
-    let resume = reader
-        .and_then(aterm_phase::resume_hint)
-        .map_or_else(String::new, |hint| format!(", then {hint}"));
-    if fact.restart.survived {
-        let rss = rss.map_or_else(String::new, |rss| format!(" ({rss})"));
-        return format!(
-            "{prog} is still running after its restart signal, not reading input {when}{rss} \
-             \u{2014} end it: aterm ctl @{sid} signal kill{resume}"
-        );
+    let head = |rss: Option<&str>| {
+        if fact.restart.survived {
+            let rss = rss.map_or_else(String::new, |rss| format!(" ({rss})"));
+            format!(
+                "{prog} is still running after its restart signal, not reading input {when}{rss} \
+                 \u{2014} end it: aterm ctl @{sid} signal kill"
+            )
+        } else {
+            let rss = rss.map_or_else(String::new, |rss| format!(", {rss}"));
+            format!(
+                "{prog} is frozen: not reading input {when} ({} B queued{rss}) \u{2014} restart \
+                 it: aterm ctl @{sid} signal term",
+                fact.bytes
+            )
+        }
+    };
+    let tails: Vec<String> = match after {
+        AfterRestart::Unknown => Vec::new(),
+        AfterRestart::Relaunch => vec![format!("; {RELAUNCH_WORDS}")],
+        AfterRestart::Command(line) => std::iter::once(line.clone())
+            .chain(aterm_agent::harness::resume::bare_of(line))
+            .map(|cmd| format!(", then {cmd}"))
+            .collect(),
+    };
+    // The whole line where it fits, then the bare command, then the same two
+    // without the resident size (the remedy outranks a measurement), then
+    // the restart alone: never a cut command.
+    [rss.as_deref(), None]
+        .into_iter()
+        .flat_map(|rss| tails.iter().map(move |tail| (rss, tail)))
+        .map(|(rss, tail)| format!("{}{tail}", head(rss)))
+        .find(|text| text.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX)
+        .unwrap_or_else(|| head(rss.as_deref()))
+}
+
+/// What follows the restart of the stalled program in session `tl`
+/// ([`attention_text`]'s `<after>`): the host's own relaunch where it would
+/// relaunch THIS session's agent (`host_relaunches`: [`host_relaunches`] —
+/// the host's live claim on the session, no holder's hand on it, and a
+/// launch its relaunch would plan — for a Claude Code,
+/// [`crate::harness_host::agent_of`]); else the resume line the footer
+/// resolver read for the foreground Claude Code (`FooterFacts::resume`,
+/// published only for the process in front); else nothing. One timeline
+/// read: the caller holds its leaf lock.
+pub(crate) fn after_restart(
+    tl: &crate::session_timeline::SessionTimeline,
+    host_relaunches: bool,
+) -> AfterRestart {
+    if host_relaunches
+        && crate::harness_host::agent_of(tl.agent()) == Some(aterm_phase::Program::Claude)
+    {
+        return AfterRestart::Relaunch;
     }
-    let rss = rss.map_or_else(String::new, |rss| format!(", {rss}"));
-    format!(
-        "{prog} is frozen: not reading input {when} ({} B queued{rss}) \u{2014} restart it: \
-         aterm ctl @{sid} signal term{resume}",
-        fact.bytes
-    )
+    tl.claude_footer()
+        .and_then(|facts| facts.resume.clone())
+        .map_or(AfterRestart::Unknown, AfterRestart::Command)
+}
+
+/// Whether THIS window's supervisor host would relaunch the agent of session
+/// `ctx` once a stall's remedy (`signal term|kill`) ends it — the one
+/// condition under which the remedy may say "aterm relaunches it on its
+/// conversation" INSTEAD of naming the `claude --resume <id>` a person runs
+/// ([`after_restart`]). All of:
+///
+/// * the host would relaunch this session's launch: `relaunching`, read
+///   from the host before any store lock
+///   ([`crate::harness_host::HostHandle::relaunching`]: `[harness]
+///   relaunch` on, and the snapshot it keeps of the agent one its relaunch
+///   would plan);
+/// * the host HOLDS the session: the live supervisor claim is its own
+///   ([`crate::harness_host::holder`], `aterm-harness@<pid>`). A session
+///   another supervisor holds (`aterm drive watch`, `aterm drive
+///   supervise`) ends the host's worker `Held`, so no exit of it is ever
+///   handed to the relaunch;
+/// * no one else's hand is on it: no halt (`hold=1`), no drive lease, no
+///   turn a named driver typed — the relaunch's own `OnExit::Held`
+///   (`aterm_agent::harness::relaunch::held_by_someone`), which leaves such
+///   an exit to its holder.
+///
+/// WHY (resume-hint review, 2026-09-26): the remedy said the relaunch would
+/// come on [`crate::harness_host::HostHandle::relaunches`] alone, one switch
+/// for every session, under the DEFAULT `[harness]` (enabled, relaunch on): a
+/// frozen Claude Code under `drive watch`, or halted, was told "aterm
+/// relaunches it" with no command, and nothing relaunched it.
+///
+/// Three leaf locks, each released before the next (`ctx.meta`, the fabric
+/// state, `ctx.turn_lease`): the caller holds none of them, nor the
+/// session's timeline.
+pub(crate) fn host_relaunches(
+    ctx: &crate::SessionCtx,
+    relaunching: &std::collections::HashSet<String>,
+    now_us: u64,
+) -> bool {
+    if !relaunching.contains(ctx.self_id.as_str()) {
+        return false;
+    }
+    let own = crate::harness_host::holder();
+    let claimed = ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_supervisor(now_us)
+        == Some(own.as_str());
+    if !claimed || ctx.fabric.hold().is_some() {
+        return false;
+    }
+    let lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
+    !match lease.as_ref() {
+        // A turn a named driver typed; an owner-class turn (no driver) is
+        // the host's own loop's, which holds nothing against it.
+        Some(crate::Lease::Turn { driver, .. }) => driver.is_some(),
+        Some(crate::Lease::Drive { expires_us, .. }) => *expires_us > now_us,
+        None => false,
+    }
 }
 
 /// [`attention_text`] at `now`, with the wall clock and the zone read here:
@@ -1243,7 +1458,7 @@ pub(crate) fn attention_text(
 pub(crate) fn attention_now(
     fact: &InputStallFact,
     program: Option<&str>,
-    reader: Option<aterm_phase::Program>,
+    after: &AfterRestart,
     sid: &str,
     now: Instant,
 ) -> String {
@@ -1254,48 +1469,10 @@ pub(crate) fn attention_now(
     attention_text(
         fact,
         program,
-        reader,
+        after,
         sid,
         clock.as_deref(),
         now.saturating_duration_since(fact.since),
-    )
-}
-
-/// The band's phase slot for a published stall — `(phase, since clauses,
-/// spoken)`, the three things `presence::words` composes a phase from:
-///
-/// ```text
-/// frozen 2m03s · not reading input     frozen, not reading input for 2m03s; restart it
-/// frozen 2m03s · survived its restart  frozen, still running after its restart signal; end it with signal kill
-/// stopped 41s · input queued           stopped with input queued for 41s; resume it
-/// ```
-///
-/// It takes the slot AHEAD of typed attention (2026-09-24): the incident's
-/// band read the supervisor's "answer this box" for 2h41m over a program that
-/// could read no answer. During a stall the attention entry is the server's
-/// own sentence, cut to fit — the band says the short form and the menu row
-/// carries the long one. The duration counts from the oldest unread byte.
-pub(crate) fn band_phase(fact: &InputStallFact, now: Instant) -> (String, Vec<String>, String) {
-    let dur = crate::presence::fmt_dur(now.saturating_duration_since(fact.since));
-    if fact.stopped {
-        return (
-            "stopped".to_string(),
-            vec![dur.clone(), "input queued".to_string()],
-            format!("stopped with input queued for {dur}; resume it"),
-        );
-    }
-    if fact.restart.survived {
-        // The program lived through `signal term` ([`Restart`]).
-        return (
-            "frozen".to_string(),
-            vec![dur, "survived its restart".to_string()],
-            "frozen, still running after its restart signal; end it with signal kill".to_string(),
-        );
-    }
-    (
-        "frozen".to_string(),
-        vec![dur.clone(), "not reading input".to_string()],
-        format!("frozen, not reading input for {dur}; restart it"),
     )
 }
 
@@ -1315,17 +1492,17 @@ pub(crate) fn episode_key(fact: &InputStallFact) -> u64 {
 /// The menu-bar row's stall half ([`crate::status_item::SessionRow::input_stall`])
 /// for a session whose timeline carries a published stall: the server's own
 /// attention words and the episode's key. Built for EVERY program — a frozen
-/// `vim` is as stuck as a frozen Claude Code — and the resume command rides
-/// it only where the reader names one.
+/// `vim` is as stuck as a frozen Claude Code — and what follows the restart
+/// rides it only where one is known ([`after_restart`]).
 pub(crate) fn menu_row(
     fact: &InputStallFact,
     program: Option<&str>,
-    reader: Option<aterm_phase::Program>,
+    after: &AfterRestart,
     sid: &str,
     now: Instant,
 ) -> crate::status_item::InputStallRow {
     crate::status_item::InputStallRow {
-        text: attention_now(fact, program, reader, sid, now),
+        text: attention_now(fact, program, after, sid, now),
         key: episode_key(fact),
     }
 }
@@ -1459,13 +1636,19 @@ impl crate::App {
         fact: Option<InputStallFact>,
         now: Instant,
     ) {
+        let relaunching = self
+            .harness
+            .as_ref()
+            .map(crate::harness_host::HostHandle::relaunching)
+            .unwrap_or_default();
+        let host_relaunches = host_relaunches(ctx, &relaunching, crate::metrics::now_us());
         let (agent_moved, text) = {
             let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let text = fact.as_ref().map(|fact| {
                 attention_now(
                     fact,
                     tl.agent().program.as_deref(),
-                    tl.agent().reader,
+                    &after_restart(&tl, host_relaunches),
                     ctx.self_id.as_str(),
                     now,
                 )
@@ -1565,9 +1748,12 @@ pub(crate) mod tests {
 
     /// The gate's verb set is a SUBSET of the halt's (`fabric::is_pty_reaching`)
     /// over every verb the table ships, and what it leaves out is EXACTLY the
-    /// remedies — `resize signal close pane tab confirm` — plus `invoke` of an action
-    /// that writes no input. A verb added to the halt set later lands in one
-    /// list or the other on purpose, or this fails.
+    /// remedies — `resize signal reset close pane tab confirm` — plus `invoke`
+    /// of an action that writes no input. A verb added to the halt set later
+    /// lands in one list or the other on purpose, or this fails. `reset`
+    /// (2026-09-26, the manual reset) writes no input: it is the remedy for a
+    /// terminal whose stuck modes are what filled the queue, so the gate must
+    /// never refuse it.
     #[test]
     fn the_input_writing_set_is_the_halt_set_minus_the_remedies() {
         let mut exempt = Vec::new();
@@ -1586,7 +1772,9 @@ pub(crate) mod tests {
         exempt.sort_unstable();
         assert_eq!(
             exempt,
-            ["close", "confirm", "pane", "resize", "signal", "tab"]
+            [
+                "close", "confirm", "pane", "reset", "resize", "signal", "tab"
+            ]
         );
         // `invoke` is input-writing only for an action that writes input.
         assert!(is_input_writing("invoke", "Paste"));
@@ -1678,7 +1866,7 @@ pub(crate) mod tests {
         }
         // Held through a restart inside RESTART_GRACE: the same busy shape and
         // word, and a retry — the program may still be ending.
-        let line = restart_refusal_text(&backlog(0, Duration::ZERO, false), false);
+        let line = held_refusal_text(&backlog(0, Duration::ZERO, false), Held::Restart, false);
         assert!(
             line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
             "{line}"
@@ -1686,7 +1874,7 @@ pub(crate) mod tests {
         assert!(line.ends_with("; retry in a moment)\n"), "{line}");
         assert!(!line.contains("signal kill"), "{line}");
         // Survived: the reason and `signal kill`, as the attention line says.
-        let line = restart_refusal_text(&backlog(0, Duration::ZERO, false), true);
+        let line = held_refusal_text(&backlog(0, Duration::ZERO, false), Held::Restart, true);
         assert!(
             line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
             "{line}"
@@ -1701,6 +1889,23 @@ pub(crate) mod tests {
         );
         assert!(line.contains("end it: signal kill"), "{line}");
         assert!(!line.contains("signal term"), "{line}");
+        // Held through `reset flush` alone ([`Held::Flush`], 2026-09-26): the
+        // same shape, and NO restart signal claimed — the remedy is still
+        // `signal term`, the first restart.
+        let line = held_refusal_text(&backlog(0, Duration::ZERO, false), Held::Flush, false);
+        assert!(
+            line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(")\n") && line.matches('\n').count() == 1,
+            "{line}"
+        );
+        assert!(line.contains("reset flush dropped its queue"), "{line}");
+        assert!(!line.contains("restart signal"), "{line}");
+        assert!(!line.contains("still running"), "{line}");
+        assert!(line.contains("restart it: signal term"), "{line}");
+        assert!(!line.contains("signal kill"), "{line}");
     }
 
     /// A sink over no tty has no reading, so it never refuses and never stops
@@ -2032,6 +2237,7 @@ pub(crate) mod tests {
             cpu: Some((4242, u64::try_from(burned.as_nanos()).expect("small"))),
             last_output: None,
             discards: 0,
+            restarts: 0,
             read_since_discard: false,
         }
     }
@@ -2278,15 +2484,17 @@ pub(crate) mod tests {
                 Restart {
                     leader: Some(4242),
                     discards: 0,
+                    restarts: 0,
                     survived: false,
                 },
-                "the episode's leader and the sink's discard count"
+                "the episode's leader and the sink's discard counts"
             );
         };
         // The leader after the discard (the count moved), still spinning: a
         // whole core since `primed` started its window, whenever it is read.
         let after_drop = |discards: u64, out: Option<Instant>, now: Instant| Activity {
             discards,
+            restarts: discards,
             last_output: out,
             ..spin(now.duration_since(t0.checked_sub(RECHECK).expect("uptime")))
         };
@@ -2434,6 +2642,133 @@ pub(crate) mod tests {
         assert_eq!(t, Transition::Left);
     }
 
+    /// A `reset flush` IS A DROP, NOT A RESTART (robustness review of the
+    /// manual reset, 2026-09-26). The flush moves the sink's discard count
+    /// and not its restart count ([`Restart::restarted`]). The stall is HELD
+    /// through it — the queue was dropped, not read — but past
+    /// [`RESTART_GRACE`] it is NOT survived, and its probes come at
+    /// [`RECHECK`], with no grace deadline. A `signal term` after the flush
+    /// moves the restart count: the grace runs from THAT probe, not from the
+    /// flush's, and ends in `survived` as a restart's always did.
+    ///
+    /// The negative control is the fix's absence: with the restart count
+    /// moved alongside (the one count the watch read before the split), the
+    /// same readings at the same instants are survived.
+    #[test]
+    fn step_holds_a_flushed_stall_but_never_calls_it_survived() {
+        let t0 = Instant::now();
+        let base = t0.checked_sub(RECHECK).expect("uptime");
+        let entered = |w: &mut InputWatches| {
+            primed(w, 1, t0);
+            let (t, _) = w.step(
+                1,
+                Some(&reading(1, 10, 0)),
+                false,
+                spin(RECHECK),
+                || None,
+                t0,
+            );
+            assert!(matches!(t, Transition::Entered(_)), "{t:?}");
+        };
+        // Still spinning, a whole core since `primed`, after `discards`
+        // drops of which `restarts` were a restart's.
+        let after = |discards: u64, restarts: u64, now: Instant| Activity {
+            discards,
+            restarts,
+            ..spin(now.duration_since(base))
+        };
+        let t1 = t0 + Duration::from_secs(1);
+        let grace = t1 + RESTART_GRACE;
+
+        // The negative control: the same drop counted as a restart.
+        let mut w = InputWatches::default();
+        entered(&mut w);
+        let _ = w.step(
+            1,
+            Some(&reading(0, 0, 0)),
+            false,
+            after(1, 1, t1),
+            || None,
+            t1,
+        );
+        let (t, _) = w.step(
+            1,
+            Some(&reading(0, 0, 0)),
+            false,
+            after(1, 1, grace),
+            || None,
+            grace,
+        );
+        assert!(
+            matches!(&t, Transition::Updated(f) if f.restart.survived),
+            "a restart's drop survives: {t:?}"
+        );
+
+        // The flush: held, no grace deadline, never survived.
+        let mut w = InputWatches::default();
+        entered(&mut w);
+        let (t, next) = w.step(
+            1,
+            Some(&reading(0, 0, 0)),
+            false,
+            after(1, 0, t1),
+            || panic!("rss is read at entry only"),
+            t1,
+        );
+        assert_eq!((t, next), (Transition::None, Some(t1 + RECHECK)));
+        let held = w.published(1).expect("held: a drop is not a read").clone();
+        assert_eq!(held.word, InputWord::Stalled);
+        assert!(!held.restart.survived);
+        for at in [grace, grace + RECHECK, grace + 4 * RECHECK] {
+            let (t, next) = w.step(
+                1,
+                Some(&reading(0, 0, 0)),
+                false,
+                after(1, 0, at),
+                || panic!(),
+                at,
+            );
+            assert_eq!((t, next), (Transition::None, Some(at + RECHECK)), "{at:?}");
+            assert_eq!(w.published(1), Some(&held), "never survived");
+        }
+
+        // `signal term` after it: the grace runs from the probe that sees it.
+        let t2 = grace + 4 * RECHECK + Duration::from_secs(1);
+        let (t, next) = w.step(
+            1,
+            Some(&reading(0, 0, 0)),
+            false,
+            after(2, 1, t2),
+            || panic!(),
+            t2,
+        );
+        assert_eq!((t, next), (Transition::None, Some(t2 + RESTART_GRACE)));
+        let almost = t2 + RESTART_GRACE - Duration::from_millis(1);
+        let (t, _) = w.step(
+            1,
+            Some(&reading(0, 0, 0)),
+            false,
+            after(2, 1, almost),
+            || panic!(),
+            almost,
+        );
+        assert_eq!(t, Transition::None, "the grace counts from the signal");
+        let at = t2 + RESTART_GRACE;
+        let (t, _) = w.step(
+            1,
+            Some(&reading(0, 0, 0)),
+            false,
+            after(2, 1, at),
+            || panic!(),
+            at,
+        );
+        let Transition::Updated(fact) = t else {
+            panic!("{t:?}")
+        };
+        assert!(fact.restart.survived);
+        assert_eq!(fact.since, held.since, "one episode throughout");
+    }
+
     /// A HELD STALL IS LET GO WHEN ITS PROGRAM SHOWS IT IS ALIVE (whole-branch
     /// review, fourth round, 2026-09-25). The reviewer's program lived through
     /// `signal term`, stopped spinning and read every key sent to it without
@@ -2461,6 +2796,7 @@ pub(crate) mod tests {
         // a byte sent after the drop has been read.
         let after_drop = |burned: Duration, read: bool| Activity {
             discards: 1,
+            restarts: 1,
             read_since_discard: read,
             ..spin(burned)
         };
@@ -2576,6 +2912,7 @@ pub(crate) mod tests {
             cpu: Some((4242, 0)),
             last_output: None,
             discards,
+            restarts: discards,
             read_since_discard: read,
         };
         let quiet = input_backlog::QUIET_STALL_AFTER.as_secs();
@@ -2645,6 +2982,7 @@ pub(crate) mod tests {
             Restart {
                 leader: Some(4242),
                 discards: 1,
+                restarts: 1,
                 survived: false,
             }
         );
@@ -2672,6 +3010,7 @@ pub(crate) mod tests {
             cpu: Some((4242, burned_ms * 1_000_000)),
             last_output: None,
             discards: 0,
+            restarts: 0,
             read_since_discard: false,
         };
         // Two probes of one shape: the arming one at t0 (a young byte), the
@@ -2728,6 +3067,7 @@ pub(crate) mod tests {
             cpu: Some((5151, 12_000_000_000)),
             last_output: None,
             discards: 0,
+            restarts: 0,
             read_since_discard: false,
         };
         let (t, _, _) = probe(spin(Duration::ZERO), other, 12);
@@ -2949,10 +3289,23 @@ pub(crate) mod tests {
         assert_eq!(since_hhmm(since, now, 1_700_000_000, None), None);
     }
 
-    /// The server's attention line: the remedy by name and by command, the
-    /// resume command only for the agent that has one, `the program` when
-    /// unresolved, `for <dur>` without a clock, and the stopped wording. The
-    /// incident's line fits the keyed cap with room to spare.
+    /// This tab's own resume line (`FooterFacts::resume`, read from Claude
+    /// Code's `sessions/<pid>.json` for the process in front), as the tests
+    /// below give it: launch flags carried, then `--resume <its id>`.
+    const OWN: &str = "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+
+    fn own() -> AfterRestart {
+        AfterRestart::Command(OWN.to_string())
+    }
+
+    /// The server's attention line: the remedy by name and by command, then
+    /// what follows the restart — THIS tab's own resume line, whole or bare
+    /// (never cut) as the keyed cap allows; the host's word that it
+    /// relaunches the agent; or nothing where neither is known — `the
+    /// program` when unresolved, `for <dur>` without a clock, and the stopped
+    /// wording. Never `claude --continue` (robustness backlog item 2,
+    /// 2026-09-26: the directory's newest conversation, a sibling tab's where
+    /// two share it).
     #[test]
     fn attention_text_names_the_program_the_facts_and_the_remedy() {
         let fact = InputStallFact {
@@ -2967,27 +3320,76 @@ pub(crate) mod tests {
         let line = attention_text(
             &fact,
             Some("claude"),
-            Some(aterm_phase::Program::Claude),
+            &own(),
+            sid,
+            Some("14:02"),
+            Duration::from_secs(9660),
+        );
+        // The incident's line: the flags do not fit the keyed cap beside the
+        // facts, so the bare line resumes the same conversation.
+        assert_eq!(
+            line,
+            "claude is frozen: not reading input since 14:02 (1 B queued, rss 38.8 GB) \u{2014} \
+             restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term, then claude --resume \
+             5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
+        );
+        assert!(line.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX);
+        let hosted = attention_text(
+            &fact,
+            Some("claude"),
+            &AfterRestart::Relaunch,
             sid,
             Some("14:02"),
             Duration::from_secs(9660),
         );
         assert_eq!(
-            line,
+            hosted,
             "claude is frozen: not reading input since 14:02 (1 B queued, rss 38.8 GB) \u{2014} \
-             restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term, then claude --continue"
+             restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term; aterm relaunches it on \
+             its conversation"
         );
-        assert!(line.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX);
+        let unknown = attention_text(
+            &fact,
+            Some("claude"),
+            &AfterRestart::Unknown,
+            sid,
+            Some("14:02"),
+            Duration::from_secs(9660),
+        );
+        assert!(
+            unknown.ends_with("signal term"),
+            "no record, no command: {unknown}"
+        );
 
         let plain = InputStallFact {
             rss_mb: None,
             ..fact.clone()
         };
-        let line = attention_text(&plain, None, None, sid, None, Duration::from_secs(75));
+        let line = attention_text(
+            &plain,
+            None,
+            &AfterRestart::Unknown,
+            sid,
+            None,
+            Duration::from_secs(75),
+        );
         assert_eq!(
             line,
             "the program is frozen: not reading input for 1m15s (1 B queued) \u{2014} restart \
              it: aterm ctl @s-b7cf523445a1b0d8658e signal term"
+        );
+        // Where the whole line fits, its flags ride it.
+        let full = attention_text(
+            &plain,
+            Some("claude"),
+            &own(),
+            sid,
+            None,
+            Duration::from_secs(75),
+        );
+        assert!(
+            full.ends_with(&format!("signal term, then {OWN}")),
+            "{full}"
         );
         let small = InputStallFact {
             rss_mb: Some(1),
@@ -2996,21 +3398,15 @@ pub(crate) mod tests {
         let line = attention_text(
             &small,
             Some("sleep"),
-            None,
+            &AfterRestart::Unknown,
             sid,
             Some("22:54"),
             Duration::ZERO,
         );
         assert!(line.contains("(1 B queued, rss 1 MB)"), "{line}");
-        let codex = attention_text(
-            &plain,
-            Some("codex"),
-            Some(aterm_phase::Program::Codex),
-            sid,
-            Some("09:00"),
-            Duration::ZERO,
-        );
-        assert!(!codex.contains("--continue"), "{codex}");
+        for text in [&hosted, &unknown, &full, &line] {
+            assert!(!text.contains("--continue"), "{text}");
+        }
 
         let stopped = InputStallFact {
             word: InputWord::Stopped,
@@ -3021,7 +3417,7 @@ pub(crate) mod tests {
             attention_text(
                 &stopped,
                 Some("claude"),
-                Some(aterm_phase::Program::Claude),
+                &own(),
                 sid,
                 Some("14:02"),
                 Duration::ZERO,
@@ -3029,6 +3425,235 @@ pub(crate) mod tests {
             "claude is stopped with input queued since 14:02 \u{2014} resume it: aterm ctl \
              @s-b7cf523445a1b0d8658e signal cont"
         );
+    }
+
+    /// What follows the restart is read from the TIMELINE: the resume line
+    /// the footer resolver published for the process in front, or — where
+    /// the window's host supervises that Claude Code under `[harness]
+    /// relaunch` — the host's relaunch. NEGATIVE CONTROLS: no footer facts,
+    /// or facts with no resume line, give no command; and facts read for a
+    /// process that is no longer in front are not this tab's any more.
+    #[test]
+    fn what_follows_the_restart_is_this_tabs_own_resume_line_or_the_hosts_relaunch() {
+        let mut tl = crate::session_timeline::SessionTimeline::default();
+        tl.note_foreground_group(7);
+        tl.set_program(7, Some("claude".into()));
+        assert_eq!(after_restart(&tl, false), AfterRestart::Unknown);
+        assert!(tl.set_claude_footer(
+            7,
+            None,
+            Some(aterm_agent::harness::footer::FooterFacts::default()),
+        ));
+        assert_eq!(after_restart(&tl, false), AfterRestart::Unknown);
+        assert!(tl.set_claude_footer(
+            7,
+            None,
+            Some(aterm_agent::harness::footer::FooterFacts {
+                resume: Some(OWN.to_string()),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(after_restart(&tl, false), own());
+        assert_eq!(after_restart(&tl, true), AfterRestart::Relaunch);
+        // Another program in front: the facts were another process's.
+        tl.note_foreground_group(8);
+        tl.set_program(8, Some("vim".into()));
+        assert_eq!(after_restart(&tl, false), AfterRestart::Unknown);
+        assert_eq!(
+            after_restart(&tl, true),
+            AfterRestart::Unknown,
+            "the host relaunches a Claude Code, never a vim"
+        );
+    }
+
+    /// THE HOST'S RELAUNCH IS PROMISED ONLY FOR A SESSION THE HOST HOLDS
+    /// (resume-hint review, 2026-09-26). The remedy says "aterm relaunches it
+    /// on its conversation" — and names no command — only where this host
+    /// would relaunch THIS session's agent ([`host_relaunches`]): its own
+    /// live claim (`aterm-harness@<pid>`), no halt, no driver's lease or
+    /// named turn, and a launch its relaunch would plan (`relaunching`,
+    /// [`crate::harness_host::HostHandle::relaunching`]).
+    ///
+    /// NEGATIVE CONTROLS — each a session the relaunch never reaches, which
+    /// under `HostHandle::relaunches` alone (one switch for every session) was told the
+    /// relaunch would come: another supervisor's live claim (`aterm drive
+    /// watch`: the host's worker ends `Held` and `on_agent_left` never runs),
+    /// no claim at all, a halt (`hold=1`), a drive lease, a turn a named
+    /// driver typed, and a session whose launch the relaunch would refuse
+    /// (absent from `relaunching`). Each names this tab's own resume line.
+    #[test]
+    fn the_hosts_relaunch_is_promised_only_for_a_session_it_holds_unheld() {
+        let app = crate::App::headless_for_test();
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        {
+            let mut tl = ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some("claude".into()));
+            tl.publish_agent(
+                "prompt",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+            assert!(tl.set_claude_footer(
+                7,
+                None,
+                Some(aterm_agent::harness::footer::FooterFacts {
+                    resume: Some(OWN.to_string()),
+                    ..Default::default()
+                }),
+            ));
+        }
+        let now_us = crate::metrics::now_us();
+        let relaunching: std::collections::HashSet<String> =
+            std::iter::once(ctx.self_id.as_str().to_string()).collect();
+        let after = |relaunching: &std::collections::HashSet<String>| {
+            let host = host_relaunches(&ctx, relaunching, now_us);
+            after_restart(&ctx.timeline.lock().unwrap(), host)
+        };
+        let claim = |holder: &str| {
+            ctx.meta.lock().unwrap().supervisor = None;
+            crate::session_timeline::claim_supervisor(&ctx, holder, None, None, now_us)
+                .expect("claimed");
+        };
+
+        // No claim yet: nothing says the host holds it.
+        assert_eq!(after(&relaunching), own(), "no claim");
+        // ANOTHER supervisor holds it (`aterm drive watch`).
+        claim("drive-watch@4242");
+        assert_eq!(after(&relaunching), own(), "another holder's claim");
+        // THE HOST holds it, unheld, and its relaunch would plan: the promise.
+        claim(&crate::harness_host::holder());
+        assert_eq!(after(&relaunching), AfterRestart::Relaunch);
+        // ...but not where its relaunch would refuse the launch.
+        assert_eq!(after(&Default::default()), own(), "a launch it refuses");
+
+        // A halt (`hold=1`) owns the exit.
+        assert!(crate::fabric::apply_hold_for_test(
+            &ctx,
+            Some(crate::fabric::Hold {
+                reason: "-".to_string(),
+                origin: "local".to_string(),
+            }),
+        ));
+        assert_eq!(after(&relaunching), own(), "hold=1");
+        assert!(crate::fabric::apply_hold_for_test(&ctx, None));
+        assert_eq!(after(&relaunching), AfterRestart::Relaunch);
+
+        // A driver's live lease owns it; a lapsed one does not.
+        let lease = |l: Option<crate::Lease>| *ctx.turn_lease.lock().unwrap() = l;
+        lease(Some(crate::Lease::Drive {
+            holder: "orchestrator".to_string(),
+            expires_us: now_us + 60_000_000,
+            conn: None,
+            hard: false,
+        }));
+        assert_eq!(after(&relaunching), own(), "a live drive lease");
+        lease(Some(crate::Lease::Drive {
+            holder: "orchestrator".to_string(),
+            expires_us: now_us.saturating_sub(1),
+            conn: None,
+            hard: false,
+        }));
+        assert_eq!(after(&relaunching), AfterRestart::Relaunch, "lapsed");
+        // A turn a named driver typed owns it; the host's own owner-class
+        // turn (no driver) does not.
+        lease(Some(crate::Lease::Turn {
+            id: 41,
+            driver: Some(aterm_session::SessionId::generate()),
+            typing: true,
+        }));
+        assert_eq!(after(&relaunching), own(), "a named driver's turn");
+        lease(Some(crate::Lease::Turn {
+            id: 42,
+            driver: None,
+            typing: true,
+        }));
+        assert_eq!(after(&relaunching), AfterRestart::Relaunch, "owner turn");
+        lease(None);
+    }
+
+    /// THE MEMORY ROW RIDES THE SAME WORD, END TO END (resume-hint review,
+    /// 2026-09-26). A Claude Code showing its critical-memory banner, under
+    /// a window whose host SUPERVISES (every such row counts as supervised,
+    /// claim or not): `App::status_session_row` hands the row the host's
+    /// word ([`host_relaunches`], as `SessionRow::restarts`), and the menu
+    /// says "restarting it at its next idle point" only on it. Relaunch off
+    /// (`relaunching` empty), no claim, and a `drive watch` claim — which
+    /// restarts nothing — each name the tab's own `claude --resume <id>`.
+    /// NEGATIVE CONTROL: the host's own claim with a launch it would plan
+    /// keeps the restart's word.
+    #[test]
+    fn the_memory_row_promises_the_restart_only_on_the_hosts_word() {
+        let app = crate::App::headless_for_test();
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        {
+            let mut tl = ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(7);
+            tl.set_program(7, Some("claude".into()));
+            tl.publish_agent(
+                "wall:memory",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+            assert!(tl.set_claude_footer(
+                7,
+                None,
+                Some(aterm_agent::harness::footer::FooterFacts {
+                    resume: Some(OWN.to_string()),
+                    ..Default::default()
+                }),
+            ));
+        }
+        let now_us = crate::metrics::now_us();
+        let relaunching: std::collections::HashSet<String> =
+            std::iter::once(ctx.self_id.as_str().to_string()).collect();
+        let label = |relaunching: &std::collections::HashSet<String>| {
+            let store = app.store.read().unwrap();
+            let row = crate::App::status_session_row(
+                store.by_local(0).expect("session 0"),
+                true,
+                relaunching,
+            );
+            assert!(row.supervised, "the host supervises it: {row:?}");
+            crate::status_item::escalation(&row)
+                .expect("a memory row")
+                .label
+        };
+        let claim = |holder: &str| {
+            ctx.meta.lock().unwrap().supervisor = None;
+            crate::session_timeline::claim_supervisor(&ctx, holder, None, None, now_us)
+                .expect("claimed");
+        };
+        let remedy = format!("memory critical \u{2014} restart it, then {OWN}");
+        let restarting = "memory critical \u{2014} restarting it at its next idle point";
+
+        // `[harness] relaunch = false`: `HostHandle::relaunching` is empty.
+        claim(&crate::harness_host::holder());
+        let off = label(&Default::default());
+        assert!(off.ends_with(&remedy), "relaunch off: {off}");
+        // No claim yet, though the host would relaunch its launch.
+        ctx.meta.lock().unwrap().supervisor = None;
+        let unclaimed = label(&relaunching);
+        assert!(unclaimed.ends_with(&remedy), "no claim: {unclaimed}");
+        // `aterm drive watch` holds it: it restarts nothing.
+        claim("drive-watch@4242");
+        let watched = label(&relaunching);
+        assert!(watched.ends_with(&remedy), "another holder: {watched}");
+        // NEGATIVE CONTROL: the host's own claim, a launch it would plan.
+        claim(&crate::harness_host::holder());
+        let hosted = label(&relaunching);
+        assert!(hosted.ends_with(restarting), "the host restarts: {hosted}");
+        assert!(!hosted.contains("--resume"), "{hosted}");
     }
 
     /// The menu row and the server's attention entry are ONE composition
@@ -3048,14 +3673,20 @@ pub(crate) mod tests {
             restart: Restart::default(),
         };
         let sid = "s-b7cf523445a1b0d8658e";
-        let claude = Some(aterm_phase::Program::Claude);
-        let row = menu_row(&fact, Some("claude"), claude, sid, now);
+        let claude = own();
+        let row = menu_row(&fact, Some("claude"), &claude, sid, now);
         assert_eq!(
             row.text,
-            attention_now(&fact, Some("claude"), claude, sid, now)
+            attention_now(&fact, Some("claude"), &claude, sid, now)
         );
         assert!(row.text.starts_with("claude is frozen: not reading input "));
-        assert!(row.text.ends_with("signal term, then claude --continue"));
+        assert!(
+            row.text.ends_with(
+                "signal term, then claude --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
+            ),
+            "{}",
+            row.text
+        );
         let later = menu_row(
             &InputStallFact {
                 bytes: 9,
@@ -3064,7 +3695,7 @@ pub(crate) mod tests {
                 ..fact.clone()
             },
             Some("claude"),
-            claude,
+            &claude,
             sid,
             now + Duration::from_secs(60),
         );
@@ -3076,12 +3707,27 @@ pub(crate) mod tests {
         assert_ne!(episode_key(&next), row.key);
     }
 
-    /// The band's phase slot for a stall: `frozen <dur> · not reading input`
-    /// and its spoken remedy; `stopped <dur> · input queued` for a stopped
-    /// job. The duration counts from the oldest unread byte.
+    /// The row's phase slot for a published stall, read through the host's
+    /// seam (`presence::Native`: `since`, `stopped`, `restart.survived`):
+    /// `frozen <dur> · not reading input` and its spoken remedy, the
+    /// survivor's `end it with signal kill`, and `stopped <dur> · input
+    /// queued` for a stopped job. The duration counts from the oldest unread
+    /// byte. (The words themselves are the engine's, proved there.)
     #[test]
     fn the_band_says_frozen_or_stopped_with_the_age_and_the_remedy() {
         let now = Instant::now();
+        let band = |fact: &InputStallFact, at: Instant| {
+            let mut slot = crate::presence::Slot::new(fact.since);
+            slot.absorb(
+                crate::presence::Facts {
+                    input_stall: Some(fact.clone()),
+                    ..crate::presence::Facts::default()
+                },
+                fact.since,
+            );
+            let w = crate::presence::words(&slot, at, 0);
+            (w.phase, w.since, w.sentence)
+        };
         let fact = InputStallFact {
             word: InputWord::Stalled,
             since: now,
@@ -3090,43 +3736,48 @@ pub(crate) mod tests {
             rss_mb: None,
             restart: Restart::default(),
         };
+        let (phase, since, sentence) = band(&fact, now + Duration::from_secs(9660));
+        assert_eq!(phase, "frozen");
         assert_eq!(
-            band_phase(&fact, now + Duration::from_secs(9660)),
-            (
-                "frozen".to_string(),
-                vec!["2h41m".to_string(), "not reading input".to_string()],
-                "frozen, not reading input for 2h41m; restart it".to_string(),
-            )
+            since,
+            vec!["2h41m".to_string(), "not reading input".to_string()]
+        );
+        assert!(
+            sentence.contains("frozen, not reading input for 2h41m; restart it"),
+            "{sentence}"
         );
         let survived = InputStallFact {
             restart: Restart {
                 leader: Some(4242),
                 discards: 0,
+                restarts: 0,
                 survived: true,
             },
             ..fact.clone()
         };
+        let (phase, since, sentence) = band(&survived, now + Duration::from_secs(9660));
+        assert_eq!(phase, "frozen");
         assert_eq!(
-            band_phase(&survived, now + Duration::from_secs(9660)),
-            (
-                "frozen".to_string(),
-                vec!["2h41m".to_string(), "survived its restart".to_string()],
+            since,
+            vec!["2h41m".to_string(), "survived its restart".to_string()]
+        );
+        assert!(
+            sentence.contains(
                 "frozen, still running after its restart signal; end it with signal kill"
-                    .to_string(),
-            )
+            ),
+            "{sentence}"
         );
         let stopped = InputStallFact {
             word: InputWord::Stopped,
             stopped: true,
             ..fact
         };
-        assert_eq!(
-            band_phase(&stopped, now + Duration::from_secs(12)),
-            (
-                "stopped".to_string(),
-                vec!["12s".to_string(), "input queued".to_string()],
-                "stopped with input queued for 12s; resume it".to_string(),
-            )
+        let (phase, since, sentence) = band(&stopped, now + Duration::from_secs(12));
+        assert_eq!(phase, "stopped");
+        assert_eq!(since, vec!["12s".to_string(), "input queued".to_string()]);
+        assert!(
+            sentence.contains("stopped with input queued for 12s; resume it"),
+            "{sentence}"
         );
     }
 
@@ -3145,6 +3796,7 @@ pub(crate) mod tests {
             restart: Restart {
                 leader: Some(69_156),
                 discards: 0,
+                restarts: 0,
                 survived: true,
             },
         };
@@ -3152,37 +3804,53 @@ pub(crate) mod tests {
         let line = attention_text(
             &fact,
             Some("claude"),
-            Some(aterm_phase::Program::Claude),
+            &own(),
             sid,
             Some("14:02"),
             Duration::from_secs(9660),
         );
+        // The resume line outranks the resident size: with it the line
+        // would pass the keyed cap, and a cut id names no conversation.
         assert_eq!(
             line,
             "claude is still running after its restart signal, not reading input since 14:02 \
-             (rss 38.8 GB) \u{2014} end it: aterm ctl @s-b7cf523445a1b0d8658e signal kill, then \
-             claude --continue"
+             \u{2014} end it: aterm ctl @s-b7cf523445a1b0d8658e signal kill, then claude \
+             --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
         );
         assert!(line.len() <= crate::session_timeline::META_ATTENTION_KEYED_MAX);
+        // Unknown: the size stays, and no command.
+        assert_eq!(
+            attention_text(
+                &fact,
+                Some("claude"),
+                &AfterRestart::Unknown,
+                sid,
+                Some("14:02"),
+                Duration::from_secs(9660),
+            ),
+            "claude is still running after its restart signal, not reading input since 14:02 \
+             (rss 38.8 GB) \u{2014} end it: aterm ctl @s-b7cf523445a1b0d8658e signal kill"
+        );
         let plain = InputStallFact {
             rss_mb: None,
             ..fact.clone()
         };
         assert_eq!(
-            attention_text(&plain, None, None, sid, None, Duration::from_secs(75)),
+            attention_text(
+                &plain,
+                None,
+                &AfterRestart::Unknown,
+                sid,
+                None,
+                Duration::from_secs(75)
+            ),
             "the program is still running after its restart signal, not reading input for \
              1m15s \u{2014} end it: aterm ctl @s-b7cf523445a1b0d8658e signal kill"
         );
         // The row a human clicks says the same, under the episode's key.
-        let row = menu_row(
-            &fact,
-            Some("claude"),
-            Some(aterm_phase::Program::Claude),
-            sid,
-            Instant::now(),
-        );
+        let row = menu_row(&fact, Some("claude"), &own(), sid, Instant::now());
         assert!(
-            row.text.contains("signal kill, then claude --continue"),
+            row.text.contains("signal kill, then claude --resume "),
             "{}",
             row.text
         );
@@ -3211,6 +3879,15 @@ pub(crate) mod tests {
                     fp: 1,
                 },
             );
+            // The footer resolver's read of this Claude Code's own record.
+            assert!(tl.set_claude_footer(
+                7,
+                None,
+                Some(aterm_agent::harness::footer::FooterFacts {
+                    resume: Some(OWN.to_string()),
+                    ..Default::default()
+                }),
+            ));
         }
         crate::session_timeline::write_attention_owned(
             &ctx,
@@ -3246,11 +3923,13 @@ pub(crate) mod tests {
         );
         assert!(
             shown.contains(&format!(
-                "aterm ctl @{} signal term, then claude --continue",
+                "aterm ctl @{} signal term, then claude --resume \
+                 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
                 ctx.self_id.as_str()
             )),
             "{shown}"
         );
+        assert!(!shown.contains("--continue"), "{shown}");
         assert!(shown.contains("(1 B queued, rss 38.8 GB)"), "{shown}");
 
         // The Exit arm's retire: the stall goes with the program.
@@ -3648,10 +4327,18 @@ pub(crate) mod tests {
     ///
     /// A job that dies on SIGTERM is the other half: its stall is withdrawn
     /// by the first probe after it ends, as before.
+    ///
+    /// And a `reset flush` FIRST (review of the manual reset's last fix,
+    /// 2026-09-27): the flush empties the queue, so `signal term` finds nothing
+    /// to drop. Its drop used to be skipped on an empty queue, which left the
+    /// restart count unmoved: the grace never opened, and a job that ignores
+    /// SIGTERM stood on "restart it: … signal term" for good — reproduced live
+    /// on a headless instance, the no-flush control moving on to `signal kill`
+    /// at +5.2 s. The signal now marks the restart whatever it drops.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_stall_whose_program_lives_through_signal_term_stands_until_signal_kill() {
-        for ignore_term in [true, false] {
+        for (ignore_term, flush_first) in [(true, false), (false, false), (true, true)] {
             let (master, slave, mut job, leader) = spinning_job(ignore_term);
             let sink = std::sync::Arc::new(SinkWriter::new(master));
             sink.note_master_nonblocking(true);
@@ -3673,6 +4360,15 @@ pub(crate) mod tests {
                         fp: 1,
                     },
                 );
+                // The footer resolver's read of its own record.
+                assert!(tl.set_claude_footer(
+                    leader,
+                    None,
+                    Some(aterm_agent::harness::footer::FooterFacts {
+                        resume: Some(OWN.to_string()),
+                        ..Default::default()
+                    }),
+                ));
             }
             let attention = || ctx.meta.lock().unwrap().attention.clone();
             let record = |app: &crate::App| app.session_status_record(77).expect("live session");
@@ -3685,6 +4381,7 @@ pub(crate) mod tests {
             let on_leader = |ns: u64| Activity {
                 cpu: Some((leader, ns)),
                 last_output: None,
+                restarts: sink.restart_discards(),
                 discards: sink.discards(),
                 read_since_discard: sink.read_since_discard(),
             };
@@ -3713,8 +4410,16 @@ pub(crate) mod tests {
             app.publish_input_stall(77, &ctx, Some(fact), t0);
             assert!(record(&app).contains(" agent=wall:unresponsive "));
 
+            if flush_first {
+                let term = app.pool.get(77).expect("session 77").term.clone();
+                let reply = crate::manual_reset::cmd_reset(77, &term, &ctx, "flush");
+                assert!(reply.ends_with(" discarded=1\n"), "{reply}");
+            }
             let reply = crate::control::cmd_signal(master, "term", &sink, None);
-            assert_eq!(reply, format!("OK signalled pgrp {leader} discarded=1\n"));
+            // Nothing left to drop after a flush: the reply says no count, and
+            // the restart is marked all the same.
+            let dropped = if flush_first { "" } else { " discarded=1" };
+            assert_eq!(reply, format!("OK signalled pgrp {leader}{dropped}\n"));
             // Past PROBE_MIN_GAP of the entry probe, so the wake-driven probe runs.
             std::thread::sleep(Duration::from_millis(300));
 
@@ -3729,7 +4434,7 @@ pub(crate) mod tests {
                     "{}",
                     record(&app)
                 );
-                assert_eq!(refusal(&ctx, "send", "claude --continue", false), None);
+                assert_eq!(refusal(&ctx, "send", OWN, false), None);
                 drop(job);
                 aterm_pty::close_fd(master);
                 aterm_pty::close_fd(slave);
@@ -3762,14 +4467,14 @@ pub(crate) mod tests {
             // The resume command typed into it is refused; inside the grace it
             // asks for a retry, never the `signal kill` the attention line does
             // not name yet. `unread=ok` and the signals stay open.
-            let refused = refusal(&ctx, "send", "claude --continue", false).expect("refused");
+            let refused = refusal(&ctx, "send", OWN, false).expect("refused");
             assert!(
                 refused.starts_with("ERR busy input-unread bytes=0 "),
                 "{refused}"
             );
             assert!(refused.contains("retry in a moment"), "{refused}");
             assert!(!refused.contains("signal kill"), "{refused}");
-            assert_eq!(refusal(&ctx, "send", "claude --continue", true), None);
+            assert_eq!(refusal(&ctx, "send", OWN, true), None);
             assert_eq!(refusal(&ctx, "signal", "kill", false), None);
 
             // Survived: the server's line moves on to `signal kill`. The job
@@ -3803,7 +4508,8 @@ pub(crate) mod tests {
             assert!(refused.contains("; end it: signal kill)"), "{refused}");
             assert!(
                 shown.contains(&format!(
-                    "aterm ctl @{} signal kill, then claude --continue",
+                    "aterm ctl @{} signal kill, then claude --resume \
+                     5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
                     ctx.self_id.as_str()
                 )),
                 "{shown}"
@@ -3823,11 +4529,182 @@ pub(crate) mod tests {
             let status = record(&app);
             assert!(!status.contains("wall:unresponsive"), "{status}");
             assert!(!status.contains(" input=stalled "), "{status}");
-            assert_eq!(refusal(&ctx, "send", "claude --continue", false), None);
+            assert_eq!(refusal(&ctx, "send", OWN, false), None);
             drop(job);
             aterm_pty::close_fd(master);
             aterm_pty::close_fd(slave);
         }
+    }
+
+    /// A `reset flush` IS NEITHER A READ NOR A RESTART, on a live App, a real
+    /// pty and a real process (robustness review of the manual reset,
+    /// 2026-09-26).
+    ///
+    /// The reviewer reproduced it on a headless instance: a python3 program
+    /// spinning in raw mode with `?1049h ?1003h ?1006h`, forty `mouse move`s
+    /// into it, `status input=stalled input_bytes=433` and the line "Python is
+    /// frozen … restart it: … signal term". Then `reset flush` answered `OK
+    /// reset reverted=alt,mouse,mouse-encoding bytes=24 discarded=433` with no
+    /// `signal` verb sent, and five seconds later the line read "Python is
+    /// still running after its restart signal … end it: … signal kill", and
+    /// `send x` was refused "(the program has not ended since its restart
+    /// signal …)". The flush's discard moved the sink's discard count, and
+    /// the watch read every moved count as `signal term`'s pre-signal drop:
+    /// the hold opened and [`RESTART_GRACE`] marked it survived. A supervisor
+    /// acting on that line SIGKILLs a program that was never sent SIGTERM.
+    ///
+    /// Now the flush's drop HOLDS the stall as it stood — the drop is not a
+    /// read, so `input=stalled`, the agent word and the frozen line stay —
+    /// but past the grace it is NOT survived: the line still names `signal
+    /// term`, and the refusal says the queue was dropped by `reset flush`,
+    /// never that a restart signal was sent. The job here dies on SIGTERM,
+    /// and the `signal term` the line names ends it: the probe after it is
+    /// reaped withdraws everything.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn reset_flush_on_a_stalled_program_is_neither_a_read_nor_a_restart() {
+        let (master, slave, mut job, leader) = spinning_job(false);
+        let sink = std::sync::Arc::new(SinkWriter::new(master));
+        sink.note_master_nonblocking(true);
+        let mut app = crate::App::headless_for_test();
+        app.pool
+            .insert(crate::stub_session_with_sink(79, sink.clone()));
+        let (term, ctx) = {
+            let s = app.pool.get(79).expect("session 79");
+            (s.term.clone(), s.ctx.clone())
+        };
+        {
+            let mut tl = ctx.timeline.lock().unwrap();
+            tl.note_foreground_group(leader);
+            tl.set_program(leader, Some("claude".into()));
+            tl.publish_agent(
+                "busy",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        let attention = || ctx.meta.lock().unwrap().attention.clone();
+        let record = |app: &crate::App| app.session_status_record(79).expect("live session");
+
+        // The unread Enter, and the stall entered on hand-aged readings of
+        // the job's REAL leader and the sink's real counts.
+        sink.write_frame_nonparking(b"\r").expect("the Enter");
+        let t0 = Instant::now();
+        let on_leader = |ns: u64| Activity {
+            cpu: Some((leader, ns)),
+            last_output: None,
+            restarts: sink.restart_discards(),
+            discards: sink.discards(),
+            read_since_discard: sink.read_since_discard(),
+        };
+        let inputs = &mut app.session_status.inputs;
+        let _ = inputs.step(
+            79,
+            Some(&reading(1, 0, 0)),
+            false,
+            on_leader(0),
+            || None,
+            t0.checked_sub(RECHECK).expect("uptime"),
+        );
+        let nanos = u64::try_from(RECHECK.as_nanos()).expect("small");
+        let (t, _) = inputs.step(
+            79,
+            Some(&reading(1, 12, 0)),
+            false,
+            on_leader(nanos),
+            || Some(2),
+            t0,
+        );
+        let Transition::Entered(fact) = t else {
+            panic!("entered: {t:?}")
+        };
+        app.publish_input_stall(79, &ctx, Some(fact), t0);
+        assert!(record(&app).contains(" agent=wall:unresponsive "));
+
+        // `reset flush`: no signal, the Enter dropped.
+        let reply = crate::manual_reset::cmd_reset(79, &term, &ctx, "flush");
+        assert!(reply.ends_with(" discarded=1\n"), "{reply}");
+        // Past PROBE_MIN_GAP of the entry probe, so a wake-driven probe runs.
+        std::thread::sleep(Duration::from_millis(300));
+        let t1 = Instant::now();
+        assert!(
+            app.observe_input_stalls(t1, Some(79)).is_empty(),
+            "the flushed queue is a drop, not a read: nothing moves"
+        );
+        assert!(
+            job.0.try_wait().expect("try_wait").is_none(),
+            "no signal reached it"
+        );
+        let status = record(&app);
+        assert!(status.contains(" input=stalled input_bytes=0 "), "{status}");
+        assert!(status.contains(" agent=wall:unresponsive "), "{status}");
+        // The refusal names the flush, never a restart signal.
+        let refused = refusal(&ctx, "send", "x", false).expect("refused");
+        assert!(
+            refused.starts_with("ERR busy input-unread bytes=0 "),
+            "{refused}"
+        );
+        assert!(refused.contains("reset flush"), "{refused}");
+        assert!(!refused.contains("restart signal"), "{refused}");
+        assert!(refused.contains("signal term"), "{refused}");
+        assert_eq!(refusal(&ctx, "send", "x", true), None);
+
+        // Past the grace, still spinning (folded by hand, as the signal-term
+        // test does): NOT survived, and the line still says `signal term`.
+        let later = t1 + RESTART_GRACE;
+        let burned = nanos + u64::try_from((later - t0).as_nanos()).expect("small");
+        let (t, _) = app.session_status.inputs.step(
+            79,
+            sink.input_backlog().as_ref(),
+            false,
+            on_leader(burned),
+            || panic!("the RSS is read at entry only"),
+            later,
+        );
+        match t {
+            Transition::None => {}
+            Transition::Updated(fact) => app.publish_input_stall(79, &ctx, Some(fact), later),
+            other => panic!("still held: {other:?}"),
+        }
+        let held = app
+            .session_status
+            .input_stall(79)
+            .expect("still published")
+            .clone();
+        assert!(
+            !held.restart.survived,
+            "no restart signal was sent: {held:?}"
+        );
+        let shown = attention().expect("the server's line");
+        assert!(shown.starts_with("claude is frozen: "), "{shown}");
+        assert!(shown.contains("signal term"), "{shown}");
+        assert!(!shown.contains("restart signal"), "{shown}");
+        assert!(!shown.contains("signal kill"), "{shown}");
+        assert!(
+            !refusal(&ctx, "send", "x", false)
+                .expect("still refused")
+                .contains("restart signal")
+        );
+
+        // The remedy the line names ends it; the probe withdraws everything.
+        let reply = crate::control::cmd_signal(master, "term", &sink, None);
+        assert_eq!(reply, format!("OK signalled pgrp {leader}\n"));
+        let _ = job.0.wait();
+        assert_eq!(
+            app.observe_input_stalls(later + PROBE_MIN_GAP, Some(79)),
+            [79]
+        );
+        assert_eq!(app.session_status.input_stall(79), None);
+        assert_eq!(attention(), None);
+        assert!(!record(&app).contains("wall:unresponsive"));
+        drop(job);
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
     }
 
     /// A PROGRAM THAT LIVES THROUGH `signal term` AND RECOVERS IS LET GO, on
@@ -3896,6 +4773,7 @@ pub(crate) mod tests {
             let on_leader = |ns: u64| Activity {
                 cpu: Some((leader, ns)),
                 last_output: None,
+                restarts: sink.restart_discards(),
                 discards: sink.discards(),
                 read_since_discard: false,
             };

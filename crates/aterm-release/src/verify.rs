@@ -881,7 +881,7 @@ fn head_status(url: &str) -> Result<String> {
 // the standalone commands: verify / status / yank / abandon
 // ---------------------------------------------------------------------------
 
-/// `cargo ship verify [vX.Y.Z]` — re-run the post-publish check anytime.
+/// `targo --unverified ship verify [vX.Y.Z]` — re-run the post-publish check anytime.
 pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     publish::assert_origin_repo_binding(&ledger::GitCli::new(repo), &origin_slug_of(repo)?)?;
     let slug = publish::workspace_channel_slug(repo)?;
@@ -929,7 +929,7 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     )
 }
 
-/// `cargo ship status` — version, ledger tail, dangling claims (ledger vs the
+/// `targo --unverified ship status` — version, ledger tail, dangling claims (ledger vs the
 /// channel) and latest published build (spec §5).
 /// `ship status`'s statement of what the next cut builds: the commit `pub publish`
 /// recorded, and the version IT declares — not this checkout's, which a cut no
@@ -1433,7 +1433,7 @@ fn demote_yank_release_convergently(
     Ok(())
 }
 
-/// What `cargo ship yank` must be told before it can publish anything: the
+/// What `targo --unverified ship yank` must be told before it can publish anything: the
 /// SIGNING inputs of the successor cut, and only those.
 ///
 /// A yank's first act is a real, published cut — [`run_yank`] publishes the
@@ -1460,7 +1460,7 @@ fn demote_yank_release_convergently(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct YankOptions {
     /// Path to the ONE credentials profile, forwarded verbatim to the successor
-    /// cut. `None` resolves exactly the way a bare `cargo ship cut` does — this
+    /// cut. `None` resolves exactly the way a bare `targo --unverified ship cut` does — this
     /// machine's provisioned identity — so an unarmed or single-machine tree
     /// still needs no flag.
     pub release_credentials: Option<PathBuf>,
@@ -1500,7 +1500,7 @@ fn yank_local_gates(
     publish::assert_origin_repo_binding(git, slug)
 }
 
-/// `cargo ship yank <build>` (spec decision 21): FIRST publish/prove a
+/// `targo --unverified ship yank <build>` (spec decision 21): FIRST publish/prove a
 /// min_build-ratcheted successor under a fresh claim, THEN remove the now-inert bad
 /// build — its origin tag, then its channel release from the published set (a
 /// demotion to a prerelease). A crash at every cleanup edge leaves the successor
@@ -1956,7 +1956,7 @@ mod tests {
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
             .collect();
-        match crate::cli::parse(&argv).unwrap() {
+        match crate::cli::parse_handed_off(&argv).unwrap() {
             crate::cli::Cmd::Cut {
                 opts,
                 abandon: None,

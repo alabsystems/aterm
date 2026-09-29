@@ -55,7 +55,8 @@ pub mod extra {
     #[cfg(test)]
     pub use aterm_grid::extra::is_combining_mark;
     pub use aterm_grid::extra::{
-        CellCoord, CellExtra, ImageData, ImageFormat, ImageRef, KittyPlaceholderData, UniformExtras,
+        CellCoord, CellExtra, ImageData, ImageFormat, ImageRef, ImageScaling, KittyPlacementTag,
+        SourceRect, UniformExtras,
     };
     pub use aterm_grid::extra_collection::CellExtras;
 }
@@ -105,7 +106,7 @@ mod tests;
 
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{Damage, DamagedRowIterator, LineDamageBounds, RowDamageBounds};
-pub use extra::{CellCoord, CellExtra, CellExtras, KittyPlaceholderData, UniformExtras};
+pub use extra::{CellCoord, CellExtra, CellExtras, UniformExtras};
 pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};
 pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable};

@@ -370,6 +370,7 @@ fn parked_record(attempt_id: u64) -> crate::PendingUpdateHandoff {
         layout_digest: [0; 32],
         screen_digest: [0; 32],
         activity_epoch: 0,
+        hold_serials: 0,
         cancel,
         arbiter: crate::HandoffAttemptArbiter::new(),
         teardown: crate::DeferredHandoffTeardown::None,
@@ -556,10 +557,9 @@ fn a_failed_successor_restore_leaves_the_draft_in_the_journal() {
         .unwrap();
     let lock = crate::native_document_journal::hold_journal_lock_for_test(&path);
     rig.successor_restores("restore refused busy", "RestoreFails");
-    // Released by LOCK_UN, not by the close alone: a child another test is
+    // The guard releases by LOCK_UN, not by the close alone: a child another test is
     // forking holds this descriptor until it execs, and the successor's open
     // below has the event loop's 25 ms journal-lock budget (the fd-copy sweep of 2026-09-27).
-    lock.unlock().expect("release the journal lock");
     drop(lock);
     assert!(
         rig.commit("commit"),
@@ -755,6 +755,7 @@ fn prelaunch_record() -> crate::HandoffPrelaunch {
         dialled: None,
         park_retry_at: None,
         park_misses: 0,
+        park_mid_sequence_reparks: 0,
         freeze_seed: crate::app_update_handoff::FreezeSeed::Default,
         land_waits: 0,
         last_wait: None,
@@ -1067,6 +1068,46 @@ fn a_headless_process_never_carries_a_draft() {
     assert_eq!(
         App::update_blocker_for_person(&reasons),
         Some(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY)
+    );
+}
+
+/// A SHELL FORKED WHILE THE JOURNAL LOCK IS HELD costs no keystroke its draft.
+///
+/// Measured: `a_journaled_draft_is_carried_and_restored_exactly` and
+/// `a_headless_process_never_carries_a_draft` each failed once in ten
+/// full-suite runs of the lib binary under load (main 37b992a3c), both on the
+/// first keystroke after `Rig::new`, with the draft typed and never journaled
+/// (`head` 1, `journal` 0, `mem` 0, nothing in flight). Other test threads fork
+/// shells; a child forked while `Rig::new`'s journal initialize held the lock
+/// kept a copy of the lock's open file description until it exec'd, a lock
+/// released by the close alone stayed taken in that copy, and the keystroke's
+/// inline append — the event loop's 25 ms of lock patience — was refused.
+/// Here the copy is taken at the instant each lock is held and kept past the
+/// keystrokes, so the losing interleaving is the only one: the step must still
+/// be `Type`, `Plan`, `Land`, because the holder releases by `LOCK_UN`.
+#[test]
+fn a_shell_forked_while_the_journal_lock_is_held_costs_no_keystroke_its_draft() {
+    let forked = crate::native_document_journal::ForkedJournalLockCopies::start();
+    let mut rig = Rig::new("forked-copy");
+    assert!(
+        forked.copied() >= 1,
+        "the open's journal initialize took the lock a fork then would copy"
+    );
+    rig.type_key("first key", "a", &["Type", "Plan", "Land"]);
+    let after_first = forked.copied();
+    assert!(
+        after_first > 1,
+        "the first append took the lock too, and it was copied"
+    );
+    rig.type_key("second key", "b", &["Type", "Plan", "Land"]);
+    assert!(forked.copied() > after_first);
+    drop(forked);
+    assert!(
+        matches!(
+            rig.parent.draft_carry(rig.document),
+            DraftCarry::Carried { .. }
+        ),
+        "the journaled draft is carried"
     );
 }
 

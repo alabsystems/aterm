@@ -140,6 +140,10 @@ mod coordination_audit_tests;
 /// A dev build's standing against the public channel: one read-only HEAD of the
 /// evergreen appcast, at the window's start and daily (gap #30).
 pub mod dev_channel;
+/// Who raised an update floor, so a revocation can take it back: the one rule both
+/// lanes' floors keep (round seven, H1).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod floor_sources;
 #[cfg(target_os = "macos")]
 mod github;
 #[cfg(target_os = "macos")]
@@ -150,6 +154,15 @@ mod install_posture;
 /// Signed single-executable Linux update transactions and explicit enrollment.
 #[cfg(target_os = "linux")]
 pub mod linux;
+/// What the Linux background check tells the window about update health: the pure
+/// rule `linux`'s loop applies, compiled into every test build like `linux_trial`.
+#[cfg(any(target_os = "linux", test))]
+mod linux_notice;
+/// When one more start of a replaced Linux executable rolls it back: the pure rule
+/// `linux` applies, compiled into every test build so the macOS gate runs its model
+/// and bind too.
+#[cfg(any(target_os = "linux", test))]
+mod linux_trial;
 #[cfg(target_os = "macos")]
 mod manifest;
 #[cfg(target_os = "macos")]
@@ -474,13 +487,52 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     )
 }
 
+/// The clause an apply-path refusal carries when the fact that caused it can
+/// change by itself: a verification helper that ran past its deadline or the
+/// apply's budget, a helper the kernel would not start just then (`EAGAIN`,
+/// `ENOMEM`, `EMFILE`, `ENFILE`), or the apply lock held by another process past
+/// its bounded wait (round four of the 2026-09 update robustness work, plan
+/// item 2).
+///
+/// WHY A CLAUSE IN THE TEXT, and not a type: these refusals reach every reader
+/// as a `String` — the apply lane's `Result<_, String>`, `ApplyOutcome::Deferred`,
+/// the GUI's cached pre-park verdict, the durable ledger's `last_failure` — and
+/// the readers that decide how long to wait (`aterm-gui`'s physical-failure
+/// shape, [`refusal_needs_person`]) only ever hold that string. Before this key,
+/// a `codesign` that ran out of the 8 s apply budget on a loaded machine was
+/// wrapped as "the installed bundle … cannot be the rollback source", which
+/// reads as a person's to clear and stopped automatic apply for good; a cached
+/// verdict of the same moment converged the build as STRUCTURAL after two
+/// attempts and held a healthy release for a day. The key is what lets both
+/// readers tell a moment from a verdict.
+///
+/// Minted in exactly one place per cause (`verify.rs`: `timed_out`, the helper
+/// spawn arms, `lock_wait_refusal`), so the classification cannot drift from the
+/// wording. A reason without it keeps the verdict it had.
+pub const PASSING_REFUSAL_KEY: &str = "a passing condition, not a verdict on the update";
+
+/// Whether an apply-path refusal is a passing MOMENT ([`PASSING_REFUSAL_KEY`]):
+/// retried on the transient schedule, never a structural verdict, never a
+/// person's to clear.
+#[must_use]
+pub fn is_passing_refusal(reason: &str) -> bool {
+    reason.contains(PASSING_REFUSAL_KEY)
+}
+
 /// The one law for "this refusal is a person's to clear": the INSTALLED bundle
 /// cannot be the swap's rollback source (`install::rollback_source_refusal`), so
 /// no lane can apply anything until the bundle is changed (2026-09-14).
+///
+/// NEVER A PASSING REFUSAL (round four, plan item 2): a check of the installed
+/// bundle that did not FINISH says nothing about the bundle, and a person asked
+/// to reinstall a healthy app would be asked for nothing. The installed-source
+/// refusal is no longer minted around a passing error, and this guard keeps a
+/// reason that somehow carries both from reading as a person's.
 #[cfg(target_os = "macos")]
 pub fn refusal_needs_person(reason: &str) -> bool {
-    install::is_rollback_source_refusal(reason)
-        || reason.contains("does not run from an installed bundle")
+    !is_passing_refusal(reason)
+        && (install::is_rollback_source_refusal(reason)
+            || reason.contains("does not run from an installed bundle"))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -500,15 +552,17 @@ pub fn refusal_needs_person(_reason: &str) -> bool {
 /// not optional.
 ///
 /// `Ok` carries what the candidate's HANDOFF POLICY file held
-/// ([`aterm_update_core::handoff_policy`], plan P0-5), read from the verified
-/// stage after every check passed and never on a refusal.
+/// ([`aterm_update_core::handoff_policy`], plan P0-5) and whether its sealed
+/// `Info.plist` declares the chunked rendezvous grant
+/// ([`HandoffCandidateFacts`]), both read from the verified stage after every
+/// check passed and never on a refusal.
 #[cfg(target_os = "macos")]
 pub fn preverify_staged_for_handoff(
     current_build: u64,
     current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
-) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
+) -> Result<HandoffCandidateFacts, String> {
     install::preverify_staged_handoff_candidate(
         current_build,
         current_commit,
@@ -516,6 +570,96 @@ pub fn preverify_staged_for_handoff(
         expected_commit,
     )
 }
+
+/// THE OPERATOR APPLY FLOOR ALONE, for a handoff whose full pre-verification
+/// a fresh cached pass let the worker skip (round six of the update audit, item
+/// 26): `Some(refusal)` when `target_build` is below the floor this machine's
+/// staging root records. The floor ratchets on OBSERVATION, so it can rise
+/// inside the pass's freshness window, and the cached pass would otherwise park
+/// every reader for a successor whose own gate 4b retires the stage. One small
+/// TOML read; `None` when there is no staging root (nothing can be yanked).
+#[cfg(target_os = "macos")]
+pub fn handoff_apply_floor_refusal(target_build: u64) -> Option<String> {
+    let staging = paths::Staging::resolve()?;
+    install::handoff_apply_floor_refusal_at(&staging, target_build)
+}
+
+/// Off macOS there is no bundle staging root, so no floor to refuse by: the
+/// macOS lane's modules (`paths`, `install`) are not compiled here (the
+/// foreign cells' type-check, 2026-09-29).
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn handoff_apply_floor_refusal(target_build: u64) -> Option<String> {
+    let _ = target_build;
+    None
+}
+
+/// THE LONGEST ONE HANDOFF PRE-VERIFICATION RUNS ([`preverify_staged_for_handoff`],
+/// [`preverify_installed_for_handoff`]; round seven, item 36): the bounded wait
+/// for the apply lock plus the verification budget opened once it is held. Every
+/// helper the check spawns answers inside that budget or is a passing refusal;
+/// what follows the last helper is two small file reads. A caller that waits for
+/// a pre-verification — the fork lane, for the candidate's handoff policy —
+/// derives its ceiling from this rather than restating the numbers.
+#[cfg(target_os = "macos")]
+pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::from_secs(
+    install::APPLY_LOCK_WAIT.as_secs() + verify::APPLY_BUDGET.as_secs(),
+);
+
+/// Off macOS a pre-verification checks nothing and returns at once.
+#[cfg(not(target_os = "macos"))]
+pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::ZERO;
+
+/// What an outgoing build learns from a handoff candidate's bundle ONCE the
+/// pre-verify has authenticated it — never from a bundle that failed a check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffCandidateFacts {
+    /// The candidate's signed handoff policy (plan P0-5).
+    pub policy: aterm_update_core::handoff_policy::PolicyRead,
+    /// The candidate's sealed `Info.plist` declares the chunked rendezvous grant
+    /// ([`HANDOFF_GRANT_CHUNKS_KEY`]): it can take more sessions than one
+    /// descriptor message carries. A declared capability of the candidate's
+    /// code, read from the bytes the signature check verified — not a knob.
+    pub grant_chunks: bool,
+}
+
+impl HandoffCandidateFacts {
+    /// Read both facts off a bundle that has just passed its checks — or refuse, as a
+    /// passing condition, when the policy file was not READ ([`Self::admitted`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn read(app_root: &std::path::Path) -> Result<Self, String> {
+        Self {
+            policy: aterm_update_core::handoff_policy::read_from_bundle(app_root),
+            grant_chunks: bundle::declares_grant_chunks(app_root),
+        }
+        .admitted()
+    }
+
+    /// These facts as a pre-verification may pass them on: a policy the system would
+    /// not let this process read just then (`PolicyRead::Unread` — no descriptor
+    /// left, an I/O error) is REFUSED, marked passing (round seven, H1 finding 57).
+    ///
+    /// Passed on, it was cached with the candidate's pass as "the successor asks
+    /// nothing", and for the pass's freshness window every park ran the capture the
+    /// release had sealed a policy to route around. Refused as a passing condition, it
+    /// is never cached (the arm-time verifier leaves the slot alone), the handoff
+    /// worker files it transient, and the next attempt reads the file again (L4).
+    #[cfg(target_os = "macos")]
+    fn admitted(self) -> Result<Self, String> {
+        if let aterm_update_core::handoff_policy::PolicyRead::Unread(why) = &self.policy {
+            return Err(verify::mark_passing(format!(
+                "the candidate's handoff policy could not be read just then ({why}); the \
+                 next attempt reads it again"
+            )));
+        }
+        Ok(self)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use bundle::{
+    HANDOFF_GRANT_CHUNKS_KEY, HANDOFF_GRANT_CHUNKS_TOKEN, plist_declares_grant_chunks,
+};
 
 /// Non-macOS: there is no `.app` bundle, so there is nothing to pre-verify,
 /// nothing this could refuse and no policy to read. The only overlap lane
@@ -527,8 +671,11 @@ pub fn preverify_staged_for_handoff(
     _current_commit: Option<&str>,
     _expected_build: Option<u64>,
     _expected_commit: Option<&str>,
-) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
-    Ok(aterm_update_core::handoff_policy::PolicyRead::Absent)
+) -> Result<HandoffCandidateFacts, String> {
+    Ok(HandoffCandidateFacts {
+        policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+        grant_chunks: false,
+    })
 }
 
 /// Record that a staged build FAILED to become the running build, so the failure
@@ -882,6 +1029,64 @@ pub fn confirm_boot_health_exact(current_build: u64, current_commit: &str) -> bo
     install::confirm_boot_health(current_build, Some(current_commit))
 }
 
+/// A TERMINAL SESSION of this executable is starting (`aterm`'s session lane, an
+/// interactive launch): on Linux it counts against a replaced executable's trial, the
+/// way a window's launch does ([`apply_staged_if_ready_preserving_fds_exact`]), and
+/// answers whether this launch IS a start of that trial — the caller then confirms it
+/// with [`confirm_linux_session`] once the session proves healthy (its shell's first
+/// output, or [`LINUX_SESSION_HEALTHY_AFTER`] alive). Until 2026-09-28 only a window
+/// counted or confirmed, so a copy used only from the terminal installed one update,
+/// never confirmed it, and stopped updating for good. `false` everywhere else, and on
+/// Linux whenever there is nothing to prove: no trial, a confirmed one, or a process
+/// running some other file than the one on trial.
+///
+/// A `--headless` GUI instance starts through here as well, in place of the boot
+/// apply: it opens no window, so it proves what a session proves, and its
+/// [`confirm_boot_health_exact`] then confirms the session lane, never the window's.
+#[must_use]
+pub fn linux_session_started(_current_build: u64, _current_commit: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::session_started(_current_build, _current_commit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// What a terminal session's confirmation of a replaced Linux executable came to
+/// ([`confirm_linux_session`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinuxSessionConfirm {
+    /// Confirmed — or nothing was waiting on this process (no trial, one already
+    /// confirmed, a process running some other file). Nothing more to do. A
+    /// session's confirmation proves the session lane only: the window lane goes on
+    /// counting its own starts until a window confirms (the round-four review), and
+    /// a window start that has not confirmed never refuses a session (round six).
+    Done,
+    /// Could not be recorded (the update lock was busy, a read failed): try again.
+    Failed,
+}
+
+/// A TERMINAL SESSION of this executable proved healthy — its shell's first output, or
+/// [`LINUX_SESSION_HEALTHY_AFTER`] alive — after [`linux_session_started`] said it is a
+/// start of a pending trial: on Linux, confirm that trial for the session lane
+/// ([`LinuxSessionConfirm`] says what came of it). A window confirms with
+/// [`confirm_boot_health_exact`]; the two differ because a session's prompt proves
+/// nothing about the window lane. [`LinuxSessionConfirm::Done`] everywhere else.
+#[must_use]
+pub fn confirm_linux_session(_current_build: u64, _current_commit: &str) -> LinuxSessionConfirm {
+    #[cfg(target_os = "linux")]
+    {
+        linux::confirm_session(_current_build, _current_commit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        LinuxSessionConfirm::Done
+    }
+}
+
 /// Linux confirms its exact inode trial; other platforms have nothing to confirm.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
@@ -961,14 +1166,15 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
 /// the event loop.
 ///
 /// `Ok` carries what that bundle's HANDOFF POLICY file held
-/// ([`aterm_update_core::handoff_policy`], plan P0-5), read only once every check
-/// above has passed.
+/// ([`aterm_update_core::handoff_policy`], plan P0-5) and its chunked-grant
+/// declaration ([`HandoffCandidateFacts`]), read only once every check above
+/// has passed.
 #[cfg(target_os = "macos")]
 pub fn preverify_installed_for_handoff(
     current_build: u64,
     expected_build: u64,
     expected_commit: &str,
-) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
+) -> Result<HandoffCandidateFacts, String> {
     let installed = bundle::resolve_layout()
         .ok_or_else(|| "no installed bundle at this executable's path".to_string())?;
     preverify_installed_locked(
@@ -977,8 +1183,9 @@ pub fn preverify_installed_for_handoff(
         current_build,
         expected_build,
         expected_commit,
-        &aterm_update_core::handoff_policy::read_from_bundle,
+        &HandoffCandidateFacts::read,
     )
+    .and_then(std::convert::identity)
 }
 
 /// [`preverify_installed_at`] UNDER THE APPLY LOCK of `staging` (bounded, as the
@@ -994,23 +1201,18 @@ pub fn preverify_installed_for_handoff(
 /// over the app by hand takes no lock; the swap-time gate is what catches that.)
 /// No staging root, no sibling can be swapping: nothing to take.
 #[cfg(target_os = "macos")]
-fn preverify_installed_locked(
+fn preverify_installed_locked<R>(
     staging: Option<&paths::Staging>,
     app_root: &std::path::Path,
     current_build: u64,
     expected_build: u64,
     expected_commit: &str,
-    read_policy: &dyn Fn(&std::path::Path) -> aterm_update_core::handoff_policy::PolicyRead,
-) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
-    let _lock = staging
-        .map(|staging| {
-            aterm_update_core::FileLock::acquire_within(
-                &staging.apply_lock,
-                install::APPLY_LOCK_WAIT,
-            )
-        })
-        .transpose()
-        .map_err(|error| format!("pre-verify lock: {error}"))?;
+    read_policy: &dyn Fn(&std::path::Path) -> R,
+) -> Result<R, String> {
+    // The lock, then the verification budget under it (round seven, item 36):
+    // the same door the staged candidate's check goes through, so this check is
+    // bounded by `HANDOFF_PREVERIFY_BOUND` too.
+    let _preverify = install::enter_preverify(staging.map(|staging| staging.apply_lock.as_path()))?;
     let floor = staging.map_or(0, |staging| {
         manifest::Floor::read(&staging.floor()).min_build
     });
@@ -1028,14 +1230,14 @@ fn preverify_installed_locked(
 /// `app_root` and the operator floor `floor_min_build`, with the policy reader
 /// injected so a test can prove a refused bundle's policy is never read.
 #[cfg(target_os = "macos")]
-fn preverify_installed_at(
+fn preverify_installed_at<R>(
     app_root: &std::path::Path,
     floor_min_build: u64,
     current_build: u64,
     expected_build: u64,
     expected_commit: &str,
-    read_policy: &dyn Fn(&std::path::Path) -> aterm_update_core::handoff_policy::PolicyRead,
-) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
+    read_policy: &dyn Fn(&std::path::Path) -> R,
+) -> Result<R, String> {
     let (build, commit) = install::verified_bundle_identity_at(app_root)?;
     // The operator apply floor (a yank) gates an ACTIVATION exactly as it gates a
     // staged swap (`install.rs`): a yanked build found under our own path is still a
@@ -1185,7 +1387,7 @@ pub fn preverify_installed_for_handoff(
     _current_build: u64,
     _expected_build: u64,
     _expected_commit: &str,
-) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
+) -> Result<HandoffCandidateFacts, String> {
     Err("installed-bundle activation is macOS-only".to_string())
 }
 
@@ -1624,6 +1826,14 @@ fn persistent_failure_notice(
     h: &health::Health,
     current_build: u64,
 ) -> (String, String) {
+    // THE STAGE STREAK IS DESCRIBED BY ITS OWN REASON (round seven, H1 open problem
+    // 101): a `network` blip does not end a standing stage streak but does overwrite
+    // `last_error`, and the arms below read passing-ness off the text they quote.
+    let stage_reason = if h.last_diagnosis_error.is_empty() {
+        h.last_error.as_str()
+    } else {
+        h.last_diagnosis_error.as_str()
+    };
     let cause = match class {
         // A stranded client (2026-09-14): the reason already names the anchor and
         // the reinstall, and "until it is republished" would be false — no release
@@ -1637,13 +1847,24 @@ fn persistent_failure_notice(
              {current_build} until it is republished",
             h.last_error
         ),
-        "stage" => format!(
-            "updates download but will not verify or install ({})",
-            h.last_error
+        // A stage that could not FINISH, every time (round six, finding 11's
+        // review): a helper past its deadline or refused a start, a copy past its
+        // budget. Nothing is known against the build, and the check keeps trying.
+        "stage" if is_passing_refusal(stage_reason) => format!(
+            "updates download but staging them could not finish — a verification or copy \
+             step on this Mac ran past its limit or could not start, every time; nothing is \
+             known against the build, and each check tries again ({stage_reason})"
         ),
+        "stage" => format!("updates download but will not verify or install ({stage_reason})"),
         "apply" => format!(
             "an update is downloaded and verified but will not start ({})",
             h.last_apply_error
+        ),
+        // Not this build's pipeline: another aterm holds the stage lock and shows
+        // no sign of life (round six, finding 3). The ledger's error names it.
+        "pipeline" if github::is_stopped_stage_holder_refusal(&h.last_error) => format!(
+            "no update can be staged while another aterm is stuck staging one ({})",
+            h.last_error
         ),
         // "pipeline", and any future class, keeps the original text.
         _ => "release manifests exist but cannot be downloaded — this build's update \
@@ -1700,6 +1921,40 @@ fn pending_update_overdue_notice(h: &health::Health, current_build: u64) -> (Str
             h.pending_build, h.pending_since
         ),
     )
+}
+
+/// The pending-update clock brought up to date for this observation
+/// ([`health::Health::note_pending_update`]) — and dropped for a build that was
+/// WITHDRAWN (round six, finding 40).
+///
+/// The clock survives an observation that finds nothing on purpose: the swap
+/// consumes the stage for a moment, and absence of evidence resetting it is how a
+/// stranded machine would stay forever "just staged". A withdrawal is not absence
+/// of evidence. A build quarantined here (it crash-looped and was reverted) or
+/// below the operator floor (yanked) will never be applied, and an hour later the
+/// overdue notice said "build P has been waiting on this machine" — again at every
+/// relaunch, until a newer release shipped. Those two are recorded facts this
+/// machine holds, so they end the clock; the revert and the yank say themselves
+/// through their own records (the apply streak, the status line).
+#[cfg(target_os = "macos")]
+fn note_pending_update(
+    staging: &paths::Staging,
+    current_build: u64,
+    observed: Option<u64>,
+) -> health::Health {
+    let h = health::Health::note_pending_update(&staging.health(), current_build, observed);
+    if observed.is_some_and(|build| build > current_build) || h.pending_build <= current_build {
+        return h;
+    }
+    let withdrawn = manifest::Quarantine::read(&staging.quarantine()).holds_build(h.pending_build)
+        || manifest::FailedMark::read(&staging.failed())
+            .is_some_and(|mark| mark.is_quarantine() && mark.build_number == h.pending_build)
+        || h.pending_build < manifest::Floor::read(&staging.floor()).min_build;
+    if withdrawn {
+        health::Health::forget_pending_update(&staging.health(), h.pending_build)
+    } else {
+        h
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1929,6 +2184,52 @@ mod persistent_notice_tests {
         );
     }
 
+    /// A WITHDRAWN BUILD IS NOT WAITING (round six, finding 40). The pending clock
+    /// survives an observation that finds nothing, on purpose — the swap consumes
+    /// the stage for a moment. But a stage retired because its build crash-looped
+    /// here (quarantined), was yanked below the operator floor, or was signed by a
+    /// machine the roster revoked will never be applied, and an hour later "build P has been waiting on this machine" was
+    /// announced for it, again at every relaunch, until a newer release shipped.
+    #[test]
+    fn a_withdrawn_build_is_never_announced_as_waiting() {
+        use super::health::Health;
+        let started = "2026-09-22T00:00:00Z".to_string();
+        let later = "2026-09-22T05:00:00Z";
+        let backdate = |s: &super::paths::Staging| {
+            let mut h = Health::read(&s.health());
+            h.pending_since = "2026-09-22T01:00:00Z".to_string();
+            std::fs::write(s.health(), aterm_toml::to_string(&h).unwrap()).unwrap();
+        };
+        for withdrawal in ["none", "quarantine", "yank", "revocation"] {
+            let s = super::paths::Staging::scratch("pending-withdrawn");
+            super::note_pending_update(&s, 10, Some(11));
+            backdate(&s);
+            match withdrawal {
+                "quarantine" => super::manifest::quarantine_artifact(&s, 11, &"ab".repeat(32)),
+                "yank" => super::manifest::Floor::bump_and_write(&s.floor(), 12, 0, 0),
+                // The check retires a stage signed by a machine the roster revoked:
+                // nothing on disk records it, so the retiring code drops the clock.
+                "revocation" => super::github::retire_revoked_stage(&s, 11),
+                _ => {}
+            }
+            // Nothing staged, the installed bundle is the running build.
+            let h = super::note_pending_update(&s, 10, None);
+            let said =
+                super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, later, 10, true);
+            if withdrawal == "none" {
+                // NEGATIVE CONTROL: a stage merely consumed keeps its clock.
+                assert!(said.is_some(), "a stranded machine must still be told");
+            } else {
+                assert!(
+                    said.is_none(),
+                    "{withdrawal}: build 11 is withdrawn, not waiting: {said:?}"
+                );
+                assert_eq!(h.pending_build, 0, "{withdrawal}");
+            }
+            let _ = std::fs::remove_dir_all(&s.root);
+        }
+    }
+
     /// THE STANDING ROW'S COUNT FOLLOWS THE LEDGER (2026-09-14, audit OBS-3): the
     /// announced class restates its number through [`HEALTH_RESTATED_TITLE`] when the
     /// count moves — no second loud notice — and speaks the loud title again only for
@@ -2086,9 +2387,16 @@ pub fn spawn_background_check_with_settings(
     }
 }
 
-/// Window launches a replaced Linux executable gets to confirm itself
-/// ([`LinuxUpdateStatus::trial_starts`]); the next launch restores the previous one.
+/// Starts a replaced Linux executable gets to confirm itself
+/// ([`LinuxUpdateStatus::trial_starts`]) — a window's launch or an interactive terminal
+/// session's; the next start restores the previous one, once no earlier start can still
+/// confirm (`linux_trial`: a burst of session starts waits for its first prompt).
 pub const LINUX_TRIAL_LAUNCHES: u32 = 3;
+
+/// How long a terminal session of a replaced Linux executable runs before it confirms
+/// the install ([`confirm_boot_health_exact`]) when its shell has printed nothing yet. A
+/// shell's first output confirms sooner; either proves the session lane itself started.
+pub const LINUX_SESSION_HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Linux disk-stage/trial facts are not a macOS DMG or a live-session handoff.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2147,6 +2455,8 @@ pub fn spawn_background_check_with_source(
         settings_retry: SETTINGS_RETRY,
         staging: std::sync::Arc::new(paths::Staging::resolve),
         checker_lock_wait: checker_watch::CHECKER_LOCK_WAIT,
+        checker_ungated_after: checker_watch::CHECKER_UNGATED_AFTER,
+        check: std::sync::Arc::new(github::check_and_stage),
         pause: None,
     });
     let generation = checker_watch::WATCH.register(
@@ -2202,6 +2512,16 @@ struct CheckerArgs {
     /// How long a cycle waits for `checker.lock` before it defers
     /// ([`checker_watch::CHECKER_LOCK_WAIT`]; a test passes a short one).
     checker_lock_wait: std::time::Duration,
+    /// After how many consecutive deferrals to a holder showing no progress the
+    /// loop checks without the lock ([`checker_watch::CHECKER_UNGATED_AFTER`]; the
+    /// deferral streak's own test passes `u64::MAX` to keep deferring). The lock
+    /// wait also sets the holder's side: its beat writes the lock every quarter of
+    /// it, and a sibling reads a write within half of it as progress
+    /// ([`holder_fresh`]).
+    checker_ungated_after: u64,
+    /// The network check and stage: [`github::check_and_stage`] in the shipping
+    /// loop, a counting stand-in in a test (which never reaches the network).
+    check: std::sync::Arc<CheckFn>,
     /// Every wait between cycles: `None` is the cadence's own (jittered, backed
     /// off, wake-aware — the shipping loop); a test passes a fixed pause.
     pause: Option<std::time::Duration>,
@@ -2233,6 +2553,11 @@ impl CheckerArgs {
         }
     }
 }
+
+/// One network check and stage for `(current build, channel)`
+/// ([`github::check_and_stage`]'s shape).
+#[cfg(target_os = "macos")]
+type CheckFn = dyn Fn(u64, &Source) -> Result<Option<String>, String> + Send + Sync;
 
 /// The arguments the process's checker was started with — what
 /// [`respawn_stalled_checker`] starts a replacement on.
@@ -2327,6 +2652,270 @@ enum CheckerGate {
     Unavailable,
 }
 
+/// THE HOLDER NAMES ITSELF (round four, plan item 14): a cycle that took
+/// `checker.lock` writes its pid into it, so a sibling that finds the lock held
+/// for cycles on end can name the process holding it. Best-effort, and not the
+/// lock: the `flock` is on the open file description, which this separate write
+/// never touches. An older build writes nothing, and the reader then names no pid.
+#[cfg(target_os = "macos")]
+fn note_checker_lock_holder(path: &std::path::Path) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    // The lock file exists (this cycle holds it): never created here, and never
+    // through a link.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", std::process::id());
+    }
+}
+
+/// The pid the last process to take `checker.lock` wrote into it
+/// ([`note_checker_lock_holder`]), if one is there to read and that process is
+/// still running. It names the holder when the holder is a build that writes it;
+/// an older holder writes nothing and leaves the last writer's pid, which is why
+/// the log line says the lock NAMES it rather than that it holds it.
+#[cfg(target_os = "macos")]
+fn checker_lock_holder(path: &std::path::Path) -> Option<u32> {
+    let pid: u32 = read_ledger_text(path)?.trim().parse().ok()?;
+    let raw = i32::try_from(pid).ok().filter(|raw| *raw > 0)?;
+    // SAFETY: signal 0 delivers nothing; it only asks whether `raw` exists.
+    let exists = unsafe { libc::kill(raw, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    exists.then_some(pid)
+}
+
+/// When this machine last completed an update check — the check receipt's
+/// `updated_at`, written only by a completed check, by whichever process ran
+/// it — when that is more than `stale` ago; `None` when it is fresher or there
+/// is no receipt to read (a machine that never checked has its own signals).
+#[cfg(target_os = "macos")]
+fn machine_check_stale_since(
+    staging: &paths::Staging,
+    stale: std::time::Duration,
+) -> Option<String> {
+    let text = read_ledger_text(&check_receipt::path(staging))?;
+    let v = text.parse::<aterm_toml::Value>().ok()?;
+    let checked = v.get("updated_at").and_then(aterm_toml::Value::as_str)?;
+    rfc3339_older_than(checked, stale.as_secs()).then(|| checked.to_string())
+}
+
+/// Whether the process holding `checker.lock` at `path` has shown it is still
+/// working within `fresh`: the lock file was written that recently — by the holder
+/// taking it ([`note_checker_lock_holder`]), or by its [`HolderBeat`], which rewrites
+/// it while that holder's checker is alive and its own heartbeat fresh, download and
+/// all.
+///
+/// THE PROGRESS SIGNAL THE DEFERRAL RULE LACKED (the round-four review). A sibling's
+/// deferrals counted cycles, and a stale machine ledger ungated at the first one,
+/// with nothing to tell a holder that is stopped from one that took the lock a minute
+/// ago or is twenty minutes into a download on a slow link — so both were called
+/// "stopped or hung" (a warning, an OS banner) and raced by an ungated check that then
+/// failed on the stage lock. A stopped process writes nothing, and a hung checker's
+/// beat stops with its heartbeat. A holder of a build older than this writes nothing
+/// after taking the lock either, and so reads as not progressing — the rule as it was.
+/// A stamp from the future (the clock stepped back) is no progress: a wrong clock can
+/// defer no check.
+///
+/// THE STAMP IS READ BEFORE THE CLOCK. Read the other way round, a beat that lands
+/// between the two reads is a stamp from after `now` — the future — and a holder
+/// writing every few milliseconds was called not progressing whenever the reader was
+/// descheduled for the moment in between (measured: a stamp 1.4 ms past the clock
+/// read, in a loaded test run, which called a working holder stopped). Read this way
+/// round, a stamp can be past the clock only by the two clocks' granularity (the file
+/// system stamps nanoseconds, `SystemTime::now` on macOS reads microseconds), which
+/// [`HOLDER_STAMP_SLACK`] absorbs; a stamp further ahead is still a wrong clock.
+#[cfg(target_os = "macos")]
+fn checker_holder_progressing(path: &std::path::Path, fresh: std::time::Duration) -> bool {
+    let Ok(written) = std::fs::symlink_metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    match std::time::SystemTime::now().duration_since(written) {
+        Ok(age) => age < fresh,
+        Err(ahead) => ahead.duration() <= HOLDER_STAMP_SLACK,
+    }
+}
+
+/// How far past this process's clock a lock stamp read before it may be and still
+/// count as written now ([`checker_holder_progressing`]): the clocks' granularity, not
+/// a clock that stepped back.
+#[cfg(target_os = "macos")]
+const HOLDER_STAMP_SLACK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How recently a holder must have written `checker.lock` to count as making
+/// progress ([`checker_holder_progressing`]): half this process's own lock wait. A live
+/// holder's [`HolderBeat`] writes it every quarter of that wait, so after the full wait
+/// it is at most one beat old; half the wait leaves a whole beat of slack, and is still
+/// shorter than the wait itself, so a lock that was taken before the wait began and
+/// never written again is always past it.
+#[cfg(target_os = "macos")]
+fn holder_fresh(lock_wait: std::time::Duration) -> std::time::Duration {
+    lock_wait / 2
+}
+
+/// THE HOLDER'S BEAT (the round-four review): while a cycle holds `checker.lock` and
+/// its checker is alive — this generation still the live one, its heartbeat fresh for
+/// its phase ([`checker_watch::classify`]) — a thread rewrites the lock every quarter
+/// of the lock wait, so a sibling can tell a holder that is checking (a download on a
+/// slow link included: a download's progress re-stamps the heartbeat) from one that is
+/// stopped or hung ([`checker_holder_progressing`]). Stopping the process stops the
+/// beat; a checker stuck inside its check lets its heartbeat go stale, and the beat
+/// stops with it. Joined on drop, before the lock is let go ([`HeldGate`]'s field
+/// order), so it never writes this pid into a lock another process then holds.
+#[cfg(target_os = "macos")]
+struct HolderBeat {
+    stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl HolderBeat {
+    fn start(
+        path: std::path::PathBuf,
+        watch: &'static checker_watch::CheckerWatch,
+        generation: u64,
+        every: std::time::Duration,
+    ) -> Self {
+        let alive = checker_alive(watch, generation);
+        Self::start_with(path, every, move || alive())
+    }
+
+    /// Rewrite the lock at `path` every `every` for as long as `alive` answers
+    /// yes — the one beat both machine-wide locks' holders keep, and under the one
+    /// rule: alive while the checker doing the work is (its generation current,
+    /// its heartbeat fresh — [`checker_alive`]). `checker.lock`'s holder asks it
+    /// through [`Self::start`]; `stage.lock`'s through [`stage_holder_alive`]
+    /// (`github::take_stage_lock`).
+    fn start_with(
+        path: std::path::PathBuf,
+        every: std::time::Duration,
+        alive: impl Fn() -> bool + Send + 'static,
+    ) -> Self {
+        let stop = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let flag = std::sync::Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("aterm-update-lock-beat".into())
+            .spawn(move || {
+                let (stopped, wake) = &*flag;
+                let mut guard = stopped.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    guard = wake
+                        .wait_timeout(guard, every)
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                    if *guard {
+                        return;
+                    }
+                    if alive() {
+                        note_checker_lock_holder(&path);
+                    }
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for HolderBeat {
+    fn drop(&mut self) {
+        let (stopped, wake) = &*self.stop;
+        *stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Whether a lock holder's work is alive, asked by its [`HolderBeat`] before each
+/// stamp.
+#[cfg(target_os = "macos")]
+pub(crate) type HolderAlive = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// THE ONE LIVENESS RULE FOR A LOCK HOLDER: `generation` of `watch` is still the
+/// live checker and its heartbeat is fresh for its phase
+/// ([`checker_watch::classify`]). A stopped process runs no beat at all; a checker
+/// HUNG inside its check (a download stalled on a dead read, a helper that never
+/// returns) lets its heartbeat go stale, and the watchdog then retires its
+/// generation — either way the answer turns to no, so the holder looks as stuck as
+/// it is and a waiting sibling can say so.
+#[cfg(target_os = "macos")]
+fn checker_alive(watch: &'static checker_watch::CheckerWatch, generation: u64) -> HolderAlive {
+    std::sync::Arc::new(move || {
+        watch.is_current(generation) && watch.snapshot().is_some_and(|beat| beat_fresh(&beat))
+    })
+}
+
+/// Whether `beat` is fresh for its phase now.
+#[cfg(target_os = "macos")]
+fn beat_fresh(beat: &checker_watch::CheckerBeat) -> bool {
+    matches!(
+        checker_watch::classify(beat, checker_watch::now_secs()),
+        checker_watch::CheckerVerdict::Fresh { .. }
+    )
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// The liveness of the check running on THIS thread, set by the loop around its
+    /// check ([`CheckAliveScope`]) so the stage lock's beat judges that check's own
+    /// generation (round six, finding 3's review).
+    static CHECK_ALIVE: std::cell::RefCell<Option<HolderAlive>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, the check on this thread is judged by `alive`
+/// ([`stage_holder_alive`]); dropped — a panic included — the thread's previous
+/// answer is put back.
+#[cfg(target_os = "macos")]
+struct CheckAliveScope(Option<HolderAlive>);
+
+#[cfg(target_os = "macos")]
+impl CheckAliveScope {
+    fn enter(alive: HolderAlive) -> Self {
+        Self(CHECK_ALIVE.with(|slot| slot.replace(Some(alive))))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CheckAliveScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CHECK_ALIVE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// What the `stage.lock` holder's beat asks before each stamp: the loop's own
+/// check answers by its generation ([`checker_alive`], set by
+/// [`CheckAliveScope`]); a check with no generation — "Check for Updates"
+/// (`check_now`) — by this process's heartbeat as it stands, fresh or not. A
+/// process with no checker at all has no watchdog to judge a hang by and keeps
+/// stamping while it runs, as the beat always did.
+#[cfg(target_os = "macos")]
+pub(crate) fn stage_holder_alive() -> HolderAlive {
+    CHECK_ALIVE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| {
+            std::sync::Arc::new(|| {
+                checker_watch::WATCH
+                    .snapshot()
+                    .is_none_or(|beat| beat_fresh(&beat))
+            })
+        })
+}
+
+/// A cycle's hold on `checker.lock`, with its [`HolderBeat`]. The beat is declared
+/// FIRST so it drops first: it stops before the lock is released.
+#[cfg(target_os = "macos")]
+struct HeldGate {
+    _beat: Option<HolderBeat>,
+    _lock: aterm_update_core::FileLock,
+}
+
 /// Ask for the machine-wide checker lock at `path`, waiting at most `wait`.
 #[cfg(target_os = "macos")]
 fn checker_gate(path: &std::path::Path, wait: std::time::Duration) -> CheckerGate {
@@ -2351,7 +2940,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// has taken over.
 #[cfg(target_os = "macos")]
 fn run_checker(
-    watch: &checker_watch::CheckerWatch,
+    watch: &'static checker_watch::CheckerWatch,
     generation: u64,
     args: &CheckerArgs,
 ) -> CheckerExit {
@@ -2411,11 +3000,7 @@ fn run_checker(
             let installed = bundle::resolve()
                 .and_then(|installed| verify::bundle_build_number(&installed.app_root).ok())
                 .filter(|build| *build > current_build);
-            let h = health::Health::note_pending_update(
-                &staging.health(),
-                current_build,
-                staged.max(installed),
-            );
+            let h = note_pending_update(&staging, current_build, staged.max(installed));
             let now = install::now_rfc3339();
             if let Some((title, body)) = announcer.tick(&h, &now, current_build) {
                 args.send_health(title, body);
@@ -2471,6 +3056,11 @@ fn run_checker(
     // per cycle. Each now speaks when it starts, every Nth repeat, and when it ends.
     let mut settings_misses = StreakLog::new(SETTINGS_MISS_LOG_EVERY);
     let mut deferrals = StreakLog::new(CHECKER_DEFERRAL_LOG_EVERY);
+    // Of those, the cycles in a row behind a holder that showed no progress
+    // (`checker_holder_progressing`): the count that ungates and is published.
+    let mut stalled_deferrals: u64 = 0;
+    // Whether this deferral streak has said it checks without the lock (once).
+    let mut ungated_said = false;
     let mut lane_busy = StreakLog::new(LANE_BUSY_LOG_EVERY);
     loop {
         if !stamp(CheckerPhase::Settings) {
@@ -2649,52 +3239,168 @@ fn run_checker(
                     if !stamp(CheckerPhase::LockWait) {
                         return Cycle::Superseded(last.get());
                     }
-                    let gate = checker_staging.as_ref().map(|s| {
-                        checker_gate(
-                            &s.status.with_file_name("checker.lock"),
-                            args.checker_lock_wait,
-                        )
-                    });
+                    let checker_lock = checker_staging
+                        .as_ref()
+                        .map(|s| s.status.with_file_name("checker.lock"));
+                    let gate = checker_lock
+                        .as_deref()
+                        .map(|path| checker_gate(path, args.checker_lock_wait));
                     if !watch.is_current(generation) {
                         return Cycle::Superseded(CheckerPhase::LockWait);
                     }
+                    // THE HOLDER THAT IS NOT MAKING PROGRESS (round four, plan
+                    // item 14). Deferring to it for good stopped every update
+                    // check on the machine, with no notice, for as long as a
+                    // stopped aterm stayed stopped. Past
+                    // `CHECKER_UNGATED_AFTER` deferrals in a row to a holder
+                    // showing no progress — or with no check completed on this
+                    // machine for `STALE_CHECK_AFTER` and the holder showing none
+                    // — this cycle checks WITHOUT the lock: the gate is a cost
+                    // device, and the streak stands (published, and ended only by
+                    // a cycle that gets the lock or a holder seen working) so the
+                    // window's watchdog can say so.
+                    //
+                    // PROGRESS IS WHAT THE HOLDER WROTE (the round-four review):
+                    // the lock file, rewritten by its `HolderBeat` while its
+                    // checker is alive. Counting cycles alone called a holder
+                    // twenty minutes into a download on a slow link stopped — a
+                    // warning, a banner, and an ungated check that then failed on
+                    // the stage lock — and a stale ledger (any machine that slept
+                    // through the check interval) did it at the FIRST deferral, to
+                    // a holder that had taken the lock a minute before. A holder
+                    // seen working is checking for this machine: its deferral is
+                    // the ordinary kind, and it ends the streak.
+                    let mut ungated = false;
                     let _checker_gate = match gate {
                         Some(CheckerGate::Deferred) => {
-                            match deferrals.note() {
-                                Streak::Began => log(&format!(
+                            let progressing = checker_lock.as_deref().is_some_and(|path| {
+                                checker_holder_progressing(
+                                    path,
+                                    holder_fresh(args.checker_lock_wait),
+                                )
+                            });
+                            let streak = deferrals.note();
+                            // The cycles in a row behind a holder showing no
+                            // progress: what ungates, and what the window's
+                            // watchdog is shown.
+                            stalled_deferrals = if progressing {
+                                0
+                            } else {
+                                stalled_deferrals.saturating_add(1)
+                            };
+                            let ledger_stale = checker_staging
+                                .as_ref()
+                                .and_then(|s| machine_check_stale_since(s, STALE_CHECK_AFTER));
+                            ungated = !progressing
+                                && (stalled_deferrals >= args.checker_ungated_after
+                                    || ledger_stale.is_some());
+                            if progressing {
+                                ungated_said = false;
+                            }
+                            let holder = checker_lock
+                                .as_deref()
+                                .and_then(checker_lock_holder)
+                                .map_or_else(
+                                    || "another aterm process".to_string(),
+                                    |pid| {
+                                        format!("another aterm process (the lock names pid {pid})")
+                                    },
+                                );
+                            match (streak, ungated) {
+                                (Streak::Began, false) => log(&format!(
                                     "update check deferred: another aterm process has held the \
                                      checker lock for more than {} s — it is checking for this \
                                      machine; this process waits for its next cycle",
                                     args.checker_lock_wait.as_secs()
                                 )),
-                                Streak::Continues(cycles) => warn(&format!(
+                                (Streak::Continues(cycles), false) if progressing => {
+                                    log(&format!(
+                                        "update check deferred {cycles} cycles in a row: \
+                                         another aterm process still holds the checker lock \
+                                         and is still checking (it wrote the lock within the \
+                                         last {} s) — a long download, not a stopped aterm",
+                                        holder_fresh(args.checker_lock_wait).as_secs()
+                                    ));
+                                }
+                                (Streak::Continues(cycles), false) => warn(&format!(
                                     "update check deferred {cycles} cycles in a row: another \
                                      aterm process has held the checker lock through each of \
                                      them (a stopped or hung aterm holds it until it is \
                                      continued or quit)"
                                 )),
-                                Streak::Quiet => {}
-                            }
-                            watch.set_deferrals(generation, deferrals.consecutive());
-                            if !stamp(CheckerPhase::Waiting) {
-                                return Cycle::Superseded(last.get());
-                            }
-                            // The same release-then-wait as a dedup skip: neither the
-                            // lane nor a flock is held across the sleep, so a manual
-                            // check in this process runs at once.
-                            check_lane::after_skip((), (lane, lane_mark), interval, || {
-                                speak_health(&mut announcer);
-                                if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
-                                    schedule.woke();
+                                (Streak::Quiet, false) => {}
+                                // Said once per streak, when it starts checking
+                                // without the lock, naming the holder.
+                                (_, true) if !ungated_said => {
+                                    ungated_said = true;
+                                    let why = ledger_stale.map_or_else(
+                                        || format!("through {stalled_deferrals} cycles in a row"),
+                                        |since| {
+                                            format!(
+                                                "and no aterm on this machine has completed an \
+                                                 update check since {since}"
+                                            )
+                                        },
+                                    );
+                                    warn(&format!(
+                                        "update check without the checker lock: {holder} has \
+                                         held it {why} without finishing a check — it may be \
+                                         stopped or hung; this process checks without waiting \
+                                         for it until it lets go"
+                                    ));
                                 }
-                            });
-                            return Cycle::Next;
+                                (Streak::Continues(cycles), true) => warn(&format!(
+                                    "update checks still run without the checker lock: {holder} \
+                                     has held it through {cycles} cycles in a row"
+                                )),
+                                (_, true) => {}
+                            }
+                            // Published: the streak behind a holder showing no
+                            // progress, which is what the window's watchdog warns
+                            // on — never a holder that is still checking.
+                            watch.set_deferrals(generation, stalled_deferrals);
+                            if !ungated {
+                                if !stamp(CheckerPhase::Waiting) {
+                                    return Cycle::Superseded(last.get());
+                                }
+                                // The same release-then-wait as a dedup skip:
+                                // neither the lane nor a flock is held across the
+                                // sleep, so a manual check in this process runs at
+                                // once.
+                                check_lane::after_skip((), (lane, lane_mark), interval, || {
+                                    speak_health(&mut announcer);
+                                    if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
+                                        schedule.woke();
+                                    }
+                                });
+                                return Cycle::Next;
+                            }
+                            None
                         }
-                        Some(CheckerGate::Held(lock)) => Some(lock),
+                        Some(CheckerGate::Held(lock)) => {
+                            // A held gate came from `checker_lock`: it is there.
+                            let beat = checker_lock.clone().map(|path| {
+                                note_checker_lock_holder(&path);
+                                HolderBeat::start(
+                                    path,
+                                    watch,
+                                    generation,
+                                    args.checker_lock_wait / 4,
+                                )
+                            });
+                            Some(HeldGate {
+                                _beat: beat,
+                                _lock: lock,
+                            })
+                        }
                         Some(CheckerGate::Unavailable) | None => None,
                     };
-                    // Past the gate, by either road: a deferral streak is over.
-                    if let Some(cycles) = deferrals.clear() {
+                    // Past the gate: a deferral streak is over — unless this
+                    // cycle is past it only because its holder is not making
+                    // progress, which is the streak going on.
+                    if !ungated && let Some(cycles) = deferrals.clear() {
+                        ungated_said = false;
+                        stalled_deferrals = 0;
                         watch.set_deferrals(generation, 0);
                         log(&format!(
                             "update checks resumed: this cycle got past the checker lock after \
@@ -2753,7 +3459,10 @@ fn run_checker(
                     if !stamp(CheckerPhase::Checking) {
                         return Cycle::Superseded(last.get());
                     }
-                    let result = github::check_and_stage(current_build, &source);
+                    let result = {
+                        let _alive = CheckAliveScope::enter(checker_alive(watch, generation));
+                        (args.check)(current_build, &source)
+                    };
                     check_lane().complete(&mut lane, current_build, &source);
                     // A check that outlived its generation has already written what
                     // it found to the ledger and `status.toml`; its replacement's
@@ -5088,5 +5797,50 @@ mod team_pin_tests {
             "A66A9P66Z7",
             "a settings file can neither relax nor replace a compiled pin"
         );
+    }
+}
+
+/// Round seven, H1 finding 57: a policy the system would not let this process read
+/// just then refuses the pre-verification as a passing condition.
+#[cfg(all(test, target_os = "macos"))]
+mod handoff_candidate_facts_tests {
+    use super::*;
+    use aterm_update_core::handoff_policy::{HandoffPolicy, PolicyRead};
+
+    /// AN UNREAD POLICY IS NEVER PASSED ON AS "ASKS NOTHING". A transient `EMFILE`
+    /// on the policy's `open(2)` — right after the candidate's codesign passed —
+    /// used to reach the GUI as a pass carrying no policy, cached for the pass's
+    /// freshness window; every park in it ran at the Full carry the release had
+    /// sealed `carry = "repaint"` to avoid. It is now a PASSING refusal: never
+    /// cached by the arm-time verifier, filed transient by the handoff worker, and
+    /// read again at the next attempt.
+    #[test]
+    fn an_unread_policy_refuses_the_preverification_as_a_passing_condition() {
+        let unread = HandoffCandidateFacts {
+            policy: PolicyRead::Unread(
+                "/x/Contents/Resources/aterm-handoff-policy.toml: unreadable: Too many open \
+                 files (os error 24)"
+                    .into(),
+            ),
+            grant_chunks: false,
+        };
+        let refused = unread
+            .admitted()
+            .expect_err("an unread policy is not a pass");
+        assert!(is_passing_refusal(&refused), "{refused}");
+        assert!(refused.contains("Too many open files"), "{refused}");
+        // NEGATIVE CONTROLS: every read that reached the file passes on as before —
+        // a malformed file included, which is a verdict the producer ignores.
+        for policy in [
+            PolicyRead::Absent,
+            PolicyRead::Ignored("not TOML".into()),
+            PolicyRead::Parsed(HandoffPolicy::default()),
+        ] {
+            let facts = HandoffCandidateFacts {
+                policy: policy.clone(),
+                grant_chunks: true,
+            };
+            assert_eq!(facts.clone().admitted(), Ok(facts), "{policy:?}");
+        }
     }
 }

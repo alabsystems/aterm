@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration-level unit tests for the `aterm-provenance` crate: origin tags,
-//! the `Provenance<T, O>` wrapper and the `authorize_pty_to_host` ceremony.
+//! and the `Provenance<T, O>` wrapper.
 
 #![allow(clippy::unwrap_used)] // tests
 #![allow(clippy::expect_used)] // tests
@@ -10,11 +10,6 @@
 use aterm_provenance::{
     Ai, ConfigFile, Host, NetworkUntrusted, Origin, OriginTag, Provenance, Pty, User,
 };
-// The `authorize_*` ceremonies and their capability tokens are only reachable
-// from outside `aterm-provenance` when the `internal-mint` feature is enabled
-// (#8013). The corresponding tests below guard on the same feature.
-#[cfg(feature = "internal-mint")]
-use aterm_provenance::{HostAuthorizationToken, authorize_pty_to_host};
 
 // -- OriginTag ----------------------------------------------------------
 
@@ -64,13 +59,6 @@ fn provenance_from_t_only_for_host() {
     // doctests on `Provenance` (src/provenance.rs).
 }
 
-// -- Authorize ceremony -------------------------------------------------
-//
-// `authorize_pty_to_host_lifts_tag` calls
-// `HostAuthorizationToken::__new_for_capability_only`, which is gated behind the
-// `internal-mint` feature (#8013). Run with:
-//     cargo test -p aterm-provenance --features internal-mint
-
 #[test]
 fn origin_tag_discriminants_are_stable() {
     assert_eq!(OriginTag::Host as u8, 0);
@@ -85,16 +73,4 @@ fn origin_tag_discriminants_are_stable() {
 fn provenance_as_ref_preserves_value() {
     let p = Provenance::<_, Pty>::from_pty(String::from("hello"));
     assert_eq!(p.as_ref(), "hello");
-}
-
-#[cfg(feature = "internal-mint")]
-#[test]
-fn authorize_pty_to_host_lifts_tag() {
-    let p = Provenance::<_, Pty>::from_pty(b"ls".to_vec());
-    // External tests must use the capability-seal constructor, which is
-    // `internal-mint`-gated (#8013).
-    let tok = HostAuthorizationToken::__new_for_capability_only();
-    let host: Provenance<Vec<u8>, Host> = authorize_pty_to_host(p, tok);
-    assert_eq!(<Host as Origin>::TAG, OriginTag::Host);
-    assert_eq!(host.as_ref(), b"ls");
 }

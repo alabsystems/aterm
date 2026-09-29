@@ -435,6 +435,10 @@ impl TerminalHandler<'_> {
             .alt_grid
             .take()
             .unwrap_or_else(|| Grid::with_scrollback(self.grid.rows(), self.grid.cols(), 0));
+        // A parked alt buffer was resized with the primary; a flap it took while
+        // parked is not the screen the app is about to see, so its resize undo
+        // (`Grid::drop_resize_undo`) must not hand rows back into it.
+        new_grid.drop_resize_undo();
         // Per xterm: tab stops are global, shared between main and alt screens.
         // Copy main screen tab stops to the new alt screen (#7494).
         new_grid.restore_tab_stops(self.grid.tab_stops(), self.grid.tab_defaults_suppressed());
@@ -451,11 +455,19 @@ impl TerminalHandler<'_> {
         let old_grid = std::mem::replace(self.grid, new_grid);
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
+        self.note_screen_replaced();
         // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
         // do NOT record `SelectionDamage::All`. A switch no longer destroys the
         // outgoing screen's selection — `post_process` parks it — and the `All` this
         // used to record would clear it on the way back in.
         self.grid.invalidate_host_coordinates();
+    }
+
+    /// Count a whole-screen replacement for the resize journal's readers
+    /// (`Terminal::screen_replaced_count`): the screen the app painted before it
+    /// is gone, so a displacement a resize left on it is gone too.
+    fn note_screen_replaced(&mut self) {
+        self.transient.screen_replaced = self.transient.screen_replaced.wrapping_add(1);
     }
 
     /// Copy the scroll region and horizontal margins from one grid to
@@ -512,7 +524,8 @@ impl TerminalHandler<'_> {
             Self::copy_margins(self.grid, &mut main_grid);
             // Keep the alternate buffer: it is persistent in xterm and mode
             // 47 exit does not clear it — a later re-entry shows it again.
-            let alt = std::mem::replace(self.grid, main_grid);
+            let mut alt = std::mem::replace(self.grid, main_grid);
+            alt.drop_resize_undo();
             *self.alt_grid = Some(alt);
             // The whole visible surface just changed — see
             // `exit_alternate_screen`'s note on why the restored grid is
@@ -522,6 +535,7 @@ impl TerminalHandler<'_> {
         self.flatten_restored_display_offset();
         self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
         self.modes.alternate_screen = false;
+        self.note_screen_replaced();
         // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
         // do NOT record `SelectionDamage::All`. A switch no longer destroys the
         // outgoing screen's selection — `post_process` parks it — and the `All` this
@@ -610,6 +624,7 @@ impl TerminalHandler<'_> {
                 self.style.bce_bg_rgb(),
             );
             self.grid.erase_screen();
+            self.note_screen_replaced();
             return;
         }
 
@@ -671,6 +686,7 @@ impl TerminalHandler<'_> {
         let old_grid = std::mem::replace(self.grid, new_grid);
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
+        self.note_screen_replaced();
         // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
         // do NOT record `SelectionDamage::All`. A switch no longer destroys the
         // outgoing screen's selection — `post_process` parks it — and the `All` this
@@ -753,6 +769,7 @@ impl TerminalHandler<'_> {
         let saved = self.cursor_save.main;
         self.restore_cursor_snapshot(saved);
         self.modes.alternate_screen = false;
+        self.note_screen_replaced();
         // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
         // do NOT record `SelectionDamage::All`. A switch no longer destroys the
         // outgoing screen's selection — `post_process` parks it — and the `All` this
@@ -815,6 +832,29 @@ impl TerminalHandler<'_> {
     /// with this layout: the wrapped command is one line under its prompt, and
     /// after the resize every history row is in the scrollback, with the dead
     /// pager's rows repainted on the blank rows above the prompt.
+    ///
+    /// What stays wrong after that is conhost's, and no byte a terminal can send
+    /// corrects it. MEASURED (2026-09-27, 80x24, the re-verifier's recipe: 40
+    /// history rows, `less`, `Stop-Process`, two commands, `less` on win.ini,
+    /// `q`; `conpty_dead_alt_screen_replay_tests` replays the reads): conhost's
+    /// next `?1049h` REPLACES the dead buffer, and everything the shell printed
+    /// on it goes with it; its `?1049l` returns to the primary buffer it froze
+    /// when the dead app entered, repainted in full, with the cursor on the row
+    /// that app's `?1049h` saved. So that exit shows the screen from before the
+    /// kill, the rows printed since are in our scrollback just above it
+    /// (`keep_screen_from_conhost_repaint`), and the frozen rows are in the
+    /// history twice: once from this leave, once from that repaint. Our half of
+    /// the ConPTY pipe carries input — keys, focus, the replies to conhost's
+    /// queries — and none of it switches conhost's buffers; a console CLIENT
+    /// writing `?1049l` does. `[Console]::Write` of it from the shell brought
+    /// conhost back at once (its primary repainted, the shell's next prompt
+    /// under it), and the next pager's exit then repainted the live screen; a
+    /// separate process attached with `AttachConsole` that read the dead buffer,
+    /// wrote `?1049l` and put the prompt's row and the cursor back on the
+    /// primary did the same with PSReadLine's pending prompt left where it was.
+    /// Painting our own rows over conhost's frozen repaint instead would hold
+    /// only until conhost's next full repaint (any resize, the next full-screen
+    /// exit), and rows taken off the scrollback to do it would be lost to it.
     pub(super) fn leave_orphaned_alternate_screen(&mut self) {
         if !self.modes.alternate_screen {
             return;
@@ -2535,6 +2575,10 @@ mod conhost_left_alt_screen_tests {
         assert_eq!(all_rows(&term), before, "spent by the first switch");
     }
 }
+
+#[cfg(test)]
+#[path = "conpty_dead_alt_screen_replay_tests.rs"]
+mod conpty_dead_alt_screen_replay_tests;
 
 #[cfg(test)]
 mod in_band_size_tests {

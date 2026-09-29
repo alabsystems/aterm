@@ -31,6 +31,11 @@ pub mod bake;
 mod bitmap_font;
 pub mod field;
 pub mod rom;
+/// THE RAIN DRIVER'S ONE FRAME: the suspended arm, the per-frame policy, the
+/// weather's notes (output, Execute, a new completion), the gated scan and the
+/// emission — every host's sequencing around the engine.
+pub mod step;
+pub use step::{RainClock, RainFrame, RainLatches, RainScan};
 
 use std::sync::Arc;
 
@@ -1500,6 +1505,16 @@ impl MatrixRain {
                 .map_or_else(|| "none".into(), |s| s.to_string()),
             self.content_streak,
         )
+    }
+
+    /// What the weather has HEARD from its host, for tests: the semantic
+    /// phase the last applied signal set (an Execute edge sets
+    /// [`RainSignal::Execute`]) and whether a failed command's ember hold is
+    /// live. Both move only when a note reached the engine and a frame
+    /// applied it.
+    #[cfg(test)]
+    pub(crate) fn heard_for_test(&self) -> (RainSignal, bool) {
+        (self.semantic_phase, self.clock_ms < self.fail_until_ms)
     }
 
     #[cfg(test)]
@@ -3164,10 +3179,12 @@ mod tests {
                     rows: 1,
                     z_index: 0,
                     band_lift_px: 0,
-                    pixel_exact: false,
+                    scaling: aterm_core::grid::extra::ImageScaling::Fit,
+                    source_rect: None,
                 }),
                 cell_row: 0,
                 cell_col: 0,
+                kitty: None,
             },
         ));
         e.rescan_from_cells(&cells, &sizes, &images, rows, cols, BG, 1);

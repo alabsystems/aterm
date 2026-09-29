@@ -1,0 +1,41 @@
+# codex 0.158.0 · MEASURED 2026-09-28, `aterm ctl text` of a private headless aterm 120x40 (a scratch launch from the owner's home, `--no-daemon --dangerously-bypass-approvals-and-sandbox`; no prompt was ever submitted, and the picker was left with Esc) · the box `More reasoning…` opens: `Advanced Reasoning` over `⚠ Consumes usage limits faster`, the cursor on `Max`, footer `enter default · s session · esc back`
+
+  >_ OpenAI Codex (v0.158.0)
+     ~
+  permissions: YOLO mode
+
+  Ah, the terminal. A classic meeting spot.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Advanced Reasoning
+  ⚠ Consumes usage limits faster
+
+
+› 1. Max    For difficult problems when quality matters more than speed · higher usage
+  2. Ultra  For demanding work using multiple agents · highest usage
+
+  enter default · s session · esc back

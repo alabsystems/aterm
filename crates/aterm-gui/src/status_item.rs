@@ -167,6 +167,37 @@ pub(crate) struct SessionRow {
     /// supervised or not ([`EscalationKind::Unresponsive`]). `None` for a
     /// sibling instance's row, like [`Self::agent`].
     pub input_stall: Option<InputStallRow>,
+    /// The line that resumes this tab's Claude Code on its OWN conversation
+    /// after a restart (`claude --resume <id>` with its launch flags —
+    /// `FooterFacts::resume`, read from Claude Code's own
+    /// `sessions/<pid>.json` for the process in front), or `None` when none
+    /// was read. The memory wall's row names it (2026-09-26); never `claude
+    /// --continue`, which resumes the directory's newest conversation — a
+    /// sibling tab's where two share it. `None` for a sibling instance's row.
+    pub resume: Option<String>,
+    /// The HOST's word that it will restart this session's agent itself at
+    /// its next idle point and carry it on (D3): this instance's harness
+    /// relaunches at all (`[harness] relaunch`, read live), the session's
+    /// kept snapshot is one the relaunch would plan
+    /// ([`crate::harness_host::HostHandle::relaunching`]), the claim on it
+    /// is the host's OWN, and nobody else's hand is on it — the stall row's
+    /// predicate ([`crate::input_stall::host_relaunches`]), computed once in
+    /// `App::status_session_row`. Only then does a memory wall's row say
+    /// [`SUPERVISED_MEMORY`]; otherwise it names the remedy with
+    /// [`Self::resume`].
+    ///
+    /// WHY (resume-hint review, 2026-09-26): the row said "restarting it at
+    /// its next idle point" on [`Self::supervised`] alone — true for every
+    /// Claude Code row under the window's host whatever `relaunch` said, and
+    /// for any row a `drive watch` claimed, which restarts nothing — and
+    /// dropped the resume line it had just been handed. Under `relaunch =
+    /// false`, a `drive watch` claim or a launch the restart refuses, the
+    /// agent side only escalates (`memory_restart` in aterm-agent's
+    /// `turn_end`), and only at an idle point: under the 2026-09-24
+    /// incident's hours-long spinner the row promised a restart that never
+    /// came and gave the person no `claude --resume <id>`. `false` for a
+    /// sibling instance's row.
+    pub restarts: bool,
 }
 
 /// The stall half of one [`SessionRow`] — `input_stall::menu_row`'s words.
@@ -240,6 +271,18 @@ impl EscalationKind {
             Self::Title => "aterm",
         }
     }
+
+    /// The kind's one word in `aterm.log` ([`herald_log_line`]).
+    fn log_word(self) -> &'static str {
+        match self {
+            Self::Unresponsive => "unresponsive",
+            Self::Attention => "attention",
+            Self::Prompt => "prompt",
+            Self::Question => "question",
+            Self::Wall => "wall",
+            Self::Title => "title",
+        }
+    }
 }
 
 /// One session's escalation: at most one per session, the most severe of
@@ -251,8 +294,10 @@ pub(crate) struct Escalation {
     /// What it is about.
     pub kind: EscalationKind,
     /// The transition's identity within `(session, kind)`: the agent's
-    /// `agent_rev` for the agent kinds, a hash of the text otherwise. The
-    /// same box re-read is the same key; a new box is a new one.
+    /// `agent_rev` for the agent kinds, the stall EPISODE's hash for
+    /// [`EscalationKind::Unresponsive`] ([`InputStallRow::key`]), the FNV-1a
+    /// hash of the text ([`text_key`]) for typed attention and a legacy
+    /// title. The same box re-read is the same key; a new box is a new one.
     pub key: u64,
     /// The menu row, host-written: `⚠ <tab title>: <kind> <command>` for an
     /// agent verdict; `⚠ <message>` for typed attention; the title itself
@@ -325,8 +370,9 @@ fn text_key(s: &str) -> u64 {
 }
 
 /// The agent-verdict half of [`escalation`]: `(kind, what)` for a verdict
-/// that needs a human, `None` for `busy|idle|survey`.
-fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
+/// that needs a human, `None` for `busy|idle|survey`. `resume` is the row's
+/// resume line ([`SessionRow::resume`]), which the memory wall names.
+fn agent_escalation(fact: &AgentFact, resume: Option<&str>) -> Option<(EscalationKind, String)> {
     match fact.word {
         "prompt" => {
             // `bash:not-read-only` names the box's kind before the colon, in
@@ -352,14 +398,11 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
             "frozen: not reading input".to_string(),
         )),
         // Claude Code's critical-memory banner: no reset to wait for, and
-        // the one remedy is the human's — say it (2026-09-24).
-        "wall:memory" => Some((
-            EscalationKind::Wall,
-            format!(
-                "memory critical \u{2014} restart it, then {}",
-                aterm_phase::resume_hint(aterm_phase::Program::Claude).unwrap_or("resume it")
-            ),
-        )),
+        // the one remedy is the human's — say it (2026-09-24): the restart,
+        // then the tab's OWN conversation (2026-09-26: never the banner's
+        // `claude --continue`, the directory's newest conversation), or the
+        // restart alone where no resume line was read.
+        "wall:memory" => Some((EscalationKind::Wall, memory_remedy(resume))),
         // An API error the network caused says its cause (the verdict's
         // host-side subject, `presence::api_cause_words`): `can't reach the
         // API`, never a bare `API error`.
@@ -380,6 +423,23 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
             ))
         }
     }
+}
+
+/// The memory wall's remedy (`wall:memory`, unsupervised): the restart, then
+/// the tab's own resume line ([`SessionRow::resume`]) — whole, never cut: the
+/// line with its carried flags where it fits [`STALL_TEXT_MAX`], else the
+/// bare `claude --resume <id>`, else the restart alone. Never the banner's
+/// `claude --continue` (2026-09-26).
+fn memory_remedy(resume: Option<&str>) -> String {
+    const HEAD: &str = "memory critical \u{2014} restart it";
+    resume
+        .into_iter()
+        .flat_map(|line| {
+            std::iter::once(line.to_string()).chain(aterm_agent::harness::resume::bare_of(line))
+        })
+        .map(|cmd| format!("{HEAD}, then {cmd}"))
+        .find(|what| what.len() <= STALL_TEXT_MAX)
+        .unwrap_or_else(|| HEAD.to_string())
 }
 
 /// A wall kind (`aterm_phase::WallKind::name`) in the words the menu row,
@@ -413,22 +473,11 @@ fn outlives_supervision(word: &str) -> bool {
     matches!(word, "wall:memory" | "wall:unresponsive")
 }
 
-/// A supervised session's stall row ([`escalation`]): the server's words with
-/// the resume step (`, then claude --continue`) handed to the harness, which
-/// relaunches the agent on its conversation once the signal ends it (U1).
-fn hosted_stall_text(text: &str) -> String {
-    let Some(hint) = aterm_phase::resume_hint(aterm_phase::Program::Claude) else {
-        return text.to_string();
-    };
-    match text.strip_suffix(&format!(", then {hint}")) {
-        Some(head) => format!("{head} \u{2014} the harness relaunches it on its conversation"),
-        None => text.to_string(),
-    }
-}
-
-/// What a SUPERVISED session's `wall:memory` row says: the harness restarts
-/// the agent at its next idle point and carries it on (D3) — information,
-/// the remedy being taken, not asked of a person.
+/// What a `wall:memory` row says where the HOST restarts the agent
+/// ([`SessionRow::restarts`]): the harness restarts it at its next idle
+/// point and carries it on (D3) — information, the remedy being taken, not
+/// asked of a person. A supervised row the host will NOT restart says the
+/// remedy instead ([`memory_remedy`], resume-hint review 2026-09-26).
 const SUPERVISED_MEMORY: &str = "memory critical \u{2014} restarting it at its next idle point";
 
 /// The ONE escalation a session row carries, or `None`. A published input
@@ -455,16 +504,16 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     };
     if let Some(stall) = &row.input_stall {
         // The whole remedy, never clipped to a row's `<kind> <command>`
-        // budget: `signal term` and `claude --continue` sit at its end. A
-        // SUPERVISED session's resume is the harness's (U1): once the signal
-        // ends it, its host relaunches it on its conversation and carries it
-        // on — so the row names the one step a person takes, and what follows.
-        let text = if row.supervised {
-            hosted_stall_text(&stall.text)
-        } else {
-            stall.text.clone()
-        };
-        let body = body_for(&fold_clip(&text, STALL_TEXT_MAX));
+        // budget: `signal term` and what follows it — the tab's own resume
+        // line, or the host's word that it relaunches the agent itself (U1) —
+        // sit at its end. That tail is the server attention's own
+        // (`input_stall::attention_text`, from `input_stall::after_restart`):
+        // one composition, so the row and `meta attention=` say the same, and
+        // a session some OTHER supervisor holds (`drive watch`, which
+        // relaunches nothing), a held one, or one whose launch the relaunch
+        // would refuse, is never told the harness will relaunch it
+        // (`input_stall::host_relaunches`, resume-hint review 2026-09-26).
+        let body = body_for(&fold_clip(&stall.text, STALL_TEXT_MAX));
         return Some(Escalation {
             session: row.id,
             kind: EscalationKind::Unresponsive,
@@ -497,17 +546,29 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     }
     if let Some(fact) = &row.agent
         && (!row.supervised || outlives_supervision(fact.word))
-        && let Some((kind, what)) = agent_escalation(fact)
+        && let Some((kind, what)) = agent_escalation(fact, row.resume.as_deref())
     {
-        // A supervised session's memory banner is the harness's to answer:
-        // it restarts the agent at its next idle point (D3), so the row says
-        // what happens, not what a person should do.
-        let what = if row.supervised && fact.word == "wall:memory" {
+        // A memory banner the HOST will answer — it restarts the agent at
+        // its next idle point (D3) — says what happens, not what a person
+        // should do. Only where the host said so ([`SessionRow::restarts`]):
+        // supervision alone is no promise (`relaunch = false`, a `drive
+        // watch` claim, a launch the restart refuses all only escalate), and
+        // there the row keeps the remedy with the tab's own resume line
+        // (resume-hint review, 2026-09-26).
+        let what = if row.restarts && fact.word == "wall:memory" {
             SUPERVISED_MEMORY.to_string()
         } else {
             what
         };
-        let what = fold_clip(&what, ROW_WHAT_MAX);
+        // A memory row that names a resume line gets the stall row's budget:
+        // `<kind> <command>`'s would cut the conversation id, and a cut id
+        // names no conversation (or another).
+        let budget = if fact.word == "wall:memory" && row.resume.is_some() {
+            STALL_TEXT_MAX
+        } else {
+            ROW_WHAT_MAX
+        };
+        let what = fold_clip(&what, budget);
         let body = body_for(&what);
         return Some(Escalation {
             session: row.id,
@@ -573,6 +634,17 @@ pub(crate) const NOTIFY_SESSION_FLOOR: std::time::Duration = std::time::Duration
 pub(crate) const NOTIFY_BURST: usize = 3;
 /// The window [`NOTIFY_BURST`] is counted over.
 pub(crate) const NOTIFY_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a session whose notice `notify.rs`'s queue refused
+/// ([`Herald::refused`]) waits before that notice is tried again. The wait is
+/// the refused session's alone: every other session's notices — which the
+/// queue never refused — are held by nothing but [`NOTIFY_SESSION_FLOOR`] and
+/// [`NOTIFY_BURST`]. The queue is ONE, shared with program notifications and
+/// drained one notifier subprocess (~100 ms) at a time, so a full one has
+/// room again within about two seconds unless a program is flooding it; a
+/// refusal that persists (that flood, or the delivery thread gone) costs one
+/// `warn` per this interval for each session that owes a notice, never one
+/// per wake of the event loop.
+pub(crate) const NOTIFY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One native notification the herald decided to post.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -592,6 +664,28 @@ pub(crate) struct HeraldOutcome {
     pub row_moved: bool,
     /// Post exactly this notification.
     pub notice: Option<HeraldNotice>,
+    /// This note met a NEW `(kind, key)`: a transition into an escalation —
+    /// not a re-read of the one shown, and not the App's timer re-heralding
+    /// a notice the limit held back ([`Herald::due`]). `false` when nothing
+    /// escalates.
+    pub transition: bool,
+    /// The transitions awaiting a notice when this note decided, its own
+    /// included: what a post pays (`n` for `… (+n-1 more)`), what
+    /// [`HeraldQuiet::Limited`] still owes (`1` on the FIRST hold), what
+    /// [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], [`HeraldQuiet::Silent`] or
+    /// [`HeraldQuiet::Shared`] spent. `0` when there was nothing to decide
+    /// ([`HeraldQuiet::Same`], or nothing escalates), so those outcomes stay
+    /// equal to `HeraldOutcome::default()` while the row does not move.
+    pub owed: u32,
+    /// This quiet decision — [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], or
+    /// [`HeraldQuiet::Limited`]'s FIRST hold (a transition leaving one notice
+    /// owed) — is its session's first since the later of its last post and
+    /// a [`NOTIFY_SESSION_FLOOR`] ago: the one `aterm.log` records at `info`
+    /// ([`herald_log_line`]). A clear does not reopen that window, so a
+    /// verdict that flaps inside the floor (box, answered, box, answered…)
+    /// earns one such line, never one per flap — as it earns one
+    /// notification. `false` for every other outcome.
+    pub first_quiet: bool,
 }
 
 /// Why a transition into an escalation posted nothing (test-visible).
@@ -603,8 +697,14 @@ pub(crate) enum HeraldQuiet {
     Silent,
     /// The human is looking at the tab in the active app.
     Looking,
-    /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back: it is OWED,
-    /// and posted (coalesced) when the limit allows ([`Herald::due`]).
+    /// Desktop alerts are disabled. The row still moves, but the notice is
+    /// spent before rate limiting and cannot arm a retry.
+    Disabled,
+    /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the
+    /// notifier's queue refused THIS session's notice less than
+    /// [`NOTIFY_RETRY`] ago (another session's refusal holds nothing here):
+    /// it is OWED, and posted (coalesced) when the limit allows
+    /// ([`Herald::due`]).
     Limited,
     /// A machine's fact ([`Escalation::shared`]) another tab already shows:
     /// told once for every tab that meets it.
@@ -619,6 +719,18 @@ struct HeraldSlot {
     label: Option<String>,
     /// When this session last posted.
     notified_at: Option<std::time::Instant>,
+    /// When it posted before that: what [`Herald::refused`] puts back in
+    /// `notified_at` when the notifier's queue refused the last post, which
+    /// then told nobody and was no post at all.
+    notified_before: Option<std::time::Instant>,
+    /// When the notice the notifier's queue last refused for THIS session
+    /// ([`Herald::refused`]) may be tried again: [`NOTIFY_RETRY`] after the
+    /// refusal. `None` from the session's next post. Per session, never
+    /// herald-wide: a wait for the whole instance held an unrelated session's
+    /// first notice — one the queue never refused — as
+    /// [`HeraldQuiet::Limited`], and its log line blamed a rate limit that
+    /// did not apply (review, 2026-09-28).
+    retry_at: Option<std::time::Instant>,
     /// Transitions the rate limit held back since the last post. Nonzero
     /// means a notice is OWED for the escalation shown now; it is paid by one
     /// coalesced notice once the limit allows, and dropped when the
@@ -627,7 +739,8 @@ struct HeraldSlot {
     /// What is shown is a machine's fact ([`Escalation::shared`]).
     shared: bool,
     /// The machine's fact shown here has been TOLD: this tab posted it, the
-    /// human was looking at this tab when it arrived, or it was quieted as
+    /// human was looking at this tab when it arrived, desktop alerts were
+    /// disabled for it, or it was quieted as
     /// [`HeraldQuiet::Shared`] because another tab had told it. Only a told
     /// fact quiets another tab — a notice the limit merely held back
     /// ([`HeraldQuiet::Limited`]) is owed, not told, and must not spend the
@@ -636,6 +749,36 @@ struct HeraldSlot {
     /// when re-heralded, so the outage was never told at all). Cleared with
     /// what is shown.
     told: bool,
+    /// When this session's last quiet decision reached `aterm.log` at `info`
+    /// ([`HeraldOutcome::first_quiet`]); `None` until one does, and again
+    /// from the session's next post. NOT cleared with what is shown: a box
+    /// answered and redrawn inside the floor is a new transition each time
+    /// (`owed` back to 1), and zeroing this with `owed` made every such flap
+    /// a fresh `info` line (review, 2026-09-28).
+    quiet_logged_at: Option<std::time::Instant>,
+}
+
+impl HeraldSlot {
+    /// Spend desktop-only work without forgetting the current in-app row.
+    fn suppress_desktop_notice(&mut self) {
+        self.owed = 0;
+        self.retry_at = None;
+        self.told |= self.shown.is_some();
+    }
+
+    /// Whether a quiet decision made at `now` is the first `aterm.log`
+    /// records at `info` for this session ([`HeraldOutcome::first_quiet`]):
+    /// none since the later of its last post and a [`NOTIFY_SESSION_FLOOR`]
+    /// ago. Spends the window when it is.
+    fn first_quiet(&mut self, now: std::time::Instant) -> bool {
+        let open = self
+            .quiet_logged_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= NOTIFY_SESSION_FLOOR);
+        if open {
+            self.quiet_logged_at = Some(now);
+        }
+        open
+    }
 }
 
 /// THE ESCALATION HERALD: per session, folds the current [`escalation`] into
@@ -653,7 +796,9 @@ struct HeraldSlot {
 /// App's timer), and only while that session still escalates, ONE notice
 /// pays every transition it held back (`… (+2 more)`). Several boxes in a
 /// few seconds therefore page twice, not once and then never — and never
-/// for a box already gone.
+/// for a box already gone. A post the notifier's queue refuses told nobody:
+/// it is taken back ([`Self::refused`]) and owed again, and THAT session —
+/// no other — is not tried again until [`NOTIFY_RETRY`] has passed.
 #[derive(Debug, Default)]
 pub(crate) struct Herald {
     slots: std::collections::HashMap<u64, HeraldSlot>,
@@ -667,11 +812,44 @@ impl Herald {
     /// Fold `session`'s current escalation. `looking` is true when the
     /// session is the focused pane of a focused window (the notification
     /// suppression set).
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "DesktopAlertDebt",
+            action = "ObserveNewLimited",
+            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "DesktopAlertDebt",
+            action = "ObserveNewFree",
+            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "DesktopAlertDebt",
+            action = "Reobserve",
+            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "DesktopAlertDebt",
+            action = "Tick",
+            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn note(
         &mut self,
         session: u64,
         current: Option<&Escalation>,
         looking: bool,
+        desktop_alerts: bool,
         now: std::time::Instant,
     ) -> HeraldOutcome {
         self.last_quiet = None;
@@ -693,13 +871,6 @@ impl Herald {
         let label = current.map(|e| e.label.clone());
         let row_moved = slot.label != label;
         slot.label = label;
-        let quiet = |herald: &mut Self, why| {
-            herald.last_quiet = Some(why);
-            HeraldOutcome {
-                row_moved,
-                notice: None,
-            }
-        };
         let Some(esc) = current else {
             slot.shown = None;
             slot.owed = 0;
@@ -707,18 +878,33 @@ impl Herald {
             slot.told = false;
             return HeraldOutcome {
                 row_moved,
-                notice: None,
+                ..HeraldOutcome::default()
             };
         };
         slot.shared = esc.shared;
-        if slot.shown == ident {
-            if slot.owed == 0 {
-                return quiet(self, HeraldQuiet::Same);
-            }
-        } else {
+        let transition = slot.shown != ident;
+        if transition {
             slot.shown = ident;
             slot.owed += 1;
             slot.told = false;
+        }
+        // What this decision covers — read before a branch below spends it,
+        // so the outcome (and the log line it earns, `herald_log_line`) says
+        // how many transitions it posted, held, or dropped.
+        let owed = slot.owed;
+        let quiet = |herald: &mut Self, why, first_quiet| {
+            herald.last_quiet = Some(why);
+            HeraldOutcome {
+                row_moved,
+                notice: None,
+                transition,
+                owed,
+                first_quiet,
+            }
+        };
+        if owed == 0 {
+            // The same box re-read, and nothing owed for it.
+            return quiet(self, HeraldQuiet::Same, false);
         }
         // A MACHINE'S FACT another tab has already told (the outage of
         // 2026-09-27: every tab met `Can't reach the API server` at once):
@@ -727,22 +913,32 @@ impl Herald {
         if shared_elsewhere {
             slot.owed = 0;
             slot.told = true;
-            return quiet(self, HeraldQuiet::Shared);
+            return quiet(self, HeraldQuiet::Shared, false);
         }
         // A notice is wanted for what is shown now (a transition, or one the
         // limit held back earlier).
         if !esc.kind.notifies() {
             slot.owed = 0;
-            return quiet(self, HeraldQuiet::Silent);
+            return quiet(self, HeraldQuiet::Silent, false);
         }
         if looking {
             // The human sees it on this tab: for a machine's fact, that is
             // the fact told for every tab.
             slot.owed = 0;
             slot.told = true;
-            return quiet(self, HeraldQuiet::Looking);
+            let first_quiet = slot.first_quiet(now);
+            return quiet(self, HeraldQuiet::Looking, first_quiet);
         }
-        let notified_at = slot.notified_at;
+        // Suppress BEFORE the rate limit: a disabled notice must not become
+        // debt merely because this session or another one notified recently.
+        // Keep the row and its transition key, so enabling alerts later does
+        // not replay an escalation the person chose to leave in the app.
+        if !desktop_alerts {
+            slot.suppress_desktop_notice();
+            let first_quiet = slot.first_quiet(now);
+            return quiet(self, HeraldQuiet::Disabled, first_quiet);
+        }
+        let (notified_at, retry_at) = (slot.notified_at, slot.retry_at);
         while self
             .recent
             .front()
@@ -750,8 +946,12 @@ impl Herald {
         {
             self.recent.pop_front();
         }
-        if Self::free_at(&self.recent, notified_at, now) > now {
-            return quiet(self, HeraldQuiet::Limited);
+        if Self::free_at(&self.recent, notified_at, retry_at, now) > now {
+            // Only the FIRST hold can be the line: a re-read while the notice
+            // is owed recurs at change rate, and a further box held behind it
+            // is counted by the notice that pays it (`… (+n more)`).
+            let first_quiet = transition && owed == 1 && slot.first_quiet(now);
+            return quiet(self, HeraldQuiet::Limited, first_quiet);
         }
         let Some(slot) = self.slots.get_mut(&session) else {
             return HeraldOutcome::default();
@@ -759,7 +959,14 @@ impl Herald {
         let more = slot.owed.saturating_sub(1);
         slot.owed = 0;
         slot.told = true;
+        slot.notified_before = slot.notified_at;
         slot.notified_at = Some(now);
+        // The refused notice's wait is over: this is its retry, or a later
+        // post. A refusal of THIS post starts a new one (`Self::refused`).
+        slot.retry_at = None;
+        // A post reopens the log's window: the first hold behind THIS notice
+        // is news, however recently the last one was logged.
+        slot.quiet_logged_at = None;
         self.recent.push_back(now);
         let body = if more == 0 {
             esc.body.clone()
@@ -773,16 +980,72 @@ impl Herald {
                 title: esc.kind.headline(),
                 body,
             }),
+            transition,
+            owed,
+            first_quiet: false,
+        }
+    }
+
+    /// `notify.rs`'s queue refused the notice [`Self::note`] just posted for
+    /// `session`, which paid `owed` transitions ([`HeraldOutcome::owed`]): it
+    /// was full — it is shared with program notifications — or its thread was
+    /// gone (`App::post_herald_notice`). Nobody was told, so the post is taken
+    /// back. Its transitions are owed again, and the fact is not told: a
+    /// machine's fact the queue dropped must not quiet every other tab as
+    /// [`HeraldQuiet::Shared`] (review, 2026-09-28: the notice was lost, the
+    /// herald believed it told, and nothing ever re-heralded the outage). The
+    /// session's floor and the instance's burst place the post took are given
+    /// back — `notified_at` is the post before it again, and its entry leaves
+    /// `recent`. [`Self::due`] re-heralds it once [`NOTIFY_RETRY`] has passed
+    /// (the slot's `retry_at`), never at once: the queue that refused it has
+    /// not drained, and an owed notice due NOW wakes the App's timer at once
+    /// (`App::presence_deadline`), so it would be retried, refused and logged
+    /// on every turn of the event loop. The wait is `session`'s alone: another
+    /// session's notice is tried when its own limit allows, and a refusal of
+    /// it starts that session's own wait.
+    pub(crate) fn refused(&mut self, session: u64, owed: u32, now: std::time::Instant) {
+        let Some(slot) = self.slots.get_mut(&session) else {
+            return;
+        };
+        slot.retry_at = Some(now + NOTIFY_RETRY);
+        let Some(posted) = slot.notified_at else {
+            return;
+        };
+        if let Some(at) = self.recent.iter().rposition(|t| *t == posted) {
+            self.recent.remove(at);
+        }
+        slot.notified_at = slot.notified_before.take();
+        slot.owed += owed;
+        slot.told = false;
+    }
+
+    /// Turning desktop alerts off cancels existing rate-limit and queue-refusal
+    /// retries, without retiring the labels or transition keys the menu uses.
+    /// Runs at config-commit rate; the normal disabled observation consumes its
+    /// own notice in [`Self::note`] before it can create more debt.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "DesktopAlertDebt",
+            action = "Disable",
+            project = "aterm_gui::status_item::desktop_alert_debt_conformance::Rig::project"
+        )
+    )]
+    pub(crate) fn suppress_pending_desktop_notices(&mut self) {
+        for slot in self.slots.values_mut() {
+            slot.suppress_desktop_notice();
         }
     }
 
     /// When a session last notified at `notified_at` may notify again: the
-    /// later of its [`NOTIFY_SESSION_FLOOR`] and the instance's
-    /// [`NOTIFY_BURST`] window freeing a place (posts older than the window
-    /// do not count). `now` means now.
+    /// later of its [`NOTIFY_SESSION_FLOOR`], the instance's [`NOTIFY_BURST`]
+    /// window freeing a place (posts older than the window do not count), and
+    /// its own `retry_at` — [`NOTIFY_RETRY`] after the notifier's queue last
+    /// refused ITS notice ([`Self::refused`]). `now` means now.
     fn free_at(
         recent: &std::collections::VecDeque<std::time::Instant>,
         notified_at: Option<std::time::Instant>,
+        retry_at: Option<std::time::Instant>,
         now: std::time::Instant,
     ) -> std::time::Instant {
         let live: Vec<std::time::Instant> = recent
@@ -796,7 +1059,8 @@ impl Herald {
         } else {
             now
         };
-        floor.max(burst).max(now)
+        let retry = retry_at.unwrap_or(now);
+        floor.max(burst).max(retry).max(now)
     }
 
     /// The sessions whose owed notice the limit now allows — the App's timer
@@ -807,7 +1071,7 @@ impl Herald {
         let mut next: Option<std::time::Instant> = None;
         for (session, slot) in self.slots.iter().filter(|(_, slot)| slot.owed > 0) {
             let (session, notified_at) = (*session, slot.notified_at);
-            let at = Self::free_at(&self.recent, notified_at, now);
+            let at = Self::free_at(&self.recent, notified_at, slot.retry_at, now);
             if at <= now {
                 ready.push(session);
             } else if next.is_none_or(|n| at < n) {
@@ -827,6 +1091,154 @@ impl Herald {
     /// Forget a retired session.
     pub(crate) fn retire(&mut self, session: u64) {
         self.slots.remove(&session);
+    }
+}
+
+/// What became of a [`Herald::note`]'s notice ([`herald_log_line`]'s
+/// `post`), decided before its line is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeraldPost {
+    /// `notify.rs`'s queue took it — or the note owed no notice at all.
+    Queued,
+    /// The queue refused it, and why (`App::post_herald_notice`'s `Err`).
+    Refused(&'static str),
+    /// `desktop_alerts` is off: nothing was offered to the queue. The menu
+    /// bar, the band and the tab marks still carry the escalation; the
+    /// notice is not owed again.
+    Suppressed,
+}
+
+/// The ONE `aterm.log` line a [`Herald::note`] earns, as `(level, text)`, or
+/// `None` when it decided nothing (nothing escalates, or the escalation
+/// cleared). `quiet` is [`Herald::last_quiet`], read right after the note;
+/// `post` says what became of the note's notice ([`HeraldPost`]: queued,
+/// refused by `notify.rs`'s queue in `App::post_herald_notice`, or held back
+/// by `desktop_alerts = false`) — so the line is written AFTER the post, and
+/// says what happened to it.
+///
+/// `aterm.log` records at `info` (`logging.rs`), and it said nothing about
+/// whether an escalation's banner went out — a rate-limit hold alone, at
+/// `debug` — so the blocked-agent incident of 2026-09-23..25 (40 hours)
+/// could not tell from its log which banners were posted. Each DECISION on a
+/// transition is one line, and at `info` it never repeats at change rate:
+///
+/// * a post the queue took says `queued`, never "posted": the delivery
+///   thread may still drop it on its own focus check. A notice the limit held
+///   back and the App's timer paid ([`Herald::due`]) says `queued after the
+///   rate limit`; a coalesced one carries the notice's own `(+N more)`. Posts
+///   are rate-limited, so these lines are too.
+/// * a post the queue REFUSED (full — it is shared with program
+///   notifications and drained one notifier subprocess at a time — or its
+///   thread gone) is instead one `warn`, `not queued…: <why>`: `queued` is
+///   only true once `try_send` returned `Ok`, and counting `queued` lines is
+///   how the log answers "which banners went out". The refused notice stays
+///   owed ([`Herald::refused`]), and its retry, [`NOTIFY_RETRY`] later, is a
+///   decision with a line of its own (`queued after the rate limit`, or
+///   refused again).
+/// * a notice `desktop_alerts = false` held back is one `info`, `not
+///   queued…: suppressed by desktop_alerts = false` — the person's own
+///   choice, so neither a `warn` nor owed again.
+/// * `not queued: looking` — the human is looking at that tab — and `not
+///   queued: limited` — the rate limit's FIRST hold (a transition leaving
+///   one notice owed) — are `info` only when
+///   [`HeraldOutcome::first_quiet`]: the session's first since the later of
+///   its last post and a [`NOTIFY_SESSION_FLOOR`] ago. A flap inside the floor
+///   (box, answered, box…), a re-read while a notice is owed, a further box
+///   held behind the first (counted by the eventual `queued … (+N more)`) —
+///   each recurs at change rate, and stays `debug`.
+///
+/// `debug`, never `info`: [`HeraldQuiet::Same`] (no transition),
+/// [`HeraldQuiet::Silent`] ([`EscalationKind::Title`]: program-written OSC
+/// titles, which flap), and [`HeraldQuiet::Shared`] — a machine's fact told
+/// once for every tab, whose telling tab's own line records the telling; the
+/// rest meet it together in an outage, and would multiply each of its flaps
+/// by the tab count.
+///
+/// NO TEXT: the line names the session, the kind and the key
+/// ([`herald_key_words`]) — never the body, label, command, subject or
+/// attention text. A box's command can hold a secret, and `aterm.log` is
+/// what a bug report attaches. Pure, so the table is tested without
+/// installing a logger (a test binary's process-global logger is
+/// first-installer-wins).
+pub(crate) fn herald_log_line(
+    session: u64,
+    current: Option<&Escalation>,
+    outcome: &HeraldOutcome,
+    quiet: Option<HeraldQuiet>,
+    post: HeraldPost,
+) -> Option<(aterm_log::Level, String)> {
+    use aterm_log::Level;
+    let esc = current?;
+    let (level, decision) = if outcome.notice.is_some() {
+        let held = if outcome.transition {
+            ""
+        } else {
+            " after the rate limit"
+        };
+        let more = match outcome.owed.saturating_sub(1) {
+            0 => String::new(),
+            more => format!(" (+{more} more)"),
+        };
+        match post {
+            HeraldPost::Queued => (Level::Info, format!("queued{held}{more}")),
+            HeraldPost::Refused(why) => (Level::Warn, format!("not queued{held}{more}: {why}")),
+            HeraldPost::Suppressed => (
+                Level::Info,
+                format!("not queued{held}{more}: suppressed by desktop_alerts = false"),
+            ),
+        }
+    } else {
+        let first = if outcome.first_quiet {
+            Level::Info
+        } else {
+            Level::Debug
+        };
+        match quiet? {
+            HeraldQuiet::Looking => (first, "not queued: looking".to_string()),
+            HeraldQuiet::Disabled => (
+                first,
+                "not queued: suppressed by desktop_alerts = false".to_string(),
+            ),
+            HeraldQuiet::Limited if outcome.first_quiet => {
+                (Level::Info, "not queued: limited".to_string())
+            }
+            HeraldQuiet::Limited => (
+                Level::Debug,
+                format!("not queued: limited, {} owed", outcome.owed),
+            ),
+            HeraldQuiet::Shared => (Level::Debug, "not queued: shared".to_string()),
+            HeraldQuiet::Same => (Level::Debug, "not queued: same".to_string()),
+            HeraldQuiet::Silent => (Level::Debug, "not queued: silent".to_string()),
+        }
+    };
+    Some((
+        level,
+        format!(
+            "escalation notification for session {session} ({} {}): {decision}",
+            esc.kind.log_word(),
+            herald_key_words(esc.kind, esc.key)
+        ),
+    ))
+}
+
+/// An escalation's key as `aterm.log` names it ([`herald_log_line`]). An
+/// agent kind's key IS the session's `agent_rev`, printed in DECIMAL as
+/// `status agent_rev=` prints it (`session_timeline.rs`), so a log line reads
+/// against `aterm ctl status`. Typed attention's and a legacy title's key is
+/// the FNV-1a hash of their text ([`text_key`]) and a stall's the hash of
+/// its EPISODE ([`crate::input_stall::episode_key`]): opaque, so hex. An
+/// App-built [`EscalationKind::Unresponsive`] row always takes the stall
+/// arm of [`escalation`] — the server publishes `agent=wall:unresponsive`
+/// only while it publishes that stall, and `App::status_session_row` copies
+/// the same stall into the row — so the verdict arm's `agent_rev` key for
+/// that kind never reaches this line.
+fn herald_key_words(kind: EscalationKind, key: u64) -> String {
+    match kind {
+        EscalationKind::Prompt | EscalationKind::Question | EscalationKind::Wall => {
+            format!("agent_rev={key}")
+        }
+        EscalationKind::Attention | EscalationKind::Title => format!("text_key={key:#018x}"),
+        EscalationKind::Unresponsive => format!("episode_key={key:#018x}"),
     }
 }
 
@@ -1712,8 +2124,13 @@ mod macos {
 }
 
 #[cfg(test)]
+#[path = "desktop_alert_debt_conformance.rs"]
+mod desktop_alert_debt_conformance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_agent::harness::resume::AfterRestart;
 
     fn rows(v: &[(u64, &str)]) -> Vec<SessionRow> {
         v.iter()
@@ -1838,19 +2255,51 @@ mod tests {
     /// critical-memory banner has no reset to wait for, only a restart and a
     /// resume. SUPERVISED it raises a row too — the banner is drawn under a
     /// running spinner, where the supervisor waits for the turn to end (the
-    /// review of 2026-09-24 found it said by nobody there) — and the row says
-    /// what the harness does: it restarts the agent at its next idle point
-    /// (D3). The supervisor's own attention still wins when it has said
+    /// review of 2026-09-24 found it said by nobody there) — and where the
+    /// HOST restarts it ([`SessionRow::restarts`]) the row says what the
+    /// harness does: it restarts the agent at its next idle point (D3).
+    /// Supervised with no such word, it keeps the remedy
+    /// (`a_supervised_memory_row_promises_the_restart_only_where_the_host_restarts`,
+    /// 2026-09-26). The supervisor's own attention still wins when it has said
     /// something. NEGATIVE CONTROL: every other wall, supervised, is still
     /// the supervisor's.
     #[test]
     fn a_memory_wall_row_names_the_restart_supervised_or_not() {
-        let label = "\u{26a0} worker: memory critical \u{2014} restart it, then claude --continue";
+        // No resume line read: the restart alone — never the banner's own
+        // `claude --continue` (2026-09-26).
+        let label = "\u{26a0} worker: memory critical \u{2014} restart it";
         let esc = escalation(&agent_row(9, "worker", "wall:memory", 1)).expect("a row");
         assert_eq!(esc.kind, EscalationKind::Wall);
         assert_eq!(esc.label, label);
+        // The tab's own resume line: named whole, past the `<kind>
+        // <command>` budget a cut id would not survive; the bare line where
+        // the flags do not fit the stall budget; never a cut one.
+        let own = SessionRow {
+            resume: Some(OWN.to_string()),
+            ..agent_row(9, "worker", "wall:memory", 1)
+        };
+        assert_eq!(
+            escalation(&own).expect("a row").label,
+            format!("\u{26a0} worker: memory critical \u{2014} restart it, then {OWN}")
+        );
+        let long = format!(
+            "claude --append-system-prompt {} --resume {ID}",
+            "x".repeat(200)
+        );
+        let long = SessionRow {
+            resume: Some(long),
+            ..agent_row(9, "worker", "wall:memory", 1)
+        };
+        assert_eq!(
+            escalation(&long).expect("a row").label,
+            format!(
+                "\u{26a0} worker: memory critical \u{2014} restart it, then claude --resume {ID}"
+            )
+        );
+        // The host restarts it ([`SessionRow::restarts`]): the row says so.
         let mut supervised = SessionRow {
             supervised: true,
+            restarts: true,
             ..agent_row(9, "worker", "wall:memory", 1)
         };
         let hosted = escalation(&supervised).expect("a row");
@@ -1879,12 +2328,67 @@ mod tests {
         }
     }
 
+    /// A SUPERVISED MEMORY ROW IS PROMISED THE RESTART ONLY WHERE THE HOST
+    /// SAID IT RESTARTS (resume-hint review, 2026-09-26). The row said
+    /// "restarting it at its next idle point" on [`SessionRow::supervised`]
+    /// alone — every Claude Code under the window's host, `relaunch = false`
+    /// or not, and every session a `drive watch` claimed — and threw away
+    /// the resume line it had just read; the agent side only escalates there
+    /// (`memory_restart`), and only at an idle point the incident's spinner
+    /// never reached. Supervised with no host restart (relaunch off, another
+    /// holder, a launch the restart refuses: all `restarts: false`), the row
+    /// names the remedy with THIS tab's `claude --resume <id>`, or the
+    /// restart alone where none was read. NEGATIVE CONTROL: the host
+    /// restarts it — the row keeps [`SUPERVISED_MEMORY`] and names no
+    /// command.
+    #[test]
+    fn a_supervised_memory_row_promises_the_restart_only_where_the_host_restarts() {
+        let not_restarted = SessionRow {
+            supervised: true,
+            restarts: false,
+            resume: Some(OWN.to_string()),
+            ..agent_row(9, "worker", "wall:memory", 1)
+        };
+        let esc = escalation(&not_restarted).expect("a row");
+        assert_eq!(esc.kind, EscalationKind::Wall);
+        assert_eq!(
+            esc.label,
+            format!("\u{26a0} worker: memory critical \u{2014} restart it, then {OWN}")
+        );
+        assert!(!esc.label.contains("restarting"), "{}", esc.label);
+        let unread = SessionRow {
+            resume: None,
+            ..not_restarted.clone()
+        };
+        assert_eq!(
+            escalation(&unread).expect("a row").label,
+            "\u{26a0} worker: memory critical \u{2014} restart it"
+        );
+        // NEGATIVE CONTROL: the host's word that it restarts the agent.
+        let restarted = SessionRow {
+            restarts: true,
+            ..not_restarted
+        };
+        let esc = escalation(&restarted).expect("a row");
+        assert_eq!(
+            esc.label,
+            format!("\u{26a0} worker: {SUPERVISED_MEMORY}"),
+            "the host restarts it: information, not a remedy"
+        );
+        assert!(!esc.label.contains("--resume"), "{}", esc.label);
+    }
+
+    /// This tab's conversation, and its resume line as the footer resolver
+    /// reads it (`FooterFacts::resume`).
+    const ID: &str = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+    const OWN: &str = "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+
     /// A stall row as `App::status_session_row` builds it: the server's
     /// attention words for `fact`, with the clock fixed so the text is exact.
     fn stall_row(
         fact: &crate::input_stall::InputStallFact,
         program: Option<&str>,
-        reader: Option<aterm_phase::Program>,
+        after: &AfterRestart,
         clock: Option<&str>,
         waited: std::time::Duration,
     ) -> InputStallRow {
@@ -1892,7 +2396,7 @@ mod tests {
             text: crate::input_stall::attention_text(
                 fact,
                 program,
-                reader,
+                after,
                 "s-b7cf523445a1b0d8658e",
                 clock,
                 waited,
@@ -1927,10 +2431,12 @@ mod tests {
             attention: Some("answer this box: 4. Chat about this".into()),
             ..agent_row(3, "\u{2733} worker", "wall:unresponsive", 9)
         };
+        // The window's host supervises it under `[harness] relaunch`: the
+        // server's own line says the host relaunches it (U1).
         worker.input_stall = Some(stall_row(
             &fact,
             Some("claude"),
-            Some(aterm_phase::Program::Claude),
+            &AfterRestart::Relaunch,
             Some("14:02"),
             std::time::Duration::from_secs(9660),
         ));
@@ -1941,21 +2447,35 @@ mod tests {
         assert_eq!(
             esc.label,
             "\u{26a0} worker: claude is frozen: not reading input since 14:02 (1 B queued, rss \
-             38.8 GB) \u{2014} restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term \
-             \u{2014} the harness relaunches it on its conversation",
-            "supervised: the resume is the harness's (U1)"
+             38.8 GB) \u{2014} restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term; aterm \
+             relaunches it on its conversation",
+            "hosted: the resume is the harness's (U1)"
         );
-        let unsupervised = SessionRow {
-            supervised: false,
+        // Unhosted — or held by another supervisor, which relaunches
+        // nothing: the resume is the person's, on THIS tab's conversation.
+        let unhosted = SessionRow {
+            input_stall: Some(stall_row(
+                &fact,
+                Some("claude"),
+                &AfterRestart::Command(OWN.to_string()),
+                Some("14:02"),
+                std::time::Duration::from_secs(9660),
+            )),
             ..worker.clone()
         };
-        assert!(
-            escalation(&unsupervised)
-                .expect("a stall row")
-                .label
-                .ends_with("signal term, then claude --continue"),
-            "unsupervised: the resume is the person's"
-        );
+        for supervised in [true, false] {
+            let label = escalation(&SessionRow {
+                supervised,
+                ..unhosted.clone()
+            })
+            .expect("a stall row")
+            .label;
+            assert!(
+                label.ends_with(&format!("signal term, then claude --resume {ID}")),
+                "supervised={supervised}: {label}"
+            );
+            assert!(!label.contains("--continue"), "{label}");
+        }
         assert_eq!(esc.label, format!("\u{26a0} {}", esc.body));
         assert_eq!(esc.key, crate::input_stall::episode_key(&fact));
         // Most severe of all: ahead of typed attention in the menu's order.
@@ -1972,7 +2492,7 @@ mod tests {
             input_stall: Some(stall_row(
                 &fact,
                 Some("vim"),
-                None,
+                &AfterRestart::Unknown,
                 Some("14:02"),
                 std::time::Duration::ZERO,
             )),
@@ -1993,7 +2513,7 @@ mod tests {
             input_stall: Some(stall_row(
                 &stopped,
                 Some("claude"),
-                Some(aterm_phase::Program::Claude),
+                &AfterRestart::Command(OWN.to_string()),
                 Some("14:02"),
                 std::time::Duration::ZERO,
             )),
@@ -2040,7 +2560,7 @@ mod tests {
             input_stall: Some(stall_row(
                 fact,
                 Some("claude"),
-                Some(aterm_phase::Program::Claude),
+                &AfterRestart::Command(OWN.to_string()),
                 None,
                 std::time::Duration::from_secs(secs),
             )),
@@ -2066,16 +2586,16 @@ mod tests {
 
         let now = std::time::Instant::now();
         let mut h = Herald::default();
-        let posted = h.note(5, Some(&first), false, now);
+        let posted = h.note(5, Some(&first), false, true, now);
         assert_eq!(
             posted.notice.as_ref().map(|n| n.title),
             Some("aterm \u{00b7} program frozen")
         );
-        let moved = h.note(5, Some(&later), false, now + NOTIFY_SESSION_FLOOR * 2);
+        let moved = h.note(5, Some(&later), false, true, now + NOTIFY_SESSION_FLOOR * 2);
         assert!(moved.row_moved && moved.notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Same));
         // The stall clears, and a NEW episode begins: a new notification.
-        let _ = h.note(5, None, false, now + NOTIFY_SESSION_FLOOR * 3);
+        let _ = h.note(5, None, false, true, now + NOTIFY_SESSION_FLOOR * 3);
         let next = crate::input_stall::InputStallFact {
             since: fact.since + std::time::Duration::from_secs(600),
             ..fact.clone()
@@ -2083,7 +2603,7 @@ mod tests {
         let again = escalation(&row_at(&next, 10)).unwrap();
         assert_ne!(again.key, first.key);
         assert!(
-            h.note(5, Some(&again), false, now + NOTIFY_SESSION_FLOOR * 4)
+            h.note(5, Some(&again), false, true, now + NOTIFY_SESSION_FLOOR * 4)
                 .notice
                 .is_some()
         );
@@ -2123,10 +2643,10 @@ mod tests {
         );
         let now = std::time::Instant::now();
         let mut h = Herald::default();
-        assert!(h.note(1, Some(&first), false, now).notice.is_some());
+        assert!(h.note(1, Some(&first), false, true, now).notice.is_some());
         for id in 2..=5 {
             let tab = escalation(&unreachable(id, 7)).expect("a row");
-            let out = h.note(id, Some(&tab), false, now + NOTIFY_BURST_WINDOW * 2);
+            let out = h.note(id, Some(&tab), false, true, now + NOTIFY_BURST_WINDOW * 2);
             assert!(out.row_moved, "each tab keeps its row");
             assert!(out.notice.is_none(), "tab {id}");
             assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
@@ -2138,11 +2658,11 @@ mod tests {
         );
         // Every tab clears; the next outage is told again.
         for id in 1..=5 {
-            let _ = h.note(id, None, false, now + NOTIFY_BURST_WINDOW * 4);
+            let _ = h.note(id, None, false, true, now + NOTIFY_BURST_WINDOW * 4);
         }
         let again = escalation(&unreachable(3, 9)).expect("a row");
         assert!(
-            h.note(3, Some(&again), false, now + NOTIFY_BURST_WINDOW * 5)
+            h.note(3, Some(&again), false, true, now + NOTIFY_BURST_WINDOW * 5)
                 .notice
                 .is_some()
         );
@@ -2160,8 +2680,12 @@ mod tests {
         assert!(cut.label.ends_with("tab 7: reply cut off"), "{}", cut.label);
         let mut h = Herald::default();
         let later = now + NOTIFY_BURST_WINDOW * 2;
-        assert!(h.note(6, Some(&server), false, later).notice.is_some());
-        assert!(h.note(7, Some(&cut), false, later).notice.is_some());
+        assert!(
+            h.note(6, Some(&server), false, true, later)
+                .notice
+                .is_some()
+        );
+        assert!(h.note(7, Some(&cut), false, true, later).notice.is_some());
     }
 
     /// Review (2026-09-27): only a TOLD outage quiets the other tabs. A first
@@ -2196,7 +2720,7 @@ mod tests {
         let fill = |h: &mut Herald, now| {
             for id in 100..100 + NOTIFY_BURST as u64 {
                 let e = escalation(&other(id)).expect("a row");
-                assert!(h.note(id, Some(&e), false, now).notice.is_some());
+                assert!(h.note(id, Some(&e), false, true, now).notice.is_some());
             }
         };
         let now = std::time::Instant::now();
@@ -2208,9 +2732,9 @@ mod tests {
         fill(&mut h, now);
         let one = escalation(&unreachable(1, 3)).expect("a row");
         let two = escalation(&unreachable(2, 5)).expect("a row");
-        assert!(h.note(1, Some(&one), false, now).notice.is_none());
+        assert!(h.note(1, Some(&one), false, true, now).notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
-        assert!(h.note(2, Some(&two), false, now).notice.is_none());
+        assert!(h.note(2, Some(&two), false, true, now).notice.is_none());
         assert_eq!(
             h.last_quiet(),
             Some(HeraldQuiet::Limited),
@@ -2223,7 +2747,9 @@ mod tests {
             .iter()
             .filter_map(|&id| {
                 let e = if id == 1 { &one } else { &two };
-                h.note(id, Some(e), false, later).notice.map(|n| n.session)
+                h.note(id, Some(e), false, true, later)
+                    .notice
+                    .map(|n| n.session)
             })
             .collect();
         assert_eq!(posted, vec![1], "told exactly once");
@@ -2231,21 +2757,24 @@ mod tests {
         assert_eq!(h.due(later + NOTIFY_BURST_WINDOW).0, Vec::<u64>::new());
         // A third tab meeting it after the teller cleared is still quieted:
         // tab 2 was told through tab 1.
-        let _ = h.note(1, None, false, later);
+        let _ = h.note(1, None, false, true, later);
         let three = escalation(&unreachable(3, 8)).expect("a row");
-        assert!(h.note(3, Some(&three), false, later).notice.is_none());
+        assert!(h.note(3, Some(&three), false, true, later).notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
 
         // The owing first tab CLEARS before its notice is due: the later tab
         // still showing the outage owes, and tells it.
         let mut h = Herald::default();
         fill(&mut h, now);
-        assert!(h.note(1, Some(&one), false, now).notice.is_none());
-        assert!(h.note(2, Some(&two), false, now).notice.is_none());
-        let _ = h.note(1, None, false, now);
+        assert!(h.note(1, Some(&one), false, true, now).notice.is_none());
+        assert!(h.note(2, Some(&two), false, true, now).notice.is_none());
+        let _ = h.note(1, None, false, true, now);
         let (due, _) = h.due(later);
         assert_eq!(due, vec![2]);
-        let told = h.note(2, Some(&two), false, later).notice.expect("told");
+        let told = h
+            .note(2, Some(&two), false, true, later)
+            .notice
+            .expect("told");
         assert!(
             told.body.ends_with("tab 2: can't reach the API"),
             "{told:?}"
@@ -2254,10 +2783,188 @@ mod tests {
         // A tab the human was LOOKING at saw the fact: that is it told, and a
         // later tab is quieted (the negative control of the owed case above).
         let mut h = Herald::default();
-        assert!(h.note(1, Some(&one), true, now).notice.is_none());
+        assert!(h.note(1, Some(&one), true, true, now).notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
-        assert!(h.note(2, Some(&two), false, now).notice.is_none());
+        assert!(h.note(2, Some(&two), false, true, now).notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+    }
+
+    /// Review (2026-09-28): a notice `notify.rs`'s queue REFUSED (full — it
+    /// is shared with program notifications — or its thread gone) told
+    /// nobody. Handed back ([`Herald::refused`]), an outage whose first
+    /// notice was refused does not quiet a second tab as
+    /// [`HeraldQuiet::Shared`] — the second tab posts it, into the same full
+    /// queue — and it is owed again: not at once (the queue has not drained,
+    /// and a notice due now wakes the App's timer now), but [`NOTIFY_RETRY`]
+    /// later, when it is told exactly once. NEGATIVE CONTROL: the same first
+    /// notice queued quiets the second tab, and nothing is owed.
+    #[test]
+    fn an_outage_the_queue_refused_is_owed_not_told() {
+        let unreachable = |id: u64, rev: u64| SessionRow {
+            id,
+            title: format!("tab {id}"),
+            agent: Some(AgentFact {
+                word: "wall:api-error",
+                detail: None,
+                rev,
+                subject: Some(crate::presence::API_UNREACHABLE.to_string()),
+            }),
+            ..SessionRow::default()
+        };
+        let one = escalation(&unreachable(1, 3)).expect("a row");
+        let two = escalation(&unreachable(2, 5)).expect("a row");
+        assert!(one.shared && two.shared);
+        let now = std::time::Instant::now();
+        let retry = now + NOTIFY_RETRY;
+
+        // The control: queued, the first notice tells every tab.
+        let mut h = Herald::default();
+        assert!(h.note(1, Some(&one), false, true, now).notice.is_some());
+        assert!(h.note(2, Some(&two), false, true, now).notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+        assert_eq!(h.due(retry), (vec![], None), "nothing owed");
+
+        // Refused: tab 1 owes it again, and it does not quiet tab 2, which
+        // posts it into the same full queue and is refused in turn.
+        let mut h = Herald::default();
+        let out = h.note(1, Some(&one), false, true, now);
+        assert!(out.notice.is_some());
+        h.refused(1, out.owed, now);
+        assert_eq!(h.due(now), (vec![], Some(retry)), "owed, and not at once");
+        let out = h.note(2, Some(&two), false, true, now);
+        assert!(
+            out.notice.is_some(),
+            "an outage nobody was told must not quiet tab 2"
+        );
+        h.refused(2, out.owed, now);
+        assert_eq!(h.due(now), (vec![], Some(retry)), "owed, and not at once");
+        // The App's timer re-heralds each due session: ONE notice in all.
+        let (due, _) = h.due(retry);
+        assert_eq!(due, vec![1, 2]);
+        let posted: Vec<u64> = due
+            .iter()
+            .filter_map(|&id| {
+                let e = if id == 1 { &one } else { &two };
+                h.note(id, Some(e), false, true, retry)
+                    .notice
+                    .map(|n| n.session)
+            })
+            .collect();
+        assert_eq!(posted, vec![1], "told exactly once");
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+        assert_eq!(h.due(retry + NOTIFY_BURST_WINDOW), (vec![], None));
+    }
+
+    /// A refused post spends nothing (review, 2026-09-28): not its session's
+    /// floor — `notified_at` is its last post before the refused one again,
+    /// neither the refused one's nor cleared — and not the instance's burst
+    /// place, which another session posts in. The refused notice is paid when
+    /// the limit next allows, still coalesced (`(+1 more)`). NEGATIVE
+    /// CONTROL: the same notice queued spends both.
+    #[test]
+    fn a_refused_notice_spends_no_floor_and_no_burst_place() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + NOTIFY_SESSION_FLOOR;
+        let retry = t1 + NOTIFY_RETRY;
+        let coalesced = Some("a: bash rm -rf build (+1 more)".to_string());
+        // Sessions 1 and 2 post at t0 (one burst place left); session 1's two
+        // next boxes are held by its floor, and paid at t1 by one notice —
+        // which the queue refuses, or (the control) takes.
+        let run = |refuse: bool| {
+            let mut h = Herald::default();
+            for id in [1, 2] {
+                let row = agent_row(id, "a", "prompt", 1);
+                assert!(herald_note(&mut h, &row, false, t0).notice.is_some());
+            }
+            for rev in [3, 5] {
+                let row = agent_row(1, "a", "prompt", rev);
+                assert!(herald_note(&mut h, &row, false, t0).notice.is_none());
+            }
+            assert_eq!(h.due(t1).0, vec![1]);
+            let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, t1);
+            assert_eq!(paid.notice.map(|n| n.body), coalesced);
+            if refuse {
+                h.refused(1, paid.owed, t1);
+            }
+            h
+        };
+
+        let mut h = run(true);
+        // Not the floor: its last post that told someone is back…
+        assert_eq!(h.slots[&1].notified_at, Some(t0));
+        assert_eq!(h.due(t1), (vec![], Some(retry)));
+        assert_eq!(h.due(retry).0, vec![1]);
+        // …not the burst place: a third session posts in it…
+        let three = agent_row(3, "c", "prompt", 1);
+        assert!(herald_note(&mut h, &three, false, retry).notice.is_some());
+        // …and the refused notice is paid, coalesced as it was, once the
+        // burst window slides past t0.
+        let freed = t0 + NOTIFY_BURST_WINDOW;
+        assert_eq!(h.due(retry), (vec![], Some(freed)));
+        let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, freed);
+        assert_eq!(paid.notice.map(|n| n.body), coalesced);
+        assert_eq!(h.due(freed), (vec![], None));
+
+        // The control: queued, the notice spent the floor and the burst place.
+        let mut h = run(false);
+        assert_eq!(h.slots[&1].notified_at, Some(t1));
+        assert_eq!(h.due(retry), (vec![], None));
+        assert!(herald_note(&mut h, &three, false, retry).notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
+    }
+
+    /// The wait after a refusal is the REFUSED session's alone (review,
+    /// 2026-09-28): a herald-wide wait held session 2's brand-new box, a
+    /// second after session 1's refusal, as [`HeraldQuiet::Limited`] — and
+    /// logged it `not queued: limited`, blaming a rate limit that did not
+    /// apply to a notice the queue never refused. The spin stays impossible:
+    /// session 1 is not due before its own [`NOTIFY_RETRY`], a further box of
+    /// its own is held behind that, and its retry pays both, coalesced.
+    /// NEGATIVE CONTROL: session 2's post, refused in turn, waits out its OWN
+    /// retry, not session 1's.
+    #[test]
+    fn a_refusal_holds_only_the_refused_session() {
+        let t = std::time::Instant::now();
+        let t1 = t + std::time::Duration::from_secs(1);
+        let (retry, retry_two) = (t + NOTIFY_RETRY, t1 + NOTIFY_RETRY);
+        let mut h = Herald::default();
+        let out = herald_note(&mut h, &agent_row(1, "a", "prompt", 1), false, t);
+        assert!(out.notice.is_some());
+        h.refused(1, out.owed, t);
+
+        // Session 2's first box, a second later: posted, and logged `queued`.
+        let two = agent_row(2, "b", "prompt", 1);
+        let posted = herald_note(&mut h, &two, false, t1);
+        assert_eq!(h.last_quiet(), None, "held by another session's refusal");
+        assert_eq!(posted.notice.as_ref().map(|n| n.session), Some(2));
+        let line = herald_log_line(
+            2,
+            escalation(&two).as_ref(),
+            &posted,
+            None,
+            HeraldPost::Queued,
+        );
+        assert_eq!(line.map(|(_, text)| text.ends_with(": queued")), Some(true));
+
+        // Session 1 is not due before its own retry, and a further box of its
+        // own is held behind it.
+        assert_eq!(h.due(t1), (vec![], Some(retry)));
+        let held = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, t1);
+        assert!(held.notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
+
+        // The control: session 2's post refused too — its wait is its own.
+        h.refused(2, posted.owed, t1);
+        assert_eq!(h.due(t1), (vec![], Some(retry)));
+        assert_eq!(h.due(retry), (vec![1], Some(retry_two)));
+        let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, retry);
+        assert_eq!(
+            paid.notice.map(|n| n.body),
+            Some("a: bash rm -rf build (+1 more)".to_string())
+        );
+        assert_eq!(h.slots[&1].retry_at, None, "a post ends the wait");
+        assert_eq!(h.due(retry), (vec![], Some(retry_two)));
+        assert_eq!(h.due(retry_two), (vec![2], None));
     }
 
     #[test]
@@ -2338,7 +3045,7 @@ mod tests {
         looking: bool,
         now: std::time::Instant,
     ) -> HeraldOutcome {
-        h.note(row.id, escalation(row).as_ref(), looking, now)
+        h.note(row.id, escalation(row).as_ref(), looking, true, now)
     }
 
     /// One notification per transition: the first box posts, the same box
@@ -2459,8 +3166,306 @@ mod tests {
 
         // Retire forgets; a cleared session that never escalated keeps no slot.
         h.retire(30);
-        assert_eq!(h.note(99, None, false, t0), HeraldOutcome::default());
+        assert_eq!(h.note(99, None, false, true, t0), HeraldOutcome::default());
         assert!(!h.slots.contains_key(&99));
+    }
+
+    /// EVERY DECISION ON A TRANSITION IS ONE LOG LINE, NO `info` LINE RECURS
+    /// AT CHANGE RATE, AND NO LINE CARRIES TEXT (the blocked-agent incident
+    /// of 2026-09-23..25, whose `aterm.log` could not say which banners went
+    /// out). Driven through the real [`Herald::note`]: a post is `queued`, or
+    /// one `warn` when the notifier's queue refused it; the same box re-read
+    /// is `debug`; the rate limit's FIRST hold is `not queued: limited`,
+    /// while its re-read, a box answered and redrawn inside the floor (the
+    /// flap — a clear does not reopen the log's window, so one line per
+    /// window, never one per flap) and a second box held behind it stay
+    /// `debug`, and the paid notice's line carries the notice's own `(+N
+    /// more)`; a post reopens the window, so the next box the human sees is
+    /// `not queued: looking` though a hold was logged a moment before, its
+    /// flap is `debug`, and a floor later it is `info` again; a legacy title
+    /// and a machine's fact another tab told are `debug`. The key is
+    /// `agent_rev` in decimal for an agent, a hex hash for text and a stall.
+    /// NEGATIVE CONTROLS: every flap step is exactly what the per-transition
+    /// rule (`transition && owed == 1`) wrote at `info`, and the text check
+    /// catches the body in the line this change replaced.
+    #[test]
+    fn each_herald_decision_is_one_log_line_without_its_text() {
+        use aterm_log::Level::{Debug, Info, Warn};
+        let t0 = std::time::Instant::now();
+        let s = |secs| t0 + std::time::Duration::from_secs(secs);
+        let note = |h: &mut Herald, row: &SessionRow, looking, now| {
+            let esc = escalation(row);
+            let out = h.note(row.id, esc.as_ref(), looking, true, now);
+            let line = herald_log_line(
+                row.id,
+                esc.as_ref(),
+                &out,
+                h.last_quiet(),
+                HeraldPost::Queued,
+            );
+            (esc, out, line)
+        };
+        // Every word a line must not carry: the tab title, the box's command,
+        // the escalation's row and notification text.
+        let leaks = |line: &str, esc: &Escalation, secrets: &[&str]| {
+            [esc.body.as_str(), esc.label.as_str()]
+                .into_iter()
+                .chain(secrets.iter().copied())
+                .find(|s| line.contains(*s))
+                .map(str::to_string)
+        };
+        let secrets = ["builder", "rm -rf build", "hunter2", "approve me"];
+        let head = "escalation notification for session 4 (prompt agent_rev=";
+        let full = HeraldPost::Refused("the notifier's queue is full");
+        let mut h = Herald::default();
+        // Session 4's every line, for the counts and the text check at the end.
+        let mut log = Vec::new();
+        let mut step = |h: &mut Herald, word: &'static str, rev: u64, looking, at| {
+            let (_, out, line) = note(h, &agent_row(4, "builder", word, rev), looking, s(at));
+            log.extend(line.clone());
+            (out, line)
+        };
+
+        // A transition that posts: `queued` — or, had the queue refused it,
+        // one `warn` in its place.
+        let (out, line) = step(&mut h, "prompt", 7, false, 0);
+        assert!((out.transition, out.owed) == (true, 1) && out.notice.is_some());
+        assert_eq!(line, Some((Info, format!("{head}7): queued"))));
+        let esc = escalation(&agent_row(4, "builder", "prompt", 7)).expect("a row");
+        assert_eq!(
+            herald_log_line(4, Some(&esc), &out, None, full),
+            Some((
+                Warn,
+                format!("{head}7): not queued: the notifier's queue is full")
+            ))
+        );
+        // …and, with `desktop_alerts = false`, one `info` naming the setting:
+        // the person's choice, not a fault.
+        assert_eq!(
+            herald_log_line(4, Some(&esc), &out, None, HeraldPost::Suppressed),
+            Some((
+                Info,
+                format!("{head}7): not queued: suppressed by desktop_alerts = false")
+            ))
+        );
+        // Non-vacuous: the text the lines leave out is really in the notice.
+        assert!(out.notice.unwrap().body.contains("rm -rf build"));
+
+        // The same box re-read: no transition, `debug`, and still `default()`.
+        let (out, line) = step(&mut h, "prompt", 7, false, 0);
+        assert_eq!(out, HeraldOutcome::default());
+        assert_eq!(line, Some((Debug, format!("{head}7): not queued: same"))));
+
+        // Answered (nothing decided, nothing logged), then a new box inside
+        // the session floor: the FIRST hold is `info`…
+        assert_eq!(step(&mut h, "busy", 8, false, 15).1, None);
+        let (out, line) = step(&mut h, "prompt", 9, false, 15);
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
+        assert_eq!((out.transition, out.owed, out.first_quiet), (true, 1, true));
+        assert_eq!(line, Some((Info, format!("{head}9): not queued: limited"))));
+        // …its re-read while the notice is owed recurs at change rate: `debug`…
+        let (out, line) = step(&mut h, "prompt", 9, false, 15);
+        assert_eq!((out.transition, out.owed), (false, 1));
+        assert_eq!(
+            line,
+            Some((Debug, format!("{head}9): not queued: limited, 1 owed")))
+        );
+        // …and so is the FLAP — answered, redrawn, answered, redrawn — inside
+        // the floor. NEGATIVE CONTROL: each redraw is a transition leaving one
+        // notice owed, exactly what the per-transition rule wrote at `info`;
+        // only the window the clear does not reopen keeps it `debug`.
+        for (answered, redrawn, at) in [(10, 11, 16), (12, 13, 17), (14, 15, 18)] {
+            assert_eq!(step(&mut h, "busy", answered, false, at).1, None);
+            let (out, line) = step(&mut h, "prompt", redrawn, false, at);
+            assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
+            assert_eq!(
+                (out.transition, out.owed, out.first_quiet),
+                (true, 1, false)
+            );
+            assert_eq!(
+                line,
+                Some((
+                    Debug,
+                    format!("{head}{redrawn}): not queued: limited, 1 owed")
+                ))
+            );
+        }
+        // A second box held behind the owed one is `debug` too (the paid line
+        // counts it).
+        let (out, line) = step(&mut h, "prompt", 16, false, 19);
+        assert_eq!((out.transition, out.owed), (true, 2));
+        assert_eq!(
+            line,
+            Some((Debug, format!("{head}16): not queued: limited, 2 owed")))
+        );
+        // The App's timer pays it past the floor: `queued`, with the NOTICE's
+        // own coalesced count — and so does a refusal's `warn`.
+        assert_eq!(h.due(s(20)).0, vec![4]);
+        let (out, line) = step(&mut h, "prompt", 16, false, 20);
+        assert!(!out.transition);
+        assert!(out.notice.as_ref().unwrap().body.ends_with(" (+1 more)"));
+        assert_eq!(
+            line,
+            Some((
+                Info,
+                format!("{head}16): queued after the rate limit (+1 more)")
+            ))
+        );
+        let esc = escalation(&agent_row(4, "builder", "prompt", 16)).expect("a row");
+        assert_eq!(
+            herald_log_line(4, Some(&esc), &out, None, full),
+            Some((
+                Warn,
+                format!(
+                    "{head}16): not queued after the rate limit (+1 more): \
+                     the notifier's queue is full"
+                )
+            ))
+        );
+
+        // The post reopened the window: a box the human sees a second later
+        // is `info`, though a hold was logged only six seconds before it…
+        assert_eq!(step(&mut h, "busy", 17, false, 21).1, None);
+        let (out, line) = step(&mut h, "prompt", 18, true, 21);
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
+        assert!(out.transition && out.first_quiet && out.notice.is_none());
+        assert_eq!(
+            line,
+            Some((Info, format!("{head}18): not queued: looking")))
+        );
+        // …the same flap while they look is `debug`…
+        assert_eq!(step(&mut h, "busy", 19, true, 22).1, None);
+        let (out, line) = step(&mut h, "prompt", 20, true, 22);
+        assert_eq!(
+            (out.transition, out.owed, out.first_quiet),
+            (true, 1, false)
+        );
+        assert_eq!(
+            line,
+            Some((Debug, format!("{head}20): not queued: looking")))
+        );
+        // …and a floor after the last `info`, the next one is news again.
+        assert_eq!(step(&mut h, "busy", 21, true, 41).1, None);
+        let (out, line) = step(&mut h, "prompt", 22, true, 41);
+        assert!(out.first_quiet);
+        assert_eq!(
+            line,
+            Some((Info, format!("{head}22): not queued: looking")))
+        );
+
+        // Session 4's `info` lines: one post, one hold for the whole flap, the
+        // paid notice, two looks — and not one line carries text.
+        let info: Vec<&str> = log
+            .iter()
+            .filter(|(level, _)| *level == Info)
+            .map(|(_, line)| line.trim_start_matches(head))
+            .collect();
+        assert_eq!(
+            info,
+            [
+                "7): queued",
+                "9): not queued: limited",
+                "16): queued after the rate limit (+1 more)",
+                "18): not queued: looking",
+                "22): not queued: looking",
+            ]
+        );
+        let boxed = escalation(&agent_row(4, "builder", "prompt", 7)).expect("a row");
+        for (_, line) in &log {
+            assert_eq!(leaks(line, &boxed, &secrets), None, "{line}");
+        }
+
+        // A legacy `⚠` title flaps as program output: `debug`, never `info`,
+        // keyed by the hex FNV of its text.
+        let titled = rows(&[(9, "\u{26a0} approve me")]).remove(0);
+        let (esc, _, line) = note(&mut h, &titled, false, s(41));
+        let esc = esc.expect("a row");
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Silent));
+        let (level, line) = line.expect("a silent transition is logged");
+        assert_eq!(level, Debug);
+        assert_eq!(
+            line,
+            format!(
+                "escalation notification for session 9 (title text_key={:#018x}): \
+                 not queued: silent",
+                text_key("\u{26a0} approve me")
+            )
+        );
+        assert_eq!(leaks(&line, &esc, &secrets), None, "{line}");
+
+        // Typed attention posts under its text's hex key, and says none of it;
+        // a stall posts under its episode's.
+        let mut h = Herald::default();
+        let asked = row(5, "zsh", None, Some("deploy token hunter2 needs a human"));
+        let (esc, _, line) = note(&mut h, &asked, false, t0);
+        let esc = esc.expect("a row");
+        assert_eq!(esc.key, text_key("deploy token hunter2 needs a human"));
+        let (level, line) = line.expect("a post is logged");
+        assert_eq!(level, Info);
+        assert_eq!(
+            line,
+            format!(
+                "escalation notification for session 5 (attention text_key={:#018x}): queued",
+                esc.key
+            )
+        );
+        assert_eq!(leaks(&line, &esc, &secrets), None, "{line}");
+        let frozen = SessionRow {
+            id: 6,
+            title: "builder".to_string(),
+            input_stall: Some(InputStallRow {
+                text: "claude is frozen: not reading input".to_string(),
+                key: 0xbeef,
+            }),
+            ..SessionRow::default()
+        };
+        let (esc, _, line) = note(&mut h, &frozen, false, t0);
+        let (level, line) = line.expect("a post is logged");
+        assert_eq!(
+            (level, line.as_str()),
+            (
+                Info,
+                "escalation notification for session 6 \
+                 (unresponsive episode_key=0x000000000000beef): queued"
+            )
+        );
+        assert_eq!(leaks(&line, &esc.unwrap(), &["frozen"]), None, "{line}");
+
+        // A machine's fact another tab already told: the telling tab's line
+        // is the `info`; the rest, meeting it together, are `debug`.
+        let unreachable = |id: u64| SessionRow {
+            id,
+            title: format!("tab {id}"),
+            agent: Some(AgentFact {
+                word: "wall:api-error",
+                detail: None,
+                rev: 3,
+                subject: Some(crate::presence::API_UNREACHABLE.to_string()),
+            }),
+            ..SessionRow::default()
+        };
+        let mut h = Herald::default();
+        let (_, out, line) = note(&mut h, &unreachable(1), false, t0);
+        assert!(out.notice.is_some());
+        assert_eq!(line.map(|(level, _)| level), Some(Info));
+        let (_, _, line) = note(&mut h, &unreachable(2), false, t0);
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+        assert_eq!(
+            line,
+            Some((
+                Debug,
+                "escalation notification for session 2 (wall agent_rev=3): not queued: shared"
+                    .to_string()
+            ))
+        );
+
+        // NEGATIVE CONTROL: the text check is not vacuous — it catches the
+        // body in the line this change replaced (`not delivered: <body>`).
+        let old = format!("escalation notification not delivered: {}", boxed.body);
+        assert_eq!(
+            leaks(&old, &boxed, &secrets).as_deref(),
+            Some("builder: bash rm -rf build")
+        );
     }
 
     #[test]

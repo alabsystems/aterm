@@ -958,6 +958,7 @@ fn restore_image_spans(extras: &mut FxHashMap<u16, CellExtra>, spans: &[ImageSpa
                     image: Arc::clone(&span.image),
                     cell_row,
                     cell_col,
+                    kitty: None,
                 }));
             }
             budget -= 1;

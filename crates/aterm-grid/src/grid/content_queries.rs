@@ -43,6 +43,22 @@ impl Grid {
             // charges its share of the payload (see `image_bytes`).
             total += extras.image_bytes();
         }
+        // Resize undo owns copies outside the page arena. Its extras have
+        // moved out of the live/ring maps, so none of these bytes are counted
+        // above (including images retained only by an off-screen undo row).
+        if let Some(undo) = &self.storage.resize_undo {
+            use super::resize_undo::{ResizeUndo, UndoRow};
+            total += std::mem::size_of::<ResizeUndo>()
+                + undo.entries.capacity() * std::mem::size_of::<UndoRow>();
+            for entry in &undo.entries {
+                if let UndoRow::Demoted(row, extras) | UndoRow::Pushed(row, extras) = entry {
+                    total += row.heap_memory_used();
+                    if let Some(extras) = extras {
+                        total += extras.retained_memory_used();
+                    }
+                }
+            }
+        }
         // Staged-but-undrained scroll-off lines (Wave-3 adversarial review):
         // under flood backpressure the lazy buffer holds raw ~8 B/cell rows the
         // tiered store has not absorbed yet — bytes the ring watermark must see.
@@ -814,6 +830,79 @@ mod tests {
             small.memory_used(),
             large.memory_used()
         );
+    }
+
+    #[test]
+    fn memory_used_counts_resize_undo_cells_and_retained_extras() {
+        use std::sync::Arc;
+
+        use crate::{ImageData, ImageFormat, ImageRef};
+
+        // Exercise both a top demotion and a bottom push through real resize.
+        for (cursor_row, retained_row) in [(3, 0), (0, 3)] {
+            let mut grid = Grid::with_scrollback(4, 20, 0);
+            for row in 0..4 {
+                grid.set_cursor(row, 0);
+                grid.write_char('x');
+            }
+            let image = Arc::new(ImageData {
+                bytes: vec![7; 64 * 1024],
+                format: ImageFormat::Png,
+                rows: 1,
+                cols: 1,
+                z_index: 0,
+                band_lift_px: 0,
+                scaling: crate::ImageScaling::Fit,
+                source_rect: None,
+            });
+            let payload_bytes = image.bytes.len();
+            grid.set_cell_image(
+                retained_row,
+                0,
+                ImageRef {
+                    image,
+                    cell_row: 0,
+                    cell_col: 0,
+                    kitty: None,
+                },
+            );
+            let url: Arc<str> = Arc::from("u".repeat(4096));
+            grid.extras_mut()
+                .get_or_create(CellCoord::new(retained_row, 0))
+                .set_hyperlink(Some(url));
+            grid.set_cursor(cursor_row, 0);
+            grid.resize_no_reflow(3, 20);
+            assert_eq!(grid.resize_undo_rows(), 1);
+
+            let with_undo = grid.memory_used();
+            let pages = grid.storage.pages.total_memory();
+            grid.drop_resize_undo();
+            assert_eq!(grid.storage.pages.total_memory(), pages);
+            let released = with_undo - grid.memory_used();
+            assert!(
+                released >= payload_bytes + 4096 + 20 * std::mem::size_of::<crate::Cell>(),
+                "undo accounting omitted its image, hyperlink or cell copy: {released} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_used_counts_blank_resize_undo_capacity() {
+        use super::super::resize_undo::{ResizeUndo, UndoRow};
+
+        let mut grid = Grid::with_scrollback(8, 20, 0);
+        grid.resize_no_reflow(4, 20);
+        let undo = grid.storage.resize_undo.as_ref().expect("blank trim stash");
+        assert!(
+            undo.entries
+                .iter()
+                .all(|entry| matches!(entry, UndoRow::Trimmed))
+        );
+        let expected = std::mem::size_of::<ResizeUndo>()
+            + undo.entries.capacity() * std::mem::size_of::<UndoRow>();
+        let with_undo = grid.memory_used();
+        grid.drop_resize_undo();
+        assert_eq!(with_undo - grid.memory_used(), expected);
     }
 
     // =========================================================================

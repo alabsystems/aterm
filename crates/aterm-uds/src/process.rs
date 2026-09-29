@@ -80,6 +80,104 @@ pub fn pid_alive(pid: u32) -> bool {
     alive
 }
 
+/// A process's kernel start time: the identity that tells a pid from the NEXT
+/// process to be given the same number. Moved here from `aterm-gui`'s seamless
+/// handoff (`seamless::read_process_birth`), whose parent attestation it has been
+/// since the LaunchServices lane, so the PTY keeper (`aterm-keeper`) can check a
+/// peer's and a shell's pid against the record without linking the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcessBirth {
+    /// Start time, unix seconds.
+    pub seconds: u64,
+    /// The microseconds within `seconds`.
+    pub microseconds: u64,
+}
+
+/// Read the kernel's start-time record for `pid`, or `None` when there is no
+/// process of THIS uid to name there.
+///
+/// `None` covers four facts on purpose, because every caller answers them the
+/// same way (refuse): no such process; a ZOMBIE (it has ended, only its record
+/// waits to be reaped); a process owned by another uid (every authority that
+/// reads this is uid-bounded); and the kernel naming a different pid than was
+/// asked for. `pid <= 1` is never a process anyone attests.
+///
+/// macOS: `proc_pidinfo(PROC_PIDTBSDINFO)`, exact-size read. Other platforms:
+/// `None` (no caller there needs it yet; Linux's equivalent is field 22 of
+/// `/proc/<pid>/stat`, and adding it is the first thing a Linux keeper does).
+#[cfg(target_vendor = "apple")]
+#[must_use]
+// Skip: bottoms out at the `proc_pidinfo`/`geteuid` FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
+    // `struct proc_bsdinfo` (sys/proc_info.h): 136 bytes on both Apple ABIs,
+    // measured with the SDK (`offsetof`) on 2026-09-28. Read as bytes at the
+    // measured offsets rather than declared as a struct, so this leaf crate
+    // stays dependency-free and a size change fails the exact-size check below
+    // instead of misreading a field.
+    const PROC_PIDTBSDINFO: i32 = 3;
+    const SIZE: usize = 136;
+    const STATUS: usize = 4;
+    const PID: usize = 12;
+    const UID: usize = 20;
+    const START_SEC: usize = 120;
+    const START_USEC: usize = 128;
+    const SZOMB: u32 = 5;
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: i32,
+            flavor: i32,
+            arg: u64,
+            buffer: *mut core::ffi::c_void,
+            buffersize: i32,
+        ) -> i32;
+        fn geteuid() -> u32;
+    }
+    if pid <= 1 {
+        return None;
+    }
+    let mut info = [0u8; SIZE];
+    // SAFETY: `info` is SIZE writable bytes, exactly the structure this flavor
+    // fills; libproc returns the number of bytes it wrote.
+    let read = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            SIZE as i32,
+        )
+    };
+    if read != SIZE as i32 {
+        return None;
+    }
+    let u32_at = |at: usize| -> Option<u32> {
+        Some(u32::from_ne_bytes(info.get(at..at + 4)?.try_into().ok()?))
+    };
+    let u64_at = |at: usize| -> Option<u64> {
+        Some(u64::from_ne_bytes(info.get(at..at + 8)?.try_into().ok()?))
+    };
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let ours = unsafe { geteuid() };
+    if u32_at(PID)? != u32::try_from(pid).ok()? || u32_at(UID)? != ours {
+        return None;
+    }
+    if u32_at(STATUS)? == SZOMB {
+        return None;
+    }
+    Some(ProcessBirth {
+        seconds: u64_at(START_SEC)?,
+        microseconds: u64_at(START_USEC)?,
+    })
+}
+
+/// See the Apple twin: no birth-record primitive is wired here.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn read_process_birth(_pid: i32) -> Option<ProcessBirth> {
+    None
+}
+
 /// End this process by `SIGKILL`, here: no destructor, exit handler or buffered
 /// flush runs. For fault injection that must die at one exact point (aterm-link's
 /// `ATERM_LINK_FAULT` and `ATERM_LINK_NOTIFY_FAULT`), which used

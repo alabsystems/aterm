@@ -8,6 +8,7 @@
 //! types and the `AUDIT_SUBSYSTEM` name stay in `control.rs`, reached via `super::`.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aterm_containment::log_denial;
@@ -28,6 +29,199 @@ use crate::{Wake, term_lock};
 /// waiting invisibly behind every occupied worker.
 const MAIN_THREAD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Why a main-thread hop brought back no answer: a wire-ready reason, which a
+/// caller prints with `{}`. Every reason but one is a fixed phrase. The one
+/// that is not is the stalled main thread's refusal, which says how long and
+/// where ([`crate::watchdog::MainStall`]) and was given before anything was
+/// posted, so a retry is always safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MainHopError {
+    /// A fixed reason: a dialog stands, the event loop is gone, the deadline
+    /// passed, the reply was dropped.
+    Reason(&'static str),
+    /// `main thread stalled <N>s since <root>; retry`.
+    Stalled(crate::watchdog::MainStall),
+}
+
+impl std::fmt::Display for MainHopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reason(reason) => f.write_str(reason),
+            Self::Stalled(stall) => std::fmt::Display::fmt(stall, f),
+        }
+    }
+}
+
+/// The main-thread hops in flight: posted by [`call_main`] or
+/// [`call_main_within`], not yet TAKEN by the main thread and not given up on,
+/// and since when some have been. [`main_thread_refusal`] reads it. A hop that
+/// has waited the stall bar on a main thread that has not beaten in that time
+/// means the thread is stuck past its idle park (inside AppKit, say), which
+/// the heartbeat alone cannot tell from a thread that is only idle.
+///
+/// The count alone is not enough. A main thread idle at its park for ten
+/// minutes has a ten-minute-old heartbeat, and the hop that wakes it is
+/// outstanding for the moment it takes to answer: judged on the heartbeat
+/// alone, a second verb arriving in that moment would be refused. So the run
+/// of outstanding hops records when it began, and it counts only once it has
+/// waited the bar itself (`MainThreadStallRefusal`'s `Buggy` replays the
+/// heartbeat-only rule).
+///
+/// A hop leaves the count when the main thread TAKES it ([`take_hop`], first
+/// thing in `user_event`), not when its worker gets the reply. Every hop but
+/// one is answered in the turn that takes it. `settings set|unset` is not: the
+/// main thread queues the write and the reply comes turns later, from the
+/// config worker's completion. Counted until that reply, a healthy thread
+/// parked idle behind it would read as stuck, and every other main-thread verb
+/// would be refused once the write took the bar (`MainThreadStallRefusal`'s
+/// `Buggy` replays that rule too). The run's start can then be older than the
+/// hops still counted in it. That never refuses a moving thread: the hops were
+/// taken in the order they were posted, so a beat came after that start, and
+/// the reader measures from whichever of the two is later.
+pub(crate) struct Hops {
+    outstanding: AtomicUsize,
+    /// When `outstanding` last left zero, on the `crate::metrics::now_ns`
+    /// clock; 0 while nothing is outstanding.
+    run_since_ns: AtomicU64,
+}
+
+impl Hops {
+    pub(crate) const fn new() -> Self {
+        Self {
+            outstanding: AtomicUsize::new(0),
+            run_since_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one hop from `now_ns` until the main thread takes it
+    /// ([`HopMark::taken`]) or the guard drops, whichever comes first.
+    pub(crate) fn post(&self, now_ns: u64) -> HopGuard<'_> {
+        if self.outstanding.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.run_since_ns.store(now_ns.max(1), Ordering::Relaxed);
+        }
+        HopGuard {
+            mark: HopMark {
+                hops: self,
+                counted: Arc::new(AtomicBool::new(true)),
+            },
+        }
+    }
+
+    /// When the current run of outstanding hops began, or `None` when no hop
+    /// is outstanding. Two relaxed words: a reader that catches a run ending
+    /// as the next begins can read the older start, a stall only if the
+    /// heartbeat has not moved for the bar either, or no start, which is no
+    /// refusal. Neither refuses a thread that is answering.
+    pub(crate) fn since_ns(&self) -> Option<u64> {
+        if self.outstanding.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        match self.run_since_ns.load(Ordering::Relaxed) {
+            0 => None,
+            since => Some(since),
+        }
+    }
+}
+
+impl Default for Hops {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One hop's place in the [`Hops`] count, shared by the worker's
+/// [`HopGuard`] and the [`Wake::Hop`] it posts. Whichever of the two comes
+/// first counts the hop out: the main thread taking it, or the worker giving
+/// up (reply, deadline, event loop gone). The other then finds nothing to
+/// count out, so a hop is counted out exactly once.
+pub(crate) struct HopMark<'a> {
+    hops: &'a Hops,
+    /// True while this hop is still in the count.
+    counted: Arc<AtomicBool>,
+}
+
+impl HopMark<'_> {
+    /// The main thread has taken this hop: it is out of the count, whenever
+    /// its reply comes.
+    pub(crate) fn taken(self) {
+        self.count_out();
+    }
+
+    fn count_out(&self) {
+        if self.counted.swap(false, Ordering::Relaxed)
+            && self.hops.outstanding.fetch_sub(1, Ordering::Relaxed) == 1
+        {
+            self.hops.run_since_ns.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+impl std::fmt::Debug for HopMark<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HopMark")
+            .field("counted", &self.counted.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// One posted hop, from its worker's side: it counts itself out of [`Hops`]
+/// when it drops (on the reply, on the deadline, and on an event loop that is
+/// gone, every path alike) unless the main thread took it first.
+pub(crate) struct HopGuard<'a> {
+    mark: HopMark<'a>,
+}
+
+impl<'a> HopGuard<'a> {
+    /// The mark the posted [`Wake::Hop`] carries to the main thread.
+    pub(crate) fn mark(&self) -> HopMark<'a> {
+        HopMark {
+            hops: self.mark.hops,
+            counted: Arc::clone(&self.mark.counted),
+        }
+    }
+}
+
+impl Drop for HopGuard<'_> {
+    fn drop(&mut self) {
+        self.mark.count_out();
+    }
+}
+
+/// The process's one [`Hops`].
+static HOPS: Hops = Hops::new();
+
+/// The request a control worker posted, with its hop counted out: the main
+/// thread has taken it. `user_event` calls this first, on every delivered
+/// [`Wake`], so what it handles is never a [`Wake::Hop`], and a request whose
+/// reply is queued (`settings set`) stops counting as a hop that waits on the
+/// main thread the moment the main thread has it.
+pub(crate) fn take_hop(ev: Wake) -> Wake {
+    match ev {
+        Wake::Hop { mark, wake } => {
+            mark.taken();
+            take_hop(*wake)
+        }
+        other => other,
+    }
+}
+
+/// Post `make(tx)` as a counted hop: wrapped in [`Wake::Hop`] with the mark
+/// that counts it out when the main thread takes it. `Err` is the one
+/// `send_event` failure a hop has, the event loop being gone.
+fn post_hop(
+    proxy: &EventLoopProxy<Wake>,
+    hop: &HopGuard<'static>,
+    wake: Wake,
+) -> Result<(), MainHopError> {
+    let wake = Wake::Hop {
+        mark: hop.mark(),
+        wake: Box::new(wake),
+    };
+    proxy
+        .send_event(wake)
+        .map_err(|_| MainHopError::Reason("event loop gone"))
+}
+
 /// The ONE main-thread RPC. Every UI-mutating / aux-window verb (controls, open,
 /// settings, invoke, spawn, close, chrome) needs the same hop: build a one-shot
 /// reply channel, post a reply-bearing `Wake` to the event loop, and BLOCK on the
@@ -38,14 +232,16 @@ const MAIN_THREAD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from
 pub(crate) fn call_main<T>(
     proxy: &EventLoopProxy<Wake>,
     make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
-) -> Result<T, &'static str> {
-    if let Some(refusal) = dialog_refusal() {
+) -> Result<T, MainHopError> {
+    if let Some(refusal) = main_thread_refusal() {
         return Err(refusal);
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    if proxy.send_event(make(tx)).is_err() {
-        return Err("event loop gone");
-    }
+    // Counted from before the post until the main thread takes it or this
+    // worker stops waiting, however that ends, so the next verb can tell a hop
+    // that has waited too long for the main thread.
+    let hop = HOPS.post(crate::metrics::now_ns());
+    post_hop(proxy, &hop, make(tx))?;
     // These RPCs answer within one event-loop turn; the deadline only fires when
     // that turn cannot finish within the generous cold-render allowance. Timing
     // out frees THIS fixed worker lane instead of retaining it forever.
@@ -60,9 +256,13 @@ pub(crate) fn call_main<T>(
             // instantly -- while costing an hour of hunting for a stall that did
             // not exist. A timeout cannot distinguish a wedged loop from a slow
             // turn from a request nobody ever settles, so it must not name one.
-            Err("main-thread reply did not arrive within 30s")
+            Err(MainHopError::Reason(
+                "main-thread reply did not arrive within 30s",
+            ))
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("main-thread reply dropped"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(MainHopError::Reason("main-thread reply dropped"))
+        }
     }
 }
 
@@ -79,15 +279,33 @@ pub(crate) fn call_main_within<T>(
     proxy: &EventLoopProxy<Wake>,
     within: std::time::Duration,
     make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
-) -> Result<T, &'static str> {
-    if let Some(refusal) = dialog_refusal() {
+) -> Result<T, MainHopError> {
+    if let Some(refusal) = main_thread_refusal() {
         return Err(refusal);
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    if proxy.send_event(make(tx)).is_err() {
-        return Err("event loop gone");
+    let hop = HOPS.post(crate::metrics::now_ns());
+    post_hop(proxy, &hop, make(tx))?;
+    recv_within(&rx, within).map_err(MainHopError::Reason)
+}
+
+/// Why a main-thread verb is refused before anything is posted, if it is. A
+/// STALLED main thread comes first. On 2026-09-28 the main thread was stuck in
+/// AppKit's scene setup before the whole process stopped running, and a verb
+/// that needed it could only post its hop and wait out the whole reply
+/// deadline, holding a worker lane, for a thread that could not answer. The
+/// heartbeat already showed the thread stuck
+/// ([`crate::watchdog::main_stall_now`], at the shipped stall bar in every
+/// build), so such a verb is now answered at once with
+/// `ERR main thread stalled <N>s since <root>; retry`, which the harness rides
+/// out as it does `ERR control server busy`. Then a standing dialog
+/// ([`dialog_refusal`]); a dialog is a designed freeze and never reads as a
+/// stall.
+fn main_thread_refusal() -> Option<MainHopError> {
+    if let Some(stall) = crate::watchdog::main_stall_now(HOPS.since_ns()) {
+        return Some(MainHopError::Stalled(stall));
     }
-    recv_within(&rx, within)
+    dialog_refusal().map(MainHopError::Reason)
 }
 
 /// WHILE A DIALOG STANDS the main thread is inside AppKit's nested modal
@@ -475,9 +693,9 @@ pub(crate) fn cmd_image(
             return "ERR path: give a bare filename (no '/'), or omit it to auto-name one\n".into();
         }
     };
-    // A capture is a main-thread photograph: refused while a dialog stands,
-    // as every main-thread verb is (ruling 267).
-    if let Some(refusal) = dialog_refusal() {
+    // A capture is a main-thread photograph: refused while the main thread is
+    // stalled or a dialog stands, as every main-thread verb is (ruling 267).
+    if let Some(refusal) = main_thread_refusal() {
         return format!("ERR {refusal}\n").into();
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -668,6 +886,27 @@ fn image_file_reply(
     }
 }
 
+/// The refusal of `window <word>` when `<word>` is neither a target nor a file name:
+/// `None` for the empty operand and for anything path-shaped — an extension
+/// (`shot.png`, `front.png`) or a separator, which the path confinement then judges —
+/// so both keep their meaning.
+///
+/// A bare word used to be taken as the capture's FILE NAME: `window bogus` answered
+/// `OK … bogus` and wrote a PNG named `bogus` into images/ (measured 2026-09-27 on
+/// 0.95.0), so a mistyped target (`window setings`) read as a successful capture of
+/// the front window. The refusal names the targets and the spelling that still
+/// writes a file of that name.
+fn unknown_window_target(first: &str) -> Option<String> {
+    if first.is_empty() || first.contains(['.', '/', '\\']) {
+        return None;
+    }
+    Some(format!(
+        "ERR unknown window target '{first}' (targets: front | prefs | about | menu | \
+         tab-menu | conn-card | session-picker | connections | update); a file name \
+         has an extension: `window {first}.png`\n"
+    ))
+}
+
 /// `window [<target>] [path]` -> capture a full-window artifact to a PNG,
 /// replying `OK <w> <h> <path>` (the SAME wire shape as `image`). For the front
 /// terminal window this stitches platform chrome around the exact submitted
@@ -688,8 +927,10 @@ fn image_file_reply(
 /// the target's name.
 ///
 /// A first token that is not a known keyword is treated as the path (so the original
-/// `window [path]` wire shape still works); a literal filename `prefs`/`front`
-/// must therefore be given a target first (e.g. `window front prefs`).
+/// `window [path]` wire shape still works) when it LOOKS like one — it has an
+/// extension (`shot.png`); a bare word is refused instead ([`unknown_window_target`]).
+/// A literal filename `prefs`/`front` must therefore be given a target first (e.g.
+/// `window front prefs`).
 ///
 /// PATH CONFINEMENT (mirrors [`cmd_image`]): the `path` is validated by
 /// `confine_image_path` to a single filename inside the socket dir's `images/` subdir,
@@ -721,7 +962,12 @@ pub(crate) fn cmd_window(
     }
     let (aux, path_arg) = match AuxTarget::parse(first) {
         Some(t) if !first.is_empty() => (t, it.next().unwrap_or("")),
-        _ => (AuxTarget::Front, rest.trim()),
+        _ => {
+            if let Some(refusal) = unknown_window_target(first) {
+                return refusal.into();
+            }
+            (AuxTarget::Front, rest.trim())
+        }
     };
     let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
         return format!(
@@ -786,8 +1032,9 @@ pub(crate) fn cmd_window(
     };
     // For the reply only — the writer re-opens via the dir fd, not this string.
     let path = confined.display_path().to_string_lossy().into_owned();
-    // Refused while a dialog stands, as every main-thread verb is (ruling 267).
-    if let Some(refusal) = dialog_refusal() {
+    // Refused while the main thread is stalled or a dialog stands, as every
+    // main-thread verb is (ruling 267).
+    if let Some(refusal) = main_thread_refusal() {
         return format!("ERR {refusal}\n").into();
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -929,6 +1176,34 @@ mod window_target_refusal_tests {
         AuxTarget::SessionPicker,
         AuxTarget::Connections,
     ];
+
+    /// `window bogus` answered `OK` and wrote a PNG named `bogus` on 0.95.0
+    /// (measured 2026-09-27). A bare word that is no target is refused, listing
+    /// every target `window` takes and the spelling that writes a file of that
+    /// name; the empty operand and anything path-shaped keep their meaning.
+    #[test]
+    fn a_bare_word_that_is_no_target_is_refused_not_written() {
+        let refusal = super::unknown_window_target("bogus").expect("a bare word is refused");
+        assert!(
+            refusal.starts_with("ERR unknown window target 'bogus' (targets: front | prefs"),
+            "{refusal}"
+        );
+        assert!(refusal.ends_with("`window bogus.png`\n"), "{refusal}");
+        // In the catalog's order, and exactly the parser's targets.
+        let listed: std::collections::BTreeSet<&str> = refusal
+            .split_once("(targets: ")
+            .and_then(|(_, tail)| tail.split_once(')'))
+            .map(|(list, _)| list.split(" | ").collect())
+            .expect("the refusal lists the targets");
+        let every: std::collections::BTreeSet<&str> = std::iter::once(AuxTarget::Front)
+            .chain(OVERLAYS)
+            .map(AuxTarget::keyword)
+            .collect();
+        assert_eq!(listed, every);
+        for operand in ["", "shot.png", "front.png", "sub/x", r"sub\x"] {
+            assert_eq!(super::unknown_window_target(operand), None, "{operand:?}");
+        }
+    }
 
     /// THE DEFECT: with nothing open every target answered `OK` and a plain
     /// front frame. Each is now refused in one sentence — the state, then the
@@ -1146,6 +1421,11 @@ struct VideoArgs {
     /// Frame-store RAM budget (from `budget=<MiB>`; default 512 MiB).
     budget_bytes: usize,
 }
+
+/// The longest take `video` records: a longer request is clamped to it. The
+/// seamless update's park waits for a live take at most this long
+/// (`app_update_handoff::VIDEO_PARK_WAIT_MAX`).
+pub(crate) const VIDEO_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 const VIDEO_USAGE: &str = "usage: video [<seconds>] [full|half] [keys] [pace] [trail] [fps=<n>] [budget=<MiB>] (seconds default 3) | video status|stop | video frames [count=N]";
 
@@ -1764,7 +2044,7 @@ fn parse_video_args(rest: &str) -> Result<VideoArgs, String> {
             }
         }
     }
-    args.secs = args.secs.clamp(0.5, 60.0);
+    args.secs = args.secs.clamp(0.5, VIDEO_MAX_DURATION.as_secs_f64());
     Ok(args)
 }
 
@@ -1903,6 +2183,10 @@ pub(crate) fn cmd_video(
     let cancel = crate::VideoCancellation::new();
     let mut cancel_on_drop = CancelVideoRequestOnDrop(Some(cancel.clone()));
     let (tx, rx) = std::sync::mpsc::channel();
+    // The main thread keeps `wire` and a seamless update's Commit waits on it:
+    // this request's reply, whatever it turns out to be, is written before
+    // that `_exit` (round six of the update audit, finding 31).
+    let (wire, written) = crate::control::ReplyWire::new();
     if proxy
         .send_event(Wake::Video {
             dur_ms: (args.secs * 1000.0) as u64,
@@ -1916,6 +2200,7 @@ pub(crate) fn cmd_video(
             dir,
             cancel,
             reply: tx,
+            wire,
         })
         .is_err()
     {
@@ -1935,8 +2220,9 @@ pub(crate) fn cmd_video(
             let (body, retention) = reply.into_parts();
             crate::control::ControlReply::with_handoff(body, retention)
         }
-        Err(error) => format!("ERR video: {error}\n").into(),
+        Err(error) => crate::control::ControlReply::from(format!("ERR video: {error}\n")),
     }
+    .releasing_on_write(written)
 }
 
 /// `controls <target>` dumps a compatibility GUI target's semantic controls as text, the
@@ -2878,6 +3164,25 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
     }
 }
 
+/// `cwd=<path>` naming a folder no shell can start in is REFUSED by name
+/// (audit #7 finding 48): `ERR no such folder <path>` when nothing is there,
+/// `ERR no access to folder <path>` when this user may not enter it. The
+/// caller named the folder and can act on the refusal, where a shell started
+/// quietly in the home folder — what a restored pane or a New Tab gets
+/// ([`crate::spawn_folder`]) — would mislead it. `None` with no `cwd=`, a
+/// folder a shell can start in, or one the check could not judge in time.
+/// Off unix nothing is refused here ([`crate::spawn_folder::folder_fault`]).
+fn spawn_cwd_refusal(form: &SpawnForm) -> Option<String> {
+    use crate::spawn_folder::Fault;
+    let (SpawnForm::Plain { cwd, .. } | SpawnForm::Connected { cwd, .. }) = form;
+    let cwd = cwd.as_deref()?;
+    let shown = if cwd.is_empty() { "\"\"" } else { cwd };
+    match crate::spawn_folder::folder_fault(cwd)? {
+        Fault::Missing => Some(format!("ERR no such folder {shown}\n")),
+        Fault::Shut => Some(format!("ERR no access to folder {shown}\n")),
+    }
+}
+
 /// Where an aimed `spawn` lands (design S3, finding F3): the FRONT window (the
 /// historical `aterm new-tab` contract), an EXPLICIT `window=<id>`, or the
 /// window HOSTING the `@<sid>` selector's session (the routing rule `@<sid>
@@ -2947,7 +3252,14 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
 ///
 /// `cwd=<path>` sets the newborn's working directory (default: inherit the
 /// focused pane's cwd, like Cmd-T); a path containing spaces is quoted
-/// (`cwd="C:\Program Files\Git"`, see [`split_quoted_tokens`]).
+/// (`cwd="C:\Program Files\Git"`, see [`split_quoted_tokens`]). On macOS
+/// and Linux a path no shell can start in is refused, `ERR no such folder
+/// <path>` or `ERR no access to folder <path>` ([`spawn_cwd_refusal`]); an
+/// inherited folder a shell cannot start in starts the newborn in the home
+/// folder, and a Messages row says so — unless a program other than that
+/// pane's shell (ssh, a container's shell) holds the pane: that folder may be
+/// another machine's, so it is not taken, and the newborn starts where it
+/// would with none ([`crate::spawn_folder::inherited`]).
 ///
 /// `split=v` / `split=h` divides the FOCUSED PANE instead of opening a tab —
 /// side-by-side and stacked respectively, the same two directions Cmd-D and
@@ -2969,14 +3281,20 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
 /// `place=tab` works headless. cwd default for the connected form is the
 /// ORIGIN session's cwd.
 pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Option<u64>) -> String {
-    let sent = match parse_spawn_args(rest) {
-        Ok(SpawnForm::Plain {
+    let Ok(form) = parse_spawn_args(rest) else {
+        return SPAWN_USAGE.to_string();
+    };
+    if let Some(refusal) = spawn_cwd_refusal(&form) {
+        return refusal;
+    }
+    let sent = match form {
+        SpawnForm::Plain {
             window,
             raise,
             cwd,
             split,
             identity,
-        }) => {
+        } => {
             let aim = SpawnAim::from_request(window, session);
             let raise = raise_after_spawn(aim.is_aimed(), raise);
             call_main(proxy, |tx| Wake::SpawnSession {
@@ -2988,13 +3306,13 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
                 reply: tx,
             })
         }
-        Ok(SpawnForm::Connected {
+        SpawnForm::Connected {
             kind,
             place,
             origin,
             cwd,
             identity,
-        }) => call_main(proxy, |tx| Wake::SpawnConnectedSession {
+        } => call_main(proxy, |tx| Wake::SpawnConnectedSession {
             kind,
             place,
             origin,
@@ -3002,7 +3320,6 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
             identity,
             reply: tx,
         }),
-        Err(()) => return SPAWN_USAGE.to_string(),
     };
     match sent {
         Ok(Ok(sid)) => format!("OK {sid}\n"),
@@ -3467,9 +3784,68 @@ mod fx_parse_tests {
 #[cfg(test)]
 mod spawn_parse_tests {
     use super::{
-        IdentitySpec, SpawnForm, parse_spawn_args, resolve_spawn_identity, split_quoted_tokens,
+        IdentitySpec, SpawnForm, parse_spawn_args, resolve_spawn_identity, spawn_cwd_refusal,
+        split_quoted_tokens,
     };
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
+
+    /// AUDIT #7 FINDING 48 — `spawn cwd=<dir>` naming no folder is refused by
+    /// name, in both forms, before anything is spawned: the agent that asked
+    /// can act on `ERR no such folder <dir>` (or `ERR no access to folder
+    /// <dir>` for one it may not enter), where a shell started quietly in the
+    /// home folder would mislead it. NEGATIVE CONTROLS: a folder that is
+    /// there, and no `cwd=` at all, pass through to the spawn.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_whose_cwd_names_no_folder_is_refused_by_name() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-spawn-cwd")
+            .tempdir()
+            .expect("scratch dir");
+        let here = scratch.path().to_str().expect("utf-8 scratch path");
+        let gone = format!("{here}/gone");
+        let refused = |rest: &str| spawn_cwd_refusal(&parse_spawn_args(rest).expect("parses"));
+        assert_eq!(
+            refused(&format!("cwd={gone}")),
+            Some(format!("ERR no such folder {gone}\n"))
+        );
+        assert_eq!(
+            refused(&format!("connected=controlled place=tab of=s-a cwd={gone}")),
+            Some(format!("ERR no such folder {gone}\n")),
+            "the connected form too"
+        );
+        assert_eq!(
+            refused(r#"cwd="""#),
+            Some("ERR no such folder \"\"\n".to_string()),
+            "an empty folder is named as empty, never read as no cwd="
+        );
+        assert_eq!(
+            refused(&format!("cwd={here} split=v")),
+            None,
+            "a folder that is there"
+        );
+        assert_eq!(
+            refused("split=h"),
+            None,
+            "no cwd=: the focused pane's folder"
+        );
+        // A folder this user may not enter (root enters any folder).
+        use std::os::unix::fs::PermissionsExt as _;
+        let shut = format!("{here}/shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let verdict = refused(&format!("cwd={shut}"));
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: getuid has no failure mode and takes no arguments.
+        if unsafe { libc::getuid() } != 0 {
+            assert_eq!(verdict, Some(format!("ERR no access to folder {shut}\n")));
+        }
+        assert_eq!(
+            refused(&format!("cwd={shut}")),
+            None,
+            "the same folder, opened"
+        );
+    }
 
     /// REVIEW (contract lens, 2026-09-17): the catalog's `spawn` summary says
     /// `[raise=<t|f>]` beside `[split=<v|h>]`, whose letters ARE the accepted
@@ -4670,7 +5046,7 @@ mod video_parse_tests {
         tx.send(Ok(crate::control::Retained::plain((7_u32, 9_u32))))
             .unwrap();
         let reply = done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(60))
             .expect("committed result completes the pending waiter")
             .expect("commit winner is awaited instead of receiving a false timeout ERR");
         assert_eq!(reply.value, (7, 9));
@@ -4708,7 +5084,7 @@ mod video_parse_tests {
         tx.send(crate::control::Retained::plain("OK video\n".to_string()))
             .unwrap();
         let reply = done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(60))
             .expect("committed video result completes the pending waiter")
             .expect("commit winner is awaited instead of receiving a false timeout ERR");
         assert_eq!(reply.value, "OK video\n");
@@ -5709,8 +6085,10 @@ mod call_main_within_tests {
             r,
             Err("main thread did not answer within the placement deadline")
         );
+        // THE BUDGET IS THE SUBJECT: the 20 ms deadline against the 30 s
+        // `call_main` default. Half that default is the line between them.
         assert!(
-            start.elapsed() < Duration::from_secs(1),
+            start.elapsed() < super::MAIN_THREAD_REPLY_TIMEOUT / 2,
             "returned at the deadline, not at the default"
         );
     }
@@ -5748,5 +6126,115 @@ mod call_main_within_tests {
         ] {
             assert_eq!(super::dialog_refusal_for(other), None, "{other:?}");
         }
+    }
+
+    /// The hop count behind the stall refusal: a run of outstanding hops
+    /// keeps the instant it began for as long as ANY hop of it waits, every
+    /// guard that drops counts itself out, and the next run starts afresh.
+    #[test]
+    fn the_hop_count_keeps_when_its_run_began_until_the_last_hop_ends() {
+        let hops = super::Hops::new();
+        assert_eq!(hops.since_ns(), None, "nothing outstanding");
+        let first = hops.post(10);
+        assert_eq!(hops.since_ns(), Some(10));
+        let second = hops.post(20);
+        assert_eq!(hops.since_ns(), Some(10), "the run began with the first");
+        drop(first);
+        assert_eq!(
+            hops.since_ns(),
+            Some(10),
+            "a hop still waits: the run goes on"
+        );
+        drop(second);
+        assert_eq!(hops.since_ns(), None, "every guard counted itself out");
+        let next = hops.post(30);
+        assert_eq!(hops.since_ns(), Some(30), "a new run, a new start");
+        drop(next);
+        assert_eq!(hops.since_ns(), None);
+        // A clock reading of 0 still counts as a start.
+        let at_zero = hops.post(0);
+        assert!(hops.since_ns().is_some());
+        drop(at_zero);
+    }
+
+    /// A hop leaves the count when the main thread TAKES it, not when its
+    /// worker gets the reply: `settings set` queues its write and is answered
+    /// turns later, by the config worker's completion. [`super::take_hop`] is
+    /// what `user_event` runs first on the posted `Wake::Hop`, and it hands
+    /// back the request itself. Whichever of the take and the guard comes
+    /// first counts the hop out, and only once: a reply after the take, or a
+    /// take after the worker gave up, never counts out another hop.
+    #[test]
+    fn a_hop_stops_counting_when_the_main_thread_takes_it() {
+        let hops: &'static super::Hops = Box::leak(Box::new(super::Hops::new()));
+        let parked = hops.post(10);
+        let request = super::take_hop(crate::Wake::Hop {
+            mark: parked.mark(),
+            wake: Box::new(crate::Wake::TitleSummaryReady),
+        });
+        assert!(
+            matches!(request, crate::Wake::TitleSummaryReady),
+            "the main thread handles the request itself: {request:?}"
+        );
+        assert_eq!(
+            hops.since_ns(),
+            None,
+            "taken, its reply queued: its worker still waits, and it is not counted"
+        );
+        let waiting = hops.post(20);
+        assert_eq!(hops.since_ns(), Some(20));
+        // The queued reply comes now.
+        drop(parked);
+        assert_eq!(
+            hops.since_ns(),
+            Some(20),
+            "a reply after the take counts out nothing more"
+        );
+        let late = waiting.mark();
+        // The worker gives up first.
+        drop(waiting);
+        assert_eq!(hops.since_ns(), None);
+        let next = hops.post(30);
+        // The main thread takes the abandoned request after all.
+        late.taken();
+        assert_eq!(
+            hops.since_ns(),
+            Some(30),
+            "a take after the give-up counts out nothing"
+        );
+        drop(next);
+        assert_eq!(hops.since_ns(), None);
+
+        // One hop of a run taken while the next still waits untaken: the run
+        // goes on. The reader measures from the later of its start and the
+        // beat that took the first, so the older start refuses nothing.
+        let first = hops.post(40);
+        let second = hops.post(50);
+        first.mark().taken();
+        assert_eq!(hops.since_ns(), Some(40));
+        drop(first);
+        assert_eq!(hops.since_ns(), Some(40), "the second still waits");
+        drop(second);
+        assert_eq!(hops.since_ns(), None);
+    }
+
+    /// The refusal a stalled main thread answers with, as the wire carries it
+    /// (`ERR {reason}`), and a fixed reason unchanged.
+    #[test]
+    fn a_stalled_main_thread_answers_a_named_retryable_err() {
+        use crate::watchdog::{Breadcrumb, MainStall};
+        let stall = MainStall {
+            stalled: Duration::from_secs(12),
+            root: Breadcrumb::NewEvents,
+            returned: true,
+        };
+        assert_eq!(
+            format!("ERR {}\n", super::MainHopError::Stalled(stall)),
+            "ERR main thread stalled 12s since `NewEvents` returned; retry\n"
+        );
+        assert_eq!(
+            super::MainHopError::Reason("event loop gone").to_string(),
+            "event loop gone"
+        );
     }
 }

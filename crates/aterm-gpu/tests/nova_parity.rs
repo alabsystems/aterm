@@ -439,7 +439,7 @@ fn supernova_damaged_path_wash_to_shockwave_cached_equals_fresh() {
         "CPU damaged path: the shockwave frame must equal a fresh render \
          (no wash ghost on any vacated row)"
     );
-    let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+    let mut gpu2 = common::independent_gpu(18.0, theme);
     gpu2.set_bloom(false);
     gpu2.set_shimmer(false);
     let mut win2 = aterm_gpu::WindowGpu::new();

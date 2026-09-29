@@ -487,6 +487,34 @@ impl std::error::Error for WriteReceiptError {
     }
 }
 
+/// WHY [`SinkWriter::discard_unread_input`] drops the input the program left
+/// unread — the one fact the drop itself cannot carry.
+///
+/// A RESTART'S DROP AND A FLUSH ARE DIFFERENT FACTS (robustness review of the
+/// manual reset, 2026-09-26). Both empty the same queue and move the same
+/// discard epoch, which must move for either: a frame already in flight was
+/// accepted for the input that went. But aterm-gui's input watch reads a
+/// moved count on a published stall as `signal term`'s pre-signal drop, and
+/// after `RESTART_GRACE` names the program as having SURVIVED its restart
+/// signal, with `signal kill` the remedy. Reproduced on a headless instance:
+/// a spinning python3 program published `input=stalled input_bytes=433`,
+/// `reset flush` answered `discarded=433` with no `signal` verb sent, and
+/// five seconds later its line read "Python is still running after its
+/// restart signal … end it: … signal kill" — steering a supervisor to
+/// SIGKILL a program that was never sent SIGTERM. So the caller says which
+/// drop it is, and only a [`Discard::Restart`] moves
+/// [`SinkWriter::restart_discards`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Discard {
+    /// The drop before a restart signal (`signal term|kill|hup|quit`,
+    /// aterm-gui's `input_stall::discard_before_signal`): the program is
+    /// about to be told to end.
+    Restart,
+    /// `reset flush` (aterm-gui's `manual_reset`): the input goes, and no
+    /// signal follows.
+    Flush,
+}
+
 /// What the non-parking body does where a frame cannot be taken without
 /// waiting (the spill at `SPILL_CAP`, or no drainer to deliver a spilled byte).
 #[cfg(unix)]
@@ -781,6 +809,10 @@ struct Shared {
     /// frame's bytes: they were accepted BEFORE the discard, so they belong
     /// to the program the discard was for, not to whoever reads next.
     discards: AtomicU64,
+    /// How many of those discards were a restart's ([`Discard::Restart`]),
+    /// bumped in the same critical section as `discards`. Only ever compared
+    /// for a move ([`SinkWriter::restart_discards`]).
+    restarts: AtomicU64,
     /// Set once, for good, by [`SinkWriter::sever_input`]: the session is
     /// closing. Every frame in flight is then dropped as a discard drops it
     /// ([`Self::discarded_since`]), and every later write fails at entry.
@@ -1199,6 +1231,11 @@ impl SinkWriter {
     ///
     /// Bytes written after this returns reach the kernel as usual.
     ///
+    /// `why` says which drop this is ([`Discard`]): both move the discard
+    /// epoch ([`Self::discards`]); only a [`Discard::Restart`] moves
+    /// [`Self::restart_discards`], the count a published stall's restart
+    /// grace is judged on. A `reset flush` is not a restart signal.
+    ///
     /// RESIDUAL: a writer that passed its epoch check just before the discard
     /// and is inside its `write(2)` as the flush lands can put that one
     /// write's bytes into the emptied queue. The window is the few
@@ -1206,7 +1243,7 @@ impl SinkWriter {
     /// without taking the fd lock, and a parked writer holds that lock for as
     /// long as the program stays frozen.
     #[cfg(unix)]
-    pub fn discard_unread_input(&self) -> Option<usize> {
+    pub fn discard_unread_input(&self, why: Discard) -> Option<usize> {
         aterm_pty::input_queue_len(self.master)?;
         let (epoch, dropped) = {
             let mut s = self.shared.spill.lock().unwrap_or_else(|p| p.into_inner());
@@ -1217,6 +1254,9 @@ impl SinkWriter {
                 .discards
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
+            if why == Discard::Restart {
+                self.shared.restarts.fetch_add(1, Ordering::AcqRel);
+            }
             // The drainer's accepted-but-unpopped chunk prefix is already in
             // the kernel's queue: the flush below counts it.
             let unsent = s.buf.len().saturating_sub(s.chunk_written);
@@ -1312,6 +1352,23 @@ impl SinkWriter {
     #[must_use]
     pub fn discards(&self) -> u64 {
         self.shared.discard_epoch()
+    }
+
+    /// How many of [`Self::discards`] were a RESTART's drop
+    /// ([`Discard::Restart`]: the one before `signal term|kill|hup|quit`) —
+    /// only ever compared for a move.
+    ///
+    /// For the watch that must tell a program that lived through its restart
+    /// signal from one whose queue `reset flush` emptied (robustness review
+    /// of the manual reset, 2026-09-26; see [`Discard`]). Both leave the
+    /// queue dropped, not read, so both hold a published stall; only a moved
+    /// count here starts its restart grace, after which the remedy is `signal
+    /// kill`. Read it BEFORE [`Self::discards`] when both are read: a restart
+    /// bumps both in one critical section, so a reader that sees this move
+    /// sees the epoch move too.
+    #[must_use]
+    pub fn restart_discards(&self) -> u64 {
+        self.shared.restarts.load(Ordering::Acquire)
     }
 
     /// SEVER this sink's input for good: its session is closing (aterm-gui's
@@ -2547,6 +2604,7 @@ impl Shared {
             input_hook: std::sync::OnceLock::new(),
             input_hook_armed: AtomicBool::new(false),
             discards: AtomicU64::new(0),
+            restarts: AtomicU64::new(0),
             severed: AtomicBool::new(false),
             reply_reserved: AtomicUsize::new(0),
         }

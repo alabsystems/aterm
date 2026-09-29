@@ -23,7 +23,7 @@ y = 0 and y = H) — the emitter stacks N of them to any height, so the tile
 must meet itself seamlessly.
 
 Run from this directory:  python3 robi.py
-Then regenerate the drawlist:  cargo run -q -p aterm-effects --example gen_robi_glyphs
+Then regenerate the drawlist:  targo --unverified run -q -p aterm-effects --example gen_robi_glyphs
 """
 
 import math

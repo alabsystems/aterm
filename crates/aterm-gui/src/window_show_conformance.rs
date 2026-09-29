@@ -94,6 +94,11 @@ impl Rig {
         // focused, unreported; the last is still waiting for its first present.
         app.on_focus(w0, false);
         app.windows.get_mut(&w2).expect("w2").pending_reveal = Some(std::time::Instant::now());
+        // Each window's OS identity, which the pre-Commit queue records keys by.
+        for (n, window) in [w0, w1, w2].into_iter().enumerate() {
+            app.winit_to_window
+                .insert(winit::window::WindowId::from(n as u64), window);
+        }
         Rig {
             app,
             windows: [w0, w1, w2],
@@ -212,22 +217,36 @@ impl Rig {
             "Type" => {
                 performed.push(action);
                 self.typed.push(self.holder);
+                // Into the real pre-Commit queue, by the holder's OS identity,
+                // as the deferral arm queues it — the stack reads it there.
+                let winit_id = *self
+                    .app
+                    .winit_to_window
+                    .iter()
+                    .find(|(_, window)| **window == self.holder)
+                    .expect("the holder's OS identity")
+                    .0;
+                self.app.queue_pre_commit_input(
+                    winit_id,
+                    winit::event::WindowEvent::Ime(winit::event::Ime::Commit("ls".into())),
+                );
                 self.app.settle_carried_window_show()
             }
             "Prove" => {
                 performed.push(action);
                 // The shipping proof path. It returns nothing, so what its stack
-                // performed is read as the plan's `stacking_ops` at the moment it
-                // went on — exactly the list `settle_carried_window_show_as`
-                // performs (pinned at that seam by `window_show`'s unit tests).
+                // performed is read as the plan's `stacking_ops` as it went on —
+                // exactly the list `settle_carried_window_show_as` performs
+                // (pinned at that seam by `window_show`'s unit tests). Read AFTER
+                // the proof: the stack keys a window typed into before it (round
+                // six, finding 45), which re-orders the plan it performs.
+                self.app.maybe_signal_handoff_ready();
                 let stack = self
                     .app
                     .carried_window_show
                     .as_ref()
-                    .filter(|carried| !carried.stacked)
                     .map(|carried| carried.plan.stacking_ops())
                     .unwrap_or_default();
-                self.app.maybe_signal_handoff_ready();
                 assert!(
                     self.app.handoff_ready.is_none(),
                     "the proof path ran to its end"
@@ -246,7 +265,9 @@ impl Rig {
             }
             "Commit" => {
                 performed.push(action);
-                let typed = self.typed.clone();
+                // The Commit arm's own reading of the queue.
+                let typed = self.app.pre_commit_typed_windows();
+                assert_eq!(typed, self.typed, "the queue holds what was typed, where");
                 self.app.commit_carried_window_show(&typed)
             }
             "Stack" | "EnterFullScreen" => self.app.settle_carried_window_show(),
@@ -323,7 +344,8 @@ impl Rig {
 }
 
 /// The update, the ways it meets the user: in aterm, in another app, with the
-/// keyboard moved (and typed into, or not) before Commit, activated and
+/// keyboard moved (and typed into, or not) before Commit, typed into before
+/// the stack went on, activated and
 /// deactivated in between, and a focus gain between the reveal and the proof
 /// (which must not stack); and the cold launch in front and away.
 const SCHEDULES: &[&[&str]] = &[
@@ -346,6 +368,10 @@ const SCHEDULES: &[&[&str]] = &[
         "Activate",
     ],
     &["Launch", "Reveal", "Activate", "Prove", "Commit"],
+    // Typed into BEFORE the proof (round six, finding 45): the window the
+    // reveal order keyed keeps the keyboard through the stack and Commit.
+    &["Launch", "Reveal", "Type", "Prove", "Commit", "Activate"],
+    &["Launch", "Reveal", "Activate", "Type", "Prove", "Commit"],
     &["ColdLaunch", "Activate", "Reveal"],
     &["ColdLaunch", "Reveal", "Activate", "Deactivate"],
 ];

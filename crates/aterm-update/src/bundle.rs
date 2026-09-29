@@ -57,6 +57,39 @@ pub(crate) fn is_dev_marked(app_root: &Path) -> bool {
         .is_some_and(|text| plist_marks_dev_build(&text))
 }
 
+/// The `Info.plist` key by which a bundle DECLARES it can take a CHUNKED
+/// rendezvous grant (`aterm-gui`'s `handoff_rendezvous`, `ATRZ2G`): the handoff
+/// descriptors of more sessions than one `SCM_RIGHTS` message carries, sent over
+/// several. Its value is the capability's token, [`HANDOFF_GRANT_CHUNKS_TOKEN`].
+///
+/// A DECLARED CAPABILITY, NOT A POLICY KNOB. An outgoing build reads it from a
+/// candidate only after that candidate's signature, sealed identity and
+/// authorization have all been verified (the handoff pre-verify), so it is
+/// codesign-sealed evidence of what the candidate's code does — never a way to
+/// relax a check. Absent, empty, any other value or an unreadable plist all read
+/// as "not declared", which leaves the handoff exactly as it was.
+pub const HANDOFF_GRANT_CHUNKS_KEY: &str = "<key>ATermHandoffGrantChunks</key>";
+
+/// The value [`HANDOFF_GRANT_CHUNKS_KEY`] carries in a bundle that reads chunked
+/// grants, and the token the parent publishes in the successor's
+/// `ATERM_HANDOFF_GRANT_CAPS`.
+pub const HANDOFF_GRANT_CHUNKS_TOKEN: &str = "chunks1";
+
+/// Whether an `Info.plist`'s text declares the chunked grant. Pure; fails closed
+/// (not declared) on anything but the exact token.
+#[must_use]
+pub fn plist_declares_grant_chunks(text: &str) -> bool {
+    crate::manifest::xml_plist_string(text, HANDOFF_GRANT_CHUNKS_KEY)
+        .is_some_and(|value| value == HANDOFF_GRANT_CHUNKS_TOKEN)
+}
+
+/// Read the chunked-grant declaration off a bundle on disk. Unreadable ⇒ false.
+/// Called only on a bundle whose signature has just been verified.
+pub(crate) fn declares_grant_chunks(app_root: &Path) -> bool {
+    crate::read_ledger_text(&app_root.join("Contents/Info.plist"))
+        .is_some_and(|text| plist_declares_grant_chunks(&text))
+}
+
 /// Resolve the installed bundle the updater **may replace**, or `None` when it must
 /// not act:
 ///
@@ -227,6 +260,40 @@ mod tests {
             "<key>ATermDevBuild</key><string></string>"
         )));
         assert!(!plist_marks_dev_build("\u{0}bplist00 binary garbage"));
+    }
+
+    #[test]
+    fn the_chunked_grant_is_declared_only_by_its_exact_token() {
+        let plist = |body: &str| {
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>7</string>{body}</dict></plist>"
+            )
+        };
+        assert!(plist_declares_grant_chunks(&plist(
+            "<key>ATermHandoffGrantChunks</key>\n\t<string>chunks1</string>"
+        )));
+        for undeclared in [
+            "",
+            "<key>ATermHandoffGrantChunks</key><string></string>",
+            "<key>ATermHandoffGrantChunks</key><string>chunks2</string>",
+            "<key>ATermHandoffGrantChunks</key><string>true</string>",
+            "<key>ATermHandoffGrantChunks</key><key>Other</key><string>chunks1</string>",
+        ] {
+            assert!(
+                !plist_declares_grant_chunks(&plist(undeclared)),
+                "{undeclared:?} declares nothing"
+            );
+        }
+        assert!(!plist_declares_grant_chunks("\u{0}bplist00 binary garbage"));
+    }
+
+    /// THE SHIPPED TEMPLATE DECLARES IT: this build reads chunked grants, so the
+    /// bundle it ships in says so, and the build before it may hand this one more
+    /// sessions than one descriptor message carries.
+    #[test]
+    fn the_shipped_info_plist_declares_the_chunked_grant() {
+        let template = include_str!("../../../apps/aterm-mac/Info.plist");
+        assert!(plist_declares_grant_chunks(template));
     }
 
     #[test]

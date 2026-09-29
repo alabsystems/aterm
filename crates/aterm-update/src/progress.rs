@@ -277,15 +277,17 @@ mod tests {
         (seen, Arc::new(move |p| into.lock().unwrap().push(p)))
     }
 
-    /// Wait (bounded) until a report matches.
+    /// Wait until a report matches — a report that must come, so a minute's
+    /// hang detector, never a latency budget.
     fn wait_for(seen: &std::sync::Mutex<Vec<Progress>>, want: &Progress) -> bool {
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if seen.lock().unwrap().contains(want) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        false
+        seen.lock().unwrap().contains(want)
     }
 
     /// THE SIZE MAKES THE FILL (design ruling 226): the probe's total rides
@@ -327,7 +329,11 @@ mod tests {
     }
 
     /// A host that does not say keeps the total unknown (the busy comet), and
-    /// a probe still waiting on the network never holds the download's end.
+    /// a probe still waiting on the network never holds the download's end: the
+    /// probe here answers only once the test lets it, AFTER the watch has
+    /// dropped, so a drop that waited for it could not return before its gate's
+    /// two minutes ran out — and the probe is seen still waiting when the drop
+    /// is back.
     #[test]
     fn a_silent_or_slow_size_probe_leaves_the_total_unknown() {
         let dir = std::env::temp_dir().join(format!("aterm-update-slow-{}", std::process::id()));
@@ -346,11 +352,15 @@ mod tests {
         ));
         drop(w);
         let (_, sink) = recorder();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let answered = Arc::new(AtomicBool::new(false));
+        let probe_answered = Arc::clone(&answered);
         let slow = watch_with(
             &part,
             "0.95.0",
-            || {
-                std::thread::sleep(Duration::from_secs(3));
+            move || {
+                let _ = gate.recv_timeout(Duration::from_secs(120));
+                probe_answered.store(true, Ordering::Release);
                 Some(1)
             },
             sink,
@@ -358,9 +368,15 @@ mod tests {
         let at = std::time::Instant::now();
         drop(slow);
         assert!(
-            at.elapsed() < Duration::from_secs(1),
+            !answered.load(Ordering::Acquire),
             "the download's end never waits for the probe"
         );
+        assert!(
+            at.elapsed() < Duration::from_secs(60),
+            "the download's end never waits for the probe: {:?}",
+            at.elapsed()
+        );
+        let _ = release.send(());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

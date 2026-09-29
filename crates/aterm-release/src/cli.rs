@@ -33,6 +33,12 @@ pub const RETIRED_UNMIRRORED_REFUSAL: &str = "--retire-unmirrored is retired: a 
      once, straight onto the release channel, so there is no origin release left unmirrored — \
      a cut the channel's floors refuse before its head PATCH is `--abandon vX.Y.Z`'s case";
 
+/// Why a real or rehearsal cut that says nothing about Linux is refused.
+pub const MAC_ONLY_REFUSAL: &str = "this cut says nothing about Linux: pass --linux-artifacts \
+     DIRECTORY (with --linux-worker ARCH=HOST:REPO for each native host the cutter should drive, \
+     or build there by hand) to ship Linux, or --mac-only to ship a Mac-only release on purpose. \
+     A cut without Linux strands every Linux install on the build it has";
+
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
@@ -45,9 +51,11 @@ USAGE
   targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z]
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
                  [--arm64-only] [--no-paint-smoke] [--release-credentials <profile.toml>]
-                 [--linux-artifacts DIRECTORY] [--linux-target aarch64|x86_64]...
+                 [--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
+                  [--linux-worker ARCH=HOST:REPO]... | --mac-only]
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
       → tag → ONE publication onto the release channel, made the head last.
+      A real or rehearsal cut must name --linux-artifacts or --mac-only.
         --dry-run          gates + provisional number + full local build into
                            dist/, notarized by Apple; nothing committed or
                            published
@@ -58,8 +66,9 @@ USAGE
                            release; its origin tag and the local journal deleted
                            (the claim commit stays; a later cut recuts)
         --min-build N      emit an operator apply floor into the manifest
-        --gate             additionally run tools/verify.sh --full inline (a
-                           green one is the MEASURE receipt a real cut
+        --gate             additionally run tools/verify.sh --full and the
+                           whole-tree tools/trust-gate-all.sh inline (green,
+                           they file the MEASURE and TRUST receipts a real cut
                            requires for the tree it builds)
         --rehearse O/R     full real cut published to the scratch channel O/R,
                            which must be PUBLIC (provisional number, no ledger
@@ -70,6 +79,13 @@ USAGE
                            missing workers pause the journaled cut for resume
         --linux-target ARCH
                            explicit native subset (repeatable); defaults to both
+        --linux-worker ARCH=HOST:REPO
+                           after the claim, build ARCH on HOST over ssh (a
+                           throwaway worktree of REPO at the claim commit) and
+                           copy its pair into --linux-artifacts; the pair is
+                           checked exactly like a hand-carried one
+        --mac-only         ship no Linux build, on purpose; a real or rehearsal
+                           cut must say this or --linux-artifacts
         --no-paint-smoke   EMERGENCY ONLY: skip the self-check's paint smoke
                            (the 29-keystroke pixel proof that the just-built
                            bundle actually paints its flagship effect — the
@@ -223,15 +239,30 @@ pub fn run() -> i32 {
     }
 }
 
-/// Pure parser (unit-tested in tests/it/resume.rs).
+/// The parser (unit-tested in tests/it/resume.rs). Pure but for one read: whether
+/// this process is a cutter another cutter handed its cut to
+/// ([`publish::is_handed_off_cutter`]), which [`parse_handed_off`] fixes for tests.
 pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
+    parse_as(args, publish::is_handed_off_cutter())
+}
+
+/// [`parse`] as a cutter another cutter handed its cut to reads its argv: the
+/// operator-facing rules its parent already held the cut to (`--mac-only`)
+/// are not asked again. What [`publish::cut_args`] must round-trip through;
+/// production reaches the same path through [`parse`]'s marker check.
+#[cfg(test)]
+pub fn parse_handed_off(args: &[String]) -> std::result::Result<Cmd, String> {
+    parse_as(args, true)
+}
+
+fn parse_as(args: &[String], handed_off: bool) -> std::result::Result<Cmd, String> {
     let mut it = args.iter().map(String::as_str);
     let Some(cmd) = it.next() else {
         return Ok(Cmd::Help);
     };
     match cmd {
         "help" | "--help" | "-h" => Ok(Cmd::Help),
-        "cut" => parse_cut(&mut it),
+        "cut" => parse_cut(&mut it, handed_off),
         "linux-build" => {
             let mut values = std::collections::BTreeMap::new();
             while let Some(flag) = it.next() {
@@ -419,7 +450,10 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
     }
 }
 
-fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<Cmd, String> {
+fn parse_cut<'a>(
+    it: &mut impl Iterator<Item = &'a str>,
+    handed_off: bool,
+) -> std::result::Result<Cmd, String> {
     let mut opts = publish::CutOptions::default();
     let mut abandon: Option<String> = None;
     while let Some(flag) = it.next() {
@@ -437,6 +471,14 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
                     it.next().ok_or("--linux-artifacts needs a directory")?,
                 ));
             }
+            "--linux-worker" => {
+                let spec = it
+                    .next()
+                    .ok_or("--linux-worker needs ARCH=DESTINATION:REPOSITORY")?;
+                crate::buildplan::linux::Worker::parse(spec)?;
+                opts.linux_workers.push(spec.to_string());
+            }
+            "--mac-only" => opts.mac_only = true,
             "--linux-target" => {
                 let triple = match it.next().ok_or("--linux-target needs aarch64 or x86_64")? {
                     "aarch64" => "aarch64-unknown-linux-gnu",
@@ -499,6 +541,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.gate
             || opts.arm64_only
             || opts.linux_artifacts.is_some()
+            || !opts.linux_workers.is_empty()
+            || opts.mac_only
             || opts.no_paint_smoke
             || opts.min_build.is_some()
             || opts.rehearse.is_some())
@@ -510,6 +554,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.gate
             || opts.arm64_only
             || opts.linux_artifacts.is_some()
+            || !opts.linux_workers.is_empty()
+            || opts.mac_only
             || opts.no_paint_smoke
             || opts.min_build.is_some()
             || opts.rehearse.is_some())
@@ -522,6 +568,28 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     }
     if opts.dry_run && opts.rehearse.is_some() {
         return Err("--dry-run and --rehearse are mutually exclusive".to_string());
+    }
+    if !opts.linux_workers.is_empty() && opts.linux_artifacts.is_none() {
+        return Err("--linux-worker requires --linux-artifacts (where its pair lands)".into());
+    }
+    if opts.mac_only && opts.linux_artifacts.is_some() {
+        return Err("--mac-only and --linux-artifacts contradict each other".into());
+    }
+    // LINUX IS DECLARED, NEVER DEFAULTED AWAY (2026-09-28). A real or rehearsal cut
+    // without `--linux-artifacts` used to go out Mac-only in silence, and every
+    // Linux install stayed on the build it had: v0.86.0 through v0.93.0 all
+    // shipped that way before anyone noticed. Refused here — before a gate, a
+    // lease or a claim — unless the operator says `--mac-only` out loud. A dry
+    // run publishes nothing and a resume or abandon already has its shape; a
+    // cutter handed its cut by another was held to this by that one.
+    if abandon.is_none()
+        && !opts.resume
+        && !opts.dry_run
+        && !opts.mac_only
+        && opts.linux_artifacts.is_none()
+        && !handed_off
+    {
+        return Err(MAC_ONLY_REFUSAL.to_string());
     }
     Ok(Cmd::Cut { opts, abandon })
 }

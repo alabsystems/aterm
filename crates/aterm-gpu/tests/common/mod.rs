@@ -193,6 +193,16 @@ pub fn font_settled(
     (cpu, gpu)
 }
 
+/// A second, INDEPENDENT GPU renderer for a test that already holds a pair
+/// from this kit (so the GPU is known to be there) — font-settled like that
+/// pair ([`font_settled`]), because a fallback chain landing between this
+/// renderer's frames and the first one's would read as a parity failure.
+pub fn independent_gpu(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
+    let mut gpu = aterm_gpu::GpuRenderer::new(px, theme).expect("GPU was available above");
+    gpu.debug_block_on_lazy_fallbacks();
+    gpu
+}
+
 /// [`backends`] for the ADDITIVE parity suites (glow, nova): forces the
 /// deterministic fontdue rasterizer and disables the GPU-only bloom + shimmer
 /// layers so the differential covers exactly the shared, proven base path.

@@ -34,6 +34,85 @@ pub fn fresh(rows: &[String]) -> bool {
         .iter()
         .any(|r| r.starts_with(['❯', '⏺', '●']))
 }
+
+/// What Claude Code's launch card says about the process that drew it:
+/// its version row (`Claude Code v2.1.283`, anchor `launch.banner`) and the
+/// row under it (`Opus 5.5 with xhigh effort · Claude Max`, `Haiku 4.5 ·
+/// Claude Max`). The model and effort are the ones the card was drawn with:
+/// the process's starting ones on a fresh screen. The inline renderer draws
+/// it once; the fullscreen renderer draws it again after a `/model` choice,
+/// with the new model (measured 2026-09-28 on 2.1.283: `Haiku 4.5 · Claude
+/// Max` became `Sonnet 5 · Claude Max` after a switch; the model-switch
+/// capture still shows `Haiku 4.5` while the switch is being confirmed) —
+/// under a user row by then, where [`launch_card`] does not read it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LaunchCard {
+    /// The build the card names (`2.1.283`).
+    pub version: String,
+    /// The model as the card spells it (`Opus 5.5`).
+    pub model: String,
+    /// The effort level word the card names after `with` (`xhigh`), when it
+    /// names one — a model without effort levels has none.
+    pub effort: Option<String>,
+}
+
+/// The launch card above the composer, read ONLY when it is the newest card
+/// on the screen and nothing a person said sits between it and the
+/// composer's frame: no user message (`❯`) — a system notice (`⏺ agents-md:
+/// …`, which the owner's fresh screen always carries) is not one, so this is
+/// not [`fresh`]. A newer card BELOW the frame (the inline renderer
+/// relaunched in the same tab, its predecessor's box still above) means the
+/// frame is not the newest process's, and nothing is read. A model row the
+/// vendor split or cut for a narrow pane (no ` · ` after the model, or a
+/// `…` in it) is refused rather than half-read. Whether the frame is a LIVE
+/// REPL's, and whether the card's build is the running one, are the caller's
+/// to check.
+#[must_use]
+pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
+    let frame = composer_frame(rows)?;
+    let banner = crate::anchor("launch.banner");
+    let card = rows.iter().rposition(|r| r.contains(banner))?;
+    if card >= frame.top || rows[card + 1..frame.top].iter().any(|r| r.starts_with('❯')) {
+        return None;
+    }
+    let (_, after) = rows[card].split_once(banner)?;
+    let version: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || p.len() > 6 || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let row = rows.get(card + 1)?;
+    // The logo's block elements (U+2580..=U+259F) and the indent go first.
+    let text = row
+        .trim_start_matches(|c: char| c == ' ' || ('\u{2580}'..='\u{259F}').contains(&c))
+        .trim_end();
+    if text.contains('\u{2026}') {
+        return None;
+    }
+    let (model, _billing) = text.split_once(" \u{00B7} ")?;
+    let (model, effort) = match model
+        .strip_suffix(" effort")
+        .and_then(|m| m.rsplit_once(" with "))
+    {
+        Some((m, level)) if !level.is_empty() && level.bytes().all(|b| b.is_ascii_lowercase()) => {
+            (m, Some(level.to_owned()))
+        }
+        _ => (model, None),
+    };
+    let model = model.trim();
+    (!model.is_empty()).then(|| LaunchCard {
+        version,
+        model: model.to_owned(),
+        effort,
+    })
+}
 use crate::prompt::parse_prompt;
 
 /// Claude Code's own suggestion for the next message: the DIM placeholder
@@ -504,5 +583,114 @@ mod tests {
         assert!(!fresh(&answered), "{answered:#?}");
         assert!(!fresh(&framed(&["⏺ Done.", ""], "  ? for shortcuts")));
         assert!(!fresh(&screen(END_OFFER)));
+    }
+
+    /// A measured screen from `src/fixtures`, its `#` header dropped.
+    fn measured(name: &str) -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/fixtures")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .lines()
+            .skip(1)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// THE LAUNCH CARD, over the measured 2.1.283 screens: the owner's fresh
+    /// bypass screen names `Opus 5.5` at `xhigh` even with its `⏺ agents-md`
+    /// notice between the card and the composer (which [`fresh`] refuses);
+    /// a model with no effort levels names none. NEGATIVE CONTROLS: a user
+    /// message under the card, a box over the composer, a model row cut or
+    /// split for a narrow pane, and a newer card below the frame.
+    #[test]
+    fn the_launch_card_names_the_starting_model() {
+        assert_eq!(
+            launch_card(&measured("claude-2.1.283-footer-bypass-idle.txt")),
+            Some(LaunchCard {
+                version: "2.1.283".into(),
+                model: "Opus 5.5".into(),
+                effort: Some("xhigh".into()),
+            })
+        );
+        assert!(!fresh(&measured("claude-2.1.283-footer-bypass-idle.txt")));
+        assert_eq!(
+            launch_card(&measured("claude-2.1.283-launch-repl-ready.txt")),
+            Some(LaunchCard {
+                version: "2.1.283".into(),
+                model: "Haiku 4.5".into(),
+                effort: None,
+            })
+        );
+        // The inline renderer relaunched in the same tab: the NEWEST card,
+        // the one above the live frame, is read — never its predecessor's.
+        let mut relaunch = measured("claude-2.1.283-inline-relaunch-repl-ready.txt");
+        let first = relaunch
+            .iter()
+            .position(|r| r.contains("Claude Code v"))
+            .unwrap();
+        relaunch[first + 1] = "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5 \u{00B7} Claude Max".into();
+        assert_eq!(
+            launch_card(&relaunch).map(|c| c.model).as_deref(),
+            Some("Haiku 4.5")
+        );
+        // A newer card BELOW the frame: that frame is a predecessor's.
+        let mut below = measured("claude-2.1.283-launch-repl-ready.txt");
+        let card: Vec<String> = below
+            .iter()
+            .filter(|r| r.contains("Claude Code v") || r.contains("Claude Max"))
+            .cloned()
+            .collect();
+        below.extend(card);
+        assert_eq!(launch_card(&below), None);
+        // A user message between the card and the frame.
+        assert_eq!(
+            launch_card(&measured("claude-2.1.283-footer-busy.txt")),
+            None
+        );
+        // A box over the composer: no frame, no card.
+        assert_eq!(
+            launch_card(&measured("claude-2.1.283-effort-switch.txt")),
+            None
+        );
+        // Cut or split for a narrow pane.
+        let base = measured("claude-2.1.283-footer-bypass-idle.txt");
+        let at = base.iter().position(|r| r.contains("Claude Max")).unwrap();
+        for cut in [
+            "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 with xh\u{2026}",
+            "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 with xhigh effort",
+        ] {
+            let mut narrow = base.clone();
+            narrow[at] = cut.into();
+            assert_eq!(launch_card(&narrow), None, "{cut}");
+        }
+    }
+
+    /// Every recorded screen: a card that is read always names the build
+    /// its fixture was captured on, and a non-empty model.
+    #[test]
+    fn every_read_card_names_its_fixtures_build() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
+        let mut read = 0;
+        for entry in std::fs::read_dir(&dir).expect("the fixtures") {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let Some(header) = text.lines().next() else {
+                continue;
+            };
+            let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+            let Some(card) = launch_card(&rows) else {
+                continue;
+            };
+            assert!(
+                header.contains(&format!("claude-code {}", card.version)),
+                "{}: {card:?} under {header:?}",
+                path.display()
+            );
+            assert!(!card.model.is_empty());
+            read += 1;
+        }
+        assert!(read >= 5, "the corpus must exercise the reader: {read}");
     }
 }

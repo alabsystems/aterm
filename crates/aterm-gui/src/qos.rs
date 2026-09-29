@@ -1286,6 +1286,7 @@ mod tests {
     fn every_control_plane_thread_declares_its_role_inside_its_closure() {
         let control = include_str!("control.rs");
         let lanes = include_str!("control_lanes.rs");
+        let listener = include_str!("control_listener.rs");
         for (thread, source, anchor) in [
             (
                 "aterm-control-N (8 request lanes)",
@@ -1307,6 +1308,19 @@ mod tests {
                 "aterm-control-listener",
                 control,
                 ".name(\"aterm-control-listener\".into())",
+            ),
+            // The supervised accept thread admits every peer (the listener
+            // thread above is its watchdog), and the startup signature hash is
+            // what a lane's `version` answer may wait on.
+            (
+                "aterm-control-accept-N",
+                listener,
+                ".name(format!(\"aterm-control-accept-{generation}\"))",
+            ),
+            (
+                "aterm-build-signature",
+                control,
+                ".name(\"aterm-build-signature\".into())",
             ),
         ] {
             let at = source

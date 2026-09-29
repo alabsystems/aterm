@@ -102,6 +102,17 @@ pub const ENV_EDGE_SIGNAL: &str = "ATERM_EDGE_SIGNAL";
 /// hint never leaks past one hop — a grandchild is not the controller.
 pub const ENV_OBSERVE_SESSION_ID: &str = "ATERM_OBSERVE_SESSION_ID";
 
+/// The shell program THIS TAB runs, as the window resolved it for the spawn
+/// (Windows: an absolute path, e.g. `C:\Windows\system32\cmd.exe`), handed to
+/// every shell tab the window spawns so a CLI typed in the tab can report the
+/// tab's own shell. `aterm doctor` / `show-config` cannot see the window's
+/// per-launch `--shell` flag: measured 2026-09-27 on 0.95.0, inside a window
+/// started with `--shell cmd`, both named pwsh — the default a new window
+/// would get — as "the window's shell". Deny-listed (below) so it describes
+/// only the tab it was handed to: a `-e` session gets none, and an inherited
+/// copy never survives a hop into a nested window's tabs.
+pub const ENV_TAB_SHELL: &str = "ATERM_TAB_SHELL";
+
 /// Exact env vars that should not leak into child shells.
 ///
 /// These are denied by exact name because other `ATERM_*` variables are
@@ -174,6 +185,8 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // Controller-spawn observation hint (session connections): one hop only —
     // a descendant that did not receive it fresh is not the controller.
     ENV_OBSERVE_SESSION_ID,
+    // The tab's own shell: true of the tab it was handed to, and of no other.
+    ENV_TAB_SHELL,
     // FABRIC credentials (design §11.2). The bridge's broker endpoint, its
     // capability FILE and its fleet name are the node's identity on the bus: a
     // nested aterm that inherited them could publish AS the outer node, under the
@@ -233,9 +246,56 @@ pub fn is_ai_env_var(key: &str) -> bool {
     false
 }
 
+/// [`is_ai_env_var`] for a key as the OS hands it over — the ONE classifier the
+/// spawn seams apply to an inherited environment (`aterm-pty`'s
+/// `build_child_env`, `aterm-gui`'s fabric bridge child).
+///
+/// A key that is not valid Unicode is classified by its LOSSY spelling, never
+/// let through unread. Every exact deny-listed name is ASCII and U+FFFD never
+/// equals one; but the [`ENV_DENY_PREFIXES`] match a key's leading bytes, and a
+/// lossy conversion keeps every ASCII byte, so `ANTHROPIC_\xffX` keeps its
+/// `ANTHROPIC_` and is denied. (Both seams used to pass every non-UTF-8 key
+/// because "every deny-listed name is ASCII" — true of the names, not of the
+/// prefixes; closed 2026-09-27.)
+///
+/// Windows environment names are case-insensitive, so there the key is
+/// ASCII-uppercased first (every deny-listed name and prefix is uppercase
+/// ASCII) — otherwise `anthropic_api_key` would reach the child. Unix names are
+/// case-sensitive and keep the exact-case check.
+#[must_use]
+pub fn is_ai_env_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    #[cfg(windows)]
+    {
+        is_ai_env_var(&key.to_ascii_uppercase())
+    }
+    #[cfg(not(windows))]
+    {
+        is_ai_env_var(&key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-UTF-8 key is classified by its lossy spelling: a deny-listed
+    /// PREFIX survives the conversion (ASCII bytes are kept), an exact name
+    /// cannot be forged by one (U+FFFD is never ASCII), and a key with no
+    /// deny-listed prefix passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_key_is_classified_by_its_lossy_spelling() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let key = |b: &[u8]| is_ai_env_key(std::ffi::OsStr::from_bytes(b));
+        assert!(key(b"ANTHROPIC_\xffX"));
+        assert!(key(b"CLAUDE\xfe"));
+        assert!(key(b"AI_\x80"));
+        assert!(!key(b"PLAIN_\xffKEY"));
+        assert!(!key(b"\xffANTHROPIC_API_KEY"));
+        assert!(key(b"ATERM_SESSION_ID"));
+        assert!(!key(b"ATERM_SESSION_ID\xff"));
+    }
 
     #[test]
     fn test_is_ai_env_var_matches_deny_prefixes() {

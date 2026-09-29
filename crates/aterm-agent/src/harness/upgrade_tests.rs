@@ -775,6 +775,85 @@ fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
     assert!(!notice.contains('\n') && notice.starts_with(ANNOUNCE_HEAD));
 }
 
+/// THE OLDEST IS NAMED FIRST (design record 2026-09-28, §3.2 C7c): tab #1
+/// held 15 processes under its agent, and the one that held the restart —
+/// its own `df`/`sysctl vm.swapusage` watch loop, 4d22h old — was one the
+/// list could leave among the counted, since only [`HELD_NAMED`] are named
+/// and they were named in the process table's order. Oldest first, ties in
+/// the order given. NEGATIVE CONTROL: the old order, replayed (the first
+/// [`HELD_NAMED`] as given), names none of the watch.
+#[test]
+fn the_notice_names_the_oldest_processes_first() {
+    let held = |pid: u32, age_s: u64| Held {
+        pid,
+        name: "zsh".to_string(),
+        age_s,
+        command: String::new(),
+    };
+    // Fourteen young shells the table lists first, the four-day watch last.
+    let mut table: Vec<Held> = (0..14)
+        .map(|i| held(60_000 + i, 60 + u64::from(i)))
+        .collect();
+    table.push(held(51_435, 4 * 86_400 + 22 * 3_600 + 26 * 60));
+    let list = held_list(&table);
+    assert!(
+        list.starts_with("pid 51435 (zsh, 4d22h); pid 60013 (zsh, 1m); pid 60012 (zsh, 1m)"),
+        "{list}"
+    );
+    assert!(list.ends_with("; and 10 more"), "{list}");
+    assert_eq!(list.matches("pid ").count(), HELD_NAMED);
+    // Ties keep the order given.
+    let tied = held_list(&[held(3, 5), held(1, 5), held(2, 9)]);
+    assert_eq!(tied, "pid 2 (zsh, 9s); pid 3 (zsh, 5s); pid 1 (zsh, 5s)");
+    // NEGATIVE CONTROL: the table's order, as the list named it until this
+    // day, leaves the watch uncounted by name.
+    let old_named: Vec<u32> = table.iter().take(HELD_NAMED).map(|h| h.pid).collect();
+    assert!(!old_named.contains(&51_435), "{old_named:?}");
+}
+
+/// A WATCH IS NOT WORK, AND IT COMES BACK (design record 2026-09-28, §3.2
+/// C7c): tab #1's agent kept a four-day disk/swap watch loop that ends only on
+/// an alert, which the stopping-point clause did not name (it waits on
+/// nothing that has ended), so no READY came. The notice now names a watch or
+/// monitor loop as something to stop and note, and every UPGRADE carry-on
+/// asks for it back — never a relaunch's, whose notice asked nothing to be
+/// stopped. NEGATIVE CONTROL: the clause as it stood names no watch.
+#[test]
+fn the_notice_asks_a_watch_stopped_and_the_carry_on_asks_it_back() {
+    assert!(
+        STOPPING_POINT.contains(
+            "A watch or monitor loop you can start again after the resume (a disk or swap \
+             watch, a status poll) is not work either: stop it, and note it."
+        ),
+        "{STOPPING_POINT}"
+    );
+    let notice = prepare_prompt(&v("2.1.280"), &v("2.1.284"), Source::Managed, "M");
+    assert!(notice.contains(STOPPING_POINT) && !notice.contains('\n'));
+    let (from, to) = (v("2.1.280"), v("2.1.284"));
+    for carry_on in [
+        continue_prompt(&from, &to, None),
+        continue_prompt(&from, &to, Some("claude-opus-5")),
+        continue_prompt_with_model(&from, &to, Some("claude-opus-5"), Some("claude-opus-5-5")),
+        continue_prompt_with_model(&to, &to, None, Some("claude-opus-5-5")),
+    ] {
+        assert!(
+            carry_on.ends_with(&format!("{RESTART_WATCHES} {CARRY_ON}")),
+            "{carry_on}"
+        );
+    }
+    // A relaunch's carry-on asked nothing to be stopped, and says nothing of it.
+    assert!(!CARRY_ON.contains("watch"));
+    // NEGATIVE CONTROL: the clause as it stood until this day.
+    let old = "Please get to a good stopping point first: let background tasks, subagents or \
+               workflows you started finish while they are still making progress (do not \
+               cancel them), but stop any background shell or task of yours that only waits \
+               for something that has already ended or can never happen (a poll loop on a \
+               workflow, agent, job or file that is gone): that wait is not work. Save or \
+               commit work in progress, and do not start new long-running work.";
+    assert!(!old.contains("watch") && !old.contains("monitor"));
+    assert_ne!(old, STOPPING_POINT);
+}
+
 /// The incident's closer (measured 2026-09-27), as the transcript of the
 /// Claude Code that ran it twice, at 03:09:00Z and 03:19:43Z on 2026-09-22,
 /// records it: 253 characters, 119 of them the one path in `D=`.
@@ -981,6 +1060,11 @@ fn idle_facts() -> Facts {
         ready_s: 0,
         idle_looks: 0,
         failed_s: 0,
+        rung: Rung::Prefer,
+        typing: false,
+        still_s: 0,
+        daemon_turn: DaemonTurn::None,
+        work_ended: false,
     }
 }
 
@@ -1907,9 +1991,10 @@ fn the_continuation_says_what_the_session_ran_before_the_restart() {
     assert_eq!(
         said,
         "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.282 (from \
-         2.1.281); it ran claude-opus-5 before the restart and was resumed. Continue where you \
-         left off. If you were waiting on the user, nobody is here to answer: decide for \
-         yourself, prefer reversible steps, and keep going."
+         2.1.281); it ran claude-opus-5 before the restart and was resumed. If you stopped a \
+         watch or loop for this restart, start it again now. Continue where you left off. If \
+         you were waiting on the user, nobody is here to answer: decide for yourself, prefer \
+         reversible steps, and keep going."
     );
     assert!(!said.starts_with(ANNOUNCE_HEAD), "never the announcement");
     // No model known: the clause is left out, not guessed.
@@ -1917,8 +2002,9 @@ fn the_continuation_says_what_the_session_ran_before_the_restart() {
     assert_eq!(
         bare,
         "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.282 (from \
-         2.1.281) and resumed. Continue where you left off. If you were waiting on the user, \
-         nobody is here to answer: decide for yourself, prefer reversible steps, and keep going."
+         2.1.281) and resumed. If you stopped a watch or loop for this restart, start it again \
+         now. Continue where you left off. If you were waiting on the user, nobody is here to \
+         answer: decide for yourself, prefer reversible steps, and keep going."
     );
     // Both continuations end on the same instruction, and it never invites a
     // "waiting on the user" report (owner, 2026-09-25).
@@ -1950,7 +2036,8 @@ fn a_model_move_says_what_ran_before_and_what_runs_now() {
         continue_prompt_with_model(&from, &to, Some("claude-opus-5"), None),
         format!(
             "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.283 (from \
-             2.1.282); it ran claude-opus-5 before the restart and was resumed. {CARRY_ON}"
+             2.1.282); it ran claude-opus-5 before the restart and was resumed. \
+             {RESTART_WATCHES} {CARRY_ON}"
         )
     );
     assert_eq!(
@@ -1959,7 +2046,7 @@ fn a_model_move_says_what_ran_before_and_what_runs_now() {
             "[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.283 (from \
              2.1.282) and resumed; it ran claude-opus-5 before the restart and now runs \
              claude-opus-5-5, the newest model of its family (for this session only: your \
-             default model is unchanged). {CARRY_ON}"
+             default model is unchanged). {RESTART_WATCHES} {CARRY_ON}"
         )
     );
     // The 1M window, named as it was asked for.
@@ -1986,7 +2073,7 @@ fn a_model_move_says_what_ran_before_and_what_runs_now() {
              2.1.282) and resumed; it ran claude-fable-5-1 before the restart and now runs \
              claude-opus-5-5, the best available model on aterm's priority list, nothing newer \
              of its own family being on offer (for this session only: your default model is \
-             unchanged). {CARRY_ON}"
+             unchanged). {RESTART_WATCHES} {CARRY_ON}"
         )
     );
 }
@@ -2115,6 +2202,52 @@ fn the_launch_model_is_the_model_flag_the_rewrite_keeps() {
     assert_eq!(got(&["claude", "--model"]), None, "no value");
     // A launch the rewrite refuses relaunches nothing.
     assert_eq!(got(&["claude", "--print", "--model", "x"]), None);
+}
+
+/// THE RESUMED CONVERSATION of a launch, by the same parse: `--resume <id>`
+/// and `-r <id>` name it (`--resume=<id>` too, the last flag winning); a
+/// resume that names none the process keeps — `--continue`, `-c`, a bare
+/// `--resume` (the picker), or any resume with `--fork-session` — is
+/// `Some(None)`; a launch with no resume flag, or one whose `--resume` is
+/// another flag's value or after `--`, resumed nothing.
+#[test]
+fn the_launch_resume_names_the_conversation_the_process_kept() {
+    let got = |w: &[&str]| launch_resume(&argv(w));
+    let named = |id: &str| Some(Some(id.to_owned()));
+    assert_eq!(got(&["claude", "--resume", "abc"]), named("abc"));
+    assert_eq!(got(&["claude", "-r", "abc"]), named("abc"));
+    assert_eq!(got(&["claude", "--resume=abc"]), named("abc"));
+    assert_eq!(
+        got(&["claude", "--model", "opus", "--resume", "abc", "--verbose"]),
+        named("abc")
+    );
+    assert_eq!(
+        got(&["claude", "--continue", "--resume", "abc"]),
+        named("abc"),
+        "the last one wins"
+    );
+    assert_eq!(got(&["claude", "--resume", "abc", "-c"]), Some(None));
+    assert_eq!(got(&["claude", "--continue"]), Some(None));
+    assert_eq!(got(&["claude", "-c"]), Some(None));
+    assert_eq!(got(&["claude", "--resume"]), Some(None), "the picker");
+    assert_eq!(
+        got(&["claude", "--resume", "--verbose"]),
+        Some(None),
+        "a bare resume before another flag"
+    );
+    assert_eq!(
+        got(&["claude", "--resume", "abc", "--fork-session"]),
+        Some(None),
+        "a fork takes a new id"
+    );
+    assert_eq!(got(&["claude"]), None);
+    assert_eq!(got(&["claude", "--model", "opus"]), None);
+    assert_eq!(
+        got(&["claude", "--append-system-prompt", "--resume", "x"]),
+        None,
+        "a value, not the flag"
+    );
+    assert_eq!(got(&["claude", "--", "--resume", "x"]), None);
 }
 
 /// THE RESUMED MODEL is the new process's: every transcript row carries the
@@ -4176,5 +4309,492 @@ fn a_full_queues_rest_doubles_per_copy_unread_up_to_a_day() {
     }
     for n in 0..full {
         assert_eq!(queue_rest(n), RETRY_S, "{n}");
+    }
+}
+
+/// THE LADDER'S RUNGS (the owner's decision of 2026-09-28): twenty minutes,
+/// an hour and two hours behind, and nothing before a start is known.
+#[test]
+fn the_ladder_climbs_by_how_long_the_session_has_been_behind() {
+    assert_eq!(rung(0), Rung::Prefer);
+    assert_eq!(rung(RUNG_SETTLED_S - 1), Rung::Prefer);
+    assert_eq!(rung(RUNG_SETTLED_S), Rung::Settled);
+    assert_eq!(rung(RUNG_KEYS_S - 1), Rung::Settled);
+    assert_eq!(rung(RUNG_KEYS_S), Rung::KeysOnly);
+    assert_eq!(rung(RUNG_LAND_S - 1), Rung::KeysOnly);
+    assert_eq!(rung(RUNG_LAND_S), Rung::Land);
+    assert_eq!(
+        (RUNG_SETTLED_S, RUNG_KEYS_S, RUNG_LAND_S),
+        (1_200, 3_600, 7_200)
+    );
+    assert_eq!(KEYS_GAP_S, 20);
+    // The person's grace: the knob's until KeysOnly, then KEYS_GAP_S — or the
+    // knob, if the owner set it shorter.
+    assert_eq!(person_grace(Rung::Prefer, 120), 120);
+    assert_eq!(person_grace(Rung::Settled, 120), 120);
+    assert_eq!(person_grace(Rung::KeysOnly, 120), 20);
+    assert_eq!(person_grace(Rung::Land, 120), 20);
+    assert_eq!(person_grace(Rung::Land, 5), 5);
+    // `--now` is the last rung.
+    let f = Facts {
+        owner_now: true,
+        ..idle_facts()
+    };
+    assert_eq!(rung_in_force(&f), Rung::Land);
+    assert_eq!(rung_in_force(&idle_facts()), Rung::Prefer);
+}
+
+/// ACTIVITY DELAYS; IT NEVER DISABLES — AND NO RUNG RELAXES A FLOOR (the
+/// owner, 2026-09-28: "It never types over a draft, a dialog or running
+/// work."). At each rung, what the gate passes that the rung before did
+/// not: from Settled a pause that only LOOKS quiet (the reader's run of idle
+/// looks at the same last words, `still_s`, the screen's own quiet restarted
+/// by a repaint); from KeysOnly a person near the tab who has not typed
+/// within KEYS_GAP_S; at Land — and under the owner's `--now` — the first
+/// such pause, its settle waived. NEGATIVE CONTROLS at EVERY rung, `--now`
+/// included: a hold, the usage limit, the login wall, a full queue, the
+/// agent's own turn (its status, its busy footer), a turn running in a Codex
+/// daemon the screen does not show — its own thread's, a goal, or one the
+/// lane cannot place in another session — a box, a draft, and a keystroke within
+/// KEYS_GAP_S each still wait — the last one, until that day, `--now`
+/// waived.
+#[test]
+fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
+    let at = |rung: Rung, f: Facts| Facts { rung, ..f };
+    // A repainting screen whose words stand still: the screen's quiet
+    // restarted, the reader's run of looks thirty seconds long.
+    let repainting = Facts {
+        quiet_s: 3,
+        status_age_s: 3,
+        still_s: 30,
+        ..idle_facts()
+    };
+    assert_eq!(
+        gate_announce(&at(Rung::Prefer, repainting.clone())),
+        Gate::Wait("settling")
+    );
+    for rung in [Rung::Settled, Rung::KeysOnly, Rung::Land] {
+        assert_eq!(
+            gate_announce(&at(rung, repainting.clone())),
+            Gate::Go,
+            "{rung:?}"
+        );
+    }
+    // One look only (no run yet): only the last rung takes the first pause.
+    let first_look = Facts {
+        still_s: 0,
+        ..repainting.clone()
+    };
+    for (rung, gate) in [
+        (Rung::Settled, Gate::Wait("settling")),
+        (Rung::KeysOnly, Gate::Wait("settling")),
+        (Rung::Land, Gate::Go),
+    ] {
+        assert_eq!(
+            gate_announce(&at(rung, first_look.clone())),
+            gate,
+            "{rung:?}"
+        );
+    }
+    // A person near the tab (within human_grace_s), not typing.
+    let near = Facts {
+        attended: true,
+        ..idle_facts()
+    };
+    for (rung, gate) in [
+        (Rung::Prefer, Gate::Wait("attended")),
+        (Rung::Settled, Gate::Wait("attended")),
+        (Rung::KeysOnly, Gate::Go),
+        (Rung::Land, Gate::Go),
+    ] {
+        assert_eq!(gate_announce(&at(rung, near.clone())), gate, "{rung:?}");
+    }
+    // Every floor, at every rung and under `--now`.
+    let floors: [Knock; 13] = [
+        (|f| f.held = true, "held"),
+        (|f| f.typing = true, "attended"),
+        (|f| f.limited = true, "limited"),
+        (|f| f.login = true, "login"),
+        (|f| f.queued = true, "queued"),
+        (|f| f.status = "busy".into(), "not-idle"),
+        (|f| f.status = "shell".into(), "not-idle"),
+        (|f| f.busy_footer = true, "busy"),
+        (|f| f.daemon_turn = DaemonTurn::Own, "daemon-turn"),
+        (|f| f.daemon_turn = DaemonTurn::Goal, "goal"),
+        (|f| f.daemon_turn = DaemonTurn::Unplaced, "daemon-busy"),
+        (|f| f.approval_box = true, "box"),
+        (|f| f.composer_empty = false, "draft"),
+    ];
+    for rung in [Rung::Prefer, Rung::Settled, Rung::KeysOnly, Rung::Land] {
+        for owner_now in [false, true] {
+            for (knock, why) in floors {
+                let mut f = Facts {
+                    owner_now,
+                    ..at(rung, repainting.clone())
+                };
+                knock(&mut f);
+                assert_eq!(
+                    gate_announce(&f),
+                    Gate::Wait(why),
+                    "{rung:?} now={owner_now} {why}"
+                );
+                assert_eq!(
+                    gate_restart(&f, true),
+                    Gate::Wait(why),
+                    "the restart keeps it too: {rung:?} now={owner_now} {why}"
+                );
+            }
+        }
+    }
+}
+
+/// THE LAST WORDS' PRINT (the repaint-proof settle): what a footer's clock,
+/// a goal's counter, a dim suggestion on the composer's row or a blank row
+/// under the words leaves as it was, and what new words or another process
+/// change. NEGATIVE CONTROL: a changed word above the composer is a new print.
+#[test]
+fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
+    let screen = |caret: &str, footer: &str| -> Vec<String> {
+        rows(&[
+            "› fix the parser",
+            "• Fixed it; the tests pass.",
+            "",
+            "  8:51 AM",
+            "",
+            caret,
+            "",
+            footer,
+        ])
+    };
+    let base = still_print(
+        7,
+        &screen(
+            "» Ask Codex to do anything",
+            "  gpt · ~/p   Pursuing goal (10d 2h 51m)",
+        ),
+        5,
+    );
+    assert_eq!(base.len(), 16);
+    assert_eq!(
+        still_print(
+            7,
+            &screen(
+                "» Ask Codex to do anything",
+                "  gpt · ~/p   Pursuing goal (10d 2h 52m)"
+            ),
+            5
+        ),
+        base,
+        "the goal's counter"
+    );
+    assert_eq!(
+        still_print(7, &screen("» keep going", "  gpt · ~/p"), 5),
+        base,
+        "the composer's own row"
+    );
+    let mut blank = screen("» Ask Codex to do anything", "  gpt");
+    blank.insert(4, String::new());
+    assert_eq!(
+        still_print(7, &blank, 6),
+        base,
+        "a blank row under the words"
+    );
+    // NEGATIVE CONTROLS.
+    let mut words = screen("» Ask Codex to do anything", "  gpt");
+    words[1] = "• Fixed it; one test still fails.".to_string();
+    assert_ne!(still_print(7, &words, 5), base, "new words");
+    assert_ne!(
+        still_print(8, &screen("» Ask Codex to do anything", "  gpt"), 5),
+        base,
+        "another process"
+    );
+}
+
+/// THE END OF THE AGENT'S OWN WORK IS THE UPGRADE'S POINT (2026-09-28, tab
+/// s-692e6 "Free disk space"): every notice was answered within seconds — "I
+/// can't stop yet, my workflow is still running; ask again later" — the round
+/// asked four times at breaks, gave up, rested two hours, re-armed and asked
+/// again; and the one moment the move could finish, the first idle point
+/// after the workflow with nothing under the agent, found the round waiting
+/// `awaiting-ready` (announced within its window) or `failed` (resting),
+/// words that own no turn end, so the loop's `keep going` took it and a new
+/// workflow began. Now, with the agent's work seen since the latest notice
+/// and ended at this idle point (`Facts::work_ended`): an announced round
+/// asks again at once — whatever its asks — and a round that gave up is
+/// re-armed (its driver asks in the same visit), once the restart's gate is
+/// open but for the READY; while that gate settles, the step waits a settle,
+/// which owns the point. NEGATIVE CONTROLS: the same point with no work seen
+/// waits as before (`awaiting-ready`, `failed`); a break is never such a
+/// point; a READY takes the restart as ever.
+#[test]
+fn the_end_of_the_agents_own_work_is_the_upgrades_point() {
+    let now = 1_790_645_000;
+    let ended = Facts {
+        work_ended: true,
+        ..idle_facts()
+    };
+    let announced = Phase::Announced {
+        at_s: now - 60,
+        asks: 1,
+    };
+    let gave_up = Phase::Failed(GAVE_UP.to_string());
+    let resting = Facts {
+        failed_s: 60,
+        ..ended.clone()
+    };
+    // The fix: asked at once; re-armed.
+    assert_eq!(next_step(&announced, &ended, false, now), Step::Announce);
+    assert_eq!(next_step(&gave_up, &resting, false, now), Step::Rearm);
+    // Past MAX_ASKS too: the agent's own answer asked for this one.
+    let spent = Phase::Announced {
+        at_s: now - 60,
+        asks: MAX_ASKS,
+    };
+    assert_eq!(next_step(&spent, &ended, false, now), Step::Announce);
+    // Settling: a settle, which owns the point.
+    let settling = Facts {
+        quiet_s: 3,
+        ..ended.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &settling, false, now),
+        Step::Wait("settling")
+    );
+    assert_eq!(
+        next_step(
+            &gave_up,
+            &Facts {
+                failed_s: 60,
+                ..settling.clone()
+            },
+            false,
+            now
+        ),
+        Step::Wait("settling")
+    );
+    assert!(crate::harness::upgrade_drive::owns_turn_ends(
+        "wait:settling",
+        0,
+        600
+    ));
+    // A person, a box, a limit: the gate's own waits.
+    let attended = Facts {
+        attended: true,
+        ..ended.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &attended, false, now),
+        Step::Wait("attended")
+    );
+    // NEGATIVE CONTROLS: no work seen since the notice — the builds before at
+    // every point.
+    let idle = idle_facts();
+    assert_eq!(
+        next_step(&announced, &idle, false, now),
+        Step::Wait("awaiting-ready")
+    );
+    assert_eq!(
+        next_step(
+            &gave_up,
+            &Facts {
+                failed_s: 60,
+                ..idle.clone()
+            },
+            false,
+            now
+        ),
+        Step::Wait("failed")
+    );
+    // A break is never the end of the work.
+    let at_break = Facts {
+        background_point: true,
+        ..ended.clone()
+    };
+    assert_eq!(
+        next_step(&announced, &at_break, false, now),
+        Step::Wait("background")
+    );
+    // A READY takes the restart, as ever.
+    assert_eq!(next_step(&announced, &ended, true, now), Step::Terminate);
+
+    // A STATUS THAT LAGS THE IDLE SCREEN (the review of 2026-09-28): the
+    // agent's background shell ended, Claude's status still reads `shell`
+    // over an idle screen, and the restart's gate never reads that lag past
+    // (`status-stale` at every look). Inside the re-ask's window the wait
+    // holds the point; past it the re-ask decides — a line goes through the
+    // lag, or, its asks spent, the round gives up — never the wait again.
+    let lagging = Facts {
+        status: "shell".to_string(),
+        idle_looks: IDLE_LOOKS,
+        ..ended.clone()
+    };
+    assert_eq!(gate_restart(&lagging, true), Gate::Wait("status-stale"));
+    assert_eq!(
+        next_step(&announced, &lagging, false, now),
+        Step::Wait("status-stale"),
+        "inside the window: the gate's wait"
+    );
+    let late = |asks| Phase::Announced {
+        at_s: now - REASK_S,
+        asks,
+    };
+    assert_eq!(
+        next_step(&late(1), &lagging, false, now),
+        Step::Announce,
+        "past the window, asks left: the re-ask's line through the lag"
+    );
+    assert_eq!(
+        next_step(&late(MAX_ASKS), &lagging, false, now),
+        Step::GiveUp,
+        "past the window, asks spent: the give-up"
+    );
+    let busy = Facts {
+        status: "busy".to_string(),
+        ..lagging.clone()
+    };
+    assert_eq!(next_step(&late(MAX_ASKS), &busy, false, now), Step::GiveUp);
+    assert_eq!(next_step(&late(2), &busy, false, now), Step::Announce);
+    // A settle past the window is no hold either: the re-ask's gate settles.
+    assert_eq!(
+        next_step(&late(MAX_ASKS), &settling, false, now),
+        Step::GiveUp
+    );
+}
+
+/// **TIER-1 FOR `HarnessUpgradeWorkEnd`** (aterm-spec
+/// `harness_upgrade_work_end_model`): at EVERY reachable idle point of the
+/// model before the host's look (`screen == 0 && looked == 0`), the real
+/// reducer is asked what the model's round would be asked — announced with
+/// the model's asks (shifted so the model's `Cap` is `MAX_ASKS`), within its
+/// re-ask window or past it (`late`), or resting after a give-up well within
+/// its rest; an idle, settled, empty composer with nothing under the agent,
+/// Claude's status `idle` or, where the model's status lags, `shell` over an
+/// idle screen read so `IDLE_LOOKS` looks in a row; the end of the agent's
+/// work exactly when the model saw work since the notice
+/// (`Facts::work_ended`) — and it asks (`Announce`, or `Rearm` from a rest)
+/// exactly where `HostAsks` or `HostReasks` is enabled, gives up exactly
+/// where `HostGivesUp` is, waits the restart gate's `status-stale` exactly
+/// where `HostHolds` is, and says its quiet word (`awaiting-ready`, `failed`)
+/// exactly where `HostWaits` is. NEGATIVE CONTROLS: the builds before
+/// (`Buggy`), an ask with no work seen (`Nag`) and the wait held past the
+/// window (`Hold`, the first build of the ask at the end of the work) each
+/// disagree with the real reducer at some reachable point.
+#[test]
+fn the_work_end_reducer_is_bound_to_its_model() {
+    use aterm_spec::derive::{Model, harness_upgrade_work_end_model};
+    type S = std::collections::BTreeMap<&'static str, i64>;
+    fn reachable(m: &Model) -> Vec<S> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = std::collections::VecDeque::from([m.init_state()]);
+        let mut out = Vec::new();
+        while let Some(s) = queue.pop_front() {
+            if !seen.insert(s.clone()) {
+                continue;
+            }
+            for a in &m.actions {
+                let mut next = s.clone();
+                if m.fire(a.name, &mut next) {
+                    queue.push_back(next);
+                }
+            }
+            out.push(s);
+        }
+        out
+    }
+    let now = 1_790_645_000;
+    let model = harness_upgrade_work_end_model();
+    let cap = model.consts.iter().find(|c| c.0 == "Cap").unwrap().1;
+    // The model's asks onto the real count: its `Cap` is `MAX_ASKS`.
+    let shift = i64::from(MAX_ASKS) - cap;
+    // The real reducer at a model point: which host action it takes.
+    let real = |s: &S| -> &'static str {
+        let phase = if s["phase"] == 1 {
+            Phase::Announced {
+                at_s: if s["late"] == 1 {
+                    now - REASK_S - 60
+                } else {
+                    now - 60
+                },
+                asks: u32::try_from(s["asks"] + shift).unwrap(),
+            }
+        } else {
+            Phase::Failed(GAVE_UP.to_string())
+        };
+        let facts = Facts {
+            work_ended: s["worked"] == 1,
+            failed_s: 60,
+            ..idle_facts()
+        };
+        let facts = if s["lag"] == 1 {
+            Facts {
+                status: "shell".to_string(),
+                idle_looks: IDLE_LOOKS,
+                ..facts
+            }
+        } else {
+            facts
+        };
+        match next_step(&phase, &facts, false, now) {
+            Step::Announce | Step::Rearm => "ask",
+            Step::GiveUp => "gives-up",
+            Step::Wait("status-stale") => "holds",
+            Step::Wait("awaiting-ready" | "failed") => "waits",
+            other => panic!("{s:?}: {other:?}"),
+        }
+    };
+    let model_says = |m: &Model, s: &S| -> Vec<&'static str> {
+        [
+            ("ask", "HostAsks"),
+            ("ask", "HostReasks"),
+            ("gives-up", "HostGivesUp"),
+            ("holds", "HostHolds"),
+            ("waits", "HostWaits"),
+        ]
+        .into_iter()
+        .filter(|(_, action)| m.action_enabled(action, s))
+        .map(|(word, _)| word)
+        .collect()
+    };
+    let points: Vec<S> = reachable(&model)
+        .into_iter()
+        .filter(|s| s["screen"] == 0 && s["looked"] == 0)
+        .collect();
+    for (what, found) in [
+        (
+            "a rest after work",
+            points.iter().any(|s| s["worked"] == 1 && s["phase"] == 2),
+        ),
+        ("no work seen", points.iter().any(|s| s["worked"] == 0)),
+        (
+            "a lag past the window",
+            points
+                .iter()
+                .any(|s| s["worked"] == 1 && s["lag"] == 1 && s["late"] == 1 && s["phase"] == 1),
+        ),
+        (
+            "asks spent",
+            points.iter().any(|s| s["asks"] == cap && s["late"] == 1),
+        ),
+    ] {
+        assert!(found, "the model reaches {what}");
+    }
+    for s in &points {
+        assert_eq!(
+            model_says(&model, s),
+            [real(s)],
+            "the real reducer against the model at {s:?}"
+        );
+    }
+    // NEGATIVE CONTROLS: each dial disagrees with the real reducer somewhere.
+    for dial in ["Buggy", "Nag", "Hold"] {
+        let wrong = aterm_spec::interp::with_consts(&model, &[(dial, 1)]);
+        let caught = reachable(&wrong)
+            .into_iter()
+            .filter(|s| s["screen"] == 0 && s["looked"] == 0)
+            .any(|s| model_says(&wrong, &s) != [real(&s)]);
+        assert!(
+            caught,
+            "{dial}: the real reducer disagrees with it somewhere"
+        );
     }
 }

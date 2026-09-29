@@ -399,8 +399,10 @@ fn scroll_up_zero_noop() {
 // and symbolic `(top, bottom, n)`, every row slice present before the shift is
 // present exactly once after it — none lost, none aliased by two rows. The mock
 // rows borrow a local backing array, so no page store is involved and no
-// allocation can occur on this path at all. Discharged with `trust-mc-driver`
-// once a working trust-mc is on the box (the managed bundle awaits its repack).
+// allocation can occur on this path at all. Its `trust-mc-driver` discharge is
+// not yet re-measured: this crate's build scripts stopped the managed bundle's
+// lane until `scripts/verify-kani-proofs.sh` gave host units a host sysroot
+// (2026-09-28; no repack is owed).
 
 /// `shift_visible_rows_up` permutes the ring's row slices.
 #[kani::proof]

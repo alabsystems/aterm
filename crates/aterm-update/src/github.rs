@@ -242,7 +242,7 @@ fn parse_numeric_tag(tag: &str) -> Result<TagKind, String> {
 
 /// The tag contract: a release the client will install is spelled exactly
 /// `vMAJOR.MINOR.PATCH`, matching the workspace version with its DEV component
-/// reset to 0 (`VERSIONING.md`). `cargo ship cut` derives it from
+/// reset to 0 (`VERSIONING.md`). `targo --unverified ship cut` derives it from
 /// `[workspace.package] version`, so the shipped app, the published source
 /// snapshot, and the tag are one number.
 ///
@@ -1091,6 +1091,17 @@ fn stage_backoff(
     current_build: u64,
     now: u64,
 ) -> Option<StageBackoff> {
+    // The quarantine ledger first: a verdict no later stage event can overwrite
+    // (round six, finding 32) — `failed.toml` holds one artifact at a time.
+    if crate::manifest::artifact_quarantined(staging, manifest.build_number, &manifest.sha256) {
+        return Some(StageBackoff {
+            retry_in_secs: 0,
+            attempts: 1,
+            quarantined: true,
+            applicable: Ready::read_publishable(staging)
+                .filter(|ready| ready.build_number > current_build),
+        });
+    }
     let memo = crate::manifest::FailedMark::read(&staging.failed())?;
     if !memo.suppresses(manifest.build_number, &manifest.sha256, now) {
         return None;
@@ -1102,6 +1113,307 @@ fn stage_backoff(
         applicable: Ready::read_publishable(staging)
             .filter(|ready| ready.build_number > current_build),
     })
+}
+
+/// The words a stage-lock refusal carries when its holder showed no sign of life
+/// ([`take_stage_lock`]); the persistent notice reads its cause by them
+/// ([`is_stopped_stage_holder_refusal`]).
+pub(crate) const STOPPED_STAGE_HOLDER: &str =
+    "holds the update stage lock and has shown no sign of life";
+
+/// Whether a ledger error is [`take_stage_lock`]'s stopped-holder refusal.
+pub(crate) fn is_stopped_stage_holder_refusal(error: &str) -> bool {
+    error.contains(STOPPED_STAGE_HOLDER)
+}
+
+/// This check's hold on `stage.lock`, with the beat that tells a waiting sibling
+/// the holder is alive. The beat is declared FIRST so it stops before the lock is
+/// let go, and never stamps this pid into a lock another process then holds.
+struct StageHold {
+    _beat: crate::HolderBeat,
+    _lock: aterm_update_core::FileLock,
+}
+
+/// Take the machine-wide stage lock (download → extract → publish), waiting at
+/// most `wait`.
+///
+/// BOUNDED (plan P2-1): a blocking wait parked the checker behind any holder.
+///
+/// AND THE HOLDER IS JUDGED (round six, finding 3). A holder past the bound was
+/// always called "another aterm staging — the next check reads what it staged".
+/// For an aterm STOPPED mid-download (a `SIGSTOP`, a debugger), or one whose check
+/// HUNG there (a download stalled on a dead read, which the window's watchdog
+/// retires but cannot unwind), that staging never comes: it keeps the lock, every
+/// sibling's check — ungated past the checker lock by round four — timed out here
+/// cycle after cycle, and the plain error booked nothing the ledger could escalate.
+///
+/// The holder now stamps the lock while its check is ALIVE — the rule
+/// `checker.lock`'s holder keeps ([`crate::stage_holder_alive`]: its checker
+/// generation current and its heartbeat fresh), not merely while the process
+/// runs, so a hung holder looks as stuck as a stopped one. A waiter that runs out
+/// of time reads the stamp: fresh is a sibling staging (the ordinary stand-down);
+/// stale is a holder that did nothing for half the wait.
+///
+/// ONE STALE READING IS NOT A VERDICT (the mixed-version pairing). A holder of a
+/// build older than this never stamps, so while it stages a large container on a
+/// slow link its lock reads stale — with the mtime and pid of whichever newer
+/// build stamped last, possibly this very process. So the first stale reading
+/// stands down unbooked, and only a SECOND consecutive one — the very next check
+/// that needs the lock — that finds the same stamp (nothing stamped in between —
+/// [`StaleStageStamps`]) is booked as the
+/// TYPED `pipeline` failure ([`STOPPED_STAGE_HOLDER`]) that `update status` and,
+/// past `PERSISTENT_AFTER`, the persistent notice say. A pid the lock names is
+/// never this process's own: an older holder leaves the last writer's there.
+/// The lock cannot be taken from a live process, stopped or not; saying so is
+/// what is left to do.
+fn take_stage_lock(staging: &Staging, wait: std::time::Duration) -> Result<StageHold, String> {
+    StaleStageStamps::note_stage_lock_reached();
+    match aterm_update_core::FileLock::acquire_within(&staging.stage_lock, wait) {
+        Ok(lock) => {
+            StaleStageStamps::forget(&staging.stage_lock);
+            crate::note_checker_lock_holder(&staging.stage_lock);
+            let alive = crate::stage_holder_alive();
+            Ok(StageHold {
+                _beat: crate::HolderBeat::start_with(
+                    staging.stage_lock.clone(),
+                    wait / 4,
+                    move || alive(),
+                ),
+                _lock: lock,
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            let fresh = crate::holder_fresh(wait);
+            if crate::checker_holder_progressing(&staging.stage_lock, fresh) {
+                StaleStageStamps::forget(&staging.stage_lock);
+                return Err(format!(
+                    "stage lock: another aterm process has been staging an update for more \
+                     than {} s; this check stands down and the next one reads what it staged",
+                    wait.as_secs()
+                ));
+            }
+            if !StaleStageStamps::seen_again(&staging.stage_lock) {
+                return Err(format!(
+                    "stage lock: another aterm process has held the update stage lock for more \
+                     than {} s with no sign of life (an older aterm stages without one); this \
+                     check stands down, and a next check that finds it the same says so",
+                    wait.as_secs()
+                ));
+            }
+            let holder = crate::checker_lock_holder(&staging.stage_lock)
+                .filter(|pid| *pid != std::process::id())
+                .map_or_else(
+                    || "another aterm process".to_string(),
+                    |pid| format!("another aterm process (the lock names pid {pid})"),
+                );
+            let error = format!(
+                "stage lock: {holder} {STOPPED_STAGE_HOLDER} across two checks — it may be \
+                 stopped (a SIGSTOP, a debugger) or stuck; no aterm on this Mac can stage an \
+                 update until it is continued or quits"
+            );
+            crate::health::Health::record_failure(&staging.health(), "pipeline", &error);
+            Err(error)
+        }
+        Err(e) => Err(format!("stage lock: {e}")),
+    }
+}
+
+/// The stage-lock stamps this process last found stale, per lock path: the memory
+/// behind [`take_stage_lock`]'s two-reading rule. In process only — a relaunch
+/// starts over, which costs one more unbooked reading, never a false one.
+///
+/// TWO READINGS MEANS TWO CONSECUTIVE ONES (round seven, H1 open problem 102). The
+/// memo was cleared only when this process took the lock or found its holder fresh,
+/// so a first reading of an older build's slow staging (which never stamps, leaving
+/// the mtime of the last newer-build stamp) survived every later check that never
+/// needed the lock — the release got staged, covered, applied — and days later the
+/// same older build staging the NEXT release slowly read the same mtime, and the
+/// first stale reading of that episode was booked as a stopped holder ("no aterm on
+/// this Mac can stage an update until it is continued or quits"): false, and never
+/// booked by the build before round six. A check that ends without reaching the
+/// stage lock now ends the run ([`Self::check_ended`]), so the second reading must
+/// come from the very next check that needs the lock.
+struct StaleStageStamps;
+
+/// A stale reading: `(lock path, the stamp read there, the run it belongs to)`.
+type StaleReading = (std::path::PathBuf, std::time::SystemTime, u64);
+
+/// [`StaleStageStamps`]' table.
+static STALE_STAGE_STAMPS: std::sync::Mutex<Vec<StaleReading>> = std::sync::Mutex::new(Vec::new());
+
+/// Per lock path, the run of consecutive stage-lock checks a reading belongs to:
+/// advanced by every check that ends without reaching that stage lock.
+static STAGE_LOCK_RUNS: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    /// Whether the check running on this thread has reached [`take_stage_lock`].
+    static REACHED_STAGE_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl StaleStageStamps {
+    /// Record the stale stamp `path` carries now, and say whether the previous
+    /// stale reading of `path` found this SAME stamp in the SAME run of checks —
+    /// nothing stamped in between, and no check in between that did without the
+    /// lock. An unreadable stamp is never a second reading.
+    fn seen_again(path: &std::path::Path) -> bool {
+        let Ok(stamp) = std::fs::symlink_metadata(path).and_then(|meta| meta.modified()) else {
+            Self::forget(path);
+            return false;
+        };
+        let run = Self::run(path);
+        let mut seen = STALE_STAGE_STAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = seen.iter_mut().find(|(p, _, _)| p == path) {
+            let again = entry.1 == stamp && entry.2 == run;
+            entry.1 = stamp;
+            entry.2 = run;
+            return again;
+        }
+        seen.push((path.to_path_buf(), stamp, run));
+        false
+    }
+
+    /// The holder of `path` showed life (or the lock was taken): the next stale
+    /// reading starts over.
+    fn forget(path: &std::path::Path) {
+        STALE_STAGE_STAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(p, _, _)| p != path);
+    }
+
+    /// A check on this thread is starting.
+    fn check_started() {
+        REACHED_STAGE_LOCK.with(|reached| reached.set(false));
+    }
+
+    /// The check on this thread reached the stage lock.
+    fn note_stage_lock_reached() {
+        REACHED_STAGE_LOCK.with(|reached| reached.set(true));
+    }
+
+    /// A check on this thread has ended: one that never reached the stage lock at
+    /// `path` (the stage was covered, the release held, nothing new) ends the run, so
+    /// no stale reading before it pairs with one after it.
+    fn check_ended(path: &std::path::Path) {
+        if REACHED_STAGE_LOCK.with(std::cell::Cell::get) {
+            return;
+        }
+        let mut runs = STAGE_LOCK_RUNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match runs.iter_mut().find(|(p, _)| p == path) {
+            Some(entry) => entry.1 = entry.1.wrapping_add(1),
+            None => runs.push((path.to_path_buf(), 1)),
+        }
+    }
+
+    /// The run of checks at `path` a reading now belongs to.
+    fn run(path: &std::path::Path) -> u64 {
+        STAGE_LOCK_RUNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(p, _)| p == path)
+            .map_or(0, |(_, run)| *run)
+    }
+}
+
+/// Retire the published stage of `build`, which the floor withdraws — a revoked
+/// machine signed it, or the operator yanked it — the caller holds the apply lock
+/// and has re-read that the stage is still `build`'s.
+///
+/// AND FORGET ITS PENDING CLOCK (round six, finding 40's review). The build is
+/// withdrawn: its release can never be re-authorized by the revoked machine, so it
+/// will never be applied, and a clock left running announced "build P has been
+/// waiting on this machine … no apply attempt has been recorded" an hour later and
+/// at every relaunch until a newer release shipped. Nothing on disk records the
+/// revocation for the pending observation to read, but this code has the build in
+/// hand; a clock another observation has re-keyed to another build is left alone
+/// ([`crate::health::Health::forget_pending_update`]).
+pub(crate) fn retire_revoked_stage(staging: &Staging, build: u64) {
+    staging.retire_published();
+    crate::health::Health::forget_pending_update(&staging.health(), build);
+}
+
+/// Book a stage (`stage_from_zip` / `stage_from_dmg`) that failed with `error`
+/// after the container arrived and matched its digest.
+///
+/// ONLY A VERDICT IS BOOKED AGAINST THE BUILD (round six, finding 11 — the rule
+/// round four set for the apply path, `install::stage_failure_is_a_verdict`). A
+/// verification helper that ran past its deadline on a loaded machine, a helper
+/// the kernel would not start just then, a copy past its launchd budget, an
+/// `hdiutil attach` past its limit: each is a MOMENT
+/// ([`crate::is_passing_refusal`]) and says nothing about the bytes. Booked like
+/// a verdict it opened the widening re-download backoff (15 min up to 24 h)
+/// against a healthy build and, three moments on, the persistent notice that
+/// "updates download but will not verify". A moment is retried at the next
+/// check instead, with no memo against the artifact.
+///
+/// BUT A MOMENT THAT NEVER PASSES STILL ESCALATES (L4, L5). A machine whose
+/// Gatekeeper check is blocked by a network filter every time, or whose `hdiutil
+/// attach` always runs past its limit, re-downloads and times out every cycle and
+/// never moves. So the moment still advances the `stage` streak — the ledger's
+/// count of checks that could not make a stage — and past `PERSISTENT_AFTER` (and
+/// the notice's thirty minutes) the persistent notice says so, in words of its own:
+/// staging could not FINISH, never that the build will not verify
+/// (`persistent_failure_notice` reads the passing key in the ledger's error). The
+/// acquisition half of this check worked, which the ledger is told first.
+///
+/// A stage refused because the artifact is QUARANTINED (a crash-loop revert
+/// landed while this check was downloading, finding 15) is no stage failure
+/// either: the quarantine is its standing record, and a backoff memo written
+/// over it would say something else.
+fn book_stage_failure(
+    staging: &Staging,
+    current_build: u64,
+    manifest: &Manifest,
+    error: &str,
+    now: u64,
+) {
+    if crate::manifest::artifact_quarantined(staging, manifest.build_number, &manifest.sha256) {
+        crate::health::Health::record_acquisition_success(&staging.health());
+        return;
+    }
+    // WITHDRAWN WHILE IT DOWNLOADED (round seven, H1 finding 33): a sibling's check
+    // recorded a revocation of its signer, or a yank, and the publish refused it. No
+    // verdict on the bytes either — the floor is its standing record, and the next
+    // check refuses the release before any download.
+    if let Some(why) = crate::manifest::Floor::read(&staging.floor())
+        .withdraws(manifest.build_number, manifest.machine_id.as_deref())
+    {
+        crate::health::Health::record_acquisition_success(&staging.health());
+        crate::status::record(staging, current_build, &format!("held: {why}"));
+        return;
+    }
+    if crate::is_passing_refusal(error) {
+        crate::warn(&format!(
+            "staging build {} could not finish just then: {error}; no backoff is booked \
+             against it, and the next check tries again",
+            manifest.build_number
+        ));
+        crate::health::Health::record_acquisition_success(&staging.health());
+        crate::health::Health::record_failure(&staging.health(), "stage", error);
+        crate::status::record(
+            staging,
+            current_build,
+            &format!(
+                "deferred: staging build {} could not finish (a passing condition); retrying \
+                 at the next check",
+                manifest.build_number
+            ),
+        );
+        return;
+    }
+    crate::manifest::FailedMark::record_stage_failure(
+        &staging.failed(),
+        manifest.build_number,
+        &manifest.sha256,
+        now,
+    );
+    crate::health::Health::record_failure(&staging.health(), "stage", error);
 }
 
 /// The exact asset names a release carries for the updater. The roster chain looks
@@ -1381,7 +1693,11 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         return Ok(None);
     }
     RATE_LIMITED.store(false, Ordering::Relaxed);
+    StaleStageStamps::check_started();
     let result = check_and_stage_inner(current_build, source);
+    if let Some(staging) = Staging::resolve() {
+        StaleStageStamps::check_ended(&staging.stage_lock);
+    }
     // EVERY exit writes status, including the failing ones. The eight `Err` paths
     // below all returned without recording, so `status.toml` kept advertising the
     // last HEALTHY outcome — "staged X — verified and ready to apply", or "up to
@@ -1496,6 +1812,146 @@ fn acquire(
 /// books (one whitespace-free token of the status line).
 const ASSET_HOST: &str = "the download host";
 const ASSET_BLOCKED_NOTE: &str = "blocked";
+
+/// The recency floors' hold on a release of `build` (F5/F6), as the status line that
+/// says it: below the operator floor (a yank), or below the high-water (a rollback).
+fn floor_hold(build: u64, effective_min_build: u64, high_water: u64) -> Option<String> {
+    if build < effective_min_build {
+        return Some(format!(
+            "held: latest build {build} is below the operator floor {effective_min_build}"
+        ));
+    }
+    (build < high_water).then(|| {
+        format!("held: latest build {build} is below high-water {high_water} (possible rollback)")
+    })
+}
+
+/// Record what this check OBSERVED in the durable floor, then withdraw a published
+/// stage the floor no longer admits, and answer the floor the rest of the check
+/// judges by (the one just written — a revocation may have LOWERED it).
+///
+/// Split out of the check so the rule is a test: the check itself needs the network.
+fn observe_floor_and_withdraw(
+    staging: &Staging,
+    current_build: u64,
+    floor_before: crate::manifest::Floor,
+    observation: &crate::manifest::FloorObservation<'_>,
+) -> crate::manifest::Floor {
+    // Remember the authoritative release's operator floor immediately (even if we do
+    // not stage). The persisted floor remains monotonic across checks.
+    // The same call ratchets the roster sequence. Doing it here — on OBSERVATION, not on
+    // successful staging — is what makes the replay defence work: a client that merely
+    // SAW roster generation n must refuse n-1 forever after, whether or not it went on to
+    // install anything from that release. `observed_roster_seq` carries that observation
+    // out of the chain even when the chain then REFUSED the release (a roster that
+    // revokes the release's signer is admitted, observed here, and only then refuses),
+    // so the ratchet is genuinely observation-driven and not acceptance-driven.
+    //
+    // And it records what that roster REVOKES, which takes back every floor the revoked
+    // machines raised (round seven, H1 findings 2 and 10): a stolen key's release
+    // with a huge `min_build`, or a huge build this client staged, held every genuine
+    // release after the revocation "below the operator floor" forever.
+    crate::manifest::Floor::observe_and_write(&staging.floor(), observation);
+    // THE FLOOR THIS CHECK JUDGES BY is the one just written: a revocation may have
+    // LOWERED it, and the snapshot taken before the fetch would go on holding the
+    // release a revoked machine's floor was holding back.
+    let floor = crate::manifest::Floor::read(&staging.floor());
+    if floor.min_build < floor_before.min_build || floor.high_water < floor_before.high_water {
+        crate::warn(&format!(
+            "the machine roster revoked {:?}; the update floors it had raised are withdrawn \
+             (min_build {} -> {}, high_water {} -> {})",
+            floor.revoked_machines,
+            floor_before.min_build,
+            floor.min_build,
+            floor_before.high_water,
+            floor.high_water
+        ));
+    }
+    // A STAGE THE FLOOR NO LONGER ADMITS IS WITHDRAWN HERE. The ratchet above records
+    // what was SEEN; this acts on what it SAYS, for the stage already on disk: a
+    // machine the roster now revokes (roster generation `n+1`), or a build the
+    // operator has yanked (`min_build`).
+    //
+    // A stage is an authorization made earlier, and nothing revisited it: a build
+    // staged at 10:00 by a machine revoked at 10:30 was applied anyway (in-session,
+    // or at the next launch), and only a separate `min_build` yank could have
+    // stopped a withdrawn machine's artifact. A yanked stage, in turn, stayed
+    // announced as "verified and ready to apply" until an apply parked every reader
+    // for it and the successor's gate 4b refused it (round seven, H1 finding 55).
+    //
+    // IT IS DECIDED HERE, NOT IN THE APPLY LANE ALONE. Revocation is a LIST, and this
+    // is the only place the roster document is in hand; the apply lane holds the
+    // floor, whose durable revocation set is what this check just recorded. A
+    // roster-GENERATION comparison there is not merely weaker but WRONG — a manifest
+    // attributed under an older generation than the roster asset is the ordinary
+    // post-join steady state, which `authorize_by_roster` deliberately admits, so
+    // gating on it retires good stages forever (see `install`, gate 4c).
+    //
+    // Matching on `machine_id` is what makes this exact: the id sits inside the
+    // manifest's SIGNED bytes and the roster maps ids to keys, so a genuine
+    // signature by one machine cannot be relabelled as another's. The stage is
+    // read WITHOUT the floor ([`Ready::read_published_bundle`]): the stage the
+    // floor now hides from every other reader is exactly the one to find.
+    let withdrawal = |staged: &Ready| {
+        floor
+            .withdraws(staged.build_number, staged.machine_id.as_deref())
+            .or_else(|| {
+                // The floor write above can fail (a full disk); the roster in hand
+                // still says who it revokes.
+                revocation_withdraws_stage(observation.revoked, staged.machine_id.as_deref()).then(
+                    || {
+                        format!(
+                            "build {} was signed by machine {}, which the machine roster \
+                             has revoked",
+                            staged.build_number,
+                            staged.machine_id.as_deref().unwrap_or("?")
+                        )
+                    },
+                )
+            })
+    };
+    if let Some(staged) = Ready::read_published_bundle(staging)
+        && let Some(why) = withdrawal(&staged)
+    {
+        // UNDER THE APPLY LOCK, like every other retirement of the published stage.
+        // `apply_staged_if_ready` in a concurrently LAUNCHING instance verifies the
+        // staged `.app` and then renames it into place under `apply_lock`; a
+        // `remove_dir_all` racing that rename would gut the tree it was in the
+        // middle of installing (and, fd-relative, keep unlinking inside the same
+        // inode after the rename — the live install), which the boot sentinel would
+        // then read as a crash loop and revert with the build poisoned. Lock order
+        // is respected (nothing is held here; the stage lock is taken later), and a
+        // boot apply that wins the lock first reads the same floor at its own gates
+        // (4b, 4c) and retires the stage itself — the re-read below then finds
+        // nothing to retire.
+        // Bounded (plan P2-1): this is the checker thread, and a wedged apply-lock
+        // holder used to park it here for good. The `Err` arm already retries.
+        match aterm_update_core::FileLock::acquire_within(
+            &staging.apply_lock,
+            crate::install::BACKGROUND_LOCK_WAIT,
+        ) {
+            Ok(_apply_lock) => {
+                if Ready::read_published_bundle(staging)
+                    .is_some_and(|still| still.build_number == staged.build_number)
+                {
+                    crate::warn(&format!("staged {why}; discarding it"));
+                    retire_revoked_stage(staging, staged.build_number);
+                    let note = format!("held: staged {why}");
+                    // Carried onto every later record of THIS check (status.toml is one
+                    // overwritten line): the sentence survives the check's own terminal
+                    // outcome, and `aterm ctl update status` really does say so.
+                    crate::status::set_check_note(note.clone());
+                    crate::status::record(staging, current_build, &note);
+                }
+            }
+            Err(error) => crate::warn(&format!(
+                "staged {why}, but the apply lock could not be taken to retire it ({error}); \
+                 no surface announces it, and the next check retries"
+            )),
+        }
+    }
+    floor
+}
 
 /// A publishable stage strictly newer than the running build, as the check loop's
 /// `Some` answer: "a build is staged and can be applied" — reported so the apply lane
@@ -1613,6 +2069,23 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         fetched.selected = None;
         fetched.refuse(reason);
     }
+    // THE DURABLE REVOCATION SET (round seven, H1): a machine a roster this client
+    // admitted once revoked is not trusted again, whatever a later roster lists — the
+    // rule the Linux lane keeps (`revoked_machines`). Without it the floor would
+    // ignore the machine's word while the check staged its build, and every surface
+    // (which reads the same set) would then hide that stage and re-download it forever.
+    if fetched.selected.is_some()
+        && let Some(who) = &fetched.attribution
+        && floor.revokes(Some(&who.machine_id))
+    {
+        let reason = format!(
+            "authoritative {} was signed by machine {}, which a machine roster this client \
+             admitted has revoked; refusing it",
+            web_tag, who.machine_id
+        );
+        fetched.selected = None;
+        fetched.refuse(reason);
+    }
     // ATTRIBUTION, recorded where a human will find it later: the updater's own status
     // file, beside the release it describes. The owner's requirement is "I can track
     // which computer does what", and for the client half this is the record. It is
@@ -1630,97 +2103,31 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let manifest_rejected = fetched.manifest_rejected;
     let rejection_reason = fetched.rejection_reason.take();
     let observed_roster_seq = fetched.observed_roster_seq;
+    let observed_revocations = std::mem::take(&mut fetched.observed_revocations);
     let best = fetched.selected;
     let seen_min_build = best
         .as_ref()
         .and_then(|(manifest, _, _)| manifest.min_build)
         .unwrap_or(0);
+    // WHO asked for that floor: the machine the roster chain attributed the release
+    // to. Recorded with it, so a revocation of that machine takes it back.
+    let seen_by = fetched
+        .attribution
+        .as_ref()
+        .map(|who| who.machine_id.clone());
 
-    // Remember the authoritative release's operator floor immediately (even if we do
-    // not stage). The persisted floor remains monotonic across checks.
-    // The same call ratchets the roster sequence. Doing it here — on OBSERVATION, not on
-    // successful staging — is what makes the replay defence work: a client that merely
-    // SAW roster generation n must refuse n-1 forever after, whether or not it went on to
-    // install anything from that release. `observed_roster_seq` carries that observation
-    // out of the chain even when the chain then REFUSED the release (a roster that
-    // revokes the release's signer is admitted, observed here, and only then refuses),
-    // so the ratchet is genuinely observation-driven and not acceptance-driven.
-    crate::manifest::Floor::bump_and_write(
-        &staging.floor(),
-        seen_min_build,
-        0,
-        observed_roster_seq.unwrap_or(0),
+    let floor = observe_floor_and_withdraw(
+        &staging,
+        current_build,
+        floor,
+        &crate::manifest::FloorObservation {
+            min_build: seen_min_build,
+            high_water: 0,
+            roster_seq: observed_roster_seq.unwrap_or(0),
+            machine: seen_by.as_deref(),
+            revoked: &observed_revocations,
+        },
     );
-    // A REVOCATION NOW REACHES AN ALREADY-STAGED BUILD. The ratchet above records
-    // that a newer generation was SEEN; this acts on what that generation SAYS.
-    //
-    // A stage is an authorization made earlier, and nothing revisited it: a build
-    // staged at 10:00 by a machine revoked at 10:30 was applied anyway (in-session,
-    // or at the next launch), and only a separate `min_build` yank could have
-    // stopped a withdrawn machine's artifact.
-    //
-    // IT BELONGS HERE, NOT IN THE APPLY LANE. Revocation is a LIST, and this is the
-    // only place the roster document is in hand; the apply lane holds a floor NUMBER,
-    // and the obvious comparison there is not merely weaker but WRONG — a manifest
-    // attributed under an older generation than the roster asset is the ordinary
-    // post-join steady state, which `authorize_by_roster` deliberately admits, so
-    // gating on it retires good stages forever (see `install`, gate 4c).
-    //
-    // Matching on `machine_id` is what makes this exact: the id sits inside the
-    // manifest's SIGNED bytes and the roster maps ids to keys, so a genuine
-    // signature by one machine cannot be relabelled as another's.
-    if !fetched.observed_revocations.is_empty()
-        && let Some(staged) = Ready::read_publishable(&staging)
-        && let Some(machine) = staged.machine_id.as_deref()
-        && revocation_withdraws_stage(&fetched.observed_revocations, Some(machine))
-    {
-        // UNDER THE APPLY LOCK, like every other retirement of the published stage.
-        // `apply_staged_if_ready` in a concurrently LAUNCHING instance verifies the
-        // staged `.app` and then renames it into place under `apply_lock`; a
-        // `remove_dir_all` racing that rename would gut the tree it was in the
-        // middle of installing (and, fd-relative, keep unlinking inside the same
-        // inode after the rename — the live install), which the boot sentinel would
-        // then read as a crash loop and revert with the build poisoned. Lock order
-        // is respected (nothing is held here; the stage lock is taken later), and a
-        // boot apply that wins the lock first simply consumes the marker — the
-        // re-read below then finds nothing to retire, which is the honest outcome:
-        // an installed build from a revoked machine is `min_build`'s to yank.
-        // Bounded (plan P2-1): this is the checker thread, and a wedged apply-lock
-        // holder used to park it here for good. The `Err` arm already retries.
-        match aterm_update_core::FileLock::acquire_within(
-            &staging.apply_lock,
-            crate::install::BACKGROUND_LOCK_WAIT,
-        ) {
-            Ok(_apply_lock) => {
-                if Ready::read_publishable(&staging)
-                    .is_some_and(|still| still.build_number == staged.build_number)
-                {
-                    crate::warn(&format!(
-                        "staged build {} was authorized by machine {machine:?}, which \
-                         roster generation {} revokes; discarding it",
-                        staged.build_number,
-                        observed_roster_seq.unwrap_or(0)
-                    ));
-                    staging.retire_published();
-                    let note = format!(
-                        "held: staged build {} was signed by machine {machine}, which the \
-                         machine roster has revoked",
-                        staged.build_number
-                    );
-                    // Carried onto every later record of THIS check (status.toml is one
-                    // overwritten line): the sentence survives the check's own terminal
-                    // outcome, and `aterm ctl update status` really does say so.
-                    crate::status::set_check_note(note.clone());
-                    crate::status::record(&staging, current_build, &note);
-                }
-            }
-            Err(error) => crate::warn(&format!(
-                "staged build {} is signed by revoked machine {machine:?} but the apply \
-                 lock could not be taken to retire it ({error}); the next check retries",
-                staged.build_number
-            )),
-        }
-    }
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {
@@ -1849,28 +2256,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // likely broken" at a machine whose pipeline had just run end to end in front of it.
     // (`latest_tag` is deliberately NOT recorded: a floor can move under the same tag,
     // and re-judging costs unmetered requests only.)
-    if manifest.build_number < effective_min_build {
+    if let Some(held) = floor_hold(manifest.build_number, effective_min_build, floor.high_water) {
         crate::health::Health::record_success(&staging.health());
-        crate::status::record(
-            &staging,
-            current_build,
-            &format!(
-                "held: latest build {} is below the operator floor {}",
-                manifest.build_number, effective_min_build
-            ),
-        );
-        return Ok(None);
-    }
-    if manifest.build_number < floor.high_water {
-        crate::health::Health::record_success(&staging.health());
-        crate::status::record(
-            &staging,
-            current_build,
-            &format!(
-                "held: latest build {} is below high-water {} (possible rollback)",
-                manifest.build_number, floor.high_water
-            ),
-        );
+        crate::status::record(&staging, current_build, &held);
         return Ok(None);
     }
 
@@ -1951,23 +2339,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // BOUNDED (plan P2-1). A blocking wait here parked the checker thread behind any
     // holder, including one stopped mid-download, for as long as it stayed stopped.
     // A holder past the bound is another process staging (the next check reads what
-    // it staged) or a wedged one (the next check tries again): either way this
-    // check's answer is the same, and waiting forever for it was never one.
-    let _stage_lock = aterm_update_core::FileLock::acquire_within(
-        &staging.stage_lock,
-        crate::install::BACKGROUND_LOCK_WAIT,
-    )
-    .map_err(|e| {
-        if e.kind() == std::io::ErrorKind::TimedOut {
-            format!(
-                "stage lock: another aterm process has been staging an update for more than \
-                 {} s; this check stands down and the next one reads what it staged",
-                crate::install::BACKGROUND_LOCK_WAIT.as_secs()
-            )
-        } else {
-            format!("stage lock: {e}")
-        }
-    })?;
+    // it staged) or one stopped mid-stage, which `take_stage_lock` tells apart by the
+    // holder's beat and books as the typed failure it is (round six, finding 3).
+    let _stage_lock = take_stage_lock(&staging, crate::install::BACKGROUND_LOCK_WAIT)?;
     // Re-check under the lock: another instance may have just staged this build.
     // Same terminal-healthy reasoning as the pre-lock check above — and the same
     // `Some` answer, so the sibling's freshly-won stage arms THIS process's
@@ -2128,25 +2502,37 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         ),
     };
     if let Err(e) = staged {
-        crate::manifest::FailedMark::record_stage_failure(
-            &staging.failed(),
-            manifest.build_number,
-            &manifest.sha256,
+        let _ = std::fs::remove_file(&container_path);
+        book_stage_failure(
+            &staging,
+            current_build,
+            &manifest,
+            &e,
             crate::install::unix_now_secs(),
         );
-        let _ = std::fs::remove_file(&container_path);
-        crate::health::Health::record_failure(&staging.health(), "stage", &e);
         return Err(e);
     }
-    // The verified bundle is the artifact now; reclaim the container and clear the memo.
+    // The verified bundle is the artifact now; reclaim the container and clear the
+    // backoff memo — never a quarantine verdict, which a success of this build says
+    // nothing about (round six, finding 32).
     let _ = std::fs::remove_file(&container_path);
-    crate::manifest::FailedMark::clear(&staging.failed());
+    crate::manifest::FailedMark::clear_backoff(&staging.failed());
     // Terminal healthy outcome: this check exercised the WHOLE pipeline (manifest,
     // container, verify, stage) successfully — clear every failure streak.
     crate::health::Health::record_success(&staging.health());
-    // Raise the high-water to the build we just staged (never lowered): a later attempt
-    // to roll us back below it is refused above (F6).
-    crate::manifest::Floor::bump_and_write(&staging.floor(), 0, manifest.build_number, 0);
+    // Raise the high-water to the build we just staged: a later attempt to roll us
+    // back below it is refused above (F6). ATTRIBUTED to the machine that signed it,
+    // so a revocation of that machine takes it back (round seven, H1 finding 10): a
+    // stolen key's staged build 9_000_000_000 otherwise held every genuine release
+    // after the revocation "below high-water" for good.
+    crate::manifest::Floor::observe_and_write(
+        &staging.floor(),
+        &crate::manifest::FloorObservation {
+            high_water: manifest.build_number,
+            machine: manifest.machine_id.as_deref(),
+            ..crate::manifest::FloorObservation::default()
+        },
+    );
     // …and remember the tag, so the next check is one HEAD.
     crate::status::set_latest_tag(&web_tag, source, current_build, manifest.build_number);
 
@@ -2647,6 +3033,303 @@ mod tests {
             "the stage streak is the one this arm must preserve"
         );
 
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// A STAGE THAT COULD NOT FINISH IS A MOMENT, NOT A VERDICT (round six, finding
+    /// 11). A verification helper that ran past its deadline on a loaded machine, a
+    /// helper the kernel would not start just then, a copy past its launchd budget:
+    /// each says nothing about the bytes. Booked like a verdict it opened the 15 min →
+    /// 24 h re-download backoff against a healthy build and pushed the stage streak to
+    /// the persistent "updates download but will not verify" notice. The apply path
+    /// has kept the memo off such moments since round four; the stage path must too.
+    ///
+    /// AND A MOMENT THAT NEVER PASSES STILL ESCALATES (the review): with no count at
+    /// all, a machine whose Gatekeeper check is blocked every time re-downloaded and
+    /// timed out every cycle, never moved, and was told nothing. Each moment advances
+    /// the stage streak, and the persistent notice past it says staging could not
+    /// FINISH — never that the build will not verify.
+    #[test]
+    fn a_stage_that_could_not_finish_books_no_backoff_but_escalates_in_its_own_words() {
+        use crate::manifest::FailedMark;
+
+        let staging = Staging::scratch("stage-passing");
+        let manifest = candidate_manifest();
+        let running = manifest.build_number - 1;
+        const NOW: u64 = 1_000_000;
+
+        let moment = format!(
+            "staged bundle failed verification: {}",
+            crate::verify::timed_out("codesign --verify (team-pinned)", false)
+        );
+        for _ in 0..crate::PERSISTENT_AFTER {
+            book_stage_failure(&staging, running, &manifest, &moment, NOW);
+        }
+        assert!(
+            FailedMark::read(&staging.failed()).is_none(),
+            "a moment writes no memo against the artifact"
+        );
+        assert!(stage_backoff(&staging, &manifest, running, NOW).is_none());
+        let h = crate::health::Health::read(&staging.health());
+        assert_eq!(
+            h.persistent_class(),
+            Some(("stage", crate::PERSISTENT_AFTER)),
+            "a moment that repeats escalates: {h:?}"
+        );
+        let (_, body) = crate::persistent_failure_notice("stage", h.stage_failures, &h, running);
+        assert!(body.contains("could not finish"), "{body}");
+        assert!(
+            !body.contains("will not verify"),
+            "nothing is known against the build: {body}"
+        );
+
+        // NEGATIVE CONTROL: a verdict on the bytes books the memo, and the notice
+        // says the build will not verify.
+        let _ = std::fs::remove_dir_all(&staging.root);
+        let staging = Staging::scratch("stage-verdict");
+        let verdict = "codesign --verify (team-pinned requirement) failed: code object is not \
+                       signed at all";
+        book_stage_failure(&staging, running, &manifest, verdict, NOW);
+        let memo = FailedMark::read(&staging.failed()).expect("a verdict is memoized");
+        assert_eq!(memo.attempts, 1);
+        assert!(stage_backoff(&staging, &manifest, running, NOW).is_some());
+        let h = crate::health::Health::read(&staging.health());
+        assert_eq!(h.stage_failures, 1);
+        let (_, body) = crate::persistent_failure_notice("stage", 3, &h, running);
+        assert!(body.contains("will not verify"), "{body}");
+
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// A STAGE HOLDER THAT SHOWS NO SIGN OF LIFE IS SAID, NOT WAITED OUT FOREVER
+    /// (round six, finding 3). An aterm stopped mid-download keeps `stage.lock`; its
+    /// siblings' checks — ungated past the checker lock by round four — then timed
+    /// out on the stage lock every cycle with "the next one reads what it staged",
+    /// a staging that never came, and booked nothing the ledger could escalate. The
+    /// stage holder now stamps the lock as it works, so a waiter tells a sibling
+    /// staging (the ordinary stand-down) from one that is stopped (a typed failure,
+    /// booked, that `update status` and the persistent notice say).
+    #[test]
+    fn a_stage_lock_held_by_a_stopped_aterm_is_a_typed_booked_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let wait = std::time::Duration::from_millis(400);
+
+        // A holder that is staging: it stamps the lock as it works.
+        let staging = Staging::scratch("stage-lock-live-holder");
+        let held = aterm_update_core::FileLock::acquire(&staging.stage_lock).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stamper = {
+            let (stop, path) = (std::sync::Arc::clone(&stop), staging.stage_lock.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    crate::note_checker_lock_holder(&path);
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            })
+        };
+        let Err(error) = take_stage_lock(&staging, wait) else {
+            panic!("the lock is held");
+        };
+        stop.store(true, Ordering::Relaxed);
+        stamper.join().unwrap();
+        assert!(error.contains("next one reads what it staged"), "{error}");
+        assert_eq!(
+            crate::health::Health::read(&staging.health()).total_failures(),
+            0,
+            "a sibling staging is no failure: {error}"
+        );
+        // Released by `LOCK_UN` (the guard's drop: `aterm_update_core::FileLock`),
+        // and the next probe is another staging's lock.
+        drop(held);
+        let _ = std::fs::remove_dir_all(&staging.root);
+
+        // A holder that is stopped: it took the lock and wrote nothing since. The
+        // lock names THIS process's pid, as it does when an older build (which never
+        // stamps) holds a lock this process stamped last.
+        let staging = Staging::scratch("stage-lock-stopped-holder");
+        let held = aterm_update_core::FileLock::acquire(&staging.stage_lock).unwrap();
+        crate::note_checker_lock_holder(&staging.stage_lock);
+        // The FIRST stale reading stands down unbooked: an older build staging a
+        // large container on a slow link reads the same way.
+        let Err(first) = take_stage_lock(&staging, wait) else {
+            panic!("the lock is held");
+        };
+        assert!(!first.contains(STOPPED_STAGE_HOLDER), "{first}");
+        assert!(!first.contains("reads what it staged"), "{first}");
+        assert_eq!(
+            crate::health::Health::read(&staging.health()).total_failures(),
+            0,
+            "one stale reading is no verdict: {first}"
+        );
+        // The second, finding the same stamp, is.
+        let Err(error) = take_stage_lock(&staging, wait) else {
+            panic!("the lock is held");
+        };
+        assert!(error.contains(STOPPED_STAGE_HOLDER), "{error}");
+        assert!(
+            !error.contains(&format!("pid {}", std::process::id())),
+            "the lock's pid is this process's own, never the holder: {error}"
+        );
+        assert!(
+            !error.contains("reads what it staged"),
+            "no staging is coming: {error}"
+        );
+        let h = crate::health::Health::read(&staging.health());
+        assert_eq!(h.pipeline_failures, 1, "booked, so it can escalate: {h:?}");
+        let (_, body) = crate::persistent_failure_notice("pipeline", 3, &h, 1);
+        assert!(
+            body.contains("stopped") && !body.contains("pipeline is likely broken"),
+            "the persistent notice names the stopped holder: {body}"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// TWO STALE READINGS ARE TWO CONSECUTIVE CHECKS' (round seven, H1 open problem
+    /// 102). An older aterm (which never stamps the lock) stages release R slowly; this
+    /// build's check reads the lock stale — the first reading, unbooked. R lands, and
+    /// every later check finds it covered or applied and never needs the lock. Days
+    /// later the older aterm is again staging slowly, the lock still carries the same
+    /// last newer-build stamp, and the next reading used to pair with the one from R's
+    /// episode: a stopped-holder failure booked on the first stale reading of the new
+    /// one. A check in between that did without the lock now ends the run.
+    #[test]
+    fn a_stale_stage_lock_reading_pairs_only_with_the_next_check_that_needs_the_lock() {
+        let wait = std::time::Duration::from_millis(400);
+        let staging = Staging::scratch("stage-lock-episodes");
+        let path = staging.stage_lock.clone();
+        let held = aterm_update_core::FileLock::acquire(&path).unwrap();
+        crate::note_checker_lock_holder(&path);
+        let check = || {
+            StaleStageStamps::check_started();
+            let Err(error) = take_stage_lock(&staging, wait) else {
+                panic!("the lock is held");
+            };
+            StaleStageStamps::check_ended(&path);
+            error
+        };
+        let booked = || crate::health::Health::read(&staging.health()).pipeline_failures;
+
+        // R's episode: one stale reading, unbooked.
+        let first = check();
+        assert!(!first.contains(STOPPED_STAGE_HOLDER), "{first}");
+        // Checks that never needed the lock: R covered, then applied.
+        for _ in 0..2 {
+            StaleStageStamps::check_started();
+            StaleStageStamps::check_ended(&path);
+        }
+        // R2's episode, same stamp: its first reading is a first reading.
+        let again = check();
+        assert!(!again.contains(STOPPED_STAGE_HOLDER), "{again}");
+        assert_eq!(booked(), 0, "no false stopped-holder failure: {again}");
+        // NEGATIVE CONTROL: the very next check that needs the lock and finds the
+        // same stamp is the second consecutive reading, and is booked.
+        let second = check();
+        assert!(second.contains(STOPPED_STAGE_HOLDER), "{second}");
+        assert_eq!(booked(), 1);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// A HUNG STAGE HOLDER LOOKS AS STUCK AS A STOPPED ONE (finding 3's review). The
+    /// holder's process runs, but its check hung (a download stalled on a dead read)
+    /// and the window's watchdog retired its generation. Its beat used to stamp for as
+    /// long as the process ran, so every sibling took the unbooked "the next one reads
+    /// what it staged" stand-down, cycle after cycle. The beat now stamps only while
+    /// the holder's checker is alive — the rule `checker.lock`'s holder keeps.
+    #[test]
+    fn a_stage_lock_held_by_a_hung_check_in_a_running_aterm_is_booked() {
+        use crate::checker_watch::{CheckerPhase, CheckerWatch};
+        static WATCH: CheckerWatch = CheckerWatch::new();
+        let wait = std::time::Duration::from_millis(400);
+
+        // `hang` is whether the holder's generation is retired (its heartbeat no
+        // longer the live one) while it holds the lock. The holder's thread runs
+        // throughout, stamping whatever its beat decides.
+        let hold = |staging: &Staging, hang: bool| {
+            let generation = WATCH.register(1_000);
+            assert!(WATCH.beat(generation, CheckerPhase::Checking));
+            let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let staging = staging.clone();
+            let holder = std::thread::spawn(move || {
+                let _alive =
+                    crate::CheckAliveScope::enter(crate::checker_alive(&WATCH, generation));
+                let hold = take_stage_lock(&staging, wait).expect("free");
+                taken_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                drop(hold);
+            });
+            taken_rx.recv().unwrap();
+            if hang {
+                assert!(
+                    WATCH.supersede(generation).is_some(),
+                    "the watchdog retires it"
+                );
+            }
+            (holder, release_tx)
+        };
+
+        // NEGATIVE CONTROL: a live holder's beat keeps the waiter standing down.
+        let staging = Staging::scratch("stage-lock-alive-check");
+        let (holder, release) = hold(&staging, false);
+        for _ in 0..2 {
+            let Err(error) = take_stage_lock(&staging, wait) else {
+                panic!("the lock is held");
+            };
+            assert!(error.contains("next one reads what it staged"), "{error}");
+        }
+        assert_eq!(
+            crate::health::Health::read(&staging.health()).total_failures(),
+            0
+        );
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let _ = std::fs::remove_dir_all(&staging.root);
+
+        // The hung holder: running, retired, its beat silent.
+        let staging = Staging::scratch("stage-lock-hung-check");
+        let (holder, release) = hold(&staging, true);
+        let _ = take_stage_lock(&staging, wait);
+        let Err(error) = take_stage_lock(&staging, wait) else {
+            panic!("the lock is held");
+        };
+        assert!(error.contains(STOPPED_STAGE_HOLDER), "{error}");
+        assert_eq!(
+            crate::health::Health::read(&staging.health()).pipeline_failures,
+            1,
+            "booked, so it can escalate: {error}"
+        );
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// The check's half of round six's finding 32: after X was quarantined and
+    /// another build Y failed to stage, a channel that names X again must still
+    /// find X held — not download it into another crash loop.
+    #[test]
+    fn a_quarantined_build_stays_held_after_another_build_fails_to_stage() {
+        use crate::manifest::FailedMark;
+
+        let staging = Staging::scratch("quarantine-then-other-failure");
+        let x = candidate_manifest();
+        let running = x.build_number - 1;
+        const NOW: u64 = 1_000_000;
+        crate::manifest::quarantine_artifact(&staging, x.build_number, &x.sha256);
+        FailedMark::record_stage_failure(
+            &staging.failed(),
+            x.build_number + 1,
+            &"cd".repeat(32),
+            NOW,
+        );
+        let held = stage_backoff(&staging, &x, running, NOW).expect("X is still quarantined");
+        assert!(held.quarantined);
+        assert!(
+            held.status_line(x.build_number).contains("is quarantined"),
+            "{}",
+            held.status_line(x.build_number)
+        );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
@@ -3494,6 +4177,217 @@ mod tests {
         // withdrawal, and retiring on it would re-download on every check forever —
         // the same never-updates shape the apply-lane seq gate had to be removed for.
         assert!(!revocation_withdraws_stage(&revoked, None));
+    }
+
+    /// A published stage of `build` signed by `machine`, as the stager leaves it.
+    fn publish_attributed_stage(staging: &Staging, build: u64, machine: &str) {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let ready = Ready {
+            build_number: build,
+            version: format!("0.0.{build}"),
+            commit: Some(commit.into()),
+            dmg_sha256: "ab".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: Some(machine.into()),
+            roster_seq: Some(9),
+        };
+        std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
+        write_bundle_identity(staging, build, commit);
+    }
+
+    /// A STOLEN KEY'S FLOORS GO WITH THE KEY (round seven, H1 findings 2 and 10).
+    ///
+    /// Machine m11's key is stolen. The thief publishes a release whose signed
+    /// manifest says `build_number = min_build = 9_999_999_999`; every client that
+    /// SEES it ratchets its operator floor there before any download, and one that
+    /// stages it raises its high-water there too. The owner revokes m11 and cuts
+    /// the next genuine release from m3 with an ordinary build number. Before the
+    /// fix, that release — and every later one — was "held: latest build … is below
+    /// the operator floor 9999999999" (or "below high-water") on every check,
+    /// recorded as a HEALTHY outcome, forever: the floors recorded no provenance and
+    /// only ever rose.
+    #[test]
+    fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_held() {
+        let staging = Staging::scratch("floor-revocation");
+        let floor = || crate::manifest::Floor::read(&staging.floor());
+        // An ordinary history: m3's releases raised a floor and a high-water.
+        crate::manifest::Floor::observe_and_write(
+            &staging.floor(),
+            &crate::manifest::FloorObservation {
+                min_build: 900,
+                high_water: 1_500,
+                roster_seq: 8,
+                machine: Some("m3"),
+                revoked: &[],
+            },
+        );
+        // THE THEFT, observed under roster generation 9, which still lists m11.
+        let after_theft = observe_floor_and_withdraw(
+            &staging,
+            1_000,
+            floor(),
+            &crate::manifest::FloorObservation {
+                min_build: 9_999_999_999,
+                roster_seq: 9,
+                machine: Some("m11"),
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        assert_eq!(after_theft.min_build, 9_999_999_999, "observed, as before");
+        // …and the thief's build staged here (the stager's high-water ratchet).
+        crate::manifest::Floor::observe_and_write(
+            &staging.floor(),
+            &crate::manifest::FloorObservation {
+                high_water: 9_000_000_000,
+                machine: Some("m11"),
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        publish_attributed_stage(&staging, 9_000_000_000, "m11");
+        assert!(
+            floor_hold(2_000, floor().min_build, floor().high_water).is_some(),
+            "the genuine release is held while m11 is trusted"
+        );
+
+        // THE REVOCATION: generation 10 revokes m11, and m3 cuts build 2_000.
+        let revoked = vec!["m11".to_string()];
+        let after = observe_floor_and_withdraw(
+            &staging,
+            1_000,
+            floor(),
+            &crate::manifest::FloorObservation {
+                min_build: 0,
+                roster_seq: 10,
+                machine: Some("m3"),
+                revoked: &revoked,
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        assert_eq!(
+            (after.min_build, after.high_water, after.roster_seq),
+            (900, 1_500, 10),
+            "the floors fall back to what the machines still trusted asked for — \
+             never lower, and the roster generation never moves back: {after:?}"
+        );
+        assert_eq!(after, floor(), "the check judges by the floor it wrote");
+        assert_eq!(
+            floor_hold(2_000, after.min_build, after.high_water),
+            None,
+            "the owner's release after the revocation is not held"
+        );
+        // A genuine yank and a genuine rollback floor still stand.
+        assert!(floor_hold(800, after.min_build, after.high_water).is_some());
+        assert!(floor_hold(1_400, after.min_build, after.high_water).is_some());
+        // The revoked machine's stage went with it (finding 10's other half).
+        assert!(Ready::read_published_bundle(&staging).is_none());
+
+        // The revoked machine's word never counts again, even replayed.
+        crate::manifest::Floor::observe_and_write(
+            &staging.floor(),
+            &crate::manifest::FloorObservation {
+                min_build: 9_999_999_999,
+                high_water: 9_000_000_000,
+                machine: Some("m11"),
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        assert_eq!((floor().min_build, floor().high_water), (900, 1_500));
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// A STAGE THE FLOOR WITHDRAWS IS ANNOUNCED NOWHERE, AND IS RETIRED BY THE
+    /// CHECK THAT SAW THE WITHDRAWAL (round seven, H1 finding 55; finding 33's
+    /// readers). Build 20 is staged; the owner yanks it (`min_build = 21`). The
+    /// floor rises on observation, but the check's `Some` answer (which arms the
+    /// apply lane), its backoff line ("NOT skipping apply: staged … is verified and
+    /// ready to apply") and `update status` all went on offering build 20, and the
+    /// apply lane parked every reader for a successor whose gate 4b then refused it.
+    #[test]
+    fn a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check() {
+        let staging = Staging::scratch("floor-withdraws-stage");
+        publish_attributed_stage(&staging, 20, "m3");
+        let mut manifest = candidate_manifest();
+        manifest.build_number = 30;
+        let now = 1_000_000;
+        crate::manifest::FailedMark::record_stage_failure(
+            &staging.failed(),
+            manifest.build_number,
+            &manifest.sha256,
+            now,
+        );
+        // NEGATIVE CONTROL: with no floor the stage is offered everywhere.
+        assert_eq!(applicable_stage(&staging, 10), Some("0.0.20".to_string()));
+        let backoff = stage_backoff(&staging, &manifest, 10, now).expect("suppressed");
+        assert!(backoff.applicable.is_some());
+
+        // THE YANK, observed but not yet acted on.
+        crate::manifest::Floor::observe_and_write(
+            &staging.floor(),
+            &crate::manifest::FloorObservation {
+                min_build: 21,
+                machine: Some("m3"),
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        assert_eq!(applicable_stage(&staging, 10), None, "no apply lane arms");
+        let backoff = stage_backoff(&staging, &manifest, 10, now).expect("suppressed");
+        assert!(
+            backoff.applicable.is_none(),
+            "{}",
+            backoff.status_line(manifest.build_number)
+        );
+        assert!(
+            Ready::read_publishable(&staging).is_none(),
+            "status says none"
+        );
+        // The check that observes it retires the stage, under the apply lock.
+        let floor = crate::manifest::Floor::read(&staging.floor());
+        observe_floor_and_withdraw(
+            &staging,
+            10,
+            floor,
+            &crate::manifest::FloorObservation::default(),
+        );
+        assert!(Ready::read_published_bundle(&staging).is_none(), "retired");
+        let status = std::fs::read_to_string(&staging.status).unwrap_or_default();
+        assert!(status.contains("yanked"), "{status}");
+
+        // A REVOKED SIGNER, the same way — and only that signer's stage.
+        let staging = Staging::scratch("floor-revokes-stage");
+        publish_attributed_stage(&staging, 20, "m3");
+        let revoked = vec!["m11".to_string()];
+        let floor = crate::manifest::Floor::read(&staging.floor());
+        observe_floor_and_withdraw(
+            &staging,
+            10,
+            floor,
+            &crate::manifest::FloorObservation {
+                roster_seq: 10,
+                revoked: &revoked,
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        assert!(
+            Ready::read_publishable(&staging).is_some(),
+            "m3's stage is untouched by m11's revocation"
+        );
+        publish_attributed_stage(&staging, 20, "m11");
+        assert_eq!(
+            applicable_stage(&staging, 10),
+            None,
+            "a stage by a machine the floor has seen revoked is offered nowhere"
+        );
+        let floor = crate::manifest::Floor::read(&staging.floor());
+        observe_floor_and_withdraw(
+            &staging,
+            10,
+            floor,
+            &crate::manifest::FloorObservation::default(),
+        );
+        assert!(Ready::read_published_bundle(&staging).is_none(), "retired");
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
     #[test]

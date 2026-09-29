@@ -4064,19 +4064,18 @@ fn grow_atlas(
 /// The sparkle-word sprites, in atlas-column order. Index `i` lives at texel
 /// `x = i * cell_w`. MUST stay in sync with [`deco_sprite_index`]. The atlas
 /// carries ONE more sprite after these: the W7 AA undercurl tile at column
-/// `aterm_render::UNDERCURL_SPRITE` (so `DECO_ATLAS_SPRITES == 8 sparkle + 1`).
-const DECO_GLYPHS: [aterm_render::DecoGlyph; 8] = [
+/// `aterm_render::UNDERCURL_SPRITE` (so `DECO_ATLAS_SPRITES == 7 sparkle + 1`).
+const DECO_GLYPHS: [aterm_render::DecoGlyph; 7] = [
     aterm_render::DecoGlyph::Star4,
     aterm_render::DecoGlyph::Star5,
     aterm_render::DecoGlyph::Dot,
     aterm_render::DecoGlyph::Plus,
     aterm_render::DecoGlyph::Paw,
-    aterm_render::DecoGlyph::Droplet,
     aterm_render::DecoGlyph::RingArc,
     aterm_render::DecoGlyph::Shade,
 ];
 
-// The shared atlas layout: 8 sparkle sprites + the undercurl tile. A drift in
+// The shared atlas layout: 7 sparkle sprites + the undercurl tile. A drift in
 // either count is a CPU/GPU parity break, so pin both at compile time.
 const _: () = assert!(DECO_GLYPHS.len() == aterm_render::UNDERCURL_SPRITE);
 const _: () = assert!(DECO_GLYPHS.len() + 1 == aterm_render::DECO_ATLAS_SPRITES);
@@ -4126,9 +4125,8 @@ fn deco_sprite_index(g: aterm_render::DecoGlyph) -> usize {
         aterm_render::DecoGlyph::Dot => 2,
         aterm_render::DecoGlyph::Plus => 3,
         aterm_render::DecoGlyph::Paw => 4,
-        aterm_render::DecoGlyph::Droplet => 5,
-        aterm_render::DecoGlyph::RingArc => 6,
-        aterm_render::DecoGlyph::Shade => 7,
+        aterm_render::DecoGlyph::RingArc => 5,
+        aterm_render::DecoGlyph::Shade => 6,
     }
 }
 
@@ -13656,8 +13654,9 @@ impl GpuRenderer {
     /// is ON for this output". Fail-safe: a non-DX12 backend (Vulkan), any COM
     /// error, or HDR-off returns `false` on Windows so the caller keeps the SDR
     /// swapchain. macOS/Metal auto-enables EDR for an f16 CAMetalLayer, so that
-    /// platform returns `true`; other non-Windows platforms return `false`
-    /// until their compositor colour-management path is implemented.
+    /// platform returns `true`; the other non-Windows platforms (Linux) return
+    /// `false` because they present SDR by design (decided 2026-09-25; see
+    /// `aterm-gui` `platform.rs` `window_set_surface_colorspace`).
     #[cfg(target_os = "macos")]
     #[cfg(wgpu_arm)]
     fn tag_swapchain_scrgb(_surface: &wgpu::Surface) -> bool {
@@ -19663,19 +19662,24 @@ impl GpuRenderer {
             let raster = input.chrome_raster(r);
             if let Some(m) = raster {
                 let rail_h = aterm_render::chrome_fit(m, chrome_room).1.min(ch);
-                for (x0, x1, color, rail) in
-                    aterm_render::chrome_raster_runs(m, w as usize, pad, cw, cols)
-                {
-                    let (y, hgt) = if rail {
-                        (y0u + (ch - rail_h) as u16, rail_h as u16)
-                    } else {
-                        (y0u, ch as u16)
-                    };
-                    bg_inst.push(BgInstance {
-                        rect: [sat_pos_u16(x0), y, sat_pos_u16(x1 - x0), hgt],
-                        color: rgb4_u32(color & 0x00ff_ffff),
-                    });
-                }
+                aterm_render::visit_chrome_raster_runs(
+                    m,
+                    w as usize,
+                    pad,
+                    cw,
+                    cols,
+                    |x0, x1, color, rail| {
+                        let (y, hgt) = if rail {
+                            (y0u + (ch - rail_h) as u16, rail_h as u16)
+                        } else {
+                            (y0u, ch as u16)
+                        };
+                        bg_inst.push(BgInstance {
+                            rect: [sat_pos_u16(x0), y, sat_pos_u16(x1 - x0), hgt],
+                            color: rgb4_u32(color & 0x00ff_ffff),
+                        });
+                    },
+                );
                 // The outlined capsules (ruling 249), over the ground and the
                 // rail, on the row's underline (ruling 254) — the CPU's
                 // rectangles from the same builder.
@@ -22400,7 +22404,8 @@ fn decode_for_key(
         image.format,
         fp_w,
         fp_h,
-        image.pixel_exact,
+        image.scaling,
+        image.source_rect,
     )
     .unwrap_or_default();
     GpuDecodedImage {
@@ -25239,7 +25244,8 @@ mod tests {
             rows: 1,
             z_index: 0,
             band_lift_px: 0,
-            pixel_exact: false,
+            scaling: aterm_core::grid::extra::ImageScaling::Fit,
+            source_rect: None,
         })
     }
 

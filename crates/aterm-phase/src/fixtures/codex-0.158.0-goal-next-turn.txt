@@ -1,0 +1,65 @@
+# codex 0.158.0 · MEASURED 2026-09-28, `aterm ctl text` of a live 131x64 tab, read only, about a second after a goal turn's end row (a goal-mode session, GPT-6-Astra ultra, `Pursuing goal`), cursor=60,2 (visible, on the placeholder), `cell 60 2` `A` dim, `status` agent=unknown integration=degraded · THE NEXT GOAL TURN ALREADY RUNNING: its first message streams under the last turn's end row with no status row and no user row (a goal continuation writes none), so the screen reads an ENDED turn; frames a second apart grew the message row by row · scrubbed: the transcript's words, paths and commit ids replaced by stand-ins of the same shape; every glyph, indent, wrap and row kept
+and keep the parser's tests green while you do it, then push the branch
+    Search mod tests in lexer.rs
+    + Show details
+
+• Ran rg -n -C2 'lexer_tests' crates/parser/src; set -o pipefail …
+  └
+    test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 3016 filtered out; finished in 0.54s
+
+    + Show details
+
+• Ran tail -n 9 reports/parser/value-tests.log; git diff --check -- crates docs reports/parser …
+  └  M docs/parser/README.md
+    ?? crates/parser/src/literals.rs
+    ?? reports/parser/
+    + Show details
+
+• Edited reports/parser/README.md (+12 -0)
+    84 +`neighbor-tests.log` uses the same invocation with filters
+    85 +`lexer_tests grammar_tests`:
+    86 +**25 passed, 0 failed**. The `lexer_tests` spelling matches no module;
+    + Show details
+
+• Edited reports/parser/README.md (+2 -1)
+    87 -the actual module is `lexer` and is checked separately.
+    87 +the actual module is `lexer`. `value-tests.log` repeats
+    88 +the same invocation with just `lexer`: **23 passed, 0 failed**.
+    + Show details
+
+• Ran set -e …
+  └  create mode 100644 reports/parser/frontend-tests.log
+     create mode 100644 reports/parser/neighbor-tests.log
+     create mode 100644 reports/parser/value-tests.log
+    + Show details
+
+• Committed as 0123456789. The focused reruns passed: 110 parser tests, 25 neighbouring tests, 23 value tests and 3 grammar
+  checker tests. The commit includes the initial failures and their corrections. I’m now doing the final pull/push and remote-head
+  check for the three repositories.
+
+• Ran set -e …
+  └ 1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a
+    0    0
+    ## main...origin/main
+    + Show details
+
+• All three are clean on main, matching remote main with zero ahead/behind:
+
+  • parser: 0123456789 — new work committed, tested and pushed.
+  • lexer: 89abcdef0
+  • grammar: 2b2b2b2b
+
+  Pulled and pushed each repository. The dependency pins remain unchanged; adopting newer shared revisions requires separate
+  qualification.
+
+  Worked for 22m 18s · 9:17 AM
+
+• The last turn made concrete progress: the parser work is tested and published. I’m now tracing the next missing link—the
+  grammar's error recovery to the lexer—to find the implementation work that can connect the production path, not just add
+  isolated tests.
+
+
+» Ask Codex to do anything
+
+  GPT-6-Astra ultra · ~/project · Fix the parser · Main [default]                                      Pursuing goal (10d 3h 14m)
+  ← for agents · ? for shortcuts

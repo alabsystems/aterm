@@ -197,6 +197,7 @@ impl App {
             kitty_favourited,
             serious_mode: self.serious_mode_enabled(),
             fullscreen,
+            front_tab_split: self.front_tab_split(),
             multi_tab,
             native_tab_active,
             terminal_front,
@@ -228,6 +229,55 @@ impl App {
             reduced_motion: self.motion_policy(true) == crate::motion::MotionPolicy::Reduced,
             menu_accels,
         }
+    }
+
+    /// Whether the front window's active tab is split, so ⌘W closes a pane
+    /// rather than the tab (`close_active_tab`).
+    fn front_tab_split(&self) -> bool {
+        self.front()
+            .and_then(|ws| ws.tab_set.active())
+            .is_some_and(|tab| tab.root.len() > 1)
+    }
+
+    /// Publish the native bar's live bits ([`crate::menu::MenuLive`]) — the facts
+    /// [`Self::palette_live`] reads for the same rows — for `validateMenuItem:`,
+    /// which AppKit calls synchronously when a menu opens and which cannot reach
+    /// `App`. Called on the way to every wait (macOS, windowed), so it allocates
+    /// nothing and never waits on a terminal: the selection is read with a
+    /// try-lock, and a busy terminal keeps the last bit (a stale Copy bit costs no
+    /// keystroke — a disabled row's ⌘C falls through to `on_key`, which copies).
+    /// Over a native tab Copy stays enabled: reading its selection would copy
+    /// the selected text on every wait. While a rename field is open Copy
+    /// stays enabled too, so ⌘C reaches `divert_menu_action_around_rename`: a
+    /// native field's editor gets `copy:` (it has no ⌘C of its own); the
+    /// in-grid field claims it inert.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn publish_menu_live(&self) {
+        let last = crate::menu::menu_live();
+        let front = self.frontmost_window;
+        let terminal = front.and_then(|wid| self.front_terminal(wid));
+        let has_selection = if front.is_some_and(|wid| self.active_native_view(wid).is_some())
+            || self.front_rename_edit().is_some()
+        {
+            true
+        } else if let Some(terminal) = terminal {
+            crate::term_try_lock(&terminal.term).map_or(last.has_selection, |term| {
+                term.text_selection().has_selection()
+            })
+        } else {
+            false
+        };
+        let promotable = front.map_or(self.launch_kitty, |wid| self.promotable_kitty(wid));
+        crate::menu::set_menu_live(crate::menu::MenuLive {
+            has_selection,
+            multi_tab: self.front().is_some_and(|ws| ws.tab_set.len() >= 2),
+            can_reopen_closed_tab: self.can_reopen_closed_tab(),
+            can_reopen_closed_view: self.can_reopen_closed_view(),
+            serious_mode: self.serious_mode_enabled(),
+            rain_on: terminal.is_some_and(|t| self.session_rain_enabled(t.session)),
+            kitty_favourited: self.kitty_log.is_favourite(promotable),
+            front_tab_split: self.front_tab_split(),
+        });
     }
 
     /// Re-resolve every OPEN palette against the live predicates and repaint — called on
@@ -601,6 +651,126 @@ mod tests {
         for c in query.chars() {
             app.palette_filter_push(c);
         }
+    }
+
+    /// THE MENU BAR PUBLISHES WHAT THE PALETTE RESOLVES. `publish_menu_live` —
+    /// what the native bar's `validateMenuItem:` reads — derives each bit from
+    /// the same fact `palette_live` does: one tab greys the tab cycle, no
+    /// selection greys Copy, serious mode checks its row, and a split front tab
+    /// titles ⌘W's row Close Pane (on the bar and in the palette).
+    #[test]
+    fn the_menu_bar_publishes_what_the_palette_resolves() {
+        use crate::menu::{MenuAction, menu_live, native_live_title, set_menu_live};
+        let _statics = crate::menu::MENU_STATICS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = menu_live();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.frontmost_window = Some(wid);
+        let agrees = |app: &App| {
+            app.publish_menu_live();
+            let bar = menu_live();
+            let palette = app.palette_live();
+            assert_eq!(bar.has_selection, palette.has_selection);
+            assert_eq!(bar.multi_tab, palette.multi_tab);
+            assert_eq!(bar.can_reopen_closed_tab, palette.can_reopen_closed_tab);
+            assert_eq!(bar.can_reopen_closed_view, palette.can_reopen_closed_view);
+            assert_eq!(bar.serious_mode, palette.serious_mode);
+            assert_eq!(bar.rain_on, palette.rain_on);
+            assert_eq!(bar.kitty_favourited, palette.kitty_favourited);
+            assert_eq!(bar.front_tab_split, palette.front_tab_split);
+            bar
+        };
+        let one = agrees(&app);
+        assert!(!one.multi_tab && !one.has_selection && !one.front_tab_split);
+        assert_eq!(native_live_title(MenuAction::CloseTab), Some("Close Tab"));
+
+        app.set_serious_mode(!one.serious_mode);
+        assert_eq!(agrees(&app).serious_mode, !one.serious_mode);
+
+        app.split_active_stub_tab(wid);
+        assert!(agrees(&app).front_tab_split);
+        assert_eq!(native_live_title(MenuAction::CloseTab), Some("Close Pane"));
+
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        let two = agrees(&app);
+        assert!(
+            two.multi_tab && !two.front_tab_split,
+            "a fresh one-pane tab is front"
+        );
+        set_menu_live(before);
+    }
+
+    /// An open rename keeps the Copy row enabled so ⌘C reaches the divert
+    /// (`divert_menu_action_around_rename`) instead of the field editor (which,
+    /// for a native field, has no ⌘C of its own). Headless, the in-grid field
+    /// presents the edit, and the divert claims its Copy inert.
+    #[test]
+    fn a_live_rename_keeps_the_menu_bar_copy_row_enabled() {
+        use crate::menu::{menu_live, set_menu_live};
+        let _statics = crate::menu::MENU_STATICS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = menu_live();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.frontmost_window = Some(wid);
+        app.tab_strip_rows = 1; // the in-grid strip presents the editor headless
+        app.publish_menu_live();
+        assert!(!menu_live().has_selection, "no selection, no edit: greyed");
+
+        let tab = app.windows[&wid].tab_set.active_id().expect("a tab");
+        assert!(app.begin_session_rename(wid, tab));
+        app.publish_menu_live();
+        assert!(menu_live().has_selection, "an open rename field keeps Copy");
+
+        let session = app.rename_edit_session(wid).expect("editing");
+        app.cancel_session_rename(wid, session);
+        app.publish_menu_live();
+        assert!(!menu_live().has_selection, "the edit closed: greyed again");
+        set_menu_live(before);
+    }
+
+    /// A ⌘ chord is a command, never text. A menu row the bar greys hands its
+    /// key equivalent to `on_key` — ⌘C with no selection, ⇧⌘] with one tab,
+    /// ⇧⌘T with nothing to reopen — and with the palette open those typed `c`,
+    /// `}` and `T` into its search.
+    #[test]
+    fn a_command_chord_never_types_into_the_palette_search() {
+        use winit::event::{ElementState, KeyEvent};
+        use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
+        let press = |code, text: &str| {
+            KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(code),
+                Key::Character(SmolStr::new(text)),
+                Some(SmolStr::new(text)),
+                KeyLocation::Standard,
+                ElementState::Pressed,
+                false,
+            )
+        };
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.frontmost_window = Some(wid);
+        app.palette_enter();
+        let query = |app: &App| {
+            app.windows[&wid]
+                .palette()
+                .expect("the palette stays open")
+                .controls_lines()[0]
+                .clone()
+        };
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SUPER;
+        app.on_key(wid, press(KeyCode::KeyC, "c"));
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SUPER | ModifiersState::SHIFT;
+        app.on_key(wid, press(KeyCode::BracketRight, "}"));
+        app.on_key(wid, press(KeyCode::KeyT, "T"));
+        assert!(query(&app).contains("query=\"\""), "{}", query(&app));
+        // Non-vacuity: the same key with no ⌘ types.
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+        app.on_key(wid, press(KeyCode::KeyC, "c"));
+        assert!(query(&app).contains("query=\"c\""), "{}", query(&app));
     }
 
     #[test]

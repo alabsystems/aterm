@@ -148,6 +148,16 @@ impl Fixture {
         {
             script(&root.join("tools").join(name), "exit 0");
         }
+        for name in aterm_verify::stages::TRUST_LANE_SCRIPTS {
+            // The lane says what it verified on a `GATED:` line, which the stage
+            // reads; the self-test says nothing.
+            let body = if name == "trust-gate-all.sh" {
+                "echo 'GATED: 1 of 1 selected; not verified: none'; exit 0"
+            } else {
+                "exit 0"
+            };
+            script(&root.join("tools").join(name), body);
+        }
         script(
             &root.join("tools/grep_guard.sh"),
             "echo 'GUARD: PASS'; exit 0",
@@ -156,6 +166,12 @@ impl Fixture {
             &root.join("tools/license_check.sh"),
             "echo 'LICENSE: PASS'; exit 0",
         );
+        script(
+            &root
+                .join("tools")
+                .join(aterm_verify::stages::EXPORT_CONTENT_SCRIPT),
+            "echo 'EXPORT CONTENT: PASS — a stand-in'; exit 0",
+        );
         fs::create_dir_all(root.join("scripts")).expect("mkdir");
         script(
             &root.join("target-drivers/debug/aterm-redraw-conformance"),
@@ -163,13 +179,16 @@ impl Fixture {
         );
         // The one `aterm` the live lanes are handed.
         script(&root.join("target-drivers/debug/aterm"), "exit 0");
-        for (_, ex) in aterm_verify::stages::OBJC_DRIVER_EXAMPLES {
+        for drive in aterm_verify::stages::OBJC_DRIVES {
             script(
-                &root.join("target-drivers/debug/examples").join(ex),
+                &root
+                    .join("target-drivers/debug/examples")
+                    .join(drive.example),
                 "exit 0",
             );
         }
         script(&stage2.join("trustdoc"), "exit 0");
+        common::checker_home(&base.join("home"));
         let _listener = std::os::unix::net::UnixListener::bind(base.join("ctl.sock"))
             .expect("bind the fixture's control socket");
         Self {
@@ -215,12 +234,13 @@ impl Fixture {
     }
 
     /// [`Self::ctx`] over another checkout of the fixture (a clone), with the
-    /// fixture's own toolchain and scratch.
+    /// fixture's own toolchain, scratch and HOME ([`common::checker_home`]).
     fn ctx_at(&self, root: &Path) -> Ctx {
         common::fixture_ctx(
             root,
             &self.stage2,
             &self.scratch,
+            &self.base.join("home"),
             Mode::Fast,
             Scope::workspace(),
             |_| {},
@@ -524,14 +544,13 @@ fn a_spec_checker_repointed_mid_run_never_claims_the_contract() {
     let repo = Fixture::new("atv-env-checker");
     let home = repo.base.join("home");
     let store_bin = aterm_verify::checkers::store_bin_dir(&home);
-    let (one, two) = (
-        home.join("store/ty/1/bin/ty"),
-        home.join("store/ty/2/bin/ty"),
-    );
-    script(&one, "echo 'ty 1'");
+    // The first build is the one each run asks its version: laid, and its
+    // first exec paid, before the runs ([`common::lay_checker`]). The second
+    // is only ever resolved, never run.
+    let one = common::lay_checker(&home, "ty", "1", "echo 'ty 1'");
+    let two = home.join("store/ty/2/bin/ty");
     script(&two, "echo 'ty 2'");
     let shim = |target: &Path| format!("#!/bin/sh\nexec '{}' \"$@\"\n", target.display());
-    write(&store_bin.join("ty"), &shim(&one));
     let relay = store_bin.join("ty");
     repo.with_targo(&format!(
         "cp '{new}' '{relay}.new' && mv '{relay}.new' '{relay}'",
@@ -569,6 +588,170 @@ fn a_spec_checker_repointed_mid_run_never_claims_the_contract() {
         )),
         "the checker that moved is named: {ladder}"
     );
+}
+
+/// Whole seconds past `bound`: a stand-in that waits this long starts later
+/// than the production bound allows.
+fn past(bound: Duration) -> u64 {
+    bound.as_secs() + 1
+}
+
+/// A stand-in body whose FIRST run waits `secs` before `then`, and whose later
+/// runs answer at once: the shape of a freshly written executable's first exec
+/// on macOS, which waits on the system's assessment of the new file (0.4 s
+/// idle, tens of seconds under load; `aterm-cli`'s `manual.rs` `run_once`).
+fn slow_first_exec(marker: &Path, secs: u64, then: &str) -> String {
+    format!(
+        "if [ ! -e '{m}' ]; then : > '{m}'; sleep {secs}; fi\n{then}",
+        m = marker.display()
+    )
+}
+
+/// A CHECKER SLOW ONLY AT ITS FIRST EXEC IS STILL NAMED WITH ITS VERSION
+/// (2026-09-28). Every stand-in here is a freshly written file, and in a
+/// merge-contract run (`verify-bcbd1f9d0`, run 2) a fresh `ty` stand-in's
+/// checkers line read `no --version answer` where
+/// `a_spec_checker_repointed_mid_run_never_claims_the_contract` asserts `ty 1`
+/// — what a stand-in answering after the 5 s deadline prints. Here the
+/// checker's FIRST exec is deliberately later than that deadline, as macOS's
+/// assessment of a new file makes it under load, and later ones answer at
+/// once. The fixture pays that first exec when it lays the checker
+/// ([`common::lay_checker`], the `run_once` rule), outside the deadline the
+/// run asks it under — a real run's, never a longer one (the review of
+/// 2026-09-28).
+#[test]
+fn a_checker_slow_only_at_its_first_exec_is_named_with_its_version() {
+    let repo = Fixture::new("atv-env-slow-ty");
+    repo.with_targo("true");
+    let ty = common::lay_checker(
+        &repo.base.join("home"),
+        "ty",
+        "9",
+        &slow_first_exec(
+            &repo.base.join("ty.started"),
+            past(aterm_verify::checkers::VERSION_DEADLINE),
+            "echo 'ty slow'",
+        ),
+    );
+
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_ne!(code, exit::COULD_NOT_RUN, "{ladder}");
+    let ty = fs::canonicalize(&ty).expect("the checker");
+    assert!(
+        ladder.contains(&format!(
+            "verify: checkers ty = {} (atpkg store, ty slow); ",
+            ty.display()
+        )),
+        "the version a checker slow to start answers is named: {ladder}"
+    );
+}
+
+/// AN INSTANCE SLOW ONLY AT ITS FIRST EXEC ADDS NO RED TO A FIXTURE RUN
+/// (2026-09-28). The stand-in `aterm-gui` the smoke launches is written afresh
+/// by every smoke build, and in the same merge-contract run it did not listen
+/// within the smoke's listen wait: `smoke: control socket never started
+/// listening` joined main's receipt as a second red, and
+/// `a_red_main_already_has_is_inherited_and_a_new_one_blocks`, which counts
+/// exactly one, failed. Here the instance's FIRST exec is half as long again
+/// as that wait ([`SOCKET_POLLS`](aterm_verify::smoke_stages::SOCKET_POLLS)
+/// looks, [`POLL_GAP`](aterm_verify::smoke_stages::POLL_GAP) apart), and later
+/// ones start at once. The build that writes it runs it once
+/// ([`common::answering_smoke`]), so the smoke — waiting a real run's wait,
+/// never a longer one (the review of 2026-09-28) — decides exactly what a fast
+/// start decides.
+#[test]
+fn an_instance_slow_only_at_its_first_exec_adds_no_red_to_a_fixture_run() {
+    let repo = Fixture::new("atv-env-slow-gui");
+    repo.git_init();
+    let smoke = repo.answering_smoke();
+    let head = "<<'GUI'\n#!/bin/sh\n";
+    assert!(smoke.contains(head), "the stand-in instance's head moved");
+    let wait = aterm_verify::smoke_stages::POLL_GAP
+        * u32::try_from(aterm_verify::smoke_stages::SOCKET_POLLS).expect("a count");
+    let first = slow_first_exec(&repo.base.join("gui.started"), wait.as_secs() * 3 / 2, "");
+    script(
+        &repo.stage2.join("targo"),
+        &smoke.replacen(head, &format!("{head}{first}\n"), 1),
+    );
+
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert!(!ladder.contains("never started listening"), "{ladder}");
+    assert!(
+        ladder.contains("  ok    smoke: aterm-ctl cursor -> OK 0 0 1 blinking_block"),
+        "{ladder}"
+    );
+    assert_eq!(code, exit::PASS, "{ladder}");
+}
+
+/// Thirty seconds: six times a spec checker's `--version` deadline (5 s) and
+/// three times the smoke's listen wait (a hundred 100 ms polls). A stand-in
+/// this slow on EVERY exec, not only its first, is one a real run gives up on.
+const SLOWER_THAN_A_REAL_RUN_WAITS: u64 = 30;
+
+/// A FIXTURE WAITS NO LONGER THAN A REAL RUN FOR A CHECKER (the review of
+/// 2026-09-28). The fixtures waited 300 s for each checker's `--version`
+/// (f6921d3de's `FIXTURE_PATIENCE`) where a real run waits 5 s, so a checker
+/// that answers late at EVERY exec — what a real regression looks like —
+/// was named with its version in a fixture and without one in a real run.
+/// A fixture now asks under the real run's deadline and pays each stand-in's
+/// FIRST exec before the run instead (the `run_once` rule; see
+/// [`common::checker_home`]).
+#[test]
+fn a_checker_slower_than_a_real_run_allows_is_named_without_a_version() {
+    let repo = Fixture::new("atv-env-late-ty");
+    repo.with_targo("true");
+    let home = repo.base.join("home");
+    let ty = home.join("store/ty/8/bin/ty");
+    script(
+        &ty,
+        &format!("/bin/sleep {SLOWER_THAN_A_REAL_RUN_WAITS}; echo 'ty late'"),
+    );
+    write(
+        &aterm_verify::checkers::store_bin_dir(&home).join("ty"),
+        &format!("#!/bin/sh\nexec '{}' \"$@\"\n", ty.display()),
+    );
+
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_ne!(code, exit::COULD_NOT_RUN, "{ladder}");
+    let ty = fs::canonicalize(&ty).expect("the checker");
+    assert!(
+        ladder.contains(&format!(
+            "verify: checkers ty = {} (atpkg store, no --version answer); ",
+            ty.display()
+        )),
+        "a checker a real run gives up on is given up on here too: {ladder}"
+    );
+}
+
+/// A FIXTURE WAITS NO LONGER THAN A REAL RUN FOR ITS INSTANCE TO LISTEN (the
+/// review of 2026-09-28). The fixtures waited 300 s where a real run's smoke
+/// waits a hundred 100 ms polls, so a stand-in `aterm-gui` that listens late
+/// at EVERY launch added no red to a fixture run, which a real run reds. A
+/// fixture's smoke now waits what a real run's does, and the stand-in's FIRST
+/// exec is paid by the build that writes it instead
+/// ([`common::answering_smoke`]).
+#[test]
+fn an_instance_listening_later_than_a_real_run_waits_is_red_in_a_fixture() {
+    let repo = Fixture::new("atv-env-late-gui");
+    repo.git_init();
+    let smoke = repo.answering_smoke();
+    let link = "mkdir -p \"$XDG_RUNTIME_DIR/aterm\"\n";
+    assert!(smoke.contains(link), "the stand-in's listen step moved");
+    script(
+        &repo.stage2.join("targo"),
+        &smoke.replacen(
+            link,
+            &format!("sleep {SLOWER_THAN_A_REAL_RUN_WAITS}\n{link}"),
+            1,
+        ),
+    );
+
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert!(
+        ladder.contains("smoke: control socket never started listening"),
+        "an instance a real run reds is red here too: {ladder}"
+    );
+    assert_eq!(code, exit::FAILED, "{ladder}");
 }
 
 /// A caller repo with every kind of uncommitted change a developer has.
@@ -2531,6 +2714,7 @@ fn warm_snapshot(repo: &Fixture) -> (Ctx, u64, Budget) {
     let budget = Budget {
         cold: held + 4096,
         warm_growth: 8192,
+        in_flight: 0,
         reserve: 4096,
         lane_cap: held * 4,
     };
@@ -2733,10 +2917,16 @@ impl Fixture {
         // A compiler that names its commit: a base serves only a run made by
         // the same one, and one that names none can be told from no other
         // (2026-09-27, third review).
+        let trustc = self.stage2.join("trustc");
         script(
-            &self.stage2.join("trustc"),
+            &trustc,
             "echo 'rustc 1.99.0-dev (trustc 0.1.0)'; echo 'commit-hash: f1f1f1f1f1f1'",
         );
+        // Its first exec paid here, where nothing bounds it (2026-09-28): each
+        // run asks it `-vV` under a 60 s ceiling, and a first exec past that
+        // leaves the run's receipt naming no compiler commit, so main's could
+        // serve no branch as a base.
+        common::run_once(&trustc, "-vV");
         script(
             &self.stage2.join("targo"),
             &format!(

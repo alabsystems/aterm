@@ -315,7 +315,7 @@ mod tests {
         tag: &str,
         replies: Vec<Option<&'static str>>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        let dir = std::env::temp_dir().join(format!("aterm-relayctl-{tag}-{}", std::process::id()));
+        let dir = crate::supervise::test_scratch_path("relayctl", tag);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let sock = dir.join("a.sock");

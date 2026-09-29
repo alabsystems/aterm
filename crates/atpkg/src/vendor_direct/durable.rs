@@ -78,9 +78,9 @@ pub(super) fn temp_path(path: &Path, seq: u64) -> io::Result<PathBuf> {
     let mut tmp = String::from(".");
     tmp.push_str(file_name(path)?);
     tmp.push_str(".tmp-");
-    tmp.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    tmp.push_str(&std::process::id().to_string());
     tmp.push('-');
-    tmp.push_str(&crate::dec_u64(seq));
+    tmp.push_str(&seq.to_string());
     Ok(path.with_file_name(tmp))
 }
 

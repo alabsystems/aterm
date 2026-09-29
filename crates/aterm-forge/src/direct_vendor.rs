@@ -27,11 +27,16 @@
 //!    `vendor/astream/crates/<name>/Cargo.toml`, as path packages (a null
 //!    `source`) licensed Apache-2.0, and NOT as aterm workspace members;
 //! 5. the root manifest's `[workspace] exclude` covers `vendor/astream`;
-//! 6. `crates/aterm-link` still reaches astream-broker and astream-cap there.
+//! 6. `crates/aterm-link` still reaches astream-broker and astream-cap there;
+//! 7. the pin did not move BACKWARD: relative to the merge-base with
+//!    `origin/main`, a bump goes forward or nowhere (see [`PinMotion`]).
 //!
 //! The gitlink is read from the INDEX rather than from `HEAD`'s tree. The
 //! index is what the next commit records, so a staged bump is judged as the
 //! commit it is about to become; on a committed tree the two are the same.
+//! Obligation 7 compares against `HEAD`'s merge-base with `origin/main`, so
+//! mid-merge (`MERGE_HEAD` set, merge commit not yet made) it is blind to the
+//! merge's own result and judges the merge commit once it exists.
 //!
 //! # What it does not prove
 //!
@@ -52,6 +57,14 @@ const SUBMODULE: &str = "vendor/astream";
 /// Accepted with or without a trailing `.git`, and in no other spelling.
 const URL: &str = "https://github.com/alabsystems/astream";
 const GITLINK_MODE: &str = "160000";
+/// The line of work the pin is judged against. The full ref name, so a local
+/// branch or tag spelled `origin/main` cannot stand in for it.
+const BASE_REF: &str = "refs/remotes/origin/main";
+/// How messages spell [`BASE_REF`].
+const BASE_NAME: &str = "origin/main";
+/// A tip-commit message line that declares a DELIBERATE backward move, with
+/// its reason: `astream-pin-rollback: astream 5021230 broke the sealed wire`.
+const ROLLBACK_TRAILER: &str = "astream-pin-rollback:";
 /// The astream crates aterm resolves. `astream-aead` only under aterm-link's
 /// off-by-default `sealed` feature, which is why [`metadata`] asks for every
 /// feature.
@@ -110,6 +123,41 @@ enum Checkout {
     },
 }
 
+/// Where this tree's pin stands against the pin `origin/main` had at the
+/// merge-base. A bump moves FORWARD in astream's history; the way it goes
+/// backward by accident is a checkout whose submodule the pull did not
+/// advance, where `git commit -a` or `git add -A` (or a merge resolved from
+/// that checkout) records the OLD gitlink. Seen 2026-09-29: main's pin went
+/// back from astream `73e837b` to its ancestor `5021230` after being bumped.
+///
+/// A provable regression fails, and so does a pin that cannot be a bump
+/// because the base's pin was never fetched ([`PinMotion::BaseNotFetched`]);
+/// everything else passes. This module never fetches, so a pin commit missing
+/// from the submodule's store is [`PinMotion::Undecided`] and passes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PinMotion {
+    /// The gitlink is the base's own, or there is nothing to compare with: no
+    /// `origin/main`, or no gitlink at `vendor/astream` at the merge-base.
+    Unchanged,
+    /// The base's pin is an ancestor of this one: a bump.
+    Forward,
+    /// Neither pin is an ancestor of the other.
+    Diverged,
+    /// This pin is a strict ancestor of the base's: a regression. `declared`
+    /// is the tip commit's `astream-pin-rollback:` reason when it names one.
+    Backward {
+        base: String,
+        declared: Option<String>,
+    },
+    /// The base's pin is not in the submodule's object store. This pin IS
+    /// (the checkout is at it), and a descendant of the base would carry the
+    /// base with it, so it is no bump from it: a stale checkout that never
+    /// fetched what main moved on to, which is where the incident began.
+    BaseNotFetched { base: String },
+    /// Could not be decided, with the reason.
+    Undecided(String),
+}
+
 /// Everything [`validate`] judges. [`capture`] reads it from the real
 /// repository and the tests mutate it.
 #[derive(Clone, Debug)]
@@ -119,6 +167,8 @@ struct Facts {
     gitmodules: Vec<(String, String)>,
     index: Vec<IndexEntry>,
     checkout: Checkout,
+    /// The pin against `origin/main`'s, at the merge-base.
+    motion: PinMotion,
     /// The root manifest's `[workspace] exclude` entries.
     exclude: Vec<String>,
     /// Held as a result so that the git facts, which explain WHY cargo
@@ -141,10 +191,12 @@ pub(crate) fn review(root: &Path) -> Result<Option<Pin>, String> {
 }
 
 fn capture(root: &Path) -> Result<Facts, String> {
+    let index = index(root)?;
     Ok(Facts {
         gitmodules: gitmodules(root)?,
-        index: index(root)?,
+        index: index.clone(),
         checkout: checkout(root),
+        motion: pin_motion(root, &index),
         exclude: exclude(root)?,
         metadata: metadata(root),
     })
@@ -268,6 +320,115 @@ fn checkout(root: &Path) -> Checkout {
     }
 }
 
+/// Never an error: what git cannot answer is [`PinMotion::Undecided`], and an
+/// unreadable gitlink is [`validate`]'s finding, not this function's.
+fn pin_motion(root: &Path, index: &[IndexEntry]) -> PinMotion {
+    let Ok(pin) = gitlink(index) else {
+        return PinMotion::Unchanged;
+    };
+    let base_tip = format!("{BASE_REF}^{{commit}}");
+    if git(
+        root,
+        &["rev-parse", "--verify", "--quiet", &base_tip],
+        false,
+    )
+    .is_err()
+    {
+        return PinMotion::Unchanged;
+    }
+    let merge_base = match git(root, &["merge-base", "HEAD", BASE_REF], false) {
+        Ok(out) => String::from_utf8_lossy(&out).trim().to_owned(),
+        Err(e) => return PinMotion::Undecided(format!("no merge-base with {BASE_REF}: {e}")),
+    };
+    // The gitlink at the merge-base. No entry there, or one that is not a
+    // gitlink, means there is no earlier pin to fall behind.
+    let base = match git(
+        root,
+        &["ls-tree", "-z", &merge_base, "--", SUBMODULE],
+        false,
+    )
+    .and_then(nul_separated)
+    {
+        Ok(entries) => match entries.iter().find_map(|e| {
+            let (meta, path) = e.split_once('\t')?;
+            let mut f = meta.split(' ');
+            let (mode, _kind, object) = (f.next()?, f.next()?, f.next()?);
+            (path == SUBMODULE && mode == GITLINK_MODE).then(|| object.to_owned())
+        }) {
+            Some(object) => object,
+            None => return PinMotion::Unchanged,
+        },
+        Err(e) => return PinMotion::Undecided(format!("cannot read {merge_base}: {e}")),
+    };
+    if base == pin {
+        return PinMotion::Unchanged;
+    }
+    let sub = root.join(SUBMODULE);
+    let held = |commit: &str| {
+        git(
+            &sub,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+            true,
+        )
+        .is_ok()
+    };
+    if !held(&pin) {
+        return PinMotion::Undecided(format!(
+            "astream commit {pin} is not in {SUBMODULE}'s object store"
+        ));
+    }
+    if !held(&base) {
+        return PinMotion::BaseNotFetched { base };
+    }
+    match (
+        is_ancestor(&sub, &base, &pin),
+        is_ancestor(&sub, &pin, &base),
+    ) {
+        (Ok(true), _) => PinMotion::Forward,
+        (Ok(false), Ok(true)) => PinMotion::Backward {
+            declared: rollback_reason(root, &merge_base),
+            base,
+        },
+        (Ok(false), Ok(false)) => PinMotion::Diverged,
+        (Err(e), _) | (_, Err(e)) => PinMotion::Undecided(e),
+    }
+}
+
+/// `git merge-base --is-ancestor`: exit 0 yes, 1 no, anything else an error,
+/// which [`git`] cannot tell apart from "no".
+fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(dir);
+    for var in REPO_ENV {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("cannot run `git merge-base --is-ancestor`: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "`git merge-base --is-ancestor {ancestor} {descendant}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+/// The reason a commit on this branch (`merge_base..HEAD`) gives for moving
+/// the pin backward, if any does. A rollback usually needs aterm changes for
+/// the older astream on top of it, so the trailer is not confined to the tip.
+/// It must start its line: an indented or quoted mention is documentation.
+fn rollback_reason(root: &Path, merge_base: &str) -> Option<String> {
+    let range = format!("{merge_base}..HEAD");
+    let log = git(root, &["log", "--format=%B%x00", &range], false).ok()?;
+    String::from_utf8_lossy(&log).lines().find_map(|line| {
+        let reason = line.strip_prefix(ROLLBACK_TRAILER)?.trim();
+        (!reason.is_empty()).then(|| reason.to_owned())
+    })
+}
+
 fn exclude(root: &Path) -> Result<Vec<String>, String> {
     let path = root.join("Cargo.toml");
     let doc: DocumentMut = std::fs::read_to_string(&path)
@@ -292,7 +453,9 @@ fn exclude(root: &Path) -> Result<Vec<String>, String> {
 /// only through aterm-link's off-by-default `sealed` feature. Still `--locked
 /// --offline`: this reads the lock that ships and fetches nothing.
 fn metadata(root: &Path) -> Result<Value, String> {
-    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // `$CARGO` (the driver running forge), else Trust's `targo` — never a stock
+    // `cargo`. `metadata` takes no lane flag.
+    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
     let out = Command::new(exe)
         .args([
             "metadata",
@@ -320,11 +483,40 @@ fn validate(root: &Path, facts: &Facts) -> Result<Pin, String> {
     let url = declared_url(&facts.gitmodules)?;
     let commit = gitlink(&facts.index)?;
     checked_out_at(&facts.checkout, &commit)?;
+    pin_did_not_move_back(&facts.motion, &commit)?;
     excluded(&facts.exclude)?;
     let metadata = facts.metadata.as_ref().map_err(Clone::clone)?;
     resolved_from_submodule(root, metadata)?;
     consumer_reaches_submodule(root, metadata)?;
     Ok(Pin { commit, url })
+}
+
+/// (7) The pin did not go backward against `origin/main` at the merge-base.
+fn pin_did_not_move_back(motion: &PinMotion, commit: &str) -> Result<(), String> {
+    match motion {
+        PinMotion::Backward {
+            base,
+            declared: None,
+        } => Err(format!(
+            "this tree pins `{SUBMODULE}` at {commit}, an ANCESTOR of {base}, the pin \
+             {BASE_NAME} had at the merge-base — a bump moves forward only. A checkout whose \
+             submodule a pull never advanced leaves this behind (`git commit -a` / `git add -A` \
+             then records the OLD gitlink). To repair it: `git -C {SUBMODULE} checkout {base} && \
+             git add {SUBMODULE}`, then commit or amend — `git submodule update --init` cannot \
+             help once the regressed gitlink is what is staged. To prevent it: `git submodule \
+             update --init {SUBMODULE}` BEFORE committing, and `git config submodule.recurse \
+             true`. A DELIBERATE rollback says so in a commit message on this branch, on a line \
+             that starts `{ROLLBACK_TRAILER} <reason>`"
+        )),
+        PinMotion::BaseNotFetched { base } => Err(format!(
+            "{BASE_NAME} pinned `{SUBMODULE}` at {base} at the merge-base, and this checkout's \
+             submodule has never fetched it, so {commit} cannot be a bump from it (a descendant \
+             would hold it) — the shape of a stale checkout re-recording an old gitlink. Run \
+             `git -C {SUBMODULE} fetch origin`, then re-run: a real bump passes, and a rollback \
+             needs a line starting `{ROLLBACK_TRAILER} <reason>` in a commit message on this branch"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// A short, bounded rendering of a path list for a one-line failure.
@@ -843,5 +1035,272 @@ mod tests {
             }
         }
         rejects(&root, &facts, &["aterm-link redirects astream-cap"]);
+    }
+
+    #[test]
+    fn a_backward_pin_is_refused_unless_a_commit_on_the_branch_declares_a_rollback() {
+        let (root, mut facts) = real();
+        let base = "0123456789012345678901234567890123456789".to_owned();
+        facts.motion = PinMotion::Backward {
+            base: base.clone(),
+            declared: None,
+        };
+        rejects(
+            &root,
+            &facts,
+            &[
+                "ANCESTOR",
+                &base,
+                "forward only",
+                "submodule.recurse",
+                ROLLBACK_TRAILER,
+            ],
+        );
+        facts.motion = PinMotion::Backward {
+            base,
+            declared: Some("astream 5021230 broke the sealed wire".into()),
+        };
+        assert!(
+            validate(&root, &facts).is_ok(),
+            "a declared rollback passes"
+        );
+        // A base the checkout never fetched cannot be bumped from either.
+        facts.motion = PinMotion::BaseNotFetched {
+            base: "0123456789012345678901234567890123456789".into(),
+        };
+        rejects(
+            &root,
+            &facts,
+            &["never fetched", "fetch origin", ROLLBACK_TRAILER],
+        );
+        // Everything else passes.
+        for other in [
+            PinMotion::Unchanged,
+            PinMotion::Forward,
+            PinMotion::Diverged,
+            PinMotion::Undecided("no origin/main".into()),
+        ] {
+            facts.motion = other.clone();
+            assert!(validate(&root, &facts).is_ok(), "{other:?} must pass");
+        }
+    }
+
+    /// A throwaway superproject whose `vendor/astream` is a real repository,
+    /// so `pin_motion` runs the git it runs in production.
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Fixture {
+            let root =
+                std::env::temp_dir().join(format!("aterm-forge-pin-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(SUBMODULE)).unwrap();
+            let f = Fixture { root };
+            f.run(&f.root, &["init", "-q", "-b", "main"]);
+            f.run(&f.root.join(SUBMODULE), &["init", "-q", "-b", "main"]);
+            f
+        }
+
+        fn run(&self, dir: &Path, args: &[&str]) -> String {
+            let mut cmd = Command::new("git");
+            cmd.args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(dir);
+            // Whatever git repository the caller exports would otherwise take
+            // these commits — and this fixture writes `origin/main`.
+            for var in REPO_ENV {
+                cmd.env_remove(var);
+            }
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        }
+
+        /// A commit in the SUBMODULE on top of `parent` (or the current HEAD).
+        fn astream_commit(&self, parent: Option<&str>, msg: &str) -> String {
+            let sub = self.root.join(SUBMODULE);
+            if let Some(p) = parent {
+                self.run(&sub, &["checkout", "-q", "--detach", p]);
+            }
+            self.run(&sub, &["commit", "-q", "--allow-empty", "-m", msg]);
+            self.run(&sub, &["rev-parse", "HEAD"])
+        }
+
+        /// A commit in the SUPERPROJECT that records `pin` at the gitlink.
+        fn commit_pin(&self, parent: Option<&str>, pin: &str, msg: &str) -> String {
+            if let Some(p) = parent {
+                self.run(&self.root, &["checkout", "-q", "--detach", p]);
+            }
+            let cacheinfo = format!("160000,{pin},{SUBMODULE}");
+            self.run(
+                &self.root,
+                &["update-index", "--add", "--cacheinfo", &cacheinfo],
+            );
+            self.run(&self.root, &["commit", "-q", "-m", msg]);
+            self.run(&self.root, &["rev-parse", "HEAD"])
+        }
+
+        fn motion(&self) -> PinMotion {
+            // `pin_motion` asks the superproject with the caller's environment,
+            // as production does (a hook's GIT_INDEX_FILE is honoured there),
+            // so an exported repository variable would aim it at that repository.
+            for var in REPO_ENV {
+                assert!(
+                    std::env::var_os(var).is_none(),
+                    "{var} is exported: unset it, or this test reads a real repository"
+                );
+            }
+            pin_motion(&self.root, &index(&self.root).unwrap())
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn the_pin_is_judged_against_origin_main_at_the_merge_base_with_real_git() {
+        let f = Fixture::new("motion");
+        let c1 = f.astream_commit(None, "c1");
+        let c2 = f.astream_commit(None, "c2");
+        let c3 = f.astream_commit(None, "c3");
+        let sibling = f.astream_commit(Some(&c1), "sibling of c2");
+
+        // No origin/main at all: nothing to fall behind.
+        let base = f.commit_pin(None, &c2, "base: the pin is c2");
+        assert_eq!(
+            f.motion(),
+            PinMotion::Unchanged,
+            "no {BASE_REF} to judge by"
+        );
+        f.run(&f.root, &["update-ref", "refs/remotes/origin/main", &base]);
+
+        // The gitlink is the base's own.
+        assert_eq!(f.motion(), PinMotion::Unchanged);
+
+        // The bump goes forward, and stays forward through a later commit.
+        f.commit_pin(Some(&base), &c3, "bump to c3");
+        assert_eq!(f.motion(), PinMotion::Forward);
+
+        // THE INCIDENT: a stale checkout commits the old gitlink back.
+        f.commit_pin(Some(&base), &c1, "an unrelated fix that drags the pin back");
+        assert_eq!(
+            f.motion(),
+            PinMotion::Backward {
+                base: c2.clone(),
+                declared: None
+            }
+        );
+
+        // The same regression, declared, is a rollback and says why.
+        f.commit_pin(
+            Some(&base),
+            &c1,
+            "revert astream\n\nastream-pin-rollback: c2 broke the sealed wire",
+        );
+        let declared = PinMotion::Backward {
+            base: c2.clone(),
+            declared: Some("c2 broke the sealed wire".into()),
+        };
+        assert_eq!(f.motion(), declared);
+        // …and it still counts once more commits sit on top of it, which is how
+        // a rollback lands (aterm changes for the older astream follow it).
+        f.run(
+            &f.root,
+            &["commit", "-q", "--allow-empty", "-m", "adapt aterm-link"],
+        );
+        assert_eq!(
+            f.motion(),
+            declared,
+            "the trailer is not confined to the tip"
+        );
+        // An empty reason, an indented mention and a quoted one declare nothing.
+        for msg in [
+            "revert\n\nastream-pin-rollback:   ",
+            "revert\n\n    astream-pin-rollback: <reason> is the escape hatch",
+            "revert\n\n> astream-pin-rollback: quoted",
+        ] {
+            f.commit_pin(Some(&base), &c1, msg);
+            assert!(
+                matches!(f.motion(), PinMotion::Backward { declared: None, .. }),
+                "{msg:?} must not declare a rollback"
+            );
+        }
+
+        // Neither pin descends from the other.
+        f.commit_pin(Some(&base), &sibling, "sideways to a sibling of c2");
+        assert_eq!(f.motion(), PinMotion::Diverged);
+
+        // A pin whose commit this checkout does not hold cannot be decided
+        // offline, and an undecided pin never fails the gate.
+        f.commit_pin(Some(&base), &"f".repeat(40), "a pin nobody fetched");
+        assert!(
+            matches!(f.motion(), PinMotion::Undecided(_)),
+            "{:?}",
+            f.motion()
+        );
+    }
+
+    #[test]
+    fn a_stale_checkout_that_never_fetched_the_base_is_caught_not_skipped() {
+        let f = Fixture::new("stale");
+        let c1 = f.astream_commit(None, "c1");
+        // main moved on to a commit this checkout's submodule never fetched.
+        let unfetched = "a".repeat(40);
+        let base = f.commit_pin(None, &unfetched, "main: pinned to a commit not held here");
+        f.run(&f.root, &["update-ref", "refs/remotes/origin/main", &base]);
+        f.commit_pin(
+            Some(&base),
+            &c1,
+            "an unrelated fix re-recording the old gitlink",
+        );
+        assert_eq!(
+            f.motion(),
+            PinMotion::BaseNotFetched { base: unfetched },
+            "a pin the checkout holds, against a base it does not, is no bump from it"
+        );
+    }
+
+    #[test]
+    fn no_gitlink_at_the_merge_base_means_no_earlier_pin_to_fall_behind() {
+        let f = Fixture::new("nobase");
+        let c1 = f.astream_commit(None, "c1");
+        // The base commit tracks something else and has no vendor/astream at all.
+        std::fs::write(f.root.join("README"), "x").unwrap();
+        f.run(&f.root, &["add", "README"]);
+        f.run(&f.root, &["commit", "-q", "-m", "base: no submodule yet"]);
+        let base = f.run(&f.root, &["rev-parse", "HEAD"]);
+        f.run(&f.root, &["update-ref", "refs/remotes/origin/main", &base]);
+        f.commit_pin(Some(&base), &c1, "add the submodule");
+        assert_eq!(f.motion(), PinMotion::Unchanged);
+    }
+
+    #[test]
+    fn a_local_branch_named_origin_main_is_not_the_base() {
+        let f = Fixture::new("shadow");
+        let c1 = f.astream_commit(None, "c1");
+        let c2 = f.astream_commit(None, "c2");
+        let base = f.commit_pin(None, &c2, "the pin is c2");
+        // The remote-tracking ref is absent, and a LOCAL branch spells its name.
+        f.run(&f.root, &["branch", "origin/main", &base]);
+        f.commit_pin(Some(&base), &c1, "goes back to c1");
+        assert_eq!(f.motion(), PinMotion::Unchanged);
     }
 }

@@ -132,29 +132,32 @@ pub fn encode_key_with_layout(
     };
     let kitty_key = folded.as_ref().unwrap_or(key);
 
-    // ConPTY win32-input-mode (DEC 9001): an Enter CHORD goes out as the
-    // INPUT_RECORD pair conhost asked for, and it goes out FIRST — ahead of the
-    // kitty gate and of xterm modifyOtherKeys — because under ConPTY conhost is
-    // the only reader there is. Measured 2026-09-22 (scratch
+    // ConPTY win32-input-mode (DEC 9001): a key conhost cannot read from legacy
+    // VT goes out as the INPUT_RECORD pair conhost asked for — the Enter chords
+    // and the ESC keys [`win32_key_record`] names — and it goes out FIRST, ahead
+    // of the kitty gate and of xterm modifyOtherKeys, because under ConPTY
+    // conhost is the only reader there is. Measured 2026-09-22 (scratch
     // CreatePseudoConsole, conhost 10.0.26200): an application's `CSI > 1 u`
     // push and its `CSI > 4;2 m` reach this terminal verbatim through the
     // pipe, so the kitty flags and the xterm level really do get set here — but
     // conhost's input parser then DROPS the `CSI 13;2 u` and the
     // `CSI 27;2;13 ~` the terminal writes back (no INPUT_RECORD at all reached
     // a `ReadKey` loop; a byte fed after them arrived fine), while the win32
-    // pair arrives as `Enter+Shift`. Letting the application's push outrank
-    // the record would therefore kill the chord for exactly the applications
-    // that asked for it (Claude Code pushes disambiguate). Unix is untouched:
-    // 9001 is never set there. The RELEASE of a chord encodes to nothing
-    // whatever the kitty flags say — the pair already carries its key-up, and
-    // a kitty release report would be dropped by conhost anyway.
+    // pair arrives as `Enter+Shift`; re-measured 2026-09-27 for Escape's own
+    // `CSI 27 u` and Ctrl+['s `CSI 27;5;91 ~`, both dropped the same way.
+    // Letting the application's push outrank the record would therefore kill
+    // the key for exactly the applications that asked for it (Claude Code
+    // pushes disambiguate). Unix is untouched: 9001 is never set there. The
+    // RELEASE of a routed key encodes to nothing whatever the kitty flags say
+    // — the pair already carries its key-up, and a kitty release report would
+    // be dropped by conhost anyway.
     if mode.contains(KeyboardMode::WIN32_INPUT)
-        && let Some(chord) = win32_enter_chord(key, modifiers)
+        && let Some(record) = win32_key_record(key, modifiers, mode, base_layout_key)
     {
         return if event_type == KeyEventType::Release {
             Vec::new()
         } else {
-            encode_win32_enter_record_pair(&chord)
+            encode_win32_record_pair(&record)
         };
     }
 
@@ -779,6 +782,17 @@ pub fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
 /// real `INPUT_RECORD` reports as `ENHANCED_KEY` in `dwControlKeyState`.
 const WIN32_VK_RETURN: u32 = 13;
 const WIN32_SC_RETURN: u32 = 28;
+/// `VK_ESCAPE` / scan 0x01 and `VK_BACK` / scan 0x0E, with the `UnicodeChar`
+/// a Windows keyboard gives each: ESC (0x1B) and BS (0x08). BS, not the DEL
+/// aterm's legacy Backspace writes: it is the char conhost itself put in the
+/// Alt+Backspace record it decoded from `ESC DEL` (measured 2026-09-27,
+/// `Backspace MODS=Alt CHAR=0x8`), so the record keeps what applications saw.
+const WIN32_VK_ESCAPE: u32 = 0x1b;
+const WIN32_SC_ESCAPE: u32 = 0x01;
+const WIN32_ESCAPE_CHAR: u32 = 0x1b;
+const WIN32_VK_BACK: u32 = 0x08;
+const WIN32_SC_BACK: u32 = 0x0e;
+const WIN32_BACK_CHAR: u32 = 0x08;
 /// `dwControlKeyState` bits (wincon.h): `SHIFT_PRESSED`, `LEFT_CTRL_PRESSED`,
 /// `LEFT_ALT_PRESSED`, `ENHANCED_KEY`. The host cannot tell a left modifier
 /// from a right one once winit has canonicalized the chord, so the LEFT bits
@@ -815,20 +829,42 @@ const WIN32_ENHANCED_KEY: u32 = 0x100;
 const WIN32_SHIFT_ENTER_CHAR: u32 = 13;
 const WIN32_CTRL_ENTER_CHAR: u32 = 10;
 
-/// The two record fields an Enter chord decides; the rest of the record is
-/// fixed (`VK_RETURN`, scan 28, repeat 1).
-struct Win32EnterChord {
-    /// [`WIN32_SHIFT_ENTER_CHAR`] or [`WIN32_CTRL_ENTER_CHAR`].
-    unicode_char: u32,
-    /// The `dwControlKeyState` word.
-    control_state: u32,
+/// The four `INPUT_RECORD` fields a routed key decides — `wVirtualKeyCode`,
+/// `wVirtualScanCode`, `UnicodeChar` and `dwControlKeyState`. `bKeyDown` and
+/// `wRepeatCount` belong to the pair ([`encode_win32_record_pair`]).
+struct Win32KeyRecord {
+    vk: u32,
+    sc: u32,
+    uc: u32,
+    cs: u32,
 }
 
-/// The win32-input-mode record fields for an Enter chord — `Some` only for an
+/// The win32-input-mode record for a key conhost cannot read from legacy VT,
+/// or `None` for every key it reads correctly, which keeps its legacy bytes.
+/// Two families, both measured against conhost 10.0.26200: the Enter chords
+/// legacy VT has no byte for ([`win32_enter_chord`]), and the keys whose
+/// legacy bytes conhost stops reading once it has seen one record
+/// ([`win32_escape_record`]).
+// Skip: `Option::or_else` over two table lookups — absent std bodies; both
+// halves are exhaustively unit-tested against the measured records.
+#[cfg_attr(trust_verify, trust::skip)]
+fn win32_key_record(
+    key: &Key,
+    modifiers: Modifiers,
+    mode: KeyboardMode,
+    base_layout_key: Option<char>,
+) -> Option<Win32KeyRecord> {
+    win32_enter_chord(key, modifiers)
+        .or_else(|| win32_escape_record(key, modifiers, mode, base_layout_key))
+}
+
+/// The win32-input-mode record for an Enter chord — `Some` only for an
 /// Enter (main block or keypad) with SHIFT and/or CTRL (ALT may ride along),
 /// `None` for everything else so the caller falls through to the legacy bytes:
 /// plain Enter stays CR and Alt+Enter stays `ESC CR`, both of which conhost
-/// already translates correctly (measured 2026-09-22). The keypad Enter is the
+/// already translates correctly (measured 2026-09-22, and again 2026-09-27
+/// after a record had switched its parser — see
+/// [`conhost_holds_once_switched`]). The keypad Enter is the
 /// same VK/scan pair flagged `ENHANCED_KEY`, as a real record for the
 /// E0-prefixed key is; it must be routed here too, because the legacy keypad
 /// arm falls back to the main Enter's bare LF, which is precisely the byte
@@ -838,8 +874,8 @@ struct Win32EnterChord {
 // Skip: bitflags `contains` and a `match` over a table enum — absent std
 // bodies; the mapping is exhaustively unit-tested against the spec.
 #[cfg_attr(trust_verify, trust::skip)]
-fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32EnterChord> {
-    let mut control_state = match key {
+fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32KeyRecord> {
+    let mut cs = match key {
         Key::Named(NamedKey::Enter) => 0u32,
         Key::Named(NamedKey::NumpadEnter) => WIN32_ENHANCED_KEY,
         _ => return None,
@@ -850,57 +886,224 @@ fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32EnterChord>
         return None;
     }
     if shift {
-        control_state |= WIN32_SHIFT_PRESSED;
+        cs |= WIN32_SHIFT_PRESSED;
     }
     if ctrl {
-        control_state |= WIN32_LEFT_CTRL_PRESSED;
+        cs |= WIN32_LEFT_CTRL_PRESSED;
     }
     if modifiers.contains(Modifiers::ALT) {
-        control_state |= WIN32_LEFT_ALT_PRESSED;
+        cs |= WIN32_LEFT_ALT_PRESSED;
     }
     // CTRL decides the char, whatever else is held: Windows translates the
     // chord's character before it looks at Shift.
-    let unicode_char = if ctrl {
+    let uc = if ctrl {
         WIN32_CTRL_ENTER_CHAR
     } else {
         WIN32_SHIFT_ENTER_CHAR
     };
-    Some(Win32EnterChord {
-        unicode_char,
-        control_state,
+    Some(Win32KeyRecord {
+        vk: WIN32_VK_RETURN,
+        sc: WIN32_SC_RETURN,
+        uc,
+        cs,
     })
 }
 
-/// The win32-input-mode `INPUT_RECORD` pair (key-down, then key-up) for an
-/// Enter chord.
+/// Whether conhost's input parser, once it has read a win32-input-mode record,
+/// HOLDS these legacy key bytes instead of delivering the key they spell.
+///
+/// Before the first record, conhost settles an ambiguous tail by the end of
+/// the read that carried it: a read ending in a lone ESC is the Escape key, and
+/// a read ending in `ESC [` is Alt+[. The first record switches that flush off
+/// for the rest of the session — a terminal speaking win32-input-mode never
+/// sends a bare ESC, so a trailing ESC must be a sequence split across reads —
+/// and aterm's first Shift+Enter IS a record. Measured 2026-09-27 (conhost
+/// 10.0.26200; every ESC pair fed raw into a ConPTY tab running a `ReadKey`
+/// loop, each followed by `z`, before and after one Shift+Enter record):
+///
+/// - `ESC` alone: nothing, even after 6 s idle, and the next `z` read as
+///   Alt+Z. This is Escape — PSReadLine's RevertLine, vim's leave-insert,
+///   Claude Code's Esc-to-interrupt — and Ctrl+[.
+/// - `ESC ESC`, `ESC DEL`: the second byte vanished and the ESC stayed pending
+///   (`z` → Alt+Z): Alt+Escape, Ctrl+Alt+[, Alt+Backspace.
+/// - `ESC [`, `ESC O`, `ESC P`, `ESC ]`, `ESC X`, `ESC ^`, `ESC _`: each opens a
+///   CSI / SS3 / DCS / OSC / SOS / PM / APC that swallowed the `z` (the string
+///   forms swallow everything up to BEL or ST): Alt+[, Alt+Shift+O, ….
+///
+/// Everything else arrived intact after the switch, so it keeps its bytes:
+/// ESC + every other printable, ESC + every other C0 (Alt+Enter, Alt+Tab,
+/// Ctrl+Alt+letter), ESC + non-ASCII, and every complete CSI/SS3 sequence
+/// (arrows, Home/End, F-keys, Shift+Tab and their modified forms). Before the
+/// switch the held forms arrived intact too, which is why this is a win32-mode
+/// rule and not a legacy one. (`ESC ESC [ E`, Alt+keypad-5 with NumLock off, is
+/// dropped by conhost before the switch and after it alike and poisons
+/// nothing, so it is outside this rule.)
+fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
+    match legacy {
+        [0x1b] => true,
+        [0x1b, second] => matches!(
+            second,
+            0x1b | 0x7f | b'[' | b'O' | b'P' | b']' | b'X' | b'^' | b'_'
+        ),
+        _ => false,
+    }
+}
+
+/// The record for a key whose legacy bytes [`conhost_holds_once_switched`]:
+/// Escape (any modifiers), Alt+Backspace, and a character chord that legacy
+/// spells as one of those forms (Ctrl+[ and Ctrl+3 are a lone ESC, Alt+[ is
+/// `ESC [`, Ctrl+Alt+8 is `ESC DEL`, …). `None` for every other key, and for a
+/// character no US-QWERTY key types — every held form is ASCII, so that is out
+/// of a keyboard's reach and the legacy bytes are the only spelling left.
+///
+/// The record states what the legacy bytes stated, re-spelled so conhost
+/// cannot mis-split it. `Uc` is the byte after the Alt prefix (ESC for Escape
+/// and Ctrl+[, `[` for Alt+[, DEL for Ctrl+Alt+8), except Backspace, whose
+/// Windows char is BS. `LEFT_ALT_PRESSED` is set exactly when the legacy form
+/// carried the ESC prefix, which is what conhost decoded that prefix to (`ESC
+/// a` → `A MODS=Alt`). `Vk`/`Sc` name the PHYSICAL key: the US identity the
+/// host resolved from the scan code (`base_layout_key`), else the character's
+/// own US key, which also contributes SHIFT for a shifted glyph (`_` is
+/// Shift+-). Measured after the switch, each record reads back as the key it
+/// names: Escape `27;1;27` → `Escape CHAR=0x1B`, Alt+Backspace `8;14;8;…;2` →
+/// `Backspace MODS=Alt CHAR=0x8` and Alt+[ `219;26;91;…;2` → `Oem4 MODS=Alt`
+/// (both exactly what conhost decoded from the legacy pair before it), and
+/// Ctrl+[ `219;26;27;…;8` → `Oem4 MODS=Control CHAR=0x1B`.
+///
+/// Ctrl+[ is the one key whose identity moves. Before the switch conhost read
+/// its lone ESC as the Escape key; the record is the one a Windows keyboard
+/// makes for that key (the US layout gives `VK_OEM_4` with Ctrl the char
+/// 0x1B), the record a console window hands its reader when Ctrl+[ is pressed
+/// on it directly. So vim, which reads the char, leaves insert mode on it as
+/// before (measured, Git's vim), while PSReadLine's Windows mode, which binds
+/// by key and has nothing on Ctrl+[, now inserts `^[` where it used to revert
+/// the line (measured). Sending the Escape key instead would keep that revert
+/// but name a key nobody pressed; Escape itself reverts the line.
+///
+/// Ctrl+Escape and Alt+Escape go out as their records too, and conhost drops
+/// them (measured: nothing reached `ReadKey`, and the next key arrived plain) —
+/// its own rule for the shell's Start-menu and window-cycling keys, which it
+/// applies to a record whichever terminal sent it. The legacy alternative is
+/// worse: after the switch it swallows the key typed next.
+// Skip: slice pattern matching and a table lookup — absent std bodies; the
+// mapping is exhaustively unit-tested against the measured records.
+#[cfg_attr(trust_verify, trust::skip)]
+fn win32_escape_record(
+    key: &Key,
+    modifiers: Modifiers,
+    mode: KeyboardMode,
+    base_layout_key: Option<char>,
+) -> Option<Win32KeyRecord> {
+    let legacy = encode_legacy(key, modifiers, mode);
+    if !conhost_holds_once_switched(&legacy) {
+        return None;
+    }
+    let (vk, sc, uc, shifted_glyph) = match key {
+        Key::Named(NamedKey::Escape) => {
+            (WIN32_VK_ESCAPE, WIN32_SC_ESCAPE, WIN32_ESCAPE_CHAR, false)
+        }
+        Key::Named(NamedKey::Backspace) => (WIN32_VK_BACK, WIN32_SC_BACK, WIN32_BACK_CHAR, false),
+        Key::Character(c) => {
+            let (vk, sc, shifted_glyph) = base_layout_key
+                .and_then(us_physical_key)
+                .or_else(|| us_physical_key(*c))?;
+            (vk, sc, u32::from(*legacy.last()?), shifted_glyph)
+        }
+        Key::Named(_) => return None,
+    };
+    let mut cs = 0;
+    if shifted_glyph || modifiers.contains(Modifiers::SHIFT) {
+        cs |= WIN32_SHIFT_PRESSED;
+    }
+    if modifiers.contains(Modifiers::CTRL) {
+        cs |= WIN32_LEFT_CTRL_PRESSED;
+    }
+    // Every two-byte held form is the ESC prefix plus the key's own byte.
+    if legacy.len() == 2 {
+        cs |= WIN32_LEFT_ALT_PRESSED;
+    }
+    Some(Win32KeyRecord { vk, sc, uc, cs })
+}
+
+/// The US-QWERTY main-block key that types `c`: its `wVirtualKeyCode`, its
+/// set-1 scan code, and whether `c` is that key's SHIFTED glyph. Scan codes
+/// are physical positions, the same on every layout; the VK is the US one,
+/// which is what conhost's own `VkKeyScan` answered for these characters
+/// before the switch (`ESC _` → `OemMinus MODS=Alt, Shift`, `ESC ^` → `D6
+/// MODS=Alt, Shift`). `None` for anything the US main block cannot type.
+// Skip: a table scan (slice iterator) — absent std bodies; unit-tested.
+#[cfg_attr(trust_verify, trust::skip)]
+fn us_physical_key(c: char) -> Option<(u32, u32, bool)> {
+    // Set-1 scan codes of A..Z.
+    const LETTER_SCAN: [u8; 26] = [
+        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
+        0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
+    ];
+    // (unshifted, shifted, VK, scan) for the digit row and the OEM keys.
+    const SYMBOL_KEYS: [(char, char, u8, u8); 21] = [
+        ('1', '!', 0x31, 0x02),
+        ('2', '@', 0x32, 0x03),
+        ('3', '#', 0x33, 0x04),
+        ('4', '$', 0x34, 0x05),
+        ('5', '%', 0x35, 0x06),
+        ('6', '^', 0x36, 0x07),
+        ('7', '&', 0x37, 0x08),
+        ('8', '*', 0x38, 0x09),
+        ('9', '(', 0x39, 0x0a),
+        ('0', ')', 0x30, 0x0b),
+        ('-', '_', 0xbd, 0x0c),
+        ('=', '+', 0xbb, 0x0d),
+        ('[', '{', 0xdb, 0x1a),
+        (']', '}', 0xdd, 0x1b),
+        ('\\', '|', 0xdc, 0x2b),
+        (';', ':', 0xba, 0x27),
+        ('\'', '"', 0xde, 0x28),
+        ('`', '~', 0xc0, 0x29),
+        (',', '<', 0xbc, 0x33),
+        ('.', '>', 0xbe, 0x34),
+        ('/', '?', 0xbf, 0x35),
+    ];
+    if c.is_ascii_alphabetic() {
+        let upper = c.to_ascii_uppercase();
+        let sc = *LETTER_SCAN.get(usize::from((upper as u8).saturating_sub(b'A')))?;
+        return Some((u32::from(upper), u32::from(sc), c.is_ascii_uppercase()));
+    }
+    SYMBOL_KEYS
+        .iter()
+        .find(|&&(plain, shifted, _, _)| c == plain || c == shifted)
+        .map(|&(plain, _, vk, sc)| (u32::from(vk), u32::from(sc), c != plain))
+}
+
+/// The win32-input-mode `INPUT_RECORD` pair (key-down, then key-up) for a
+/// routed key.
 ///
 /// Format (microsoft/terminal doc/specs/#4999-win32-input-mode.md):
 /// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, every field spelled (Windows Terminal's
-/// own `_GenerateWin32KeySequence` writes all six). `Uc` and `Cs` come from the
-/// chord and are the SAME on both halves (the modifier is still held when Enter
-/// comes back up); `Kd` is 1 then 0; `Rc` is 1.
+/// own `_GenerateWin32KeySequence` writes all six). `Uc` and `Cs` are the SAME
+/// on both halves (the modifier is still held when the key comes back up);
+/// `Kd` is 1 then 0; `Rc` is 1.
 ///
 /// Both halves are emitted from the PRESS. Windows applications key on the
 /// key-down and the host keeps no per-key state, so a self-contained pair per
-/// press is what makes the chord atomic; the caller's release path emits
+/// press is what makes the key atomic; the caller's release path emits
 /// nothing for this key, so no second key-up ever follows.
 // Skip: the key encoders build byte sequences via Vec push/extend and
 // table lookups — absent std bodies (alloc + iterator class). The encoded
 // bytes are exhaustively unit-tested against the win32-input-mode spec.
 #[cfg_attr(trust_verify, trust::skip)]
-fn encode_win32_enter_record_pair(chord: &Win32EnterChord) -> Vec<u8> {
+fn encode_win32_record_pair(record: &Win32KeyRecord) -> Vec<u8> {
     let mut buf = Vec::with_capacity(48);
     for key_down in [1u32, 0u32] {
         buf.extend_from_slice(b"\x1b[");
-        write_u32(&mut buf, WIN32_VK_RETURN);
+        write_u32(&mut buf, record.vk);
         buf.push(b';');
-        write_u32(&mut buf, WIN32_SC_RETURN);
+        write_u32(&mut buf, record.sc);
         buf.push(b';');
-        write_u32(&mut buf, chord.unicode_char);
+        write_u32(&mut buf, record.uc);
         buf.push(b';');
         write_u32(&mut buf, key_down);
         buf.push(b';');
-        write_u32(&mut buf, chord.control_state);
+        write_u32(&mut buf, record.cs);
         buf.extend_from_slice(b";1_");
     }
     buf

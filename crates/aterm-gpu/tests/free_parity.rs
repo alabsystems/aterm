@@ -368,7 +368,7 @@ fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
         .render_input_cached(&mut win_free, &make_free(&mut term, y_b))
         .pixels()
         .to_vec();
-    let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+    let mut gpu2 = common::independent_gpu(18.0, theme);
     let mut win_legacy = aterm_gpu::WindowGpu::new();
     let _ = gpu2.render_input_cached(&mut win_legacy, &make_legacy(&mut term, y_a));
     let gpu_legacy = gpu2
@@ -438,7 +438,7 @@ fn damaged_path_free_no_ghosting_and_settled_gate_hit_both_backends() {
         cpu_b_cached, cpu_b_fresh,
         "CPU damaged path must repaint the moved multi-row free rect with no ghosting"
     );
-    let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+    let mut gpu2 = common::independent_gpu(18.0, theme);
     let mut win2 = aterm_gpu::WindowGpu::new();
     let gpu_b_fresh = gpu2.render_input(&mut win2, &in_b, None).pixels;
     assert_eq!(
@@ -524,7 +524,7 @@ fn settled_translucent_sprite_inside_dirty_band_stays_byte_stable() {
             "frame {n}: CPU cached repaint must be byte-stable (no re-blend of \
              the settled translucent sprite)"
         );
-        let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+        let mut gpu2 = common::independent_gpu(18.0, theme);
         let mut win2 = aterm_gpu::WindowGpu::new();
         let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
         assert_eq!(
@@ -606,7 +606,7 @@ fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
             "frame {n}: CPU damaged path must be byte-stable for a settled \
              translucent OverText sprite inside the dirty bounding band"
         );
-        let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+        let mut gpu2 = common::independent_gpu(18.0, theme);
         let mut win2 = aterm_gpu::WindowGpu::new();
         let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
         assert_eq!(
@@ -687,7 +687,7 @@ fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
             "frame {n}: CPU damaged path must be byte-stable — the settled \
              lifted Add deco's dy spill must land on a rebuilt neighbour row"
         );
-        let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+        let mut gpu2 = common::independent_gpu(18.0, theme);
         let mut win2 = aterm_gpu::WindowGpu::new();
         let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
         assert_eq!(
@@ -749,7 +749,7 @@ fn settled_translucent_cat_quad_inside_dirty_band_stays_byte_stable() {
             gpu.scissor_taken() > scissors_before,
             "frame {n}: the two-row text edit must take the SCISSORED path"
         );
-        let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+        let mut gpu2 = common::independent_gpu(18.0, theme);
         let mut win2 = aterm_gpu::WindowGpu::new();
         let gpu_fresh = gpu2.render_input(&mut win2, &input, None).pixels;
         assert_eq!(

@@ -501,6 +501,9 @@ pub(crate) struct LeadingInputOptions {
     /// The `if-fp=<hex16>` fence: the visible screen's FNV-1a-64 the caller last
     /// read (`status hash=`, `turn hash=`). See [`InputFence`].
     pub if_fp: Option<u64>,
+    /// The `if-human=<n>` fence: the person-gesture count the caller last read
+    /// (`status human_seq=`, `text --json`'s `"human_seq"`). See [`InputFence`].
+    pub if_human: Option<u64>,
     /// `unread=ok`: write even though the program has left earlier input
     /// unread — the one override of the unread-input gate
     /// (`crate::input_stall::refusal`), for a driver that means to queue.
@@ -648,6 +651,24 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
             consumed = true;
             continue;
         }
+        if guarded && let Some(value) = head.strip_prefix("if-human=") {
+            match value.parse::<u64>() {
+                Ok(n) if opts.if_human.replace(n).is_some() => {
+                    opts.refusal = Some("ERR usage: if-human= given twice\n".to_string());
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    opts.refusal = Some(
+                        "ERR usage: if-human=<n> needs the person count a read returned \
+                         (status human_seq=)\n"
+                            .to_string(),
+                    );
+                }
+            }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
         if guarded && let Some(value) = head.strip_prefix("if-fp=") {
             match parse_fp(value) {
                 Some(fp) if opts.if_fp.replace(fp).is_some() => {
@@ -716,6 +737,12 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
 ///   `guard_at_cursor`, the row holding the cursor does (`turn …
 ///   submit=guarded:<re>`, where the row that matters is the one a submit
 ///   lands in).
+/// * `human` (`if-human=<n>`): no PERSON has given the session input since
+///   the read that returned `n` ([`crate::human_input::HumanInputStamp::seq`])
+///   — the one thing the screen fences cannot see: a person's key already
+///   written to the PTY and not yet read by the program moves no screen.
+///   Refused `OK skipped reason=person` (2026-09-27, R3b of the question
+///   answer's critique).
 ///
 /// This is the operator delivery fence's shape (`operator_input_if_epoch`:
 /// compare the screen generation, then write, under one lock) offered to any
@@ -729,6 +756,8 @@ pub(crate) struct InputFence<'a> {
     pub generation: Option<crate::control::ScreenGen>,
     /// `if-fp=<hex16>` — the visible screen's FNV-1a-64 must still be this.
     pub fp: Option<u64>,
+    /// `if-human=<n>` — the session's person-gesture count must still be this.
+    pub human: Option<u64>,
     /// Match `guard` against the CURSOR's row only, not every visible row.
     /// The guarded submit's binding: a composer holds the cursor, a select
     /// box does not, and a transcript row that happens to match (Claude Code
@@ -742,7 +771,10 @@ impl InputFence<'_> {
     /// Whether any condition is armed — the dispatch routes an armed write to
     /// the fenced arm and leaves an unarmed one on its ordinary path.
     pub(crate) fn is_armed(&self) -> bool {
-        self.guard.is_some() || self.generation.is_some() || self.fp.is_some()
+        self.guard.is_some()
+            || self.generation.is_some()
+            || self.fp.is_some()
+            || self.human.is_some()
     }
 
     /// Decide the fence against `terminal` (the caller holds its lock).
@@ -789,6 +821,9 @@ pub(crate) enum GuardedInput {
     /// The screen moved since the caller's read (`if-gen=`/`if-fp=` no longer
     /// holds): NOTHING was written.
     Changed,
+    /// A person gave the session input since the caller's read (`if-human=`
+    /// no longer holds): NOTHING was written.
+    Person,
     /// A row matched, and the bytes were handed to the kernel (or refused with
     /// zero bytes, or accepted in part) while the lock was still held.
     Pressed(Delivery),
@@ -833,6 +868,12 @@ pub(crate) fn input_if_fenced(
     fence: &InputFence<'_>,
 ) -> GuardedInput {
     let terminal = term_lock(term);
+    // A person's hand since the caller's read: asked under the same hold as
+    // the screen fences, ahead of them — "a person keyed" is the more useful
+    // thing to tell a driver than "the screen moved", which it may also have.
+    if fence.human.is_some_and(|n| ctx.human_input.seq() != n) {
+        return GuardedInput::Person;
+    }
     if let Some(declined) = fence.check(&terminal) {
         return declined;
     }
@@ -886,6 +927,7 @@ pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
     match decision {
         GuardedInput::Skipped => "OK skipped\n".to_string(),
         GuardedInput::Changed => "OK skipped reason=changed\n".to_string(),
+        GuardedInput::Person => "OK skipped reason=person\n".to_string(),
         GuardedInput::Pressed(Delivery::Full | Delivery::FullAt { .. }) => "OK\n".to_string(),
         GuardedInput::Pressed(Delivery::BusyZero | Delivery::ConflictZero) => {
             "ERR busy sink\n".to_string()
@@ -1881,20 +1923,40 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             if it.next().is_some() {
                 return Err("ERR usage: pointer move <r> <c>\n".to_string());
             }
-            let (Ok(row), Ok(col)) = (rs.parse::<u16>(), cs.parse::<u16>()) else {
+            let (Ok(row), Ok(col)) = (rs.parse::<i32>(), cs.parse::<u16>()) else {
                 return Err("ERR bad args\n".to_string());
             };
-            if row >= MAX_GRID_ROWS || col >= MAX_GRID_COLS {
+            if col >= MAX_GRID_COLS {
                 return Err("ERR out of range\n".to_string());
             }
-            Ok(PointerAction::Move { row, col })
+            // A NEGATIVE row is a chrome row above the grid (`-1` the one
+            // right above it): the band, the presence row, the strip.
+            if row < 0 {
+                return match u16::try_from(row.unsigned_abs()) {
+                    Ok(up) if up <= MAX_CHROME_ROWS => Ok(PointerAction::MoveChrome { up, col }),
+                    _ => Err("ERR out of range\n".to_string()),
+                };
+            }
+            match u16::try_from(row) {
+                Ok(row) if row < MAX_GRID_ROWS => Ok(PointerAction::Move { row, col }),
+                _ => Err("ERR out of range\n".to_string()),
+            }
         }
-        Some(_) => Err("ERR usage: pointer [move <r> <c>|leave|status]\n".to_string()),
+        Some("click") => match it.next() {
+            None => Ok(PointerAction::Click),
+            Some(_) => Err("ERR usage: pointer click\n".to_string()),
+        },
+        Some(_) => Err("ERR usage: pointer [move <r> <c>|click|leave|status]\n".to_string()),
     }
 }
 
-/// `pointer [move <r> <c>|leave|status]` -> put the front window's POINTER on a
-/// cell (or withdraw it) and reply where it actually is.
+/// The deepest chrome row `pointer move -<up> <c>` may name: the strip, the
+/// presence row and the message band's rows together stay far below it.
+const MAX_CHROME_ROWS: u16 = 16;
+
+/// `pointer [move <r> <c>|click|leave|status]` -> put the front window's
+/// POINTER on a cell (a negative `r` is a chrome row above the grid), click
+/// where it is, or withdraw it, and reply where it actually is.
 ///
 /// This is the verb that makes hover states drivable: it goes through
 /// [`crate::App::pointer_cmd`], whose arms are `on_cursor_moved` / `on_cursor_left`
@@ -2666,6 +2728,44 @@ mod tests {
         }
     }
 
+    /// `if-human=<n>` parses to the person count `status human_seq=` prints,
+    /// composes with the other fences on `key` and `send`, and refuses any
+    /// other shape — never typed into the program as text.
+    #[test]
+    fn if_human_is_the_person_fence_on_key_and_send() {
+        for verb in ["key", "send"] {
+            let (o, tail) = take_leading_options(verb, "if-human=7 if-gen=3.15 1");
+            assert_eq!(o.if_human, Some(7), "{verb}");
+            assert_eq!(o.refusal, None, "{verb}");
+            assert_eq!(tail, "1", "{verb}");
+        }
+        for bad in ["", "-1", "x", "1.5", "0x7"] {
+            let (o, tail) = take_leading_options("key", &format!("if-human={bad} 1"));
+            assert!(
+                o.refusal
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("ERR usage: if-human=")),
+                "if-human={bad:?} must be refused"
+            );
+            assert_eq!(tail, "1");
+        }
+        let (o, _) = take_leading_options("key", "if-human=1 if-human=1 1");
+        assert_eq!(
+            o.refusal.as_deref(),
+            Some("ERR usage: if-human= given twice\n")
+        );
+        // NEGATIVE CONTROL: a verb that is not guarded keeps it as body, and a
+        // body token spelled like it is still body.
+        assert_eq!(
+            take_leading_options("paste", "if-human=1 x").1,
+            "if-human=1 x"
+        );
+        assert_eq!(
+            take_leading_options("send", "hello if-human=1").1,
+            "hello if-human=1"
+        );
+    }
+
     /// `if-gen=<epoch>.<seq>` parses to the screen generation `status gen=`
     /// prints, composes with the other options, and refuses any other shape. The
     /// retired `if-seq=` is taken off the tail and REFUSED — on `send` too, where
@@ -2868,6 +2968,25 @@ mod tests {
         for line in ["move 1", "move 1 2 3", "move a b", "leave now", "wiggle"] {
             assert!(parse_pointer(line).is_err(), "pointer {line:?}");
         }
+        // DAY NINE, D5: a negative row names a chrome row above the grid (the
+        // message band), and `click` presses where the pointer is.
+        assert_eq!(
+            parse_pointer("move -1 5"),
+            Ok(PointerAction::MoveChrome { up: 1, col: 5 })
+        );
+        assert_eq!(
+            parse_pointer(&format!("move -{MAX_CHROME_ROWS} 0")),
+            Ok(PointerAction::MoveChrome {
+                up: MAX_CHROME_ROWS,
+                col: 0
+            })
+        );
+        assert_eq!(
+            parse_pointer(&format!("move -{} 0", MAX_CHROME_ROWS + 1)),
+            Err("ERR out of range\n".to_string())
+        );
+        assert_eq!(parse_pointer("click"), Ok(PointerAction::Click));
+        assert!(parse_pointer("click right").is_err());
     }
 
     /// `lines=N` reaches `InputEvent::Wheel.lines` for the wheel actions: absent it

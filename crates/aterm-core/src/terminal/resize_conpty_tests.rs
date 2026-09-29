@@ -25,8 +25,8 @@ use aterm_scrollback::Scrollback;
 /// CUP to conhost's cursor and show cursor. Rows past `rows.len()` are blank.
 /// Every row here is shorter than the width, which is the shape conhost
 /// sends for such rows; a logical line spanning several rows goes out as one
-/// autowrapping run instead, and no fixture in this file repaints one, so the
-/// continuation flags such a run would set are not exercised here.
+/// autowrapping run instead — the pwsh captures at the end of this file
+/// replay that shape byte for byte.
 fn conhost_repaint(rows: &[String], visible_rows: u16, cursor_1based: (u16, u16)) -> Vec<u8> {
     let mut out = b"\x1b[?25l\x1b[H".to_vec();
     for r in 0..visible_rows {
@@ -908,5 +908,690 @@ fn conpty_rows_shrink_in_the_bottom_push_corner_leaves_the_viewport_conhost_pain
         cached_results(&mut t, "line "),
         legacy_results(&t, "line "),
         "the search index equals a fresh build"
+    );
+}
+
+// ---- pwsh under conhost, byte for byte (captured 2026-09-27) --------------
+//
+// The fixtures below replay the shapes `aterm ctl cast` recorded from pwsh 7.6
+// in an aterm 0.95.0 tab on Windows 11 26200, 23x80 (the presence band had
+// taken a row). The prompt's text is replaced by a stand-in of the same length
+// (116 columns: it wraps at 80), so every row and every CUP lands where the
+// capture put it. The re-verification of 2026-09-27 saw, on this exact
+// sequence, a widen to 120 staircase older history rows (40 blanks, then
+// `col-test 02`) and a narrow to 60 put a shifted copy of the screen's top
+// row into history. Both came from continuation links that outlived the text
+// they described: conhost's `cls` erases row by row with `CSI K`, and EL did
+// not break the link into the row below (see `Grid::clear_wrap_into_next_row`).
+
+/// A stand-in for the measured 116-column pwsh prompt.
+fn pwsh_prompt() -> String {
+    format!("PS C:\\{}>", "w".repeat(109))
+}
+
+/// One `col-test NN` line of the verifier's recipe: 102 columns.
+fn col_test(n: usize) -> String {
+    format!("col-test {n:02} {}", UNIT.repeat(9))
+}
+
+/// The 22-column tail a `col-test` line leaves on its second row at 80.
+const COL_TEST_TAIL: &str = "ijabcdefghijabcdefghij";
+
+/// conhost's `cls` for pwsh (measured): two passes of `CSI K` down every
+/// row from the top, the second after `CSI 3J`.
+fn conhost_cls(rows: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    for lead in [&b"\x1b[?25l\x1b[H"[..], &b"\x1b[?25l\x1b[3J"[..]] {
+        out.extend_from_slice(lead);
+        for r in 0..rows {
+            if r > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(b"\x1b[K");
+        }
+        out.extend_from_slice(b"\x1b[H\x1b[?25h");
+    }
+    out
+}
+
+/// How conhost writes a run wider than 80 columns that starts on the BOTTOM
+/// row (measured): the first 80 columns, CR LF (which scrolls), then
+/// `CSI <rows-1>;80 H` re-writing the 80th character so that the rest
+/// autowraps onto the new bottom row.
+fn bottom_row_run(text: &str, rows: u16) -> Vec<u8> {
+    let mut out = text[..80].as_bytes().to_vec();
+    out.extend_from_slice(format!("\r\n\x1b[{};80H", rows - 1).as_bytes());
+    out.extend_from_slice(text[79..].as_bytes());
+    out
+}
+
+/// pwsh printing `col-test 01..=40` from the top of a cleared 23x80 screen,
+/// then its next prompt (measured): a line that fits goes out as one
+/// autowrapping run and CR LF; from `col-test 12` on every line starts on the
+/// bottom row and takes the `bottom_row_run` shape, then CR, LF; the prompt
+/// takes it too and ends with `CSI 1 C`.
+fn pwsh_col_test_fill() -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in 1..=40 {
+        if n <= 11 {
+            out.extend_from_slice(col_test(n).as_bytes());
+        } else {
+            out.extend(bottom_row_run(&col_test(n), 23));
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend(bottom_row_run(&pwsh_prompt(), 23));
+    out.extend_from_slice(b"\x1b[1C");
+    out
+}
+
+/// A pwsh prompt with a typed command after it, as the screen holds it before
+/// `cls`: 116 + 70 columns from row 0, so rows 1 and 2 are continuations.
+fn prompt_and_command(t: &mut Terminal) {
+    t.process(pwsh_prompt().as_bytes());
+    t.process(format!("cls; {}\r\n", "x".repeat(65)).as_bytes());
+    let g = t.grid();
+    assert!(
+        g.row(1).is_some_and(|r| r.is_wrapped()) && g.row(2).is_some_and(|r| r.is_wrapped()),
+        "precondition: the prompt and its command leave rows 1 and 2 as continuations"
+    );
+}
+
+/// Every history line, oldest first: its text (trailing blanks trimmed) and
+/// whether it continues the line before it.
+fn history(t: &Terminal) -> Vec<(String, bool)> {
+    let g = t.grid();
+    (0..g.scrollback_lines())
+        .map(|i| {
+            let line = g.get_history_line(i).expect("history line");
+            (line.to_string().trim_end().to_string(), line.is_wrapped())
+        })
+        .collect()
+}
+
+/// The 59 history rows the fill leaves at 80 columns: `col-test 01..=29` as
+/// head + continuation, then `col-test 30`'s head (its tail is screen row 0).
+fn col_test_history_at_80() -> Vec<(String, bool)> {
+    let mut rows = Vec::new();
+    for n in 1..=30 {
+        let line = col_test(n);
+        rows.push((line[..80].to_string(), false));
+        if n < 30 {
+            rows.push((line[80..].to_string(), true));
+        }
+    }
+    rows
+}
+
+/// conhost's measured repaint after the widen to 23x120: the tail at row 0 as
+/// a line of its own, `col-test 31..=40` one row each, the prompt padded to
+/// the full 120 columns, ten blank rows, and the cursor after the prompt.
+fn widen_to_120_repaint() -> Vec<u8> {
+    let mut out = format!("\x1b[?25l\x1b[H{COL_TEST_TAIL}\x1b[K\r\n").into_bytes();
+    for n in 31..=40 {
+        out.extend_from_slice(format!("{}\x1b[K\r\n", col_test(n)).as_bytes());
+    }
+    out.extend_from_slice(format!("{}    \r\n", pwsh_prompt()).as_bytes());
+    for _ in 0..10 {
+        out.extend_from_slice(b"\x1b[K\r\n");
+    }
+    out.extend_from_slice(b"\x1b[K\x1b[12;118H\x1b[?25h");
+    out
+}
+
+/// conhost's measured repaint after narrowing back to 23x80: the tail at row
+/// 0, `col-test 31..=40` as autowrapping runs, the prompt, `CSI 1 C`.
+fn narrow_to_80_repaint() -> Vec<u8> {
+    let mut out = format!("\x1b[?25l\x1b[H{COL_TEST_TAIL}\x1b[K\r\n").into_bytes();
+    for n in 31..=40 {
+        out.extend_from_slice(format!("{}\x1b[K\r\n", col_test(n)).as_bytes());
+    }
+    out.extend_from_slice(format!("{}\x1b[K\x1b[1C\x1b[?25h", pwsh_prompt()).as_bytes());
+    out
+}
+
+/// The terminal shapes a ConPTY tab can have: ring-only; the GUI's (history in
+/// a ring thousands of lines deep, a store behind it); and a small ring, so the
+/// history lives in the store and reaches the rewrap through the lazy buffer.
+fn conpty_shapes(rows: u16, cols: u16) -> [(&'static str, Terminal); 3] {
+    [
+        ("ring-only", Terminal::new(rows, cols)),
+        (
+            "gui-ring",
+            Terminal::with_scrollback(rows, cols, 6_123, Scrollback::new(64, 512, 8_000_000)),
+        ),
+        ("store", tiered(rows, cols)),
+    ]
+}
+
+/// Resize under the ConPTY policy the way the GUI does (the offloaded entry
+/// point) and feed conhost's `repaint` before or after the worker's re-attach
+/// — conhost's bytes can arrive on either side of it.
+fn conpty_resize(t: &mut Terminal, rows: u16, cols: u16, repaint: &[u8], before_reattach: bool) {
+    match t.resize_offloading_scrollback_with_policy(rows, cols, ResizePolicy::ConPty) {
+        Some(pending) => {
+            if before_reattach {
+                t.process(repaint);
+            }
+            assert!(t.finish_resize_offload(pending.reflow()).is_none());
+            if !before_reattach {
+                t.process(repaint);
+            }
+        }
+        None => t.process(repaint),
+    }
+}
+
+/// The verifier's widen, replayed: after conhost's `cls` the fill leaves exact
+/// history (no continuation link survived from the prompt that sat on those
+/// rows); the widen to 120 gives each of `col-test 01..=29` ONE row with no
+/// history row shifted, and the boundary line's head stays the newest history
+/// line (conhost repaints its 22-column tail at row 0 as a line of its own —
+/// the measured `widen_to_120_repaint`); narrowing back restores the 59 rows
+/// exactly, three times over.
+#[test]
+fn conpty_widen_after_conhost_cls_rewraps_history_with_no_row_shifted() {
+    for before_reattach in [true, false] {
+        for (label, mut t) in conpty_shapes(23, 80) {
+            prompt_and_command(&mut t);
+            t.process(&conhost_cls(23));
+            assert!(
+                (1..23).all(|r| !t.grid().row(r).is_some_and(|row| row.is_wrapped())),
+                "{label}: conhost's row-by-row `CSI K` breaks every link below row 0"
+            );
+            t.process(&pwsh_col_test_fill());
+            assert_eq!(
+                history(&t),
+                col_test_history_at_80(),
+                "{label}: the fill's history"
+            );
+            let screen_at_80 = visible_rows(&t);
+            assert_eq!(screen_at_80[0], COL_TEST_TAIL, "{label}: tail at row 0");
+
+            let widened: Vec<(String, bool)> = (1..=29)
+                .map(|n| (col_test(n), false))
+                .chain([(col_test(30)[..80].to_string(), false)])
+                .collect();
+            for cycle in 1..=3 {
+                conpty_resize(&mut t, 23, 120, &widen_to_120_repaint(), before_reattach);
+                assert_eq!(
+                    history(&t),
+                    widened,
+                    "{label} cycle {cycle} (repaint before re-attach: {before_reattach}): \
+                     at 120 every line is one row, none shifted"
+                );
+                let screen = visible_rows(&t);
+                assert_eq!(screen[0], COL_TEST_TAIL, "{label}: conhost's row 0");
+                assert_eq!(screen[1], col_test(31), "{label}: row 1");
+                assert_eq!(screen[11], pwsh_prompt(), "{label}: the prompt row");
+
+                conpty_resize(&mut t, 23, 80, &narrow_to_80_repaint(), before_reattach);
+                assert_eq!(
+                    history(&t),
+                    col_test_history_at_80(),
+                    "{label} cycle {cycle}: narrowing back restores the 59 rows exactly"
+                );
+                assert_eq!(visible_rows(&t), screen_at_80, "{label}: and the screen");
+            }
+        }
+    }
+}
+
+/// pwsh's `cls; 1..30 | % {'pad {0:D2}' -f $_}` at 23x80 (measured: `pad
+/// 01..=23` each followed by `CSI K`, the rest scrolled in bare), the prompt
+/// at the bottom.
+fn pwsh_pad_fill() -> Vec<u8> {
+    let mut out = conhost_cls(23);
+    for n in 1..=30 {
+        out.extend_from_slice(format!("pad {n:02}").as_bytes());
+        if n <= 23 {
+            out.extend_from_slice(b"\x1b[K");
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend(bottom_row_run(&pwsh_prompt(), 23));
+    out.extend_from_slice(b"\x1b[1C");
+    out
+}
+
+/// conhost's measured repaint after that screen shrank to 20x60: `pad 13` at
+/// row 0 (it demoted `pad 10..=12`), the prompt padded to two full rows.
+fn shrink_to_60_repaint() -> Vec<u8> {
+    let mut out = b"\x1b[?25l\x1b[H".to_vec();
+    for n in 13..=30 {
+        out.extend_from_slice(format!("pad {n:02}\x1b[K\r\n").as_bytes());
+    }
+    out.extend_from_slice(format!("{}    \x1b[20;58H\x1b[?25h", pwsh_prompt()).as_bytes());
+    out
+}
+
+/// The verifier's stray row, replayed: short lines written over rows that
+/// held wrapped lines, then a shrink to 20x60. History holds exactly the three
+/// lines conhost demoted, nothing is retained twice and no row is shifted
+/// right — the re-verification saw `pad 03, 05, .., 13` each 20 columns right
+/// and a copy of `pad 13` in history while conhost painted it at row 0.
+#[test]
+fn conpty_column_shrink_after_conhost_cls_pushes_no_stray_row() {
+    let pad = |range: std::ops::RangeInclusive<usize>| -> Vec<(String, bool)> {
+        range.map(|n| (format!("pad {n:02}"), false)).collect()
+    };
+    for before_reattach in [true, false] {
+        for (label, mut t) in conpty_shapes(23, 80) {
+            // The session the capture came from: the widen test's fill, a
+            // widen to 120 and back, then the pads.
+            prompt_and_command(&mut t);
+            t.process(&conhost_cls(23));
+            t.process(&pwsh_col_test_fill());
+            conpty_resize(&mut t, 23, 120, &widen_to_120_repaint(), before_reattach);
+            conpty_resize(&mut t, 23, 80, &narrow_to_80_repaint(), before_reattach);
+            assert!(
+                (0..23).any(|r| t.grid().row(r).is_some_and(|row| row.is_wrapped())),
+                "{label}: precondition: the screen the pads overwrite holds continuations"
+            );
+            t.process(&pwsh_pad_fill());
+            assert_eq!(
+                history(&t),
+                pad(1..=9),
+                "{label}: history before the shrink"
+            );
+
+            conpty_resize(&mut t, 20, 60, &shrink_to_60_repaint(), before_reattach);
+            assert_eq!(
+                history(&t),
+                pad(1..=12),
+                "{label} (repaint before re-attach: {before_reattach}): exactly the \
+                 demoted lines, unshifted"
+            );
+            let prompt = pwsh_prompt();
+            let expected: Vec<String> = (13..=30)
+                .map(|n| format!("pad {n:02}"))
+                .chain([prompt[..60].to_string(), prompt[60..].to_string()])
+                .collect();
+            assert_eq!(
+                visible_rows(&t),
+                expected,
+                "{label}: the screen conhost painted"
+            );
+            let retained = retained_rows(&t);
+            for n in 1..=30 {
+                let text = format!("pad {n:02}");
+                assert_eq!(
+                    retained.iter().filter(|r| **r == text).count(),
+                    1,
+                    "{label}: {text} retained once"
+                );
+            }
+        }
+    }
+}
+
+// ---- a shrink with a non-blank row under the cursor (captured 2026-09-27) --
+//
+// The round-2 review's recipe, replayed from its `aterm ctl cast` (pwsh 7.6,
+// aterm 0.95.0, a 24x80 tab): `cls; 1..30 | % { "pad {0:D2}" -f $_ }` went in
+// as two input lines, so PSReadLine drew its `>>` continuation prompt, and the
+// fill ended with the prompt drawn twice and `>>` on a fresh bottom row, the
+// cursor back on the prompt ABOVE it (`CR LF >> CSI 23;38 H`). Every resize the
+// review then made is replayed with conhost's repaint for it. The round-3
+// review found the widths where the cell after the prompt starts a row of its
+// own (58, 39, 29) and a one-line fill with the prompt alone on the bottom
+// rows; those runs are replayed too. The captures' OSC marks and SGR changes
+// are left out and the prompt is the 116-column stand-in, which is the
+// measured prompt's length.
+
+/// The two pad fills the reviews captured at 24x80.
+#[derive(Clone, Copy, Debug)]
+enum PadPrompt {
+    /// The command went in as two input lines, so PSReadLine drew the prompt
+    /// twice and its `>>` on a fresh bottom row, and put the cursor back on
+    /// the prompt above it (`CR LF >> CSI 23;38 H`). History `pad 01..=11`;
+    /// `pad 12..=30` on rows 0..=18, the prompts on rows 19..=22, `>>` on row
+    /// 23, the cursor on row 22 one column past the prompt.
+    AboveContinuation,
+    /// One input line: one prompt, on rows 22..=23, the cursor after it on the
+    /// bottom row. History `pad 01..=08`; `pad 09..=30` on rows 0..=21.
+    Alone,
+}
+
+/// The capture's pad fill: conhost's `cls` (`CSI K` down every row, then
+/// `CSI 3J`), `pad 01..=30` (the first 24 with `CSI K`), then the prompt in
+/// the bottom-row shape ending in pwsh's `CSI 1 C` — twice with `>>` under the
+/// second for `PadPrompt::AboveContinuation`.
+fn pwsh_pad_fill_24(fill: PadPrompt) -> Vec<u8> {
+    let mut out = b"\x1b[?25l\x1b[H".to_vec();
+    for r in 0..24 {
+        if r > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"\x1b[K");
+    }
+    out.extend_from_slice(b"\x1b[H\x1b[?25h\x1b[3J");
+    for n in 1..=30 {
+        out.extend_from_slice(format!("pad {n:02}").as_bytes());
+        if n <= 24 {
+            out.extend_from_slice(b"\x1b[K");
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend(bottom_row_run(&pwsh_prompt(), 24));
+    out.extend_from_slice(b"\x1b[1C");
+    if let PadPrompt::AboveContinuation = fill {
+        out.extend_from_slice(b"\r\n");
+        out.extend(bottom_row_run(&pwsh_prompt(), 24));
+        out.extend_from_slice(b"\x1b[1C\x1b[?25l\r\n>>\x1b[23;38H\x1b[?25h");
+    }
+    out
+}
+
+/// Every resize the review made after the fill, in order, with the pad line
+/// conhost repainted at row 0: 20x60 demoted `pad 12..=15` and 20x50 `pad
+/// 16..=17`; no other step demoted anything.
+const PAD_RESIZES: [(u16, u16, usize); 14] = [
+    (20, 60, 16),
+    (24, 80, 16),
+    (24, 60, 16),
+    (24, 80, 16),
+    (23, 70, 16),
+    (24, 80, 16),
+    (24, 40, 16),
+    (24, 80, 16),
+    (22, 60, 16),
+    (24, 80, 16),
+    (20, 50, 18),
+    (24, 80, 18),
+    (21, 75, 18),
+    (24, 80, 18),
+];
+
+/// Does the cursor's copy of the prompt take a row more than its text? conhost
+/// keeps the cursor's row through the cursor's cell when it rewraps (the prompt
+/// and its `CSI 1 C`: 118 cells), so at a width that fits the 116 columns of
+/// text in one row fewer than those 118 cells — 58, 39 and 29 measured — the
+/// cursor's cell is a row of its own, painted `CSI K`.
+fn cursor_row_of_its_own(cols: u16) -> bool {
+    let cols = usize::from(cols);
+    let text = pwsh_prompt().len();
+    (text + 2).div_ceil(cols) > text.div_ceil(cols)
+}
+
+/// The rows conhost paints after each of those resizes, down to the last
+/// with content: `pad <first>..=30`, the prompt(s) cut at the width with the
+/// cursor's own row when it has one, and `>>` for `AboveContinuation`.
+fn pad_painted(fill: PadPrompt, first: usize, cols: u16) -> Vec<String> {
+    let prompt_rows: Vec<String> = pwsh_prompt()
+        .as_bytes()
+        .chunks(usize::from(cols))
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect();
+    let mut screen: Vec<String> = (first..=30).map(|n| format!("pad {n:02}")).collect();
+    if let PadPrompt::AboveContinuation = fill {
+        screen.extend(prompt_rows.iter().cloned());
+    }
+    screen.extend(prompt_rows);
+    if cursor_row_of_its_own(cols) {
+        screen.push(String::new());
+    }
+    if let PadPrompt::AboveContinuation = fill {
+        screen.push(">>".to_string());
+    }
+    screen
+}
+
+/// The whole screen after that repaint: the painted rows, blank rows to the
+/// bottom.
+fn pad_screen(fill: PadPrompt, first: usize, rows: u16, cols: u16) -> Vec<String> {
+    let mut screen = pad_painted(fill, first, cols);
+    screen.resize(usize::from(rows), String::new());
+    screen
+}
+
+/// Where conhost puts the cursor after that repaint: one column past the
+/// cursor's prompt (its `CSI 1 C`), 0-based.
+fn pad_cursor(fill: PadPrompt, first: usize, cols: u16) -> (u16, u16) {
+    let cols = usize::from(cols);
+    let prompt = pwsh_prompt().len();
+    let offset = prompt + 1;
+    let above = match fill {
+        PadPrompt::AboveContinuation => prompt.div_ceil(cols),
+        PadPrompt::Alone => 0,
+    };
+    let row = (31 - first) + above + offset / cols;
+    (
+        u16::try_from(row).unwrap(),
+        u16::try_from(offset % cols).unwrap(),
+    )
+}
+
+/// conhost's repaint bytes for that screen (the measured shape): each row's
+/// text, a prompt's last row ended by its blanks as spaces when it has four
+/// or fewer (at 60, 40 and 39 columns) and by `CSI K` otherwise, the cursor's
+/// own row as `CSI K`, `>>` for `AboveContinuation`, rows joined by CR LF,
+/// `CSI K` rows to the bottom, then the cursor: a CUP, or — when the paint
+/// ended on the cursor's own row at the bottom (`Alone` at 58, 39, 29) — the
+/// `CSI n C` from column 0 conhost sends there, or nothing at column 0.
+fn pad_repaint(fill: PadPrompt, first: usize, rows: u16, cols: u16) -> Vec<u8> {
+    let prompt = pwsh_prompt();
+    let width = usize::from(cols);
+    let blanks = prompt.len().div_ceil(width) * width - prompt.len();
+    let prompt_end = if blanks <= 4 {
+        " ".repeat(blanks)
+    } else {
+        "\x1b[K".to_string()
+    };
+    let mut lines: Vec<String> = (first..=30).map(|n| format!("pad {n:02}\x1b[K")).collect();
+    if let PadPrompt::AboveContinuation = fill {
+        lines.push(format!("{prompt}{prompt_end}"));
+    }
+    lines.push(format!("{prompt}{prompt_end}"));
+    if cursor_row_of_its_own(cols) {
+        lines.push("\x1b[K".to_string());
+    }
+    if let PadPrompt::AboveContinuation = fill {
+        lines.push(">>\x1b[K".to_string());
+    }
+    let mut out = b"\x1b[?25l\x1b[H".to_vec();
+    out.extend_from_slice(lines.join("\r\n").as_bytes());
+    let painted = pad_painted(fill, first, cols).len();
+    for _ in painted..usize::from(rows) {
+        out.extend_from_slice(b"\r\n\x1b[K");
+    }
+    let (row, col) = pad_cursor(fill, first, cols);
+    let ends_on_the_cursor_row = cursor_row_of_its_own(cols)
+        && matches!(fill, PadPrompt::Alone)
+        && painted == usize::from(rows);
+    if !ends_on_the_cursor_row {
+        out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    } else if col > 0 {
+        out.extend_from_slice(format!("\x1b[{col}C").as_bytes());
+    }
+    out.extend_from_slice(b"\x1b[?25h");
+    out
+}
+
+fn pad_history(last: usize) -> Vec<(String, bool)> {
+    (1..=last).map(|n| (format!("pad {n:02}"), false)).collect()
+}
+
+/// Replay `fill`, then every `(rows, cols, first)` step with conhost's repaint
+/// for it, on every ConPTY terminal shape and with the repaint on either side
+/// of the off-thread re-attach. After each step the history is exactly what
+/// conhost demoted (`pad 01..first`), the screen and the cursor are the ones
+/// conhost painted, and every pad line is retained exactly once; at the end
+/// the search index equals a fresh build.
+fn replay_pad_resizes(fill: PadPrompt, steps: &[(u16, u16, usize)]) {
+    let (fill_first, fill_cursor) = match fill {
+        PadPrompt::AboveContinuation => (12, (22, 37)),
+        PadPrompt::Alone => (9, (23, 37)),
+    };
+    for before_reattach in [true, false] {
+        for (label, mut t) in conpty_shapes(24, 80) {
+            let label = format!("{label} {fill:?}");
+            t.process(&pwsh_pad_fill_24(fill));
+            assert_eq!(
+                history(&t),
+                pad_history(fill_first - 1),
+                "{label}: the fill's history"
+            );
+            assert_eq!(
+                visible_rows(&t),
+                pad_screen(fill, fill_first, 24, 80),
+                "{label}: the fill's screen"
+            );
+            assert_eq!(
+                (t.grid().cursor_row(), t.grid().cursor_col()),
+                fill_cursor,
+                "{label}: the cursor one column past the prompt"
+            );
+
+            for &(rows, cols, first) in steps {
+                let step =
+                    format!("{label} {cols}x{rows} (repaint before re-attach: {before_reattach})");
+                conpty_resize(
+                    &mut t,
+                    rows,
+                    cols,
+                    &pad_repaint(fill, first, rows, cols),
+                    before_reattach,
+                );
+                assert_eq!(
+                    history(&t),
+                    pad_history(first - 1),
+                    "{step}: history is what conhost demoted"
+                );
+                assert_eq!(
+                    visible_rows(&t),
+                    pad_screen(fill, first, rows, cols),
+                    "{step}: the screen conhost painted"
+                );
+                assert_eq!(
+                    (t.grid().cursor_row(), t.grid().cursor_col()),
+                    pad_cursor(fill, first, cols),
+                    "{step}: conhost's cursor"
+                );
+                let retained = retained_rows(&t);
+                for n in 1..=30 {
+                    let text = format!("pad {n:02}");
+                    assert_eq!(
+                        retained.iter().filter(|r| **r == text).count(),
+                        1,
+                        "{step}: {text} retained once"
+                    );
+                }
+            }
+            assert_eq!(
+                cached_results(&mut t, "pad "),
+                legacy_results(&t, "pad "),
+                "{label}: the search index equals a fresh build"
+            );
+        }
+    }
+}
+
+/// The review's lost line, replayed: a ConPTY shrink with `>>` under the
+/// cursor demotes every row conhost demotes, so after conhost's repaint the
+/// history is `pad 01..=15` (the review saw `pad 01..=14`, and `pad 15` in
+/// neither history nor screen), the screen is the one conhost painted, and no
+/// pad line is lost or doubled at any of the fourteen steps — including
+/// 20x50, which lost `pad 17` the same way.
+#[test]
+fn conpty_shrink_with_a_row_below_the_cursor_keeps_every_line() {
+    replay_pad_resizes(PadPrompt::AboveContinuation, &PAD_RESIZES);
+}
+
+/// The round-3 review's widths, captured 2026-09-27 (pwsh 7.6 in a debug
+/// aterm 0.95.0 of this tree, `aterm ctl cast`; `pad_repaint` reproduces every
+/// one of these repaints byte for byte, less the SGR bytes and the first
+/// resize's `CSI 8;20;58 t`). At 58, 39 and 29 columns conhost's rewrap puts
+/// the cell after the prompt (the cursor's, past pwsh's `CSI 1 C`) on a row of
+/// its own, so it demotes one row more than a rewrap that clamps the cursor to
+/// the prompt's last glyph: with `>>` below, 20x58 demoted `pad 12..=16`
+/// (row 0 `pad 17`), 20x39 `pad 17..=18` and 20x29 `pad 19..=20`; the review
+/// saw `pad 16` lost at 20x58, in neither history nor screen.
+const PAD_RESIZES_EXACT_WIDTHS: [(u16, u16, usize); 6] = [
+    (20, 58, 17),
+    (24, 80, 17),
+    (20, 39, 19),
+    (24, 80, 19),
+    (20, 29, 21),
+    (24, 80, 21),
+];
+
+/// The same capture's run with ONE prompt and nothing under it: 20x58
+/// demoted `pad 09..=13` (the review saw `pad 13` lost), 20x60 nothing,
+/// 20x39 `pad 14`, 20x29 `pad 15`.
+const PAD_RESIZES_EXACT_WIDTHS_ALONE: [(u16, u16, usize); 7] = [
+    (20, 58, 14),
+    (24, 80, 14),
+    (20, 60, 14),
+    (20, 39, 15),
+    (24, 80, 15),
+    (20, 29, 16),
+    (24, 80, 16),
+];
+
+/// A width that fits the prompt's text in one row fewer than the cells
+/// through the cursor keeps every line: with `>>` under the prompt, and with
+/// the prompt alone on the bottom rows.
+#[test]
+fn conpty_shrink_to_a_width_the_prompt_fills_exactly_keeps_every_line() {
+    replay_pad_resizes(PadPrompt::AboveContinuation, &PAD_RESIZES_EXACT_WIDTHS);
+    replay_pad_resizes(PadPrompt::Alone, &PAD_RESIZES_EXACT_WIDTHS_ALONE);
+}
+
+/// The rows-only path demotes the same four rows (its trim finds no blank row
+/// under the cursor, so all four come off the top): a height-only shrink of
+/// the same screen agrees with the rewrap path.
+#[test]
+fn conpty_rows_only_shrink_with_a_row_below_the_cursor_demotes_the_same_rows() {
+    let fill = PadPrompt::AboveContinuation;
+    let mut t = Terminal::new(24, 80);
+    t.process(&pwsh_pad_fill_24(fill));
+    t.resize_with_policy(20, 80, ResizePolicy::ConPty);
+    assert_eq!(history(&t), pad_history(15));
+    assert_eq!(visible_rows(&t), pad_screen(fill, 16, 20, 80));
+    assert_eq!(
+        (t.grid().cursor_row(), t.grid().cursor_col()),
+        pad_cursor(fill, 16, 80)
+    );
+}
+
+/// TEETH: the same first step on the Native policy is the review's defect —
+/// the width shrink pushes only the three rows that bring the cursor on
+/// screen and cuts `>>`, conhost paints `pad 16` over the `pad 15` it left at
+/// row 0, and `pad 15` is gone from history and screen alike.
+#[test]
+fn native_shrink_with_a_row_below_the_cursor_under_a_conhost_repaint_loses_a_line() {
+    let fill = PadPrompt::AboveContinuation;
+    let mut t = Terminal::new(24, 80);
+    t.process(&pwsh_pad_fill_24(fill));
+    t.resize(20, 60);
+    t.process(&pad_repaint(fill, 16, 20, 60));
+    assert_eq!(history(&t), pad_history(14), "Native pushed three rows");
+    assert!(
+        !retained_rows(&t).iter().any(|r| r == "pad 15"),
+        "pad 15 is in neither history nor screen"
+    );
+}
+
+/// TEETH for the exact widths: the Native rewrap clamps the cursor to the
+/// prompt's last glyph, so at 20x58 it keeps the cursor on the prompt's
+/// second row and pushes one row fewer than conhost demoted; conhost's repaint
+/// then paints `pad 14` over the `pad 13` left at row 0.
+#[test]
+fn native_shrink_to_a_width_the_prompt_fills_exactly_loses_a_line() {
+    let fill = PadPrompt::Alone;
+    let mut t = Terminal::new(24, 80);
+    t.process(&pwsh_pad_fill_24(fill));
+    t.resize(20, 58);
+    assert_eq!(
+        (t.grid().cursor_row(), t.grid().cursor_col()),
+        (19, 57),
+        "Native: the cursor clamped to the prompt's last glyph"
+    );
+    t.process(&pad_repaint(fill, 14, 20, 58));
+    assert_eq!(history(&t), pad_history(12), "Native pushed four rows");
+    assert!(
+        !retained_rows(&t).iter().any(|r| r == "pad 13"),
+        "pad 13 is in neither history nor screen"
     );
 }

@@ -762,7 +762,7 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
     }
 
     // Key-hint footer.
-    let hint = "\u{2191}\u{2193} move   \u{23ce} choose   type to filter   esc close";
+    let hint = "\u{2191}\u{2193} move   \u{23ce} choose   esc close";
     let fsize = TypeStep::Caption.px(px);
     let hint_w = text_w(hint, fsize.get());
     let fx = card_x + fit((card_w - hint_w) * 0.5, cw, card_w - hint_w - cw);

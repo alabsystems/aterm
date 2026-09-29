@@ -367,7 +367,7 @@ fn main() {
 
     if arms.len() < 2 {
         println!("startup_exec: SKIPPED — need the release binaries first.");
-        println!("  build them with: cargo build --release --workspace --bins");
+        println!("  build them with: targo --unverified build --release --workspace --bins");
         for m in &missing {
             println!("  missing: {m}");
         }

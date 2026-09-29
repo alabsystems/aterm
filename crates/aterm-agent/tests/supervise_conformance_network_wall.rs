@@ -130,6 +130,7 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         pending_input: false,
         interrupted: false,
         restartable: true,
+        resume: None,
         upgrading: false,
         taskless: false,
         login_back: false,
@@ -139,6 +140,13 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
             2 => Reach::Up { since: at },
             _ => Reach::Unknown,
         },
+        program: aterm_phase::Program::Claude,
+        goal: None,
+        model_field: None,
+        limits: Default::default(),
+        sandbox_fell: None,
+        thread_model: None,
+        upgrade_goal: false,
     }
 }
 

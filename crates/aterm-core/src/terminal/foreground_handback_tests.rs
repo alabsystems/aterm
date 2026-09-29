@@ -423,6 +423,129 @@ fn foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence
     );
 }
 
+// ---------------------------------------------------------------------------
+// THE MANUAL RESET (2026-09-26): `Terminal::manual_handback`, the engine half
+// of the `reset` control verb and Edit ▸ Reset Terminal.
+// ---------------------------------------------------------------------------
+
+/// The live session the 2026-09-26 audit found (window pid 6874, sid 0 at
+/// `~/publication`): a zsh prompt drawn under the incident's modes, armed
+/// before the automatic handback existed, so the only holder the reader ever
+/// saw was the live zsh. Scrollback first, so the test can prove the reset
+/// never touches it; the second value is the main screen's scrollback line
+/// count before the modes were armed (the alt screen has none of its own).
+fn stuck_live_prompt() -> (Terminal, usize) {
+    let sb = aterm_scrollback::Scrollback::new(64, 512, 8_000_000);
+    let mut t = Terminal::with_scrollback(24, 80, 64, sb);
+    for i in 0..40 {
+        t.process(format!("history line {i}\r\n").as_bytes());
+    }
+    let history = t.grid().scrollback_lines();
+    t.process(b"\x1b[?1049h\x1b[>5u\x1b[?1003h\x1b[?1006h\x1b[>4;2m\x1b[?25l");
+    t.process(b"publication % ");
+    (t, history)
+}
+
+/// A shifted charset, an open OSC 8 link and a torn escape sequence carry no
+/// evidence at all: the automatic handback cannot reach them, the manual one
+/// hands every one back. NEGATIVE CONTROL built in: the gated path on an
+/// identical terminal sends only the torn sequence's `CAN`.
+#[test]
+fn manual_handback_reaches_what_the_evidence_gate_cannot() {
+    let arm = |t: &mut Terminal| {
+        t.process(b"\x1b(0\x0e\x1b]8;;https://example.com/dead\x1b\\link\x1b[12;");
+    };
+    let mut gated = Terminal::new(24, 80);
+    arm(&mut gated);
+    assert!(!gated.program_owns_terminal(), "no evidence");
+    let h = gated.foreground_handback().expect("torn CSI");
+    assert_eq!(h.reverted, vec!["parser"], "the gate keeps every mode");
+    assert!(
+        gated.current_hyperlink().is_some(),
+        "the link survives the gate"
+    );
+
+    let mut t = Terminal::new(24, 80);
+    arm(&mut t);
+    let h = t.manual_handback();
+    for name in ["parser", "g0", "gl", "hyperlink"] {
+        assert!(h.reverted.contains(&name), "{name}: {:?}", h.reverted);
+    }
+    assert_eq!(h.bytes.first(), Some(&0x18), "CAN first");
+    assert!(t.parser_is_ground());
+    assert!(t.current_hyperlink().is_none(), "the link is closed");
+    // The next text prints as ASCII, unlinked.
+    t.process(b"\r\nqx");
+    let row = t.grid().cursor_row() as usize;
+    assert_eq!(
+        t.row_text(row).unwrap().trim_end(),
+        "qx",
+        "not line-drawing"
+    );
+}
+
+/// The live-6874 state: every input-hijacking mode goes, the alt screen is
+/// left, the cursor shows, and neither the scrollback nor the main screen
+/// loses a line. Ctrl+7 reaches the prompt as the legacy byte, not CSI-u.
+#[test]
+fn manual_handback_hands_the_stuck_prompt_back_without_clearing_anything() {
+    let (mut t, history) = stuck_live_prompt();
+    assert!(history > 0, "precondition: scrollback exists");
+    assert_ne!(ctrl7(&t), vec![0x1f], "precondition: CSI-u chords");
+
+    let h = t.manual_handback();
+    for name in [
+        "kitty-alt",
+        "alt",
+        "mouse",
+        "mouse-encoding",
+        "mok",
+        "cursor",
+    ] {
+        assert!(h.reverted.contains(&name), "{name}: {:?}", h.reverted);
+    }
+    assert_eq!(t.program_evidence(), 0, "no program mode is left");
+    assert!(!t.is_alternate_screen());
+    assert_eq!(t.modes().mouse_mode, MouseMode::None);
+    assert_eq!(t.modes().mouse_encoding, MouseEncoding::X10);
+    assert_eq!(ctrl7(&t), vec![0x1f]);
+    assert_eq!(
+        t.grid().scrollback_lines(),
+        history,
+        "the scrollback is untouched"
+    );
+    assert!(
+        t.visible_content().contains("history line 39"),
+        "the main screen is shown again, not cleared"
+    );
+}
+
+/// A second reset has nothing to send; a replay of the recorded bytes
+/// reaches the live state (the host records them as `RawIn`).
+#[test]
+fn manual_handback_is_idempotent_and_replays_to_the_live_state() {
+    let (mut live, _) = stuck_live_prompt();
+    let h = live.manual_handback();
+    assert!(!h.bytes.is_empty());
+    let (mut replay, _) = stuck_live_prompt();
+    replay.process(&h.bytes);
+    assert_eq!(projection(&replay), projection(&live));
+
+    let again = live.manual_handback();
+    assert!(
+        again.bytes.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&again.bytes)
+    );
+    assert!(again.reverted.is_empty());
+
+    let mut fresh = Terminal::new(24, 80);
+    assert!(
+        fresh.manual_handback().bytes.is_empty(),
+        "a fresh terminal is at its defaults"
+    );
+}
+
 /// The ASSERTED evidence (2026-09-27, the handback lane under load 59-65):
 /// every setter of an evidence bit is reported, even over a mode already in
 /// force, and each call takes what it reports. The host gives a re-armed bit

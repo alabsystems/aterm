@@ -29,6 +29,11 @@ aterm-effects = { path = "../aterm-effects" }
 # native app runs — extracted from aterm-gui). Pure + clock-injected; the
 # predict_api module samples the real monotonic clock for it (aterm-time below).
 aterm-predict = { workspace = true }
+# The unified message engine (the message band: `notice`, `messages`, the
+# rows the frame reserves above the grid — src/messages_api.rs). Its only
+# dependency is aterm-time: clockless, thread-free, wasm-clean. The renderer's
+# `band` module composes its rows (the same composition the native window runs).
+aterm-messages = { workspace = true }
 # Real monotonic clock for the predict_api host seam: std Instant on native,
 # performance.now() on wasm32 — the predictor's echo reconciliation runs on
 # REAL time (the glitch-expiry self-heal), unlike the deterministic effects clock.
@@ -56,3 +61,15 @@ console_error_panic_hook = "0.1"
 # NOTE: no per-crate [profile.release] — profiles only take effect from the
 # workspace root, which already sets lto/codegen-units=1/strip for release. A wasm
 # size build (opt-level="z") is driven by the build tool's --profile, not here.
+
+[dev-dependencies]
+# TEST-ONLY: the control socket's percent-encoder, which `messages_api`'s
+# `pct_encode` copies byte for byte (`aterm-control` takes the engine's disk
+# tier, whose zstd C library cannot target wasm32, so the shipped module keeps
+# the copy) — `pct_encode_is_the_control_wires` holds the two together.
+# Dev-dependencies never enter the shipped wasm32 graph (resolver 2), and the
+# wasm census's derived closure excludes them.
+aterm-control = { workspace = true }
+
+[lints]
+workspace = true

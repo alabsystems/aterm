@@ -503,6 +503,22 @@ mod tests {
                 perms.set_mode(0o755);
             }
             std::fs::set_permissions(&exe, perms).unwrap();
+            // THE COPY'S FIRST EXEC IS PAID HERE, UNBOUNDED. A copy is a new file, and the
+            // first exec of a new file waits, at 0% CPU, until macOS `syspolicyd` has
+            // assessed it, one file at a time behind every test binary the gate links: a
+            // 43 MB fresh Mach-O measured 30 s there (2026-09-28), exactly where the
+            // readiness bound below fired on a child that had not started yet. A later exec
+            // of the same file costs nothing (the manual.rs `run_once` rule), so the copy
+            // runs once with no outliver env — the probe returns at once — and the bounded
+            // spawn, the unlink and the read below all meet the same, assessed file.
+            let _ = std::process::Command::new(&exe)
+                .args(["--exact", "--quiet", OUTLIVER_PROBE])
+                .env(PROBE_ENV, "1")
+                .env_remove(OUTLIVER_ENV)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
             // The child announces when its test body has reached the park. An exec path
             // alone does not establish that under a parallel workspace test.
             let mut child = std::process::Command::new(&exe)

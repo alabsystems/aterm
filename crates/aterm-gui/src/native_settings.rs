@@ -17,6 +17,11 @@ use aterm_containment::consent::{
     ResetOutcome, ResetPlan, SpikeEvidence, TccutilPresence,
 };
 use aterm_grapheme::GraphemeClusters;
+use aterm_messages::page::{
+    EMPTY as MESSAGES_EMPTY, MessagesClock, MessagesFilter, NOT_SAVED as MESSAGES_NOT_SAVED,
+    description as messages_description, same_chip as messages_same_chip,
+    status_words as messages_status_words,
+};
 
 use crate::about::AboutState;
 use crate::app_config::Config;
@@ -3507,7 +3512,7 @@ impl SettingsApp {
     }
 
     /// The host performed (or refused) an entry's button: its words are the
-    /// page's feedback (`messages_host::act_feedback`).
+    /// page's feedback (`aterm_messages::page::act_feedback`).
     fn finish_message_act(
         view: &mut SettingsViewState,
         operation: OperationId,
@@ -3584,14 +3589,14 @@ impl SettingsApp {
             }
             // THE REPORT (design ruling 65): the entries the chip shows, newest
             // first, each as its own Copy puts it, under the build information —
-            // what a report needs, in one press.
+            // what a report needs, in one press. The text is the engine's
+            // (ruling 397); the build information is this host's.
             "copy-all" => {
                 let shown = messages_visible(&self.messages, &view.messages_filter);
-                let mut text = crate::about::provenance_text();
-                for entry in &shown {
-                    text.push_str("\n\n");
-                    text.push_str(&entry.copy_text());
-                }
+                let text = aterm_messages::page::copy_all_text(
+                    &crate::about::provenance_text(),
+                    shown.iter().copied(),
+                );
                 let operation = cx.clipboard(ClipboardRequest::CopyText {
                     text,
                     sensitive: false,
@@ -4425,7 +4430,6 @@ fn settings_field_is_visible(key: &str, modified_only: bool, global_search: bool
         "matrix_rain.materialize",
         "matrix_rain.ink_text",
         "matrix_rain.phosphor",
-        "sparkle_words.orca.enabled",
     ];
     // Keyword-toy internals are intentionally Manual-only. The ordinary UI
     // exposes exactly the two product-level toggles, while the config editor
@@ -4500,6 +4504,11 @@ enum AdvancedEffectPath {
     /// `[harness]` on every config reload and starts, stops or re-policies the
     /// supervisor of every Claude Code session the moment the file is saved.
     HarnessRuntime,
+    /// The desktop-notification delivery thread (`notify::spawn_delivery`),
+    /// whose `own_alerts` switch every config commit re-stores
+    /// (`App::apply_desktop_alerts`), plus the App's own producers, which read
+    /// `desktop_alerts` per notice.
+    DesktopNotifier,
 }
 
 /// Deliberately small native Advanced surface. Everything outside this map
@@ -4641,6 +4650,11 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_HARNESS_ANSWER_QUESTIONS => Some(Effect::HarnessRuntime),
         prefs::EDIT_PACKAGES_ENABLED | prefs::EDIT_PACKAGES_AUTO_INSTALL => {
             Some(Effect::PackageRuntime)
+        }
+        // aterm's own desktop notifications: a row only where a desktop
+        // notifier exists (the `allow_notifications` gate above, same reason).
+        prefs::EDIT_DESKTOP_ALERTS => {
+            crate::notify::delivery_available().then_some(Effect::DesktopNotifier)
         }
         // The [machine] host settings actuate only on macOS (`defaults`, Spotlight):
         // ordinary Security rows there, Modified/Manual-only elsewhere — the
@@ -5194,7 +5208,6 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
     let sparkle = config.sparkle_words.as_ref();
     let profanity = sparkle.and_then(|s| s.profanity.as_ref());
     let feline = sparkle.and_then(|s| s.feline.as_ref());
-    let orca = sparkle.and_then(|s| s.orca.as_ref());
     let ink = sparkle.and_then(|s| s.ink.as_ref());
     let emphasis = sparkle.and_then(|s| s.emphasis.as_ref());
     match key {
@@ -5224,7 +5237,6 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "sparkle_words.feline.allow_bare_cat" => feline.and_then(|f| f.allow_bare_cat),
         "sparkle_words.feline.cjk_single_char" => feline.and_then(|f| f.cjk_single_char),
         "sparkle_words.feline.log" => feline.and_then(|f| f.log),
-        "sparkle_words.orca.enabled" => orca.and_then(|o| o.enabled),
         "sparkle_words.ink.enabled" => ink.and_then(|i| i.enabled),
         "sparkle_words.ink.loop" => ink.and_then(|i| i.loop_),
         "sparkle_words.emphasis.enabled" => emphasis.and_then(|e| e.enabled),
@@ -5256,6 +5268,7 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "option_as_meta" => config.option_as_meta,
         "focus_boost" => config.focus_boost,
         "explain_heavy_load" => config.explain_heavy_load,
+        "desktop_alerts" => config.desktop_alerts,
         "allow_osc52_query" => config.allow_osc52_query,
         "allow_window_ops" => config.allow_window_ops,
         "allow_notifications" => config.allow_notifications,
@@ -13672,6 +13685,25 @@ fn parent_or_motion_inactivity(
         ));
     }
 
+    // THE MOMENTUM GLOW's gate: since 2026-09-27 it obeys the cursor-effects
+    // master (`cursor_trail`, whose absent-key default is platform-split), and
+    // nothing trail-shaped besides — the style (`off` keeps it) and the pack do
+    // not dim it — so it is not a TRAIL_TUNING_KEYS row and states only this.
+    if key == prefs::EDIT_CURSOR_MOMENTUM_GLOW
+        && !candidate_setting_bool(
+            state,
+            patch,
+            prefs::EDIT_CURSOR_TRAIL,
+            crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
+        )
+    {
+        return Some(inactive(
+            "The typing momentum glow is saved but inactive while Cursor trail is Off",
+            "Inactive · Cursor trail Off",
+            "Currently inactive: Cursor trail is Off",
+        ));
+    }
+
     // Every one of the five flags below is `false` unless `key` is a cursor-trail
     // key, so gate the whole block on that cheap key-only test: `candidate_trail_resolution`
     // is a field-vector scan plus a `String` plus a walk of the trail-pack catalog,
@@ -15524,10 +15556,18 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             ));
         }
         for service in access.unmeasured.iter() {
-            rows.push(format!(
-                "{} \u{2014} not measured",
-                macos_access_service_label(service)
-            ));
+            // App-data sits here whenever THIS host's grant is not observed,
+            // but the class itself was measured (the coverage line says where):
+            // say what the grant does.
+            rows.push(if *service == "app-data" {
+                "Other applications' data \u{2014} stopped once Full Disk Access is granted"
+                    .to_string()
+            } else {
+                format!(
+                    "{} \u{2014} not measured",
+                    macos_access_service_label(service)
+                )
+            });
         }
         for service in access.uncovered.iter() {
             rows.push(format!(
@@ -15544,13 +15584,9 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     // grants Full Disk Access, and the line used to stay byte-identical — so
     // the screen meant to confirm the fix could not show it working.
     let prompt = if access.prompt_possible() && access.fda == FdaState::Granted {
-        // The measured half and the unmeasured half, kept apart. Saying only
-        // "an interruption cannot be ruled out" to an owner who has just fixed
-        // the exact thing they came here to fix reads as "it did not work".
-        "Granted. Measured by aterm on macOS 26.6: the \"access data from other applications\" \
-         request stopped. Your Documents, Desktop and Downloads folders, network and removable \
-         drives, and sessions that were already open have not been measured, so an interruption \
-         from those cannot be ruled out."
+        // The coverage line above already says what was measured and what
+        // was not; this line says what that leaves, pointing at the rows.
+        "Granted. What is marked not measured below can still interrupt a program."
     } else if access.prompt_possible() {
         "A program running in aterm can still be interrupted by a macOS file-access request."
     } else {
@@ -20554,50 +20590,16 @@ fn messages_link_width() -> f32 {
     124.0 * settings_text_scale().min(1.5)
 }
 
-/// The page's one-line invitation when the log is empty.
-const MESSAGES_EMPTY: &str = "Nothing yet.";
-
-/// What the filters let through (design ruling 262): a SEVERITY — All, or
-/// Problems (warnings and errors together, ruling 264) — AND a TAG, or every
-/// tag. The two combine: "updates that failed" is the Updates chip and
-/// Problems together. A tag is
-/// matched by the chip it shows under ([`crate::messages_host::tag_words`]),
-/// so `fabric` and `harness` are one Agents chip and `toolchain` and
-/// `packages` one ALab tools chip, and a deep link to either tag of a pair
-/// selects that chip; the wire keeps each tag.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MessagesFilter {
-    /// Only this tag's chip.
-    pub(crate) tag: Option<String>,
-    /// Only Warn and Error.
-    pub(crate) warn_only: bool,
-}
-
-impl MessagesFilter {
-    /// Whether `entry` passes both filters.
-    fn admits(&self, entry: &MessageView) -> bool {
-        (!self.warn_only || entry.alarm())
-            && self
-                .tag
-                .as_ref()
-                .is_none_or(|t| messages_same_chip(t, &entry.tag))
-    }
-
-    /// Neither filter is down.
-    fn is_all(&self) -> bool {
-        self.tag.is_none() && !self.warn_only
-    }
-}
-
-/// Whether two tags show under ONE chip (their plain words are the same).
-fn messages_same_chip(a: &str, b: &str) -> bool {
-    crate::messages_host::tag_words(a) == crate::messages_host::tag_words(b)
-}
-
-/// The not-saved note (design ruling 65): what a page over an in-memory ring
-/// says, in words a person can act on.
-const MESSAGES_NOT_SAVED: &str =
-    "These messages are kept only until aterm quits: the log file could not be opened.";
+// The filter (`MessagesFilter`), the chip identity (`messages_same_chip`), the
+// not-saved note, the count line's words, the day clock (`MessagesClock`) and
+// an entry's spoken description are the page MODEL's: `aterm_messages::page`
+// (design ruling 382), imported under these names at the top of this file.
+// So are the page's CHROME words (ruling 395): the heading, the subtitle, the
+// segments', chips' and pop-up's words, Copy and Copy All and what Copy All
+// copies, a footer button's `Open …`, the meta line, `Technical details` and
+// the empty log's `Nothing yet.` (`MESSAGES_EMPTY`). The macOS page's own
+// affordances keep theirs here: `Open Log Folder` and the `Explain heavy load`
+// row.
 
 /// Copy All's action: the shown entries, newest first, and the build
 /// information on top.
@@ -20661,23 +20663,12 @@ fn messages_visible<'a>(
         .collect()
 }
 
-/// The page's subtitle: what the log is (design §10.11). Most messages are
-/// records that were never on the band, so the log is what aterm REPORTED, not
-/// only what it told you. One line at every width (it fits the 286.5 pt phone
-/// page, `page_subtitles_fit_compact_and_minimum_medium_content_measure`).
+/// The page's subtitle, the engine's (`aterm_messages::page::SUBTITLE`, ruling
+/// 395): what the log is (design §10.11). One line at every width (it fits the
+/// 286.5 pt phone page,
+/// `page_subtitles_fit_compact_and_minimum_medium_content_measure`).
 fn messages_page_subtitle(_width: SettingsWidth) -> &'static str {
-    "What aterm reported, newest first."
-}
-
-/// The count line's words: `42 messages`, or `12 of 42` under a filter. The
-/// log is one scrolling list (ruling 264): the count is the whole of what
-/// the filters admit, never a page.
-fn messages_status_words(total: usize, shown: usize, all: bool) -> String {
-    if all || total == 0 {
-        format!("{total} message{}", if total == 1 { "" } else { "s" })
-    } else {
-        format!("{shown} of {total}")
-    }
+    aterm_messages::page::SUBTITLE
 }
 
 /// A status-sized line whose WHOLE text is the semantic node's label and
@@ -20762,8 +20753,8 @@ fn messages_count_line(
     };
     let (copy, copy_w) = messages_small_button(
         MESSAGES_COPY_ALL,
-        "Copy All",
-        "Copy the shown messages",
+        aterm_messages::page::COPY_ALL,
+        aterm_messages::page::COPY_ALL_NAME,
         !empty,
     );
     let (folder, folder_w) = messages_small_button(
@@ -20871,28 +20862,16 @@ fn messages_severity_segments(
     let measure = |label: &str| {
         crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px) + 28.0
     };
-    let tagged = |e: &&MessageView| {
-        filter
-            .tag
-            .as_ref()
-            .is_none_or(|t| messages_same_chip(t, &e.tag))
-    };
-    let all = messages.entries.iter().filter(tagged).count();
-    let alarms = messages
-        .entries
-        .iter()
-        .filter(tagged)
-        .filter(|e| e.alarm())
-        .count();
+    // The counts and their words are the engine's (rulings 391 and 395): the
+    // web page's `all=`/`problems=` and `all_words=`/`problems_words=` are the
+    // same calls.
+    let (all, alarms) = messages.severity_counts(filter.tag.as_deref());
+    let (all_words, problems_words) = aterm_messages::page::severity_segment_words(all, alarms);
     let segments = [
-        (
-            "settings/messages/filter/all",
-            format!("All \u{00b7} {all}"),
-            !filter.warn_only,
-        ),
+        ("settings/messages/filter/all", all_words, !filter.warn_only),
         (
             "settings/messages/filter/warn",
-            format!("Problems \u{00b7} {alarms}"),
+            problems_words,
             filter.warn_only,
         ),
     ];
@@ -20994,32 +20973,22 @@ fn messages_tag_chip_rows(
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px),
         ) + 26.0
     };
-    // One chip per chip NAME, keyed by the first tag that shows under it.
-    let mut groups: Vec<(String, String, usize)> = Vec::new();
-    for (tag, _) in &messages.tags {
-        let words = crate::messages_host::tag_words(tag).into_owned();
-        let count = messages
-            .entries
-            .iter()
-            .filter(|e| messages_same_chip(tag, &e.tag) && (!filter.warn_only || e.alarm()))
-            .count();
-        if !groups.iter().any(|(_, w, _)| *w == words) {
-            groups.push((tag.clone(), words, count));
-        }
-    }
+    // One chip per chip NAME, keyed by the first tag that shows under it —
+    // the engine's chips (ruling 391) and their words (ruling 395), the web
+    // page's `chip` lines and its `all_tags=`.
     let mut chips: Vec<(String, String, bool)> = vec![(
         MESSAGES_TAGS_ALL.to_string(),
-        "All tags".to_string(),
+        aterm_messages::page::ALL_TAGS.to_string(),
         filter.tag.is_none(),
     )];
-    chips.extend(groups.into_iter().map(|(tag, words, count)| {
+    chips.extend(messages.chips(filter.warn_only).into_iter().map(|chip| {
         (
-            format!("settings/messages/filter/tag/{tag}"),
-            format!("{words} \u{00b7} {count}"),
+            format!("settings/messages/filter/tag/{}", chip.tag),
+            chip.label(),
             filter
                 .tag
                 .as_deref()
-                .is_some_and(|t| messages_same_chip(t, &tag)),
+                .is_some_and(|t| messages_same_chip(t, &chip.tag)),
         )
     }));
     // The severity segments lead the first row where the page seats them
@@ -21129,19 +21098,16 @@ fn messages_tag_chip(key: &str, label: &str, selected: bool, width: f32) -> UiNo
 }
 
 /// The compact page's TAG POP-UP (ruling 262): one `Tag: All ▾` control; open,
-/// the tag chips are listed under it and a press on one closes it.
+/// the tag chips are listed under it and a press on one closes it. Its words
+/// are the engine's (ruling 395).
 fn messages_tag_popup(filter: &MessagesFilter, open: bool, width: f32, height: f32) -> UiNode {
-    let current = filter.tag.as_deref().map_or_else(
-        || "All".to_string(),
-        |t| crate::messages_host::tag_words(t).into_owned(),
-    );
-    let label = format!("Tag: {current}");
+    let tag = filter.tag.as_deref();
     UiNode::new(
         MESSAGES_TAG_MENU,
         UiContent::Button(
             Control::new(
-                ButtonSpec::new(format!("Filter by tag: {current}"))
-                    .visual_label(label)
+                ButtonSpec::new(aterm_messages::page::tag_menu_name(tag))
+                    .visual_label(aterm_messages::page::tag_menu_label(tag))
                     .trailing_icon(ButtonIcon::ChevronDown),
                 ActionId::new(MESSAGES_TAG_MENU),
             )
@@ -21338,75 +21304,6 @@ fn messages_rule(key: &str) -> UiNode {
     .paint_only()
 }
 
-/// THE LOG'S CALENDAR (design ruling 273): the reader's local day, and
-/// whether any admitted entry is from an EARLIER day — only then does the
-/// list carry day headers (a list all of today would spend a line saying what
-/// every row's time already says). Under the headers a row older than today
-/// says its local time (`9:41 PM`), since its header already names the day;
-/// today's rows, and every row of an unheaded list, keep their relative
-/// words (`3 h ago`). Round 18, day four (D12): headers came only when the
-/// entries spanned two days, so a filter that left ONE past day showed no
-/// heading and a raw `2026-09-24` in the time column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MessagesClock {
-    now_unix_ms: u64,
-    offset_s: i64,
-    /// Today, as an `aterm_messages::words::local_day`.
-    today: i64,
-    headed: bool,
-}
-
-impl MessagesClock {
-    fn of(visible: &[&MessageView], now_unix_ms: u64, offset_s: i64) -> Self {
-        let day = |e: &&MessageView| aterm_messages::words::local_day(e.at_unix_ms, offset_s);
-        let today = aterm_messages::words::local_day(now_unix_ms, offset_s);
-        // EARLIER, never merely other: an entry stamped past midnight by a
-        // writer whose clock runs ahead is today's (ruling 281) — it heads
-        // no list of today alone, and its section is today's.
-        let headed = visible.iter().any(|e| day(e) < today);
-        Self {
-            now_unix_ms,
-            offset_s,
-            today,
-            headed,
-        }
-    }
-
-    /// The lead column's words for an entry stamped `at`.
-    fn when(self, at_unix_ms: u64) -> String {
-        if self.headed && aterm_messages::words::local_day(at_unix_ms, self.offset_s) < self.today {
-            aterm_messages::words::clock_words(at_unix_ms, self.offset_s)
-        } else {
-            aterm_messages::words::relative_words(self.now_unix_ms, at_unix_ms)
-        }
-    }
-
-    /// Each entry's SECTION day, newest first, when the list is headed: its
-    /// local day, never newer than the section above it — a record whose
-    /// stamp runs ahead of its neighbours' (another writer's clock) stays in
-    /// the section it is listed in, so every day has one header — and never
-    /// newer than today (ruling 281: a stamp from tomorrow opened a section
-    /// that read `Today` above today's own).
-    fn sections(self, visible: &[&MessageView]) -> Option<Vec<i64>> {
-        if !self.headed {
-            return None;
-        }
-        let mut floor = self.today;
-        Some(
-            visible
-                .iter()
-                .map(|e| {
-                    floor = floor.min(aterm_messages::words::local_day(
-                        e.at_unix_ms,
-                        self.offset_s,
-                    ));
-                    floor
-                })
-                .collect(),
-        )
-    }
-}
-
 /// THE LEAD COLUMN (ruling 262): the severity mark, when, and the tag's chip
 /// name — one fixed width for every row of the page, so every title begins at
 /// the same x. `when` is the widest the relative words take (measured); `tag`
@@ -21477,18 +21374,6 @@ impl MessagesLead {
         let columns = if self.tag > 0.0 { 3.0 } else { 2.0 };
         self.mark + self.when + self.tag + columns * self.gap
     }
-}
-
-/// An entry's name for a screen reader beyond its title (ruling 262): its
-/// severity, its chip name and when, in words — `Warning, ALab tools, 6 hours
-/// ago` — never the wire's `warn · toolchain`.
-fn messages_description(entry: &MessageView, now_unix_ms: u64) -> String {
-    format!(
-        "{}, {}, {}",
-        entry.severity_words(),
-        crate::messages_host::tag_words(&entry.tag),
-        aterm_messages::words::spoken_relative_words(now_unix_ms, entry.at_unix_ms)
-    )
 }
 
 /// One entry's ONE LINE (ruling 262): a flush DISCLOSURE control the whole
@@ -21615,17 +21500,6 @@ fn messages_head_node(
     .children(vec![button, visual])
 }
 
-/// The label an entry's button carries on the page: a destination reads as
-/// where it goes (`Open Packages`, ruling 262); a verb stays itself.
-fn messages_button_label(label: &str) -> String {
-    match label {
-        "Packages" | "Software Update" | "Manual" | "Appearance" | "Messages" | "Settings" => {
-            format!("Open {label}")
-        }
-        other => other.to_string(),
-    }
-}
-
 /// An expanded entry's body, laid out (ruling 262): the meta line (the local
 /// time, and the state where it says something), the plain sentence — the
 /// cause and the next step, `detail[0]` — the buttons in a footer, and the
@@ -21655,56 +21529,40 @@ impl MessagesBody {
     fn of(entry: &MessageView, text_width: f32, utc_offset_s: i64, now_unix_ms: u64) -> Self {
         let (qpx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
         let (ppx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-        let mut meta =
-            aterm_messages::words::local_words(now_unix_ms, entry.at_unix_ms, utc_offset_s);
-        let state = entry.state_words();
-        meta.push_str(" \u{00b7} ");
-        meta.push_str(&state);
-        if entry.repeats > 1 {
-            meta.push_str(&format!(" \u{00b7} \u{00d7}{}", entry.repeats));
-        }
-        // A diagram (a caret under a column) is technical whole; else the first
-        // line is the sentence and the rest the details. The `shown for` line a
-        // record carries is the meta line's already.
-        let diagram = entry
-            .detail
-            .iter()
-            .any(|l| l.starts_with(char::is_whitespace));
-        let shown = entry.shown_line();
-        let mut lines = entry
-            .detail
-            .iter()
-            .map(String::as_str)
-            .filter(|l| Some(*l) != shown);
-        // The sentence is the entry's leading `sentences` lines (ruling 314:
-        // one, but a tab's upgrade row's why and next step), each wrapped to
-        // at most three lines.
-        let sentence = if diagram {
-            Vec::new()
-        } else {
-            lines
-                .by_ref()
-                .take(entry.sentences.max(1))
-                .flat_map(|first| {
-                    let mut wrapped = wrapped_copy_lines(first, ppx, text_width);
-                    if wrapped.len() > 3 {
-                        wrapped.truncate(3);
-                        if let Some(last) = wrapped.pop() {
-                            wrapped.push(elide_wrapped_copy_tail(
-                                &last,
-                                ppx,
-                                crate::widget::TextFace::Ui,
-                                text_width,
-                            ));
-                        }
+        // The meta line's words are the engine's (ruling 395, the web page's
+        // `meta=`); the wrap is the layout's.
+        let meta = entry.meta_words(now_unix_ms, utc_offset_s);
+        // The split is the engine's (ruling 391, the web page's `sentence=`
+        // and `technical=`): a diagram (a caret under a column) is technical
+        // whole; else the entry's leading `sentences` lines (ruling 314: one,
+        // but a tab's upgrade row's why and next step) are the sentence and
+        // the rest the details; the `shown for` line a record carries is the
+        // meta line's already. Each sentence line wraps to at most three
+        // lines.
+        let (sentence, technical) = entry.sentence_and_technical();
+        let diagram = entry.is_diagram();
+        let sentence = sentence
+            .into_iter()
+            .flat_map(|first| {
+                let mut wrapped = wrapped_copy_lines(first, ppx, text_width);
+                if wrapped.len() > 3 {
+                    wrapped.truncate(3);
+                    if let Some(last) = wrapped.pop() {
+                        wrapped.push(elide_wrapped_copy_tail(
+                            &last,
+                            ppx,
+                            crate::widget::TextFace::Ui,
+                            text_width,
+                        ));
                     }
-                    wrapped
-                })
-                .collect()
-        };
+                }
+                wrapped
+            })
+            .collect();
         // A diagram's rows are CUT (a column stays a column); a prose line in
         // the monospace face wraps at its spaces.
-        let technical = lines
+        let technical = technical
+            .into_iter()
             .flat_map(|line| {
                 if diagram {
                     messages_cut_code(line, text_width)
@@ -21727,7 +21585,7 @@ impl MessagesBody {
             .iter()
             .enumerate()
             .map(|(k, action)| {
-                let label = messages_button_label(action.label);
+                let label = aterm_messages::page::button_label(action.label);
                 MessagesButton {
                     key: format!("{key}/action/{}", action.index),
                     width: measure(&label).min(text_width),
@@ -21739,10 +21597,10 @@ impl MessagesBody {
             .collect();
         buttons.push(MessagesButton {
             key: format!("{key}/copy"),
-            label: "Copy".to_string(),
+            label: aterm_messages::page::COPY.to_string(),
             primary: false,
             enabled: true,
-            width: measure("Copy").min(text_width),
+            width: measure(aterm_messages::page::COPY).min(text_width),
         });
         let mut footer: Vec<Vec<MessagesButton>> = vec![Vec::new()];
         let mut used = 0.0_f32;
@@ -21762,13 +21620,17 @@ impl MessagesBody {
         }
     }
 
-    /// The technical lines bounded to `lines` (at least one): the last kept
-    /// line says how many more there are. Copy keeps them all.
+    /// The technical lines bounded to `lines`: the last kept line says how
+    /// many more there are, and at least ONE real line stands above it — a
+    /// bound of one keeps two rows (day nine: `Technical details` over a
+    /// bare `… (2 more lines)` said nothing; ruling 368), and [`Self::fit`]
+    /// drops the whole block when even that does not fit. Two lines are
+    /// never one line and a marker for the other. Copy keeps them all.
     fn bound(&mut self, lines: usize) {
-        let cap = lines.max(1);
-        if self.technical.len() > cap {
-            let hidden = self.technical.len() - (cap - 1);
-            self.technical.truncate(cap - 1);
+        let keep = lines.saturating_sub(1).max(1);
+        if self.technical.len() > keep + 1 {
+            let hidden = self.technical.len() - keep;
+            self.technical.truncate(keep);
             self.technical
                 .push(format!("\u{2026} ({hidden} more lines)"));
         }
@@ -21801,7 +21663,9 @@ impl MessagesBody {
             let drop = (over / code_h).ceil() as usize;
             if self.technical.len() > drop {
                 self.bound(self.technical.len() - drop);
-            } else {
+            }
+            // One real line and its marker, or nothing (Copy keeps them all).
+            if self.height() > avail {
                 self.technical.clear();
             }
         }
@@ -21984,7 +21848,7 @@ fn messages_body_node(entry: &MessageView, body: &MessagesBody, indent: f32) -> 
         children.push(messages_spacer(&format!("{key}/tech-gap"), 8.0));
         children.push(line(
             format!("{key}/technical"),
-            "Technical details".to_string(),
+            aterm_messages::page::TECHNICAL.to_string(),
             SemanticRole::Text,
             StyleRef::Quiet,
             line_h,
@@ -22149,7 +22013,7 @@ fn messages_list_node(
     let node = UiNode::new(
         "settings/messages/list",
         UiContent::Group(GroupSpec {
-            label: Some("Messages".to_string()),
+            label: Some(aterm_messages::page::HEADING.to_string()),
             role: SemanticRole::List,
             style: StyleRef::Secondary,
         }),
@@ -22253,14 +22117,10 @@ fn messages_filter_items(
         let tag_rows = if popup_form {
             // The pop-up measured to its words and its chevron; beside the
             // severity segments where both fit on one line.
-            let current = filter.tag.as_deref().map_or_else(
-                || "All".to_string(),
-                |t| crate::messages_host::tag_words(t).into_owned(),
-            );
             let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
             let popup_w = (crate::tray_raster::ui_text_width_for(
                 crate::widget::TextFace::Ui,
-                &format!("Tag: {current}"),
+                &aterm_messages::page::tag_menu_label(filter.tag.as_deref()),
                 px,
             ) + 56.0)
                 .min(content_width);
@@ -22732,7 +22592,7 @@ fn messages_page(
         return vec![
             UiNode::new(
                 "settings/messages/section",
-                UiContent::Group(GroupSpec::new("Messages")),
+                UiContent::Group(GroupSpec::new(aterm_messages::page::HEADING)),
             )
             .layout(
                 Layout::column()
@@ -22744,7 +22604,7 @@ fn messages_page(
             .children(children),
         ];
     }
-    let mut out = page_heading("Messages", messages_page_subtitle(width));
+    let mut out = page_heading(aterm_messages::page::HEADING, messages_page_subtitle(width));
     out.extend(controls);
     out.extend(list);
     out
@@ -27470,7 +27330,13 @@ mod tests {
                 );
                 assert!(!app_data.contains("not measured"), "{app_data}");
             } else {
-                assert!(app_data.contains("not measured"), "{app_data}");
+                // Not observed on this host, and still the measured fact about
+                // the class, never "not measured".
+                assert!(
+                    app_data.contains("once Full Disk Access is granted"),
+                    "{app_data}"
+                );
+                assert!(!app_data.contains("not measured"), "{app_data}");
                 assert!(!app_data.contains("confirmed"), "{app_data}");
             }
             assert!(copy.responsible.contains("does not establish their access"));
@@ -27780,9 +27646,8 @@ mod tests {
         );
         assert_eq!(copy.services.len(), 7);
         assert!(
-            copy.services
-                .iter()
-                .any(|s| s.starts_with("Other applications' data \u{2014} not measured")),
+            copy.services.iter().any(|s| s
+                == "Other applications' data \u{2014} stopped once Full Disk Access is granted"),
             "{:?}",
             copy.services
         );
@@ -27831,7 +27696,7 @@ mod tests {
             today.coverage
         );
         assert!(
-            today.prompt.contains("cannot be ruled out"),
+            today.prompt.contains("can still interrupt"),
             "a held grant whose breadth is unmeasured still leaves a prompt possible — and \
              says so as a GRANTED state, not as the missing-grant sentence: {}",
             today.prompt
@@ -28564,13 +28429,9 @@ mod tests {
     /// rule that keeps the warm-up off the verb table.
     #[test]
     fn no_control_dispatch_arm_can_reach_the_reset() {
-        // The entry points that actually RUN the tool. The fence is about
-        // execution, not vocabulary: `consent::tccutil_reset_command` is a PURE
-        // argv builder and `control_privacy.rs` legitimately calls it to render
-        // the `remediate reset=` recipe the `privacy` verb is specified to
-        // print (design §5.1). Printing the recipe tells a human what to type;
-        // it resets nothing. Executing it from a control surface is the thing
-        // that must be impossible, so these are the tokens that matter.
+        // The entry points that actually RUN the tool. Executing it from a
+        // control surface is the thing that must be impossible, so these are
+        // the tokens that matter.
         const RESET_ENTRY_POINTS: &[&str] = &["run_tccutil_reset", "wait_bounded", "ResetPlan"];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut checked = 0usize;
@@ -28606,17 +28467,24 @@ mod tests {
              matched nothing"
         );
 
-        // And the fence must be checking something real: the control surface
-        // may name the recipe (it prints it), so prove that allowance is live
-        // rather than silently unused, or the test above could pass because
-        // nothing anywhere touches reset at all.
+        // And the fence must be checking something real: the functions it
+        // bans are defined in the panel that owns the reset, or the scan above
+        // could pass because nothing anywhere touches reset at all.
+        let panel = std::fs::read_to_string(dir.join("native_settings.rs"))
+            .expect("read native_settings.rs");
+        for token in &RESET_ENTRY_POINTS[..2] {
+            assert!(
+                panel.contains(&format!("fn {token}(")),
+                "the reset entry point `{token}` is gone from native_settings.rs; \
+                 this fence is no longer proving anything"
+            );
+        }
+        // The `privacy` verb no longer prints a reset recipe either: an agent
+        // in a session reads it, and running one would re-arm a prompt the
+        // human already answered.
         let privacy = std::fs::read_to_string(dir.join("control_privacy.rs"))
             .expect("read control_privacy.rs");
-        assert!(
-            privacy.contains("tccutil_reset_command"),
-            "the `privacy` verb is specified to print a `remediate reset=` recipe; \
-             if that call is gone, this fence is no longer proving anything"
-        );
+        assert!(!privacy.contains("tccutil_reset_command"));
     }
 
     fn compile_settings_view(
@@ -31457,6 +31325,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -31523,6 +31392,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -31588,6 +31458,7 @@ mod tests {
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
                 pass_seq: 0,
+                stale_index_only_pass_seq: 0,
                 programs: std::collections::BTreeMap::new(),
                 extra: Default::default(),
             }),
@@ -31754,6 +31625,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -32077,6 +31949,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -34388,6 +34261,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -45311,7 +45185,6 @@ enabled = true
             "matrix_rain.materialize",
             "matrix_rain.ink_text",
             "matrix_rain.phosphor",
-            "sparkle_words.orca.enabled",
             SPARKLE_MASTER_KEY,
         ] {
             assert!(!settings_field_is_visible(key, false, false), "{key}");
@@ -45452,6 +45325,11 @@ enabled = true
             group_witnesses.push(("This Mac", prefs::EDIT_MACHINE_SPOTLIGHT_NOINDEX));
         }
         group_witnesses.push(("Paste safety", prefs::EDIT_CONFIRM_MULTILINE_PASTE));
+        // The Security page's "Notifications" box (`desktop_alerts`): a row only
+        // where a desktop notifier exists.
+        if crate::notify::delivery_available() {
+            group_witnesses.push(("Notifications", prefs::EDIT_DESKTOP_ALERTS));
+        }
         assert_eq!(
             ordinary_groups,
             group_witnesses
@@ -45480,6 +45358,8 @@ enabled = true
             ("Scrollback", "Searchable scrollback lines"),
             ("Text direction & width", "right-to-left"),
             ("Permissions", "request access"),
+            // Off loses nothing: the note says where the alerts still go.
+            ("Notifications", "message band"),
             // The This Mac box must say the second way its rows apply — the
             // card's own button — and how each change is undone.
             ("This Mac", "Apply now"),
@@ -46899,6 +46779,46 @@ enabled = true
         }
     }
 
+    /// THE MOMENTUM GLOW ANSWERS TO THE CURSOR-EFFECTS MASTER, AND ONLY TO IT.
+    /// Since 2026-09-27 the glow obeys `cursor_trail` (a master-off window
+    /// typed into fast lights no halo), so with the master Off its row says
+    /// so instead of looking checked and live. It is NOT a trail tuning row:
+    /// the trail's style (`off` keeps the glow) and a missing pack leave it
+    /// lit, so it takes neither of those disclosures. The absent master is
+    /// the platform default, Off on Windows.
+    #[test]
+    fn the_momentum_glow_row_discloses_the_cursor_trail_master_and_nothing_else() {
+        let availability = audited_availability();
+        let motion = crate::native_app::ViewMotionCx::default();
+        let key = prefs::EDIT_CURSOR_MOMENTUM_GLOW;
+        let project =
+            |source: &str| projected_effect(source, &[(key, "true")], key, availability, motion);
+
+        let off = project("cursor_trail = false\n");
+        assert!(effect_note_contains(&off, "Cursor trail is Off"), "{off:?}");
+        assert!(!off.has_live_effect, "{off:?}");
+
+        for source in [
+            "cursor_trail = true\n",
+            "cursor_trail = true\ncursor_trail_style = \"off\"\n",
+            "cursor_trail = true\ncursor_trail_style = \"pack:not-loaded\"\n",
+        ] {
+            let on = project(source);
+            assert!(on.has_live_effect, "{source}{on:?}");
+            assert!(
+                !effect_note_contains(&on, "Cursor trail is Off"),
+                "{source}{on:?}"
+            );
+        }
+
+        let absent = project("");
+        assert_eq!(
+            absent.has_live_effect,
+            crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
+            "the absent master is the platform default: {absent:?}"
+        );
+    }
+
     #[test]
     fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
         let availability = audited_availability();
@@ -48148,6 +48068,68 @@ enabled = true
                 .contains("Answer questions with the recommended option"),
             "{}",
             control.label
+        );
+    }
+
+    /// `desktop_alerts` (2026-09-28: the owner turned aterm's own desktop
+    /// alerts off) is an ordinary Settings ▸ Security switch in its own
+    /// "Notifications" box, resolved OFF from the default config, and a search
+    /// for "alerts" draws it. NEGATIVE CONTROL: a config that turns it on
+    /// seeds it ON, so the OFF is the default's and not a dead switch. Only
+    /// where a desktop notifier exists: elsewhere it is Manual-only, like
+    /// `allow_notifications`.
+    #[test]
+    fn the_security_page_carries_the_desktop_alerts_switch() {
+        let key = prefs::EDIT_DESKTOP_ALERTS;
+        assert_eq!(prefs::section_of(key), prefs::Section::Security);
+        assert_eq!(prefs::group_of(key).0, "Notifications");
+        assert!(prefs::group_footnote("Notifications").is_some());
+        let on: Config = aterm_toml::from_str("desktop_alerts = true").unwrap();
+        let seed = |cfg: &Config| {
+            prefs::editable_fields(cfg)
+                .into_iter()
+                .find(|field| field.key == key)
+                .and_then(|field| field.seed)
+        };
+        assert_eq!(seed(&Config::default()).as_deref(), Some("false"));
+        assert_eq!(seed(&on).as_deref(), Some("true"), "an ON config seeds ON");
+        if !crate::notify::delivery_available() {
+            assert!(native_advanced_effect(key).is_none());
+            return;
+        }
+        assert!(matches!(
+            native_advanced_effect(key),
+            Some(AdvancedEffectPath::DesktopNotifier)
+        ));
+        let (mut runtime, instance, view) = setup();
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Security);
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
+        let control = compiled
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .expect("the Security page draws the desktop-alerts switch");
+        assert!(
+            control.label.contains("Desktop notifications from aterm"),
+            "{}",
+            control.label
+        );
+        assert_eq!(control.value, SemanticValue::Bool(false), "default OFF");
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/search"),
+                    value: Some(SemanticInput::Text("alerts".to_string())),
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!("settings/control/{key}")))
+                .is_some(),
+            "a search for \"alerts\" draws it"
         );
     }
 
@@ -49599,41 +49581,8 @@ enabled = true
         assert_eq!(when(&compiled, 40).as_deref(), Some("1 min ago"));
     }
 
-    /// A STAMP FROM TOMORROW IS TODAY'S (ruling 281): a writer whose clock
-    /// runs ahead stamps a record past the reader's midnight. It heads no
-    /// list of today alone (ruling 277: a list all of today carries none),
-    /// and in a headed list it opens no section of its own — before 281 it
-    /// did, and read `Today` above today's own `Today`. NEGATIVE CONTROL: a
-    /// past entry still heads the list, into two sections.
-    #[test]
-    fn a_stamp_from_tomorrow_is_todays() {
-        const DAY: u64 = 86_400_000;
-        let state = sample_messages();
-        let now = state.now_unix_ms;
-        let mut entries: Vec<MessageView> = state.entries.into_iter().take(3).collect();
-        // Past the reader's midnight (the reader is at 15:53 UTC).
-        entries[0].at_unix_ms = now + 9 * 3_600_000;
-        entries[1].at_unix_ms = now - 60_000;
-        entries[2].at_unix_ms = now - 120_000;
-        let refs: Vec<&MessageView> = entries.iter().collect();
-        let today = aterm_messages::words::local_day(now, 0);
-        let clock = MessagesClock::of(&refs, now, 0);
-        assert!(
-            !clock.headed,
-            "a list of today and tomorrow carries no header"
-        );
-        assert_eq!(clock.sections(&refs), None);
-
-        entries[2].at_unix_ms = now - 3 * DAY;
-        let refs: Vec<&MessageView> = entries.iter().collect();
-        let clock = MessagesClock::of(&refs, now, 0);
-        assert!(clock.headed, "a past entry heads it");
-        assert_eq!(
-            clock.sections(&refs),
-            Some(vec![today, today, today - 3]),
-            "tomorrow's stamp is in today's section"
-        );
-    }
+    // `a_stamp_from_tomorrow_is_todays` (ruling 281) pins the day clock alone and
+    // moved with it to the engine: `aterm_messages::page_tests` (design ruling 382).
 
     /// ONE PAST DAY IS STILL HEADED, AND THE TITLES NEVER MOVE WITH THE
     /// FILTER (round 18, day four, D12/D13): a filter that left one past day
@@ -50375,8 +50324,8 @@ enabled = true
     #[test]
     fn an_upgrade_records_why_and_next_step_are_its_sentence() {
         let state = sample_messages();
-        let remedy = "it asks again on its own at 12:55 AM; Upgrade now asks it at its next turn \
-                      end; Skip This Version in the tab's menu keeps it on 2.1.280";
+        let remedy = "it asks again on its own at 12:55 AM; Upgrade now asks it at its next pause; \
+                      Skip This Version in the tab's menu keeps it on 2.1.280";
         let entry = MessageView {
             detail: vec![
                 "behind for 7 h: it has not agreed to the move yet, so the upgrade rests, then \
@@ -51458,6 +51407,57 @@ enabled = true
         );
     }
 
+    /// DAY NINE, D4 (ruling 368): an entry's Technical details never shows
+    /// its `… (N more lines)` marker alone. Room for one line keeps one real
+    /// line and the marker when that fits, else no block at all (Copy keeps
+    /// every line); two lines are never one and a marker for the other.
+    /// Control: room for everything cuts nothing.
+    #[test]
+    fn technical_details_never_show_the_more_lines_marker_alone() {
+        let body = |technical: &[&str]| MessagesBody {
+            meta: vec!["Today 21:40 \u{00b7} config".to_string()],
+            sentence: vec!["Misspelled setting".to_string()],
+            technical: technical.iter().map(|l| (*l).to_string()).collect(),
+            footer: vec![Vec::new()],
+        };
+        let code = messages_code_line_height();
+        let with_rows = |b: &MessagesBody, rows: usize| {
+            let mut b = b.clone();
+            b.technical.truncate(rows);
+            b.height()
+        };
+        // Two lines, room for one: never `… (2 more lines)` alone.
+        let two = body(&["line 3: windw_padding = 20", "near miss: window_padding"]);
+        let mut fitted = two.clone();
+        fitted.fit(with_rows(&two, 1) + 0.5);
+        assert!(
+            fitted.technical.iter().all(|l| !l.starts_with('\u{2026}')),
+            "{:?}",
+            fitted.technical
+        );
+        assert!(
+            fitted.technical.is_empty(),
+            "no room for both: the block goes"
+        );
+        // Five lines, room for two rows: one real line and the marker.
+        let five = body(&["a", "b", "c", "d", "e"]);
+        let mut fitted = five.clone();
+        fitted.fit(with_rows(&five, 2) + 0.5);
+        assert_eq!(fitted.technical, vec!["a", "\u{2026} (4 more lines)"]);
+        // Room for one row only: never the marker alone.
+        let mut fitted = five.clone();
+        fitted.fit(with_rows(&five, 1) + 0.5);
+        assert!(fitted.technical.is_empty(), "{:?}", fitted.technical);
+        // The bound itself keeps a real line at a bound of one.
+        let mut bounded = five.clone();
+        bounded.bound(1);
+        assert_eq!(bounded.technical, vec!["a", "\u{2026} (4 more lines)"]);
+        // Control: room for everything cuts nothing.
+        let mut fitted = five.clone();
+        fitted.fit(five.height() + code);
+        assert_eq!(fitted.technical.len(), 5);
+    }
+
     /// ROUND 16, DAY TWO (ruling 267): every script tag is a filter, and a
     /// wider page lays its tags out as chips — seven script tags made three
     /// lines of them. Past two lines the page takes the `Tag: …` pop-up, which
@@ -51807,7 +51807,7 @@ enabled = true
         config.push(
             ConfigFamily::IgnoredKeys,
             "config line 3: windw_padding \u{2014} did you mean \"window_padding\"? \
-             (unknown to this aterm build; preserved for forward compatibility)"
+             (no effect in this build)"
                 .into(),
         );
         config.push(

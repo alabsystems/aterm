@@ -166,6 +166,14 @@ impl<T> RecoveryLedger<T> {
 }
 
 impl<T: Clone> RecoveryLedger<T> {
+    /// Whether [`Self::candidate_snapshot`] would answer `Some`, without cloning
+    /// the record — the menu's enabled bit asks this on the way to every wait.
+    pub(crate) fn has_candidate(&self, now_ms: u64) -> bool {
+        self.entries
+            .back()
+            .is_some_and(|entry| now_ms.saturating_sub(entry.closed_at_ms) <= self.max_age_ms)
+    }
+
     pub(crate) fn candidate_snapshot(&self, now_ms: u64) -> Option<ReopenCandidate<T>> {
         let entry = self.entries.back()?;
         (now_ms.saturating_sub(entry.closed_at_ms) <= self.max_age_ms).then(|| ReopenCandidate {
@@ -233,6 +241,7 @@ mod tests {
             questions: None,
             identity: None,
             agent: None,
+            held: false,
         })
     }
 
@@ -263,6 +272,29 @@ mod tests {
         assert_eq!(ledger.len(), 2);
         let oldest = ledger.entries.front().unwrap();
         assert_eq!(oldest.value.tab.root, tab("two").tab.root);
+    }
+
+    /// `has_candidate` answers exactly what `candidate_snapshot().is_some()`
+    /// does — empty, fresh, and past the age bound — without cloning.
+    #[test]
+    fn has_candidate_agrees_with_the_snapshot() {
+        let mut ledger = RecoveryLedger::new(4, 10);
+        for now in [0, 5, 20] {
+            assert_eq!(
+                ledger.has_candidate(now),
+                ledger.candidate_snapshot(now).is_some()
+            );
+            assert!(!ledger.has_candidate(now), "empty");
+        }
+        ledger.push(tab("one"), 5);
+        for now in [5, 15, 16, 40] {
+            assert_eq!(
+                ledger.has_candidate(now),
+                ledger.candidate_snapshot(now).is_some(),
+                "at {now}"
+            );
+        }
+        assert!(ledger.has_candidate(15) && !ledger.has_candidate(16));
     }
 
     #[test]

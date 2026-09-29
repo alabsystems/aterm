@@ -42,6 +42,14 @@
 //!   branded command with the caller's own arguments filled in — both lanes
 //!   where there are two — and then RUN WHAT WAS ASKED FOR, upstream.
 //!
+//!   THE SPELLING IS `aterm_types::rust_lane`'s (2026-09-23): one vocabulary with
+//!   `aterm pkg lane` ([`crate::lane`]) and `aterm help rust`, so a cargo verb
+//!   gets the lane targo accepts for it — `build`/`check`/`test` both, `run`/`doc`/
+//!   `install`… the unverified one, `metadata`/`fmt`/`tree`… none, `clippy`
+//!   `targo tippy` — never a command targo refuses. And a directory whose
+//!   `rust-toolchain.toml` pins a STOCK channel says so under the lanes: that pin
+//!   moves only rustup's proxies, never `targo` ([`Pin`]).
+//!
 //!   ANNOUNCE, DO NOT PREVENT. This row used to refuse (exit
 //!   [`REFUSAL_EXIT`]) on the reading that "the friction is the feature". The
 //!   owner's instruction of 2026-09-08 decides otherwise, verbatim: *"We don't
@@ -51,9 +59,9 @@
 //!   built to close, says *"intercept and loudly WARN"*, not refuse. The
 //!   refusal came from a review, not from either instruction. What §4 actually
 //!   withholds is SILENT substitution, which is why it already let
-//!   `cargo +stable build` through with one loud line ([`passthrough_note`]);
-//!   a bare `cargo build` that announces and then runs is no more silent than
-//!   that one. The suppression the owner asked for is a SETTING, `[reroute]
+//!   `cargo +stable build` through with a signpost of its own
+//!   ([`stock_channel_signpost`]); a bare `cargo build` that announces and then
+//!   runs is no more silent than that one. The suppression the owner asked for is a SETTING, `[reroute]
 //!   announce = false` in aterm.toml ([`crate::config::RerouteConfig`], Settings
 //!   ▸ Packages) — owner, 2026-09-22: settings, "NOT ENV VARS those are for
 //!   development". `ATERM_REROUTE_QUIET` is gone, and so is `ATERM_REROUTE_STRICT`,
@@ -76,10 +84,14 @@
 //!   escape works even when atpkg is unreachable. The Rust side stamps the same marker
 //!   on any upstream child it execs, so cargo's own `rustc`/`rustdoc` spawns are never
 //!   re-announced or refused.
-//! * `cargo +<toolchain>` naming a non-Trust toolchain is the user naming
-//!   upstream deliberately: it runs, with one loud line, because §4 withholds
-//!   only *silent* substitution. `+trust…` keeps the lane question and is
-//!   signposted like a bare `cargo`.
+//! * `<tool> +<toolchain>` naming a non-Trust toolchain is the user naming
+//!   upstream deliberately: it runs as named, after [`stock_channel_signpost`] —
+//!   the Trust spelling of the same command, silenced like any signpost by the
+//!   setting — because §4 withholds only *silent* substitution. That holds for the
+//!   DIRECT Rust rows too since 2026-09-23: `rustfmt +1.97.1 x.rs` used to hand
+//!   `+1.97.1` to trustfmt as a file name (ledger item HOST-05). `+trust…` keeps
+//!   the lane question and is signposted like a bare `cargo`; upstream receives the
+//!   directive it was given, and a DIRECT row's branded tool never does ([`plan`]).
 //! * `rustup run <tc> cargo` never reaches these stubs (rustup resolves the
 //!   toolchain's own binaries), and neither does an absolute path — which is why
 //!   the compiler's own bootstrap, which drives stage0 by absolute path, stays
@@ -100,6 +112,8 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use aterm_types::rust_lane;
 
 use crate::store::Layout;
 
@@ -245,7 +259,10 @@ const RUSTC_LANES: &[Lane] = &[
 
 /// `cargo <verb>` for a verb that IS a direct-row operation: one branded
 /// spelling and no lane question — tippy lints and trustfmt formats, neither
-/// proves nor builds. Anything else keeps both lanes.
+/// proves nor builds. Every other verb is spelled by `aterm_types::rust_lane`
+/// (2026-09-23): both lanes for `build`/`check`/`test`, the unverified one for a
+/// verb with no verified lane, none for a verb that takes no lane — pinned
+/// against this table by `the_table_speaks_the_shared_rust_lane_vocabulary`.
 pub const CARGO_VERB_REROUTES: &[(&str, &str)] = &[("clippy", "targo tippy"), ("fmt", "targo fmt")];
 
 /// THE table. Order is the order doctor and `aterm help reroute` list it in.
@@ -352,11 +369,50 @@ pub fn engaged(value: Option<&str>) -> bool {
 
 /// `+<toolchain>` as the FIRST argument (rustup's own spelling) — the user naming
 /// a toolchain deliberately. `None` for anything else.
+/// ([`aterm_types::rust_lane::explicit_toolchain`], the one reading.)
 #[must_use]
 pub fn explicit_toolchain(args: &[String]) -> Option<&str> {
-    let first = args.first()?;
-    let toolchain = first.strip_prefix('+')?;
-    (!toolchain.is_empty()).then_some(toolchain)
+    rust_lane::explicit_toolchain(args)
+}
+
+/// Whether `row` names a stock RUST tool: the rows a rustup `+<toolchain>` means
+/// something to, and the ones [`rust_lane::trust_spelling`] spells.
+fn is_rust_row(row: &Row) -> bool {
+    rust_lane::STOCK_TOOLS
+        .iter()
+        .any(|(stock, _)| *stock == row.upstream)
+}
+
+/// Where a channel is pinned for the directory a stub runs in: a toolchain FILE
+/// rustup would read ([`rust_lane::find_pin`]), or `$RUSTUP_TOOLCHAIN`, which rustup
+/// ranks above any file. It says what rustup's proxies resolve to, and — the fact the
+/// 2026-09-23 incident turned on — that it moves nothing else: `targo`, `tippy`,
+/// `trustfmt` and `trustdoc` are not rustup proxies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    /// The channel named, verbatim.
+    pub channel: String,
+    /// Where it was read: a file path, or `$RUSTUP_TOOLCHAIN`.
+    pub source: String,
+}
+
+impl Pin {
+    /// The pin for `cwd`, `$RUSTUP_TOOLCHAIN` (`env_toolchain`) first as rustup ranks
+    /// it. `None` when neither names a channel.
+    #[must_use]
+    pub fn for_dir(cwd: Option<&Path>, env_toolchain: Option<&str>) -> Option<Pin> {
+        if let Some(tc) = env_toolchain.filter(|tc| !tc.is_empty()) {
+            return Some(Pin {
+                channel: tc.to_string(),
+                source: String::from("$RUSTUP_TOOLCHAIN"),
+            });
+        }
+        let (file, channel) = rust_lane::find_pin(cwd?)?;
+        Some(Pin {
+            channel,
+            source: file.display().to_string(),
+        })
+    }
 }
 
 // ── messages: byte-stable, stderr-only, one fix sentence ────────────────────
@@ -383,6 +439,20 @@ fn signpost_closing() -> String {
     // directory actually gets — instead of guessing from the lines above.
     format!(
         "       `aterm help rust` shows which toolchain this directory gets; the default here is Trust.\n       ({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
+    )
+}
+
+/// The lines a STOCK pin adds under a SIGNPOST's lanes (2026-09-23) — the incident's
+/// shape: an agent read `channel = "1.97.1"` and concluded stock was this repository's
+/// lane, when the pin moves only rustup's proxies. A Trust pin is the default and adds
+/// nothing.
+fn pin_lines(pin: &Pin) -> String {
+    if rust_lane::is_trust_channel(&pin.channel) {
+        return String::new();
+    }
+    format!(
+        "       This directory pins stock \"{}\", which moves only rustup's proxies, never targo:\n       the Trust spellings above run the Trust toolchain here too. ({})\n",
+        pin.channel, pin.source
     )
 }
 
@@ -413,6 +483,8 @@ pub fn direct_announcement(upstream: &str, branded: &str, upstream_found: bool) 
 /// that toolchain, whose `cargo`/`rustc` are Trust's own (`crate::seam::STOCK_NAMES`), so
 /// the first line names it and says no "no proof claim" of it —
 /// `aterm: running 'cargo +trust' (rustup's trust toolchain); on Trust the tool is 'targo':`.
+///
+/// No pin is consulted: [`signpost_message_in`] is the form [`plan`] prints.
 #[must_use]
 pub fn signpost_message(
     row: &Row,
@@ -420,8 +492,28 @@ pub fn signpost_message(
     args: &[String],
     toolchain: Option<&str>,
 ) -> String {
+    signpost_message_in(row, lanes, args, toolchain, None)
+}
+
+/// [`signpost_message`] with the directory's [`Pin`], when it has one — named under the
+/// lanes.
+///
+/// Every spelling of a Rust row is [`rust_lane::trust_spelling`]'s — the vocabulary
+/// `aterm pkg lane` and `aterm help rust` share — so a cargo verb gets the lane targo
+/// ACCEPTS for it: `cargo build` both, `cargo run` the unverified one only, `cargo
+/// metadata`/`cargo fmt` none, `cargo clippy` `targo tippy`. Until 2026-09-23 every verb
+/// but `clippy` and `fmt` got both lanes, so `cargo metadata` printed `targo trust
+/// metadata` and `targo --unverified metadata` — two commands targo refuses.
+#[must_use]
+pub fn signpost_message_in(
+    row: &Row,
+    lanes: &[Lane],
+    args: &[String],
+    toolchain: Option<&str>,
+    pin: Option<&Pin>,
+) -> String {
     let head = toolchain.map_or(Head::Upstream, Head::Toolchain);
-    signpost_block(row, lanes, args, head)
+    signpost_block(row, lanes, args, head, pin)
 }
 
 /// A SIGNPOST row with no upstream copy on PATH: nothing ran, so the first line says
@@ -435,7 +527,36 @@ pub fn signpost_message(
 /// ```
 #[must_use]
 pub fn no_upstream_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
-    signpost_block(row, lanes, args, Head::NotOnPath)
+    signpost_block(row, lanes, args, Head::NotOnPath, None)
+}
+
+/// The signpost for `<upstream> +<stock channel> …` on any Rust row — a STOCK toolchain
+/// named on the command line (`cargo +1.97.1 test`, `rustfmt +1.97.1 x.rs`). `args` is
+/// what follows the directive. Upstream then runs AS NAMED: an announcement, never a
+/// prevention, since the reroute cannot tell a person's `cargo +stable` from a tool's
+/// by-name spawn.
+///
+/// It replaced a one-line note that 33 agent logs of 2026-09-23 carried beside a `cargo
+/// +1.97.1` that ran anyway, and which named no Trust command with the caller's
+/// arguments — so the Trust spelling of the very command leads, both lanes where there
+/// are two, and one line says a stock channel moves only rustup's proxies. The setting
+/// silences it like any signpost, and it says so.
+///
+/// ```text
+/// aterm: running upstream 'cargo +1.97.1' (no proof claim); on Trust the tool is 'targo':
+///          targo trust test -p x          VERIFIED   — emits a proof claim
+///          targo --unverified test -p x   UNVERIFIED — no proof claim
+///        A stock channel, named here or pinned, moves only rustup's proxies, never targo.
+///        `aterm help rust` shows which toolchain this directory gets; the default here is Trust.
+///        ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
+/// ```
+#[must_use]
+pub fn stock_channel_signpost(row: &Row, toolchain: &str, args: &[String]) -> String {
+    let lanes = match row.policy {
+        Policy::Signpost { lanes, .. } => lanes,
+        Policy::Direct { .. } | Policy::Oracle { .. } => &[],
+    };
+    signpost_block(row, lanes, args, Head::Stock(toolchain), None)
 }
 
 /// What the first line of a SIGNPOST block says of the run.
@@ -445,21 +566,34 @@ enum Head<'a> {
     Upstream,
     /// Upstream runs under the caller's `+<toolchain>` — a Trust one ([`signpost_message`]).
     Toolchain(&'a str),
+    /// Upstream runs under the caller's `+<toolchain>` — a STOCK one
+    /// ([`stock_channel_signpost`]).
+    Stock(&'a str),
     /// No upstream copy on PATH: nothing ran.
     NotOnPath,
 }
 
-/// [`signpost_message`] and [`no_upstream_message`].
-fn signpost_block(row: &Row, lanes: &[Lane], args: &[String], head: Head<'_>) -> String {
+/// [`signpost_message_in`], [`no_upstream_message`] and [`stock_channel_signpost`].
+fn signpost_block(
+    row: &Row,
+    lanes: &[Lane],
+    args: &[String],
+    head: Head<'_>,
+    pin: Option<&Pin>,
+) -> String {
     let upstream = row.upstream;
     let branded = branded_of(row);
-    let rest = args.join(" ");
-    // The first line's state: what runs, or that there is nothing to run. `verb` is the
-    // `cargo clippy`/`cargo fmt` spelling's; `claim` is said only of upstream.
+    // The first line's state: what runs, or that there is nothing to run. `verb` is a
+    // one-spelling cargo verb's (`cargo clippy`, `cargo run`); `claim` is said only of
+    // upstream.
     let head_line = |verb: &str, claim: &str| match head {
         Head::Upstream => format!(
             "aterm: running upstream '{}'{claim}",
             join_command(upstream, verb)
+        ),
+        Head::Stock(toolchain) => format!(
+            "aterm: running upstream '{}'{claim}",
+            join_command(&format!("{upstream} +{toolchain}"), verb)
         ),
         Head::Toolchain(toolchain) => format!(
             "aterm: running '{}' (rustup's {toolchain} toolchain)",
@@ -468,36 +602,82 @@ fn signpost_block(row: &Row, lanes: &[Lane], args: &[String], head: Head<'_>) ->
         Head::NotOnPath => format!("aterm: upstream '{upstream}' is not on PATH"),
     };
     let mut out = String::new();
-    // `cargo clippy` / `cargo fmt`: one spelling, no lane.
-    if let Some((verb, reroute)) = args
-        .first()
-        .and_then(|verb| CARGO_VERB_REROUTES.iter().find(|(v, _)| v == verb))
-        .filter(|_| upstream == "cargo")
-    {
-        let tail = args[1..].join(" ");
-        out.push_str(&head_line(verb, ""));
-        out.push_str(&format!("; on Trust the tool is '{reroute}':\n"));
-        out.push_str(&format!("         {}\n", join_command(reroute, &tail)));
+    let mut trust_tool = branded.to_string();
+    if let Some(spellings) = rust_lane::trust_spelling(upstream, args) {
+        // A Rust row: the shared vocabulary decides the spelling and its lane.
+        let verb = (upstream == "cargo")
+            .then(|| rust_lane::cargo_verb_index(args))
+            .flatten()
+            .map_or("", |i| args[i].as_str());
+        match spellings.as_slice() {
+            // A verb targo is not known to have (`cargo nextest`): the spelling is
+            // conditional, and the line says so rather than naming a command that
+            // answers "no such command" (measured for `targo nextest`/`targo deny`).
+            [_] if rust_lane::is_unknown_verb(&spellings) => {
+                out.push_str(&head_line(verb, " (no proof claim)"));
+                out.push_str(&format!(
+                    "; targo is not known to have `{verb}`\n       (a cargo extension targo lacks has no Trust spelling). If it has, it is:\n"
+                ));
+            }
+            // One spelling with no lane: `cargo clippy` → `targo tippy`, `cargo fmt`,
+            // `cargo metadata`, `rustfmt` → `trustfmt`. Named by the Trust tool and, for
+            // cargo, its verb — a flag is not part of a tool's name.
+            [one] if one.label.is_empty() => {
+                trust_tool = if upstream == "cargo" {
+                    match verb {
+                        "" => String::from("targo"),
+                        "clippy" => String::from("targo tippy"),
+                        verb => format!("targo {verb}"),
+                    }
+                } else {
+                    one.command.split(' ').next().unwrap_or(branded).to_string()
+                };
+                out.push_str(&head_line(verb, ""));
+                out.push_str(&format!("; on Trust the tool is '{trust_tool}':\n"));
+            }
+            // One lane only: `cargo run`/`doc`/`install`… have no verified lane, which the
+            // lane's own note says.
+            [_] => {
+                out.push_str(&head_line(verb, " (no proof claim)"));
+                out.push_str(&format!("; on Trust the tool is '{branded}':\n"));
+            }
+            _ => {
+                out.push_str(&head_line("", " (no proof claim)"));
+                out.push_str(&format!("; on Trust the tool is '{branded}':\n"));
+            }
+        }
+        out.push_str(&rust_lane::render_spellings(&spellings, "         "));
     } else if lanes.is_empty() {
+        // Not a Rust row (`tlc`): one spelling, equivalence unproven.
         out.push_str(&head_line("", " (no proof claim)"));
         out.push_str(&format!("; on this toolchain the tool is '{branded}'\n"));
         out.push_str("       (drop-in equivalence is not yet proven):\n");
-        out.push_str(&format!("         {}\n", join_command(branded, &rest)));
+        out.push_str(&format!(
+            "         {}\n",
+            join_command(branded, &args.join(" "))
+        ));
     } else {
         out.push_str(&head_line("", " (no proof claim)"));
         out.push_str(&format!("; on Trust the tool is '{branded}':\n"));
-        let commands: Vec<String> = lanes
+        let rest = args.join(" ");
+        let rendered: Vec<rust_lane::Spelling> = lanes
             .iter()
-            .map(|lane| join_command(lane.command, &rest))
+            .map(|lane| rust_lane::Spelling {
+                label: lane.label,
+                command: join_command(lane.command, &rest),
+                note: lane.note,
+            })
             .collect();
-        let width = commands.iter().map(String::len).max().unwrap_or(0) + 3;
-        let label_width = lanes.iter().map(|lane| lane.label.len()).max().unwrap_or(0);
-        for (lane, command) in lanes.iter().zip(&commands) {
-            out.push_str(&format!(
-                "         {command:<width$}{:<label_width$} — {}\n",
-                lane.label, lane.note
-            ));
-        }
+        out.push_str(&rust_lane::render_spellings(&rendered, "         "));
+    }
+    if let Head::Stock(_) = head {
+        let tool = trust_tool.split(' ').next().unwrap_or(branded);
+        out.push_str(&format!(
+            "       A stock channel, named here or pinned, moves only rustup's proxies, never {tool}.\n"
+        ));
+    }
+    if let Some(pin) = pin {
+        out.push_str(&pin_lines(pin));
     }
     if head == Head::NotOnPath {
         out.pop();
@@ -539,15 +719,6 @@ pub const EXPLICIT_LANE_PROGRAM: &str = "trust";
 #[must_use]
 pub fn explicit_lane_note(upstream: &str, branded: &str) -> String {
     format!("aterm: running {branded}, Trust's '{upstream}'.")
-}
-
-/// The one line printed when `cargo +<tc>` names a non-Trust toolchain and runs, unless
-/// [`ANNOUNCE_SETTING`] silences it — which the line names, since it prints on every build.
-#[must_use]
-pub fn passthrough_note(upstream: &str) -> String {
-    format!(
-        "aterm: running upstream '{upstream}' — no proof claim ({ANNOUNCE_SETTING} in aterm.toml silences this)."
-    )
 }
 
 /// A branded tool that is not installed: nothing ran, and the one command that installs it.
@@ -603,17 +774,30 @@ pub fn policy_summary(row: &Row, upstream_found: bool) -> String {
     } else {
         String::new()
     };
+    // A stock `+<channel>` on a Rust row runs upstream as named, after the Trust
+    // spelling ([`stock_channel_signpost`]) — said only where an upstream copy is there
+    // to run, like the escape.
+    let stock_channel = |then: &str| {
+        if upstream_found && is_rust_row(row) {
+            format!("; '{upstream} +<stock channel> <args>' {then}")
+        } else {
+            String::new()
+        }
+    };
     match row.policy {
         Policy::Direct {
             branded,
             source_verb,
             ..
-        } => match source_verb {
-            Some(SourceVerb { verb, ext }) => format!(
-                "runs '{branded} <args>' with one stderr line ('{branded} {verb} <file>' for a bare `{ext}` file){escape}"
-            ),
-            None => format!("runs '{branded} <args>' with one stderr line{escape}"),
-        },
+        } => {
+            let stock = stock_channel("runs upstream as named, after the Trust spelling");
+            match source_verb {
+                Some(SourceVerb { verb, ext }) => format!(
+                    "runs '{branded} <args>' with one stderr line ('{branded} {verb} <file>' for a bare `{ext}` file){stock}{escape}"
+                ),
+                None => format!("runs '{branded} <args>' with one stderr line{stock}{escape}"),
+            }
+        }
         Policy::Signpost { branded, lanes: [] } => format!(
             "announced, naming '{branded} <args>' (drop-in equivalence is not yet proven), then run upstream{escape}"
         ),
@@ -624,13 +808,15 @@ pub fn policy_summary(row: &Row, upstream_found: bool) -> String {
                 .collect();
             let mut s = format!("announced, naming {}", named.join(" / "));
             if upstream == "cargo" {
+                // The verb decides the lane (`aterm_types::rust_lane`).
+                s.push_str(" for build/check/test, 'targo --unverified <args>' for a verb with no verified lane (run, doc, install, …), 'targo <args>' for one that takes no lane (metadata, tree, …); ");
                 let verbs: Vec<String> = CARGO_VERB_REROUTES
                     .iter()
                     .map(|(verb, reroute)| format!("'{upstream} {verb}' → '{reroute}'"))
                     .collect();
-                s.push_str("; ");
                 s.push_str(&verbs.join(", "));
             }
+            s.push_str(&stock_channel("names the same Trust spelling"));
             s.push_str(", then run upstream");
             s.push_str(&escape);
             s
@@ -739,7 +925,7 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String 
         upstream,
     )));
     s.push_str(" 1>&2\nexit ");
-    s.push_str(&crate::dec_u64(u64::from(REFUSAL_EXIT)));
+    s.push_str(&REFUSAL_EXIT.to_string());
     s.push('\n');
     s
 }
@@ -1190,6 +1376,17 @@ pub fn remove_all(layout: &Layout) {
 ///
 /// A SIGNPOST row announces (unless `[reroute] announce = false`) and then execs
 /// UPSTREAM, so its exit code is the upstream tool's. ORACLE refuses.
+///
+/// NO ROW REFUSES AN AGENT (decided with evidence, 2026-09-23). The stub answers a
+/// NAME looked up on PATH, and it cannot tell an agent's own `cargo` from a by-name
+/// spawn inside a tool that agent ran: aterm's own `xtask gate web` / `gate linux`
+/// and the cross cells spawn the rustup proxy `cargo` BY NAME with
+/// `RUSTUP_TOOLCHAIN=<stable>` — stock by design, the Trust sysroot carrying only
+/// its host std — so a refusal here would turn those gates red for every agent that
+/// runs them. What can refuse an agent's OWN command is its text: `aterm pkg lane`
+/// ([`crate::lane`]) reads one command line, and a guard the owner wires calls it
+/// (an agent's `PreToolUse` hook, say). aterm installs nothing into an agent
+/// (decision "B", 2026-09-23), so it wires no such guard itself.
 pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
     let Some(row) = row_for(upstream) else {
         eprintln!("atpkg {HIDDEN_VERB}: '{upstream}' is not a rerouted name");
@@ -1206,6 +1403,13 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         announce: &|| crate::config::cached_reroute().announce(),
         upstream: &|| upstream_on_path(layout, upstream, path_var.as_deref()),
         branded: &|branded, program| installed(layout, branded, program),
+        // Read only where a signpost names it: a few `stat`s walking up.
+        pin: &|| {
+            Pin::for_dir(
+                std::env::current_dir().ok().as_deref(),
+                std::env::var("RUSTUP_TOOLCHAIN").ok().as_deref(),
+            )
+        },
     };
     match plan(row, args, &machine) {
         Plan::Refuse { say } => {
@@ -1248,6 +1452,8 @@ struct Machine<'a> {
     upstream: &'a dyn Fn() -> Option<PathBuf>,
     /// Where a branded tool, shipped by the program named second, stands ([`installed`]).
     branded: &'a dyn Fn(&str, &str) -> Install,
+    /// The directory's pinned channel ([`Pin::for_dir`]), named under a signpost's lanes.
+    pin: &'a dyn Fn() -> Option<Pin>,
 }
 
 /// Where a branded tool stands on this machine — the cases `atpkg run` tells apart.
@@ -1367,29 +1573,43 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
     if machine.passthrough {
         return run_upstream(&|| None);
     }
+    // `+<toolchain>` is rustup's (first argument only), so it means something on the Rust
+    // rows alone: `lean +x` hands `+x` to clean untouched.
+    let toolchain = if is_rust_row(row) {
+        explicit_toolchain(args)
+    } else {
+        None
+    };
+    // What the rendered commands and a branded tool see: never a rustup directive. The
+    // managed `targo` is not a rustup proxy and rejects one, and a fix the user cannot
+    // paste is no fix. Upstream still gets the caller's own arguments, directive included.
+    let shown = if toolchain.is_some() {
+        &args[1..]
+    } else {
+        args
+    };
+    // A STOCK toolchain named on any Rust row — `cargo +1.97.1 test`, `rustfmt +1.97.1
+    // x.rs` — runs upstream as named, after the Trust spelling of the same command. Until
+    // 2026-09-23 a DIRECT row handed `+1.97.1` to its branded tool as an argument
+    // (`trustfmt: Error: file '+1.97.1' does not exist`, measured) — ledger item HOST-05.
+    if let Some(stock) = toolchain.filter(|tc| !rust_lane::is_trust_channel(tc)) {
+        return run_upstream(&|| {
+            (machine.announce)().then(|| stock_channel_signpost(row, stock, shown))
+        });
+    }
     match row.policy {
+        // `+trust…` on a DIRECT row names Trust: its branded tool runs, without the
+        // directive.
         Policy::Direct {
             branded,
             program,
             source_verb,
-        } => run_branded(branded, program, direct_args(source_verb, args), &|| {
+        } => run_branded(branded, program, direct_args(source_verb, shown), &|| {
             direct_announcement(upstream, branded, (machine.upstream)().is_some())
         }),
         Policy::Signpost { branded, lanes } => {
-            let toolchain = explicit_toolchain(args);
-            if toolchain.is_some_and(|toolchain| !toolchain.starts_with("trust")) {
-                return run_upstream(&|| (machine.announce)().then(|| passthrough_note(upstream)));
-            }
-            // `+trust…` keeps the lane question but must not reach the rendered
-            // commands: the managed `targo` is not a rustup proxy and rejects
-            // a `+toolchain` directive, and a fix the user cannot paste is no fix.
-            // Upstream still gets the caller's own arguments, `+trust…` included, and
-            // the first line names that toolchain as what runs.
-            let shown = if toolchain.is_some() {
-                &args[1..]
-            } else {
-                args
-            };
+            // `+trust…` keeps the lane question, and the first line names that toolchain
+            // as what runs.
             if upstream == "cargo"
                 && shown
                     .first()
@@ -1401,8 +1621,16 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
             }
             match (machine.upstream)() {
                 Some(target) => Plan::Upstream {
-                    say: (machine.announce)()
-                        .then(|| signpost_message(row, lanes, shown, toolchain)),
+                    say: (machine.announce)().then(|| {
+                        // A `+trust…` directive, not the directory's pin, decides what
+                        // upstream is.
+                        let pin = if toolchain.is_some() {
+                            None
+                        } else {
+                            (machine.pin)()
+                        };
+                        signpost_message_in(row, lanes, shown, toolchain, pin.as_ref())
+                    }),
                     target,
                     args: args.to_vec(),
                 },
@@ -1788,10 +2016,11 @@ mod tests {
             !text.contains("ATERM_"),
             "no environment knob is taught: {text}"
         );
-        // No arguments: the bare commands, no trailing space.
+        // No arguments: `targo` alone (which prints its usage), no trailing space —
+        // not two lanes around no verb (`targo trust` alone is its own help page).
         let bare = signpost_message(row, lanes, &[], None);
-        assert!(bare.contains("targo trust   "), "{bare}");
-        assert!(!bare.contains("targo trust  \n"), "{bare}");
+        assert!(bare.contains("\n         targo\n"), "{bare}");
+        assert!(!bare.contains("targo trust"), "{bare}");
     }
 
     /// THE 2026-09-08 RULING, AT THE DECISION POINT.
@@ -1883,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_oracle_and_passthrough_are_one_line_each_and_name_the_escape() {
+    fn direct_and_oracle_are_one_line_each_and_name_the_escape() {
         let no_copy = oracle_message("z3", None);
         for text in [
             direct_announcement("rustfmt", "trustfmt", true),
@@ -1911,11 +2140,6 @@ mod tests {
         assert_eq!(
             direct_announcement("clippy", "tippy", false),
             "aterm: running tippy, Trust's 'clippy'."
-        );
-        // `cargo +stable` runs what was typed: one line, and the setting that silences it.
-        assert_eq!(
-            passthrough_note("cargo"),
-            "aterm: running upstream 'cargo' — no proof claim ([reroute] announce = false in aterm.toml silences this)."
         );
         assert_eq!(
             unreachable_message("cargo"),
@@ -2443,6 +2667,18 @@ mod tests {
         upstream: Option<&str>,
         branded: &[&str],
     ) -> Plan {
+        plan_pinned(name, call, announce, upstream, branded, None)
+    }
+
+    /// [`plan_on`] in a directory whose pinned channel is `pin` ([`Pin::for_dir`]).
+    fn plan_pinned(
+        name: &str,
+        call: &[&str],
+        announce: bool,
+        upstream: Option<&str>,
+        branded: &[&str],
+        pin: Option<Pin>,
+    ) -> Plan {
         let machine = Machine {
             passthrough: false,
             announce: &|| announce,
@@ -2454,6 +2690,7 @@ mod tests {
                     Install::Absent
                 }
             },
+            pin: &|| pin.clone(),
         };
         plan(
             row_for(name).expect("a rerouted name"),
@@ -2538,6 +2775,7 @@ mod tests {
                 assert_eq!((tool, program), ("clean", "clean"));
                 Install::Shim(shim.clone())
             },
+            pin: &|| None,
         };
         assert_eq!(
             plan(row_for("lean").unwrap(), &args(&["f.lean"]), &machine),
@@ -2554,6 +2792,7 @@ mod tests {
                 assert_eq!(program, "trust", "{tool}");
                 Install::ShimLost
             },
+            pin: &|| None,
         };
         assert_eq!(
             plan(row_for("rustfmt").unwrap(), &args(&["x.rs"]), &machine),
@@ -2671,7 +2910,11 @@ mod tests {
         assert_eq!(
             plan_on("cargo", &["+stable", "build"], true, Some(UP), &[]),
             Plan::Upstream {
-                say: Some(passthrough_note("cargo")),
+                say: Some(stock_channel_signpost(
+                    row_for("cargo").unwrap(),
+                    "stable",
+                    &args(&["build"])
+                )),
                 target: up(),
                 args: args(&["+stable", "build"]),
             }
@@ -2717,6 +2960,7 @@ mod tests {
             announce: &|| true,
             upstream: &|| Some(up()),
             branded: &|_, _| Install::Absent,
+            pin: &|| panic!("the escape reads no pin"),
         };
         assert_eq!(
             plan(row_for("rustfmt").unwrap(), &args(&["x.rs"]), &machine),
@@ -2726,6 +2970,390 @@ mod tests {
                 args: args(&["x.rs"]),
             }
         );
+    }
+
+    /// THE INCIDENT'S COMMAND (2026-09-23): `cargo +1.97.1 test -p x` in a session.
+    /// Measured before on the installed aterm 0.91.0: ONE line naming only `targo trust
+    /// <verb>` — no arguments, and not the unverified lane the agents needed — and 33
+    /// agent logs carried it beside a stock run. Now the first line says what runs, the
+    /// Trust spelling of the very command follows in both lanes, and one line says a
+    /// stock channel moves only rustup's proxies. Upstream still runs as named (announce,
+    /// never prevent), and the setting silences the lines, never the run.
+    #[test]
+    fn a_stock_channel_signposts_the_trust_spelling_and_runs_upstream_as_named() {
+        let call = ["+1.97.1", "test", "-p", "x"];
+        let Plan::Upstream {
+            say: Some(text),
+            target,
+            args: argv,
+        } = plan_on("cargo", &call, true, Some(UP), &[])
+        else {
+            panic!("a stock channel runs upstream");
+        };
+        assert_eq!(
+            (target, argv),
+            (PathBuf::from(UP), args(&call)),
+            "upstream runs exactly as named"
+        );
+        assert!(
+            text.starts_with(
+                "aterm: running upstream 'cargo +1.97.1' (no proof claim); on Trust the tool is 'targo':\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("targo trust test -p x"), "{text}");
+        assert!(text.contains("targo --unverified test -p x"), "{text}");
+        assert!(
+            text.contains("moves only rustup's proxies, never targo.\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("+1.97.1 test"),
+            "the Trust spelling carries no directive: {text}"
+        );
+        assert!(text.contains("`aterm help rust`"), "{text}");
+        assert!(
+            text.ends_with(&format!(
+                "({ANNOUNCE_SETTING} in aterm.toml silences this — Settings ▸ Packages.)"
+            )),
+            "{text}"
+        );
+        // The directive, not the directory's pin, decides what upstream is.
+        let pinned = Pin {
+            channel: "trust".into(),
+            source: "/r/rust-toolchain.toml".into(),
+        };
+        assert_eq!(
+            plan_pinned("cargo", &call, true, Some(UP), &[], Some(pinned)),
+            plan_on("cargo", &call, true, Some(UP), &[])
+        );
+        // The setting silences the lines, never the run.
+        assert_eq!(
+            plan_on("cargo", &call, false, Some(UP), &[]),
+            Plan::Upstream {
+                say: None,
+                target: PathBuf::from(UP),
+                args: args(&call),
+            }
+        );
+        // `cargo +stable clippy`: the linter's one spelling, not two lanes.
+        let Plan::Upstream {
+            say: Some(text), ..
+        } = plan_on(
+            "cargo",
+            &["+stable", "clippy", "--all-targets"],
+            true,
+            Some(UP),
+            &[],
+        )
+        else {
+            panic!("`cargo +stable clippy` runs upstream");
+        };
+        assert!(
+            text.starts_with(
+                "aterm: running upstream 'cargo +stable clippy'; on Trust the tool is 'targo tippy':\n         targo tippy --all-targets\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("targo trust"), "{text}");
+        // `rustc +1.95.0 main.rs`: trustc's two lanes.
+        let Plan::Upstream {
+            say: Some(text),
+            args: argv,
+            ..
+        } = plan_on("rustc", &["+1.95.0", "main.rs"], true, Some(UP), &[])
+        else {
+            panic!("`rustc +1.95.0` runs upstream");
+        };
+        assert!(text.contains("trustc main.rs"), "{text}");
+        assert!(text.contains("trustc -Ztrust-verify=off main.rs"), "{text}");
+        assert!(text.contains("never trustc.\n"), "{text}");
+        assert_eq!(argv, args(&["+1.95.0", "main.rs"]));
+        // A cargo extension targo lacks is never presented as THE Trust tool.
+        let text = stock_channel_signpost(
+            row_for("cargo").unwrap(),
+            "1.97.1",
+            &args(&["nextest", "run"]),
+        );
+        assert!(
+            text.contains("targo is not known to have `nextest`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("If it has, it is:\n         targo nextest run\n"),
+            "{text}"
+        );
+        assert!(!text.contains("on Trust the tool is"), "{text}");
+    }
+
+    /// HOST-05's second half, measured before this change: `rustfmt +1.97.1 --check x.rs`
+    /// in a session ran trustfmt with `+1.97.1` as a FILE (`Error: file '+1.97.1' does not
+    /// exist`, exit 1) — and it still did on main's `plan` until this change. A DIRECT
+    /// Rust row never hands a rustup directive to its branded tool: a stock one is
+    /// signposted and runs upstream as named, `+trust…` is dropped and the branded tool
+    /// runs.
+    #[test]
+    fn a_direct_row_never_hands_a_rustup_directive_to_the_branded_tool() {
+        let call = ["+1.97.1", "--check", "x.rs"];
+        let Plan::Upstream {
+            say: Some(text),
+            args: argv,
+            ..
+        } = plan_on("rustfmt", &call, true, Some(UP), &["trustfmt"])
+        else {
+            panic!("a stock channel runs upstream rustfmt");
+        };
+        assert_eq!(argv, args(&call));
+        assert!(
+            text.starts_with(
+                "aterm: running upstream 'rustfmt +1.97.1'; on Trust the tool is 'trustfmt':\n         trustfmt --check x.rs\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("never trustfmt.\n"), "{text}");
+        // `+trust` names Trust: the branded tool runs without the directive.
+        assert_eq!(
+            plan_on(
+                "rustfmt",
+                &["+trust", "x.rs"],
+                true,
+                Some(UP),
+                &["trustfmt"]
+            ),
+            Plan::Branded {
+                say: direct_announcement("rustfmt", "trustfmt", true),
+                copy: store("trustfmt"),
+                args: args(&["x.rs"]),
+            }
+        );
+        for (name, branded) in [("clippy", "tippy"), ("rustdoc", "trustdoc")] {
+            let Plan::Upstream { args: argv, .. } =
+                plan_on(name, &["+1.97.1", "a.rs"], true, Some(UP), &[branded])
+            else {
+                panic!("{name} +1.97.1 runs upstream");
+            };
+            assert_eq!(argv, args(&["+1.97.1", "a.rs"]), "{name}");
+            let Plan::Branded { args: argv, .. } =
+                plan_on(name, &["+trust", "a.rs"], true, Some(UP), &[branded])
+            else {
+                panic!("{name} +trust runs {branded}");
+            };
+            assert_eq!(argv, args(&["a.rs"]), "{name}");
+        }
+        // No upstream copy: nothing runs, and the line says so — the directive is never
+        // handed to the branded tool instead.
+        assert_eq!(
+            plan_on("rustfmt", &call, true, None, &["trustfmt"]),
+            Plan::Missing {
+                say: not_on_path_message("rustfmt"),
+            }
+        );
+        // Not a Rust row: `+` means nothing to clean, and nothing is stripped.
+        let Plan::Branded { args: argv, .. } = plan_on("lean", &["+x"], true, Some(UP), &["clean"])
+        else {
+            panic!("lean runs clean");
+        };
+        assert_eq!(argv, args(&["+x"]));
+    }
+
+    /// A directory that pins a STOCK channel says so under the lanes: a pin moves only
+    /// rustup's proxies, never targo. A Trust pin adds nothing, and a `+trust` directive
+    /// outranks the pin.
+    #[test]
+    fn a_pinned_channel_is_named_under_the_lanes() {
+        let stock = Pin {
+            channel: "1.97.1".into(),
+            source: "/r/rust-toolchain.toml".into(),
+        };
+        let Plan::Upstream {
+            say: Some(text),
+            args: argv,
+            ..
+        } = plan_pinned("cargo", &["test"], true, Some(UP), &[], Some(stock.clone()))
+        else {
+            panic!("a pinned directory still runs upstream");
+        };
+        assert_eq!(argv, args(&["test"]));
+        assert!(
+            text.contains(
+                "This directory pins stock \"1.97.1\", which moves only rustup's proxies, never targo:\n       the Trust spellings above run the Trust toolchain here too. (/r/rust-toolchain.toml)\n"
+            ),
+            "{text}"
+        );
+        let lanes_at = text.find("targo --unverified test").unwrap();
+        assert!(
+            text.find("pins stock").unwrap() > lanes_at,
+            "under the lanes: {text}"
+        );
+        assert!(text.ends_with("Settings ▸ Packages.)"), "{text}");
+        // A Trust pin is the default: nothing is added.
+        let trust = Pin {
+            channel: "trust".into(),
+            source: "$RUSTUP_TOOLCHAIN".into(),
+        };
+        assert_eq!(
+            plan_pinned("cargo", &["test"], true, Some(UP), &[], Some(trust)),
+            plan_on("cargo", &["test"], true, Some(UP), &[])
+        );
+        // `cargo +trust test`: the directive, not the pin, decides what runs.
+        let Plan::Upstream {
+            say: Some(text), ..
+        } = plan_pinned(
+            "cargo",
+            &["+trust", "test"],
+            true,
+            Some(UP),
+            &[],
+            Some(stock.clone()),
+        )
+        else {
+            panic!("`cargo +trust test` runs upstream");
+        };
+        assert!(text.contains("targo trust test"), "{text}");
+        assert!(!text.contains("pins stock"), "{text}");
+        // Silenced by the setting like the rest of a signpost — but it runs.
+        assert_eq!(
+            plan_pinned(
+                "cargo",
+                &["test"],
+                false,
+                Some(UP),
+                &[],
+                Some(stock.clone())
+            ),
+            Plan::Upstream {
+                say: None,
+                target: PathBuf::from(UP),
+                args: args(&["test"]),
+            }
+        );
+        // With no upstream copy nothing runs, and no pin is named.
+        let Plan::Missing { say } = plan_pinned("cargo", &["test"], true, None, &[], Some(stock))
+        else {
+            panic!("no upstream cargo runs nothing");
+        };
+        assert!(!say.contains("pins"), "{say}");
+        // `$RUSTUP_TOOLCHAIN` outranks a file, as rustup ranks it; empty is unset.
+        let pin = Pin::for_dir(None, Some("1.95.0")).unwrap();
+        assert_eq!(
+            (pin.channel.as_str(), pin.source.as_str()),
+            ("1.95.0", "$RUSTUP_TOOLCHAIN")
+        );
+        assert_eq!(Pin::for_dir(None, Some("")), None);
+        // A file up the tree is found from a subdirectory.
+        let l = layout("pin");
+        let sub = l.prefix.join("crate").join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            l.prefix.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.97.1\"\n",
+        )
+        .unwrap();
+        let pin = Pin::for_dir(Some(&sub), None).expect("the pin up the tree");
+        assert_eq!(pin.channel, "1.97.1");
+        assert!(pin.source.ends_with("rust-toolchain.toml"), "{pin:?}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// Every cargo verb is signposted with a command targo ACCEPTS (measured on store
+    /// build 9192): `cargo metadata` printed `targo trust metadata` and `targo
+    /// --unverified metadata` before this change — both refused by targo.
+    #[test]
+    fn every_cargo_verb_is_signposted_with_a_command_targo_accepts() {
+        let cargo = row_for("cargo").unwrap();
+        let Policy::Signpost { lanes, .. } = cargo.policy else {
+            panic!()
+        };
+        let text = signpost_message(
+            cargo,
+            lanes,
+            &args(&["metadata", "--format-version", "1"]),
+            None,
+        );
+        assert!(
+            text.starts_with(
+                "aterm: running upstream 'cargo metadata'; on Trust the tool is 'targo metadata':\n         targo metadata --format-version 1\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("targo trust"), "{text}");
+        assert!(!text.contains("targo --unverified"), "{text}");
+        let text = signpost_message(cargo, lanes, &args(&["run", "-p", "x"]), None);
+        assert!(
+            text.starts_with(
+                "aterm: running upstream 'cargo run' (no proof claim); on Trust the tool is 'targo':\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("targo --unverified run -p x"), "{text}");
+        assert!(text.contains("this verb has no verified lane"), "{text}");
+        assert!(!text.contains("targo trust run"), "{text}");
+        let text = signpost_message(cargo, lanes, &args(&["--version"]), None);
+        assert!(
+            text.starts_with(
+                "aterm: running upstream 'cargo'; on Trust the tool is 'targo':\n         targo --version\n"
+            ),
+            "{text}"
+        );
+        // A verb targo is not known to have is never presented as THE Trust tool:
+        // `targo nextest` answers "no such command" (measured 2026-09-24).
+        let text = signpost_message(cargo, lanes, &args(&["nextest", "run"]), None);
+        assert!(
+            text.starts_with(
+                "aterm: running upstream 'cargo nextest' (no proof claim); targo is not known to have `nextest`\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("If it has, it is:\n         targo nextest run\n"),
+            "{text}"
+        );
+        assert!(!text.contains("on Trust the tool is"), "{text}");
+    }
+
+    /// The spellings this module prints and the ones `aterm_types::rust_lane` renders
+    /// for `aterm pkg lane` and `aterm help rust` are ONE vocabulary: the lanes of the
+    /// policy table, the cargo verb reroutes and the DIRECT rows' branded tools cannot
+    /// drift from it.
+    #[test]
+    fn the_table_speaks_the_shared_rust_lane_vocabulary() {
+        let as_lanes = |stock: &str, a: &[&str]| -> Vec<(String, String, String)> {
+            rust_lane::trust_spelling(stock, &args(a))
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.label.to_string(), s.command, s.note.to_string()))
+                .collect()
+        };
+        for (stock, table) in [("cargo", CARGO_LANES), ("rustc", RUSTC_LANES)] {
+            let verb: &[&str] = if stock == "cargo" { &["build"] } else { &[] };
+            let ours: Vec<(String, String, String)> = table
+                .iter()
+                .map(|l| {
+                    (
+                        l.label.to_string(),
+                        join_command(l.command, &verb.join(" ")),
+                        l.note.to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(ours, as_lanes(stock, verb), "{stock}");
+        }
+        for (verb, reroute) in CARGO_VERB_REROUTES {
+            assert_eq!(as_lanes("cargo", &[verb])[0].1, *reroute, "cargo {verb}");
+        }
+        let mut rust_rows = 0;
+        for row in TABLE.iter().filter(|r| is_rust_row(r)) {
+            rust_rows += 1;
+            if let Policy::Direct { branded, .. } = row.policy {
+                assert_eq!(
+                    as_lanes(row.upstream, &[])[0].1,
+                    branded,
+                    "{}",
+                    row.upstream
+                );
+            }
+        }
+        assert_eq!(rust_rows, 5, "cargo, rustc, rustfmt, rustdoc, clippy");
     }
 
     /// The stub's own decisions, in a real `/bin/sh`: the escape hatch execs the

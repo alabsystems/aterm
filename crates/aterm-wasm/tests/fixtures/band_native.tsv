@@ -1,0 +1,742 @@
+# band_native.tsv — THIS HOST's message band, frame by frame (design ruling 333 of
+# docs/DESIGN-unified-messages-2026-09-21.md). Written by aterm-gui's
+# `message_band_visual_tests::the_web_band_golden_is_this_hosts_band` (which also
+# asserts it; rewrite with ATERM_BAND_GOLDEN=write) and read by aterm-wasm's
+# `messages_api::tests::the_web_band_is_the_native_golden`, which replays the scenes
+# through the web module and must land on every digest. Digests are FNV-1a-64 of each
+# band row's RenderCells (Debug), its ChromeRasters (Debug) and its RGBA pixel rows,
+# the ChromeBleed (Debug) and the pixels above the grid. Both hosts draw with the
+# bundled JetBrains Mono at 20 px on the portable rasterizer, pad 6, links withheld.
+# The colour arithmetic runs on THIS host's libm (macOS libSystem here): on another
+# libm both tests would flag the same last-place difference together (ruling 326 (g)),
+# which is a platform fact, not a web defect.
+font	JetBrainsMono-Regular.ttf	20	pad	6
+theme	dark	d0d0d0	111318	50fa7b	33415e	3b8eea	00cdcd
+theme	GitHub Light	1f2328	ffffff	0969da	b6e3ff	0969da	1b7c83
+theme	Catppuccin Latte	4c4f69	eff1f5	dc8a78	acb0be	1e66f5	179299
+theme	Solarized Light	657b83	fdf6e3	657b83	eee8d5	268bd2	2aa198
+line	record	0	post ci Build finished
+shot	record	100
+line	warn	0	post ci sev=warn Disk nearly full -- 2 GB left on /
+shot	warn	100
+line	error	0	post ci sev=error Deploy failed -- exit 1
+shot	error	100
+line	bar0	0	progress p pct=0 Downloading assets
+shot	bar0	2500
+line	bar25	0	progress p pct=25 Downloading assets
+shot	bar25	2500
+line	bar50	0	progress p pct=50 Downloading assets
+shot	bar50	2500
+line	bar999	0	progress p pct=99.9 Downloading assets
+shot	bar999	2500
+line	bar100	0	progress p pct=100 Downloading assets
+shot	bar100	2500
+line	amount	0	progress f done=3/10 Copying files
+line	amount	1000	progress f done=5/10 Copying files
+line	amount	2000	progress f done=7/10 Copying files
+shot	amount	2600
+shot	amount	3000
+line	busy	0	progress b busy Indexing the tree
+shot	busy	2600
+shot	busy	3400
+shot	busy	4700
+line	stall	0	progress s pct=40 Uploading logs
+shot	stall	2500
+shot	stall	13000
+line	complete	0	progress p pct=50 Building
+line	complete	3000	done p ok Built
+shot	complete	2500
+shot	complete	3100
+shot	complete	3400
+line	fault	0	progress p pct=50 Uploading
+line	fault	3000	done p warn Upload failed
+shot	fault	2500
+shot	fault	3100
+shot	fault	3300
+line	vanish	0	progress p pct=50 Syncing
+line	vanish	3000	done p withdraw
+shot	vanish	2500
+shot	vanish	3050
+shot	vanish	3200
+line	stack	0	post ci sev=warn Disk nearly full
+line	stack	10	post ci sev=error Deploy failed
+line	stack	20	progress p pct=60 Downloading assets
+shot	stack	2600
+line	shrink	0	post ci sev=warn Disk nearly full
+line	shrink	10	post ci sev=error Deploy failed
+line	shrink	1000	dismiss 2
+shot	shrink	900
+shot	shrink	1200
+shot	shrink	2700
+frame	record	dark	60	moving	100	n=0	w=732	top=2b6805bc002bd025	bleed=669b18c6d2d9c95b	||
+frame	warn	dark	60	moving	100	n=1	w=732	top=71c012057e921235	bleed=cf1a83ea290f92a4	r0=fd7429095357ad42:efb5edcdf4c24727:f5b019b52ef03e7f	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	dark	60	moving	100	n=1	w=732	top=71c012057e921235	bleed=cf1a83ea290f92a4	r0=403f7ac19afc3ebd:18c939f1438091c7:3892f07004f7fda5	| ✕ Deploy failed · exit 1|
+frame	bar0	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=802b74a314dbf7aa	r0=27499208f35d66a5:cfd1906949301f9a:e59d675264b3dfd5	| ↻ Downloading assets    0%|
+frame	bar25	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=76f7b28bdfd4a944:07de0757d35ccadd:692d690ad19db48a	| ↻ Downloading assets   25%|
+frame	bar50	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=02ef1d78f543be41:45fa82bd6e779d8e:c38ada5cc55e6244	| ↻ Downloading assets   50%|
+frame	bar999	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=1d2558c4e763709a	r0=a404c785192440e5:4f8b264f579c5d86:384aa5b20b8e9592	| ↻ Downloading assets   99%|
+frame	bar100	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=8dfb42fa88b6e366	r0=5d449b06b2655977:c6a6c9f3d9c0d4c2:cf3d534ae1f9f5b0	| ↻ Downloading assets  100%|
+frame	amount	dark	60	moving	2600	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=990ea6371102070a:f0232cb6d975cfc1:3d73dc48236101f7	| ↻ Copying files   70%|
+frame	amount	dark	60	moving	3000	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=990ea6371102070a:f0232cb6d975cfc1:3d73dc48236101f7	| ↻ Copying files   70%|
+frame	busy	dark	60	moving	2600	n=1	w=732	top=71c012057e921235	bleed=0f87fdf068a00816	r0=8198198c1b3b0925:d2a265397875ea8e:7b7e2938641c045e	| ↻ Indexing the tree|
+frame	busy	dark	60	moving	3400	n=1	w=732	top=71c012057e921235	bleed=0f87fdf068a00816	r0=4d7b59e1e6b80ee3:fd50d4f276da1287:583303b887eaca5b	| ↻ Indexing the tree|
+frame	busy	dark	60	moving	4700	n=1	w=732	top=71c012057e921235	bleed=0f87fdf068a00816	r0=57e33aa6d9ffcda5:c96d871da82c6d14:756da2ea1a83903b	| ↻ Indexing the tree|
+frame	stall	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=91798bb35fceea1b:f809d0ce2a9425f8:cd0208bbec33e7ee	| ↻ Uploading logs   40%|
+frame	stall	dark	60	moving	13000	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=8ec2b8e1ef8de4e2:e71a9d6ac220a447:1f8bfbc3046fe7b0	| ↻ Uploading logs   40%|
+frame	complete	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=f5c64d34557f14e2:45fa82bd6e779d8e:b1eaa1cc56970613	| ↻ Building   50%|
+frame	complete	dark	60	moving	3100	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=3c6592a28283e6cc:9f35f1a26ceb3d4a:c8b3c186d138bef7	| ✓ Built|
+frame	complete	dark	60	moving	3400	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=1559d82581e9e1da:86a75a5bf0af17e6:5fccc15239c0cefd	| ✓ Built|
+frame	fault	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=cf222474a53f2500:45fa82bd6e779d8e:907abb568807b1e5	| ↻ Uploading   50%|
+frame	fault	dark	60	moving	3100	n=1	w=732	top=71c012057e921235	bleed=937a6d2b4e3b194d	r0=a977b7e218ed4945:6ecd0975cef95f8f:6f3ccd23444d9cf2	| ⚠ Upload failed   50% failed|
+frame	fault	dark	60	moving	3300	n=1	w=732	top=71c012057e921235	bleed=0085138f36b3c1e7	r0=d175a339f2aee51d:b4b1c3ae5b255f2b:927e62b2ba55d32a	| ⚠ Upload failed   50% failed|
+frame	vanish	dark	60	moving	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=72828b97cb12c558:45fa82bd6e779d8e:afc840f1191672c9	| ↻ Syncing   50%|
+frame	vanish	dark	60	moving	3050	n=1	w=732	top=71c012057e921235	bleed=b5dfa404363d017d	r0=1d6d4da9ece80502:afba5516ac5ee414:405b0da34369285f	| ↻ Syncing   50%|
+frame	vanish	dark	60	moving	3200	n=1	w=732	top=71c012057e921235	bleed=9d76b921a8785c6f	r0=662f2982306e0868:10a1b8a0c02ce064:d0ae1b29f62a0d37	| ↻ Syncing   50%|
+frame	stack	dark	60	moving	2600	n=3	w=732	top=71c012057e921235	bleed=c59a569bfe4fd573	r0=ad0faf98b602bcbd:18c939f1438091c7:ee7cc32631be1af5	r1=f657101866a15037:fc38151c0bbd71b3:027b29ff4e49b6ef	r2=67e7fc99b3f27977:45f8fa906cd13ce1:13b3f151b8a225c0	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	dark	60	moving	900	n=2	w=732	top=71c012057e921235	bleed=c324b5da10d48101	r0=ad0faf98b602bcbd:18c939f1438091c7:ee7cc32631be1af5	r1=67e7fc99b3f27977:b3f64f0716e53e80:13b3f151b8a225c0	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	dark	60	moving	1200	n=2	w=732	top=71c012057e921235	bleed=c324b5da10d48101	r0=0dc630ee4e38d3bf:efb5edcdf4c24727:95c7aa1fdf71e838	r1=1d9f5b6359786161:09612b07b5ecb5a5:e8dc1a7e37c692ed	| ⚠ Disk nearly full||
+frame	shrink	dark	60	moving	2700	n=1	w=732	top=71c012057e921235	bleed=cf1a83ea290f92a4	r0=67e7fc99b3f27977:efb5edcdf4c24727:13b3f151b8a225c0	| ⚠ Disk nearly full|
+frame	record	dark	60	still	100	n=0	w=732	top=2b6805bc002bd025	bleed=669b18c6d2d9c95b	||
+frame	warn	dark	60	still	100	n=1	w=732	top=71c012057e921235	bleed=cf1a83ea290f92a4	r0=fd7429095357ad42:efb5edcdf4c24727:f5b019b52ef03e7f	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	dark	60	still	100	n=1	w=732	top=71c012057e921235	bleed=cf1a83ea290f92a4	r0=403f7ac19afc3ebd:18c939f1438091c7:3892f07004f7fda5	| ✕ Deploy failed · exit 1|
+frame	bar0	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=802b74a314dbf7aa	r0=27499208f35d66a5:cfd1906949301f9a:e59d675264b3dfd5	| ↻ Downloading assets    0%|
+frame	bar25	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=76f7b28bdfd4a944:07de0757d35ccadd:692d690ad19db48a	| ↻ Downloading assets   25%|
+frame	bar50	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=02ef1d78f543be41:45fa82bd6e779d8e:c38ada5cc55e6244	| ↻ Downloading assets   50%|
+frame	bar999	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=1d2558c4e763709a	r0=a404c785192440e5:4f8b264f579c5d86:384aa5b20b8e9592	| ↻ Downloading assets   99%|
+frame	bar100	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=8dfb42fa88b6e366	r0=5d449b06b2655977:c6a6c9f3d9c0d4c2:cf3d534ae1f9f5b0	| ↻ Downloading assets  100%|
+frame	amount	dark	60	still	2600	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=990ea6371102070a:f0232cb6d975cfc1:3d73dc48236101f7	| ↻ Copying files   70%|
+frame	amount	dark	60	still	3000	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=990ea6371102070a:f0232cb6d975cfc1:3d73dc48236101f7	| ↻ Copying files   70%|
+frame	busy	dark	60	still	2600	n=1	w=732	top=71c012057e921235	bleed=0f87fdf068a00816	r0=5724361f3c636dbd:d2a265397875ea8e:992be3dd4467e25f	| ↻ Indexing the tree|
+frame	busy	dark	60	still	3400	n=1	w=732	top=71c012057e921235	bleed=0f87fdf068a00816	r0=5724361f3c636dbd:d2a265397875ea8e:992be3dd4467e25f	| ↻ Indexing the tree|
+frame	busy	dark	60	still	4700	n=1	w=732	top=71c012057e921235	bleed=0f87fdf068a00816	r0=5724361f3c636dbd:d2a265397875ea8e:992be3dd4467e25f	| ↻ Indexing the tree|
+frame	stall	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=91798bb35fceea1b:f809d0ce2a9425f8:cd0208bbec33e7ee	| ↻ Uploading logs   40%|
+frame	stall	dark	60	still	13000	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=91798bb35fceea1b:f809d0ce2a9425f8:cd0208bbec33e7ee	| ↻ Uploading logs   40%|
+frame	complete	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=f5c64d34557f14e2:45fa82bd6e779d8e:b1eaa1cc56970613	| ↻ Building   50%|
+frame	complete	dark	60	still	3100	n=1	w=732	top=71c012057e921235	bleed=8dfb42fa88b6e366	r0=615d19bda660cc18:ba3c63b7ec69d98e:3ed6ba684cb41489	| ✓ Built|
+frame	complete	dark	60	still	3400	n=1	w=732	top=71c012057e921235	bleed=8dfb42fa88b6e366	r0=615d19bda660cc18:ba3c63b7ec69d98e:3ed6ba684cb41489	| ✓ Built|
+frame	fault	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=cf222474a53f2500:45fa82bd6e779d8e:907abb568807b1e5	| ↻ Uploading   50%|
+frame	fault	dark	60	still	3100	n=1	w=732	top=71c012057e921235	bleed=0085138f36b3c1e7	r0=d175a339f2aee51d:b4b1c3ae5b255f2b:927e62b2ba55d32a	| ⚠ Upload failed   50% failed|
+frame	fault	dark	60	still	3300	n=1	w=732	top=71c012057e921235	bleed=0085138f36b3c1e7	r0=d175a339f2aee51d:b4b1c3ae5b255f2b:927e62b2ba55d32a	| ⚠ Upload failed   50% failed|
+frame	vanish	dark	60	still	2500	n=1	w=732	top=71c012057e921235	bleed=abb018b8766aafca	r0=72828b97cb12c558:45fa82bd6e779d8e:afc840f1191672c9	| ↻ Syncing   50%|
+frame	vanish	dark	60	still	3050	n=1	w=732	top=71c012057e921235	bleed=c02b1e6500b3c006	r0=37182cf1a46958c8:67c9c494bba99d06:43a01326073f7562	| ↻ Syncing   50%|
+frame	vanish	dark	60	still	3200	n=1	w=732	top=71c012057e921235	bleed=c02b1e6500b3c006	r0=37182cf1a46958c8:67c9c494bba99d06:43a01326073f7562	| ↻ Syncing   50%|
+frame	stack	dark	60	still	2600	n=3	w=732	top=71c012057e921235	bleed=c59a569bfe4fd573	r0=ad0faf98b602bcbd:18c939f1438091c7:ee7cc32631be1af5	r1=f657101866a15037:fc38151c0bbd71b3:027b29ff4e49b6ef	r2=67e7fc99b3f27977:45f8fa906cd13ce1:13b3f151b8a225c0	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	dark	60	still	900	n=2	w=732	top=71c012057e921235	bleed=c324b5da10d48101	r0=ad0faf98b602bcbd:18c939f1438091c7:ee7cc32631be1af5	r1=67e7fc99b3f27977:b3f64f0716e53e80:13b3f151b8a225c0	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	dark	60	still	1200	n=2	w=732	top=71c012057e921235	bleed=c324b5da10d48101	r0=0dc630ee4e38d3bf:efb5edcdf4c24727:95c7aa1fdf71e838	r1=1d9f5b6359786161:09612b07b5ecb5a5:e8dc1a7e37c692ed	| ⚠ Disk nearly full||
+frame	shrink	dark	60	still	2700	n=1	w=732	top=71c012057e921235	bleed=cf1a83ea290f92a4	r0=67e7fc99b3f27977:efb5edcdf4c24727:13b3f151b8a225c0	| ⚠ Disk nearly full|
+frame	record	dark	80	moving	100	n=0	w=972	top=80792eea0494a425	bleed=669b18c6d2d9c95b	||
+frame	warn	dark	80	moving	100	n=1	w=972	top=8e873b212dd34df5	bleed=cf1a83ea290f92a4	r0=6540bad2421d632a:efb5edcdf4c24727:5d00f24d01deab9f	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	dark	80	moving	100	n=1	w=972	top=8e873b212dd34df5	bleed=cf1a83ea290f92a4	r0=4f804ecc8e5c1c9d:18c939f1438091c7:7c10cf69d60dd445	| ✕ Deploy failed · exit 1|
+frame	bar0	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=802b74a314dbf7aa	r0=fb1221a7f7784ab5:922442454d1a0a5a:e3cdc97982e94775	| ↻ Downloading assets    0%|
+frame	bar25	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=526dd8c976073a1a:6dcccd81a5fcc50b:7fcb85c76969ef22	| ↻ Downloading assets   25%|
+frame	bar50	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=e238618d351f0129:0aa7b7c14f1292be:9697f48d3394d0d4	| ↻ Downloading assets   50%|
+frame	bar999	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=a4d42652fc6e8109	r0=53d2bcecf5f391bf:97aaa865c62791ae:39ad02540364704e	| ↻ Downloading assets   99%|
+frame	bar100	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=8dfb42fa88b6e366	r0=7b45ed1811f797bf:f0df1aa4be02b7e2:bc7fa1cbe6bcdfb0	| ↻ Downloading assets  100%|
+frame	amount	dark	80	moving	2600	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3c59b968bf28438e:4bde51c6705900c2:1e91565100374a87	| ↻ Copying files   70%|
+frame	amount	dark	80	moving	3000	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3c59b968bf28438e:4bde51c6705900c2:1e91565100374a87	| ↻ Copying files   70%|
+frame	busy	dark	80	moving	2600	n=1	w=972	top=8e873b212dd34df5	bleed=0f87fdf068a00816	r0=2e3c478b7dcd5aa1:2a49aa1eaaa0ea5e:80f37cd3000aebde	| ↻ Indexing the tree|
+frame	busy	dark	80	moving	3400	n=1	w=972	top=8e873b212dd34df5	bleed=0f87fdf068a00816	r0=7babc819a0690290:8a8b0b09fd4f90e7:367eab9deb84f5bf	| ↻ Indexing the tree|
+frame	busy	dark	80	moving	4700	n=1	w=972	top=8e873b212dd34df5	bleed=0f87fdf068a00816	r0=c345e97de36d0629:befc995805a3583d:5b5889447dd6e11b	| ↻ Indexing the tree|
+frame	stall	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3150f6e34da0e42f:ad8020927e108f64:d7627b8357f17874	| ↻ Uploading logs   40%|
+frame	stall	dark	80	moving	13000	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=c98e1f962009dc6f:1bfa76d41e21107b:7670df31513adf93	| ↻ Uploading logs   40%|
+frame	complete	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3d3b36b7cf00eb62:0aa7b7c14f1292be:66fa6f7a49395523	| ↻ Building   50%|
+frame	complete	dark	80	moving	3100	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=db7129a46713844a:945d225eadee56a4:fc5d1606f94daadf	| ✓ Built|
+frame	complete	dark	80	moving	3400	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=4a3863ebe71b4819:6f08e64df58939ed:b3cb6cb4853bff48	| ✓ Built|
+frame	fault	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=978496cd4d98b8c0:0aa7b7c14f1292be:951bad5db3c8aa35	| ↻ Uploading   50%|
+frame	fault	dark	80	moving	3100	n=1	w=972	top=8e873b212dd34df5	bleed=937a6d2b4e3b194d	r0=af1ed343c174f769:2cb79f08aa59bb3f:fffdf782f5c93112	| ⚠ Upload failed   50% failed|
+frame	fault	dark	80	moving	3300	n=1	w=972	top=8e873b212dd34df5	bleed=0085138f36b3c1e7	r0=6a9c3c5db6ad01ad:bb191f7fc8532e4b:0bb0c5f8eb14e8ca	| ⚠ Upload failed   50% failed|
+frame	vanish	dark	80	moving	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=2e8d053f3dbd3f98:0aa7b7c14f1292be:8e3ba779ec1c4479	| ↻ Syncing   50%|
+frame	vanish	dark	80	moving	3050	n=1	w=972	top=8e873b212dd34df5	bleed=b5dfa404363d017d	r0=986b80819b7084d2:31c08a441699e79c:c43ee0fd38931adf	| ↻ Syncing   50%|
+frame	vanish	dark	80	moving	3200	n=1	w=972	top=8e873b212dd34df5	bleed=9d76b921a8785c6f	r0=3ed1aec04798c562:a46159af826e377c:0807d5ee1cb579e7	| ↻ Syncing   50%|
+frame	stack	dark	80	moving	2600	n=3	w=972	top=8e873b212dd34df5	bleed=c59a569bfe4fd573	r0=fabdd0b15eaea385:18c939f1438091c7:0d0ed689eaac6f15	r1=742e075321003be3:bb4d24fb27c03078:7dbbbe709dcef658	r2=76b11fea6a5b4577:45f8fa906cd13ce1:161a1dacd06a4c20	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	dark	80	moving	900	n=2	w=972	top=8e873b212dd34df5	bleed=c324b5da10d48101	r0=fabdd0b15eaea385:18c939f1438091c7:0d0ed689eaac6f15	r1=76b11fea6a5b4577:b3f64f0716e53e80:161a1dacd06a4c20	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	dark	80	moving	1200	n=2	w=972	top=8e873b212dd34df5	bleed=c324b5da10d48101	r0=2768a9688e12e387:efb5edcdf4c24727:b7919053bec36958	r1=46fcf0d1c50ff7a1:09612b07b5ecb5a5:3fe7ed7f503d6dcd	| ⚠ Disk nearly full||
+frame	shrink	dark	80	moving	2700	n=1	w=972	top=8e873b212dd34df5	bleed=cf1a83ea290f92a4	r0=76b11fea6a5b4577:efb5edcdf4c24727:161a1dacd06a4c20	| ⚠ Disk nearly full|
+frame	record	dark	80	still	100	n=0	w=972	top=80792eea0494a425	bleed=669b18c6d2d9c95b	||
+frame	warn	dark	80	still	100	n=1	w=972	top=8e873b212dd34df5	bleed=cf1a83ea290f92a4	r0=6540bad2421d632a:efb5edcdf4c24727:5d00f24d01deab9f	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	dark	80	still	100	n=1	w=972	top=8e873b212dd34df5	bleed=cf1a83ea290f92a4	r0=4f804ecc8e5c1c9d:18c939f1438091c7:7c10cf69d60dd445	| ✕ Deploy failed · exit 1|
+frame	bar0	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=802b74a314dbf7aa	r0=fb1221a7f7784ab5:922442454d1a0a5a:e3cdc97982e94775	| ↻ Downloading assets    0%|
+frame	bar25	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=526dd8c976073a1a:6dcccd81a5fcc50b:7fcb85c76969ef22	| ↻ Downloading assets   25%|
+frame	bar50	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=e238618d351f0129:0aa7b7c14f1292be:9697f48d3394d0d4	| ↻ Downloading assets   50%|
+frame	bar999	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=a4d42652fc6e8109	r0=53d2bcecf5f391bf:97aaa865c62791ae:39ad02540364704e	| ↻ Downloading assets   99%|
+frame	bar100	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=8dfb42fa88b6e366	r0=7b45ed1811f797bf:f0df1aa4be02b7e2:bc7fa1cbe6bcdfb0	| ↻ Downloading assets  100%|
+frame	amount	dark	80	still	2600	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3c59b968bf28438e:4bde51c6705900c2:1e91565100374a87	| ↻ Copying files   70%|
+frame	amount	dark	80	still	3000	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3c59b968bf28438e:4bde51c6705900c2:1e91565100374a87	| ↻ Copying files   70%|
+frame	busy	dark	80	still	2600	n=1	w=972	top=8e873b212dd34df5	bleed=0f87fdf068a00816	r0=7c33c5598c08b359:2a49aa1eaaa0ea5e:ae42bc7303fc21df	| ↻ Indexing the tree|
+frame	busy	dark	80	still	3400	n=1	w=972	top=8e873b212dd34df5	bleed=0f87fdf068a00816	r0=7c33c5598c08b359:2a49aa1eaaa0ea5e:ae42bc7303fc21df	| ↻ Indexing the tree|
+frame	busy	dark	80	still	4700	n=1	w=972	top=8e873b212dd34df5	bleed=0f87fdf068a00816	r0=7c33c5598c08b359:2a49aa1eaaa0ea5e:ae42bc7303fc21df	| ↻ Indexing the tree|
+frame	stall	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3150f6e34da0e42f:ad8020927e108f64:d7627b8357f17874	| ↻ Uploading logs   40%|
+frame	stall	dark	80	still	13000	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3150f6e34da0e42f:ad8020927e108f64:d7627b8357f17874	| ↻ Uploading logs   40%|
+frame	complete	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=3d3b36b7cf00eb62:0aa7b7c14f1292be:66fa6f7a49395523	| ↻ Building   50%|
+frame	complete	dark	80	still	3100	n=1	w=972	top=8e873b212dd34df5	bleed=8dfb42fa88b6e366	r0=05429bf0ceace358:bac1518004233cae:a6b34e16d67a5689	| ✓ Built|
+frame	complete	dark	80	still	3400	n=1	w=972	top=8e873b212dd34df5	bleed=8dfb42fa88b6e366	r0=05429bf0ceace358:bac1518004233cae:a6b34e16d67a5689	| ✓ Built|
+frame	fault	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=978496cd4d98b8c0:0aa7b7c14f1292be:951bad5db3c8aa35	| ↻ Uploading   50%|
+frame	fault	dark	80	still	3100	n=1	w=972	top=8e873b212dd34df5	bleed=0085138f36b3c1e7	r0=6a9c3c5db6ad01ad:bb191f7fc8532e4b:0bb0c5f8eb14e8ca	| ⚠ Upload failed   50% failed|
+frame	fault	dark	80	still	3300	n=1	w=972	top=8e873b212dd34df5	bleed=0085138f36b3c1e7	r0=6a9c3c5db6ad01ad:bb191f7fc8532e4b:0bb0c5f8eb14e8ca	| ⚠ Upload failed   50% failed|
+frame	vanish	dark	80	still	2500	n=1	w=972	top=8e873b212dd34df5	bleed=abb018b8766aafca	r0=2e8d053f3dbd3f98:0aa7b7c14f1292be:8e3ba779ec1c4479	| ↻ Syncing   50%|
+frame	vanish	dark	80	still	3050	n=1	w=972	top=8e873b212dd34df5	bleed=c02b1e6500b3c006	r0=4b789adb2882ee68:dcde9bb151eb5fd6:95bb161287fa9d42	| ↻ Syncing   50%|
+frame	vanish	dark	80	still	3200	n=1	w=972	top=8e873b212dd34df5	bleed=c02b1e6500b3c006	r0=4b789adb2882ee68:dcde9bb151eb5fd6:95bb161287fa9d42	| ↻ Syncing   50%|
+frame	stack	dark	80	still	2600	n=3	w=972	top=8e873b212dd34df5	bleed=c59a569bfe4fd573	r0=fabdd0b15eaea385:18c939f1438091c7:0d0ed689eaac6f15	r1=742e075321003be3:bb4d24fb27c03078:7dbbbe709dcef658	r2=76b11fea6a5b4577:45f8fa906cd13ce1:161a1dacd06a4c20	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	dark	80	still	900	n=2	w=972	top=8e873b212dd34df5	bleed=c324b5da10d48101	r0=fabdd0b15eaea385:18c939f1438091c7:0d0ed689eaac6f15	r1=76b11fea6a5b4577:b3f64f0716e53e80:161a1dacd06a4c20	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	dark	80	still	1200	n=2	w=972	top=8e873b212dd34df5	bleed=c324b5da10d48101	r0=2768a9688e12e387:efb5edcdf4c24727:b7919053bec36958	r1=46fcf0d1c50ff7a1:09612b07b5ecb5a5:3fe7ed7f503d6dcd	| ⚠ Disk nearly full||
+frame	shrink	dark	80	still	2700	n=1	w=972	top=8e873b212dd34df5	bleed=cf1a83ea290f92a4	r0=76b11fea6a5b4577:efb5edcdf4c24727:161a1dacd06a4c20	| ⚠ Disk nearly full|
+frame	record	dark	120	moving	100	n=0	w=1452	top=8da8e61a2afe4c25	bleed=669b18c6d2d9c95b	||
+frame	warn	dark	120	moving	100	n=1	w=1452	top=840904b6da165f75	bleed=cf1a83ea290f92a4	r0=00f1e798324ef8ba:efb5edcdf4c24727:5888b18e2671cddf	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	dark	120	moving	100	n=1	w=1452	top=840904b6da165f75	bleed=cf1a83ea290f92a4	r0=9f3d3cb424c2595d:18c939f1438091c7:6538dc3e96233585	| ✕ Deploy failed · exit 1|
+frame	bar0	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=802b74a314dbf7aa	r0=4e93811a55d2ab55:f971f4e4a24446da:6238d2bd15b69035	| ↻ Downloading assets    0%|
+frame	bar25	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=7e2a97ad4f7827fe:4157daab3a0d2355:dd8dcb9bbebca66c	| ↻ Downloading assets   25%|
+frame	bar50	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=9896453e9d472291:bf5dd98388ef499e:9b96d54d50ae6df4	| ↻ Downloading assets   50%|
+frame	bar999	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=372cd4078065ac73	r0=93ad48b4f4325766:24cf00bd72233002:b7b313dc3948ebc2	| ↻ Downloading assets   99%|
+frame	bar100	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=8dfb42fa88b6e366	r0=43f6c3c7015607cf:e3ed3d4037574322:1de46051fc05a5b0	| ↻ Downloading assets  100%|
+frame	amount	dark	120	moving	2600	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=c8952f5cec0ab026:d773979282517082:885f9b421b644457	| ↻ Copying files   70%|
+frame	amount	dark	120	moving	3000	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=c8952f5cec0ab026:d773979282517082:885f9b421b644457	| ↻ Copying files   70%|
+frame	busy	dark	120	moving	2600	n=1	w=1452	top=840904b6da165f75	bleed=0f87fdf068a00816	r0=221c2105dde4d6b9:382f0331fb2167fe:e4f754565393bade	| ↻ Indexing the tree|
+frame	busy	dark	120	moving	3400	n=1	w=1452	top=840904b6da165f75	bleed=0f87fdf068a00816	r0=b1059c911058d3ef:078589cabb995723:33dc999b8611e72a	| ↻ Indexing the tree|
+frame	busy	dark	120	moving	4700	n=1	w=1452	top=840904b6da165f75	bleed=0f87fdf068a00816	r0=26c7ed76d24ee5f3:2070bfd0dd03f4e5:1ffd13c556a639f4	| ↻ Indexing the tree|
+frame	stall	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=64f44bc8ad3ab7cb:40d5a87339b719a7:39a72c9d8a9fe2b4	| ↻ Uploading logs   40%|
+frame	stall	dark	120	moving	13000	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=ffb544850aee1c87:2071a36a551f5f83:2317f77016d7286a	| ↻ Uploading logs   40%|
+frame	complete	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=dc8e13228c4c1462:bf5dd98388ef499e:48da18b00b310383	| ↻ Building   50%|
+frame	complete	dark	120	moving	3100	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=8f2e1691384f205b:e3e0021cdf04ae71:c2cb62ec8ad546fb	| ✓ Built|
+frame	complete	dark	120	moving	3400	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=e9b25a84b8e88159:1c815146efbfcac3:d449f3fda7856f0e	| ✓ Built|
+frame	fault	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=3de632cb01000c40:bf5dd98388ef499e:109326d61824e615	| ↻ Uploading   50%|
+frame	fault	dark	120	moving	3100	n=1	w=1452	top=840904b6da165f75	bleed=937a6d2b4e3b194d	r0=1b08062c6b6308c9:2273c244ae87901f:429bd473d132bb52	| ⚠ Upload failed   50% failed|
+frame	fault	dark	120	moving	3300	n=1	w=1452	top=840904b6da165f75	bleed=0085138f36b3c1e7	r0=5ddc9b3538847b25:aee513c012bc3a0b:72f417b58e20260a	| ⚠ Upload failed   50% failed|
+frame	vanish	dark	120	moving	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=fd882e4e8c290c18:bf5dd98388ef499e:af420e4e5b071cd9	| ↻ Syncing   50%|
+frame	vanish	dark	120	moving	3050	n=1	w=1452	top=840904b6da165f75	bleed=b5dfa404363d017d	r0=0471feb0551351d2:63fa4e318f5769ac:6f033ac4ee9d6c9f	| ↻ Syncing   50%|
+frame	vanish	dark	120	moving	3200	n=1	w=1452	top=840904b6da165f75	bleed=9d76b921a8785c6f	r0=c8817b5c8b66f1f6:4a2b1e8400277c4c:d3654af0f3661947	| ↻ Syncing   50%|
+frame	stack	dark	120	moving	2600	n=3	w=1452	top=840904b6da165f75	bleed=c59a569bfe4fd573	r0=34310c09e66e6515:18c939f1438091c7:1541591c7cd73f55	r1=4df9bb20fb8477c0:e3fd77d0f89c0aaa:e0644081d2576b79	r2=408b0753b22b1d77:45f8fa906cd13ce1:cc453e8028c103e0	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	dark	120	moving	900	n=2	w=1452	top=840904b6da165f75	bleed=c324b5da10d48101	r0=34310c09e66e6515:18c939f1438091c7:1541591c7cd73f55	r1=408b0753b22b1d77:b3f64f0716e53e80:cc453e8028c103e0	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	dark	120	moving	1200	n=2	w=1452	top=840904b6da165f75	bleed=c324b5da10d48101	r0=5d7724ac85757597:efb5edcdf4c24727:c153f48907933a98	r1=e42b592e55fc9021:09612b07b5ecb5a5:75a346161c91c50d	| ⚠ Disk nearly full||
+frame	shrink	dark	120	moving	2700	n=1	w=1452	top=840904b6da165f75	bleed=cf1a83ea290f92a4	r0=408b0753b22b1d77:efb5edcdf4c24727:cc453e8028c103e0	| ⚠ Disk nearly full|
+frame	record	dark	120	still	100	n=0	w=1452	top=8da8e61a2afe4c25	bleed=669b18c6d2d9c95b	||
+frame	warn	dark	120	still	100	n=1	w=1452	top=840904b6da165f75	bleed=cf1a83ea290f92a4	r0=00f1e798324ef8ba:efb5edcdf4c24727:5888b18e2671cddf	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	dark	120	still	100	n=1	w=1452	top=840904b6da165f75	bleed=cf1a83ea290f92a4	r0=9f3d3cb424c2595d:18c939f1438091c7:6538dc3e96233585	| ✕ Deploy failed · exit 1|
+frame	bar0	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=802b74a314dbf7aa	r0=4e93811a55d2ab55:f971f4e4a24446da:6238d2bd15b69035	| ↻ Downloading assets    0%|
+frame	bar25	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=7e2a97ad4f7827fe:4157daab3a0d2355:dd8dcb9bbebca66c	| ↻ Downloading assets   25%|
+frame	bar50	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=9896453e9d472291:bf5dd98388ef499e:9b96d54d50ae6df4	| ↻ Downloading assets   50%|
+frame	bar999	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=372cd4078065ac73	r0=93ad48b4f4325766:24cf00bd72233002:b7b313dc3948ebc2	| ↻ Downloading assets   99%|
+frame	bar100	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=8dfb42fa88b6e366	r0=43f6c3c7015607cf:e3ed3d4037574322:1de46051fc05a5b0	| ↻ Downloading assets  100%|
+frame	amount	dark	120	still	2600	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=c8952f5cec0ab026:d773979282517082:885f9b421b644457	| ↻ Copying files   70%|
+frame	amount	dark	120	still	3000	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=c8952f5cec0ab026:d773979282517082:885f9b421b644457	| ↻ Copying files   70%|
+frame	busy	dark	120	still	2600	n=1	w=1452	top=840904b6da165f75	bleed=0f87fdf068a00816	r0=71a2beee856d27b1:382f0331fb2167fe:23b1e04e5ba6bbdf	| ↻ Indexing the tree|
+frame	busy	dark	120	still	3400	n=1	w=1452	top=840904b6da165f75	bleed=0f87fdf068a00816	r0=71a2beee856d27b1:382f0331fb2167fe:23b1e04e5ba6bbdf	| ↻ Indexing the tree|
+frame	busy	dark	120	still	4700	n=1	w=1452	top=840904b6da165f75	bleed=0f87fdf068a00816	r0=71a2beee856d27b1:382f0331fb2167fe:23b1e04e5ba6bbdf	| ↻ Indexing the tree|
+frame	stall	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=64f44bc8ad3ab7cb:40d5a87339b719a7:39a72c9d8a9fe2b4	| ↻ Uploading logs   40%|
+frame	stall	dark	120	still	13000	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=64f44bc8ad3ab7cb:40d5a87339b719a7:39a72c9d8a9fe2b4	| ↻ Uploading logs   40%|
+frame	complete	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=dc8e13228c4c1462:bf5dd98388ef499e:48da18b00b310383	| ↻ Building   50%|
+frame	complete	dark	120	still	3100	n=1	w=1452	top=840904b6da165f75	bleed=8dfb42fa88b6e366	r0=4dfee1ad2a4890d8:878e90a1589988ee:61bde224b24e2289	| ✓ Built|
+frame	complete	dark	120	still	3400	n=1	w=1452	top=840904b6da165f75	bleed=8dfb42fa88b6e366	r0=4dfee1ad2a4890d8:878e90a1589988ee:61bde224b24e2289	| ✓ Built|
+frame	fault	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=3de632cb01000c40:bf5dd98388ef499e:109326d61824e615	| ↻ Uploading   50%|
+frame	fault	dark	120	still	3100	n=1	w=1452	top=840904b6da165f75	bleed=0085138f36b3c1e7	r0=5ddc9b3538847b25:aee513c012bc3a0b:72f417b58e20260a	| ⚠ Upload failed   50% failed|
+frame	fault	dark	120	still	3300	n=1	w=1452	top=840904b6da165f75	bleed=0085138f36b3c1e7	r0=5ddc9b3538847b25:aee513c012bc3a0b:72f417b58e20260a	| ⚠ Upload failed   50% failed|
+frame	vanish	dark	120	still	2500	n=1	w=1452	top=840904b6da165f75	bleed=abb018b8766aafca	r0=fd882e4e8c290c18:bf5dd98388ef499e:af420e4e5b071cd9	| ↻ Syncing   50%|
+frame	vanish	dark	120	still	3050	n=1	w=1452	top=840904b6da165f75	bleed=c02b1e6500b3c006	r0=111afdf801a62ba8:84814f355f2c68f6:d86162d6411ae482	| ↻ Syncing   50%|
+frame	vanish	dark	120	still	3200	n=1	w=1452	top=840904b6da165f75	bleed=c02b1e6500b3c006	r0=111afdf801a62ba8:84814f355f2c68f6:d86162d6411ae482	| ↻ Syncing   50%|
+frame	stack	dark	120	still	2600	n=3	w=1452	top=840904b6da165f75	bleed=c59a569bfe4fd573	r0=34310c09e66e6515:18c939f1438091c7:1541591c7cd73f55	r1=4df9bb20fb8477c0:e3fd77d0f89c0aaa:e0644081d2576b79	r2=408b0753b22b1d77:45f8fa906cd13ce1:cc453e8028c103e0	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	dark	120	still	900	n=2	w=1452	top=840904b6da165f75	bleed=c324b5da10d48101	r0=34310c09e66e6515:18c939f1438091c7:1541591c7cd73f55	r1=408b0753b22b1d77:b3f64f0716e53e80:cc453e8028c103e0	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	dark	120	still	1200	n=2	w=1452	top=840904b6da165f75	bleed=c324b5da10d48101	r0=5d7724ac85757597:efb5edcdf4c24727:c153f48907933a98	r1=e42b592e55fc9021:09612b07b5ecb5a5:75a346161c91c50d	| ⚠ Disk nearly full||
+frame	shrink	dark	120	still	2700	n=1	w=1452	top=840904b6da165f75	bleed=cf1a83ea290f92a4	r0=408b0753b22b1d77:efb5edcdf4c24727:cc453e8028c103e0	| ⚠ Disk nearly full|
+frame	record	GitHub Light	60	moving	100	n=0	w=732	top=feb93f3471407d05	bleed=669b18c6d2d9c95b	||
+frame	warn	GitHub Light	60	moving	100	n=1	w=732	top=9e29e469fa9ea675	bleed=bab6305e2145e928	r0=699258caa975f08f:efb5edcdf4c24727:8bbb8c8d534c43d0	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	GitHub Light	60	moving	100	n=1	w=732	top=9e29e469fa9ea675	bleed=bab6305e2145e928	r0=09a11fe0598240b3:18c939f1438091c7:c09b8fdb4e7bbe30	| ✕ Deploy failed · exit 1|
+frame	bar0	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=5bf8999e24da7f0e	r0=61e3ebb14f660b73:73fe51e550131732:e04c6b278ff1ff4a	| ↻ Downloading assets    0%|
+frame	bar25	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=4b3dd5712127fa8d:bde458ca45b7e015:3379c5ca2750b772	| ↻ Downloading assets   25%|
+frame	bar50	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=646d20d1e424c4d5:91ee3d5b55b58106:7e69395ccd24158b	| ↻ Downloading assets   50%|
+frame	bar999	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=3797c2e309a94237	r0=29e15d52ef317a90:5fda52a484b0731b:c69fbeb9ad7f99ab	| ↻ Downloading assets   99%|
+frame	bar100	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=fb9b221def4254ca	r0=7ceaae987de9025d:d55b3743ba3ef7ea:5390bd64791a6c48	| ↻ Downloading assets  100%|
+frame	amount	GitHub Light	60	moving	2600	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=a5767a2be094cbb0:ade9400da14c2d6c:8f6f0de9225a21c0	| ↻ Copying files   70%|
+frame	amount	GitHub Light	60	moving	3000	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=a5767a2be094cbb0:ade9400da14c2d6c:8f6f0de9225a21c0	| ↻ Copying files   70%|
+frame	busy	GitHub Light	60	moving	2600	n=1	w=732	top=9e29e469fa9ea675	bleed=53067c2461324e4c	r0=a3bc6774740681d0:8a624364b405962a:e6b4a7c8a0ed2297	| ↻ Indexing the tree|
+frame	busy	GitHub Light	60	moving	3400	n=1	w=732	top=9e29e469fa9ea675	bleed=53067c2461324e4c	r0=076496c2f5b9f163:d0924bdfc76e97f5:783e0a22c265b661	| ↻ Indexing the tree|
+frame	busy	GitHub Light	60	moving	4700	n=1	w=732	top=9e29e469fa9ea675	bleed=53067c2461324e4c	r0=98d38ba1bc48b5bd:b592dbfafc09c93c:86d3d79fd4844adf	| ↻ Indexing the tree|
+frame	stall	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=77345d531667dbd4:787336bcd1349d7c:1ab09002fd1ba028	| ↻ Uploading logs   40%|
+frame	stall	GitHub Light	60	moving	13000	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=584e7c4ebe944d03:bc3656360d73cfc0:40990902174eb0c8	| ↻ Uploading logs   40%|
+frame	complete	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=c35b665e2bf36cb5:91ee3d5b55b58106:380929af37804265	| ↻ Building   50%|
+frame	complete	GitHub Light	60	moving	3100	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=cda536b88047bf6b:5564b408412a7f7f:fa03ed3e430fa052	| ✓ Built|
+frame	complete	GitHub Light	60	moving	3400	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=fe07714d4b3db9e5:e30f367eac7b40ec:acf5d2b8b6e15d4a	| ✓ Built|
+frame	fault	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=178d6d16aca32ff4:91ee3d5b55b58106:8f8a54eedcc1166c	| ↻ Uploading   50%|
+frame	fault	GitHub Light	60	moving	3100	n=1	w=732	top=9e29e469fa9ea675	bleed=3379a51c965e4cf1	r0=f0073868acf6c1a7:b382b51d77b86cd9:dfb77356b7b6dcec	| ⚠ Upload failed   50% failed|
+frame	fault	GitHub Light	60	moving	3300	n=1	w=732	top=9e29e469fa9ea675	bleed=a533979b8d77c50c	r0=27c82a384846d413:f6595b31d3839b27:91a4872dca10b018	| ⚠ Upload failed   50% failed|
+frame	vanish	GitHub Light	60	moving	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=5099ee36095366bc:91ee3d5b55b58106:e132d37a6bc687c5	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	60	moving	3050	n=1	w=732	top=9e29e469fa9ea675	bleed=f7d99cf8cc6290e7	r0=3ba148ef6ca4565a:37fb52614e8442b8:18da3c77ed438491	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	60	moving	3200	n=1	w=732	top=9e29e469fa9ea675	bleed=f4b10d33c4843665	r0=ba059fe5372502ca:0b493b29e14b9c84:3b6f2754e3ee8b2c	| ↻ Syncing   50%|
+frame	stack	GitHub Light	60	moving	2600	n=3	w=732	top=9e29e469fa9ea675	bleed=330d76a84bb5d77d	r0=ecb7259261cee7a1:18c939f1438091c7:0f7d9b29678eda5f	r1=efac96b9df1ba285:e4c374a786a2167d:6d31bff2dc29bdf3	r2=fa9309b203c19be6:45f8fa906cd13ce1:b658ef0fe731a849	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	60	moving	900	n=2	w=732	top=9e29e469fa9ea675	bleed=491213fbb253b7fd	r0=ecb7259261cee7a1:18c939f1438091c7:0f7d9b29678eda5f	r1=fa9309b203c19be6:b3f64f0716e53e80:b658ef0fe731a849	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	60	moving	1200	n=2	w=732	top=9e29e469fa9ea675	bleed=491213fbb253b7fd	r0=3d7de969c808acfe:efb5edcdf4c24727:cbf31a89b9b464d3	r1=21b15b0851e5edd1:09612b07b5ecb5a5:d416d75131ecdf5d	| ⚠ Disk nearly full||
+frame	shrink	GitHub Light	60	moving	2700	n=1	w=732	top=9e29e469fa9ea675	bleed=bab6305e2145e928	r0=fa9309b203c19be6:efb5edcdf4c24727:b658ef0fe731a849	| ⚠ Disk nearly full|
+frame	record	GitHub Light	60	still	100	n=0	w=732	top=feb93f3471407d05	bleed=669b18c6d2d9c95b	||
+frame	warn	GitHub Light	60	still	100	n=1	w=732	top=9e29e469fa9ea675	bleed=bab6305e2145e928	r0=699258caa975f08f:efb5edcdf4c24727:8bbb8c8d534c43d0	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	GitHub Light	60	still	100	n=1	w=732	top=9e29e469fa9ea675	bleed=bab6305e2145e928	r0=09a11fe0598240b3:18c939f1438091c7:c09b8fdb4e7bbe30	| ✕ Deploy failed · exit 1|
+frame	bar0	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=5bf8999e24da7f0e	r0=61e3ebb14f660b73:73fe51e550131732:e04c6b278ff1ff4a	| ↻ Downloading assets    0%|
+frame	bar25	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=4b3dd5712127fa8d:bde458ca45b7e015:3379c5ca2750b772	| ↻ Downloading assets   25%|
+frame	bar50	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=646d20d1e424c4d5:91ee3d5b55b58106:7e69395ccd24158b	| ↻ Downloading assets   50%|
+frame	bar999	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=3797c2e309a94237	r0=29e15d52ef317a90:5fda52a484b0731b:c69fbeb9ad7f99ab	| ↻ Downloading assets   99%|
+frame	bar100	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=fb9b221def4254ca	r0=7ceaae987de9025d:d55b3743ba3ef7ea:5390bd64791a6c48	| ↻ Downloading assets  100%|
+frame	amount	GitHub Light	60	still	2600	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=a5767a2be094cbb0:ade9400da14c2d6c:8f6f0de9225a21c0	| ↻ Copying files   70%|
+frame	amount	GitHub Light	60	still	3000	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=a5767a2be094cbb0:ade9400da14c2d6c:8f6f0de9225a21c0	| ↻ Copying files   70%|
+frame	busy	GitHub Light	60	still	2600	n=1	w=732	top=9e29e469fa9ea675	bleed=53067c2461324e4c	r0=da502b1098f008b4:8a624364b405962a:2ca1b8d3209eda17	| ↻ Indexing the tree|
+frame	busy	GitHub Light	60	still	3400	n=1	w=732	top=9e29e469fa9ea675	bleed=53067c2461324e4c	r0=da502b1098f008b4:8a624364b405962a:2ca1b8d3209eda17	| ↻ Indexing the tree|
+frame	busy	GitHub Light	60	still	4700	n=1	w=732	top=9e29e469fa9ea675	bleed=53067c2461324e4c	r0=da502b1098f008b4:8a624364b405962a:2ca1b8d3209eda17	| ↻ Indexing the tree|
+frame	stall	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=77345d531667dbd4:787336bcd1349d7c:1ab09002fd1ba028	| ↻ Uploading logs   40%|
+frame	stall	GitHub Light	60	still	13000	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=77345d531667dbd4:787336bcd1349d7c:1ab09002fd1ba028	| ↻ Uploading logs   40%|
+frame	complete	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=c35b665e2bf36cb5:91ee3d5b55b58106:380929af37804265	| ↻ Building   50%|
+frame	complete	GitHub Light	60	still	3100	n=1	w=732	top=9e29e469fa9ea675	bleed=fb9b221def4254ca	r0=e38d2a212c0f1eea:4ca5ddf5f87914a6:ae9ece061002652e	| ✓ Built|
+frame	complete	GitHub Light	60	still	3400	n=1	w=732	top=9e29e469fa9ea675	bleed=fb9b221def4254ca	r0=e38d2a212c0f1eea:4ca5ddf5f87914a6:ae9ece061002652e	| ✓ Built|
+frame	fault	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=178d6d16aca32ff4:91ee3d5b55b58106:8f8a54eedcc1166c	| ↻ Uploading   50%|
+frame	fault	GitHub Light	60	still	3100	n=1	w=732	top=9e29e469fa9ea675	bleed=a533979b8d77c50c	r0=27c82a384846d413:f6595b31d3839b27:91a4872dca10b018	| ⚠ Upload failed   50% failed|
+frame	fault	GitHub Light	60	still	3300	n=1	w=732	top=9e29e469fa9ea675	bleed=a533979b8d77c50c	r0=27c82a384846d413:f6595b31d3839b27:91a4872dca10b018	| ⚠ Upload failed   50% failed|
+frame	vanish	GitHub Light	60	still	2500	n=1	w=732	top=9e29e469fa9ea675	bleed=661ee58187f8ce38	r0=5099ee36095366bc:91ee3d5b55b58106:e132d37a6bc687c5	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	60	still	3050	n=1	w=732	top=9e29e469fa9ea675	bleed=4d033d5179d29ca2	r0=3e3d4f7a089811b4:1ffc5896f6ece88a:0427d4cad5e98d27	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	60	still	3200	n=1	w=732	top=9e29e469fa9ea675	bleed=4d033d5179d29ca2	r0=3e3d4f7a089811b4:1ffc5896f6ece88a:0427d4cad5e98d27	| ↻ Syncing   50%|
+frame	stack	GitHub Light	60	still	2600	n=3	w=732	top=9e29e469fa9ea675	bleed=330d76a84bb5d77d	r0=ecb7259261cee7a1:18c939f1438091c7:0f7d9b29678eda5f	r1=efac96b9df1ba285:e4c374a786a2167d:6d31bff2dc29bdf3	r2=fa9309b203c19be6:45f8fa906cd13ce1:b658ef0fe731a849	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	60	still	900	n=2	w=732	top=9e29e469fa9ea675	bleed=491213fbb253b7fd	r0=ecb7259261cee7a1:18c939f1438091c7:0f7d9b29678eda5f	r1=fa9309b203c19be6:b3f64f0716e53e80:b658ef0fe731a849	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	60	still	1200	n=2	w=732	top=9e29e469fa9ea675	bleed=491213fbb253b7fd	r0=3d7de969c808acfe:efb5edcdf4c24727:cbf31a89b9b464d3	r1=21b15b0851e5edd1:09612b07b5ecb5a5:d416d75131ecdf5d	| ⚠ Disk nearly full||
+frame	shrink	GitHub Light	60	still	2700	n=1	w=732	top=9e29e469fa9ea675	bleed=bab6305e2145e928	r0=fa9309b203c19be6:efb5edcdf4c24727:b658ef0fe731a849	| ⚠ Disk nearly full|
+frame	record	GitHub Light	80	moving	100	n=0	w=972	top=e318081a975bce85	bleed=669b18c6d2d9c95b	||
+frame	warn	GitHub Light	80	moving	100	n=1	w=972	top=2df9902529595635	bleed=bab6305e2145e928	r0=a53c6dda3f2bebbf:efb5edcdf4c24727:60db7100dfd009b0	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	GitHub Light	80	moving	100	n=1	w=972	top=2df9902529595635	bleed=bab6305e2145e928	r0=c98b7be5ef6bc7e3:18c939f1438091c7:710d222d3d1b7b90	| ✕ Deploy failed · exit 1|
+frame	bar0	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=5bf8999e24da7f0e	r0=5b1048451ce4a3eb:3eb6282a33907752:ce308a5e39b9266a	| ↻ Downloading assets    0%|
+frame	bar25	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=e70ec938cae07164:266652f6e5d4a40f:871f3713810f984f	| ↻ Downloading assets   25%|
+frame	bar50	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=e7c3f8ea3d9788a4:3f21c98040ffa716:37278c57afbc0c2b	| ↻ Downloading assets   50%|
+frame	bar999	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=66e82e4207e3289f	r0=1328f66ee19793d0:d44c13f71eb95402:c175d71ae02204bb	| ↻ Downloading assets   99%|
+frame	bar100	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=fb9b221def4254ca	r0=d7c270541809e0dd:b058b742c9e00b6a:77a50b8262bb2928	| ↻ Downloading assets  100%|
+frame	amount	GitHub Light	80	moving	2600	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=638494fc6ee004ac:c8f9270198d397a7:5c5f1c06dd10c2c0	| ↻ Copying files   70%|
+frame	amount	GitHub Light	80	moving	3000	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=638494fc6ee004ac:c8f9270198d397a7:5c5f1c06dd10c2c0	| ↻ Copying files   70%|
+frame	busy	GitHub Light	80	moving	2600	n=1	w=972	top=2df9902529595635	bleed=53067c2461324e4c	r0=9eff62df619ba4d0:257d0b43c95b24aa:5f3435fae225f597	| ↻ Indexing the tree|
+frame	busy	GitHub Light	80	moving	3400	n=1	w=972	top=2df9902529595635	bleed=53067c2461324e4c	r0=5fa1cb0c3b73aee4:95f8a24f1a2c75e3:e18596695a0f95eb	| ↻ Indexing the tree|
+frame	busy	GitHub Light	80	moving	4700	n=1	w=972	top=2df9902529595635	bleed=53067c2461324e4c	r0=2d72be7e123ab615:782229d80257d11d:f00ca4c10dff01fb	| ↻ Indexing the tree|
+frame	stall	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=b93c57adeba2a6b9:e49a6adb34653e3f:43e4a1b067534cc8	| ↻ Uploading logs   40%|
+frame	stall	GitHub Light	80	moving	13000	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=1236043e11401907:74acb86a5853a7cc:87186413001c43b6	| ↻ Uploading logs   40%|
+frame	complete	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=a0d4f0326f1d69f9:3f21c98040ffa716:aaa464fe2b974205	| ↻ Building   50%|
+frame	complete	GitHub Light	80	moving	3100	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=8b6c05cad04c5f41:59e1f0b4899d772f:106ff24778d888d9	| ✓ Built|
+frame	complete	GitHub Light	80	moving	3400	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=a611813e1841ce96:c475048537d2a52d:48ecba06b5a9ee16	| ✓ Built|
+frame	fault	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=1b641205fa757438:3f21c98040ffa716:1b2b89bebcdacc0c	| ↻ Uploading   50%|
+frame	fault	GitHub Light	80	moving	3100	n=1	w=972	top=2df9902529595635	bleed=3379a51c965e4cf1	r0=465835bb49870bbf:3745c89bc69cc6c1:1999ebb4ecf9e1dc	| ⚠ Upload failed   50% failed|
+frame	fault	GitHub Light	80	moving	3300	n=1	w=972	top=2df9902529595635	bleed=a533979b8d77c50c	r0=b304496af26160fb:8c8108d0628435f7:7c46a72fd130aa58	| ⚠ Upload failed   50% failed|
+frame	vanish	GitHub Light	80	moving	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=560087794179c500:3f21c98040ffa716:edd1521be7948b05	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	80	moving	3050	n=1	w=972	top=2df9902529595635	bleed=f7d99cf8cc6290e7	r0=40727d247d95705e:3718c01a39fe0520:0d43dfeaf5208151	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	80	moving	3200	n=1	w=972	top=2df9902529595635	bleed=f4b10d33c4843665	r0=d284bca5ecc350e0:865b589e87d1190c:bffc2f324c69244c	| ↻ Syncing   50%|
+frame	stack	GitHub Light	80	moving	2600	n=3	w=972	top=2df9902529595635	bleed=330d76a84bb5d77d	r0=44175f296d50f041:18c939f1438091c7:77e0cdaef311f21f	r1=6b0169772f255662:915ded318a049d72:ac461ff25991ff73	r2=7a699d04f9693d16:45f8fa906cd13ce1:0439f69e8078e469	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	80	moving	900	n=2	w=972	top=2df9902529595635	bleed=491213fbb253b7fd	r0=44175f296d50f041:18c939f1438091c7:77e0cdaef311f21f	r1=7a699d04f9693d16:b3f64f0716e53e80:0439f69e8078e469	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	80	moving	1200	n=2	w=972	top=2df9902529595635	bleed=491213fbb253b7fd	r0=ab92c26f2382021e:efb5edcdf4c24727:4c38a163c90b5993	r1=22683ad4df798061:09612b07b5ecb5a5:ecd5e4d7bf340c3d	| ⚠ Disk nearly full||
+frame	shrink	GitHub Light	80	moving	2700	n=1	w=972	top=2df9902529595635	bleed=bab6305e2145e928	r0=7a699d04f9693d16:efb5edcdf4c24727:0439f69e8078e469	| ⚠ Disk nearly full|
+frame	record	GitHub Light	80	still	100	n=0	w=972	top=e318081a975bce85	bleed=669b18c6d2d9c95b	||
+frame	warn	GitHub Light	80	still	100	n=1	w=972	top=2df9902529595635	bleed=bab6305e2145e928	r0=a53c6dda3f2bebbf:efb5edcdf4c24727:60db7100dfd009b0	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	GitHub Light	80	still	100	n=1	w=972	top=2df9902529595635	bleed=bab6305e2145e928	r0=c98b7be5ef6bc7e3:18c939f1438091c7:710d222d3d1b7b90	| ✕ Deploy failed · exit 1|
+frame	bar0	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=5bf8999e24da7f0e	r0=5b1048451ce4a3eb:3eb6282a33907752:ce308a5e39b9266a	| ↻ Downloading assets    0%|
+frame	bar25	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=e70ec938cae07164:266652f6e5d4a40f:871f3713810f984f	| ↻ Downloading assets   25%|
+frame	bar50	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=e7c3f8ea3d9788a4:3f21c98040ffa716:37278c57afbc0c2b	| ↻ Downloading assets   50%|
+frame	bar999	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=66e82e4207e3289f	r0=1328f66ee19793d0:d44c13f71eb95402:c175d71ae02204bb	| ↻ Downloading assets   99%|
+frame	bar100	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=fb9b221def4254ca	r0=d7c270541809e0dd:b058b742c9e00b6a:77a50b8262bb2928	| ↻ Downloading assets  100%|
+frame	amount	GitHub Light	80	still	2600	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=638494fc6ee004ac:c8f9270198d397a7:5c5f1c06dd10c2c0	| ↻ Copying files   70%|
+frame	amount	GitHub Light	80	still	3000	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=638494fc6ee004ac:c8f9270198d397a7:5c5f1c06dd10c2c0	| ↻ Copying files   70%|
+frame	busy	GitHub Light	80	still	2600	n=1	w=972	top=2df9902529595635	bleed=53067c2461324e4c	r0=edb84e4ab6aa8634:257d0b43c95b24aa:9da3258bb14e2d17	| ↻ Indexing the tree|
+frame	busy	GitHub Light	80	still	3400	n=1	w=972	top=2df9902529595635	bleed=53067c2461324e4c	r0=edb84e4ab6aa8634:257d0b43c95b24aa:9da3258bb14e2d17	| ↻ Indexing the tree|
+frame	busy	GitHub Light	80	still	4700	n=1	w=972	top=2df9902529595635	bleed=53067c2461324e4c	r0=edb84e4ab6aa8634:257d0b43c95b24aa:9da3258bb14e2d17	| ↻ Indexing the tree|
+frame	stall	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=b93c57adeba2a6b9:e49a6adb34653e3f:43e4a1b067534cc8	| ↻ Uploading logs   40%|
+frame	stall	GitHub Light	80	still	13000	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=b93c57adeba2a6b9:e49a6adb34653e3f:43e4a1b067534cc8	| ↻ Uploading logs   40%|
+frame	complete	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=a0d4f0326f1d69f9:3f21c98040ffa716:aaa464fe2b974205	| ↻ Building   50%|
+frame	complete	GitHub Light	80	still	3100	n=1	w=972	top=2df9902529595635	bleed=fb9b221def4254ca	r0=a77707951a1e120a:0a79dc5d872d3726:b92e916523ec1c8e	| ✓ Built|
+frame	complete	GitHub Light	80	still	3400	n=1	w=972	top=2df9902529595635	bleed=fb9b221def4254ca	r0=a77707951a1e120a:0a79dc5d872d3726:b92e916523ec1c8e	| ✓ Built|
+frame	fault	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=1b641205fa757438:3f21c98040ffa716:1b2b89bebcdacc0c	| ↻ Uploading   50%|
+frame	fault	GitHub Light	80	still	3100	n=1	w=972	top=2df9902529595635	bleed=a533979b8d77c50c	r0=b304496af26160fb:8c8108d0628435f7:7c46a72fd130aa58	| ⚠ Upload failed   50% failed|
+frame	fault	GitHub Light	80	still	3300	n=1	w=972	top=2df9902529595635	bleed=a533979b8d77c50c	r0=b304496af26160fb:8c8108d0628435f7:7c46a72fd130aa58	| ⚠ Upload failed   50% failed|
+frame	vanish	GitHub Light	80	still	2500	n=1	w=972	top=2df9902529595635	bleed=661ee58187f8ce38	r0=560087794179c500:3f21c98040ffa716:edd1521be7948b05	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	80	still	3050	n=1	w=972	top=2df9902529595635	bleed=4d033d5179d29ca2	r0=eb226f4b257a3214:c9b312d40051328a:4b393f02c16e8147	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	80	still	3200	n=1	w=972	top=2df9902529595635	bleed=4d033d5179d29ca2	r0=eb226f4b257a3214:c9b312d40051328a:4b393f02c16e8147	| ↻ Syncing   50%|
+frame	stack	GitHub Light	80	still	2600	n=3	w=972	top=2df9902529595635	bleed=330d76a84bb5d77d	r0=44175f296d50f041:18c939f1438091c7:77e0cdaef311f21f	r1=6b0169772f255662:915ded318a049d72:ac461ff25991ff73	r2=7a699d04f9693d16:45f8fa906cd13ce1:0439f69e8078e469	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	80	still	900	n=2	w=972	top=2df9902529595635	bleed=491213fbb253b7fd	r0=44175f296d50f041:18c939f1438091c7:77e0cdaef311f21f	r1=7a699d04f9693d16:b3f64f0716e53e80:0439f69e8078e469	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	80	still	1200	n=2	w=972	top=2df9902529595635	bleed=491213fbb253b7fd	r0=ab92c26f2382021e:efb5edcdf4c24727:4c38a163c90b5993	r1=22683ad4df798061:09612b07b5ecb5a5:ecd5e4d7bf340c3d	| ⚠ Disk nearly full||
+frame	shrink	GitHub Light	80	still	2700	n=1	w=972	top=2df9902529595635	bleed=bab6305e2145e928	r0=7a699d04f9693d16:efb5edcdf4c24727:0439f69e8078e469	| ⚠ Disk nearly full|
+frame	record	GitHub Light	120	moving	100	n=0	w=1452	top=793af741de82a785	bleed=669b18c6d2d9c95b	||
+frame	warn	GitHub Light	120	moving	100	n=1	w=1452	top=b62fce3468bf97b5	bleed=bab6305e2145e928	r0=0a053687962eb59f:efb5edcdf4c24727:89a513ddf7e558f0	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	GitHub Light	120	moving	100	n=1	w=1452	top=b62fce3468bf97b5	bleed=bab6305e2145e928	r0=f2982a5cdb8c1183:18c939f1438091c7:75330207d192cbd0	| ✕ Deploy failed · exit 1|
+frame	bar0	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=5bf8999e24da7f0e	r0=c4f03b3b7170bb5b:8b6ea35d1157ae92:83024c8aef621c2a	| ↻ Downloading assets    0%|
+frame	bar25	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=4b2c27763049c5b3:8cd5227b7d17bff1:2e48eec8346584f3	| ↻ Downloading assets   25%|
+frame	bar50	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=e11e4a2cf6bc014c:2feda114d6515936:e65b0025ee3c53ab	| ↻ Downloading assets   50%|
+frame	bar999	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=50c81352e52aa93b	r0=d6f5aa78d8f9cc9d:77c8f9620918d9e8:7b176341a884e76b	| ↻ Downloading assets   99%|
+frame	bar100	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=fb9b221def4254ca	r0=1557739f8b734ddd:230b518f07bd326a:4849e02e071e4168	| ↻ Downloading assets  100%|
+frame	amount	GitHub Light	120	moving	2600	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=9251ce0271081364:7ff4228ef2b9a243:aec185bbdd7541fc	| ↻ Copying files   70%|
+frame	amount	GitHub Light	120	moving	3000	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=9251ce0271081364:7ff4228ef2b9a243:aec185bbdd7541fc	| ↻ Copying files   70%|
+frame	busy	GitHub Light	120	moving	2600	n=1	w=1452	top=b62fce3468bf97b5	bleed=53067c2461324e4c	r0=b755cff0c8ee2ad0:d467266d848581aa:272804ac90129b97	| ↻ Indexing the tree|
+frame	busy	GitHub Light	120	moving	3400	n=1	w=1452	top=b62fce3468bf97b5	bleed=53067c2461324e4c	r0=b327de36ef7b4ab4:52aa6aef5b57fbfc:41d2120508561f30	| ↻ Indexing the tree|
+frame	busy	GitHub Light	120	moving	4700	n=1	w=1452	top=b62fce3468bf97b5	bleed=53067c2461324e4c	r0=6d2c0f88c7814912:fc51d5c2d2961388:b9a377ecf851f011	| ↻ Indexing the tree|
+frame	stall	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=03d8f1206483cc81:5080b68d45955454:a72104bcb1879c76	| ↻ Uploading logs   40%|
+frame	stall	GitHub Light	120	moving	13000	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=dc9aaa796ba2200e:30bbbdbf24bb798b:c9485daff9625c42	| ↻ Uploading logs   40%|
+frame	complete	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=4f2012b4b83f52a1:2feda114d6515936:abebb877d4d73ac5	| ↻ Building   50%|
+frame	complete	GitHub Light	120	moving	3100	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=f9add5b8cc4dcfb9:f7a91434c4f76c8b:3f6f965c8743a962	| ✓ Built|
+frame	complete	GitHub Light	120	moving	3400	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=5ff5963e89d477f8:981f5895101db1fa:df9301978581a64e	| ✓ Built|
+frame	fault	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=63d1aa5e70ee2f00:2feda114d6515936:90c8b2ff2e22ed0c	| ↻ Uploading   50%|
+frame	fault	GitHub Light	120	moving	3100	n=1	w=1452	top=b62fce3468bf97b5	bleed=3379a51c965e4cf1	r0=fd2e6ebbea541d27:8f4fe8887012fd91:75d14cee21cca43c	| ⚠ Upload failed   50% failed|
+frame	fault	GitHub Light	120	moving	3300	n=1	w=1452	top=b62fce3468bf97b5	bleed=a533979b8d77c50c	r0=f25d2e370b1d7053:32f91d913fac0557:284422a118e7c358	| ⚠ Upload failed   50% failed|
+frame	vanish	GitHub Light	120	moving	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=f3a21860f6bf1a08:2feda114d6515936:9ca27129caf7f545	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	120	moving	3050	n=1	w=1452	top=b62fce3468bf97b5	bleed=f7d99cf8cc6290e7	r0=47ffb77033dca066:3ca3c07af3182d10:9f358f658a2df391	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	120	moving	3200	n=1	w=1452	top=b62fce3468bf97b5	bleed=f4b10d33c4843665	r0=718fd2a5fb02cb3c:9bb9791c4e2287dc:da92650c6f68d70c	| ↻ Syncing   50%|
+frame	stack	GitHub Light	120	moving	2600	n=3	w=1452	top=b62fce3468bf97b5	bleed=330d76a84bb5d77d	r0=53f48617618ceb81:18c939f1438091c7:304c74da4cd5051f	r1=14716cf47553e532:76b20220e093e922:8fc891950dfc1f89	r2=2ddbfe0b73f7e0b6:45f8fa906cd13ce1:43164aa3902283a9	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	120	moving	900	n=2	w=1452	top=b62fce3468bf97b5	bleed=491213fbb253b7fd	r0=53f48617618ceb81:18c939f1438091c7:304c74da4cd5051f	r1=2ddbfe0b73f7e0b6:b3f64f0716e53e80:43164aa3902283a9	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	120	moving	1200	n=2	w=1452	top=b62fce3468bf97b5	bleed=491213fbb253b7fd	r0=c57b3405fd73a8de:efb5edcdf4c24727:3be11d5e8c84ce93	r1=b34f2c1ae3dac801:09612b07b5ecb5a5:b72c61cf8aa520fd	| ⚠ Disk nearly full||
+frame	shrink	GitHub Light	120	moving	2700	n=1	w=1452	top=b62fce3468bf97b5	bleed=bab6305e2145e928	r0=2ddbfe0b73f7e0b6:efb5edcdf4c24727:43164aa3902283a9	| ⚠ Disk nearly full|
+frame	record	GitHub Light	120	still	100	n=0	w=1452	top=793af741de82a785	bleed=669b18c6d2d9c95b	||
+frame	warn	GitHub Light	120	still	100	n=1	w=1452	top=b62fce3468bf97b5	bleed=bab6305e2145e928	r0=0a053687962eb59f:efb5edcdf4c24727:89a513ddf7e558f0	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	GitHub Light	120	still	100	n=1	w=1452	top=b62fce3468bf97b5	bleed=bab6305e2145e928	r0=f2982a5cdb8c1183:18c939f1438091c7:75330207d192cbd0	| ✕ Deploy failed · exit 1|
+frame	bar0	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=5bf8999e24da7f0e	r0=c4f03b3b7170bb5b:8b6ea35d1157ae92:83024c8aef621c2a	| ↻ Downloading assets    0%|
+frame	bar25	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=4b2c27763049c5b3:8cd5227b7d17bff1:2e48eec8346584f3	| ↻ Downloading assets   25%|
+frame	bar50	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=e11e4a2cf6bc014c:2feda114d6515936:e65b0025ee3c53ab	| ↻ Downloading assets   50%|
+frame	bar999	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=50c81352e52aa93b	r0=d6f5aa78d8f9cc9d:77c8f9620918d9e8:7b176341a884e76b	| ↻ Downloading assets   99%|
+frame	bar100	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=fb9b221def4254ca	r0=1557739f8b734ddd:230b518f07bd326a:4849e02e071e4168	| ↻ Downloading assets  100%|
+frame	amount	GitHub Light	120	still	2600	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=9251ce0271081364:7ff4228ef2b9a243:aec185bbdd7541fc	| ↻ Copying files   70%|
+frame	amount	GitHub Light	120	still	3000	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=9251ce0271081364:7ff4228ef2b9a243:aec185bbdd7541fc	| ↻ Copying files   70%|
+frame	busy	GitHub Light	120	still	2600	n=1	w=1452	top=b62fce3468bf97b5	bleed=53067c2461324e4c	r0=0e369f69bd1ca134:d467266d848581aa:0cd48baca9b7d317	| ↻ Indexing the tree|
+frame	busy	GitHub Light	120	still	3400	n=1	w=1452	top=b62fce3468bf97b5	bleed=53067c2461324e4c	r0=0e369f69bd1ca134:d467266d848581aa:0cd48baca9b7d317	| ↻ Indexing the tree|
+frame	busy	GitHub Light	120	still	4700	n=1	w=1452	top=b62fce3468bf97b5	bleed=53067c2461324e4c	r0=0e369f69bd1ca134:d467266d848581aa:0cd48baca9b7d317	| ↻ Indexing the tree|
+frame	stall	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=03d8f1206483cc81:5080b68d45955454:a72104bcb1879c76	| ↻ Uploading logs   40%|
+frame	stall	GitHub Light	120	still	13000	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=03d8f1206483cc81:5080b68d45955454:a72104bcb1879c76	| ↻ Uploading logs   40%|
+frame	complete	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=4f2012b4b83f52a1:2feda114d6515936:abebb877d4d73ac5	| ↻ Building   50%|
+frame	complete	GitHub Light	120	still	3100	n=1	w=1452	top=b62fce3468bf97b5	bleed=fb9b221def4254ca	r0=b2fd4a17ad2dd64a:cd1d0beaa5f67c26:135ab328cd4eab4e	| ✓ Built|
+frame	complete	GitHub Light	120	still	3400	n=1	w=1452	top=b62fce3468bf97b5	bleed=fb9b221def4254ca	r0=b2fd4a17ad2dd64a:cd1d0beaa5f67c26:135ab328cd4eab4e	| ✓ Built|
+frame	fault	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=63d1aa5e70ee2f00:2feda114d6515936:90c8b2ff2e22ed0c	| ↻ Uploading   50%|
+frame	fault	GitHub Light	120	still	3100	n=1	w=1452	top=b62fce3468bf97b5	bleed=a533979b8d77c50c	r0=f25d2e370b1d7053:32f91d913fac0557:284422a118e7c358	| ⚠ Upload failed   50% failed|
+frame	fault	GitHub Light	120	still	3300	n=1	w=1452	top=b62fce3468bf97b5	bleed=a533979b8d77c50c	r0=f25d2e370b1d7053:32f91d913fac0557:284422a118e7c358	| ⚠ Upload failed   50% failed|
+frame	vanish	GitHub Light	120	still	2500	n=1	w=1452	top=b62fce3468bf97b5	bleed=661ee58187f8ce38	r0=f3a21860f6bf1a08:2feda114d6515936:9ca27129caf7f545	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	120	still	3050	n=1	w=1452	top=b62fce3468bf97b5	bleed=4d033d5179d29ca2	r0=0498b844411ab6d4:f790c0e7df1ec68a:c4d0b40e21680287	| ↻ Syncing   50%|
+frame	vanish	GitHub Light	120	still	3200	n=1	w=1452	top=b62fce3468bf97b5	bleed=4d033d5179d29ca2	r0=0498b844411ab6d4:f790c0e7df1ec68a:c4d0b40e21680287	| ↻ Syncing   50%|
+frame	stack	GitHub Light	120	still	2600	n=3	w=1452	top=b62fce3468bf97b5	bleed=330d76a84bb5d77d	r0=53f48617618ceb81:18c939f1438091c7:304c74da4cd5051f	r1=14716cf47553e532:76b20220e093e922:8fc891950dfc1f89	r2=2ddbfe0b73f7e0b6:45f8fa906cd13ce1:43164aa3902283a9	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	120	still	900	n=2	w=1452	top=b62fce3468bf97b5	bleed=491213fbb253b7fd	r0=53f48617618ceb81:18c939f1438091c7:304c74da4cd5051f	r1=2ddbfe0b73f7e0b6:b3f64f0716e53e80:43164aa3902283a9	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	GitHub Light	120	still	1200	n=2	w=1452	top=b62fce3468bf97b5	bleed=491213fbb253b7fd	r0=c57b3405fd73a8de:efb5edcdf4c24727:3be11d5e8c84ce93	r1=b34f2c1ae3dac801:09612b07b5ecb5a5:b72c61cf8aa520fd	| ⚠ Disk nearly full||
+frame	shrink	GitHub Light	120	still	2700	n=1	w=1452	top=b62fce3468bf97b5	bleed=bab6305e2145e928	r0=2ddbfe0b73f7e0b6:efb5edcdf4c24727:43164aa3902283a9	| ⚠ Disk nearly full|
+frame	record	Catppuccin Latte	60	moving	100	n=0	w=732	top=a5f131a3f2c6ca25	bleed=669b18c6d2d9c95b	||
+frame	warn	Catppuccin Latte	60	moving	100	n=1	w=732	top=8b72c940cf49db25	bleed=476b3e2ed8edfd5d	r0=da71e255f17ddb80:efb5edcdf4c24727:9e331b402328d7ea	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Catppuccin Latte	60	moving	100	n=1	w=732	top=8b72c940cf49db25	bleed=476b3e2ed8edfd5d	r0=b269fe76492115b9:18c939f1438091c7:64641c78b53b591c	| ✕ Deploy failed · exit 1|
+frame	bar0	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=81455dd25ff2fd57	r0=17438a32e5a758f1:b96fd993816f5772:0aec6ce1606a04cb	| ↻ Downloading assets    0%|
+frame	bar25	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=198b73fd00c459fc:12d0be89248c8d4e:80c8735cffa68a21	| ↻ Downloading assets   25%|
+frame	bar50	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=15de9ce17f98ee9d:9f1256126a9786d6:cfb62021f16f4827	| ↻ Downloading assets   50%|
+frame	bar999	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=08e09202fc99f107	r0=16deb545ab44d9f4:4f09d378ae435e89:690eb84d4f192ffc	| ↻ Downloading assets   99%|
+frame	bar100	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=6a6c5fb865fccd93	r0=4bf148def0c63a35:b95b98a3fd6f552a:c30b6a3cc3100471	| ↻ Downloading assets  100%|
+frame	amount	Catppuccin Latte	60	moving	2600	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=6bc9c2d0ce01fd9d:4d0ccf13ef813317:25ad58684c200ca8	| ↻ Copying files   70%|
+frame	amount	Catppuccin Latte	60	moving	3000	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=6bc9c2d0ce01fd9d:4d0ccf13ef813317:25ad58684c200ca8	| ↻ Copying files   70%|
+frame	busy	Catppuccin Latte	60	moving	2600	n=1	w=732	top=8b72c940cf49db25	bleed=13c43899b9f6f363	r0=2b3429e0adee5353:07a4ff23ad8bce8a:5285ee1b211dd1ce	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	60	moving	3400	n=1	w=732	top=8b72c940cf49db25	bleed=13c43899b9f6f363	r0=bf026ef19555085c:1e11ab2c370e9681:1ff353be2cf6fea1	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	60	moving	4700	n=1	w=732	top=8b72c940cf49db25	bleed=13c43899b9f6f363	r0=2355dc71f0b39446:54a63f2eb5d963ae:f31a24bc03e85801	| ↻ Indexing the tree|
+frame	stall	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=5c8f93f95d88ab00:4d152941769ce84b:9c4fc5b1244b6f87	| ↻ Uploading logs   40%|
+frame	stall	Catppuccin Latte	60	moving	13000	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=bf7703b36201923a:0a3977aa3eb79edc:44e4e1079de8d815	| ↻ Uploading logs   40%|
+frame	complete	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=345fed6dcfb39e99:9f1256126a9786d6:46dd976bd330c54c	| ↻ Building   50%|
+frame	complete	Catppuccin Latte	60	moving	3100	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=6a698adc9f195efb:56f6204160542709:772f7cfc2db17861	| ✓ Built|
+frame	complete	Catppuccin Latte	60	moving	3400	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=250147824e4e9027:41f33db7ea526d2f:7ec548e13d425fe4	| ✓ Built|
+frame	fault	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=bf6b76e5ad5ae386:9f1256126a9786d6:7dd04f6fdc294c18	| ↻ Uploading   50%|
+frame	fault	Catppuccin Latte	60	moving	3100	n=1	w=732	top=8b72c940cf49db25	bleed=2edce1ab5c8a5345	r0=ee4afea04bb26ffb:0e988bf39873e28d:20a3d92559f60abe	| ⚠ Upload failed   50% failed|
+frame	fault	Catppuccin Latte	60	moving	3300	n=1	w=732	top=8b72c940cf49db25	bleed=78a7a0b913242a09	r0=8aadc1a7f8bc9495:7ffbfc8eac80ae77:8cefae2fb27d1389	| ⚠ Upload failed   50% failed|
+frame	vanish	Catppuccin Latte	60	moving	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=23093eaa91b48cca:9f1256126a9786d6:3588078718b5dbcd	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	60	moving	3050	n=1	w=732	top=8b72c940cf49db25	bleed=3d9ca7b7d1da0871	r0=dcc55505bf1d541e:a4fbfbb47150fe5e:f3ac91b063291f7f	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	60	moving	3200	n=1	w=732	top=8b72c940cf49db25	bleed=c5a2390f446089b0	r0=9107643d138ea8ee:845f124195947c6a:7f3e02ddde27f615	| ↻ Syncing   50%|
+frame	stack	Catppuccin Latte	60	moving	2600	n=3	w=732	top=8b72c940cf49db25	bleed=77f40601644d4dbe	r0=1b73fc518fa3473b:18c939f1438091c7:c0944c6b80ab9ea7	r1=1d5c747ee3c38b12:8168d6a1492661ae:7897ca58e91006ee	r2=ef83006dee7c7cbf:45f8fa906cd13ce1:cb5b847c4310a288	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	60	moving	900	n=2	w=732	top=8b72c940cf49db25	bleed=6a3de5fd46a092a4	r0=1b73fc518fa3473b:18c939f1438091c7:c0944c6b80ab9ea7	r1=ef83006dee7c7cbf:b3f64f0716e53e80:cb5b847c4310a288	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	60	moving	1200	n=2	w=732	top=8b72c940cf49db25	bleed=6a3de5fd46a092a4	r0=f6e99fde8459cf27:efb5edcdf4c24727:008f5e6cd0d36f01	r1=488eea9fc7f27e01:09612b07b5ecb5a5:b79fa0698cd84e05	| ⚠ Disk nearly full||
+frame	shrink	Catppuccin Latte	60	moving	2700	n=1	w=732	top=8b72c940cf49db25	bleed=476b3e2ed8edfd5d	r0=ef83006dee7c7cbf:efb5edcdf4c24727:cb5b847c4310a288	| ⚠ Disk nearly full|
+frame	record	Catppuccin Latte	60	still	100	n=0	w=732	top=a5f131a3f2c6ca25	bleed=669b18c6d2d9c95b	||
+frame	warn	Catppuccin Latte	60	still	100	n=1	w=732	top=8b72c940cf49db25	bleed=476b3e2ed8edfd5d	r0=da71e255f17ddb80:efb5edcdf4c24727:9e331b402328d7ea	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Catppuccin Latte	60	still	100	n=1	w=732	top=8b72c940cf49db25	bleed=476b3e2ed8edfd5d	r0=b269fe76492115b9:18c939f1438091c7:64641c78b53b591c	| ✕ Deploy failed · exit 1|
+frame	bar0	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=81455dd25ff2fd57	r0=17438a32e5a758f1:b96fd993816f5772:0aec6ce1606a04cb	| ↻ Downloading assets    0%|
+frame	bar25	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=198b73fd00c459fc:12d0be89248c8d4e:80c8735cffa68a21	| ↻ Downloading assets   25%|
+frame	bar50	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=15de9ce17f98ee9d:9f1256126a9786d6:cfb62021f16f4827	| ↻ Downloading assets   50%|
+frame	bar999	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=08e09202fc99f107	r0=16deb545ab44d9f4:4f09d378ae435e89:690eb84d4f192ffc	| ↻ Downloading assets   99%|
+frame	bar100	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=6a6c5fb865fccd93	r0=4bf148def0c63a35:b95b98a3fd6f552a:c30b6a3cc3100471	| ↻ Downloading assets  100%|
+frame	amount	Catppuccin Latte	60	still	2600	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=6bc9c2d0ce01fd9d:4d0ccf13ef813317:25ad58684c200ca8	| ↻ Copying files   70%|
+frame	amount	Catppuccin Latte	60	still	3000	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=6bc9c2d0ce01fd9d:4d0ccf13ef813317:25ad58684c200ca8	| ↻ Copying files   70%|
+frame	busy	Catppuccin Latte	60	still	2600	n=1	w=732	top=8b72c940cf49db25	bleed=13c43899b9f6f363	r0=4ba9b7c18c4d598b:07a4ff23ad8bce8a:575a1c9eb1dd481f	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	60	still	3400	n=1	w=732	top=8b72c940cf49db25	bleed=13c43899b9f6f363	r0=4ba9b7c18c4d598b:07a4ff23ad8bce8a:575a1c9eb1dd481f	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	60	still	4700	n=1	w=732	top=8b72c940cf49db25	bleed=13c43899b9f6f363	r0=4ba9b7c18c4d598b:07a4ff23ad8bce8a:575a1c9eb1dd481f	| ↻ Indexing the tree|
+frame	stall	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=5c8f93f95d88ab00:4d152941769ce84b:9c4fc5b1244b6f87	| ↻ Uploading logs   40%|
+frame	stall	Catppuccin Latte	60	still	13000	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=5c8f93f95d88ab00:4d152941769ce84b:9c4fc5b1244b6f87	| ↻ Uploading logs   40%|
+frame	complete	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=345fed6dcfb39e99:9f1256126a9786d6:46dd976bd330c54c	| ↻ Building   50%|
+frame	complete	Catppuccin Latte	60	still	3100	n=1	w=732	top=8b72c940cf49db25	bleed=6a6c5fb865fccd93	r0=eaffdcd98710ee18:55c0d389dc1ae9e6:234368bc05d94b30	| ✓ Built|
+frame	complete	Catppuccin Latte	60	still	3400	n=1	w=732	top=8b72c940cf49db25	bleed=6a6c5fb865fccd93	r0=eaffdcd98710ee18:55c0d389dc1ae9e6:234368bc05d94b30	| ✓ Built|
+frame	fault	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=bf6b76e5ad5ae386:9f1256126a9786d6:7dd04f6fdc294c18	| ↻ Uploading   50%|
+frame	fault	Catppuccin Latte	60	still	3100	n=1	w=732	top=8b72c940cf49db25	bleed=78a7a0b913242a09	r0=8aadc1a7f8bc9495:7ffbfc8eac80ae77:8cefae2fb27d1389	| ⚠ Upload failed   50% failed|
+frame	fault	Catppuccin Latte	60	still	3300	n=1	w=732	top=8b72c940cf49db25	bleed=78a7a0b913242a09	r0=8aadc1a7f8bc9495:7ffbfc8eac80ae77:8cefae2fb27d1389	| ⚠ Upload failed   50% failed|
+frame	vanish	Catppuccin Latte	60	still	2500	n=1	w=732	top=8b72c940cf49db25	bleed=3f26b86e49501f57	r0=23093eaa91b48cca:9f1256126a9786d6:3588078718b5dbcd	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	60	still	3050	n=1	w=732	top=8b72c940cf49db25	bleed=519d629d98a4e5e1	r0=1e036827cd210dc0:7cff323944885c0a:bb4b488d6556afe8	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	60	still	3200	n=1	w=732	top=8b72c940cf49db25	bleed=519d629d98a4e5e1	r0=1e036827cd210dc0:7cff323944885c0a:bb4b488d6556afe8	| ↻ Syncing   50%|
+frame	stack	Catppuccin Latte	60	still	2600	n=3	w=732	top=8b72c940cf49db25	bleed=77f40601644d4dbe	r0=1b73fc518fa3473b:18c939f1438091c7:c0944c6b80ab9ea7	r1=1d5c747ee3c38b12:8168d6a1492661ae:7897ca58e91006ee	r2=ef83006dee7c7cbf:45f8fa906cd13ce1:cb5b847c4310a288	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	60	still	900	n=2	w=732	top=8b72c940cf49db25	bleed=6a3de5fd46a092a4	r0=1b73fc518fa3473b:18c939f1438091c7:c0944c6b80ab9ea7	r1=ef83006dee7c7cbf:b3f64f0716e53e80:cb5b847c4310a288	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	60	still	1200	n=2	w=732	top=8b72c940cf49db25	bleed=6a3de5fd46a092a4	r0=f6e99fde8459cf27:efb5edcdf4c24727:008f5e6cd0d36f01	r1=488eea9fc7f27e01:09612b07b5ecb5a5:b79fa0698cd84e05	| ⚠ Disk nearly full||
+frame	shrink	Catppuccin Latte	60	still	2700	n=1	w=732	top=8b72c940cf49db25	bleed=476b3e2ed8edfd5d	r0=ef83006dee7c7cbf:efb5edcdf4c24727:cb5b847c4310a288	| ⚠ Disk nearly full|
+frame	record	Catppuccin Latte	80	moving	100	n=0	w=972	top=4551556241a3c625	bleed=669b18c6d2d9c95b	||
+frame	warn	Catppuccin Latte	80	moving	100	n=1	w=972	top=bede70a0e2cbbb25	bleed=476b3e2ed8edfd5d	r0=2717f9a3099e01e0:efb5edcdf4c24727:0238c34cb26e57ea	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Catppuccin Latte	80	moving	100	n=1	w=972	top=bede70a0e2cbbb25	bleed=476b3e2ed8edfd5d	r0=84af3773b010a859:18c939f1438091c7:c9026a4a0dcb5ddc	| ✕ Deploy failed · exit 1|
+frame	bar0	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=81455dd25ff2fd57	r0=07106cb4bec01939:69ef249c9ca06a52:66cedc403d27016b	| ↻ Downloading assets    0%|
+frame	bar25	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=6190d6f70e15ef20:b0e2fb1243886604:17631d8dd6a82782	| ↻ Downloading assets   25%|
+frame	bar50	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=6463fb29e96be25a:067b88ea5829ea86:194fe0ec9b4e82d7	| ↻ Downloading assets   50%|
+frame	bar999	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=4ab9fddcf5d2ed3b	r0=8fbd3d53916d534c:997bd460a2d5b040:9a08176c5622da5c	| ↻ Downloading assets   99%|
+frame	bar100	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=6a6c5fb865fccd93	r0=9e2caa48bb969df5:8a8c292742eb1eaa:51c23390289f5bb1	| ↻ Downloading assets  100%|
+frame	amount	Catppuccin Latte	80	moving	2600	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=3265900c3ff9c8a9:b5eb654db7fe5109:e22846a1fd88213b	| ↻ Copying files   70%|
+frame	amount	Catppuccin Latte	80	moving	3000	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=3265900c3ff9c8a9:b5eb654db7fe5109:e22846a1fd88213b	| ↻ Copying files   70%|
+frame	busy	Catppuccin Latte	80	moving	2600	n=1	w=972	top=bede70a0e2cbbb25	bleed=13c43899b9f6f363	r0=6d78674c30740f13:73d1caa5c17bf08a:8a1fc084f82b524e	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	80	moving	3400	n=1	w=972	top=bede70a0e2cbbb25	bleed=13c43899b9f6f363	r0=e7c5b83f30d7e5e5:86dcd23e691c31fd:845c384982461130	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	80	moving	4700	n=1	w=972	top=bede70a0e2cbbb25	bleed=13c43899b9f6f363	r0=95af424856572dde:94272229e77957af:c83cff79d915c6d9	| ↻ Indexing the tree|
+frame	stall	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=9d34842457f40fcd:446a11c67bb8f8e0:238c9fc78d24892e	| ↻ Uploading logs   40%|
+frame	stall	Catppuccin Latte	80	moving	13000	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=0fdfe0760b602aab:b0f6d8c206d90fe1:0e44246a45c47d2e	| ↻ Uploading logs   40%|
+frame	complete	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=f5f21c64a91d442d:067b88ea5829ea86:f44f27839a1ab93c	| ↻ Building   50%|
+frame	complete	Catppuccin Latte	80	moving	3100	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=d0c8f2224ed227e8:bdaf40ddd7930c0d:72d3058b6847b159	| ✓ Built|
+frame	complete	Catppuccin Latte	80	moving	3400	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=d4c666d640a7edfe:2216b2fefcea4706:445d7a71e08a43b0	| ✓ Built|
+frame	fault	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=617b51c344a74cfa:067b88ea5829ea86:4cc7f62f12f71828	| ↻ Uploading   50%|
+frame	fault	Catppuccin Latte	80	moving	3100	n=1	w=972	top=bede70a0e2cbbb25	bleed=2edce1ab5c8a5345	r0=cdb6cf522b5b6e17:e4ec78800872313d:09d814017851a96e	| ⚠ Upload failed   50% failed|
+frame	fault	Catppuccin Latte	80	moving	3300	n=1	w=972	top=bede70a0e2cbbb25	bleed=78a7a0b913242a09	r0=a986b075fe4f573b:346327cbb74120c7:ae17da8543113b19	| ⚠ Upload failed   50% failed|
+frame	vanish	Catppuccin Latte	80	moving	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=7a30e327bac0261e:067b88ea5829ea86:27bf04240cc0029d	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	80	moving	3050	n=1	w=972	top=bede70a0e2cbbb25	bleed=3d9ca7b7d1da0871	r0=9a1e79a14e794ffa:3491b4b4391f04ae:d808ef2d00c0945f	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	80	moving	3200	n=1	w=972	top=bede70a0e2cbbb25	bleed=c5a2390f446089b0	r0=06a4592592675374:e72382cb5b5ea6ea:7e9c186cec7214c5	| ↻ Syncing   50%|
+frame	stack	Catppuccin Latte	80	moving	2600	n=3	w=972	top=bede70a0e2cbbb25	bleed=77f40601644d4dbe	r0=b91cdebc27a4781b:18c939f1438091c7:2399cf652be51687	r1=d4bac2362ab6dfe1:6251e840cf8a2477:7d2b9da33299e6f0	r2=d823ab47e79f8c2f:45f8fa906cd13ce1:57f35cbfe7f82c48	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	80	moving	900	n=2	w=972	top=bede70a0e2cbbb25	bleed=6a3de5fd46a092a4	r0=b91cdebc27a4781b:18c939f1438091c7:2399cf652be51687	r1=d823ab47e79f8c2f:b3f64f0716e53e80:57f35cbfe7f82c48	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	80	moving	1200	n=2	w=972	top=bede70a0e2cbbb25	bleed=6a3de5fd46a092a4	r0=22b9a33aff948b67:efb5edcdf4c24727:2c05e68f7202bbe1	r1=ce6a27e4733d5621:09612b07b5ecb5a5:144091a420560885	| ⚠ Disk nearly full||
+frame	shrink	Catppuccin Latte	80	moving	2700	n=1	w=972	top=bede70a0e2cbbb25	bleed=476b3e2ed8edfd5d	r0=d823ab47e79f8c2f:efb5edcdf4c24727:57f35cbfe7f82c48	| ⚠ Disk nearly full|
+frame	record	Catppuccin Latte	80	still	100	n=0	w=972	top=4551556241a3c625	bleed=669b18c6d2d9c95b	||
+frame	warn	Catppuccin Latte	80	still	100	n=1	w=972	top=bede70a0e2cbbb25	bleed=476b3e2ed8edfd5d	r0=2717f9a3099e01e0:efb5edcdf4c24727:0238c34cb26e57ea	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Catppuccin Latte	80	still	100	n=1	w=972	top=bede70a0e2cbbb25	bleed=476b3e2ed8edfd5d	r0=84af3773b010a859:18c939f1438091c7:c9026a4a0dcb5ddc	| ✕ Deploy failed · exit 1|
+frame	bar0	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=81455dd25ff2fd57	r0=07106cb4bec01939:69ef249c9ca06a52:66cedc403d27016b	| ↻ Downloading assets    0%|
+frame	bar25	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=6190d6f70e15ef20:b0e2fb1243886604:17631d8dd6a82782	| ↻ Downloading assets   25%|
+frame	bar50	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=6463fb29e96be25a:067b88ea5829ea86:194fe0ec9b4e82d7	| ↻ Downloading assets   50%|
+frame	bar999	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=4ab9fddcf5d2ed3b	r0=8fbd3d53916d534c:997bd460a2d5b040:9a08176c5622da5c	| ↻ Downloading assets   99%|
+frame	bar100	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=6a6c5fb865fccd93	r0=9e2caa48bb969df5:8a8c292742eb1eaa:51c23390289f5bb1	| ↻ Downloading assets  100%|
+frame	amount	Catppuccin Latte	80	still	2600	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=3265900c3ff9c8a9:b5eb654db7fe5109:e22846a1fd88213b	| ↻ Copying files   70%|
+frame	amount	Catppuccin Latte	80	still	3000	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=3265900c3ff9c8a9:b5eb654db7fe5109:e22846a1fd88213b	| ↻ Copying files   70%|
+frame	busy	Catppuccin Latte	80	still	2600	n=1	w=972	top=bede70a0e2cbbb25	bleed=13c43899b9f6f363	r0=934bd39e1ac56ecb:73d1caa5c17bf08a:732d4bf281f2b25f	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	80	still	3400	n=1	w=972	top=bede70a0e2cbbb25	bleed=13c43899b9f6f363	r0=934bd39e1ac56ecb:73d1caa5c17bf08a:732d4bf281f2b25f	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	80	still	4700	n=1	w=972	top=bede70a0e2cbbb25	bleed=13c43899b9f6f363	r0=934bd39e1ac56ecb:73d1caa5c17bf08a:732d4bf281f2b25f	| ↻ Indexing the tree|
+frame	stall	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=9d34842457f40fcd:446a11c67bb8f8e0:238c9fc78d24892e	| ↻ Uploading logs   40%|
+frame	stall	Catppuccin Latte	80	still	13000	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=9d34842457f40fcd:446a11c67bb8f8e0:238c9fc78d24892e	| ↻ Uploading logs   40%|
+frame	complete	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=f5f21c64a91d442d:067b88ea5829ea86:f44f27839a1ab93c	| ↻ Building   50%|
+frame	complete	Catppuccin Latte	80	still	3100	n=1	w=972	top=bede70a0e2cbbb25	bleed=6a6c5fb865fccd93	r0=81c99cd8d5b784b8:470fe298ed724e66:f006f79699b6feb0	| ✓ Built|
+frame	complete	Catppuccin Latte	80	still	3400	n=1	w=972	top=bede70a0e2cbbb25	bleed=6a6c5fb865fccd93	r0=81c99cd8d5b784b8:470fe298ed724e66:f006f79699b6feb0	| ✓ Built|
+frame	fault	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=617b51c344a74cfa:067b88ea5829ea86:4cc7f62f12f71828	| ↻ Uploading   50%|
+frame	fault	Catppuccin Latte	80	still	3100	n=1	w=972	top=bede70a0e2cbbb25	bleed=78a7a0b913242a09	r0=a986b075fe4f573b:346327cbb74120c7:ae17da8543113b19	| ⚠ Upload failed   50% failed|
+frame	fault	Catppuccin Latte	80	still	3300	n=1	w=972	top=bede70a0e2cbbb25	bleed=78a7a0b913242a09	r0=a986b075fe4f573b:346327cbb74120c7:ae17da8543113b19	| ⚠ Upload failed   50% failed|
+frame	vanish	Catppuccin Latte	80	still	2500	n=1	w=972	top=bede70a0e2cbbb25	bleed=3f26b86e49501f57	r0=7a30e327bac0261e:067b88ea5829ea86:27bf04240cc0029d	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	80	still	3050	n=1	w=972	top=bede70a0e2cbbb25	bleed=519d629d98a4e5e1	r0=ec240fb156142180:0afb9c321eaa440a:240d9f8f1da762a8	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	80	still	3200	n=1	w=972	top=bede70a0e2cbbb25	bleed=519d629d98a4e5e1	r0=ec240fb156142180:0afb9c321eaa440a:240d9f8f1da762a8	| ↻ Syncing   50%|
+frame	stack	Catppuccin Latte	80	still	2600	n=3	w=972	top=bede70a0e2cbbb25	bleed=77f40601644d4dbe	r0=b91cdebc27a4781b:18c939f1438091c7:2399cf652be51687	r1=d4bac2362ab6dfe1:6251e840cf8a2477:7d2b9da33299e6f0	r2=d823ab47e79f8c2f:45f8fa906cd13ce1:57f35cbfe7f82c48	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	80	still	900	n=2	w=972	top=bede70a0e2cbbb25	bleed=6a3de5fd46a092a4	r0=b91cdebc27a4781b:18c939f1438091c7:2399cf652be51687	r1=d823ab47e79f8c2f:b3f64f0716e53e80:57f35cbfe7f82c48	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	80	still	1200	n=2	w=972	top=bede70a0e2cbbb25	bleed=6a3de5fd46a092a4	r0=22b9a33aff948b67:efb5edcdf4c24727:2c05e68f7202bbe1	r1=ce6a27e4733d5621:09612b07b5ecb5a5:144091a420560885	| ⚠ Disk nearly full||
+frame	shrink	Catppuccin Latte	80	still	2700	n=1	w=972	top=bede70a0e2cbbb25	bleed=476b3e2ed8edfd5d	r0=d823ab47e79f8c2f:efb5edcdf4c24727:57f35cbfe7f82c48	| ⚠ Disk nearly full|
+frame	record	Catppuccin Latte	120	moving	100	n=0	w=1452	top=150ca1325b25be25	bleed=669b18c6d2d9c95b	||
+frame	warn	Catppuccin Latte	120	moving	100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=476b3e2ed8edfd5d	r0=a6e973b9231778a0:efb5edcdf4c24727:18dc8ff6f84583ea	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Catppuccin Latte	120	moving	100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=476b3e2ed8edfd5d	r0=9297dbf855f62d99:18c939f1438091c7:da474483c7e9505c	| ✕ Deploy failed · exit 1|
+frame	bar0	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=81455dd25ff2fd57	r0=2310e54223eec1a9:db379c1d8694b892:5fa988d7f1f0a1ab	| ↻ Downloading assets    0%|
+frame	bar25	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=0c0065d4a7448314:c4207262a0e95966:c570075219460c71	| ↻ Downloading assets   25%|
+frame	bar50	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=bd38347cf5dabcd2:0daffbb0456a56e6:d0b2db4bb2390e37	| ↻ Downloading assets   50%|
+frame	bar999	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=f50ff1eb30c856b2	r0=d5efa22a66019d2b:4570d7a5c2199676:97c992d6db1c8d44	| ↻ Downloading assets   99%|
+frame	bar100	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=6a6c5fb865fccd93	r0=3bcdd21d19398675:96c308a0b68f71aa:7239916dc161ef31	| ↻ Downloading assets  100%|
+frame	amount	Catppuccin Latte	120	moving	2600	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=00d6005b7f5d1c21:f396f09f5ac73c94:a1b17af764c1465b	| ↻ Copying files   70%|
+frame	amount	Catppuccin Latte	120	moving	3000	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=00d6005b7f5d1c21:f396f09f5ac73c94:a1b17af764c1465b	| ↻ Copying files   70%|
+frame	busy	Catppuccin Latte	120	moving	2600	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=13c43899b9f6f363	r0=51e246f167a96f93:c8c4b23003cd348a:5943f114f5576b4e	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	120	moving	3400	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=13c43899b9f6f363	r0=b5a37583377c117d:9d73012c123edd1f:3ffacd02810504e5	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	120	moving	4700	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=13c43899b9f6f363	r0=8263ea1e88d2f4ba:af10da4d51dde6eb:294f92fde314552e	| ↻ Indexing the tree|
+frame	stall	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=d8832f9c1a8f65d9:a80dd59c12abb5d6:aea60ba4394b9145	| ↻ Uploading logs   40%|
+frame	stall	Catppuccin Latte	120	moving	13000	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=101ba4928dfae82a:d316a87e43ed07ae:da42fb053557a471	| ↻ Uploading logs   40%|
+frame	complete	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=bbdd852f0e28b2b5:0daffbb0456a56e6:c24404b0e49d7cdc	| ↻ Building   50%|
+frame	complete	Catppuccin Latte	120	moving	3100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=f3843a495b9a4bd4:a25a4954f5c4c19a:2f1bb576c9c38e29	| ✓ Built|
+frame	complete	Catppuccin Latte	120	moving	3400	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=cb148d2640f5851a:4422649e2151516f:428efc0b627881fc	| ✓ Built|
+frame	fault	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=400bcdb0e3624972:0daffbb0456a56e6:12d9f8e88bf5bcc8	| ↻ Uploading   50%|
+frame	fault	Catppuccin Latte	120	moving	3100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=2edce1ab5c8a5345	r0=a9ad3aafe32604bf:17ea54905effcd5d:557ef916292a864e	| ⚠ Upload failed   50% failed|
+frame	fault	Catppuccin Latte	120	moving	3300	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=78a7a0b913242a09	r0=1621a1e448ef7707:4162646c3e9d46a7:cb99e59a678785f9	| ⚠ Upload failed   50% failed|
+frame	vanish	Catppuccin Latte	120	moving	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=c292baf661ac3676:0daffbb0456a56e6:e09f8d87a3f0b67d	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	120	moving	3050	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3d9ca7b7d1da0871	r0=059c5022d2cc12d2:c70480302ec8a6ce:0e3bf4c970d8a0df	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	120	moving	3200	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=c5a2390f446089b0	r0=62a22f767d1c9040:898e47a980b4bbea:6cb07ba39c847f65	| ↻ Syncing   50%|
+frame	stack	Catppuccin Latte	120	moving	2600	n=3	w=1452	top=f3bc7cf6540f7b25	bleed=77f40601644d4dbe	r0=0454be98980785db:18c939f1438091c7:1c289e89939dd2c7	r1=b99a8c1f080030c9:ba280f5d4151c4f0:8034bf56dad75230	r2=bca8ba7e8dbcb1cf:45f8fa906cd13ce1:50fac5f1a7abf1c8	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	120	moving	900	n=2	w=1452	top=f3bc7cf6540f7b25	bleed=6a3de5fd46a092a4	r0=0454be98980785db:18c939f1438091c7:1c289e89939dd2c7	r1=bca8ba7e8dbcb1cf:b3f64f0716e53e80:50fac5f1a7abf1c8	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	120	moving	1200	n=2	w=1452	top=f3bc7cf6540f7b25	bleed=6a3de5fd46a092a4	r0=bb7639238ee347e7:efb5edcdf4c24727:f3cc6a29aaa627a1	r1=97b2d7bceee01ae1:09612b07b5ecb5a5:8ba26ee7707e1b85	| ⚠ Disk nearly full||
+frame	shrink	Catppuccin Latte	120	moving	2700	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=476b3e2ed8edfd5d	r0=bca8ba7e8dbcb1cf:efb5edcdf4c24727:50fac5f1a7abf1c8	| ⚠ Disk nearly full|
+frame	record	Catppuccin Latte	120	still	100	n=0	w=1452	top=150ca1325b25be25	bleed=669b18c6d2d9c95b	||
+frame	warn	Catppuccin Latte	120	still	100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=476b3e2ed8edfd5d	r0=a6e973b9231778a0:efb5edcdf4c24727:18dc8ff6f84583ea	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Catppuccin Latte	120	still	100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=476b3e2ed8edfd5d	r0=9297dbf855f62d99:18c939f1438091c7:da474483c7e9505c	| ✕ Deploy failed · exit 1|
+frame	bar0	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=81455dd25ff2fd57	r0=2310e54223eec1a9:db379c1d8694b892:5fa988d7f1f0a1ab	| ↻ Downloading assets    0%|
+frame	bar25	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=0c0065d4a7448314:c4207262a0e95966:c570075219460c71	| ↻ Downloading assets   25%|
+frame	bar50	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=bd38347cf5dabcd2:0daffbb0456a56e6:d0b2db4bb2390e37	| ↻ Downloading assets   50%|
+frame	bar999	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=f50ff1eb30c856b2	r0=d5efa22a66019d2b:4570d7a5c2199676:97c992d6db1c8d44	| ↻ Downloading assets   99%|
+frame	bar100	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=6a6c5fb865fccd93	r0=3bcdd21d19398675:96c308a0b68f71aa:7239916dc161ef31	| ↻ Downloading assets  100%|
+frame	amount	Catppuccin Latte	120	still	2600	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=00d6005b7f5d1c21:f396f09f5ac73c94:a1b17af764c1465b	| ↻ Copying files   70%|
+frame	amount	Catppuccin Latte	120	still	3000	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=00d6005b7f5d1c21:f396f09f5ac73c94:a1b17af764c1465b	| ↻ Copying files   70%|
+frame	busy	Catppuccin Latte	120	still	2600	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=13c43899b9f6f363	r0=dd6aa6398df2634b:c8c4b23003cd348a:117e89712e3474df	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	120	still	3400	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=13c43899b9f6f363	r0=dd6aa6398df2634b:c8c4b23003cd348a:117e89712e3474df	| ↻ Indexing the tree|
+frame	busy	Catppuccin Latte	120	still	4700	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=13c43899b9f6f363	r0=dd6aa6398df2634b:c8c4b23003cd348a:117e89712e3474df	| ↻ Indexing the tree|
+frame	stall	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=d8832f9c1a8f65d9:a80dd59c12abb5d6:aea60ba4394b9145	| ↻ Uploading logs   40%|
+frame	stall	Catppuccin Latte	120	still	13000	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=d8832f9c1a8f65d9:a80dd59c12abb5d6:aea60ba4394b9145	| ↻ Uploading logs   40%|
+frame	complete	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=bbdd852f0e28b2b5:0daffbb0456a56e6:c24404b0e49d7cdc	| ↻ Building   50%|
+frame	complete	Catppuccin Latte	120	still	3100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=6a6c5fb865fccd93	r0=ef0377d12b8b1878:aca09df86dab5766:7d7dd2ab101ecbb0	| ✓ Built|
+frame	complete	Catppuccin Latte	120	still	3400	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=6a6c5fb865fccd93	r0=ef0377d12b8b1878:aca09df86dab5766:7d7dd2ab101ecbb0	| ✓ Built|
+frame	fault	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=400bcdb0e3624972:0daffbb0456a56e6:12d9f8e88bf5bcc8	| ↻ Uploading   50%|
+frame	fault	Catppuccin Latte	120	still	3100	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=78a7a0b913242a09	r0=1621a1e448ef7707:4162646c3e9d46a7:cb99e59a678785f9	| ⚠ Upload failed   50% failed|
+frame	fault	Catppuccin Latte	120	still	3300	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=78a7a0b913242a09	r0=1621a1e448ef7707:4162646c3e9d46a7:cb99e59a678785f9	| ⚠ Upload failed   50% failed|
+frame	vanish	Catppuccin Latte	120	still	2500	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=3f26b86e49501f57	r0=c292baf661ac3676:0daffbb0456a56e6:e09f8d87a3f0b67d	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	120	still	3050	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=519d629d98a4e5e1	r0=906e05be56481500:b5daf822ef62140a:d5083a2bd98de228	| ↻ Syncing   50%|
+frame	vanish	Catppuccin Latte	120	still	3200	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=519d629d98a4e5e1	r0=906e05be56481500:b5daf822ef62140a:d5083a2bd98de228	| ↻ Syncing   50%|
+frame	stack	Catppuccin Latte	120	still	2600	n=3	w=1452	top=f3bc7cf6540f7b25	bleed=77f40601644d4dbe	r0=0454be98980785db:18c939f1438091c7:1c289e89939dd2c7	r1=b99a8c1f080030c9:ba280f5d4151c4f0:8034bf56dad75230	r2=bca8ba7e8dbcb1cf:45f8fa906cd13ce1:50fac5f1a7abf1c8	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	120	still	900	n=2	w=1452	top=f3bc7cf6540f7b25	bleed=6a3de5fd46a092a4	r0=0454be98980785db:18c939f1438091c7:1c289e89939dd2c7	r1=bca8ba7e8dbcb1cf:b3f64f0716e53e80:50fac5f1a7abf1c8	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Catppuccin Latte	120	still	1200	n=2	w=1452	top=f3bc7cf6540f7b25	bleed=6a3de5fd46a092a4	r0=bb7639238ee347e7:efb5edcdf4c24727:f3cc6a29aaa627a1	r1=97b2d7bceee01ae1:09612b07b5ecb5a5:8ba26ee7707e1b85	| ⚠ Disk nearly full||
+frame	shrink	Catppuccin Latte	120	still	2700	n=1	w=1452	top=f3bc7cf6540f7b25	bleed=476b3e2ed8edfd5d	r0=bca8ba7e8dbcb1cf:efb5edcdf4c24727:50fac5f1a7abf1c8	| ⚠ Disk nearly full|
+frame	record	Solarized Light	60	moving	100	n=0	w=732	top=9de9278ba2b0b815	bleed=669b18c6d2d9c95b	||
+frame	warn	Solarized Light	60	moving	100	n=1	w=732	top=1c8eb3804ba015a5	bleed=9e21df9fc6e56b13	r0=7621767be3aaf738:efb5edcdf4c24727:d13ee894cdce5aad	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Solarized Light	60	moving	100	n=1	w=732	top=1c8eb3804ba015a5	bleed=9e21df9fc6e56b13	r0=4ecd2b4dd632bd35:18c939f1438091c7:523e35e92a1c620c	| ✕ Deploy failed · exit 1|
+frame	bar0	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=292676aa90124465	r0=a6c8f763314200a0:e61a46f6ec76e3aa:69e97e1fb5471832	| ↻ Downloading assets    0%|
+frame	bar25	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=65a93a8f4fe2de0f:f7828dcf0344de51:c54ce0f7d7d7d415	| ↻ Downloading assets   25%|
+frame	bar50	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=df0a58120e27c212:a6e7f2d43d58a17a:fd1a2caf4e160118	| ↻ Downloading assets   50%|
+frame	bar999	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=249549fce28e3ec0	r0=408ef8e1c2a42629:a31e75e93df4e6bd:7ac7b3f150c2f13a	| ↻ Downloading assets   99%|
+frame	bar100	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=fcf1f6be0c2905f5	r0=3d45933a585a28f9:050cfbf9294ff9ca:58ebca047ab87457	| ↻ Downloading assets  100%|
+frame	amount	Solarized Light	60	moving	2600	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=183041199ada607e:b15250eda7378e47:5662a99905ddc715	| ↻ Copying files   70%|
+frame	amount	Solarized Light	60	moving	3000	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=183041199ada607e:b15250eda7378e47:5662a99905ddc715	| ↻ Copying files   70%|
+frame	busy	Solarized Light	60	moving	2600	n=1	w=732	top=1c8eb3804ba015a5	bleed=d03f4ee213af09d3	r0=49cc58dc7de7762e:43ef6aed971096f2:928e5c566d6036a2	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	moving	3400	n=1	w=732	top=1c8eb3804ba015a5	bleed=d03f4ee213af09d3	r0=a2c674336386afc3:b6a49a1e2c0b98b0:98895a4ff8d06809	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	moving	4700	n=1	w=732	top=1c8eb3804ba015a5	bleed=d03f4ee213af09d3	r0=db08217b6e202a5e:63616480c5e40c0e:c0fbc268edaa96bd	| ↻ Indexing the tree|
+frame	stall	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=be30f6ad654b00c6:4d0148b785ecad63:675e54493d1c7f3d	| ↻ Uploading logs   40%|
+frame	stall	Solarized Light	60	moving	13000	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=8b7dfdd98e0b8094:0937b4a9cb8763d5:0647fef0ede78e00	| ↻ Uploading logs   40%|
+frame	complete	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=ce51a21bfd717f29:a6e7f2d43d58a17a:541e9e28560534a6	| ↻ Building   50%|
+frame	complete	Solarized Light	60	moving	3100	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=91dfad2f15250a7f:c45911c85d882e68:9d1c60027195d1a7	| ✓ Built|
+frame	complete	Solarized Light	60	moving	3400	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=2bf2520150459d7e:4fdf4d109fb96bac:9ad2c486c45091c1	| ✓ Built|
+frame	fault	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=5bc45f26095d3142:a6e7f2d43d58a17a:34cca62fcb24e366	| ↻ Uploading   50%|
+frame	fault	Solarized Light	60	moving	3100	n=1	w=732	top=1c8eb3804ba015a5	bleed=de8729eae2d6e152	r0=1891f7a5c8849cf3:cd09d396351cac05:de8f27babda2cc79	| ⚠ Upload failed   50% failed|
+frame	fault	Solarized Light	60	moving	3300	n=1	w=732	top=1c8eb3804ba015a5	bleed=ce37d8db9a521463	r0=d56bd4f9c718b8f7:090ab67efb7f29b3:2c4584b95fa9cad1	| ⚠ Upload failed   50% failed|
+frame	vanish	Solarized Light	60	moving	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=f145ca6073693a9c:a6e7f2d43d58a17a:4460f11fc27f98ea	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	60	moving	3050	n=1	w=732	top=1c8eb3804ba015a5	bleed=433068cb211bc424	r0=e5337c3f86a20680:b68d0d0b014b0224:1442f87f600db0fc	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	60	moving	3200	n=1	w=732	top=1c8eb3804ba015a5	bleed=5048d7d3cf4986aa	r0=248891ca05fc76ec:d7be33dfccef5bb6:dda3c84df88ee653	| ↻ Syncing   50%|
+frame	stack	Solarized Light	60	moving	2600	n=3	w=732	top=1c8eb3804ba015a5	bleed=ea2e79b02df25558	r0=8539fcb683482b97:18c939f1438091c7:7fa5071cd0c5ce8e	r1=ab99551a77a5cbeb:6ed1aea29987356c:cc0b22d56fb0847a	r2=0252bc1072e2ee3b:45f8fa906cd13ce1:936ea686575610dd	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	60	moving	900	n=2	w=732	top=1c8eb3804ba015a5	bleed=9a94a11ecbad6d0e	r0=8539fcb683482b97:18c939f1438091c7:7fa5071cd0c5ce8e	r1=0252bc1072e2ee3b:b3f64f0716e53e80:936ea686575610dd	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	60	moving	1200	n=2	w=732	top=1c8eb3804ba015a5	bleed=9a94a11ecbad6d0e	r0=45972be3e25435b3:efb5edcdf4c24727:f5b89632b6bd61d5	r1=1d6e0c995419cbd1:09612b07b5ecb5a5:dffc798f5c446b85	| ⚠ Disk nearly full||
+frame	shrink	Solarized Light	60	moving	2700	n=1	w=732	top=1c8eb3804ba015a5	bleed=9e21df9fc6e56b13	r0=0252bc1072e2ee3b:efb5edcdf4c24727:936ea686575610dd	| ⚠ Disk nearly full|
+frame	record	Solarized Light	60	still	100	n=0	w=732	top=9de9278ba2b0b815	bleed=669b18c6d2d9c95b	||
+frame	warn	Solarized Light	60	still	100	n=1	w=732	top=1c8eb3804ba015a5	bleed=9e21df9fc6e56b13	r0=7621767be3aaf738:efb5edcdf4c24727:d13ee894cdce5aad	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Solarized Light	60	still	100	n=1	w=732	top=1c8eb3804ba015a5	bleed=9e21df9fc6e56b13	r0=4ecd2b4dd632bd35:18c939f1438091c7:523e35e92a1c620c	| ✕ Deploy failed · exit 1|
+frame	bar0	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=292676aa90124465	r0=a6c8f763314200a0:e61a46f6ec76e3aa:69e97e1fb5471832	| ↻ Downloading assets    0%|
+frame	bar25	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=65a93a8f4fe2de0f:f7828dcf0344de51:c54ce0f7d7d7d415	| ↻ Downloading assets   25%|
+frame	bar50	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=df0a58120e27c212:a6e7f2d43d58a17a:fd1a2caf4e160118	| ↻ Downloading assets   50%|
+frame	bar999	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=249549fce28e3ec0	r0=408ef8e1c2a42629:a31e75e93df4e6bd:7ac7b3f150c2f13a	| ↻ Downloading assets   99%|
+frame	bar100	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=fcf1f6be0c2905f5	r0=3d45933a585a28f9:050cfbf9294ff9ca:58ebca047ab87457	| ↻ Downloading assets  100%|
+frame	amount	Solarized Light	60	still	2600	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=183041199ada607e:b15250eda7378e47:5662a99905ddc715	| ↻ Copying files   70%|
+frame	amount	Solarized Light	60	still	3000	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=183041199ada607e:b15250eda7378e47:5662a99905ddc715	| ↻ Copying files   70%|
+frame	busy	Solarized Light	60	still	2600	n=1	w=732	top=1c8eb3804ba015a5	bleed=d03f4ee213af09d3	r0=68f5b0ddaaafc9d5:43ef6aed971096f2:bbd9255be9c4234e	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	still	3400	n=1	w=732	top=1c8eb3804ba015a5	bleed=d03f4ee213af09d3	r0=68f5b0ddaaafc9d5:43ef6aed971096f2:bbd9255be9c4234e	| ↻ Indexing the tree|
+frame	busy	Solarized Light	60	still	4700	n=1	w=732	top=1c8eb3804ba015a5	bleed=d03f4ee213af09d3	r0=68f5b0ddaaafc9d5:43ef6aed971096f2:bbd9255be9c4234e	| ↻ Indexing the tree|
+frame	stall	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=be30f6ad654b00c6:4d0148b785ecad63:675e54493d1c7f3d	| ↻ Uploading logs   40%|
+frame	stall	Solarized Light	60	still	13000	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=be30f6ad654b00c6:4d0148b785ecad63:675e54493d1c7f3d	| ↻ Uploading logs   40%|
+frame	complete	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=ce51a21bfd717f29:a6e7f2d43d58a17a:541e9e28560534a6	| ↻ Building   50%|
+frame	complete	Solarized Light	60	still	3100	n=1	w=732	top=1c8eb3804ba015a5	bleed=fcf1f6be0c2905f5	r0=62fcb6f82ca640fc:ef5728c56de19986:4c3c5149454c9930	| ✓ Built|
+frame	complete	Solarized Light	60	still	3400	n=1	w=732	top=1c8eb3804ba015a5	bleed=fcf1f6be0c2905f5	r0=62fcb6f82ca640fc:ef5728c56de19986:4c3c5149454c9930	| ✓ Built|
+frame	fault	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=5bc45f26095d3142:a6e7f2d43d58a17a:34cca62fcb24e366	| ↻ Uploading   50%|
+frame	fault	Solarized Light	60	still	3100	n=1	w=732	top=1c8eb3804ba015a5	bleed=ce37d8db9a521463	r0=d56bd4f9c718b8f7:090ab67efb7f29b3:2c4584b95fa9cad1	| ⚠ Upload failed   50% failed|
+frame	fault	Solarized Light	60	still	3300	n=1	w=732	top=1c8eb3804ba015a5	bleed=ce37d8db9a521463	r0=d56bd4f9c718b8f7:090ab67efb7f29b3:2c4584b95fa9cad1	| ⚠ Upload failed   50% failed|
+frame	vanish	Solarized Light	60	still	2500	n=1	w=732	top=1c8eb3804ba015a5	bleed=bd7821ed1f3f2c0b	r0=f145ca6073693a9c:a6e7f2d43d58a17a:4460f11fc27f98ea	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	60	still	3050	n=1	w=732	top=1c8eb3804ba015a5	bleed=db4d112628d60b67	r0=63f9fc3697634d90:548679ab69adfd0a:19b67de1e7412cf9	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	60	still	3200	n=1	w=732	top=1c8eb3804ba015a5	bleed=db4d112628d60b67	r0=63f9fc3697634d90:548679ab69adfd0a:19b67de1e7412cf9	| ↻ Syncing   50%|
+frame	stack	Solarized Light	60	still	2600	n=3	w=732	top=1c8eb3804ba015a5	bleed=ea2e79b02df25558	r0=8539fcb683482b97:18c939f1438091c7:7fa5071cd0c5ce8e	r1=ab99551a77a5cbeb:6ed1aea29987356c:cc0b22d56fb0847a	r2=0252bc1072e2ee3b:45f8fa906cd13ce1:936ea686575610dd	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	60	still	900	n=2	w=732	top=1c8eb3804ba015a5	bleed=9a94a11ecbad6d0e	r0=8539fcb683482b97:18c939f1438091c7:7fa5071cd0c5ce8e	r1=0252bc1072e2ee3b:b3f64f0716e53e80:936ea686575610dd	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	60	still	1200	n=2	w=732	top=1c8eb3804ba015a5	bleed=9a94a11ecbad6d0e	r0=45972be3e25435b3:efb5edcdf4c24727:f5b89632b6bd61d5	r1=1d6e0c995419cbd1:09612b07b5ecb5a5:dffc798f5c446b85	| ⚠ Disk nearly full||
+frame	shrink	Solarized Light	60	still	2700	n=1	w=732	top=1c8eb3804ba015a5	bleed=9e21df9fc6e56b13	r0=0252bc1072e2ee3b:efb5edcdf4c24727:936ea686575610dd	| ⚠ Disk nearly full|
+frame	record	Solarized Light	80	moving	100	n=0	w=972	top=afa198c44f3567d5	bleed=669b18c6d2d9c95b	||
+frame	warn	Solarized Light	80	moving	100	n=1	w=972	top=944423e695cee7a5	bleed=9e21df9fc6e56b13	r0=f0c210fd72c3bf48:efb5edcdf4c24727:1f243d126c47f52d	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Solarized Light	80	moving	100	n=1	w=972	top=944423e695cee7a5	bleed=9e21df9fc6e56b13	r0=12cd1a5809250c25:18c939f1438091c7:540aa073c6b36f4c	| ✕ Deploy failed · exit 1|
+frame	bar0	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=292676aa90124465	r0=3b627ff7ae199e00:e67dbd130618682a:dfb79ddaa085d3b2	| ↻ Downloading assets    0%|
+frame	bar25	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=b859016018fe202a:af7072e794d15fe3:3ac4e21554a6781f	| ↻ Downloading assets   25%|
+frame	bar50	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=6031ed1b16d09794:22e35c1819f00cba:a62e71c06a801838	| ↻ Downloading assets   50%|
+frame	bar999	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=0f98b5bad30a1d47	r0=218bcd7fbd2b66b0:5872974d618e5e46:2cf8cbef514cc9d2	| ↻ Downloading assets   99%|
+frame	bar100	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=fcf1f6be0c2905f5	r0=784b4c1a21b54fd9:20defc861ea31eca:a90dc4b069b1f517	| ↻ Downloading assets  100%|
+frame	amount	Solarized Light	80	moving	2600	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=01fec9e2581bed2e:7c30e877d3993ce6:2725e5c19bf9aeb5	| ↻ Copying files   70%|
+frame	amount	Solarized Light	80	moving	3000	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=01fec9e2581bed2e:7c30e877d3993ce6:2725e5c19bf9aeb5	| ↻ Copying files   70%|
+frame	busy	Solarized Light	80	moving	2600	n=1	w=972	top=944423e695cee7a5	bleed=d03f4ee213af09d3	r0=58b9c04ab4bc8076:720afcbbc47a1592:1b9134d6a90bdc02	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	moving	3400	n=1	w=972	top=944423e695cee7a5	bleed=d03f4ee213af09d3	r0=6d74460a1ed68af0:00b81c0e51fcc8dc:38b89e283d538a39	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	moving	4700	n=1	w=972	top=944423e695cee7a5	bleed=d03f4ee213af09d3	r0=7862481cc7667e8b:a5d683912e697605:7359c5eb3d808972	| ↻ Indexing the tree|
+frame	stall	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=ed9226d35f869510:6c5b3a0f12824ec2:6502b89575c8dfbd	| ↻ Uploading logs   40%|
+frame	stall	Solarized Light	80	moving	13000	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=953560d6c2fa60e4:a9f0f4cf99beeb4c:3f65b79d92b9d4a2	| ↻ Uploading logs   40%|
+frame	complete	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=f980e59684f13209:22e35c1819f00cba:049d5ba63c107d86	| ↻ Building   50%|
+frame	complete	Solarized Light	80	moving	3100	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=6b8febec31f801c9:ba7eaa51d3c22024:0b9e96f1bc981c86	| ✓ Built|
+frame	complete	Solarized Light	80	moving	3400	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=2b6fbe15eafd66c7:94ba9b44e450f144:e21bffe1cfc87095	| ✓ Built|
+frame	fault	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=95a5f3b741f7beee:22e35c1819f00cba:0f10c7ec53f88006	| ↻ Uploading   50%|
+frame	fault	Solarized Light	80	moving	3100	n=1	w=972	top=944423e695cee7a5	bleed=de8729eae2d6e152	r0=8241023e86cbec1b:0d67fd1b924a20ad:1f7a264d92b0e709	| ⚠ Upload failed   50% failed|
+frame	fault	Solarized Light	80	moving	3300	n=1	w=972	top=944423e695cee7a5	bleed=ce37d8db9a521463	r0=5b29ea1e29022ae1:06a3a1cb62b82b33:60153fd1a07d3971	| ⚠ Upload failed   50% failed|
+frame	vanish	Solarized Light	80	moving	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=6d0c3449168fa788:22e35c1819f00cba:bd4f702e54a1170a	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	80	moving	3050	n=1	w=972	top=944423e695cee7a5	bleed=433068cb211bc424	r0=8c19d80e6eaf60c2:447ef88334fe4abc:0db9b3f85725fd7c	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	80	moving	3200	n=1	w=972	top=944423e695cee7a5	bleed=5048d7d3cf4986aa	r0=fbcf9043f86754bc:fc5c8cbd49778a66:8821450fd03cc933	| ↻ Syncing   50%|
+frame	stack	Solarized Light	80	moving	2600	n=3	w=972	top=944423e695cee7a5	bleed=ea2e79b02df25558	r0=cc74750f74d51c67:18c939f1438091c7:60376d22fe06410e	r1=7e243bca0d984a23:a153bab662bb0125:f02fc403ece512ba	r2=1560234397839bbb:45f8fa906cd13ce1:3bd7b6303d85519d	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	80	moving	900	n=2	w=972	top=944423e695cee7a5	bleed=9a94a11ecbad6d0e	r0=cc74750f74d51c67:18c939f1438091c7:60376d22fe06410e	r1=1560234397839bbb:b3f64f0716e53e80:3bd7b6303d85519d	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	80	moving	1200	n=2	w=972	top=944423e695cee7a5	bleed=9a94a11ecbad6d0e	r0=1ff2c230943700c3:efb5edcdf4c24727:e18dd1ea40a97595	r1=0531bdcc88b965e1:09612b07b5ecb5a5:f8f66963fece8705	| ⚠ Disk nearly full||
+frame	shrink	Solarized Light	80	moving	2700	n=1	w=972	top=944423e695cee7a5	bleed=9e21df9fc6e56b13	r0=1560234397839bbb:efb5edcdf4c24727:3bd7b6303d85519d	| ⚠ Disk nearly full|
+frame	record	Solarized Light	80	still	100	n=0	w=972	top=afa198c44f3567d5	bleed=669b18c6d2d9c95b	||
+frame	warn	Solarized Light	80	still	100	n=1	w=972	top=944423e695cee7a5	bleed=9e21df9fc6e56b13	r0=f0c210fd72c3bf48:efb5edcdf4c24727:1f243d126c47f52d	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Solarized Light	80	still	100	n=1	w=972	top=944423e695cee7a5	bleed=9e21df9fc6e56b13	r0=12cd1a5809250c25:18c939f1438091c7:540aa073c6b36f4c	| ✕ Deploy failed · exit 1|
+frame	bar0	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=292676aa90124465	r0=3b627ff7ae199e00:e67dbd130618682a:dfb79ddaa085d3b2	| ↻ Downloading assets    0%|
+frame	bar25	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=b859016018fe202a:af7072e794d15fe3:3ac4e21554a6781f	| ↻ Downloading assets   25%|
+frame	bar50	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=6031ed1b16d09794:22e35c1819f00cba:a62e71c06a801838	| ↻ Downloading assets   50%|
+frame	bar999	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=0f98b5bad30a1d47	r0=218bcd7fbd2b66b0:5872974d618e5e46:2cf8cbef514cc9d2	| ↻ Downloading assets   99%|
+frame	bar100	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=fcf1f6be0c2905f5	r0=784b4c1a21b54fd9:20defc861ea31eca:a90dc4b069b1f517	| ↻ Downloading assets  100%|
+frame	amount	Solarized Light	80	still	2600	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=01fec9e2581bed2e:7c30e877d3993ce6:2725e5c19bf9aeb5	| ↻ Copying files   70%|
+frame	amount	Solarized Light	80	still	3000	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=01fec9e2581bed2e:7c30e877d3993ce6:2725e5c19bf9aeb5	| ↻ Copying files   70%|
+frame	busy	Solarized Light	80	still	2600	n=1	w=972	top=944423e695cee7a5	bleed=d03f4ee213af09d3	r0=92a78420bf0fd88d:720afcbbc47a1592:1aa5efe00534332e	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	still	3400	n=1	w=972	top=944423e695cee7a5	bleed=d03f4ee213af09d3	r0=92a78420bf0fd88d:720afcbbc47a1592:1aa5efe00534332e	| ↻ Indexing the tree|
+frame	busy	Solarized Light	80	still	4700	n=1	w=972	top=944423e695cee7a5	bleed=d03f4ee213af09d3	r0=92a78420bf0fd88d:720afcbbc47a1592:1aa5efe00534332e	| ↻ Indexing the tree|
+frame	stall	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=ed9226d35f869510:6c5b3a0f12824ec2:6502b89575c8dfbd	| ↻ Uploading logs   40%|
+frame	stall	Solarized Light	80	still	13000	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=ed9226d35f869510:6c5b3a0f12824ec2:6502b89575c8dfbd	| ↻ Uploading logs   40%|
+frame	complete	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=f980e59684f13209:22e35c1819f00cba:049d5ba63c107d86	| ↻ Building   50%|
+frame	complete	Solarized Light	80	still	3100	n=1	w=972	top=944423e695cee7a5	bleed=fcf1f6be0c2905f5	r0=4009dc1ad0f3dd14:8853184a4a297886:deb3fd3a0014fbf0	| ✓ Built|
+frame	complete	Solarized Light	80	still	3400	n=1	w=972	top=944423e695cee7a5	bleed=fcf1f6be0c2905f5	r0=4009dc1ad0f3dd14:8853184a4a297886:deb3fd3a0014fbf0	| ✓ Built|
+frame	fault	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=95a5f3b741f7beee:22e35c1819f00cba:0f10c7ec53f88006	| ↻ Uploading   50%|
+frame	fault	Solarized Light	80	still	3100	n=1	w=972	top=944423e695cee7a5	bleed=ce37d8db9a521463	r0=5b29ea1e29022ae1:06a3a1cb62b82b33:60153fd1a07d3971	| ⚠ Upload failed   50% failed|
+frame	fault	Solarized Light	80	still	3300	n=1	w=972	top=944423e695cee7a5	bleed=ce37d8db9a521463	r0=5b29ea1e29022ae1:06a3a1cb62b82b33:60153fd1a07d3971	| ⚠ Upload failed   50% failed|
+frame	vanish	Solarized Light	80	still	2500	n=1	w=972	top=944423e695cee7a5	bleed=bd7821ed1f3f2c0b	r0=6d0c3449168fa788:22e35c1819f00cba:bd4f702e54a1170a	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	80	still	3050	n=1	w=972	top=944423e695cee7a5	bleed=db4d112628d60b67	r0=a8edb415abc78aac:e74e05ec0e71c90a:9b01916eda914579	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	80	still	3200	n=1	w=972	top=944423e695cee7a5	bleed=db4d112628d60b67	r0=a8edb415abc78aac:e74e05ec0e71c90a:9b01916eda914579	| ↻ Syncing   50%|
+frame	stack	Solarized Light	80	still	2600	n=3	w=972	top=944423e695cee7a5	bleed=ea2e79b02df25558	r0=cc74750f74d51c67:18c939f1438091c7:60376d22fe06410e	r1=7e243bca0d984a23:a153bab662bb0125:f02fc403ece512ba	r2=1560234397839bbb:45f8fa906cd13ce1:3bd7b6303d85519d	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	80	still	900	n=2	w=972	top=944423e695cee7a5	bleed=9a94a11ecbad6d0e	r0=cc74750f74d51c67:18c939f1438091c7:60376d22fe06410e	r1=1560234397839bbb:b3f64f0716e53e80:3bd7b6303d85519d	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	80	still	1200	n=2	w=972	top=944423e695cee7a5	bleed=9a94a11ecbad6d0e	r0=1ff2c230943700c3:efb5edcdf4c24727:e18dd1ea40a97595	r1=0531bdcc88b965e1:09612b07b5ecb5a5:f8f66963fece8705	| ⚠ Disk nearly full||
+frame	shrink	Solarized Light	80	still	2700	n=1	w=972	top=944423e695cee7a5	bleed=9e21df9fc6e56b13	r0=1560234397839bbb:efb5edcdf4c24727:3bd7b6303d85519d	| ⚠ Disk nearly full|
+frame	record	Solarized Light	120	moving	100	n=0	w=1452	top=00042d33a7444d55	bleed=669b18c6d2d9c95b	||
+frame	warn	Solarized Light	120	moving	100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=9e21df9fc6e56b13	r0=cd2507707368fd68:efb5edcdf4c24727:005060b7bc5ac42d	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Solarized Light	120	moving	100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=9e21df9fc6e56b13	r0=0d2695708767bac5:18c939f1438091c7:b20fac6362fcd6cc	| ✕ Deploy failed · exit 1|
+frame	bar0	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=292676aa90124465	r0=126aa85855717540:5a8fe98061f5b12a:077ffea61c2764b2	| ↻ Downloading assets    0%|
+frame	bar25	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=499364b791ee4e5f:9d679d6220ec03dd:c5e712eb822a8b7c	| ↻ Downloading assets   25%|
+frame	bar50	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=97e9aa0f942c460c:e12815b02455663a:c052466560ddcef8	| ↻ Downloading assets   50%|
+frame	bar999	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d9d86141c7e744b2	r0=7394b905d4de57db:e8378be08c79a7f5:985198d617d2812a	| ↻ Downloading assets   99%|
+frame	bar100	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=fcf1f6be0c2905f5	r0=9f296db7385b3899:de587aee7883a8ca:9752554aa9a4eb97	| ↻ Downloading assets  100%|
+frame	amount	Solarized Light	120	moving	2600	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=7beef24173d1514e:5e032a772bd85310:4a0956b4bf1b24f2	| ↻ Copying files   70%|
+frame	amount	Solarized Light	120	moving	3000	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=7beef24173d1514e:5e032a772bd85310:4a0956b4bf1b24f2	| ↻ Copying files   70%|
+frame	busy	Solarized Light	120	moving	2600	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d03f4ee213af09d3	r0=fe5283898a71e8e6:9813ffd72946dcd2:a837b23d7d1428c2	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	moving	3400	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d03f4ee213af09d3	r0=9170d35dcf4d8a54:9ffcbf38545f886c:e35db90aabd6a8e0	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	moving	4700	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d03f4ee213af09d3	r0=f40592c089ba1c69:3c5db195a106e09d:7982c8a42cfdc385	| ↻ Indexing the tree|
+frame	stall	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=67ad6484ff31b6a2:aed36c523a2a7a2b:dc9da6f5ec41977a	| ↻ Uploading logs   40%|
+frame	stall	Solarized Light	120	moving	13000	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=56ba637256b309e3:fdb081cd2f443df1:9488439086878375	| ↻ Uploading logs   40%|
+frame	complete	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=20543d4fabd74a09:e12815b02455663a:b9efffc5e4518ac6	| ↻ Building   50%|
+frame	complete	Solarized Light	120	moving	3100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=2679a79f99f7f1bd:de7a13290626fd3a:72571148dafc4b26	| ✓ Built|
+frame	complete	Solarized Light	120	moving	3400	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=7cd0c2769c64768c:a12de4dd0f488284:154ad012ba6d36d0	| ✓ Built|
+frame	fault	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=8ecd7e6938653946:e12815b02455663a:f4d0490daa7ca946	| ↻ Uploading   50%|
+frame	fault	Solarized Light	120	moving	3100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=de8729eae2d6e152	r0=04bda1d07a074f5b:0537336223186e9d:0281be3c25123129	| ⚠ Upload failed   50% failed|
+frame	fault	Solarized Light	120	moving	3300	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=ce37d8db9a521463	r0=74d2802eabd6d315:3ff9a9e9b2b2a633:e0296c29f851fb31	| ⚠ Upload failed   50% failed|
+frame	vanish	Solarized Light	120	moving	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=9569d5952010ef00:e12815b02455663a:8b0b5e30cb9dff4a	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	120	moving	3050	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=433068cb211bc424	r0=47aabaa2c75269ee:f7ed8cc8ac026e0c:1ad0bf23b0ad3b7c	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	120	moving	3200	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=5048d7d3cf4986aa	r0=acb479c7b17cdbfc:2c53533f34f5f386:b496db79f60d88f3	| ↻ Syncing   50%|
+frame	stack	Solarized Light	120	moving	2600	n=3	w=1452	top=7e3cfb728ea88ba5	bleed=ea2e79b02df25558	r0=66fb7a29dad50e47:18c939f1438091c7:eafaeca6ebe6590e	r1=5fc56b56fd201163:1cbe3504b1a2d80c:6a74f2a072b9dc3a	r2=df6932a7ef1a66bb:45f8fa906cd13ce1:3fcefe57e9e1281d	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	120	moving	900	n=2	w=1452	top=7e3cfb728ea88ba5	bleed=9a94a11ecbad6d0e	r0=66fb7a29dad50e47:18c939f1438091c7:eafaeca6ebe6590e	r1=df6932a7ef1a66bb:b3f64f0716e53e80:3fcefe57e9e1281d	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	120	moving	1200	n=2	w=1452	top=7e3cfb728ea88ba5	bleed=9a94a11ecbad6d0e	r0=4518f614301ee923:efb5edcdf4c24727:7084cd3e37752215	r1=31b8c7abb7136141:09612b07b5ecb5a5:bbcdaf8e41200605	| ⚠ Disk nearly full||
+frame	shrink	Solarized Light	120	moving	2700	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=9e21df9fc6e56b13	r0=df6932a7ef1a66bb:efb5edcdf4c24727:3fcefe57e9e1281d	| ⚠ Disk nearly full|
+frame	record	Solarized Light	120	still	100	n=0	w=1452	top=00042d33a7444d55	bleed=669b18c6d2d9c95b	||
+frame	warn	Solarized Light	120	still	100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=9e21df9fc6e56b13	r0=cd2507707368fd68:efb5edcdf4c24727:005060b7bc5ac42d	| ⚠ Disk nearly full · 2 GB left on /|
+frame	error	Solarized Light	120	still	100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=9e21df9fc6e56b13	r0=0d2695708767bac5:18c939f1438091c7:b20fac6362fcd6cc	| ✕ Deploy failed · exit 1|
+frame	bar0	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=292676aa90124465	r0=126aa85855717540:5a8fe98061f5b12a:077ffea61c2764b2	| ↻ Downloading assets    0%|
+frame	bar25	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=499364b791ee4e5f:9d679d6220ec03dd:c5e712eb822a8b7c	| ↻ Downloading assets   25%|
+frame	bar50	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=97e9aa0f942c460c:e12815b02455663a:c052466560ddcef8	| ↻ Downloading assets   50%|
+frame	bar999	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d9d86141c7e744b2	r0=7394b905d4de57db:e8378be08c79a7f5:985198d617d2812a	| ↻ Downloading assets   99%|
+frame	bar100	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=fcf1f6be0c2905f5	r0=9f296db7385b3899:de587aee7883a8ca:9752554aa9a4eb97	| ↻ Downloading assets  100%|
+frame	amount	Solarized Light	120	still	2600	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=7beef24173d1514e:5e032a772bd85310:4a0956b4bf1b24f2	| ↻ Copying files   70%|
+frame	amount	Solarized Light	120	still	3000	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=7beef24173d1514e:5e032a772bd85310:4a0956b4bf1b24f2	| ↻ Copying files   70%|
+frame	busy	Solarized Light	120	still	2600	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d03f4ee213af09d3	r0=443766ba2a6945fd:9813ffd72946dcd2:5af764216ae74e6e	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	still	3400	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d03f4ee213af09d3	r0=443766ba2a6945fd:9813ffd72946dcd2:5af764216ae74e6e	| ↻ Indexing the tree|
+frame	busy	Solarized Light	120	still	4700	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=d03f4ee213af09d3	r0=443766ba2a6945fd:9813ffd72946dcd2:5af764216ae74e6e	| ↻ Indexing the tree|
+frame	stall	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=67ad6484ff31b6a2:aed36c523a2a7a2b:dc9da6f5ec41977a	| ↻ Uploading logs   40%|
+frame	stall	Solarized Light	120	still	13000	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=67ad6484ff31b6a2:aed36c523a2a7a2b:dc9da6f5ec41977a	| ↻ Uploading logs   40%|
+frame	complete	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=20543d4fabd74a09:e12815b02455663a:b9efffc5e4518ac6	| ↻ Building   50%|
+frame	complete	Solarized Light	120	still	3100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=fcf1f6be0c2905f5	r0=be3ff2dfd68035a4:5e4ee39b02b3f686:ea1101a845387070	| ✓ Built|
+frame	complete	Solarized Light	120	still	3400	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=fcf1f6be0c2905f5	r0=be3ff2dfd68035a4:5e4ee39b02b3f686:ea1101a845387070	| ✓ Built|
+frame	fault	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=8ecd7e6938653946:e12815b02455663a:f4d0490daa7ca946	| ↻ Uploading   50%|
+frame	fault	Solarized Light	120	still	3100	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=ce37d8db9a521463	r0=74d2802eabd6d315:3ff9a9e9b2b2a633:e0296c29f851fb31	| ⚠ Upload failed   50% failed|
+frame	fault	Solarized Light	120	still	3300	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=ce37d8db9a521463	r0=74d2802eabd6d315:3ff9a9e9b2b2a633:e0296c29f851fb31	| ⚠ Upload failed   50% failed|
+frame	vanish	Solarized Light	120	still	2500	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=bd7821ed1f3f2c0b	r0=9569d5952010ef00:e12815b02455663a:8b0b5e30cb9dff4a	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	120	still	3050	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=db4d112628d60b67	r0=90605b0d9c72a954:b73a9de9181f610a:077a2bac3a030879	| ↻ Syncing   50%|
+frame	vanish	Solarized Light	120	still	3200	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=db4d112628d60b67	r0=90605b0d9c72a954:b73a9de9181f610a:077a2bac3a030879	| ↻ Syncing   50%|
+frame	stack	Solarized Light	120	still	2600	n=3	w=1452	top=7e3cfb728ea88ba5	bleed=ea2e79b02df25558	r0=66fb7a29dad50e47:18c939f1438091c7:eafaeca6ebe6590e	r1=5fc56b56fd201163:1cbe3504b1a2d80c:6a74f2a072b9dc3a	r2=df6932a7ef1a66bb:45f8fa906cd13ce1:3fcefe57e9e1281d	| ✕ Deploy failed| ↻ Downloading assets   60%| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	120	still	900	n=2	w=1452	top=7e3cfb728ea88ba5	bleed=9a94a11ecbad6d0e	r0=66fb7a29dad50e47:18c939f1438091c7:eafaeca6ebe6590e	r1=df6932a7ef1a66bb:b3f64f0716e53e80:3fcefe57e9e1281d	| ✕ Deploy failed| ⚠ Disk nearly full|
+frame	shrink	Solarized Light	120	still	1200	n=2	w=1452	top=7e3cfb728ea88ba5	bleed=9a94a11ecbad6d0e	r0=4518f614301ee923:efb5edcdf4c24727:7084cd3e37752215	r1=31b8c7abb7136141:09612b07b5ecb5a5:bbcdaf8e41200605	| ⚠ Disk nearly full||
+frame	shrink	Solarized Light	120	still	2700	n=1	w=1452	top=7e3cfb728ea88ba5	bleed=9e21df9fc6e56b13	r0=df6932a7ef1a66bb:efb5edcdf4c24727:3fcefe57e9e1281d	| ⚠ Disk nearly full|

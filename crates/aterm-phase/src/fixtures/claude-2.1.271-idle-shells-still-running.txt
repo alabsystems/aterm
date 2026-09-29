@@ -1,0 +1,19 @@
+# claude-code 2.1.271 · HAND-BUILT 2026-09-28 (no capture of the incident screen was kept): the idle screen of the incident tab (2026-09-21..27; its id is not quoted), which aca8837b6 records as drawing `· N shells ·` over two background `tail -f … | grep -m1 …` closers (the version and the count of two are 4385f4cf6's record); the done row, its time and turn length, the bypass footer and the transcript rows are assembled on the 2.1.267 wait_bg4.out shape (the bypass pill as claude-goal-active-suggestion.txt measured it, the blank rows and the 80 columns as claude-2.1.283-footer-after-turn.txt did); the transcript is neutral text, its paths stand-ins · two shells still running under a finished turn
+⏺ Two closers watch the run's journal in the background; each ends when its
+  line lands.
+
+⏺ Bash(D=/tmp/example-run; tail -f -n +1 "$D/journal.jsonl" | grep -m1 opened)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Bash(D=/tmp/example-run; tail -f -n +1 "$D/journal.jsonl" | grep -m1 closed)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Both closers are armed in the background; each prints when its journal line
+  lands. I'll pick the results up when they notify.
+
+✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage

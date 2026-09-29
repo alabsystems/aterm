@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 use aterm_spec::{
-    derive::{harness_exit_record_model, harness_relaunch_on_exit_model},
+    derive::{
+        harness_codex_exit_witness_model, harness_exit_record_model, harness_relaunch_on_exit_model,
+    },
     interp, verify,
 };
 
@@ -172,4 +174,49 @@ fn a_crash_is_read_at_its_exit_and_kept_through_the_back_off() {
     let mut instant = model.init_state();
     assert!(model.fire("Graceful", &mut instant));
     assert!(!model.action_enabled("LookAtInstant", &instant));
+}
+
+/// A CODEX EXIT IS READ ON ITS SHELL'S WORD ALONE (the review of 2026-09-27):
+/// someone's signal is never relaunched and a crash is left only when no word
+/// came — proven; the first cut's look at the thread lock (which SIGTERM
+/// leaves behind as SIGKILL does) relaunches a person's `kill`, and Claude
+/// Code's rule inherited (silence a graceful exit) leaves a crash — each
+/// caught on a path of its own.
+#[test]
+fn a_codex_exit_is_decided_on_its_shells_word_alone() {
+    let model = harness_codex_exit_witness_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == model.name),
+        "the Codex exit machine must stay enrolled in the spec-link registry"
+    );
+    verify::prove_and_catch_scalar(&model, "harness codex exit witness");
+    let buggy = interp::with_buggy(&model, 1);
+    for (path, caught) in [
+        (&["Signal", "LookAtLock", "Decide"][..], "TheirsIsLeft"),
+        (
+            &["Crash", "LookAsClaude", "Decide"][..],
+            "AToldCrashIsRelaunched",
+        ),
+    ] {
+        let mut st = buggy.init_state();
+        for a in path {
+            assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
+        }
+        assert!(!buggy.check_invariant(caught, &st), "{path:?}: {st:?}");
+    }
+    // The shipped machine: a crash told is relaunched; someone's signal,
+    // told, is left; no word at all is left.
+    for (path, decided) in [
+        (&["Crash", "ShellWord", "Look", "Decide"][..], 1),
+        (&["Signal", "ShellWord", "Look", "Decide"][..], 2),
+        (&["Crash", "LookGone", "Decide"][..], 2),
+    ] {
+        let mut st = model.init_state();
+        for a in path {
+            assert!(model.fire(a, &mut st), "{a} at {st:?}");
+        }
+        assert_eq!(st["decided"], decided, "{path:?}: {st:?}");
+    }
 }

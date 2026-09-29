@@ -761,10 +761,11 @@ pub fn install_tombstone_shim(layout: &Layout, tool: &ToolName) -> io::Result<()
 
     // The failing-shim message. The tool-bearing text is the only variable part; the
     // platform backend embeds it injection-safely (Unix: a single-quoted `printf` arg;
-    // Windows: a `cmd`-escaped `echo`). Built with `push_str` (no `format!`, Trust gate).
-    let mut message = String::from("atpkg: ");
-    message.push_str(tool.as_str());
-    message.push_str(" was yanked/revoked — run `aterm pkg update`");
+    // Windows: a `cmd`-escaped `echo`).
+    let message = format!(
+        "atpkg: {} was yanked/revoked — run `aterm pkg update`",
+        tool.as_str()
+    );
     // Atomic install through the platform backend (Unix: an executable `sh` script
     // temp+rename; Windows: a `.cmd` batch wrapper), replacing whatever shim was there.
     platform::install_tombstone_shim(&shim, &message)?;

@@ -451,8 +451,17 @@ pub(crate) fn dial_relay(
             nonce: nonce.clone(),
             fingerprint: conn.fingerprint.clone(),
         });
-    aterm_net::drive::dial_and_relay_pinned(
-        &conn.host, ccfg, "dial", "drive", &token, prebuffer, local, endpoint,
+    // The connect probe: the remote's control server must answer `version`
+    // before the caller's verb is sent, so a remote whose control socket
+    // accepts nothing is reported in seconds rather than holding this lane
+    // and the caller for the verb's whole deadline.
+    let probe = aterm_net::drive::ConnectProbe {
+        request: b"version\n",
+        within: crate::proxy::FORWARD_ACCEPT_DEADLINE,
+        is_refusal: crate::proxy::is_connection_refusal,
+    };
+    aterm_net::drive::dial_and_relay_probed(
+        &conn.host, ccfg, "dial", "drive", &token, prebuffer, local, endpoint, probe,
     )
     .map_err(|e| format!("{}: {e}", conn.host))
 }

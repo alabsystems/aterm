@@ -9,6 +9,10 @@
 //!
 //! ## Running
 //!
+//! STOCK EXCEPTION (Trust ships no cargo-fuzz and no ASan runtime; measured
+//! 2026-09-28: `targo fuzz` → "no such command: `fuzz`"). This lane runs on a
+//! stock nightly:
+//!
 //! ```bash
 //! cd crates/aterm-scrollback
 //! cargo +nightly fuzz run lz4_decompress -- -max_total_time=60 -timeout=10

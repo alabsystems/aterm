@@ -451,3 +451,135 @@ fn grid_tab_stop_positions() {
     let positions: Vec<u16> = grid.storage.tab_stop_positions().collect();
     assert_eq!(positions, vec![5, 10, 20]);
 }
+
+// ===========================================================================
+// CBT and the DECSLRM left margin — gated on ORIGIN MODE, not on DECLRMM
+// ===========================================================================
+//
+// VT510's CBT page names no margin at all: "If an attempt is made to move the
+// active position past the first character position on the line, then the
+// active position stays at column one." DECOM is the page that turns "column
+// one" into "the left margin": set, "the cursor cannot move outside of the
+// margins"; reset, "the cursor can move outside of the margins".
+//
+// xterm composes them exactly so — tabs.c `TabToPrevStop` clamps to
+// `ScrnLeftMargin` only inside `if (xw->flags & ORIGIN)` — and Ghostty says it
+// in a comment: `// With origin mode enabled, our leftmost limit is the left
+// margin.` (`horizontalTabBack`). `ScrnLeftMargin` is 0 unless DECLRMM is on,
+// so both flags must be set for the margin to bind.
+//
+// aterm used to gate on DECLRMM alone, justified in-code as "matching CUB
+// behavior". That is the inference both xterm and Ghostty declined to make:
+// each clamps CUB on the left margin unconditionally and still leaves CBT
+// origin-gated, in the same file.
+
+/// A 3x40 grid with DECSLRM margins at columns 10..=30 and the default tab
+/// stops (every 8: 8, 16, 24, 32).
+fn grid_with_margins_at_10_30() -> Grid {
+    let mut grid = Grid::new(3, 40);
+    grid.set_horizontal_margins(10, 30);
+    assert!(grid.has_horizontal_margins());
+    assert!(grid.tab_stops()[8], "the stop at 8 is left of the margin");
+    grid
+}
+
+/// DECLRMM alone does NOT make the left margin bind: without origin mode the
+/// back tab runs past it to the real stop at column 8.
+#[test]
+fn cbt_ignores_the_left_margin_without_origin_mode() {
+    let mut grid = grid_with_margins_at_10_30();
+    grid.set_cursor(0, 12);
+
+    grid.back_tab_margin(true, false);
+
+    assert_eq!(
+        grid.cursor_col(),
+        8,
+        "with DECOM reset the cursor may leave the margins, so CBT reaches the \
+         tab stop at 8 instead of stopping on the left margin at 10"
+    );
+}
+
+/// With origin mode set the margin binds, exactly as xterm and Ghostty do it.
+#[test]
+fn cbt_clamps_to_the_left_margin_under_origin_mode() {
+    let mut grid = grid_with_margins_at_10_30();
+    grid.set_cursor(0, 12);
+
+    grid.back_tab_margin(true, true);
+
+    assert_eq!(
+        grid.cursor_col(),
+        10,
+        "DECOM set: the cursor cannot move outside the margins, so CBT stops on \
+         the left margin with no tab stop between 10 and 12"
+    );
+}
+
+/// A cursor ALREADY LEFT of the left margin is not dragged rightwards onto it.
+///
+/// xterm does drag it (`if (next_column < left) next_column = left;` then
+/// `set_cur_col`), which makes a BACKWARD tab move the cursor FORWARD. Ghostty
+/// structurally cannot — its bound is the loop guard `if (x <= left_limit)
+/// return;` — and pins the case in `test "Terminal: horizontal tab back with
+/// cursor before left margin"`. CBT is backward motion by definition, so the
+/// cursor stands still. (aterm used to send it to column 0 here, i.e. FURTHER
+/// outside the margin the active DECOM says it may not leave.)
+#[test]
+fn cbt_left_of_the_left_margin_never_moves_the_cursor() {
+    let mut grid = grid_with_margins_at_10_30();
+    grid.set_cursor(0, 3);
+
+    grid.back_tab_margin(true, true);
+
+    assert_eq!(
+        grid.cursor_col(),
+        3,
+        "a back tab from outside the left margin moves neither forward to the \
+         margin (xterm) nor further back to column 0 (aterm's old rule)"
+    );
+}
+
+/// With no margins armed at all, origin mode changes nothing: CBT is the plain
+/// back tab, floored at column 0.
+#[test]
+fn cbt_without_declrmm_is_the_plain_back_tab_in_either_mode() {
+    for origin in [false, true] {
+        let mut grid = Grid::new(3, 40);
+        grid.set_cursor(0, 5);
+        grid.back_tab_margin(false, origin);
+        assert_eq!(
+            grid.cursor_col(),
+            0,
+            "origin={origin}: no stop below 5, so CBT floors at column 0"
+        );
+    }
+}
+
+/// CHT is deliberately NOT changed to match xterm here.
+///
+/// xterm's `TabToNextStop` (tabs.c) computes the destination and then clamps it
+/// DOWN to `rgt_marg`, so a CHT with the cursor already right of the right
+/// margin moves the cursor BACKWARD — a forward tab that goes backwards. It is
+/// a defect, not a convention: xterm's own `CursorForward` (cursor.c) handles
+/// the identical situation with `if (screen->cur_col > max) max = screen->max_col;`,
+/// the escape `TabToNextStop` lacks, and `CursorBack` states the rule in
+/// English ("if the cursor is already before the left-margin, we have to let it
+/// go"). Ghostty avoids it structurally (`while (cursor.x < scrolling_region.right)`)
+/// and iTerm2 patched it explicitly. aterm's `tab_margin` uses the row edge when
+/// the cursor is outside the margins, so it never moved backward either — this
+/// test is the pin that keeps it that way.
+#[test]
+fn cht_right_of_the_right_margin_never_moves_the_cursor_backward() {
+    let mut grid = grid_with_margins_at_10_30();
+    grid.set_cursor(0, 33);
+
+    grid.tab_margin(true);
+
+    assert!(
+        grid.cursor_col() >= 33,
+        "a FORWARD tab must never move the cursor backward; xterm's clamp-down \
+         to the right margin would have landed it on 30, got {}",
+        grid.cursor_col()
+    );
+}

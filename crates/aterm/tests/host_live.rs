@@ -1458,13 +1458,18 @@ const UPGRADE_CEILING: Duration = Duration::from_secs(10 * 60);
 /// cannot know. [`first_run`] keeps the fakes' probes inside the bound; this
 /// is what a probe that still missed it is waited by.
 fn version_waits(inst: &Instance) -> usize {
+    journal(inst).matches("step=wait:no-version").count()
+}
+
+/// The session's loop journal (`<sid>.journal.jsonl`): a host's step is a
+/// journal line, and a step's wait word is written nowhere else — the gate
+/// failure of 32a51a716 could not say which wait left its restart in flight.
+fn journal(inst: &Instance) -> String {
     ["state", "home"]
         .iter()
         .find_map(|root| find_file(&inst.tmp.join(root), &format!("{}.journal.jsonl", inst.sid)))
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default()
-        .matches("step=wait:no-version")
-        .count()
 }
 
 /// THE LIVE UPGRADE AS A STEP OF THE WORKER, live: a fake Claude Code at
@@ -1555,8 +1560,9 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
     assert_eq!(
         got.len(),
         2,
-        "relaunched once: {got:?}\nharness log:\n{}",
-        harness_lines(&inst)
+        "relaunched once: {got:?}\nharness log:\n{}\njournal:\n{}",
+        harness_lines(&inst),
+        journal(&inst)
     );
     assert_ne!(got[0].0, got[1].0, "a new process");
     assert_eq!(

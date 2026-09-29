@@ -39,12 +39,10 @@ required-features = ["control-conformance"]
 name = "objc_live_class_audit"
 path = "examples/objc_live_class_audit.rs"
 
-# THE IME DRIVER, the auditor's other half and DECLARED FOR THE SAME REASON.
-# It was auto-discovered while its sibling was declared, and three places call
-# it "the `[[example]]`" — aterm-verify's stages.rs:394 says the target name,
-# the built file and the argv "all have to agree, so they read it from here",
-# which is only true of a target this file names. Two gates of the same kind,
-# spelled the same way. The auditor asks whether the class is SHAPED right;
+# THE IME DRIVER, the auditor's other half, DECLARED like every objc driver:
+# its row in `aterm-verify`'s `OBJC_DRIVES` names the target, and the build,
+# the built file and the drive all read that name, which is only true of a
+# target this file names. The auditor asks whether the class is SHAPED right;
 # this one drives a whole composition through it — marked text, cursor ranges,
 # commit, doCommandBySelector: — and asks whether it BEHAVES right. Also run by
 # `aterm verify`; by hand it is
@@ -64,9 +62,7 @@ path = "examples/objc_ime_drive.rs"
 # NSWindow, enters the registered IMPs through AppKit's own dispatch, captures
 # 26 drawing states with `-cacheDisplayInRect:`, and reads all four classes off
 # the live objects. DECLARED and not auto-discovered for the same reason as its
-# siblings: `aterm-verify`'s stages.rs says the target name, the built file and
-# the argv all have to agree, which is only true of a target this file names.
-# Run by `aterm verify`; by hand it is
+# siblings (`aterm-verify`'s `OBJC_DRIVES`). Run by `aterm verify`; by hand it is
 # `cargo run -p aterm-gui --example objc_toolbar_drive`.
 [[example]]
 name = "objc_toolbar_drive"
@@ -462,6 +458,21 @@ aterm-grid = { workspace = true, features = ["spec-anchors"] }
 # StreamingSearch machine's temporal half) AND its kani `proof_anchor!` records;
 # re-declared with `spec-anchors` ON so this gate's test binary collects both.
 aterm-search = { workspace = true, features = ["spec-anchors"] }
+# aterm-agent supplies the `#[refines]`/`#[spec_unmodeled]` anchors of four
+# derived machines — the live upgrade's ladder (`HarnessUpgradeLadder`) and
+# its goal pause (`HarnessUpgradeGoalPause`), the Claude Code footer's reader
+# (`ClaudeFooterModel`) and the Codex rate-limit nudge's deciders
+# (`SupervisorCodexRateNudge`), each fully bound-or-waived —
+# re-declared here with `spec-anchors` ON so this gate's test binary collects
+# them (the production `aterm-gui` build keeps the feature off).
+aterm-agent = { workspace = true, features = ["spec-anchors"] }
+# aterm-keeper supplies the `PtyKeeperCustody` / `KeeperRelaunchBrake` /
+# `KeeperDeathJudgement` anchors
+# (KeeperCore's handlers, the brake, and the waivers of the actions that are the
+# window's or launchd's). The window's own dependency (unix, P3's
+# `keeper_link`) carries no anchors; this test build re-declares it with
+# `spec-anchors` ON so the closure gate sees the three machines bound.
+aterm-keeper = { workspace = true, features = ["spec-anchors"] }
 # Resolve external ISOLATION `.tla` machine names (obligation 4) against the
 # committed specs in this crate; test-only, out of the production closure.
 aterm-spec-models = { workspace = true }
@@ -473,6 +484,9 @@ aterm-spec-models = { workspace = true }
 # carve-out); already in the tree via wgpu-hal 0.62.2, so this is a direct dep, not
 # a new crate. The DisplayConfig SDR-white/HDR-state query is FLAT C (not COM) and
 # is hand-rolled in hdr_win.rs (house style), so those features are not pulled here.
+# `Win32_Storage_FileSystem` is the one non-DXGI use: `pinned_dir.rs`'s Windows arm
+# disposes and renames through `SetFileInformationByHandle`, whose variable-length
+# `FILE_RENAME_INFO` layout the crate carries (docs/NATIVE_WINDOWS_DESIGN.md §3.1).
 windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
@@ -488,6 +502,10 @@ windows = { version = "0.62", features = [
 # these two files and nothing else. `rustix` lives on as aterm-dirfd's
 # [dev-dependencies] differential oracle.
 aterm-dirfd = { workspace = true }
+# THE PTY KEEPER's client (P3, opt-in: `[keeper] enabled`): the window's link
+# registers every master with the keeper and takes its offers at boot
+# (`keeper_link.rs`). The keeper itself links no GUI framework (grep_guard B19).
+aterm-keeper = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Native X11 clipboard (clipboard_x11.rs) over the pure-Rust x11rb RustConnection,

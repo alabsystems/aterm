@@ -345,7 +345,7 @@ pub fn child_args(program: &str, bound: u64) -> Vec<String> {
         String::from("update"),
         program.to_string(),
         String::from("--wait-lock"),
-        crate::dec_u64(bound),
+        bound.to_string(),
     ]
 }
 
@@ -564,15 +564,15 @@ pub fn contended_line(row: &Row, build: Option<u64>, bound: u64) -> String {
 /// spelled out (`2 min 30 s`), so the line never rounds what the child actually waited.
 pub(crate) fn wait_words(secs: u64) -> String {
     if secs < 120 {
-        let mut s = crate::dec_u64(secs);
+        let mut s = secs.to_string();
         s.push_str(" s");
         return s;
     }
-    let mut s = crate::dec_u64(secs / 60);
+    let mut s = (secs / 60).to_string();
     s.push_str(" min");
     if !secs.is_multiple_of(60) {
         s.push(' ');
-        s.push_str(&crate::dec_u64(secs % 60));
+        s.push_str(&(secs % 60).to_string());
         s.push_str(" s");
     }
     s

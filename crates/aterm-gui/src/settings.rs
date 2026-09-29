@@ -750,10 +750,8 @@ pub(crate) fn demo_style(state: &SettingsState) -> Option<&str> {
 }
 
 /// A full-width blank row of `cols` cells in `fg`/`bg` (the `seam` overline marks the
-/// panel's top edge on row 0).
-pub(crate) fn blank_row(cols: usize, fg: [u8; 3], bg: [u8; 3], seam: bool) -> Vec<RenderCell> {
-    vec![chrome_band::cell(' ', fg, bg, false, seam); cols]
-}
+/// panel's top edge on row 0) — the renderer's (`aterm_render::band`, ruling 331).
+pub(crate) use aterm_render::band::blank_row;
 
 /// Write `s` into `row` starting at column `col`, clamped to the row width. Each glyph
 /// becomes a `chrome_band::cell` in `fg`/`bg`. Multi-cell-wide glyphs are not expected here
@@ -1211,9 +1209,11 @@ mod tests {
         // their own caption between Permissions and the network drive, which is
         // where `prefs::category_of` puts them. The caption list moved when those
         // keys became editable and this pin did not, so it was red on main.
+        // "Notifications" (2026-09-28): `desktop_alerts`, aterm's OWN desktop
+        // notifications, in their own box after the network drive.
         assert_eq!(
             caps(prefs::Section::Security),
-            ["Permissions", "This Mac", "Network drive"]
+            ["Permissions", "This Mac", "Network drive", "Notifications"]
         );
         // The Kitty Log page is READ-ONLY (§F4.6): no editable key ever maps
         // to it, so its grouped layout is empty.

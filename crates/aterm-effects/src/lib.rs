@@ -85,7 +85,10 @@ pub mod classic_wake;
 pub mod cursor_beam;
 pub mod cursor_comet;
 pub mod cursor_droplet;
-pub mod cursor_fireball;
+/// THE CURSOR FAMILY'S ONE FRAME STEP (`docs/DESIGN-host-boundary-2026-08-30.md`
+/// Phase 3): the aurora, the cadence comet and every block-cursor body, ticked
+/// in one order with one caret-ownership law, for every host.
+pub mod cursor_fx;
 pub mod cursor_glow;
 pub mod cursor_phaser;
 pub mod cursor_rainbow;
@@ -115,6 +118,10 @@ pub mod kitty_registry;
 pub mod kitty_sing;
 pub mod matrix_overlay;
 pub mod matrix_rain;
+/// MOTION POLICY (W11) — the single accessibility gate for every decorative
+/// animation: one pure, total resolution of `motion`, the OS Reduce Motion
+/// flag and focus, from which every effect takes its amplitude.
+pub mod motion;
 pub mod nova;
 /// The mushroom cloud — the rarest f-bomb detonation tier.
 pub mod nuke;
@@ -151,6 +158,11 @@ pub mod robi;
 /// tile, handed to the shared cat atlas through `CatBaker::host_tile` — the
 /// [`pet_baker`] pattern applied to the helper robot's animation frames.
 pub mod robi_baker;
+/// THE SOUND-CUE POLICY: the gain laws (focus × the music master × volume,
+/// the riff's and the bonk's own switches) and the drains that turn the
+/// engines' cues into synth events — one author for every host; the sink is
+/// the host's.
+pub mod sound_policy;
 /// `@generated` — the checked-in const drawlists for the ROBI roster (do not
 /// edit by hand). Produced by `cargo run -p aterm-effects --example
 /// gen_robi_glyphs`; kept honest by the `robi_glyphs_gen_matches_assets` drift
@@ -193,12 +205,3 @@ mod trick_flash;
 pub mod typed_tricks;
 pub mod typing_momentum;
 pub mod word_decorations;
-
-/// Sparkle Words v3 §4: the orca class is SUSPENDED — a soft gate, single
-/// source of truth. Both resolvers (the native `Config::sparkle_deco_config`
-/// and the web `EffectsPipeline::set_sparkle_classes`) AND their orca gate
-/// with `!ORCA_SUSPENDED`; the engine, lexicon entries, splash emitter, and
-/// engine unit tests (which build `DecoConfig` directly) stay intact and
-/// green. Re-enable = flip this const (the orca redo then rides the §6
-/// framework as an `Orcas` collection).
-pub const ORCA_SUSPENDED: bool = true;

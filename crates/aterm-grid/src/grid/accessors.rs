@@ -271,6 +271,23 @@ impl Grid {
         self.storage.take_last_resize_row_shift()
     }
 
+    /// Drain what the most recent resize did to this grid's rows: every arm
+    /// counted, trim/demote/push/reveal/append plus whether a column rewrap ran
+    /// (see [`crate::ResizeShape`]). Independent of
+    /// [`take_last_resize_row_shift`](Self::take_last_resize_row_shift), which
+    /// stays the selection's one input: draining either leaves the other intact.
+    /// Every resize overwrites the whole record, so a drain after each resize
+    /// sees that resize alone.
+    pub fn take_last_resize_shape(&mut self) -> crate::ResizeShape {
+        self.storage.presentation.take_last_resize_shape()
+    }
+
+    /// Read the most recent resize's [`crate::ResizeShape`] without draining it.
+    #[must_use]
+    pub fn last_resize_shape(&self) -> crate::ResizeShape {
+        self.storage.presentation.last_resize_shape
+    }
+
     /// SELECTION CUSTODY Phase 4: record that VISIBLE rows `top..=bottom` had their
     /// content moved or rewritten, so a selection overlapping them — and ONLY one
     /// overlapping them — must be cleared.

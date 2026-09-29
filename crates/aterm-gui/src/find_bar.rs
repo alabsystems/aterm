@@ -37,8 +37,8 @@
 //! shortens by dropping the `i/` position, never the marker:
 //!
 //! * `+` — the index was capped (history deeper than `search_history_lines`), so
-//!   the total is a floor. Spelled out as `no matches (partial history)` where
-//!   the status zone is wide enough.
+//!   the total is a floor. Spelled out as `(partial history)` where the status
+//!   zone is wide enough.
 //! * `…` — the terminal changed since the count was taken (output arrived, the
 //!   screen repainted). The search is deliberately not re-run per PTY batch, so
 //!   the number is a past census and can be wrong in EITHER direction; it
@@ -243,7 +243,7 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     };
     let (candidates, fg, bold) = if v.regex_error {
         (
-            vec!["bad regex".to_string(), "re!".to_string()],
+            vec!["bad regex".to_string(), "invalid".to_string()],
             c.warn,
             true,
         )
@@ -290,6 +290,7 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     } else {
         (
             vec![
+                format!("{}/{}{spelled}", v.idx, v.total),
                 format!("{}/{}{mark}", v.idx, v.total),
                 format!("{}{mark}", v.total),
             ],
@@ -1134,6 +1135,15 @@ mod tests {
             90,
         ));
         assert!(s.contains("bad regex"), "{s}");
+        // The narrowest status zone (8 cells, at 49 columns) still says what
+        // is wrong.
+        let bad = FindBarView {
+            is_regex: true,
+            regex_error: true,
+            ..view("(")
+        };
+        let s = all(&paint(&bad, 50));
+        assert!(s.contains("invalid"), "{s}");
     }
 
     /// THE HISTORY IS AWAY, NOT EMPTY (ruling 237): while a rewrap holds the
@@ -1256,11 +1266,14 @@ mod tests {
             widths_checked += 1;
             let painted = status_row(&moved, cols);
             assert!(
-                painted.contains('…'),
+                painted.contains('…') || painted.contains("(stale)"),
                 "cols={cols} dropped the staleness marker: {painted}"
             );
         }
         assert!(widths_checked >= 4, "the width sweep must actually sweep");
+        // Where the zone has room, the mark is spelled out, as it is for a miss.
+        let wide = status_row(&moved, 200);
+        assert!(wide.contains("1/6 (stale)"), "{wide}");
 
         let both = FindBarView {
             truncated: true,

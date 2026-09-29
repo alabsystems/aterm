@@ -185,13 +185,9 @@ fn vet_args(
                 return Err(concat(&[
                     "unexpected argument '",
                     tok,
-                    "' — `atpkg-keys ",
+                    "' for `atpkg-keys ",
                     verb,
-                    "` takes no more than ",
-                    &max_positional.to_string(),
-                    " positional argument(s). Refusing rather than ignoring it: an \
-                     argument this tool silently drops is one the operator believes it \
-                     read.",
+                    "`",
                 ]));
             }
             i += 1;
@@ -202,12 +198,9 @@ fn vet_args(
             return Err(concat(&[
                 "'",
                 tok,
-                "' uses the `--name=value` form, which this tool does not read. Write it \
-                 as two tokens: `--",
+                "' uses the `--name=value` form; write it as two tokens: `--",
                 name.get(..eq).unwrap_or(""),
-                " <value>`. It is refused rather than ignored because ignoring it \
-                 substitutes a default path for the one you supplied, and the defaults \
-                 here are a trust-anchor file and a machine key.",
+                " <value>`",
             ]));
         }
         if MASTER_FLAGS.contains(&name) {
@@ -224,24 +217,15 @@ fn vet_args(
             ]));
         }
         if !allowed.contains(&name) {
-            let mut msg = concat(&[
-                "unknown flag '",
-                tok,
-                "' for `atpkg-keys ",
-                verb,
-                "`. It accepts: ",
-            ]);
+            let mut msg = concat(&["unknown flag '", tok, "' for `atpkg-keys ", verb, "`"]);
             for (n, a) in allowed.iter().enumerate() {
-                if n > 0 {
-                    msg.push_str(", ");
-                }
+                msg.push_str(if n == 0 { " (it accepts " } else { ", " });
                 msg.push_str("--");
                 msg.push_str(a);
             }
-            msg.push_str(
-                ". Refusing rather than ignoring it: a flag this tool drops silently is one \
-                 whose value gets replaced by a default the operator never chose.",
-            );
+            if !allowed.is_empty() {
+                msg.push(')');
+            }
             return Err(msg);
         }
         match argv.get(i + 1).and_then(|v| v.as_deref()) {
@@ -311,7 +295,7 @@ fn main() -> ExitCode {
         Err(concat(&[
             "too many arguments — `atpkg-keys` reads at most ",
             &MAX_ARGS.to_string(),
-            " after the verb, and refuses rather than silently ignoring the rest",
+            " after the verb",
         ]))
     } else {
         match verb.as_deref() {
@@ -646,23 +630,6 @@ const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHIN
      and never will be. DESTROY that paper, fix the problem above, and run `atpkg-keys \
      setup` again — it will generate a different master.";
 
-/// What `setup` must say when the anchor is armed but the run did not finish.
-///
-/// Nothing is committed and no other machine has seen this master, so the clean recovery is
-/// to start over rather than to patch the half-state. `join` cannot finish it: `join`
-/// requires the master-signed roster this run failed to produce.
-#[cfg(unix)]
-fn setup_armed_but_unfinished(pins: &str) -> String {
-    concat(&[
-        "atpkg-keys: THE ANCHOR IS ARMED but this run did not finish, so do NOT commit it \
-         in this state. Nothing is committed yet and no other machine has seen this \
-         master, so start over cleanly: `git checkout -- ",
-        pins,
-        "` to discard the armed anchor, destroy the paper you just wrote, fix the problem \
-         above, and run `atpkg-keys setup` again.",
-    ])
-}
-
 /// `setup` / `join` — the two verbs whose only human step is writing the phrase on paper.
 ///
 /// # The order here is the entire safety argument, so it is spelled out
@@ -770,8 +737,9 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
                 .map_err(|e| concat(&[&e, "\n", SETUP_PAPER_ARMS_NOTHING]))?;
             announce_master(&seed)?;
 
-            prov::write_rest(planned)
-                .map_err(|e| concat(&[&e, "\n", &setup_armed_but_unfinished(&paths.pins)]))?
+            // Its failures say the recovery themselves — start over when nothing
+            // authorizes this machine, keep the key when the roster is recoverable.
+            prov::write_rest(planned)?
         }
         prov::Verb::Join => {
             let phrase = atpkg_keys::master::prompt_for_master(
@@ -799,9 +767,8 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
 /// there is deliberately NO unverified parse path in this tool. Reading a roster means
 /// verifying it first, which is also the automatic transcription check.
 ///
-/// All this layer adds is the line that tells the operator a fresh roster was started,
-/// because the library half is used by code paths that report through a structured
-/// summary instead.
+/// Its one caller is `machine-revoke`, which needs a roster to revoke from, so an absent
+/// one is refused (`MustExist`), never started.
 ///
 /// The exact byte SNAPSHOT comes back with the roster, because guarded publication needs
 /// it twice over: as the compare-and-swap premise checked immediately before the write,
@@ -818,24 +785,12 @@ fn load_roster(
     ),
     String,
 > {
-    // `MayCreateFresh` is this wrapper's callers' contract (`setup`, the first
-    // mint on a box with no roster); `join`'s stricter `MustExist` is applied inside
-    // `provision::plan`, not here.
-    let (roster, snapshot) = atpkg_keys::provision::load_roster(
+    atpkg_keys::provision::load_roster(
         path,
         master_pubkey,
         now,
-        atpkg_keys::provision::RosterExpectation::MayCreateFresh,
-    )?;
-    let was_fresh = snapshot.is_none();
-    if was_fresh {
-        eprint_line(&concat(&[
-            "atpkg-keys: no roster at ",
-            path,
-            " — starting a new one at roster_seq 0",
-        ]));
-    }
-    Ok((roster, snapshot))
+        atpkg_keys::provision::RosterExpectation::MustExist,
+    )
 }
 
 /// A stable, printable name for a rejection (see
@@ -903,13 +858,26 @@ fn show_roster(r: &aterm_update_core::roster::Roster) {
 /// It can be run from ANY surviving machine — the master is the authority, not the
 /// hardware. What it does NOT do is un-install: revocation stops future acceptance, and
 /// anything already staged from a malicious-but-validly-signed release is the operator
-/// yank's problem (`cargo ship yank` / `min_build`), not this command's.
+/// yank's problem (`targo --unverified ship yank` / `min_build`), not this command's.
 #[cfg(unix)]
 fn machine_revoke(argv: &Argv) -> Result<(), String> {
     atpkg_keys::master::forbid_core_dumps();
     let id = flag(argv, "id").ok_or("usage: atpkg-keys machine-revoke --id <machine-id>")?;
     let roster_path = flag(argv, "roster").unwrap_or(DEFAULT_ROSTER);
     let now = now_unix()?;
+    // Nothing to revoke from: say so before the phrase is typed. (An interrupted roster
+    // write is not "nothing" — taking the lock below completes it forward. A roster that
+    // cannot be read is not absent either: the lock and the load below name that error.)
+    if matches!(std::fs::metadata(roster_path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        && atpkg_keys::provision::refuse_pending_roster_transaction(roster_path).is_ok()
+    {
+        return Err(concat(&[
+            "no roster at ",
+            roster_path,
+            " — copy aterm-machines.toml and its .sig there from a machine that has them \
+             or from the latest release, or pass --roster <path>",
+        ]));
+    }
 
     let phrase = atpkg_keys::master::prompt_for_master(
         "master phrase (52 characters, echo off; spaces, case, and o/i/l are forgiven): ",
@@ -927,12 +895,10 @@ fn machine_revoke(argv: &Argv) -> Result<(), String> {
     eprint_line(&concat(&[
         "atpkg-keys: '",
         id,
-        "' is revoked. Publish the roster and its .sig on the next release — running \
-         clients pick it up on their next check (75s authenticated, 30min anonymous) and \
-         refuse that machine before any signature check. A FRESH install (no roster_seq \
-         floor yet) can still be served an older, still-master-signed roster that lists \
-         the revoked machine — rosters never lapse by design, so re-key entirely if that \
-         residual matters for the theft at hand.",
+        "' is revoked. Publish the roster and its .sig with the next release; a running \
+         aterm refuses that machine at its first update check after that (every 10 \
+         minutes on macOS). A fresh install can still be served an older master-signed \
+         roster that lists it — if that matters for this theft, re-key entirely.",
     ]));
     Ok(())
 }

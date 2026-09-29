@@ -1,0 +1,41 @@
+# codex 0.157.1 · HAND-BUILT 2026-09-28 from the binary's strings (identical in 0.158.0: view `rate-limit-switch-prompt`, title `Approaching rate limits`, subtitle `Switch to <model> for lower credit usage?`, options `Switch to <model>` [Uses fewer credits for upcoming turns], `Keep current model`, `Keep current model (never show again)` [Hide future rate limit reminders about switching models]) on the list-selection geometry MEASURED on 0.158.0's `/model` boxes (title and subtitle at column 2 over two blank rows, `› 1.` options at column 0, descriptions two columns past the longest label, `enter select · esc back` at column 2 as the last row); the label as the owner's ledger recorded it twice (`Approaching rate limits => Switch to gpt-6-luna`) · no screen of this box was captured: it needs Codex's usage past its threshold
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Committed and pushed the parser fix; the suite is green.
+
+  Worked for 12m 4s · 1:39 PM
+
+
+  Approaching rate limits
+  Switch to gpt-6-luna for lower credit usage?
+
+
+› 1. Switch to gpt-6-luna                   Uses fewer credits for upcoming turns
+  2. Keep current model
+  3. Keep current model (never show again)  Hide future rate limit reminders about switching models
+
+  enter select · esc back

@@ -427,6 +427,27 @@ pub enum Intent {
         /// Which word.
         word: UpgradeWord,
     },
+    /// THE OWNER'S WORD ON SEVERAL TABS' UPGRADES AT ONCE, pressed on the one
+    /// row that stands for an agent's stalled upgrades (2026-09-28, the owner:
+    /// "also fix this stacking failures of claude upgrades!" — three stalled
+    /// tabs were three rows, the whole band): `word` written for each listed
+    /// tab, for the build the row named it with (`moves`: `(tab, to)`), exactly
+    /// as an [`Intent::AgentUpgrade`] press of each would. The tabs are the ones
+    /// the row SHOWED, never whatever stalls when the press lands. Not
+    /// [`Intent::ends_with_row`]: Settings ▸ Messages offers it while any
+    /// listed upgrade still takes the word.
+    AgentUpgradeTabs {
+        /// Which word.
+        word: UpgradeWord,
+        /// Each tab (`s-<hex>`) and the target build the row named for it.
+        moves: Vec<(String, String)>,
+    },
+    /// END THE SESSIONS THE PTY KEEPER KEPT (keeper design §5.3 step 7): the
+    /// recovery row's one decision — close every tab whose shell the keeper
+    /// held through the last run's crash and this launch reattached (each is
+    /// hung up and released, as a tab close does). Consequential, and it ends
+    /// with the row.
+    EndRecovered,
 }
 
 /// `Show tab N` for tabs 1–9, the only numbers a tab strip shows by number
@@ -471,7 +492,8 @@ impl Intent {
             Self::NewWindow => "New window",
             Self::StopPaste { .. } => "Stop paste",
             Self::ShowTab { tab, .. } => SHOW_TAB[usize::from(*tab).min(10) % 10],
-            Self::AgentUpgrade { word, .. } => word.label(),
+            Self::AgentUpgrade { word, .. } | Self::AgentUpgradeTabs { word, .. } => word.label(),
+            Self::EndRecovered => "End sessions",
         }
     }
 
@@ -497,7 +519,7 @@ impl Intent {
             Self::NewWindow => "Window",
             Self::StopPaste { .. } => "Stop",
             Self::ShowTab { tab, .. } => TAB_N[usize::from(*tab).min(10) % 10],
-            Self::AgentUpgrade { word, .. } => match word {
+            Self::AgentUpgrade { word, .. } | Self::AgentUpgradeTabs { word, .. } => match word {
                 // What the press does, not when (round 18, day four, D6: a
                 // bare `Now` beside `Tomorrow` said neither what nor to whom).
                 UpgradeWord::Now => "Upgrade",
@@ -507,6 +529,7 @@ impl Intent {
                 UpgradeWord::NotToday => "Not now",
                 UpgradeWord::Skip => "Skip",
             },
+            Self::EndRecovered => "End",
         }
     }
 
@@ -525,7 +548,10 @@ impl Intent {
     pub const fn ends_with_row(&self) -> bool {
         matches!(
             self,
-            Self::NotNow { .. } | Self::StopPaste { .. } | Self::ShowTab { .. }
+            Self::NotNow { .. }
+                | Self::StopPaste { .. }
+                | Self::ShowTab { .. }
+                | Self::EndRecovered
         )
     }
 
@@ -559,6 +585,11 @@ impl Intent {
                     word: UpgradeWord::Now,
                     ..
                 }
+                | Self::AgentUpgradeTabs {
+                    word: UpgradeWord::Now,
+                    ..
+                }
+                | Self::EndRecovered
         )
     }
 
@@ -599,6 +630,17 @@ impl Intent {
                 escape_field(to),
                 escape_field(tab)
             ),
+            Self::AgentUpgradeTabs { word, moves } => {
+                let mut out = format!("agent-upgrades:{}", word.as_str());
+                for (tab, to) in moves {
+                    out.push(':');
+                    out.push_str(&escape_field(to));
+                    out.push(':');
+                    out.push_str(&escape_field(tab));
+                }
+                out
+            }
+            Self::EndRecovered => "end-recovered".to_string(),
         }
     }
 
@@ -610,6 +652,7 @@ impl Intent {
         match kind {
             "details" if payload.is_empty() => Some(Self::Details),
             "new-window" if payload.is_empty() => Some(Self::NewWindow),
+            "end-recovered" if payload.is_empty() => Some(Self::EndRecovered),
             "open-settings" => Some(Self::OpenSettings {
                 route: unescape_payload(payload),
             }),
@@ -656,6 +699,22 @@ impl Intent {
                     to,
                     word: UpgradeWord::parse(word)?,
                 })
+            }
+            "agent-upgrades" => {
+                let mut fields = payload.split(':');
+                let word = UpgradeWord::parse(fields.next()?)?;
+                let rest: Vec<&str> = fields.collect();
+                if rest.is_empty() || !rest.len().is_multiple_of(2) {
+                    return None;
+                }
+                let moves: Vec<(String, String)> = rest
+                    .chunks(2)
+                    .map(|pair| (unescape_payload(pair[1]), unescape_payload(pair[0])))
+                    .collect();
+                moves
+                    .iter()
+                    .all(|(tab, to)| !tab.is_empty() && !to.is_empty())
+                    .then_some(Self::AgentUpgradeTabs { word, moves })
             }
             _ => None,
         }
@@ -706,6 +765,7 @@ pub(crate) fn every_intent() -> Vec<Intent> {
             decision: Decision::FileAccess,
         },
         Intent::NewWindow,
+        Intent::EndRecovered,
         Intent::StopPaste { session: 3 },
         Intent::ShowTab { tab: 2, window: 7 },
         Intent::AgentUpgrade {
@@ -723,6 +783,17 @@ pub(crate) fn every_intent() -> Vec<Intent> {
             tab: "s-a:b".into(),
             to: "2.1.282:%\t".into(),
             word: UpgradeWord::Skip,
+        },
+        Intent::AgentUpgradeTabs {
+            word: UpgradeWord::Now,
+            moves: vec![
+                ("s-b5cf2faabac5ce5127bd".into(), "2.1.284".into()),
+                ("s-d3346b29dd236432b852".into(), "2.1.284".into()),
+            ],
+        },
+        Intent::AgentUpgradeTabs {
+            word: UpgradeWord::NotToday,
+            moves: vec![("s-a:b".into(), "2.1.282:%\t".into())],
         },
     ]
 }
@@ -1708,6 +1779,11 @@ mod tests {
                             word: UpgradeWord::Now,
                             ..
                         }
+                        | Intent::AgentUpgradeTabs {
+                            word: UpgradeWord::Now,
+                            ..
+                        }
+                        | Intent::EndRecovered
                 ),
                 "{intent:?}"
             );

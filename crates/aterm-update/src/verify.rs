@@ -123,6 +123,14 @@ impl ApplyBudget {
     }
 }
 
+/// The deadline this thread's verification must finish by, or `None` outside a
+/// budget — for the tests that pin a lane to running under one (round seven,
+/// item 36: the pre-park verification's ceiling rests on it).
+#[cfg(test)]
+pub(crate) fn current_budget_deadline() -> Option<Instant> {
+    APPLY_DEADLINE.with(std::cell::Cell::get)
+}
+
 impl Drop for ApplyBudget {
     fn drop(&mut self) {
         APPLY_DEADLINE.with(|d| d.set(self.0));
@@ -213,7 +221,7 @@ pub(crate) fn status_bounded_with_stderr_observed(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| HelperFailure {
-            message: format!("spawn {what}: {error}"),
+            message: spawn_refusal(what, &error),
             writer_stopped: true,
         })?;
     let drain = if let Some(mut stream) = child.stderr.take() {
@@ -237,7 +245,7 @@ pub(crate) fn status_bounded_with_stderr_observed(
             });
         if let Err(error) = spawned {
             return Err(HelperFailure {
-                message: format!("spawn {what} stderr drain: {error}"),
+                message: spawn_refusal(&format!("{what} stderr drain"), &error),
                 writer_stopped: stop_helper_before(&mut child, cleanup_deadline()),
             });
         }
@@ -254,10 +262,13 @@ pub(crate) fn status_bounded_with_stderr_observed(
                     std::thread::sleep(HELPER_POLL.min(remaining));
                     continue;
                 }
-                format!(
+                // A copy that outran its own ceiling is the disk's afternoon
+                // (a cross-volume `ditto` of a large bundle on a busy volume),
+                // not the bundle: passing (round four, plan item 2).
+                mark_passing(format!(
                     "{what} did not finish within {}s; treating as a failure",
                     limit.as_secs()
-                )
+                ))
             }
             Err(error) => format!("wait for {what}: {error}"),
         };
@@ -369,14 +380,85 @@ fn helper_deadline() -> (Instant, bool) {
 }
 
 /// The rejection a helper that outran [`helper_deadline`] reports.
-fn timed_out(what: &str, bound_by_budget: bool) -> String {
+///
+/// A REJECTION, AND A PASSING ONE (round four, plan item 2): the apply refuses
+/// exactly as before — nothing is swapped past a helper that did not answer —
+/// but the reason carries [`crate::PASSING_REFUSAL_KEY`], because a deadline
+/// missed says the machine was slow at that moment (a loaded desk, a cold page
+/// cache, `spctl` waiting on the network), not that the bundle is bad. Its
+/// readers retry it on the transient schedule instead of converging the build as
+/// structural or asking a person to reinstall.
+pub(crate) fn timed_out(what: &str, bound_by_budget: bool) -> String {
     if bound_by_budget {
-        format!("{what} ran past this apply's verification budget; treating as a rejection")
+        mark_passing(format!(
+            "{what} ran past this apply's verification budget; treating as a rejection"
+        ))
     } else {
-        format!(
+        mark_passing(format!(
             "{what} did not finish within {}s; treating as a rejection",
             HELPER_TIMEOUT.as_secs()
-        )
+        ))
+    }
+}
+
+/// `message`, marked as a passing refusal ([`crate::PASSING_REFUSAL_KEY`]). The one
+/// spelling, so every cause reads the same in the log and the key is never
+/// reworded at one site and missed at another.
+pub(crate) fn mark_passing(message: String) -> String {
+    format!("{message} ({})", crate::PASSING_REFUSAL_KEY)
+}
+
+/// Whether an I/O error from starting a helper, or from waiting on a lock, is a
+/// fact about this MOMENT rather than about the bundle or the machine's setup.
+///
+/// * `TimedOut` — `FileLock::acquire_within`'s answer when another process held
+///   the lock past the bounded wait; the holder lets go or is reaped.
+/// * `EAGAIN` / `ENOMEM` — `fork`/`posix_spawn` refused for the process table or
+///   memory at that instant (Rust reports `EAGAIN` as `WouldBlock`, `ENOMEM` as
+///   `OutOfMemory`).
+/// * `EMFILE` / `ENFILE` — no descriptor for the helper's pipes just then.
+///
+/// Everything else keeps its verdict: `ENOENT` (no `/usr/bin/codesign`), `EACCES`,
+/// `ENOLCK`, an unsupported filesystem — those come back the same every time.
+pub(crate) fn io_error_is_passing(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::OutOfMemory
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE)
+    )
+}
+
+/// The refusal for an I/O error while starting helper `what`, marked passing when
+/// the error is a moment ([`io_error_is_passing`]).
+fn spawn_refusal(what: &str, error: &std::io::Error) -> String {
+    let message = format!("spawn {what}: {error}");
+    if io_error_is_passing(error) {
+        mark_passing(message)
+    } else {
+        message
+    }
+}
+
+/// The refusal a bounded wait on the apply lock reports, under `what` (the lane's
+/// own prefix: "lock", "pre-verify lock", "health lock").
+///
+/// A lock another process held past the wait is PASSING (round four, plan item
+/// 2): the holder is a sibling launch mid-swap, a stage publishing, or a process
+/// stopped under a debugger — every one of them lets go or is reaped, and the
+/// next attempt takes the lock. Until this, a seamless successor that waited out
+/// a sibling's hold returned `Deferred("lock: …")`, stayed the old build, refused
+/// the target and was booked STRUCTURAL by its parent. Any OTHER lock error
+/// (`ENOLCK`, an unsupported filesystem) is not a moment and keeps its verdict.
+pub(crate) fn lock_wait_refusal(what: &str, error: &std::io::Error) -> String {
+    let message = format!("{what}: {error}");
+    if io_error_is_passing(error) {
+        mark_passing(message)
+    } else {
+        message
     }
 }
 
@@ -394,6 +476,11 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
 /// can wait on the disk arbitration daemon indefinitely. A timeout is an `Err`
 /// and the child is killed and reaped. Same output caveat as [`output_bounded`]:
 /// for helpers that print a few lines at most.
+///
+/// A limit run out is PASSING ([`mark_passing`], round six, finding 11), like
+/// [`timed_out`]: a helper that did not finish says the machine was slow at that
+/// moment, not that the image is bad, and the stage path retries it rather than
+/// booking a backoff against a healthy build.
 pub(crate) fn output_within(
     cmd: &mut Command,
     what: &str,
@@ -402,10 +489,10 @@ pub(crate) fn output_within(
     output_until(cmd, what, || {
         (
             Instant::now() + limit,
-            format!(
+            mark_passing(format!(
                 "{what} did not finish within {}s; treating as a failure",
                 limit.as_secs()
-            ),
+            )),
         )
     })
 }
@@ -424,7 +511,7 @@ fn output_until(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("spawn {what}: {e}"))?;
+        .map_err(|e| spawn_refusal(what, &e))?;
     let (deadline, timeout) = bound();
     let mut poll = HELPER_POLL_MIN;
     loop {
@@ -610,7 +697,7 @@ fn codesign_verify(app: &Path, expected_team: &str) -> Result<(), String> {
             stderr.trim()
         )),
         Err(CodesignError::TimedOut) => Err(timed_out(WHAT, bound_by_budget)),
-        Err(CodesignError::Spawn(e)) => Err(format!("spawn {WHAT}: {e}")),
+        Err(CodesignError::Spawn(e)) => Err(spawn_refusal(WHAT, &e)),
         Err(CodesignError::Wait(e)) => Err(format!("wait for {WHAT}: {e}")),
         Err(e @ CodesignError::Unsupported) => Err(format!("{WHAT}: {e}")),
     }
@@ -699,6 +786,78 @@ mod tests {
         );
     }
 
+    /// A HELPER THAT DID NOT FINISH IS A PASSING REFUSAL (round four, plan item
+    /// 2): still a rejection — nothing is swapped past it — but one its readers
+    /// retry on the transient schedule, never a structural verdict and never a
+    /// person's. Both deadlines that bind a helper say so: the apply's budget and
+    /// the helper's own ceiling, and a copy's own `limit` as well.
+    ///
+    /// CONTROL: a helper that ran and REFUSED is a verdict and carries no key.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_timeout_is_a_passing_refusal() {
+        let budget = {
+            let _budget = ApplyBudget::start(Duration::from_millis(50));
+            output_bounded(Command::new("/bin/sleep").arg("30"), "a slow helper")
+                .expect_err("a helper past the budget is a rejection")
+        };
+        assert!(crate::is_passing_refusal(&budget), "{budget}");
+        assert!(
+            crate::is_passing_refusal(&timed_out("codesign", false)),
+            "the helper's own ceiling is the same moment"
+        );
+        let copy = status_bounded_with_stderr(
+            Command::new("/bin/sleep").arg("30"),
+            "ditto",
+            Duration::from_millis(100),
+        )
+        .expect_err("a copy past its limit is a failure");
+        assert!(crate::is_passing_refusal(&copy), "{copy}");
+
+        // CONTROL: `false` ran and refused — the verdict shape, with no key.
+        let refused = output_bounded(&mut Command::new("/usr/bin/false"), "a refusing helper")
+            .expect("the helper ran to an exit");
+        assert!(!refused.status.success());
+        let verdict = format!(
+            "codesign --verify (structural) failed: {}",
+            String::from_utf8_lossy(&refused.stderr).trim()
+        );
+        assert!(!crate::is_passing_refusal(&verdict), "{verdict}");
+    }
+
+    /// WHICH I/O ERRORS ARE A MOMENT, by errno. The kernel refusing a helper for
+    /// the process table, memory or descriptors just then — and a lock held past
+    /// its wait — pass; a missing helper, a permission, a filesystem without locks
+    /// come back the same every time and keep their verdict. The spawn itself is
+    /// driven for the missing-binary case, so the classification is read off a
+    /// real `spawn` error, not only a constructed one.
+    #[test]
+    fn only_a_moment_s_io_errors_are_passing() {
+        for passing in [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
+            let error = std::io::Error::from_raw_os_error(passing);
+            assert!(io_error_is_passing(&error), "{error}");
+            assert!(crate::is_passing_refusal(&spawn_refusal(
+                "codesign", &error
+            )));
+        }
+        let lock = std::io::Error::new(std::io::ErrorKind::TimedOut, "held for more than 10s");
+        assert!(crate::is_passing_refusal(&lock_wait_refusal("lock", &lock)));
+        for verdict in [libc::ENOENT, libc::EACCES, libc::ENOLCK, libc::EINVAL] {
+            let error = std::io::Error::from_raw_os_error(verdict);
+            assert!(!io_error_is_passing(&error), "{error}");
+            assert!(!crate::is_passing_refusal(&lock_wait_refusal(
+                "lock", &error
+            )));
+        }
+        let missing = output_bounded(
+            &mut Command::new("/nonexistent/aterm-update-helper"),
+            "a missing helper",
+        )
+        .expect_err("a helper that does not exist cannot start");
+        assert!(missing.starts_with("spawn a missing helper"), "{missing}");
+        assert!(!crate::is_passing_refusal(&missing), "{missing}");
+    }
+
     /// A CHECK-THREAD HELPER ENDS AT ITS OWN LIMIT (plan P2-1, round three). The
     /// check's `hdiutil` attach and detaches ran with `.output()` — no bound at all
     /// — on the update checker's thread, inside a check holding the process's check
@@ -718,6 +877,10 @@ mod tests {
         .expect_err("a helper past its limit is a failure");
         let waited = started.elapsed();
         assert!(error.contains("sleep did not finish within"), "{error}");
+        // A limit run out is the machine's moment, not a verdict on the image
+        // (round six, finding 11): the stage path retries it instead of booking
+        // a backoff against a healthy build.
+        assert!(crate::is_passing_refusal(&error), "{error}");
         assert!(waited < Duration::from_secs(5), "waited {waited:?}");
         let out = output_within(
             Command::new("/bin/echo").arg("hi"),
@@ -790,10 +953,17 @@ mod tests {
             }
         };
         aterm_spec::verify::prove_and_catch_scalar(&model, "bounded helper cleanup");
+        /// A child that never exits (`exit` 0) counts the looks at it made once
+        /// the cleanup's `deadline` had passed. One such look is the loop's own
+        /// last (a poll that woke past the deadline, then saw it gone); a second
+        /// is a cleanup that renewed its deadline, and the fake answers it with
+        /// an error so a cleanup that would wait forever ends, and fails.
         struct FakeChild {
             exit: u8,
             kill_error: bool,
             kills: usize,
+            deadline: Instant,
+            late: usize,
         }
         impl HelperChild for FakeChild {
             fn request_kill(&mut self) -> std::io::Result<()> {
@@ -808,23 +978,45 @@ mod tests {
                 match self.exit {
                     1 => Ok(Some(std::process::ExitStatus::from_raw(0))),
                     2 => Err(std::io::Error::other("wait failed")),
-                    _ => Ok(None),
+                    _ => {
+                        if Instant::now() >= self.deadline {
+                            self.late += 1;
+                        }
+                        if self.late > 1 {
+                            return Err(std::io::Error::other("still looked at past the deadline"));
+                        }
+                        Ok(None)
+                    }
                 }
             }
         }
         for exit in 0..=2 {
             for kill_error in [false, true] {
+                let started = Instant::now();
+                let deadline = started + Duration::from_millis(15);
                 let mut child = FakeChild {
                     exit,
                     kill_error,
                     kills: 0,
+                    deadline,
+                    late: 0,
                 };
-                let started = Instant::now();
-                let stopped = stop_helper_before(&mut child, started + Duration::from_millis(15));
+                let stopped = stop_helper_before(&mut child, deadline);
                 assert_eq!(child.kills, 1);
+                // The cleanup ends at its deadline, never a renewed one: at most
+                // the one look that found it passed — read off the calls, not a
+                // clock, so a loaded machine cannot fail it — and inside a
+                // minute's hang detector.
                 assert!(
-                    started.elapsed() < Duration::from_secs(1),
-                    "cleanup must not wait unboundedly after a failed kill"
+                    child.late <= 1,
+                    "cleanup must not wait unboundedly after a failed kill: {} looks past \
+                     its deadline",
+                    child.late
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "cleanup must not wait unboundedly after a failed kill: {:?}",
+                    started.elapsed()
                 );
                 let mut state = model.successors("Kill", &model.init_state())[0].clone();
                 if exit > 0 {

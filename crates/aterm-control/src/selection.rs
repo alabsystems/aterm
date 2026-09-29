@@ -269,6 +269,10 @@ pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
         {
             return reply(id, exit);
         }
+        // The caller hung up: nobody can read the completion, so stop now.
+        if sub.caller_gone() {
+            return "ERR hangup\n".to_string();
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             return "OK timeout\n".to_string();

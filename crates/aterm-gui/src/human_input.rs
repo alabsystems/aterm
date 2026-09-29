@@ -44,27 +44,41 @@
 //! into a composer a person has touched since aterm's own last write
 //! ([`HumanInputStamp::last`]).
 //!
-//! Lock-free: one monotonic clock read ([`crate::metrics::now_us`]) and one
-//! relaxed atomic store per person gesture, one load per read. The stamp
-//! lives in this process: a session adopted across a seamless update reads
-//! "never" until a person keys it again.
+//! **The count** ([`HumanInputStamp::seq`], `status human_seq=`, `text
+//! --json`'s `"human_seq"`): how many person gestures have reached the
+//! session. A write fenced on it (`key|send if-human=<n>`, checked under the
+//! terminal lock with the other fences, `crate::control_input::InputFence`)
+//! is refused `OK skipped reason=person` when a person has keyed since the
+//! read that returned `n` — the round trip between a supervisor's read and
+//! its key that the age alone cannot close (R3b of the question answer's
+//! critique, 2026-09-25; built 2026-09-27).
+//!
+//! Lock-free: one monotonic clock read ([`crate::metrics::now_us`]), one
+//! relaxed atomic store and one relaxed add per person gesture, one load per
+//! read. The stamp lives in this process: a session adopted across a
+//! seamless update reads "never" until a person keys it again.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::input::InputEvent;
 
-/// When a person last gave this session input: [`crate::metrics::now_us`]
+/// When a person last gave this session input — [`crate::metrics::now_us`]
 /// plus one (so `0` stays "never"), or `0` when no person ever has since the
-/// session started in this process. Lives on [`crate::SessionCtx`].
+/// session started in this process — and how many gestures that has been
+/// ([`Self::seq`]). Lives on [`crate::SessionCtx`].
 #[derive(Debug, Default)]
-pub(crate) struct HumanInputStamp(AtomicU64);
+pub(crate) struct HumanInputStamp {
+    at: AtomicU64,
+    count: AtomicU64,
+}
 
 impl HumanInputStamp {
     /// A person's gesture reached the session at `now_us`. `true` when it
     /// opens a burst: the first ever, or the first after
     /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without one.
     pub(crate) fn note(&self, now_us: u64) -> bool {
-        let before = self.0.swap(now_us.saturating_add(1), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let before = self.at.swap(now_us.saturating_add(1), Ordering::Relaxed);
         before.checked_sub(1).is_none_or(|at| {
             now_us.saturating_sub(at) / 1000 >= crate::session_timeline::HUMAN_BURST_GAP_MS
         })
@@ -73,14 +87,21 @@ impl HumanInputStamp {
     /// The raw stamp: equal to an earlier reading exactly when no person's
     /// gesture has reached the session since that reading.
     pub(crate) fn last(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.at.load(Ordering::Relaxed)
+    }
+
+    /// How many person gestures have reached the session in this process
+    /// (`human_seq=`): equal to an earlier reading exactly when none has
+    /// since — what a write fenced `if-human=<n>` is checked against.
+    pub(crate) fn seq(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Milliseconds from the last person's gesture to `now_us`; `None` when
     /// no person has given the session input. A stamp later than `now_us`
     /// (two clock reads racing) reads as `0`.
     pub(crate) fn ms_since(&self, now_us: u64) -> Option<u64> {
-        let at = self.0.load(Ordering::Relaxed).checked_sub(1)?;
+        let at = self.at.load(Ordering::Relaxed).checked_sub(1)?;
         Some(now_us.saturating_sub(at) / 1000)
     }
 

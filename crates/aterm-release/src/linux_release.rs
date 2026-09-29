@@ -40,6 +40,311 @@ pub struct Handoff {
     pub targets: Vec<String>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    /// The native hosts the cutter drives itself (`--linux-worker`), journaled
+    /// with the rest of the handoff so a resumed cut still knows where each
+    /// architecture is built. Empty: every worker is run by hand.
+    #[serde(default)]
+    pub workers: Vec<Worker>,
+}
+
+/// A native Linux host the cutter drives over ssh: `ARCH=DESTINATION:REPOSITORY`
+/// on the command line (`aarch64=buildhost:/home/me/src/aterm`).
+///
+/// The cutter runs `ship linux-build` there in a throwaway worktree of
+/// REPOSITORY detached at the claim commit, copies the executable and its
+/// provenance receipt back into the handoff directory, and removes the remote
+/// run. The pair then goes through the SAME [`Handoff::import`] a hand-carried
+/// pair does — identity, size, digest and Trust provenance, bound to the claim —
+/// so a worker is trusted exactly as much as an operator carrying its pair by
+/// hand would be: no more (a mistaken or stale pair is refused) and no less (a
+/// compromised worker HOST can still build hostile bytes with a matching
+/// receipt, and only the host's own integrity rules that out). No credential
+/// crosses to it: agent and X11 forwarding are switched off on every call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worker {
+    /// The Linux target triple this host builds natively.
+    pub target: String,
+    /// The ssh destination (`host` or `user@host`, an ssh config alias included).
+    pub destination: String,
+    /// The aterm checkout on that host that the throwaway worktree comes from:
+    /// absolute, or `~/`-relative to the remote login.
+    pub repository: String,
+}
+
+/// The ssh options on every worker call. `BatchMode`: never a prompt the
+/// launchd-hosted cut cannot answer. The timeouts: a dead host or a dropped
+/// connection fails the step instead of holding the release lock forever. The
+/// forwarding switches: a user's `ForwardAgent yes` must not hand the
+/// publisher's agent to a build host.
+const SSH_OPTIONS: [&str; 14] = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=20",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=6",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "ClearAllForwardings=yes",
+];
+
+/// The shell a worker runs, fed to `bash -l -s` on stdin so no script text is
+/// ever re-quoted through ssh's argv join. Its arguments are validated
+/// [`Worker`] fields and cut identity, each a single shell-safe word. The build
+/// talks on stderr (streamed to the operator); stdout's LAST line is the
+/// private directory holding the pair (a login file may print before it).
+///
+/// The body is one function called with stdin from `/dev/null`: bash parses
+/// all of it before running any of it, so nothing the build runs can read the
+/// rest of the script off the pipe. Each run gets its own `mktemp -d`, so an
+/// orphaned earlier run of the same build cannot delete or overwrite this one.
+/// `umask 077` because the worker refuses a group- or other-writable target
+/// root, and a login's `umask 002` (Ubuntu's default) made exactly that —
+/// measured on the first live run.
+const WORKER_SCRIPT: &str = r#"main() {
+set -eu
+umask 077
+repo=$1 commit=$2 version=$3 build=$4 arch=$5
+case "${XDG_CACHE_HOME:-}" in
+/*) cache=$XDG_CACHE_HOME ;;
+*) cache=$HOME/.cache ;;
+esac
+root="$cache/aterm-linux-worker"
+mkdir -p "$root"
+chmod 700 "$root"
+run=$(mktemp -d "$root/run-$build-$arch.XXXXXX")
+work="$run/src"
+out="$run/out"
+cd "$repo"
+git fetch --quiet origin
+git worktree add --quiet --detach "$work" "$commit"
+trap 'cd "$repo" && git worktree remove --force "$work" >/dev/null 2>&1 || true' EXIT
+git -C "$work" submodule update --init --quiet vendor/astream
+mkdir -m 700 "$out"
+cd "$work"
+targo --unverified ship linux-build --version "$version" --build-number "$build" \
+    --commit "$commit" --out "$out" >&2
+printf '%s\n' "$out"
+}
+main "$@" </dev/null
+"#;
+
+/// One shell-safe word: nothing a remote shell would split, glob, expand or
+/// read as an option.
+fn shell_word(value: &str, extra: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c) || extra.contains(c))
+}
+
+/// Whether `directory` already holds this cut's valid pair for `target` —
+/// the receipt parses, names exactly this version, build, commit and
+/// architecture, and the executable matches it. A pair from another build (a
+/// dry run's, a failed claim's) or a torn copy is NOT current.
+fn pair_is_current(
+    directory: &Path,
+    target: LinuxTarget,
+    version: &str,
+    build: u64,
+    commit: &str,
+) -> bool {
+    let name = target.asset_name(version);
+    let receipt = directory.join(format!("{name}.handoff.toml"));
+    let Ok(metadata) = fs::symlink_metadata(&receipt) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() > 65536 {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&receipt) else {
+        return false;
+    };
+    let Ok(artifact) = aterm_toml::from_str::<Artifact>(&text) else {
+        return false;
+    };
+    artifact.validate(version, build, commit).is_ok()
+        && artifact.target == target.triple()
+        && artifact.verify_file(&directory.join(&name)).is_ok()
+}
+
+impl Worker {
+    /// Parse `ARCH=DESTINATION:REPOSITORY`, where ARCH is `aarch64` or `x86_64`.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let usage = || {
+            format!(
+                "--linux-worker {spec:?}: expected ARCH=DESTINATION:REPOSITORY, e.g. \
+                 aarch64=buildhost:/home/me/src/aterm"
+            )
+        };
+        let (arch, rest) = spec.split_once('=').ok_or_else(usage)?;
+        let (destination, repository) = rest.split_once(':').ok_or_else(usage)?;
+        let target = match arch {
+            "aarch64" => LinuxTarget::Aarch64,
+            "x86_64" => LinuxTarget::X86_64,
+            other => return Err(format!("unsupported Linux worker architecture {other:?}")),
+        };
+        if !shell_word(destination, "@") {
+            return Err(format!(
+                "--linux-worker destination {destination:?} must be a plain ssh host or user@host"
+            ));
+        }
+        let path_ok = (repository.starts_with('/') || repository.starts_with("~/"))
+            && shell_word(repository.trim_start_matches('~'), "/")
+            && !repository.split('/').any(|part| part == "..");
+        if !path_ok {
+            return Err(format!(
+                "--linux-worker repository {repository:?} must be an absolute or ~/ path of \
+                 plain characters"
+            ));
+        }
+        Ok(Self {
+            target: target.triple().to_string(),
+            destination: destination.to_string(),
+            repository: repository.to_string(),
+        })
+    }
+
+    /// Build this worker's architecture at the claim and copy its pair into
+    /// `directory` — unless this cut's valid pair is already there (a resumed
+    /// cut, or an operator who carried it by hand). Anything else under those
+    /// names — another build's pair, a torn copy — is removed and rebuilt, so a
+    /// stale file can never stop a cut after its claim.
+    fn run(&self, directory: &Path, version: &str, build: u64, commit: &str) -> Result<(), String> {
+        let target = target(&self.target)?;
+        check_identity(version, build, commit)?;
+        let name = target.asset_name(version);
+        let receipt = format!("{name}.handoff.toml");
+        if pair_is_current(directory, target, version, build, commit) {
+            println!(
+                "==> Linux worker {}: this cut's pair is already in {}; not rebuilding",
+                target.triple(),
+                directory.display()
+            );
+            return Ok(());
+        }
+        for stale in [&name, &receipt] {
+            match fs::remove_file(directory.join(stale)) {
+                Ok(()) => println!(
+                    "==> Linux worker {}: removed a stale {stale}",
+                    target.triple()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove stale Linux handoff file {stale}: {e}")),
+            }
+        }
+        let arch = self.target.split('-').next().unwrap_or(&self.target);
+        println!(
+            "==> Linux worker {}: building v{version} build {build} at {} on {} ({}) — \
+             its output follows",
+            target.triple(),
+            &commit[..12],
+            self.destination,
+            self.repository
+        );
+        let mut child = Command::new("ssh")
+            .args(SSH_OPTIONS)
+            .args(["-a", "-x", "--", &self.destination])
+            .args(["bash", "-l", "-s", "--", &self.repository, commit, version])
+            .arg(build.to_string())
+            .arg(arch)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "could not start ssh to Linux worker {}: {e}",
+                    self.destination
+                )
+            })?;
+        child
+            .stdin
+            .take()
+            .ok_or("Linux worker ssh has no stdin")?
+            .write_all(WORKER_SCRIPT.as_bytes())
+            .map_err(|e| format!("send the Linux worker script: {e}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("wait for Linux worker {}: {e}", self.destination))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Linux worker {} on {} failed ({}); its output is above. Fix it and resume the \
+                 cut, or build there by hand into {}",
+                target.triple(),
+                self.destination,
+                output.status,
+                directory.display()
+            ));
+        }
+        let text = String::from_utf8(output.stdout)
+            .map_err(|e| format!("Linux worker output is not UTF-8: {e}"))?;
+        let remote_out = text.lines().last().unwrap_or_default();
+        let remote_run = remote_out.strip_suffix("/out").unwrap_or_default();
+        if !remote_out.starts_with('/')
+            || !shell_word(remote_out, "/")
+            || !remote_run.contains("/aterm-linux-worker/run-")
+        {
+            return Err(format!(
+                "Linux worker on {} did not name its output directory (got {remote_out:?})",
+                self.destination
+            ));
+        }
+        // Into a private staging directory first, then renamed into place
+        // receipt LAST: an interrupted copy never leaves a pair that looks whole.
+        let staging = directory.join(format!(".worker-{arch}"));
+        match fs::remove_dir_all(&staging) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("clear {}: {e}", staging.display())),
+        }
+        fs::create_dir(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+        let status = Command::new("scp")
+            .args(SSH_OPTIONS)
+            .args(["-q", "--"])
+            .arg(format!("{}:{remote_out}/{name}", self.destination))
+            .arg(format!("{}:{remote_out}/{receipt}", self.destination))
+            .arg(&staging)
+            .status()
+            .map_err(|e| format!("could not start scp from Linux worker: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "copying the Linux worker's pair from {}:{remote_out} failed ({status})",
+                self.destination
+            ));
+        }
+        for file in [&name, &receipt] {
+            fs::rename(staging.join(file), directory.join(file))
+                .map_err(|e| format!("move the Linux worker's {file} into place: {e}"))?;
+        }
+        let _ = fs::remove_dir(&staging);
+        // Best effort: the remote run directory is scratch once the pair is here.
+        let _ = Command::new("ssh")
+            .args(SSH_OPTIONS)
+            .args([
+                "-a",
+                "-x",
+                "--",
+                &self.destination,
+                "rm",
+                "-rf",
+                "--",
+                remote_run,
+            ])
+            .stdin(std::process::Stdio::null())
+            .status();
+        println!(
+            "==> Linux worker {}: pair copied into {}",
+            target.triple(),
+            directory.display()
+        );
+        Ok(())
+    }
 }
 
 pub const TARGETS: [LinuxTarget; 2] = [LinuxTarget::X86_64, LinuxTarget::Aarch64];
@@ -198,7 +503,7 @@ impl Handoff {
         }
         Ok(())
     }
-    pub fn new(directory: &Path, targets: &[String]) -> Result<Self, String> {
+    pub fn new(directory: &Path, targets: &[String], workers: &[String]) -> Result<Self, String> {
         let directory = directory
             .canonicalize()
             .map_err(|e| format!("Linux handoff directory: {e}"))?;
@@ -215,11 +520,38 @@ impl Handoff {
         for requested in &targets {
             target(requested)?;
         }
+        let workers = workers
+            .iter()
+            .map(|spec| Worker::parse(spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (i, worker) in workers.iter().enumerate() {
+            if !targets.contains(&worker.target) {
+                return Err(format!(
+                    "--linux-worker builds {}, which this cut does not declare (--linux-target)",
+                    worker.target
+                ));
+            }
+            if workers[..i].iter().any(|w| w.target == worker.target) {
+                return Err(format!("two --linux-worker hosts for {}", worker.target));
+            }
+        }
         Ok(Self {
             directory,
             targets,
             artifacts: Vec::new(),
+            workers,
         })
+    }
+
+    /// Run every declared [`Worker`] whose pair is not in the handoff directory
+    /// yet. Architectures with no worker are left for [`Self::import`] to ask
+    /// the operator for, exactly as before workers existed.
+    pub fn run_workers(&self, version: &str, build: u64, commit: &str) -> Result<(), String> {
+        private_directory(&self.directory)?;
+        for worker in &self.workers {
+            worker.run(&self.directory, version, build, commit)?;
+        }
+        Ok(())
     }
 
     /// Every declared native architecture is required. The default target set
@@ -252,7 +584,8 @@ impl Handoff {
             let metadata = fs::symlink_metadata(&receipt_path).map_err(|_| format!(
                 "Linux worker output missing for {}. On that native host at commit {commit}, run: \
                  targo --unverified ship linux-build --version {version} --build-number {build} \
-                 --commit {commit} --out <handoff-directory>; copy its pair into {} and resume the cut",
+                 --commit {commit} --out <handoff-directory>; copy its pair into {} and resume the \
+                 cut (or name the host with --linux-worker on the next cut, and the cutter runs it)",
                 target.triple(), self.directory.display()))?;
             if !metadata.file_type().is_file() || metadata.len() > 65536 {
                 return Err("unsafe or oversized Linux handoff receipt".into());
@@ -672,7 +1005,7 @@ mod tests {
         for t in TARGETS {
             fixture(&source.0, t);
         }
-        let mut handoff = Handoff::new(&source.0, &[]).unwrap();
+        let mut handoff = Handoff::new(&source.0, &[], &[]).unwrap();
         handoff
             .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
             .unwrap();
@@ -694,12 +1027,13 @@ mod tests {
         let dist = Scratch::new();
         fixture(&source.0, LinuxTarget::Aarch64);
         assert!(
-            Handoff::new(&source.0, &[])
+            Handoff::new(&source.0, &[], &[])
                 .unwrap()
                 .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
                 .is_err()
         );
-        let mut handoff = Handoff::new(&source.0, &[LinuxTarget::Aarch64.triple().into()]).unwrap();
+        let mut handoff =
+            Handoff::new(&source.0, &[LinuxTarget::Aarch64.triple().into()], &[]).unwrap();
         handoff
             .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
             .unwrap();
@@ -707,14 +1041,15 @@ mod tests {
         handoff.stamp(&mut manifest).unwrap();
         assert!(manifest.linux_x86_64.is_none());
         assert!(manifest.linux_aarch64.is_some());
-        assert!(Handoff::new(&source.0, &["riscv64".into()]).is_err());
+        assert!(Handoff::new(&source.0, &["riscv64".into()], &[]).is_err());
         assert!(
             Handoff::new(
                 &source.0,
                 &[
                     LinuxTarget::Aarch64.triple().into(),
                     LinuxTarget::Aarch64.triple().into()
-                ]
+                ],
+                &[]
             )
             .is_err()
         );
@@ -725,7 +1060,8 @@ mod tests {
         let source = Scratch::new();
         let dist = Scratch::new();
         let mut artifact = fixture(&source.0, LinuxTarget::Aarch64);
-        let mut handoff = Handoff::new(&source.0, std::slice::from_ref(&artifact.target)).unwrap();
+        let mut handoff =
+            Handoff::new(&source.0, std::slice::from_ref(&artifact.target), &[]).unwrap();
         handoff
             .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
             .unwrap();
@@ -872,6 +1208,54 @@ mod tests {
             .is_err()
         );
         assert!(parse(&["cut", "--resume", "--linux-artifacts", "/changed/output"]).is_err());
+        // Linux is declared, never defaulted away: a real or rehearsal cut that
+        // names neither --linux-artifacts nor --mac-only is refused pre-claim.
+        let silent = parse(&["cut"]).unwrap_err();
+        assert_eq!(silent, crate::cli::MAC_ONLY_REFUSAL);
+        assert!(parse(&["cut", "--rehearse", "o/r"]).is_err());
+        assert!(parse(&["cut", "--mac-only"]).is_ok());
+        assert!(parse(&["cut", "--linux-artifacts", "/private/output"]).is_ok());
+        assert!(
+            parse(&["cut", "--dry-run"]).is_ok(),
+            "a dry run publishes nothing"
+        );
+        assert!(
+            parse(&["cut", "--resume"]).is_ok(),
+            "a resume has its shape already"
+        );
+        assert!(
+            parse(&["cut", "--mac-only", "--linux-artifacts", "/private/output"]).is_err(),
+            "contradiction"
+        );
+        assert!(parse(&["cut", "--resume", "--mac-only"]).is_err());
+        assert!(parse(&["cut", "--abandon", "v0.26.0", "--mac-only"]).is_err());
+        // A cutter handed its cut by another is exempt: its parent held the rule.
+        assert!(
+            crate::cli::parse_handed_off(&["cut".to_string()]).is_ok(),
+            "the handed-off cutter reads its parent's argv"
+        );
+        // --linux-worker needs somewhere to land and a well-formed spec.
+        assert!(parse(&["cut", "--mac-only", "--linux-worker", "aarch64=h:/r"]).is_err());
+        assert!(
+            parse(&[
+                "cut",
+                "--linux-artifacts",
+                "/private/output",
+                "--linux-worker",
+                "aarch64=builder@buildhost:~/aterm"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "cut",
+                "--linux-artifacts",
+                "/private/output",
+                "--linux-worker",
+                "aarch64=-oProxyCommand=x:/r"
+            ])
+            .is_err()
+        );
         assert!(
             parse(&[
                 "cut",
@@ -883,5 +1267,110 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_worker_spec_is_one_shell_safe_host_and_path() {
+        let worker = Worker::parse("aarch64=builder@buildhost:/home/builder/src/aterm").unwrap();
+        assert_eq!(worker.target, LinuxTarget::Aarch64.triple());
+        assert_eq!(worker.destination, "builder@buildhost");
+        assert_eq!(worker.repository, "/home/builder/src/aterm");
+        assert_eq!(
+            Worker::parse("x86_64=box:~/src/aterm").unwrap().target,
+            LinuxTarget::X86_64.triple()
+        );
+        for bad in [
+            "aarch64",
+            "aarch64=host",
+            "riscv64=host:/r",
+            "aarch64=:/r",
+            "aarch64=-oProxyCommand=evil:/r",
+            "aarch64=host;rm:/r",
+            "aarch64=host:relative/path",
+            "aarch64=host:/r/../etc",
+            "aarch64=host:/r with space",
+            "aarch64=host:/r$(id)",
+            "aarch64=host:~root/r",
+        ] {
+            assert!(Worker::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn workers_must_build_a_declared_target_once() {
+        let dir = Scratch::new();
+        let aarch64 = LinuxTarget::Aarch64.triple().to_string();
+        let handoff = Handoff::new(
+            &dir.0,
+            std::slice::from_ref(&aarch64),
+            &["aarch64=h:/r".into()],
+        )
+        .unwrap();
+        assert_eq!(handoff.workers.len(), 1);
+        assert!(
+            Handoff::new(
+                &dir.0,
+                std::slice::from_ref(&aarch64),
+                &["x86_64=h:/r".into()]
+            )
+            .is_err(),
+            "a worker for an architecture the cut does not declare"
+        );
+        assert!(
+            Handoff::new(&dir.0, &[], &["aarch64=a:/r".into(), "aarch64=b:/r".into()]).is_err(),
+            "two workers for one architecture"
+        );
+    }
+
+    #[test]
+    fn only_this_cuts_valid_pair_counts_as_already_built() {
+        let dir = Scratch::new();
+        let target = LinuxTarget::Aarch64;
+        let commit = "a".repeat(40);
+        assert!(
+            !pair_is_current(&dir.0, target, "0.100.0", 100, &commit),
+            "nothing there"
+        );
+        fixture(&dir.0, target);
+        assert!(pair_is_current(&dir.0, target, "0.100.0", 100, &commit));
+        // A dry run's (or a failed claim's) pair: same file names, other build.
+        assert!(!pair_is_current(&dir.0, target, "0.100.0", 101, &commit));
+        assert!(!pair_is_current(
+            &dir.0,
+            target,
+            "0.100.0",
+            100,
+            &"b".repeat(40)
+        ));
+        assert!(!pair_is_current(
+            &dir.0,
+            LinuxTarget::X86_64,
+            "0.100.0",
+            100,
+            &commit
+        ));
+        // A torn copy: the executable no longer matches its receipt.
+        let asset = dir.0.join(target.asset_name("0.100.0"));
+        let mut bytes = fs::read(&asset).unwrap();
+        bytes.truncate(70);
+        fs::write(&asset, bytes).unwrap();
+        assert!(!pair_is_current(&dir.0, target, "0.100.0", 100, &commit));
+    }
+
+    #[test]
+    fn the_worker_script_is_parsed_whole_before_it_runs() {
+        // One function, called with stdin from /dev/null: nothing the build runs
+        // can read the rest of the script off ssh's pipe.
+        assert!(WORKER_SCRIPT.starts_with("main() {\n"));
+        assert!(WORKER_SCRIPT.trim_end().ends_with("main \"$@\" </dev/null"));
+        assert!(WORKER_SCRIPT.contains("umask 077"));
+        assert!(WORKER_SCRIPT.contains("mktemp -d"));
+        if std::path::Path::new("/bin/bash").exists() {
+            let status = Command::new("/bin/bash")
+                .args(["-n", "-c", WORKER_SCRIPT])
+                .status()
+                .unwrap();
+            assert!(status.success(), "bash -n rejects the worker script");
+        }
     }
 }

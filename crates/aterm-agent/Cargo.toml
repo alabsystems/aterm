@@ -25,7 +25,25 @@ path = "src/bin/aterm-drive.rs"
 name = "aterm-fleet"
 path = "src/bin/aterm-fleet.rs"
 
+[features]
+# Compile this crate's source↔spec anchors into the LIBRARY, for a
+# downstream test binary that collects them via `inventory` (aterm-gui's
+# `spec_xref_closure` gate): `#[refines]` on the live upgrade's ladder (its
+# gate, its rung, the repaint-proof settle's look and the Codex daemon's pin,
+# machine `HarnessUpgradeLadder`) and its goal pause (the pause's step, its
+# owed resume and the daemon's turn, `HarnessUpgradeGoalPause`), on the
+# Claude Code footer's reader
+# (`ClaudeFooterModel`) and on the Codex rate-limit nudge's deciders
+# (`SupervisorCodexRateNudge`), each machine's other actions waived by name.
+# OFF by default: the shipped build carries no `aterm-spec` and no probe.
+# This crate's own test build expands the anchors through `cfg(test)`, and
+# its integration tests through the dev edge on itself below.
+spec-anchors = ["dep:aterm-spec"]
+
 [dependencies]
+# Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
+# feature (the anchor macros emit `::aterm_spec::inventory::submit!`).
+aterm-spec = { workspace = true, optional = true }
 # Predicate constructors (idle/seq/block/row-match). Agent knowledge lives HERE;
 # the engine core knows nothing of "a turn" or "a Claude prompt".
 aterm-observe = { workspace = true }
@@ -58,6 +76,9 @@ aterm-types = { workspace = true }
 # input and the transcript's usage rows) through the workspace's own parser.
 # A leaf: its one dependency is `serde`, already in the shipped graph.
 aterm-json = { workspace = true }
+# Selective transcript deserialization validates discarded tool payloads without
+# constructing their Value trees. Already in aterm-json's shipped closure.
+serde = { workspace = true }
 # The box escalation cuts the badge's line by terminal CELLS, not chars (a wide
 # character is two): the workspace's own width tables, `char_width`. Not a new
 # edge in the shipped graph — aterm-core already links it — and its one
@@ -70,6 +91,13 @@ aterm-grapheme = { workspace = true }
 # writes. No cycle: atpkg depends on no aterm-agent; aterm-cli and aterm-gui,
 # this crate's two binary consumers, already link it.
 atpkg = { workspace = true }
+# The ONE spelling of Claude Code's top-effort mode, `aterm_primer::CLAUDE_TOP_EFFORT_KEY`
+# (its settings key and the name `/effort` and the footer's effort results use): the
+# footer reads that name as `xhigh`. The publication baseline bans the word, joined,
+# in every exported file, so the source spells it once, from parts, in the crate that
+# writes the key. Not a new edge in the shipped graph — atpkg above already depends on
+# it — and aterm-primer is a std-only leaf with no dependencies of its own.
+aterm-primer = { workspace = true }
 # The harness's master switch (`harness.enabled`) and `disk.apply` are read out
 # of aterm.toml with the SAME parser the GUI's Settings page seeds from, so the
 # switch cannot read OFF on the glass and ON here (`harness::cli::toml_bool`).
@@ -83,8 +111,30 @@ aterm-toml = { workspace = true }
 # dependencies (aterm-digest, aterm-uds) are already this crate's.
 aterm-shell-integration = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# The disk reclaim (`harness::disk::target`) reaches every profile, lock and
+# cache of a build directory through directory handles it opened without
+# following a symlink, and deletes an idle profile's `incremental/` with the
+# fd-relative `*at` calls — the crate that owns them (and their `unsafe`), so
+# this one writes none. Not a new edge in the shipped graph: aterm-gui already
+# links it, under the same `cfg(unix)`. Unix-only, like the crate itself
+# (`#![cfg(unix)]`) and its one user here (`disk_target::fd`); elsewhere the
+# reclaim refuses. Declared for every target, it pulled aterm-dirfd into the
+# Windows cells' graph, whose test-target pass then compiled its Unix-only
+# differential oracle (`tests/oracle.rs`) for Windows — 135 errors per cell.
+aterm-dirfd = { workspace = true }
+
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# This crate's INTEGRATION tests link the library with its source↔spec
+# anchors on (`spec-anchors`), so a Tier-1 bind in `tests/` (the footer's
+# `conformance_footer_model`, the Codex nudge's
+# `supervise_conformance_codex_rate_nudge`) sees its machine's anchors and
+# proves each one ENTERED — the unit-test build expands them through
+# `cfg(test)` already. A dev edge: `cargo build -p aterm` never follows it,
+# so the shipped library carries no aterm-spec and no probe (as aterm-gpu's
+# own `wgpu-oracle` edge).
+aterm-agent = { path = ".", features = ["spec-anchors"] }
 # The loopback-TLS remote-Turn test mints its capability's `EdgeToken`. Test-only:
 # the library names nothing from aterm-session. No cycle (aterm-session does not
 # depend on aterm-agent).

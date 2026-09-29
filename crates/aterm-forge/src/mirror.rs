@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo forge mirror` — the Lane 1 GENERATOR: turn `Cargo.lock`'s
+//! `targo --unverified forge mirror` — the Lane 1 GENERATOR: turn `Cargo.lock`'s
 //! registry-sourced entries into a cargo `local-registry` that cargo itself
 //! enforces.
 //!
@@ -63,7 +63,7 @@
 //! # Seams
 //!
 //! Closed (2026-09-01): the config split is [`crate::mirror_config`]
-//! (`cargo forge mirror config [--write]` renders the shippable
+//! (`targo --unverified forge mirror config [--write]` renders the shippable
 //! `[source.crates-io] replace-with` fragment at
 //! `tools/cargo-mirror-config.toml`, which flips no default — cargo does not
 //! read that path); the gate is `[OB-16]` in [`crate::check`]; and stale output
@@ -207,7 +207,7 @@ pub fn locked_registry_packages(root: &Path) -> Result<Vec<RegistryPkg>, String>
         let checksum = field("checksum").ok_or_else(|| {
             format!(
                 "{}: registry entry `{name} {version}` has no `checksum` — the lock cannot \
-                 anchor a mirror; regenerate it with `cargo metadata --locked`",
+                 anchor a mirror; regenerate it with `targo metadata --locked`",
                 path.display()
             )
         })?;
@@ -849,7 +849,7 @@ impl RowAnchor {
             )),
             Ok(dirs) if dirs.is_empty() => Self::absent(format!(
                 "no crates.io sparse-index cache under {} (a delivery target has none; run \
-                 `cargo fetch` once, online, on a machine that should)",
+                 `targo fetch` once, online, on a machine that should)",
                 cargo_home.display()
             )),
             Ok(dirs) => Self {
@@ -930,7 +930,7 @@ impl RowAnchor {
                  RESOLVES with — `deps` and `features` — which selects different code out of \
                  the same cksum-pinned tarball with every checksum in the delivery still \
                  correct. A mirror row must be the byte sequence cargo's own sparse-index \
-                 cache holds for that version. Re-emit with `cargo forge mirror emit`, or diff \
+                 cache holds for that version. Re-emit with `targo --unverified forge mirror emit`, or diff \
                  this against a fresh emit."
             )),
         }
@@ -999,7 +999,7 @@ pub(crate) fn judge_row_against_lock_edges(
     Some(format!(
         "{name} {version}: Cargo.lock resolved `{}` as a dependency of this package, and its \
          index row no longer declares it. The row's identity and cksum are untouched, so this \
-         is an edit to the metadata cargo resolves with. Re-emit with `cargo forge mirror emit`.",
+         is an edit to the metadata cargo resolves with. Re-emit with `targo --unverified forge mirror emit`.",
         missing.join("`, `")
     ))
 }
@@ -1024,7 +1024,7 @@ pub struct EmitStats {
     pub refusals: Vec<String>,
 }
 
-/// `cargo forge mirror emit --out DIR` with the real cargo home.
+/// `targo --unverified forge mirror emit --out DIR` with the real cargo home.
 pub fn run_emit(root: &Path, out: &Path) -> Result<Outcome, String> {
     let cargo_home = default_cargo_home()?;
     emit(root, &cargo_home, out).map(|(o, _)| o)
@@ -1278,7 +1278,7 @@ pub fn emit(root: &Path, cargo_home: &Path, out: &Path) -> Result<(Outcome, Emit
             } else {
                 st.fetch.push(format!(
                     "{} {} — no paired crates.io sparse-index cache line \
-                     (run `cargo fetch` online once)",
+                     (run `targo fetch` online once)",
                     p.name, p.version
                 ));
             }
@@ -1361,7 +1361,7 @@ pub fn emit(root: &Path, cargo_home: &Path, out: &Path) -> Result<(Outcome, Emit
 // verify
 // ---------------------------------------------------------------------------
 
-/// `cargo forge mirror verify --dir DIR`, with this machine's cargo cache as
+/// `targo --unverified forge mirror verify --dir DIR`, with this machine's cargo cache as
 /// the row-provenance anchor when it has one.
 pub fn run_verify(root: &Path, dir: &Path) -> Result<Outcome, String> {
     verify(root, dir, &RowAnchor::discover())
@@ -2626,7 +2626,7 @@ mod tests {
     /// untouched, so all three enforced checksums still agree; only the
     /// `features` map — which is what cargo RESOLVES with — is edited. Before
     /// the row anchor this passed `verify`, `bundle`, `check-bundle`,
-    /// `unbundle` and `cargo forge check`, and changed what the compiler saw.
+    /// `unbundle` and `targo --unverified forge check`, and changed what the compiler saw.
     #[test]
     fn an_edited_features_map_is_refused_against_cargos_own_index_cache() {
         let fx = good_fixture("row-features");

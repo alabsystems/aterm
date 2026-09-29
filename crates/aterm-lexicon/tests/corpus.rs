@@ -701,7 +701,7 @@ ambiguous= false
 
 #[test]
 fn class_precedence_total_order() {
-    // profanity > feline > orca > emphasis, independent of insertion order.
+    // profanity > feline > animal > emphasis, independent of insertion order.
     let over = r#"
 [[entry]]
 class    = "emphasis"
@@ -709,7 +709,18 @@ lang     = "en"
 mode     = "forms"
 stems    = []
 suffixes = []
-forms    = ["kitty", "fucking", "megasplash"]
+forms    = ["kitty", "fucking", "megasplash", "megapod"]
+cjk      = false
+ambiguous= false
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "whale"
+stems    = []
+suffixes = []
+forms    = ["megasplash"]
 cjk      = false
 ambiguous= false
 
@@ -719,7 +730,7 @@ lang     = "en"
 mode     = "forms"
 stems    = []
 suffixes = []
-forms    = ["megasplash"]
+forms    = ["megaorca", "megapod"]
 cjk      = false
 ambiguous= false
 "#;
@@ -740,7 +751,19 @@ ambiguous= false
         Class::Profanity,
         "profanity outranks everything"
     );
-    assert_eq!(one("megasplash"), Class::Orca, "orca outranks emphasis");
+    assert_eq!(one("megasplash"), Class::Animal, "animal outranks emphasis");
+    assert!(
+        lx.scan("megaorca", &o).is_empty(),
+        "a retired class = \"orca\" entry loads as nothing, not as an error"
+    );
+    // Nor does it mask a lower class any more (2026-09-27): while the class was
+    // suspended an orca entry outranked animal and emphasis and then drew
+    // nothing, so the same word under emphasis decorated nothing either.
+    assert_eq!(
+        one("megapod"),
+        Class::Emphasis,
+        "a retired orca entry no longer claims a word a lower class also lists"
+    );
 }
 
 // =============== Match.form_id / form_hash (sparkle identity P0) ================

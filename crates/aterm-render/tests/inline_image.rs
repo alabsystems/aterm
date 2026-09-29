@@ -156,7 +156,8 @@ fn negative_z_images_composite_before_base_and_combining_glyphs() {
             rows: 1,
             z_index: -1,
             band_lift_px: 0,
-            pixel_exact: false,
+            scaling: aterm_core::grid::extra::ImageScaling::Fit,
+            source_rect: None,
         });
         let composited = aterm_render::blend_rgb(cell_bg_u32, image_rgb_u32, alpha);
         let composited_bg = [
@@ -177,6 +178,7 @@ fn negative_z_images_composite_before_base_and_combining_glyphs() {
                         image: image.clone(),
                         cell_row: 0,
                         cell_col: 0,
+                        kitty: None,
                     },
                 ));
             }
@@ -237,7 +239,8 @@ fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
             rows: 1,
             z_index,
             band_lift_px: 0,
-            pixel_exact: false,
+            scaling: aterm_core::grid::extra::ImageScaling::Fit,
+            source_rect: None,
         });
         for &col in image_cols {
             input.images[0].push((
@@ -246,6 +249,7 @@ fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
                     image: Arc::clone(&image),
                     cell_row: 0,
                     cell_col: 0,
+                    kitty: None,
                 },
             ));
         }
@@ -320,7 +324,8 @@ fn chrome_band_lift_paints_the_lip_above_the_grid() {
             rows: 1,
             z_index: 0,
             band_lift_px,
-            pixel_exact: false,
+            scaling: aterm_core::grid::extra::ImageScaling::Fit,
+            source_rect: None,
         })
     };
     let make_input = |band_lift_px: u16| {
@@ -335,6 +340,7 @@ fn chrome_band_lift_paints_the_lip_above_the_grid() {
                     image: Arc::clone(&image),
                     cell_row: 0,
                     cell_col: col as u16,
+                    kitty: None,
                 },
             ));
         }
@@ -422,7 +428,8 @@ fn oversized_inline_image_png_draws_nothing_without_huge_alloc() {
             aterm_core::grid::extra::ImageFormat::Png,
             4 * cw,
             2 * ch,
-            false,
+            aterm_core::grid::extra::ImageScaling::Fit,
+            None,
         )
         .is_none(),
         "oversized inline-image PNG must decode to nothing"
@@ -476,7 +483,7 @@ fn text_only_frame_is_unaffected_by_the_image_path() {
     assert_eq!(a, b, "image-free frame renders identically");
 }
 
-/// ASPECT FIDELITY of the FITTED placement (`pixel_exact == false`): iTerm2 OSC
+/// ASPECT FIDELITY of the FITTED placement (`ImageScaling::Fit`): iTerm2 OSC
 /// 1337 `File=width=…;height=…`, Kitty with an explicit `c=`/`r=` cell box, and
 /// the host's own chrome rasters — every placement whose target was named in
 /// CELLS. The footprint decode FITS the source instead of stretching it.
@@ -513,7 +520,8 @@ fn footprint_decode_preserves_the_source_aspect_ratio() {
         },
         fp_w,
         fp_h,
-        false,
+        aterm_core::grid::extra::ImageScaling::Fit,
+        None,
     )
     .expect("raw RGBA fits its footprint");
     assert_eq!(
@@ -589,7 +597,8 @@ fn an_aspect_matched_source_still_fills_the_whole_footprint() {
         },
         fp_w,
         fp_h,
-        false,
+        aterm_core::grid::extra::ImageScaling::Fit,
+        None,
     )
     .expect("cell-exact raster decodes");
     assert_eq!(
@@ -610,12 +619,150 @@ fn an_aspect_matched_source_still_fills_the_whole_footprint() {
         },
         fp_w,
         fp_h,
-        false,
+        aterm_core::grid::extra::ImageScaling::Fit,
+        None,
     )
     .expect("aspect-matched raster decodes");
     assert!(
         out.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
         "an aspect-matched source leaves NO transparent margin"
+    );
+}
+
+/// STRETCH (iTerm2 `preserveAspectRatio=0`) is the one policy that fills the
+/// WHOLE footprint whatever the source's aspect. The same 120x60 raster the fit
+/// test letterboxes into a 126x68 box must, stretched, leave no transparent
+/// pixel at all — and the fitted decode of it is the negative control: it DOES
+/// leave bars, so the two policies are genuinely different requests.
+#[test]
+fn stretch_fills_the_whole_footprint_where_fit_letterboxes() {
+    use aterm_core::grid::extra::{ImageFormat, ImageScaling};
+    let (sw, sh) = (120usize, 60usize);
+    let src: Vec<u8> = std::iter::repeat_n([200u8, 30, 30, 255], sw * sh)
+        .flatten()
+        .collect();
+    let (fp_w, fp_h) = (126usize, 68usize);
+    let format = ImageFormat::RawRgba8 {
+        width: sw as u16,
+        height: sh as u16,
+    };
+    let decode = |scaling| {
+        aterm_render::decode_image_to_footprint(&src, format, fp_w, fp_h, scaling, None)
+            .expect("raw RGBA decodes")
+    };
+    let transparent = |out: &[u8]| {
+        out.as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[3] == 0)
+            .count()
+    };
+
+    let fitted = decode(ImageScaling::Fit);
+    assert!(
+        transparent(&fitted) > 0,
+        "control: FIT letterboxes a 2.00 raster in a 1.85 box"
+    );
+    let stretched = decode(ImageScaling::Stretch);
+    assert_eq!(stretched.len(), fp_w * fp_h * 4);
+    assert_eq!(
+        transparent(&stretched),
+        0,
+        "STRETCH fills every footprint pixel, aspect ignored"
+    );
+    // And the PNG path honours it identically to the raw one.
+    let png = solid_png(sw as u32, sh as u32, [200, 30, 30]);
+    let from_png = aterm_render::decode_image_to_footprint(
+        &png,
+        ImageFormat::Png,
+        fp_w,
+        fp_h,
+        ImageScaling::Stretch,
+        None,
+    )
+    .expect("PNG decodes");
+    assert_eq!(transparent(&from_png), 0, "PNG stretch fills the box too");
+}
+
+/// A Kitty source rectangle (`x=`/`y=`/`w=`/`h=`) crops BEFORE the scaling
+/// policy runs: only the named part of the raster reaches the footprint, a zero
+/// width/height means "to the edge", an over-long one is clamped, and one that
+/// misses the raster entirely draws nothing.
+#[test]
+fn source_rect_crops_before_the_scaling_policy() {
+    use aterm_core::grid::extra::{ImageFormat, ImageScaling, SourceRect};
+    // 4x2 raster: the left 2x2 half red, the right 2x2 half blue.
+    let (red, blue) = ([255u8, 0, 0, 255], [0u8, 0, 255, 255]);
+    let mut src = Vec::new();
+    for _y in 0..2 {
+        for x in 0..4 {
+            src.extend_from_slice(if x < 2 { &red } else { &blue });
+        }
+    }
+    let format = ImageFormat::RawRgba8 {
+        width: 4,
+        height: 2,
+    };
+    let crop = |rect: SourceRect, fp: (usize, usize)| {
+        aterm_render::decode_image_to_footprint(
+            &src,
+            format,
+            fp.0,
+            fp.1,
+            ImageScaling::PixelExact,
+            Some(rect),
+        )
+    };
+    let all = |out: &[u8], px: [u8; 4]| out.as_chunks::<4>().0.iter().all(|p| *p == px);
+
+    let right = SourceRect {
+        x: 2,
+        y: 0,
+        width: 2,
+        height: 2,
+    };
+    let out = crop(right, (2, 2)).expect("in-bounds crop decodes");
+    assert!(
+        all(&out, blue),
+        "only the right (blue) half survives the crop"
+    );
+    // Control: the uncropped raster in the same box shows red at its origin.
+    let whole =
+        aterm_render::decode_image_to_footprint(&src, format, 2, 2, ImageScaling::PixelExact, None)
+            .expect("decodes");
+    assert!(
+        all(&whole, red),
+        "control: uncropped, the top-left 2x2 is red"
+    );
+
+    // width/height 0 = to the edge; an over-long width is clamped.
+    for rect in [
+        SourceRect {
+            x: 2,
+            y: 0,
+            width: 0,
+            height: 0,
+        },
+        SourceRect {
+            x: 2,
+            y: 0,
+            width: 99,
+            height: 99,
+        },
+    ] {
+        let out = crop(rect, (2, 2)).expect("clamped crop decodes");
+        assert!(all(&out, blue), "{rect:?} reaches exactly the blue half");
+    }
+    // A rectangle outside the raster draws nothing.
+    let outside = SourceRect {
+        x: 4,
+        y: 0,
+        width: 1,
+        height: 1,
+    };
+    assert!(
+        crop(outside, (2, 2)).is_none(),
+        "a missed crop draws nothing"
     );
 }
 
@@ -770,7 +917,8 @@ fn sixel_footprint_decode_is_pixel_exact() {
         },
         fp_w,
         fp_h,
-        true,
+        aterm_core::grid::extra::ImageScaling::PixelExact,
+        None,
     )
     .expect("a raw raster places without a codec");
     assert_eq!(
@@ -806,7 +954,8 @@ fn sixel_footprint_decode_is_pixel_exact() {
         },
         5,
         4,
-        true,
+        aterm_core::grid::extra::ImageScaling::PixelExact,
+        None,
     )
     .expect("an oversized raster still places");
     assert_eq!(out.len(), 5 * 4 * 4);

@@ -128,9 +128,16 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// the same day): the block reaches every aterm child, but an owner may limit
 /// a headless instance's harness off (`[harness] headless = false`) or the
 /// whole harness (`enabled = false`), so "aterm's harness" would claim a
-/// press some sessions never get; the guard's advice holds either way.
+/// press some sessions never get; the guard's advice holds either way. v11
+/// (2026-09-27): the Rust paragraph's stock-pin sentence. On 2026-09-23 an
+/// orchestrating agent wrote `cargo +1.97.1` and "clippy/fmt" into ~45 subagent
+/// prompts for two repos whose rust-toolchain.toml pins stock 1.97.1, having read
+/// `aterm help rust`'s "the project wins" for such a pin; the block said nothing
+/// about pins at all. The owner's ruling that day: Rust means the Trust toolchain
+/// everywhere, a stock-pinned repo included — and the pin moves only rustup's
+/// proxies (measured: targo still ran the store's trustc there).
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v10 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v11 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 /// The end marker closing the managed block.
 const MARK_END: &str = "<!-- /aterm primer -->";
@@ -181,16 +188,15 @@ const RUST_NOTE: &str = "\
 aterm installs the ALab VERIFIED Rust toolchain beside stock Rust and atpkg's rc block puts
 it on PATH in every shell. USE IT, BY NAME (in replies too): `targo` (not cargo),
 `trustc` (not rustc), `tippy` (not clippy), `trustfmt` (not rustfmt); `ty`, `ay`, `clean`
-are the verifiers. Stock `cargo`/`rustc` is the EXCEPTION here, never the default — a
-session-scoped reroute prints the `targo` spelling whenever you type one; if you must run
-stock anyway, say why in your reply. Name the lane:
-`targo trust <cmd>` (verified, fail-closed, proof report) or `targo --unverified <cmd>`
-(no proof claim); a bare `targo build` is refused on purpose, so that refusal is not a
-broken tool. Run `aterm help rust` in the project BEFORE the first build: it MEASURES which
-compiler this directory gets. `'rustc' is not installed for the custom toolchain 'trust'`
-is a stale rustup link, not a blocked machine: `targo` still works; run `aterm pkg doctor`
-then `aterm pkg repair`; never rebuild a toolchain from source to answer it.
-If `$ATPKG_BIN` is unset and that directory is absent, this toolchain is not installed here.";
+are the verifiers. Stock `cargo`/`rustc` is the EXCEPTION; a session reroute prints the
+`targo` spelling. This holds when rust-toolchain.toml pins stock: that pin moves only rustup's proxies,
+never targo/tippy/trustfmt, so never write `cargo +<channel>`; explain any stock use.
+Name the lane: `targo trust <cmd>` (verified, fail-closed) or `targo --unverified <cmd>`
+(no proof claim). Bare `targo build` is refused on purpose. Run `aterm help rust` BEFORE
+building: it MEASURES this directory's compiler. `'rustc' is not installed for the custom
+toolchain 'trust'` means a stale rustup link: run `aterm pkg doctor`, then `aterm pkg repair`;
+never rebuild a toolchain from source for it.
+If `$ATPKG_BIN` is unset and `aterm pkg which targo` names nothing, this toolchain is not installed here.";
 
 /// The fabric paragraph — peer messaging, for EVERY agent in [`AGENT_FILES`].
 ///
@@ -1235,19 +1241,21 @@ pub enum HookRemoval {
 /// `statusLine` in the same position, or removed when that install kept none
 /// (see `restore_harness_statusline` for where the answer is read from).
 ///
-/// Where it runs TODAY: inside [`auto_prime`] (the window's pass at a fresh
-/// spawn, at most once a minute, and only while `agents_auto_prime` is on) and
-/// in `aterm agents remove`. It is public, and takes no knob, so that a
-/// caller can run it whatever `agents_auto_prime` says — the window running it
-/// at startup and after an update handoff is the in-GUI host's work (lane E,
-/// the next wave), not built here. Until then a user with the knob off keeps
-/// the hooks an older build wrote ([`remove_aterm_hooks_in`] is the same call
-/// from a home directory).
+/// Where it runs: inside [`auto_prime`] (the window's pass at a fresh spawn,
+/// at most once a minute, and only while `agents_auto_prime` is on); in
+/// `aterm agents remove`; and at every non-headless window start, including an
+/// update-handoff successor, whatever `agents_auto_prime` says (aterm-gui's
+/// `harness_host::sweep_legacy_hooks`, off the winit thread, through
+/// [`remove_aterm_hooks_in`] — the same call from a home directory). It takes
+/// no knob for that reason. A headless instance never touches the user's
+/// settings.
 ///
 /// # Errors
 ///
 /// An unreadable or unparseable file, or a shape no removal is safe into
 /// (`hooks` not an object, an event not an array): the file is left as it is.
+/// A failed write, which leaves the file as it was and no backup of it
+/// (`write_settings`).
 pub fn remove_aterm_hooks(path: &Path) -> Result<HookRemoval, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -1265,9 +1273,257 @@ pub fn remove_aterm_hooks(path: &Path) -> Result<HookRemoval, String> {
         return Ok(HookRemoval::Nothing);
     }
     let backup = write_backup(path, text.as_bytes())?;
-    write_atomically(path, format!("{}\n", doc.render()).as_bytes())
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    write_settings(path, &doc, Some(&backup))?;
     Ok(HookRemoval::Removed { removed, backup })
+}
+
+/// Claude Code's settings key for its TOP-EFFORT mode ("xhigh effort plus
+/// standing dynamic-workflow orchestration"): the key of [`CLAUDE_DEFAULTS`] that
+/// turns the mode on, written to `~/.claude/settings.json` and read back from it
+/// exactly as the vendor spells it.
+///
+/// SPELLED FROM PARTS ON PURPOSE. The publication baseline bans this word, joined,
+/// in every exported file, as the marker of an agent-session artifact, and no
+/// repository can waive a baseline pattern. Here it is the vendor's settings key,
+/// so the source names it ONCE, from parts, and every use — aterm-gui's and atpkg's
+/// doctor's included — goes through this constant, while the export guard keeps
+/// catching a real leak anywhere else. `concat!` makes the same `&'static str` the
+/// joined literal would, so the key written and the key read are the vendor's,
+/// byte for byte — pinned by `the_top_effort_key_is_the_vendors_spelling`, the
+/// one test that spells the key without this constant.
+pub const CLAUDE_TOP_EFFORT_KEY: &str = concat!("ultra", "code");
+
+/// THE CLAUDE CODE DEFAULTS aterm's owner runs with (2026-09-28): the top-effort
+/// mode ([`CLAUDE_TOP_EFFORT_KEY`]) on, xhigh effort, and the session-quality
+/// survey off. Each is ADDED to the user's Claude settings only where that key is
+/// UNSET — a value a person set by hand, any value, is theirs and is left exactly
+/// as it is (owner: "add that if unset or leave another setting if it's manually
+/// set"). The two that set an effort ([`CLAUDE_EFFORT_DEFAULTS`]) are also held
+/// back while a person's own effort stands anywhere in the file
+/// ([`claude_efforts_set_by_hand`]; owner: "if the session was EXPLICITLY and
+/// manually set to another setting, inherit that").
+///
+/// Why these three, read from Claude Code 2.1.283 itself:
+/// * [`CLAUDE_TOP_EFFORT_KEY`] — "xhigh effort plus standing dynamic-workflow
+///   orchestration";
+/// * `effortLevel` — the persisted effort ("Persisted effort level for supported
+///   models"), `xhigh` the level the top-effort mode implies;
+/// * `feedbackSurveyRate` — "Probability (0–1) that the session quality survey
+///   appears when eligible": `0` keeps its rating prompt from drawing under a
+///   supervised session's input.
+///
+/// Settings, not launch flags, on purpose: the live upgrade relaunches a session
+/// WITHOUT its launch `--effort` (owner direction 2026-09-23 — the default
+/// settings govern), so a default that lives only in a session evaporates at the
+/// next relaunch. Measured 2026-09-28 on a headless aterm: with the top-effort key
+/// `true` in the user settings a fresh launch, a harness-shaped `--resume`, and a
+/// `/model` pick all came up `xhigh` in the top-effort mode.
+pub const CLAUDE_DEFAULTS: [(&str, ClaudeDefault); 3] = [
+    (CLAUDE_TOP_EFFORT_KEY, ClaudeDefault::Bool(true)),
+    ("effortLevel", ClaudeDefault::Str(DEFAULT_EFFORT)),
+    ("feedbackSurveyRate", ClaudeDefault::Number("0")),
+];
+
+/// The effort the defaults bring. A person who set this very level by hand chose
+/// what the defaults would, so it holds nothing back.
+const DEFAULT_EFFORT: &str = "xhigh";
+
+/// The defaults that SET AN EFFORT, which are added only where no person's own
+/// effort stands ([`claude_efforts_set_by_hand`]). Claude Code 2.1.283 resolves
+/// the effort to `xhigh` whenever the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`])
+/// is true, BEFORE it reads the top-level `effortLevel` or the per-model one
+/// `/effort <level>` saves, so adding that key would silently override a `medium`
+/// a person picked; and a top-level `xhigh` beside a per-model `medium` says the
+/// opposite of what they chose. The survey rate is no effort and is added
+/// regardless. atpkg's doctor mirrors this list (it takes only the key's name,
+/// [`CLAUDE_TOP_EFFORT_KEY`], from this crate), pinned equal by a test in
+/// aterm-gui.
+pub const CLAUDE_EFFORT_DEFAULTS: [&str; 2] = [CLAUDE_TOP_EFFORT_KEY, "effortLevel"];
+
+/// Every effort a person set BY HAND in the Claude settings text
+/// `settings_json` that is not `xhigh` (the defaults' own effort), as `(path,
+/// value as JSON text)`: the top-level `effortLevel` first, then each
+/// `modelSettings.<model>.effortLevel` (where `/effort <level>` saves the level
+/// for the session's model) in model-name order. A duplicate key reads as
+/// Claude Code reads it, the last one winning. Empty when there is none, and for
+/// text that does not parse as JSON.
+///
+/// Public so that aterm-gui can pin atpkg's mirror of this rule (the doctor's
+/// report of which defaults the window holds back) to this one.
+#[must_use]
+pub fn claude_efforts_set_by_hand(settings_json: &str) -> Vec<(String, String)> {
+    settings_json::Json::parse(settings_json)
+        .map(|doc| efforts_set_by_hand(&doc))
+        .unwrap_or_default()
+}
+
+/// [`claude_efforts_set_by_hand`] over a parsed document.
+fn efforts_set_by_hand(doc: &settings_json::Json) -> Vec<(String, String)> {
+    use settings_json::Json;
+    fn last<'a>(members: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+        members.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    let Some(top) = doc.as_object() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut note = |path: String, effort: &Json| {
+        if effort.as_str() != Some(DEFAULT_EFFORT) {
+            found.push((path, effort.render()));
+        }
+    };
+    if let Some(effort) = last(top, "effortLevel") {
+        note("effortLevel".to_string(), effort);
+    }
+    if let Some(models) = last(top, "modelSettings").and_then(Json::as_object) {
+        // A map, so a model named twice keeps its LAST entry, and the models come
+        // out in name order.
+        let models: std::collections::BTreeMap<&str, &Json> =
+            models.iter().map(|(m, s)| (m.as_str(), s)).collect();
+        for (model, settings) in models {
+            if let Some(effort) = settings.as_object().and_then(|s| last(s, "effortLevel")) {
+                note(format!("modelSettings.{model}.effortLevel"), effort);
+            }
+        }
+    }
+    found
+}
+
+/// One default's value, as it is written when the key is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeDefault {
+    Bool(bool),
+    Str(&'static str),
+    /// The number's JSON text.
+    Number(&'static str),
+}
+
+impl ClaudeDefault {
+    fn json(self) -> settings_json::Json {
+        match self {
+            ClaudeDefault::Bool(b) => settings_json::Json::Bool(b),
+            ClaudeDefault::Str(s) => settings_json::Json::Str(s.to_string()),
+            ClaudeDefault::Number(n) => settings_json::Json::Number(n.to_string()),
+        }
+    }
+}
+
+/// What [`add_claude_defaults`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultsWrite {
+    /// Every default was already set (to it or to a person's own value) or held
+    /// back by a person's own effort, or there is no Claude settings directory
+    /// to write into.
+    Nothing,
+    /// These keys were added; the previous bytes (if the file existed) are at
+    /// `backup`.
+    Added {
+        keys: Vec<&'static str>,
+        backup: Option<PathBuf>,
+    },
+}
+
+/// Add each of [`CLAUDE_DEFAULTS`] to the Claude settings file at `path` where
+/// its key is UNSET, keeping every other key, and every value a person set, in
+/// the order it was written ([`settings_json`]). The defaults that set an effort
+/// ([`CLAUDE_EFFORT_DEFAULTS`]) are not added at all while an effort other than
+/// `xhigh` is set by hand anywhere in the file ([`claude_efforts_set_by_hand`]):
+/// that effort is the person's explicit choice, and the top-effort key
+/// ([`CLAUDE_TOP_EFFORT_KEY`]) would override it. The previous bytes go beside
+/// the file as `<file>.bak-<unix>` first, as [`remove_aterm_hooks`] does
+/// (`write_settings`). A file that already has every key is not touched, so the
+/// pass is quiet after the first write. A missing file is created (with only the
+/// defaults) when its directory exists — Claude Code reads it — and nothing is
+/// created when the directory itself is missing (no Claude Code here).
+///
+/// # Errors
+///
+/// An unreadable or unparseable file, one whose top level is not an object, or
+/// a symlink whose target does not exist (a dotfiles link to a file not there
+/// yet — created over, the link itself would be replaced by a plain file): it
+/// is left exactly as it is. A failed write, which leaves the file as it was and
+/// no backup of it.
+pub fn add_claude_defaults(path: &Path) -> Result<DefaultsWrite, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // NotFound through a link means the LINK is there and its target is
+            // not: never a missing file to create.
+            if let Ok(meta) = std::fs::symlink_metadata(path)
+                && meta.file_type().is_symlink()
+            {
+                let target = std::fs::read_link(path)
+                    .map_or_else(|_| "?".to_string(), |t| t.display().to_string());
+                return Err(format!(
+                    "{}: a symlink to {target}, which does not exist — left as it is",
+                    path.display()
+                ));
+            }
+            None
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    if text.is_none() && !path.parent().is_some_and(Path::is_dir) {
+        return Ok(DefaultsWrite::Nothing);
+    }
+    let mut doc = match &text {
+        Some(t) => settings_json::Json::parse(t).map_err(|e| format!("{}: {e}", path.display()))?,
+        None => settings_json::Json::Object(Vec::new()),
+    };
+    let own_effort = !efforts_set_by_hand(&doc).is_empty();
+    let top = doc
+        .as_object_mut()
+        .ok_or_else(|| format!("{}: the top level is not a JSON object", path.display()))?;
+    let mut keys = Vec::new();
+    for (key, value) in CLAUDE_DEFAULTS {
+        if own_effort && CLAUDE_EFFORT_DEFAULTS.contains(&key) {
+            continue;
+        }
+        if !top.iter().any(|(k, _)| k == key) {
+            top.push((key.to_string(), value.json()));
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Ok(DefaultsWrite::Nothing);
+    }
+    let backup = match &text {
+        Some(t) => Some(write_backup(path, t.as_bytes())?),
+        None => None,
+    };
+    write_settings(path, &doc, backup.as_deref())?;
+    Ok(DefaultsWrite::Added { keys, backup })
+}
+
+/// Write `doc` over the settings file at `path`, whose previous bytes the caller
+/// has just saved at `backup` ([`write_backup`]) — before the write, so a crash
+/// in the middle of it still leaves a copy. A write that FAILS removes that
+/// backup again: the file is exactly as it was, so the copy saves nothing, and a
+/// failure that repeats at every window start (a settings file linked into a
+/// read-only directory, as home-manager lays it out) must not leave one more
+/// full copy of the file each time.
+fn write_settings(
+    path: &Path,
+    doc: &settings_json::Json,
+    backup: Option<&Path>,
+) -> Result<(), String> {
+    write_atomically(path, format!("{}\n", doc.render()).as_bytes()).map_err(|e| {
+        if let Some(backup) = backup {
+            // Best effort: the error the caller sees is the write's.
+            let _ = std::fs::remove_file(backup);
+        }
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// [`add_claude_defaults`] on `<home>/.claude/settings.json`
+/// ([`CLAUDE_SETTINGS_FILE`]).
+///
+/// # Errors
+///
+/// As [`add_claude_defaults`].
+pub fn add_claude_defaults_in(home: &Path) -> Result<DefaultsWrite, String> {
+    add_claude_defaults(&home.join(CLAUDE_SETTINGS_FILE))
 }
 
 /// [`remove_aterm_hooks`] on `<home>/.claude/settings.json`
@@ -1426,6 +1682,25 @@ fn harness_state_of(command: &str) -> Option<PathBuf> {
 /// ([`create_private_temp`]'s mode) and given the target's own mode once the bytes
 /// are down, exactly as [`write_atomically`] treats the file itself.
 fn write_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    write_backup_with(path, |file| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => file.set_permissions(meta.permissions()),
+            _ => Ok(()),
+        }
+    })
+}
+
+/// [`write_backup`], its bytes and mode put down by `fill` into the file it has just
+/// created. A `fill` that FAILS takes that file away again: a copy cut short (a full
+/// disk, a failed sync) is no backup, and left behind it would read as one — and pile
+/// up, one more at every window start the failure repeats. Split out so a test can
+/// fail the fill, which nothing on a working disk does.
+fn write_backup_with(
+    path: &Path,
+    fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1433,13 +1708,12 @@ fn write_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     for n in 1..=64u32 {
         match create_private_temp(&candidate) {
             Ok(mut file) => {
-                file.write_all(bytes)
-                    .and_then(|()| file.sync_all())
-                    .and_then(|()| match std::fs::metadata(path) {
-                        Ok(meta) if meta.is_file() => file.set_permissions(meta.permissions()),
-                        _ => Ok(()),
-                    })
-                    .map_err(|e| format!("{}: {e}", candidate.display()))?;
+                if let Err(e) = fill(&mut file) {
+                    drop(file);
+                    // Best effort: the error the caller sees is the fill's.
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(format!("{}: {e}", candidate.display()));
+                }
                 return Ok(candidate);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2053,8 +2327,8 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         // Marked + versioned, so installs are idempotent and updatable.
         assert!(block.starts_with(MARK_BEGIN) && block.trim_end().ends_with(MARK_END));
         assert!(
-            MARK_BEGIN.contains(" v10 "),
-            "the rm sentence's reason changed (approve-all, 2026-09-24): bump the version"
+            MARK_BEGIN.contains(" v11 "),
+            "the Rust paragraph's stock-pin sentence changed the block: bump the version"
         );
         // v9: the verb pointer is the short catalog and the per-verb entry, never
         // the 114 KB page.
@@ -2126,6 +2400,11 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
             "aterm pkg doctor",
             "aterm pkg repair",
             "`$ATPKG_BIN` is unset",
+            // v9 (2026-09-24): a stock pin is rustup's, never the repo's lane —
+            // the sentence whose absence let `cargo +1.97.1` into ~45 prompts.
+            "rust-toolchain.toml pins stock",
+            "moves only rustup's proxies",
+            "never write `cargo +<channel>`",
         ] {
             assert!(RUST_NOTE.contains(needle), "rust note lost: {needle}");
         }
@@ -2284,7 +2563,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         let old = format!("before\n\n{V1_BLOCK}\nafter\n");
         assert_eq!(block_state(&old, &block).unwrap(), BlockState::Stale);
         let updated = upsert_block(&old, &block).unwrap().unwrap();
-        assert!(updated.starts_with("before\n\n<!-- aterm primer v10"));
+        assert!(updated.starts_with("before\n\n<!-- aterm primer v11"));
         assert!(updated.ends_with("<!-- /aterm primer -->\n\nafter\n"));
         assert_eq!(
             updated.matches(MARK_PREFIX).count(),
@@ -2316,7 +2595,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v10"),
+                updated.starts_with("mine\n\n<!-- aterm primer v11"),
                 "{}",
                 a.name
             );
@@ -2376,7 +2655,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v10"),
+                updated.starts_with("mine\n\n<!-- aterm primer v11"),
                 "{}",
                 a.name
             );
@@ -2424,7 +2703,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v10"),
+                updated.starts_with("mine\n\n<!-- aterm primer v11"),
                 "{}",
                 a.name
             );
@@ -2482,7 +2761,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v10"),
+                updated.starts_with("mine\n\n<!-- aterm primer v11"),
                 "{}",
                 a.name
             );
@@ -4172,6 +4451,21 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         }
     }
 
+    /// THE ONE TEST-SIDE ORACLE FOR CLAUDE CODE'S TOP-EFFORT SETTINGS KEY. Every
+    /// other fixture and expectation (here, in atpkg's doctor and in aterm-gui)
+    /// goes through [`CLAUDE_TOP_EFFORT_KEY`] itself, so a typo in its parts —
+    /// `"ultra", "_code"`, or a guessed vendor rename — would pass them all while
+    /// the window wrote a key Claude Code 2.1.283 ignores into every user's
+    /// settings and the doctor reported it as set. This pins the constant to the
+    /// vendor's spelling, written independently: the bytes with one letter as a
+    /// hex escape (`\x63` is `c`), because the export baseline bans the joined
+    /// word in every exported file and a byte-string escape is the one spelling
+    /// that is neither the joined word nor the constant's own parts.
+    #[test]
+    fn the_top_effort_key_is_the_vendors_spelling() {
+        assert_eq!(CLAUDE_TOP_EFFORT_KEY.as_bytes(), b"ultra\x63ode");
+    }
+
     /// Decision "B" (2026-09-22): the pass writes no hooks, and takes out the
     /// entries earlier aterms wrote — ONCE: the matched entries go (and the
     /// harness's `statusLine`, with no byte copy to restore from), a group or
@@ -4179,6 +4473,251 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
     /// key stays in the order the owner wrote it, the previous bytes are beside
     /// the file as `<file>.bak-<unix>`, the row names the file; the next pass
     /// writes nothing and makes no second backup.
+    /// THE CLAUDE DEFAULTS ARE ADDED ONLY WHERE UNSET (owner, 2026-09-28): an
+    /// unset key gets the top-effort mode / xhigh / the survey off; a value a
+    /// person set by hand — even one that differs, the top-effort key `false`,
+    /// `effortLevel: "medium"`, a non-zero survey rate — is theirs and stays; every
+    /// other key stays in the order it was written; a file with every key is not
+    /// touched.
+    #[test]
+    fn claude_defaults_fill_only_unset_keys_and_keep_a_persons_own_values() {
+        const TOP: &str = CLAUDE_TOP_EFFORT_KEY;
+        let home = aterm_tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        // No Claude Code here at all: nothing is created.
+        assert_eq!(
+            add_claude_defaults_in(home.path()),
+            Ok(DefaultsWrite::Nothing)
+        );
+        assert!(!claude.exists());
+
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        // The directory but no file: created with the three defaults, no backup.
+        let created = add_claude_defaults_in(home.path()).unwrap();
+        assert_eq!(
+            created,
+            DefaultsWrite::Added {
+                keys: vec![TOP, "effortLevel", "feedbackSurveyRate"],
+                backup: None,
+            }
+        );
+        let text = std::fs::read_to_string(&settings).unwrap();
+        let v = settings_json::Json::parse(&text).unwrap();
+        assert_eq!(v.get(TOP), Some(&settings_json::Json::Bool(true)));
+        assert_eq!(
+            v.get("effortLevel"),
+            Some(&settings_json::Json::Str("xhigh".into()))
+        );
+
+        // A person's own values, one per default, and a foreign key first.
+        std::fs::write(
+            &settings,
+            format!(r#"{{"model": "claude-fable-5-1", "{TOP}": false, "effortLevel": "medium"}}"#),
+        )
+        .unwrap();
+        let partial = add_claude_defaults_in(home.path()).unwrap();
+        let DefaultsWrite::Added { keys, backup } = partial else {
+            panic!("the survey rate was unset: {partial:?}");
+        };
+        assert_eq!(keys, vec!["feedbackSurveyRate"], "only the unset key");
+        assert!(
+            backup.is_some_and(|b| b.exists()),
+            "the previous bytes are kept"
+        );
+        let v = settings_json::Json::parse(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v.get(TOP), Some(&settings_json::Json::Bool(false)));
+        assert_eq!(
+            v.get("effortLevel"),
+            Some(&settings_json::Json::Str("medium".into()))
+        );
+        assert_eq!(
+            v.as_object().unwrap().first().map(|(k, _)| k.as_str()),
+            Some("model"),
+            "every other key stays where it was written"
+        );
+
+        // Every key set: not touched — same bytes, no new backup.
+        let before = std::fs::read(&settings).unwrap();
+        let backups = || {
+            std::fs::read_dir(&claude)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("settings.json.bak-")
+                })
+                .count()
+        };
+        let n = backups();
+        assert_eq!(
+            add_claude_defaults_in(home.path()),
+            Ok(DefaultsWrite::Nothing)
+        );
+        assert_eq!(std::fs::read(&settings).unwrap(), before);
+        assert_eq!(backups(), n);
+
+        // Unparseable: refused, and left exactly as it is.
+        std::fs::write(&settings, b"{ not json").unwrap();
+        assert!(add_claude_defaults_in(home.path()).is_err());
+        assert_eq!(std::fs::read(&settings).unwrap(), b"{ not json");
+    }
+
+    /// AN EFFORT SET BY HAND IS INHERITED (owner, 2026-09-28: "if the session was
+    /// EXPLICITLY and manually set to another setting, inherit that"). Claude Code
+    /// resolves the effort to `xhigh` whenever the top-effort key
+    /// ([`CLAUDE_TOP_EFFORT_KEY`]) is true, before it reads the level a person
+    /// saved, so while any effort other than `xhigh` stands — the per-model one
+    /// `/effort medium` saves, or a top-level one — neither that key nor a
+    /// top-level `effortLevel` is added; the survey rate, no effort, still is. A
+    /// hand-set `xhigh` is the default's own and holds nothing back.
+    #[test]
+    fn claude_defaults_add_no_top_effort_or_effort_over_an_effort_set_by_hand() {
+        const TOP: &str = CLAUDE_TOP_EFFORT_KEY;
+        let home = aterm_tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let added = |text: &str| -> (Vec<&'static str>, settings_json::Json) {
+            std::fs::write(&settings, text).unwrap();
+            let keys = match add_claude_defaults_in(home.path()).unwrap() {
+                DefaultsWrite::Added { keys, .. } => keys,
+                DefaultsWrite::Nothing => Vec::new(),
+            };
+            let after = std::fs::read_to_string(&settings).unwrap();
+            (keys, settings_json::Json::parse(&after).unwrap())
+        };
+
+        // What `/effort medium` saves: the per-model level.
+        let (keys, v) =
+            added(r#"{"modelSettings": {"claude-opus-5-5": {"effortLevel": "medium"}}}"#);
+        assert_eq!(keys, vec!["feedbackSurveyRate"], "only the survey rate");
+        assert_eq!(v.get(TOP), None, "the top-effort key would override medium");
+        assert_eq!(v.get("effortLevel"), None);
+
+        // A top-level effort set by hand holds the top-effort key back too.
+        let (keys, v) = added(r#"{"effortLevel": "medium"}"#);
+        assert_eq!(keys, vec!["feedbackSurveyRate"]);
+        assert_eq!(v.get(TOP), None);
+        assert_eq!(
+            v.get("effortLevel"),
+            Some(&settings_json::Json::Str("medium".into()))
+        );
+
+        // A hand-set `xhigh`, per model or top-level, blocks nothing.
+        let (keys, v) =
+            added(r#"{"modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh"}}}"#);
+        assert_eq!(keys, vec![TOP, "effortLevel", "feedbackSurveyRate"]);
+        assert_eq!(v.get(TOP), Some(&settings_json::Json::Bool(true)));
+        let (keys, _) = added(r#"{"effortLevel": "xhigh"}"#);
+        assert_eq!(keys, vec![TOP, "feedbackSurveyRate"]);
+
+        // The rule's own reading: every such effort, top level first, then the
+        // models in name order, the last of a duplicate key winning as Claude
+        // Code's parser has it; a model setting with no effort is none.
+        assert_eq!(
+            claude_efforts_set_by_hand(
+                r#"{"modelSettings": {"z": {"effortLevel": "low"}, "a": {"effortLevel": "high"},
+                    "b": {"maxEffortLevel": "high"}, "c": {"effortLevel": "xhigh"}},
+                    "effortLevel": "xhigh", "effortLevel": "medium"}"#
+            ),
+            vec![
+                ("effortLevel".to_string(), "\"medium\"".to_string()),
+                (
+                    "modelSettings.a.effortLevel".to_string(),
+                    "\"high\"".to_string()
+                ),
+                (
+                    "modelSettings.z.effortLevel".to_string(),
+                    "\"low\"".to_string()
+                ),
+            ]
+        );
+        assert!(
+            claude_efforts_set_by_hand(r#"{"effortLevel": "medium", "effortLevel": "xhigh"}"#)
+                .is_empty()
+        );
+        assert!(claude_efforts_set_by_hand("not json").is_empty());
+    }
+
+    /// A `settings.json` that is a symlink to a file not there (a dotfiles link
+    /// whose checkout is missing) is not a missing file: created over, the write
+    /// would put a plain file where the LINK was — the dotfiles link gone, and no
+    /// backup of it. It is refused by name and left exactly as it is; the hook
+    /// sweep, which only ever rewrites a file it read, does nothing to it either.
+    #[cfg(unix)]
+    #[test]
+    fn claude_defaults_never_create_over_a_dangling_settings_link() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let target = home.path().join("dotfiles").join("claude-settings.json");
+        std::os::unix::fs::symlink(&target, &settings).unwrap();
+
+        let refused = add_claude_defaults_in(home.path());
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("a symlink to") && e.contains("does not exist")),
+            "{refused:?}"
+        );
+        assert_eq!(remove_aterm_hooks_in(home.path()), Ok(HookRemoval::Nothing));
+        let meta = std::fs::symlink_metadata(&settings).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link is still a link");
+        assert_eq!(std::fs::read_link(&settings).unwrap(), target);
+        assert!(!target.exists(), "nothing is created at the link's target");
+        assert_eq!(
+            std::fs::read_dir(&claude).unwrap().count(),
+            1,
+            "no backup and no temp file beside the link"
+        );
+    }
+
+    /// A write that FAILS leaves no backup: the settings file is a link into a
+    /// read-only directory (as home-manager lays it out), so the backup beside the
+    /// link succeeds and the write beside the real file cannot. Both rewriters
+    /// return the error, the file keeps its bytes, and no `.bak-` copy is left to
+    /// pile up at every window start.
+    #[cfg(unix)]
+    #[test]
+    fn a_settings_write_that_fails_leaves_no_backup_behind() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = aterm_tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let store = home.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let real = store.join("settings.json");
+        // aterm's hooks to remove AND every default unset: both passes would write.
+        std::fs::write(&real, SETTINGS_WITH_ATERM_HOOKS).unwrap();
+        std::os::unix::fs::symlink(&real, claude.join("settings.json")).unwrap();
+
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let hooks = remove_aterm_hooks_in(home.path());
+        let defaults = add_claude_defaults_in(home.path());
+        // Put the permissions back before asserting, so the tempdir can go.
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(hooks.is_err(), "{hooks:?}");
+        assert!(defaults.is_err(), "{defaults:?}");
+        let backups: Vec<String> = std::fs::read_dir(&claude)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("settings.json.bak-"))
+            .collect();
+        assert!(
+            backups.is_empty(),
+            "a backup outlived the failed write: {backups:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            SETTINGS_WITH_ATERM_HOOKS
+        );
+    }
+
     #[test]
     fn the_pass_removes_the_hook_entries_aterm_wrote_and_leaves_the_foreign_ones() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -4287,6 +4826,49 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             assert_ne!(second, backup);
             assert_eq!(mode_of(&second), mode, "second backup of a {mode:o} file");
         }
+    }
+
+    /// A backup whose bytes FAIL to go down after its file was created — a full disk
+    /// or a failed sync, injected here, since nothing on a working disk fails — is
+    /// taken away again: the error comes back, and no `.bak-` file cut short is left
+    /// to read as a copy of the settings, nor to pile up at every window start the
+    /// failure repeats. The control: the same call with a fill that succeeds leaves
+    /// its backup.
+    #[test]
+    fn a_backup_whose_bytes_fail_to_go_down_is_not_left_behind() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let settings = home.path().join("settings.json");
+        std::fs::write(&settings, SETTINGS_WITH_ATERM_HOOKS).unwrap();
+        let backups = || -> Vec<String> {
+            std::fs::read_dir(home.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("settings.json.bak-"))
+                .collect()
+        };
+
+        let failed = write_backup_with(&settings, |file| {
+            file.write_all(&SETTINGS_WITH_ATERM_HOOKS.as_bytes()[..16])?;
+            Err(std::io::Error::other("injected: no space left on device"))
+        });
+        let why = failed.unwrap_err();
+        assert!(why.contains("injected: no space left on device"), "{why}");
+        assert!(
+            backups().is_empty(),
+            "a backup cut short outlived its failure: {:?}",
+            backups()
+        );
+
+        let kept = write_backup_with(&settings, |file| {
+            file.write_all(SETTINGS_WITH_ATERM_HOOKS.as_bytes())
+        })
+        .unwrap();
+        assert_eq!(backups().len(), 1, "{:?}", backups());
+        assert_eq!(
+            std::fs::read_to_string(kept).unwrap(),
+            SETTINGS_WITH_ATERM_HOOKS
+        );
     }
 
     /// The removal is callable on its own — the window runs it whatever

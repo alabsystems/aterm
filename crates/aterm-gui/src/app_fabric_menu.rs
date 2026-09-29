@@ -8,7 +8,7 @@
 //! mechanism: every row is the menu-bar face of something the wire already
 //! does —
 //!
-//! * **Inbox…** is `inbox --peek --meta` on the focused session, rendered as a
+//! * **Inbox** is `inbox --peek --meta` on the focused session, rendered as a
 //!   Markdown tab. METADATA ONLY, by construction: the `--meta` form prints no
 //!   body, and the file is written `0600`.
 //! * **Hold This Session / Lift Hold** are the `hold` verb with
@@ -16,7 +16,7 @@
 //!   Owner may name — so a FLEET hold is exactly as untouchable from the menu
 //!   as from `aterm ctl hold`: the rows grey with the fleet's reason and a
 //!   click that slipped past the grey is answered `ERR denied` and shown.
-//! * **Fabric Status… / Turn Fabric On… / Turn Fabric Off…** run `aterm fabric
+//! * **Fabric Status / Turn Fabric On… / Turn Fabric Off…** run `aterm fabric
 //!   [on|off]` as a CHILD of this process — the round-13 verb, untouched — on
 //!   a thread, pointed at THIS instance's control socket, and open what it
 //!   printed as a tab. `on`/`off` ask first (the platform's confirm sheet).
@@ -198,7 +198,7 @@ pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     file.write_all(text.as_bytes())
 }
 
-/// The Inbox… tab's text: a heading, what the listing is (and is not), then
+/// The Inbox tab's text: a heading, what the listing is (and is not), then
 /// the `inbox --peek --meta` reply verbatim in a fenced block. The reply's
 /// rows carry id, offset, time, sender, kind, trust and the flags — the
 /// `--meta` form prints no body, which is the whole point of this surface.
@@ -206,8 +206,8 @@ pub(crate) fn inbox_markdown(sid: &str, listing: &str) -> String {
     let mut s = String::with_capacity(listing.len() + 256);
     s.push_str(&format!("# Inbox \u{2014} {sid}\n\n"));
     s.push_str(
-        "Metadata only (`inbox --peek --meta`): who wrote, what kind, how trusted, \
-         when \u{2014} never the text of a message. Peeked: nothing is marked listed.\n\n",
+        "Who wrote, what kind, how trusted, when \u{2014} never the text of a message. \
+         Opening this list leaves the session's inbox as it was.\n\n",
     );
     s.push_str("```text\n");
     s.push_str(listing.trim_end());
@@ -224,8 +224,7 @@ pub(crate) fn identity_markdown(sid: &str, identity: Option<&str>, reply: Option
             s.push_str(&format!("# Identity \u{2014} {name}\n\n"));
             s.push_str(&format!(
                 "Session {sid} runs under the agent identity `{name}`: its agents keep \
-                 their homes (and logins) in the identity's own directory. Read-only \
-                 (`identities {name}`).\n\n"
+                 their homes (and logins) in the identity's own directory. Read-only.\n\n"
             ));
             s.push_str("```text\n");
             s.push_str(reply.unwrap_or("").trim_end());
@@ -243,7 +242,7 @@ pub(crate) fn identity_markdown(sid: &str, identity: Option<&str>, reply: Option
     s
 }
 
-/// The Fabric Status… / On / Off tab's text: the command, how it ended, then
+/// The Fabric Status / On / Off tab's text: the command, how it ended, then
 /// its stdout and stderr in fenced blocks.
 fn fabric_markdown(
     plan: &FabricPlan,
@@ -253,7 +252,7 @@ fn fabric_markdown(
 ) -> String {
     let mut s = String::new();
     s.push_str(&format!("# {}\n\n", plan.verb.words()));
-    s.push_str(&format!("{}\n\n", fabric_status_words(plan.verb, status)));
+    s.push_str(&format!("{}\n\n", fabric_status_words(status)));
     if !stdout.trim().is_empty() {
         s.push_str("```text\n");
         s.push_str(stdout.trim_end());
@@ -267,9 +266,8 @@ fn fabric_markdown(
     s
 }
 
-/// One line saying how the child ended — the notice and the tab's subtitle.
-/// Why `aterm fabric …` did not end cleanly, in a few words: `exited 2`,
-/// `killed by a signal`, or the spawn's own error.
+/// Why `aterm fabric …` did not end cleanly, in a few words — the band row's
+/// reason: `exited 2`, `killed by a signal`, or the spawn's own error.
 fn fabric_failure_reason(status: &Result<Option<i32>, String>) -> String {
     match status {
         Ok(Some(code)) => format!("exited {code}"),
@@ -278,12 +276,20 @@ fn fabric_failure_reason(status: &Result<Option<i32>, String>) -> String {
     }
 }
 
-fn fabric_status_words(verb: FabricVerb, status: &Result<Option<i32>, String>) -> String {
+/// Why the `aterm` binary did not start: its path and the OS error. No verb of
+/// its own — the tab's "Could not run:" and the band's "Couldn't run …" say it.
+fn spawn_failure(cli: &std::path::Path, e: &std::io::Error) -> String {
+    format!("{}: {e}", cli.display())
+}
+
+/// The output tab's line under its heading (the command): how it ended, and
+/// nothing the heading or the page itself already says.
+fn fabric_status_words(status: &Result<Option<i32>, String>) -> String {
     match status {
-        Ok(Some(0)) => format!("{}: done.", verb.words()),
-        Ok(Some(code)) => format!("{} exited {code} \u{2014} see the tab.", verb.words()),
-        Ok(None) => format!("{} was killed by a signal.", verb.words()),
-        Err(e) => format!("{} could not run: {e}", verb.words()),
+        Ok(Some(0)) => "Done.".to_string(),
+        Ok(Some(code)) => format!("Exited {code}."),
+        Ok(None) => "Killed by a signal.".to_string(),
+        Err(e) => format!("Could not run: {e}"),
     }
 }
 
@@ -422,7 +428,7 @@ impl App {
         }
     }
 
-    /// Inbox…: the focused session's `inbox --peek --meta` as a Markdown tab
+    /// Inbox: the focused session's `inbox --peek --meta` as a Markdown tab
     /// on `wid`. Nothing with no focused session (the row is greyed then).
     pub(crate) fn open_session_inbox_tab(&mut self, wid: WindowId) {
         let Some(session) = self.focused_session_id(wid) else {
@@ -509,7 +515,7 @@ impl App {
         self.post_message(crate::message_reporters::fabric_failure(verb, title, lines));
     }
 
-    /// Fabric Status… / Turn Fabric On… / Turn Fabric Off…: confirm when the
+    /// Fabric Status / Turn Fabric On… / Turn Fabric Off…: confirm when the
     /// verb changes something, compose the plan, and — on a real window — run
     /// `aterm fabric …` as a child on its own thread (it walks every local
     /// instance itself), opening its output as a tab when it ends.
@@ -561,11 +567,7 @@ impl App {
                         String::from_utf8_lossy(&out.stdout).into_owned(),
                         String::from_utf8_lossy(&out.stderr).into_owned(),
                     ),
-                    Err(e) => (
-                        Err(format!("cannot run {}: {e}", cli.display())),
-                        String::new(),
-                        String::new(),
-                    ),
+                    Err(e) => (Err(spawn_failure(&cli, &e)), String::new(), String::new()),
                 };
                 let text = fabric_markdown(&plan, &status, &stdout, &stderr);
                 let status = match write_private(&plan.out, &text) {
@@ -630,7 +632,7 @@ impl App {
 mod tests {
     //! SPEC19 §9's tests for the Fabric menu's App side: Hold/Lift greyed with
     //! the fleet reason under a fleet hold (and live in the right order
-    //! otherwise), Inbox… opening a metadata-only tab, Set Role… writing the
+    //! otherwise), Inbox opening a metadata-only tab, Set Role… writing the
     //! role, the presence toggles gating the projection and queueing their
     //! durable write, and the fabric commands composing without running.
 
@@ -808,7 +810,7 @@ mod tests {
         ));
     }
 
-    /// Inbox…: a delivered task appears in the tab's file by id, sender, kind
+    /// Inbox: a delivered task appears in the tab's file by id, sender, kind
     /// and trust — and its TEXT does not. The tab is a Markdown document on
     /// the window; the row is greyed with no session.
     #[test]
@@ -987,13 +989,27 @@ mod tests {
         assert_eq!(FabricVerb::On.words(), "aterm fabric on");
         assert!(FabricVerb::Status.confirmation().is_none());
         assert!(FabricVerb::Off.confirmation().is_some());
-        assert_eq!(
-            fabric_status_words(FabricVerb::On, &Ok(Some(1))),
-            "aterm fabric on exited 1 \u{2014} see the tab."
-        );
+        // The tab's line under the `# aterm fabric on` heading says how it
+        // ended and no more: not the command again, not "see the tab" on the
+        // tab itself.
+        assert_eq!(fabric_status_words(&Ok(Some(1))), "Exited 1.");
+        assert_eq!(fabric_status_words(&Ok(Some(0))), "Done.");
+        // A spawn failure says "run" once: the tab's own words, then the path
+        // and the OS error (the band's reason is the same string).
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let failed = Err(spawn_failure(std::path::Path::new("/x/aterm"), &missing));
+        let words = fabric_status_words(&failed);
+        assert!(words.starts_with("Could not run: /x/aterm: "), "{words}");
+        assert_eq!(words.matches("run").count(), 1, "{words}");
+        assert!(fabric_failure_reason(&failed).starts_with("/x/aterm: "));
+        app.run_fabric_cli(wid, FabricVerb::On);
+        let plan = app.last_fabric_plan.clone().expect("a plan");
+        let md = fabric_markdown(&plan, &Ok(Some(1)), "out\n", "");
+        assert!(md.starts_with("# aterm fabric on\n\nExited 1.\n\n"), "{md}");
+        assert!(!md.contains("see the tab"), "{md}");
     }
 
-    /// The Inbox… document's text is the listing, verbatim, fenced.
+    /// The Inbox document's text is the listing, verbatim, fenced.
     #[test]
     fn inbox_markdown_fences_the_listing_verbatim() {
         let md = inbox_markdown(
@@ -1004,5 +1020,14 @@ mod tests {
         assert!(md.ends_with(
             "```text\nOK 1 hold=0\nmsg 1 off=1 t=5 from=x kind=note trust=agent\n```\n"
         ));
+        // The prose above the listing is for a person: no wire command, no
+        // internal flag name.
+        let prose = md.split("```").next().unwrap_or_default();
+        assert!(prose.contains("never the text of a message"), "{prose}");
+        assert!(
+            prose.contains("leaves the session's inbox as it was"),
+            "{prose}"
+        );
+        assert!(!prose.contains('`') && !prose.contains("listed"), "{prose}");
     }
 }

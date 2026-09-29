@@ -176,8 +176,7 @@ impl StoreLock {
         let tmp = layout
             .prefix
             .join(format!("store.lock.holder.tmp-{}", std::process::id()));
-        if crate::call2(std::fs::write, &tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_ok()
-        {
+        if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
             self.holder = Some(path);
         } else {
             let _ = std::fs::remove_file(&tmp);
@@ -1170,25 +1169,32 @@ mod tests {
     }
 
     /// An unusable prefix is not something to wait on: the `Io` refusal comes back
-    /// at once, with no announcement.
+    /// at once, with no announcement. "At once" is read off the wait's own polls —
+    /// every poll asks `still_wanted` first, and none was asked — not off a clock,
+    /// with a minute's hang detector against a bound of two.
     #[test]
     fn lock_store_waiting_never_waits_on_io() {
         let l = temp_layout("wait-badprefix");
         std::fs::write(&l.prefix, b"not a directory").unwrap();
         let started = Instant::now();
         let announced = std::cell::Cell::new(0u32);
+        let polls = std::cell::Cell::new(0u32);
         let err = match lock_store_waiting(
             &l,
-            Duration::from_secs(5),
+            Duration::from_secs(120),
             |_| announced.set(announced.get() + 1),
-            || true,
+            || {
+                polls.set(polls.get() + 1);
+                true
+            },
         ) {
             Ok(_) => panic!("a file-shaped prefix cannot yield a store lock"),
             Err(e) => e,
         };
         assert!(matches!(err, StoreLockError::Io(..)), "{err:?}");
+        assert_eq!(polls.get(), 0, "no wait on Io: the first attempt's refusal");
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_secs(60),
             "no wait on Io: {:?}",
             started.elapsed()
         );
@@ -1198,7 +1204,9 @@ mod tests {
 
     /// A waiter whose caller has gone (`still_wanted` says no — the window that
     /// spawned it quit) stands down with `Contended` instead of polling out its
-    /// whole bound and then racing a successor's waiter for the freed lock.
+    /// whole bound and then racing a successor's waiter for the freed lock: at
+    /// the very poll that found it gone (read off the polls, not a clock), and
+    /// inside a minute's hang detector against a bound of two.
     #[test]
     fn lock_store_waiting_stands_down_when_no_longer_wanted() {
         let a = temp_layout("wait-orphan");
@@ -1210,8 +1218,16 @@ mod tests {
         let started = Instant::now();
         let err = match lock_store_waiting(
             &b,
-            Duration::from_secs(30),
-            |_| panic!("stood down inside the grace: nothing to announce"),
+            Duration::from_secs(120),
+            // Nothing is announced inside the grace. A first poll a loaded
+            // machine delays past the grace may announce — the caller is still
+            // there then — but never one inside it.
+            |_| {
+                assert!(
+                    started.elapsed() >= WAIT_ANNOUNCE_GRACE,
+                    "stood down inside the grace: nothing to announce"
+                );
+            },
             || {
                 polls.set(polls.get() + 1);
                 polls.get() < 2
@@ -1221,8 +1237,9 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, StoreLockError::Contended(..)), "{err:?}");
+        assert_eq!(polls.get(), 2, "stood down at the poll that found it gone");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(60),
             "stood down long before the bound: {:?}",
             started.elapsed()
         );

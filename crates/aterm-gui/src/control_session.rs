@@ -125,9 +125,9 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
     } else {
         session_window_rows(proxy)
     };
-    sessions_lines(&snapshot, rows.as_deref().map_err(|e| *e), |id| {
-        frozen.contains(&id)
-    })
+    // A failed hop costs the window columns (`-`) whatever its reason.
+    let rows = rows.as_deref().map_err(|_| "placement hop failed");
+    sessions_lines(&snapshot, rows, |id| frozen.contains(&id))
 }
 
 /// `sessions bridge`: the same local-id, stable-sid and launch-nonce triples
@@ -191,9 +191,9 @@ const PLACEMENT_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 /// `window=- active=- wfocus=-` and every session still appears.
 pub(crate) fn session_window_rows(
     proxy: Option<&EventLoopProxy<Wake>>,
-) -> Result<Vec<SessionWindowRow>, &'static str> {
+) -> Result<Vec<SessionWindowRow>, super::control_media::MainHopError> {
     let Some(proxy) = proxy else {
-        return Err("no event loop");
+        return Err(super::control_media::MainHopError::Reason("no event loop"));
     };
     super::control_media::call_main_within(proxy, PLACEMENT_HOP_TIMEOUT, |reply| {
         Wake::ReadSessionWindows { reply }
@@ -614,14 +614,17 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     /// The action decided under an immutable read, applied after the borrow ends.
     enum Act {
         None,
-        Release,
+        /// Release, and wake the preempted turn's driving session too (its
+        /// band's `▸ @<sid>` reads this lease): the wedged turn's own guard
+        /// finds another id, or none, when it drops, and posts nothing.
+        Release(Option<aterm_session::SessionId>),
         Refuse(String),
     }
     let now = crate::metrics::now_us();
     let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
     let act = match lease.as_ref() {
         None => Act::None,
-        Some(crate::Lease::Turn { id, .. }) => {
+        Some(crate::Lease::Turn { id, driver, .. }) => {
             if force {
                 // Force-PREEMPT a wedged Turn lease: the crash-recovery escape hatch
                 // for a turn whose driver crashed/disconnected. The synchronous serve
@@ -630,7 +633,7 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
                 // Safe: cmd_turn's LeaseGuard now clears ONLY its own turn id, so a
                 // fresh turn acquiring the freed slot is not stomped when the wedged
                 // one finally returns. A deliberate operator override, like `signal`.
-                Act::Release
+                Act::Release(driver.clone())
             } else {
                 Act::Refuse(format!(
                     "ERR busy turn={id} (a turn releases its own lease; use `lease release force` to preempt a wedged turn)\n"
@@ -644,7 +647,7 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         }) => {
             let live = *expires_us > now;
             if !live || force || holder.as_deref() == Some(h.as_str()) {
-                Act::Release
+                Act::Release(None)
             } else {
                 Act::Refuse(format!(
                     "ERR lease held by {h} (pass holder={h} or force)\n"
@@ -654,10 +657,17 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     };
     match act {
         Act::None => "OK lease none\n".to_string(),
-        Act::Release => {
+        Act::Release(driver) => {
             *lease = None;
             drop(lease);
             crate::presence::post_lease_changed(&ctx.self_id, false);
+            // Every move of a lease posts a wake to every session whose facts
+            // read it (`DriverGeometry`'s `EveryMovedLeaseOwesAWake`): a
+            // preempted turn's driver too, or its window's row holds on a
+            // lease mark that has moved until something else re-senses it.
+            if let Some(driver) = driver {
+                crate::presence::post_lease_changed(&driver, false);
+            }
             "OK lease released\n".to_string()
         }
         Act::Refuse(e) => e,
@@ -951,6 +961,11 @@ pub(crate) fn cmd_ready(
             disarm(term);
             return "ERR exited\n".to_string();
         }
+        // A caller that hung up gives its lane back now, not at the deadline.
+        if crate::control::caller_hung_up() {
+            disarm(term);
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
         let now = Instant::now();
         let (prompt, settled, next_dl) = {
             let mut t = term_lock(term);
@@ -976,10 +991,11 @@ pub(crate) fn cmd_ready(
             disarm(term);
             return "OK timeout\n".to_string();
         }
-        // Park until a REAL event wakes us — fully event-driven, no re-poll: an
+        // Park until a REAL event wakes us — event-driven, no re-poll: an
         // output burst or session exit (both `notify` us), the kernel idle
         // deadline (`next_dl`, always armed here so block-state transitions are
-        // re-checked within the settle window), or the overall deadline.
+        // re-checked within the settle window), or the overall deadline. (On a
+        // served lane `hangup_park` also wakes it to check for a hangup.)
         let mut wake = deadline;
         if let Some(dl) = next_dl {
             wake = wake.min(dl);
@@ -987,7 +1003,7 @@ pub(crate) fn cmd_ready(
         let dur = wake
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
-        let _ = sub.wait(dur);
+        let _ = sub.wait(crate::control::hangup_park(dur));
     }
 }
 
@@ -1017,8 +1033,8 @@ pub(crate) fn cmd_ready(
 /// loss for content/match/block, and a deterministic idle deadline — lives in the
 /// kernel (`observe_at` at the `post_process` seam, model-checked by
 /// `watcher_latch_model` / `idle_deadline_model`). This verb only *waits*, and it
-/// is **fully event-driven, with no polling**: it registers a subscriber and
-/// parks on its wake, so it sleeps until a REAL event arrives —
+/// is **event-driven**: it registers a subscriber and parks on its wake, so it
+/// sleeps until a REAL event arrives —
 ///   * an output burst   (`Wake::Output` → `Subscribers::notify`) for content/
 ///     match/gone/block predicates,
 ///   * the next idle deadline (the exact `IdleFor` fire instant, via
@@ -1026,8 +1042,11 @@ pub(crate) fn cmd_ready(
 ///   * session exit       (`Wake::Exit` → notify) → `ERR exited`,
 ///   * the overall timeout (the ultimate liveness backstop) → `OK timeout`.
 ///
-/// CPU is ~0% while parked; every wake corresponds to an event the caller cares
-/// about.
+/// One wake is not an event: on a control lane serving a socket connection the
+/// park is cut into [`crate::control::HANGUP_POLL`] (200 ms) slices
+/// ([`crate::control::hangup_park`]), and each slice asks whether the caller hung
+/// up (→ `ERR hangup`, and the lane goes back). CPU stays ~0% while parked; an
+/// in-process caller (no socket) parks exactly as long as the events say.
 pub(crate) fn cmd_await(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -1196,6 +1215,11 @@ pub(crate) fn cmd_await(
             term_lock(term).watch_disarm(id);
             return "ERR exited\n".to_string();
         }
+        // A caller that hung up gives its lane back now, not at the deadline.
+        if crate::control::caller_hung_up() {
+            term_lock(term).watch_disarm(id);
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
         let now = Instant::now();
         let (sat, next_dl) = {
             let mut t = term_lock(term);
@@ -1210,9 +1234,10 @@ pub(crate) fn cmd_await(
             term_lock(term).watch_disarm(id);
             return "OK timeout\n".to_string();
         }
-        // Park until a REAL event wakes us — fully event-driven, no re-poll:
-        // an output burst or session exit (both `notify` us), the next idle
-        // deadline (`next_dl`), or the overall timeout (the backstop).
+        // Park until a REAL event wakes us — event-driven, no re-poll: an
+        // output burst or session exit (both `notify` us), the next idle
+        // deadline (`next_dl`), or the overall timeout (the backstop). (On a
+        // served lane `hangup_park` also wakes it to check for a hangup.)
         let mut wake = overall;
         if let Some(dl) = next_dl {
             wake = wake.min(dl);
@@ -1220,7 +1245,7 @@ pub(crate) fn cmd_await(
         let dur = wake
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
-        let _ = sub.wait(dur);
+        let _ = sub.wait(crate::control::hangup_park(dur));
     }
 }
 
@@ -1331,15 +1356,18 @@ fn await_agent(
         if gone {
             return "ERR exited\n".to_string();
         }
+        if crate::control::caller_hung_up() {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
         let now = Instant::now();
         if now >= overall {
             return "OK timeout\n".to_string();
         }
-        let _ = sub.wait(
+        let _ = sub.wait(crate::control::hangup_park(
             overall
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1)),
-        );
+        ));
     }
 }
 
@@ -1412,6 +1440,32 @@ pub(crate) struct TurnIo<'a> {
     /// driver from it. Resolved by the dispatch site like the routes above,
     /// because only the dispatch has the scope.
     pub driver: Option<aterm_session::SessionId>,
+}
+
+/// The end of turn `id`'s INPUT: its lease stops saying the driver may type
+/// ([`crate::Lease::driver_may_type`]) — only while the slot still holds
+/// this turn, never a turn that preempted it — and the presence is woken, so
+/// a window that held its band row for the turn re-grids now. `true` when
+/// this turn's lease was the one changed.
+pub(crate) fn end_turn_input(
+    turn_lease: &std::sync::Mutex<Option<crate::Lease>>,
+    id: u64,
+    sid: &aterm_session::SessionId,
+) -> bool {
+    let mut lease = turn_lease.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(crate::Lease::Turn {
+        id: held, typing, ..
+    }) = lease.as_mut()
+    else {
+        return false;
+    };
+    if *held != id || !*typing {
+        return false;
+    }
+    *typing = false;
+    drop(lease);
+    crate::presence::post_lease_changed(sid, false);
+    true
 }
 
 impl TurnIo<'static> {
@@ -1560,25 +1614,52 @@ enum Phase {
     Latched,
     Deadline,
     Exited,
+    /// The caller hung up. Only an [`OnHangup::Abort`] park ends this way.
+    HungUp,
+}
+
+/// Whether a [`park_watch`] ends early when the caller hangs up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnHangup {
+    /// Nothing has been typed yet (a `turn`'s yield, `await momentum`), or the
+    /// submit is verified (a `turn`'s final settle): abandoning the wait leaves
+    /// no half-applied input, so the lane goes back now. A `turn` that typed
+    /// is still recorded in the turn ledger, with `status=hangup`.
+    Abort,
+    /// Text is in the target's composer and its submit is not yet verified (a
+    /// `turn`'s echo settle and submit verification): the turn finishes, or
+    /// the text would sit there unsubmitted and the next turn's would be
+    /// appended to it.
+    Finish,
 }
 
 /// Park until watcher `id` latches, `until` passes, or `exited()` — the ONE
 /// event-driven wait every `turn` phase and the momentum predicate use: a
 /// subscriber wake (output / exit), the kernel's next deadline, or the
-/// backstop. Disarms the watcher on every path. Zero polling: each wake is a
-/// real event or a deadline the kernel named.
+/// backstop. Disarms the watcher on every path. Off a control lane each wake
+/// is a real event or a deadline the kernel named. On a lane serving a
+/// socket connection the park also wakes every [`crate::control::HANGUP_POLL`]
+/// (200 ms) to ask whether the caller hung up ([`crate::control::hangup_park`]).
 fn park_watch(
     term: &Arc<Mutex<Terminal>>,
     exited: &dyn Fn() -> bool,
     sub: &crate::subscribe::Subscription,
     id: aterm_core::terminal::WatchId,
     until: std::time::Instant,
+    on_hangup: OnHangup,
 ) -> Phase {
     use std::time::{Duration, Instant};
     loop {
         if exited() {
             term_lock(term).watch_disarm(id);
             return Phase::Exited;
+        }
+        // A caller that hung up ends an abortable wait: no socket caller is
+        // left to answer, and the lane goes back now rather than at the phase
+        // deadline.
+        if on_hangup == OnHangup::Abort && crate::control::caller_hung_up() {
+            term_lock(term).watch_disarm(id);
+            return Phase::HungUp;
         }
         let now = Instant::now();
         let (sat, next_dl) = {
@@ -1601,7 +1682,7 @@ fn park_watch(
         let dur = wake
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
-        let _ = sub.wait(dur);
+        let _ = sub.wait(crate::control::hangup_park(dur));
     }
 }
 
@@ -1614,6 +1695,8 @@ pub(crate) enum MomentumWait {
     Deadline(f32),
     /// The session died while parked.
     Exited,
+    /// The caller hung up while parked (nothing was typed yet).
+    HungUp,
     /// No reading could be taken (the reason), or the watcher budget was full.
     Unreadable(String),
 }
@@ -1678,7 +1761,7 @@ pub(crate) fn park_until_momentum_below(
         let Some(id) = armed else {
             return MomentumWait::Unreadable(WAITS_FULL.to_string());
         };
-        match park_watch(term, exited, sub, id, until) {
+        match park_watch(term, exited, sub, id, until, OnHangup::Abort) {
             // The crossing passed: confirm on a fresh reading (the loop head),
             // which is also where a re-lit ribbon gets its next crossing.
             Phase::Latched => {}
@@ -1687,6 +1770,7 @@ pub(crate) fn park_until_momentum_below(
                 return MomentumWait::Deadline(now_v);
             }
             Phase::Exited => return MomentumWait::Exited,
+            Phase::HungUp => return MomentumWait::HungUp,
         }
     }
 }
@@ -1757,6 +1841,7 @@ pub(crate) fn cmd_await_momentum(
         MomentumWait::Below(v) => format!("OK momentum {v:.2}\n"),
         MomentumWait::Deadline(_) => "OK timeout\n".to_string(),
         MomentumWait::Exited => "ERR exited\n".to_string(),
+        MomentumWait::HungUp => crate::control::HUNG_UP_REPLY.to_string(),
         MomentumWait::Unreadable(e) => format!("ERR {e}\n"),
     }
 }
@@ -1950,7 +2035,9 @@ fn guarded_submit(
             GuardedInput::Pressed(Delivery::Full | Delivery::FullAt { .. }) => {
                 return GuardedSubmit::Pressed;
             }
-            GuardedInput::Skipped | GuardedInput::Changed => return GuardedSubmit::Missed,
+            GuardedInput::Skipped | GuardedInput::Changed | GuardedInput::Person => {
+                return GuardedSubmit::Missed;
+            }
             GuardedInput::Pressed(Delivery::BusyZero | Delivery::ConflictZero)
                 if std::time::Instant::now() < window =>
             {
@@ -2177,6 +2264,10 @@ pub(crate) fn cmd_turn_guarded(
         *lease = Some(crate::Lease::Turn {
             id,
             driver: io.driver.clone(),
+            // The driver may type from here to its last Enter
+            // ([`crate::Lease::driver_may_type`]): no window re-grids the
+            // session under it until [`end_turn_input`].
+            typing: true,
         });
         (id, own)
     };
@@ -2214,7 +2305,7 @@ pub(crate) fn cmd_turn_guarded(
             }
         }
     }
-    let _lease = LeaseGuard {
+    let lease_guard = LeaseGuard {
         turn_lease: &ctx.turn_lease,
         id: turn_id,
         sid: &ctx.self_id,
@@ -2263,9 +2354,15 @@ pub(crate) fn cmd_turn_guarded(
 
     // Park until watcher `id` latches, `until` passes, or the session exits —
     // `park_watch`, the one wait every phase shares. Disarms on every path.
+    // `wait` gives the lane back when the caller hangs up; `wait_committed` is
+    // for the phases between the first typed byte and a verified submit,
+    // which a hangup must not cut short (see [`OnHangup::Finish`]).
     let exited_now = || exited(store);
     let wait = |id: aterm_core::terminal::WatchId, until: Instant| -> Phase {
-        park_watch(term, &exited_now, &sub, id, until)
+        park_watch(term, &exited_now, &sub, id, until, OnHangup::Abort)
+    };
+    let wait_committed = |id: aterm_core::terminal::WatchId, until: Instant| -> Phase {
+        park_watch(term, &exited_now, &sub, id, until, OnHangup::Finish)
     };
     // Arm a watcher; None (budget full) fails the whole verb honestly.
     let arm = |spec: WatcherSpec| -> Option<aterm_core::terminal::WatchId> {
@@ -2283,6 +2380,8 @@ pub(crate) fn cmd_turn_guarded(
             MomentumWait::Below(_) => yielded_ms = Some(yield0.elapsed().as_millis() as u64),
             MomentumWait::Deadline(v) => return format!("ERR yield timeout momentum={v:.2}\n"),
             MomentumWait::Exited => return "ERR exited\n".to_string(),
+            // Nothing is typed before the yield ends: no turn to record.
+            MomentumWait::HungUp => return crate::control::HUNG_UP_REPLY.to_string(),
             MomentumWait::Unreadable(e) => return format!("ERR yield: {e}\n"),
         }
         // The dispatch asked the unread-input gate when this turn ARRIVED; the
@@ -2358,9 +2457,11 @@ pub(crate) fn cmd_turn_guarded(
         let Some(id) = arm(WatcherSpec::IdleFor { dur: ECHO_SETTLE }) else {
             return format!("ERR {WAITS_FULL}\n");
         };
-        match wait(id, deadline.min(Instant::now() + ECHO_CAP)) {
+        match wait_committed(id, deadline.min(Instant::now() + ECHO_CAP)) {
             Phase::Exited => return "ERR exited\n".to_string(),
-            Phase::Latched | Phase::Deadline => {}
+            // A committed park never ends on a hangup (`OnHangup::Finish`):
+            // the turn goes on to its submit either way.
+            Phase::Latched | Phase::Deadline | Phase::HungUp => {}
         }
     }
 
@@ -2462,7 +2563,7 @@ pub(crate) fn cmd_turn_guarded(
             // press the app consumed without starting a command block.
             let mut advanced = false;
             loop {
-                match wait(id, window) {
+                match wait_committed(id, window) {
                     Phase::Exited => return "ERR exited\n".to_string(),
                     Phase::Latched => {
                         advanced = true;
@@ -2480,7 +2581,10 @@ pub(crate) fn cmd_turn_guarded(
                             None => return format!("ERR {WAITS_FULL}\n"),
                         }
                     }
-                    Phase::Deadline => break,
+                    // A committed park never ends on a hangup
+                    // (`OnHangup::Finish`); were it to, the press is judged
+                    // as one whose window closed, never abandoned unrecorded.
+                    Phase::Deadline | Phase::HungUp => break,
                 }
             }
             // AUTO degrade: the window expired with content moving after the press
@@ -2513,64 +2617,91 @@ pub(crate) fn cmd_turn_guarded(
         crate::presence::post_lease_changed(&ctx.self_id, true);
     }
 
+    // The turn has typed its last key: the window may re-grid the session
+    // now — the band row the lease asked for is born HERE, inside the turn,
+    // where the settle below waits out the program's repaint of it — never
+    // between the caller's read and the paste, nor between the paste and the
+    // Enter. A turn typed under its own connection's drive lease keeps the
+    // hold: its holder types on after it. A turn whose submit did not land
+    // skips its settle below and releases the lease at once: ending its input
+    // first would post a wake that could raise the row only for the release's
+    // wake to fold it a moment later (review of 2026-09-28) — the N → N-1 → N
+    // re-grid a program on the alternate screen can miss. It keeps the hold
+    // to its release, and the row, if anything else wants it, comes then.
+    if lease_guard.handed_back.is_none() && (submitted || submit == "none") {
+        end_turn_input(&ctx.turn_lease, turn_id, &ctx.self_id);
+    }
+
     // ── phase 3: the turn settles — no content change for `idle_ms`. ──
     // An unverified submit skips the settle wait (waiting `idle_ms` for a turn
     // that never started would just burn the deadline) and reports honestly.
+    // A caller that hangs up here gets its lane back at once (`wait` is
+    // [`OnHangup::Abort`]), but its turn was typed and submitted, so it is
+    // still recorded below, as `status=hangup`: the ledger is what `history`,
+    // the events digest and `aterm drive report` read back. The verdict says
+    // `status=hangup` too.
     let mut status = "timeout";
     if submitted || submit == "none" {
-        // Default settle = GLOBAL idle: no content change for `idle_ms`, which
-        // assumes the app stops painting when done. `settle=match:<re>` keys on a
-        // screen PATTERN instead — for a periodically-repainting TUI (clock,
-        // spinner, `watch`) that never goes idle and would otherwise burn the
-        // whole timeout — and `settle=gone:<re>` on that pattern LEAVING (a busy
-        // footer that is the only honest "turn over" signal).
-        let armed = match &settle_matcher {
-            Some((true, m)) => {
-                // `gone` is level-triggered, so it must not be armed before the
-                // busy pattern is ON the screen: the verified submit can be the
-                // input line clearing, with the footer landing a frame later, and
-                // a `gone` armed in that gap latches at arm over the pre-response
-                // screen. Phase 3a: wait (bounded by `submit_window`) for the
-                // pattern to APPEAR; phase 3b: for it to LEAVE. Never seen inside
-                // the window => the default idle settle, the honest degrade for a
-                // wrong pattern or a turn too quick to paint its footer.
-                let Some(seen) = term_lock(term).watch_rows(
-                    m.clone(),
-                    aterm_core::terminal::RowRange::All,
-                    Instant::now(),
-                ) else {
-                    return format!("ERR {WAITS_FULL}\n");
-                };
-                let appear_by =
-                    deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
-                match wait(seen, appear_by) {
-                    Phase::Exited => return "ERR exited\n".to_string(),
-                    Phase::Latched => term_lock(term).watch_rows_gone(
+        'settle: {
+            // Default settle = GLOBAL idle: no content change for `idle_ms`, which
+            // assumes the app stops painting when done. `settle=match:<re>` keys on a
+            // screen PATTERN instead — for a periodically-repainting TUI (clock,
+            // spinner, `watch`) that never goes idle and would otherwise burn the
+            // whole timeout — and `settle=gone:<re>` on that pattern LEAVING (a busy
+            // footer that is the only honest "turn over" signal).
+            let armed = match &settle_matcher {
+                Some((true, m)) => {
+                    // `gone` is level-triggered, so it must not be armed before the
+                    // busy pattern is ON the screen: the verified submit can be the
+                    // input line clearing, with the footer landing a frame later, and
+                    // a `gone` armed in that gap latches at arm over the pre-response
+                    // screen. Phase 3a: wait (bounded by `submit_window`) for the
+                    // pattern to APPEAR; phase 3b: for it to LEAVE. Never seen inside
+                    // the window => the default idle settle, the honest degrade for a
+                    // wrong pattern or a turn too quick to paint its footer.
+                    let Some(seen) = term_lock(term).watch_rows(
                         m.clone(),
                         aterm_core::terminal::RowRange::All,
                         Instant::now(),
-                    ),
-                    Phase::Deadline => arm(WatcherSpec::IdleFor {
-                        dur: Duration::from_millis(idle_ms),
-                    }),
+                    ) else {
+                        return format!("ERR {WAITS_FULL}\n");
+                    };
+                    let appear_by =
+                        deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
+                    match wait(seen, appear_by) {
+                        Phase::Exited => return "ERR exited\n".to_string(),
+                        Phase::HungUp => {
+                            status = "hangup";
+                            break 'settle;
+                        }
+                        Phase::Latched => term_lock(term).watch_rows_gone(
+                            m.clone(),
+                            aterm_core::terminal::RowRange::All,
+                            Instant::now(),
+                        ),
+                        Phase::Deadline => arm(WatcherSpec::IdleFor {
+                            dur: Duration::from_millis(idle_ms),
+                        }),
+                    }
                 }
+                Some((false, m)) => term_lock(term).watch_rows(
+                    m.clone(),
+                    aterm_core::terminal::RowRange::All,
+                    Instant::now(),
+                ),
+                None => arm(WatcherSpec::IdleFor {
+                    dur: Duration::from_millis(idle_ms),
+                }),
+            };
+            let Some(id) = armed else {
+                return format!("ERR {WAITS_FULL}\n");
+            };
+            match wait(id, deadline) {
+                Phase::Exited => return "ERR exited\n".to_string(),
+                Phase::HungUp => status = "hangup",
+                Phase::Latched => status = "settled",
+                Phase::Deadline => {}
             }
-            Some((false, m)) => term_lock(term).watch_rows(
-                m.clone(),
-                aterm_core::terminal::RowRange::All,
-                Instant::now(),
-            ),
-            None => arm(WatcherSpec::IdleFor {
-                dur: Duration::from_millis(idle_ms),
-            }),
-        };
-        let Some(id) = armed else {
-            return format!("ERR {WAITS_FULL}\n");
-        };
-        match wait(id, deadline) {
-            Phase::Exited => return "ERR exited\n".to_string(),
-            Phase::Latched => status = "settled",
-            Phase::Deadline => {}
         }
     }
 
@@ -2620,6 +2751,10 @@ pub(crate) fn cmd_turn_guarded(
             .unwrap_or_else(|p| p.into_inner())
             .notify(session);
     }
+    // A `status=hangup` verdict still goes out whole: no socket caller is left
+    // to read it, but an in-process one is — the durable operator
+    // (`run_operator_proposal`) records its action as acted from this line's
+    // `submitted=1`, exactly as for a settled turn.
     // `trim=1` drops the settled screen's trailing blank rows and closes the verdict
     // with `trimmed=<k>` — the same rule and framing as `text trim`, through the one
     // shared framer. `screen_hash` above was taken over the UNTRIMMED screen on
@@ -2976,7 +3111,9 @@ pub(crate) fn cmd_meta_supervisor(
     let ttl_ms = match toks.next() {
         None => None,
         Some(tok) => match tok.strip_prefix("ttl=").map(str::parse::<u64>) {
-            Some(Ok(ms)) if (1..=600_000).contains(&ms) => Some(ms),
+            Some(Ok(ms)) if (1..=crate::session_timeline::SUPERVISOR_TTL_MAX_MS).contains(&ms) => {
+                Some(ms)
+            }
             _ => return Some((USAGE.to_string(), false)),
         },
     };
@@ -3211,6 +3348,24 @@ pub(crate) fn cmd_cast_frames(ctx: &SessionCtx, rest: &str) -> String {
             snapshot.evicted()
         ));
     }
+    // The same disclosure for bursts the READER dropped before they reached the
+    // recorder (its writer queue was full): output the engine drew and these
+    // frames never saw.
+    let (dropped, dropped_bytes) = snapshot.dropped();
+    if dropped > 0 {
+        body.push_str(&format!(
+            "--- WARNING: {dropped} output burst(s) ({dropped_bytes} bytes) dropped before recording (writer queue full); frames after the first drop may be wrong ---\n"
+        ));
+    }
+    // …and for a recording that starts at a seamless update (an adopted
+    // session): the screen it restored is not in the recording, so its frames
+    // fold from a blank engine.
+    if let Some(gap) = snapshot.handoff() {
+        body.push_str(&format!(
+            "--- WARNING: recording restarted at a seamless update (handoff {}); the screen before it is not recorded, early frames may be wrong ---\n",
+            gap.payload()
+        ));
+    }
     for (k, (t, rows)) in frames.iter().enumerate() {
         body.push_str(&format!(
             "--- frame {}/{} @ {}ms ---\n",
@@ -3226,6 +3381,159 @@ pub(crate) fn cmd_cast_frames(ctx: &SessionCtx, rest: &str) -> String {
     format!("OK {}\n{body}", body.lines().count())
 }
 
+/// How long `cast drift` lets the recording catch up before it reads the screen:
+/// the cast writer thread records a burst shortly AFTER the engine processed it,
+/// so a content sequence that has not moved for this long means every burst the
+/// engine drew is in the recorder.
+const CAST_DRIFT_SETTLE: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// Consistent-cut attempts before `cast drift` proceeds with `cut=racy`.
+const CAST_DRIFT_CUT_ATTEMPTS: usize = 3;
+
+/// At most this many `cast drift` analyses fold recordings at once in this
+/// instance. Each is up to `2 + MAX_RUNS` folds of a whole recording on a
+/// wait lane, and `cast drift` is Read-class, so any scoped peer can ask: the
+/// cap keeps a burst of askers from taking the cores of the window a person
+/// is using (measured before it: eight concurrent requests held the instance
+/// at 700% CPU).
+const CAST_DRIFT_CONCURRENCY: usize = 2;
+
+/// How long a request waits for a fold slot before it is refused `ERR busy`.
+const CAST_DRIFT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The instance's `cast drift` fold slots ([`CAST_DRIFT_CONCURRENCY`]).
+static CAST_DRIFT_SLOTS: DriftSlots = DriftSlots {
+    busy: Mutex::new(0),
+    freed: std::sync::Condvar::new(),
+};
+
+/// A counting semaphore for [`CAST_DRIFT_SLOTS`]; a slot is released when its
+/// guard drops (a panicking analysis included).
+struct DriftSlots {
+    busy: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// One held fold slot.
+struct DriftSlot(&'static DriftSlots);
+
+impl DriftSlots {
+    /// Wait up to `wait` for a slot; `None` when every slot stayed taken.
+    fn acquire(&'static self, wait: std::time::Duration) -> Option<DriftSlot> {
+        let busy = self.busy.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut busy, timeout) = self
+            .freed
+            .wait_timeout_while(busy, wait, |busy| *busy >= CAST_DRIFT_CONCURRENCY)
+            .unwrap_or_else(|p| p.into_inner());
+        if timeout.timed_out() && *busy >= CAST_DRIFT_CONCURRENCY {
+            return None;
+        }
+        *busy += 1;
+        Some(DriftSlot(self))
+    }
+}
+
+impl Drop for DriftSlot {
+    fn drop(&mut self) {
+        let mut busy = self.0.busy.lock().unwrap_or_else(|p| p.into_inner());
+        *busy = busy.saturating_sub(1);
+        drop(busy);
+        self.0.freed.notify_one();
+    }
+}
+
+/// `cast drift [max_runs=<k>] [rows=<n>] [seed=auto|alt|primary]` -> the
+/// COUNTERFACTUAL REPLAY AUDIT of this session's asciicast against its live
+/// screen (`aterm_control::cast_drift`, which owns the method and the wire):
+/// `OK <n> verdict=<clean|desync|unfaithful|unknown|empty> fidelity=… culprit=…
+/// … cut=<quiescent|racy> folds=<f> ms=<ms>` then `n` `run`/`row`/`cursor`
+/// lines, parse by key. It names the resize run an app never repainted after —
+/// the alt-screen net-zero flap that shifts every row up one — and the rows
+/// that are wrong, with what the app believes they say.
+///
+/// THE CUT. `seq0 = content_seq`; settle ([`CAST_DRIFT_SETTLE`]); under the term
+/// lock read the rows, cursor, alt flag and `seq1`, release; take the recorder
+/// snapshot under ITS lock, release; `seq2`. Equal sequences mean the screen did
+/// not move while it was read and the recording had time to take every burst
+/// that drew it (`cut=quiescent`); otherwise it retries, and after
+/// [`CAST_DRIFT_CUT_ATTEMPTS`] answers `cut=racy` with the replays held
+/// against EACH OTHER (`against=replay fidelity=-`: an app that never stops
+/// drawing cannot make every answer `unknown`). The two locks are taken one
+/// after the other, NEVER nested (the `cast frames` order), and the folds run
+/// with both released: a replay never holds the engine or the recorder. At
+/// most [`CAST_DRIFT_CONCURRENCY`] analyses fold at once in the instance; a
+/// request that waits [`CAST_DRIFT_SLOT_WAIT`] for a slot is answered `ERR
+/// busy`. `policy` is the session's resize seam
+/// ([`crate::app_render::pty_resize_policy`]), asked by the caller before any
+/// lock. Served on a wait lane (`is_wait_request`), never the main thread.
+pub(crate) fn cmd_cast_drift(
+    term: &Arc<Mutex<Terminal>>,
+    cast: &Mutex<crate::cast::CastRecorder>,
+    policy: aterm_core::grid::ResizePolicy,
+    rest: &str,
+) -> String {
+    cast_drift_with(term, cast, policy, rest, &|d| std::thread::sleep(d))
+}
+
+/// [`cmd_cast_drift`] with the settle step injected, so a test can move the
+/// screen inside the cut instead of sleeping.
+fn cast_drift_with(
+    term: &Arc<Mutex<Terminal>>,
+    cast: &Mutex<crate::cast::CastRecorder>,
+    policy: aterm_core::grid::ResizePolicy,
+    rest: &str,
+    settle: &dyn Fn(std::time::Duration),
+) -> String {
+    use aterm_control::cast_drift::{Cut, DriftArgs, LiveScreen, analyze, analyze_replay};
+    let args = match DriftArgs::parse(rest) {
+        Ok(args) => args,
+        Err(usage) => return format!("{usage}\n"),
+    };
+    let Some(_slot) = CAST_DRIFT_SLOTS.acquire(CAST_DRIFT_SLOT_WAIT) else {
+        return format!(
+            "ERR busy: {CAST_DRIFT_CONCURRENCY} cast drift analyses are running in this instance; \
+             ask again\n"
+        );
+    };
+    let mut attempt = 0;
+    let (live, snapshot, quiescent) = loop {
+        attempt += 1;
+        let seq0 = term_lock(term).content_seq();
+        settle(CAST_DRIFT_SETTLE);
+        let (live, seq1) = {
+            let t = term_lock(term);
+            let c = t.cursor();
+            let live = LiveScreen {
+                rows: (0..t.rows() as usize)
+                    .map(|r| super::visible_row(&t, r))
+                    .collect(),
+                cursor: Some((c.row, c.col)),
+                alt: Some(t.is_alternate_screen()),
+            };
+            (live, t.content_seq())
+        };
+        let snapshot = {
+            let rec = cast.lock().unwrap_or_else(|p| p.into_inner());
+            rec.snapshot()
+        };
+        let seq2 = term_lock(term).content_seq();
+        let quiescent = seq0 == seq1 && seq1 == seq2;
+        if quiescent || attempt >= CAST_DRIFT_CUT_ATTEMPTS {
+            break (live, snapshot, quiescent);
+        }
+    };
+    let (header, events) = snapshot.drift_input();
+    let started = std::time::Instant::now();
+    let mut report = if quiescent {
+        analyze(&header, &events, Some(&live), &args, policy)
+    } else {
+        analyze_replay(&header, &events, live.alt, &args, policy)
+    };
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    report.settle_cut(if quiescent { Cut::Quiescent } else { Cut::Racy });
+    report.render(ms, None)
+}
+
 /// `temporal [tick] [trim]` -> `OK <nbytes>[ trimmed=<k>]\n` then the session's
 /// screen RECONSTRUCTED at logical `tick` (default: the latest recorded instant) —
 /// with `trim`, minus its trailing all-blank rows (the `text trim` rule; the byte
@@ -3238,21 +3546,45 @@ pub(crate) fn cmd_cast_frames(ctx: &SessionCtx, rest: &str) -> String {
 /// screen text. Pure observer of the TARGET's own recorder (no renderer, no live
 /// term lock), so it is correct cross-session like `cast`. `<tick>` is
 /// MICROSECONDS since the session's recorder epoch; `temporal status` -> `OK
-/// enabled=<bool> latest_tick=<n> keyframes=<n> live_events=<n> dropped_events=<n>`
-/// reports the reachable window and whether recording is on, so a caller can pick a
-/// valid tick without guessing. Two DISTINCT failures: `ERR temporal: this session
-/// is not recording …\n` when recording was never enabled for it (the default — a
+/// enabled=<bool> latest_tick=<n> keyframes=<n> live_events=<n> dropped_events=<n>
+/// lost_resizes=<n> pending_resizes=<n>[ carried=0 from_build=<n|->]` reports the
+/// reachable window and whether recording is on, so a caller can pick a valid tick
+/// without guessing. `lost_resizes=` counts resizes the live engine applied that the
+/// spine will never hold (its resize journal overran before a reader read it — a
+/// replay across them lacks their row moves), and `pending_resizes=` resizes it
+/// applied that no reader has handed the spine YET (they wait for the reader's next
+/// hold, the program's next output; [`crate::temporal::SpineWatermark::pending`]).
+/// A replay at the spine's end (no tick, or one at or past `latest_tick`) lacks the
+/// pending ones, so its header then says so too: `OK <nbytes>[ trimmed=<k>][
+/// pending_resizes=<n>]`, the key only when `n > 0`. The `carried=0 from_build=`
+/// tail is only for an adopted session, whose spine starts at the seamless update
+/// that adopted it (`session_timeline::HandoffGap`). Two DISTINCT failures:
+/// `ERR temporal: this session is not recording …\n` when recording
+/// was never enabled for it (the default — a
 /// config fix that reaches NEW tabs: a session keeps its spawn-time wiring),
 /// versus `ERR temporal unreachable\n` when the base keyframe (or a needed input
 /// blob) has aged out of the bounded retention window (honest partial reach, never
 /// a wrong reconstruction). `<nbytes>` is the UTF-8 body length, matching the
 /// read-verb framing so the existing client reads the body without guessing.
-pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
+pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str) -> String {
     const USAGE: &str = "ERR usage: temporal [status | <tick>] [trim]  (tick = µs since \
                          session start; `temporal status` reports the reachable range)\n";
     // `trim` is the LAST token of either form. `temporal status trim` has no rows
     // to trim, so it is a usage error rather than a token that quietly vanishes.
     let (rest, trim) = super::control_query::split_trim_tail(rest);
+    // The resizes the TARGET's engine applied that no reader has handed its spine
+    // yet: the watermark is read under the target's term lock (the reader
+    // publishes it under that lock), taken only after the recorder lock was
+    // released, so the two are never nested. Read BEFORE any replay, so a resize
+    // handed over meanwhile is counted rather than missed.
+    let pending = || {
+        let spine = ctx
+            .temporal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .spine_watermark();
+        spine.pending(&term_lock(term))
+    };
     // `temporal status` -> the reachable window + whether recording is on, so a
     // caller can DISCOVER a valid tick (µs since session start) and tell an OFF
     // recorder from an aged-out one without guessing. Additive subform; the bare
@@ -3261,14 +3593,19 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
         if trim {
             return USAGE.to_string();
         }
+        let pending = pending();
         let rec = ctx.temporal.lock().unwrap_or_else(|p| p.into_inner());
         let enabled = rec.total_events() > 0;
         return format!(
-            "OK enabled={enabled} latest_tick={} keyframes={} live_events={} dropped_events={}\n",
+            "OK enabled={enabled} latest_tick={} keyframes={} live_events={} dropped_events={} \
+             lost_resizes={} pending_resizes={}{}\n",
             rec.latest_tick().0,
             rec.keyframe_count(),
             rec.live_events(),
             rec.dropped_events(),
+            rec.lost_resizes(),
+            if enabled { pending } else { 0 },
+            rec.status_tail(),
         );
     }
     let at = match rest {
@@ -3282,11 +3619,16 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
     // == 0` means recording was never turned on (the default) — a config fix, not
     // the inherent retention bound that `ERR temporal unreachable` names. Reporting
     // one error for both stranded first-contact callers.
-    let (enabled, replay) = {
+    let pending = pending();
+    let (enabled, replay, at_end) = {
         let rec = ctx.temporal.lock().unwrap_or_else(|p| p.into_inner());
         let enabled = rec.total_events() > 0;
         let replay = if enabled { rec.replay_at(at) } else { None };
-        (enabled, replay)
+        (
+            enabled,
+            replay,
+            at.is_none_or(|tick| tick >= rec.latest_tick()),
+        )
     };
     if !enabled {
         return "ERR temporal: this session is not recording; set temporal_recording = true in \
@@ -3295,6 +3637,14 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
     }
     let Some(term) = replay else {
         return "ERR temporal unreachable\n".to_string();
+    };
+    // A replay at the spine's end lacks the pending resizes: said on the header,
+    // after the byte count the client reads (the key only when there are any, so
+    // the common header is unchanged).
+    let pending = if at_end && pending > 0 {
+        format!(" pending_resizes={pending}")
+    } else {
+        String::new()
     };
     let rows = term.rows() as usize;
     let mut body = String::new();
@@ -3309,9 +3659,14 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
         let sent = super::control_query::trimmed_len(body.lines());
         let keep: usize = body.split_inclusive('\n').take(sent).map(str::len).sum();
         body.truncate(keep);
-        return format!("OK {} trimmed={}\n{}", body.len(), rows - sent, body);
+        return format!(
+            "OK {} trimmed={}{pending}\n{}",
+            body.len(),
+            rows - sent,
+            body
+        );
     }
-    format!("OK {}\n{}", body.len(), body)
+    format!("OK {}{pending}\n{}", body.len(), body)
 }
 
 /// Why a wait could not arm: the session's watchers are all armed (the
@@ -4103,6 +4458,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         });
         SessionHandle {
             sid,
@@ -4611,8 +4968,14 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let _ = tx.send(cmd_sessions_bridge(&store));
         });
+        // The three locks stay held until this test returns, so the roster cannot
+        // have answered by taking them, and an answer rules out a roster that
+        // waits on them without end. It does not rule out a bounded patience
+        // shorter than the minute; the roster has none (`bridge_roster` reads the
+        // store alone). The minute is a hang detector for a roster that parks
+        // behind them.
         let bridge = rx
-            .recv_timeout(std::time::Duration::from_secs(3))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("identity-only roster must not wait on terminal, meta or timeline");
         let mut lines = bridge.lines();
         assert_eq!(lines.next(), Some("OK 2"));
@@ -4825,6 +5188,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         }
     }
 
@@ -4840,23 +5205,30 @@ mod tests {
     fn temporal_trim_byte_frames_the_trimmed_body_and_status_trim_is_usage() {
         let ctx = temporal_ctx();
         let rows: usize = 8;
+        let live = Mutex::new(aterm_core::terminal::Terminal::new(rows as u16, 20));
+        // A ground blank grid is the replay base; the two lines below fill only
+        // the first two of eight rows, so six trailing rows stay blank. (The
+        // engine and the recorder are locked one after the other, never nested.)
+        let input = b"first line\r\nsecond line\r\n";
+        let (base, at) = {
+            let mut t = term_lock(&live);
+            let base = (t.checkpoint(), crate::temporal::SpinePre::take(&t));
+            t.process(input);
+            base
+        };
         {
             let mut rec = ctx.temporal.lock().unwrap();
-            let mut t = aterm_core::terminal::Terminal::new(rows as u16, 20);
-            // A ground blank grid is the replay base; the two lines below fill
-            // only the first two of eight rows, so six trailing rows stay blank.
-            rec.record_keyframe(t.checkpoint());
-            let input = b"first line\r\nsecond line\r\n";
-            t.process(input);
+            rec.record_keyframe(base);
+            rec.spine_watermark().seed(at);
             rec.record_raw_in(input);
         }
 
         // Bare: the whole grid, one line per row (row-count framed).
-        let bare = cmd_temporal(&ctx, "");
+        let bare = cmd_temporal(&ctx, &live, "");
         assert!(bare.starts_with("OK "), "bare temporal: {bare:?}");
 
         // Trim: `OK <nbytes> trimmed=<k>` then the trimmed body.
-        let trimmed = cmd_temporal(&ctx, "trim");
+        let trimmed = cmd_temporal(&ctx, &live, "trim");
         let (header, body) = trimmed
             .split_once('\n')
             .expect("a header line then the body");
@@ -4879,11 +5251,270 @@ mod tests {
         );
 
         // `temporal status trim` has no rows to trim → usage, not a swallow.
-        let status_trim = cmd_temporal(&ctx, "status trim");
+        let status_trim = cmd_temporal(&ctx, &live, "status trim");
         assert!(
             status_trim.starts_with("ERR usage: temporal"),
             "status trim is a usage error: {status_trim:?}"
         );
+    }
+
+    /// A flap that lands after the program's last output is PENDING: no reader
+    /// hold has handed it to the spine yet, so a replay at the spine's end is
+    /// the screen before it. `temporal status` and the replay's header say how
+    /// many (`pending_resizes=2`) instead of passing that screen off as the
+    /// live one; the program's next output hands both halves over, and the
+    /// replay then IS the live screen, with nothing pending. The flap is a
+    /// width flap (20 -> 19 -> 20 columns cuts the last one), which the
+    /// engine's resize undo does not serve, so the two screens differ.
+    #[test]
+    fn temporal_discloses_resizes_still_pending_on_the_spine() {
+        use crate::temporal::{SpineMark, SpinePre};
+        const ROWS: u16 = 6;
+        const COLS: u16 = 20;
+        let ctx = temporal_ctx();
+        let live = Mutex::new(aterm_core::terminal::Terminal::new(ROWS, COLS));
+        let (base, at) = {
+            let t = term_lock(&live);
+            (t.checkpoint(), SpinePre::take(&t))
+        };
+        let watermark = {
+            let mut rec = ctx.temporal.lock().unwrap();
+            rec.record_keyframe(base);
+            rec.spine_watermark().seed(at);
+            rec.spine_watermark()
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let mut mark = SpineMark::attach(watermark);
+        // One reader hold, then the writer thread's folds.
+        let mut slice = |bytes: &[u8]| {
+            {
+                let mut t = term_lock(&live);
+                let pre = SpinePre::take(&t);
+                t.process(bytes);
+                mark.record(&tx, pre, &t, bytes);
+            }
+            let mut rec = ctx.temporal.lock().unwrap();
+            while let Ok(msg) = rx.try_recv() {
+                rec.apply(msg);
+            }
+        };
+        let mut frame = String::from("\x1b[?1049h\x1b[2J");
+        for r in 0..ROWS {
+            frame.push_str(&format!(
+                "\x1b[{row};1HL{r}\x1b[{row};{COLS}HE",
+                row = r + 1
+            ));
+        }
+        frame.push_str("\x1b[4;3H");
+        slice(frame.as_bytes());
+        let screen = || -> String {
+            let t = term_lock(&live);
+            (0..t.rows() as usize)
+                .map(|r| format!("{}\n", crate::control::visible_row(&t, r)))
+                .collect()
+        };
+        let replayed = |reply: &str| -> (String, String) {
+            let (head, body) = reply.split_once('\n').expect("header + body");
+            (head.to_string(), body.to_string())
+        };
+        assert!(
+            cmd_temporal(&ctx, &live, "status").ends_with(" pending_resizes=0\n"),
+            "nothing pending before the flap"
+        );
+
+        {
+            let mut t = term_lock(&live);
+            t.resize(ROWS, COLS - 1);
+            t.resize(ROWS, COLS);
+        }
+        let status = cmd_temporal(&ctx, &live, "status");
+        assert!(status.ends_with(" pending_resizes=2\n"), "{status}");
+        let (head, body) = replayed(&cmd_temporal(&ctx, &live, ""));
+        assert!(head.ends_with(" pending_resizes=2"), "{head}");
+        assert_ne!(
+            body,
+            screen(),
+            "the spine lacks the flap until the next output"
+        );
+
+        slice(b"\x1b[1;1HT1\x1b[K\x1b[4;3H");
+        let status = cmd_temporal(&ctx, &live, "status");
+        assert!(status.ends_with(" pending_resizes=0\n"), "{status}");
+        let (head, body) = replayed(&cmd_temporal(&ctx, &live, ""));
+        assert!(!head.contains("pending_resizes"), "{head}");
+        assert_eq!(body, screen(), "both halves handed over: the live screen");
+    }
+
+    /// A live engine and its asciicast recorder, driven by the SAME operations
+    /// (what the PTY reader and the resize pass do to a real session): an
+    /// alt-screen frame with a non-blank footer, an 8 -> 7 -> 8 flap split by
+    /// output that draws nothing (a mode set: it drops the engine's resize
+    /// undo, so the grow appends and the rows stay shifted), then a diff frame
+    /// the app sent without a repaint. `quiet_flapped_session` is the same flap
+    /// with nothing between its halves, which the engine undoes.
+    fn flapped_session() -> (Arc<Mutex<Terminal>>, Mutex<crate::cast::CastRecorder>) {
+        flapped_session_split(true)
+    }
+
+    fn quiet_flapped_session() -> (Arc<Mutex<Terminal>>, Mutex<crate::cast::CastRecorder>) {
+        flapped_session_split(false)
+    }
+
+    fn flapped_session_split(
+        split: bool,
+    ) -> (Arc<Mutex<Terminal>>, Mutex<crate::cast::CastRecorder>) {
+        use std::time::Duration;
+        let term = Arc::new(Mutex::new(Terminal::new(8, 20)));
+        let cast = Mutex::new(crate::cast::CastRecorder::new(20, 8));
+        let mut frame = String::from("\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[H");
+        for r in 0..8 {
+            frame.push_str(&format!("\x1b[{};1HA{r}", r + 1));
+        }
+        frame.push_str("\x1b[6;3H\x1b[?2026l");
+        let out = |ms: u64, bytes: &[u8]| {
+            term_lock(&term).process(bytes);
+            cast.lock()
+                .unwrap()
+                .record_output(Duration::from_millis(ms), bytes);
+        };
+        out(100, frame.as_bytes());
+        for (us, rows) in [(1_000_000u64, 7u16), (1_000_700, 8)] {
+            if split && rows == 8 {
+                let mode = b"\x1b[?1000h";
+                term_lock(&term).process(mode);
+                cast.lock()
+                    .unwrap()
+                    .record_output(Duration::from_micros(1_000_300), mode);
+            }
+            term_lock(&term).resize(rows, 20);
+            cast.lock()
+                .unwrap()
+                .record_resize(Duration::from_micros(us), 20, rows);
+        }
+        out(1_006, b"\x1b[?2026h\x1b[3;1H\x1b[KB2\x1b[6;3H\x1b[?2026l");
+        (term, cast)
+    }
+
+    /// The verb's wire: `OK <n>` counts exactly the lines after it, the cut is
+    /// quiescent when nothing moves, and the flap is named with its rows.
+    #[test]
+    fn cmd_cast_drift_frames_lines_and_names_the_flap() {
+        let (term, cast) = flapped_session();
+        let reply = cast_drift_with(
+            &term,
+            &cast,
+            aterm_core::grid::ResizePolicy::Native,
+            "",
+            &|_| {},
+        );
+        let mut lines = reply.lines();
+        let head = lines.next().expect("a header");
+        let n: usize = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse().ok())
+            .expect("OK <n>");
+        assert_eq!(lines.clone().count(), n, "{reply}");
+        assert!(reply.ends_with('\n'));
+        for key in [
+            "verdict=desync",
+            "fidelity=pass",
+            "culprit=1.000000",
+            "cut=quiescent",
+            "dropped=0",
+            "folds=2",
+        ] {
+            assert!(head.split_whitespace().any(|t| t == key), "{key} in {head}");
+        }
+        assert_eq!(
+            lines.next(),
+            Some(
+                "run t=1.000000 n=2 gap_ms=0.700 geom=20x8>20x7>20x8 net=zero first_out_ms=5.300 \
+                 clear_ms=- culprit=1"
+            )
+        );
+        assert_eq!(lines.next(), Some("row 0 live=A1 expected=A0"));
+        // The grammar's refusal.
+        assert_eq!(
+            cast_drift_with(
+                &term,
+                &cast,
+                aterm_core::grid::ResizePolicy::Native,
+                "frames",
+                &|_| {},
+            ),
+            format!("{}\n", aterm_control::cast_drift::USAGE)
+        );
+    }
+
+    /// The same flap with NOTHING between its halves: the engine's resize undo
+    /// hands the demoted row back, the live screen is what the app drew, and
+    /// the verb answers clean with no culprit.
+    #[test]
+    fn cmd_cast_drift_answers_clean_for_a_quiet_flap() {
+        let (term, cast) = quiet_flapped_session();
+        let reply = cast_drift_with(
+            &term,
+            &cast,
+            aterm_core::grid::ResizePolicy::Native,
+            "",
+            &|_| {},
+        );
+        let head = reply.lines().next().expect("a header");
+        for key in ["verdict=clean", "fidelity=pass", "culprit=-"] {
+            assert!(head.split_whitespace().any(|t| t == key), "{key} in {head}");
+        }
+        assert!(!reply.contains(" live="), "no drifted row: {reply}");
+    }
+
+    /// A screen that moves while it is being read is a RACY cut: after the
+    /// bounded retries the verb still answers, with the replays held against
+    /// each other (`against=replay fidelity=-`) — the screen it could not read
+    /// still is compared with nothing, and a busy app gets an answer.
+    #[test]
+    fn cmd_cast_drift_answers_a_racy_cut_from_the_replays() {
+        let (term, cast) = flapped_session();
+        let settles = std::cell::Cell::new(0);
+        let reply = cast_drift_with(
+            &term,
+            &cast,
+            aterm_core::grid::ResizePolicy::Native,
+            "",
+            &|_| {
+                settles.set(settles.get() + 1);
+                term_lock(&term).process(b"\x1b[1;1Hmoved");
+            },
+        );
+        assert_eq!(settles.get(), CAST_DRIFT_CUT_ATTEMPTS, "bounded retries");
+        let head = reply.lines().next().unwrap();
+        assert!(
+            head.contains(" verdict=desync fidelity=- against=replay "),
+            "{head}"
+        );
+        assert!(head.contains(" culprit=1.000000 "), "{head}");
+        assert!(head.contains(" cut=racy "), "{head}");
+        assert!(
+            !reply.contains(" live=moved"),
+            "the moving screen is not read"
+        );
+    }
+
+    /// The instance folds at most [`CAST_DRIFT_CONCURRENCY`] recordings at
+    /// once; a request that cannot get a slot in time is refused by name, and
+    /// a released slot is taken again.
+    #[test]
+    fn cast_drift_slots_cap_the_concurrent_folds() {
+        static SLOTS: DriftSlots = DriftSlots {
+            busy: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        };
+        let short = std::time::Duration::from_millis(20);
+        let held: Vec<DriftSlot> = (0..CAST_DRIFT_CONCURRENCY)
+            .map(|_| SLOTS.acquire(short).expect("a free slot"))
+            .collect();
+        assert!(SLOTS.acquire(short).is_none(), "every slot is taken");
+        drop(held);
+        assert!(SLOTS.acquire(short).is_some(), "released slots are free");
     }
 }
 

@@ -49,8 +49,11 @@ pub const CLAIM_HELD: &str = "supervisor claim held by ";
 
 /// The claim's lease, ms: three renewals' worth.
 pub(super) const CLAIM_TTL_MS: u64 = 90_000;
-/// How often the claim is renewed (and, behind another holder, tried).
-pub(super) const CLAIM_RENEW: Duration = Duration::from_secs(20);
+/// How often the claim is renewed (and, behind another holder, tried). Public
+/// because the in-GUI host's adopted-claim grace after a seamless update is
+/// counted in these steps: the time an external loop needs to renew, from the
+/// new instance, a claim the old one held (aterm-gui `harness_host`).
+pub const CLAIM_RENEW: Duration = Duration::from_secs(20);
 
 /// Where the loop stands on the session's supervisor claim.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

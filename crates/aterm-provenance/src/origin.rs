@@ -1,20 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The 6-element origin lattice: [`Origin`] sealed trait, [`OriginTag`]
-//! runtime mirror, and the 6 marker types. See
-//! `designs/2026-04-19-provenance-framework.md` §3.
+//! The six origins: [`Origin`] sealed trait, [`OriginTag`] runtime mirror, and
+//! the 6 marker types.
 
 mod sealed {
     /// Sealing trait for [`super::Origin`]. Prevents downstream crates from
-    /// adding origin variants; adding an origin is a framework-level ceremony
-    /// (update §3 Hasse diagram, update join table in `build.rs`, update the
-    /// TLA+ spec, bump checkpoint schema version).
+    /// adding origin variants; adding one means a new [`super::OriginTag`]
+    /// discriminant.
     pub trait Sealed {}
 }
 
 /// Compile-time origin tag. `Origin` is sealed; adding a variant is a
-/// framework-level action (see §3 Hasse diagram).
+/// framework-level action.
 ///
 /// Every valid origin marker type exposes its runtime tag via
 /// [`Origin::TAG`], which [`crate::Provenance::tag`] reads.
@@ -33,11 +31,10 @@ pub trait Origin: sealed::Sealed + 'static + Copy {
     fn runtime_tag() -> OriginTag;
 }
 
-/// Runtime-shaped mirror of [`Origin`], as [`crate::Provenance::tag`] answers it
-/// and as per-row grid metadata (Phase 2) stores it.
+/// Runtime-shaped mirror of [`Origin`], as [`crate::Provenance::tag`] answers it.
 ///
-/// Discriminants are stable at-rest: checkpoint v4 uses these byte values
-/// directly (see design §5.1).
+/// The discriminants are pinned (`tests/unit.rs`,
+/// `origin_tag_discriminants_are_stable`); nothing persists them today.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OriginTag {

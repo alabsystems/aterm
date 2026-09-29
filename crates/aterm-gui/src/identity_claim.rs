@@ -56,10 +56,12 @@
 //!
 //! ## The third gate: the handoff window
 //!
-//! A handoff is not one step. The predecessor EXITS (its lock dies with it), and only
-//! then does the successor bind and publish its own graph entry — so between the two,
-//! neither gate above answered, and a launch landing in exactly that window adopted
-//! the id. Closed (2026-09-25) without touching the proof-carrying fd protocol: at
+//! A handoff is not one step. For a FIXED-PATH socket (`--control-sock`) the
+//! predecessor EXITS (its lock dies with it), and only then does the successor bind and
+//! publish its own graph entry — so between the two, neither gate above answered, and a
+//! launch landing in exactly that window adopted the id. (A PER-PROCESS socket's
+//! successor publishes BEFORE the Commit instead; see the fourth section below.) Closed
+//! (2026-09-25) without touching the proof-carrying fd protocol: at
 //! Commit, before `_exit`, the predecessor writes `claims/<sid>.successor` naming the
 //! attested successor pid for each carried id ([`mark_successor`]), and
 //! [`claim_for_adoption`] treats a marker that names a LIVE process other than us as
@@ -69,8 +71,35 @@
 //! live unrelated one (a safe refusal: the launch mints a fresh identity). The
 //! derived model is `SessionIdClaim` (`PredecessorExits` / `SuccessorPublishes`, with
 //! `Unmarked = 1` the pre-fix exit that duplicates).
+//!
+//! ## The other order: a successor that publishes before the Commit
+//!
+//! A successor on a PER-PROCESS socket (`aterm-<pid>.sock`, every ordinary launch)
+//! does not wait for the Commit to bind: two per-process sockets cannot collide, so it
+//! binds and publishes `graph/<sid>` for every carried id as soon as it has booted —
+//! measured on every update since the in-GUI supervisor host shipped, 191–272 ms
+//! BEFORE the predecessor commits. For that window the entry names a live process
+//! that is not this one while THIS process still owns the sessions, decides the
+//! Commit, and rolls back if it rejects. The `@<sid>` dispatch probe
+//! ([`live_holder`]) read that as a second holder and refused the predecessor's own
+//! supervisor (`ERR ambiguous session id … also served by pid <successor>`, the
+//! 2026-09-28 update to 0.97.0: one supervisor restart, and on a rejected handoff
+//! the same refusal counted toward the restart budget).
+//!
+//! An entry naming THIS process's own kernel-attested update candidate is a
+//! transfer in progress, not a second holder: the handoff lane registers the
+//! candidate's pid ([`register_handoff_candidate`]) as it makes the candidate — at
+//! the dial on the launched lane, before the grant hands it a single descriptor;
+//! right after the fork on the fork lane, microseconds before the child could have
+//! booted — for as long as the attempt decides, and [`live_holder`] does not refuse an id
+//! whose entry names it. Nothing else changes: the pid is the kernel's (the fork,
+//! or `LOCAL_PEERPID` at the rendezvous accept), a stranger publishing the same id
+//! is refused as before, and ADOPTION ([`live_holder_in`], [`claim_for_adoption`])
+//! still reads the candidate's entry as a holder. The derived model is
+//! `HandoffAddressOwner` (`Buggy = 1`: the refusal before the exemption).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_session::SessionId;
 
@@ -390,11 +419,119 @@ pub(crate) fn rendezvous_test_guard() -> std::sync::MutexGuard<'static, ()> {
 /// ~10.4–11.3 µs for our own entry, ~11.7–12.7 µs to refuse a live foreign one —
 /// against a 4.8–5.7 µs floor for one request+reply over a unix socket. So the
 /// gate, not the probe's own cost, is what keeps this off the hot path.
+///
+/// NOT THIS PROCESS'S OWN UPDATE CANDIDATE: an entry naming the pid a handoff lane
+/// registered ([`register_handoff_candidate`]) is the transfer this process is
+/// deciding, and the id is still answered HERE until the Commit (module header, "The
+/// other order"). Only the dispatch probe exempts it; adoption does not.
 pub(crate) fn live_holder(sid: &SessionId) -> Option<u32> {
     if !adopted_here(sid) {
         return None;
     }
-    live_holder_in(&rendezvous_dir()?, sid)
+    let pid = live_holder_in(&rendezvous_dir()?, sid)?;
+    (HANDOFF_CANDIDATE.load(Ordering::SeqCst) != pid).then_some(pid)
+}
+
+/// The pid of THIS process's own seamless-update candidate while a handoff attempt
+/// decides, `0` for none — never a live holder's pid, since `pid_alive(0)` is false.
+/// Set and cleared only through [`CandidateRegistration`].
+static HANDOFF_CANDIDATE: AtomicU32 = AtomicU32::new(0);
+
+/// A handoff lane's registration of its candidate, held for as long as the attempt
+/// decides: from the candidate's creation (the dial, or the fork) to the lane's
+/// return. A Commit `_exit`s this process with it held; every rejection returns only
+/// after the candidate is proven dead, and the drop clears it.
+// The handoff lanes that register a candidate are unix's alone.
+#[cfg(unix)]
+#[must_use = "the registration holds only while the value lives"]
+pub(crate) struct CandidateRegistration {
+    pid: u32,
+}
+
+/// Register `pid` — the kernel's answer for this process's update candidate (the
+/// fork's child, or `LOCAL_PEERPID` at the rendezvous accept) — as the transfer this
+/// process is deciding: an `@<sid>` whose discovery entry names it is served here
+/// until the Commit ([`live_holder`]).
+#[cfg(unix)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "HandoffAddressOwner",
+        action = "Launch",
+        project = "aterm_gui::identity_claim::project_handoff_address_owner"
+    )
+)]
+pub(crate) fn register_handoff_candidate(pid: u32) -> CandidateRegistration {
+    HANDOFF_CANDIDATE.store(pid, Ordering::SeqCst);
+    CandidateRegistration { pid }
+}
+
+#[cfg(unix)]
+impl CandidateRegistration {
+    /// The attempt is over: its candidate committed (this process is gone) or was
+    /// proven dead. Clears only its OWN pid — a later attempt's registration is not
+    /// ours to end.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "HandoffAddressOwner",
+            action = "Reject",
+            project = "aterm_gui::identity_claim::project_handoff_address_owner"
+        )
+    )]
+    fn release(&self) {
+        let _ = HANDOFF_CANDIDATE.compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CandidateRegistration {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// `HandoffAddressOwner`'s variables, read off the REAL state for `sid` under
+/// `dir`, with `candidate` this process's update candidate (`0`: none yet):
+/// `cand` its liveness (1 alive, 2 dead), `registered` whether the lane's
+/// registration names it, `entry` whom `graph/<sid>` names (0 this process or
+/// no live holder, 1 the candidate, 2 another live process), `pred` 1 (this
+/// process is the one asking), and no request answered yet. The Tier-1 binds
+/// fire the model's `Request` on it and compare `refused` with the real
+/// dispatch probe's answer.
+#[cfg(test)]
+pub(crate) fn project_handoff_address_owner(
+    dir: &Path,
+    sid: &SessionId,
+    candidate: u32,
+) -> aterm_spec::interp::State {
+    let alive = |pid: u32| crate::control_auth::pid_alive(pid);
+    let cand = match candidate {
+        0 => 0,
+        pid if alive(pid) => 1,
+        _ => 2,
+    };
+    let registered = i64::from(candidate != 0 && registered_handoff_candidate() == candidate);
+    let entry = match crate::proxy::graph_entry_host_pid(dir, sid) {
+        Some(pid) if candidate != 0 && pid == candidate => 1,
+        Some(pid) if pid != std::process::id() && alive(pid) => 2,
+        _ => 0,
+    };
+    aterm_spec::interp::State::from([
+        ("cand", cand),
+        ("registered", registered),
+        ("entry", entry),
+        ("pred", 1),
+        ("asked", 0),
+        ("refused", 0),
+        ("steps", 0),
+    ])
+}
+
+/// Test-only: the pid registered now (`0`: none).
+#[cfg(test)]
+pub(crate) fn registered_handoff_candidate() -> u32 {
+    HANDOFF_CANDIDATE.load(Ordering::SeqCst)
 }
 
 /// Claim an identity this process is ADOPTING, and say whether it may.
@@ -845,38 +982,72 @@ mod tests {
         let _ = successor.wait();
     }
 
-    /// Two ADOPTIONS of one premint in the same process-second: the first takes the
-    /// id, the second is told no and mints its own. The ids that result differ —
+    /// Two ADOPTIONS of one premint "in the same second": the first takes the id,
+    /// the second is told no and mints its own. The ids that result differ —
     /// which is the whole property, stated as the fleet sees it.
+    ///
+    /// The same second is a STATE, constructed, never a stopwatch reading. Nothing
+    /// in minting or in the claim reads a clock (a minted id is 80 CSPRNG bits, the
+    /// claim a kernel `flock`), so what makes two launches collide is not how close
+    /// together they run: it is that both read ONE premint while the first holder
+    /// is still LIVE. The test builds exactly that — one premint handed to both,
+    /// the first adopter's claim shown held when the second asks. (It used to
+    /// require both adoptions inside one wall-clock second, a precondition that
+    /// decided nothing about the guard and failed once under the gate's load.)
+    ///
+    /// NEGATIVE CONTROL: the claim is what refuses. The other two gates are shown
+    /// silent (no discovery entry, no successor marker), and once the first holder
+    /// is gone the SAME adoption takes the premint — the same-shell relaunch.
     #[test]
     fn two_instances_minted_in_one_second_cannot_collide() {
+        // `release_claims_for_test` (the control below, and two sibling tests)
+        // drops every claim this process parked: serialize with it, or a sibling
+        // could release the first adopter between the two adoptions.
+        let _guard = rendezvous_test_guard();
         let d = dir();
         let premint = SessionId::generate();
-        let start = std::time::Instant::now();
-
-        let first = if claim_for_adoption(d.path(), &premint) {
-            premint.clone()
-        } else {
-            SessionId::generate()
-        };
-        let second = if claim_for_adoption(d.path(), &premint) {
-            premint.clone()
-        } else {
-            SessionId::generate()
+        let launch = || {
+            if claim_for_adoption(d.path(), &premint) {
+                premint.clone()
+            } else {
+                SessionId::generate()
+            }
         };
 
+        let first = launch();
         assert_eq!(first, premint, "the first adopter gets the preminted id");
+        // The simultaneity, as a fact: the first holder is live when the second
+        // launch asks, and the claim is the only gate that could say no.
+        assert!(
+            matches!(claim_in(d.path(), &premint), ClaimOutcome::Taken),
+            "the first adopter still holds its claim"
+        );
+        assert_eq!(
+            live_holder_in(d.path(), &premint),
+            None,
+            "no discovery entry"
+        );
+        assert_eq!(
+            live_successor_in(d.path(), &premint),
+            None,
+            "no handoff marker"
+        );
+
+        let second = launch();
         assert_ne!(
             second, premint,
             "the second adopter must NOT answer to an id that is already live"
         );
         assert_ne!(first, second, "two live instances, two ids");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "both adoptions must land inside one process-second for this to be \
-             the same-second case; took {:?}",
-            start.elapsed()
+
+        release_claims_for_test();
+        assert_eq!(
+            launch(),
+            premint,
+            "NEGATIVE CONTROL: with the first holder gone the same adoption takes the \
+             premint, so its live claim was what refused the second"
         );
+        release_claims_for_test();
     }
 
     /// The id becomes a FILENAME. Anything but the minted shape is refused before
@@ -957,5 +1128,115 @@ mod tests {
             claim_for_adoption(d.path(), &sid),
             "a dead instance's leftover entry must not block a relaunch"
         );
+    }
+
+    // `HandoffAddressOwner`'s other actions are no function of this process's
+    // dispatch: explicit scope boundaries, not silent coverage holes.
+    #[aterm_spec::spec_unmodeled(
+        machine = "HandoffAddressOwner",
+        action = "SuccessorPublishes",
+        reason = "The successor's own `control::publish_discovery`, run in ANOTHER process; \
+                  the Tier-1 binds plant the entry it writes (`sock/nonce/pid`)."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "HandoffAddressOwner",
+        action = "StrangerPublishes",
+        reason = "An unrelated instance's discovery entry; the Tier-1 binds plant one naming \
+                  a live pid that is not this process."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "HandoffAddressOwner",
+        action = "Commit",
+        reason = "`seamless::commit_and_exit` `_exit`s this process: nothing it answers \
+                  afterwards exists to project."
+    )]
+    #[expect(
+        dead_code,
+        reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
+    )]
+    fn handoff_address_owner_scope_waivers() {}
+
+    /// THE REGISTRATION IS EXACTLY ITS OWN (the handoff lane's
+    /// `register_handoff_candidate`, bound to `HandoffAddressOwner`'s `Launch` and
+    /// `Reject`): while it lives, an adopted id whose entry names THAT pid is
+    /// served here (the transfer this process decides), and its drop clears only
+    /// its own pid. NEGATIVE CONTROLS: without a registration the same entry is
+    /// refused — the live refusal of 2026-09-28 — and so, registration or not, is
+    /// an entry naming any OTHER live process; and ADOPTION still reads the
+    /// candidate's entry as a holder.
+    #[cfg(unix)]
+    #[test]
+    fn a_handoff_candidate_registration_is_exactly_its_own() {
+        let _guard = rendezvous_test_guard();
+        let d = dir();
+        set_rendezvous_override(Some(d.path().to_path_buf()));
+        let mut successor = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the successor stand-in");
+        let succ = successor.id();
+        let sid = SessionId::generate();
+        note_adopted(&sid);
+        std::fs::create_dir_all(d.path().join("graph")).expect("graph dir");
+        let entry = |pid: u32| {
+            std::fs::write(
+                d.path().join("graph").join(sid.as_str()),
+                format!("sock /nonexistent/aterm-{pid}.sock\nnonce ab\npid {pid}\n"),
+            )
+            .expect("plant the entry");
+        };
+        entry(succ);
+        assert_eq!(registered_handoff_candidate(), 0, "nothing registered yet");
+        assert_eq!(
+            live_holder(&sid),
+            Some(succ),
+            "NEGATIVE CONTROL: unregistered, the early entry is refused (the live line)"
+        );
+
+        let reg = register_handoff_candidate(succ);
+        assert_eq!(registered_handoff_candidate(), succ);
+        assert_eq!(live_holder(&sid), None, "the transfer this process decides");
+        assert_eq!(
+            live_holder_in(d.path(), &sid),
+            Some(succ),
+            "adoption still sees the candidate as a holder"
+        );
+        assert!(
+            !claim_for_adoption(d.path(), &sid),
+            "a launch may not adopt an id the candidate publishes"
+        );
+        entry(LIVE_FOREIGN_PID);
+        assert_eq!(
+            live_holder(&sid),
+            Some(LIVE_FOREIGN_PID),
+            "NEGATIVE CONTROL: a stranger is refused while the registration lives"
+        );
+
+        // A later registration (another attempt) is not ended by this one's drop.
+        let later = register_handoff_candidate(LIVE_FOREIGN_PID);
+        drop(reg);
+        assert_eq!(registered_handoff_candidate(), LIVE_FOREIGN_PID);
+        drop(later);
+        assert_eq!(
+            registered_handoff_candidate(),
+            0,
+            "every registration dropped"
+        );
+        entry(succ);
+        assert_eq!(
+            live_holder(&sid),
+            Some(succ),
+            "NEGATIVE CONTROL: after the drop the live candidate's entry is refused again"
+        );
+
+        let _ = successor.kill();
+        let _ = successor.wait();
+        assert_eq!(
+            live_holder(&sid),
+            None,
+            "a dead candidate's entry holds nothing"
+        );
+        set_rendezvous_override(None);
     }
 }

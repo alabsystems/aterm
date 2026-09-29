@@ -384,6 +384,11 @@ pub(crate) struct Reopened {
     pub(crate) class: DeathClass,
     /// The journals it came from, newest first.
     pub(crate) sources: Vec<JournalId>,
+    /// The writer of each of `manifest`'s windows, in order: the pid of the
+    /// journal it came from. A window's pool ids are its writer's, so a shell
+    /// the PTY keeper kept is matched only to its own writer's leaves
+    /// (`keeper_link::place_by_owner`).
+    pub(crate) writers: Vec<u32>,
     /// The leaves that had a program running, their windows counted in this
     /// merged layout; `None` when any source journal did not say (an older
     /// writer's), which reads as today's "programs lost" (D16, ruling 282).
@@ -403,6 +408,28 @@ pub(crate) struct Lost {
     pub(crate) named: Vec<String>,
     /// Leaves whose program's name was not resolved yet.
     pub(crate) unnamed: usize,
+}
+
+/// The reopened layout's terminal panes whose saved folder is not here
+/// ([`Reopened::panes_without_folder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PanesWithoutFolder {
+    /// Panes whose restore asks for a folder no shell can start in: each
+    /// starts in the home folder, and a Messages row names the folder.
+    pub(crate) gone: usize,
+    /// Panes a program held
+    /// ([`crate::restore::TerminalLeafRestore::folder_may_be_remote`]): the
+    /// folder may be another machine's, so the restore does not ask for it
+    /// and no row names it.
+    pub(crate) unasked: usize,
+}
+
+impl PanesWithoutFolder {
+    /// Every pane's folder is here.
+    pub(crate) const NONE: Self = Self {
+        gone: 0,
+        unasked: 0,
+    };
 }
 
 impl Reopened {
@@ -461,6 +488,59 @@ impl Reopened {
                     u32::try_from(tab).unwrap_or(u32::MAX),
                 );
                 walk(&restored.root, place, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The layout's terminal panes that name a folder no shell can start in
+    /// (`not_found`: the check the spawn itself makes,
+    /// [`crate::spawn_folder::folder_fault`]) — what the reopened row counts
+    /// rather than claim every tab came back in its folder (audit #7 finding
+    /// 48). The tree a window restores from: its canonical tabs, else the
+    /// legacy mirror (`restore_into_window`). A pane a program held
+    /// ([`crate::restore::TerminalLeafRestore::folder_may_be_remote`]) counts
+    /// apart, as [`PanesWithoutFolder::unasked`]: its restore does not ask for
+    /// that folder.
+    pub(crate) fn panes_without_folder(
+        &self,
+        not_found: impl Fn(&str) -> bool,
+    ) -> PanesWithoutFolder {
+        fn walk(
+            node: &crate::restore::RestoredSplitTree,
+            not_found: &dyn Fn(&str) -> bool,
+            out: &mut PanesWithoutFolder,
+        ) {
+            match node {
+                crate::restore::RestoredSplitTree::Leaf {
+                    view: crate::restore::RestoredView::Terminal(leaf),
+                } if leaf.cwd.as_deref().is_some_and(not_found) => {
+                    if leaf.folder_may_be_remote() {
+                        out.unasked += 1;
+                    } else {
+                        out.gone += 1;
+                    }
+                }
+                crate::restore::RestoredSplitTree::Leaf { .. } => {}
+                crate::restore::RestoredSplitTree::Split { first, second, .. } => {
+                    walk(first, not_found, out);
+                    walk(second, not_found, out);
+                }
+            }
+        }
+        let mut out = PanesWithoutFolder::NONE;
+        for window in &self.manifest.windows {
+            if window.restored_tabs.is_empty() {
+                out.gone += window
+                    .tabs
+                    .iter()
+                    .flat_map(crate::restore::PaneLayout::leaves)
+                    .filter(|leaf| leaf.cwd().is_some_and(&not_found))
+                    .count();
+            } else {
+                for tab in &window.restored_tabs {
+                    walk(&tab.root, &not_found, &mut out);
+                }
             }
         }
         out
@@ -1002,6 +1082,7 @@ mod unix {
                     if header.probation && (class.crashed() || header.second_chance) =>
                 {
                     let skipped = Reopened {
+                        writers: vec![id.pid; manifest.windows.len()],
                         manifest,
                         class,
                         sources: vec![id],
@@ -1112,6 +1193,7 @@ mod unix {
         let class = newest.class;
         let mut windows = Vec::new();
         let mut sources = Vec::new();
+        let mut writers = Vec::new();
         let mut programs = Some(Vec::new());
         let mut second_chance = false;
         for candidate in candidates {
@@ -1134,12 +1216,17 @@ mod unix {
             // (the brake skipped every other): this is its second chance.
             second_chance |= candidate.header.probation;
             sources.push(candidate.id);
+            writers.extend(std::iter::repeat_n(
+                candidate.id.pid,
+                candidate.manifest.windows.len(),
+            ));
             windows.extend(candidate.manifest.windows);
         }
         Some(Reopened {
             manifest: RestoreManifest::new(windows),
             class,
             sources,
+            writers,
             programs,
             second_chance,
         })
@@ -1647,6 +1734,7 @@ pub(crate) mod fixtures {
                 questions: None,
                 identity: None,
                 agent: None,
+                held: false,
             },
         ))
     }
@@ -1686,8 +1774,8 @@ pub(crate) mod tests {
     pub(crate) use super::fixtures::layout;
     use super::{
         BootClaim, DeathClass, Evidence, JournalHeader, JournalId, JournalOwner, Lane,
-        MIN_WRITE_INTERVAL, Note, PROBATION, TITLE_WRITE_INTERVAL, claim_at_boot, classify_death,
-        decode, encode, same_but_titles,
+        MIN_WRITE_INTERVAL, Note, PROBATION, PanesWithoutFolder, TITLE_WRITE_INTERVAL,
+        claim_at_boot, classify_death, decode, encode, same_but_titles,
     };
     use crate::crash_signal::{MarkerOwner, markers};
     use crate::restore::{self, RestoreManifest};
@@ -1805,22 +1893,230 @@ pub(crate) mod tests {
             Some(Vec::new()),
             "`programs = []` round-trips"
         );
-        let row = journal_reopened_message(&quiet, None, None, None, false);
+        let row =
+            journal_reopened_message(&quiet, None, None, None, false, PanesWithoutFolder::NONE);
         assert_eq!((row.severity, row.hold), (Severity::Info, Hold::LogOnly));
         assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN);
 
         let lost = reopen(Some(vec![vim_in(0, 1)]));
         assert_eq!(lost.programs, Some(vec![vim_in(0, 1)]));
-        let row = journal_reopened_message(&lost, None, None, None, false);
+        let row =
+            journal_reopened_message(&lost, None, None, None, false, PanesWithoutFolder::NONE);
         assert_eq!(row.severity, Severity::Warn);
         assert_ne!(row.hold, Hold::LogOnly);
         assert!(row.detail[0].starts_with("vim was running in 1 of 2 tabs"));
 
         let older = reopen(None);
         assert_eq!(older.programs, None);
-        let row = journal_reopened_message(&older, None, None, None, false);
+        let row =
+            journal_reopened_message(&older, None, None, None, false, PanesWithoutFolder::NONE);
         assert_eq!(row.severity, Severity::Warn);
         assert_eq!(row.detail[0], JOURNAL_LOSS);
+    }
+
+    /// AUDIT #7 FINDING 48, TIER-1 through the real journal: a layout whose
+    /// second tab's folder is gone by the time it is reopened is written, the
+    /// writer killed, the journal claimed and read back — and the reopened row
+    /// COUNTS the pane that could not open its folder, by the check the spawn
+    /// itself makes (`spawn_folder::folder_fault`), instead of saying both
+    /// tabs came back in their folders, and the loss sentence above it no
+    /// longer says ONLY the scrollback was lost (audit #8). NEGATIVE CONTROL
+    /// through the same files: with both folders there the row reads as it
+    /// always did. The same pane while ssh held it is not counted, and the
+    /// row claims no folders: that folder may be another machine's, and its
+    /// shell starts in the default folder (audit #8) — unless the pane
+    /// carries the agent aterm hosted there, which ran on this machine.
+    #[test]
+    fn a_reopened_layout_counts_the_panes_whose_folder_is_gone() {
+        use crate::message_reporters::{
+            JOURNAL_NOTHING_RAN, JOURNAL_NOTHING_RAN_FOLDERLESS, journal_reopened_message,
+        };
+        let folders = scratch("cj-folders");
+        let here = folders.path().join("here");
+        let gone = folders.path().join("gone");
+        std::fs::create_dir(&here).unwrap();
+        std::fs::create_dir(&gone).unwrap();
+        let (here, gone_str) = (here.to_str().unwrap(), gone.to_str().unwrap());
+        let manifest = layout(&[(here, "zsh"), (gone_str, "zsh")]);
+        let reopen_from = |manifest: &RestoreManifest, programs: Vec<super::LeafProgram>| {
+            let (dir, logs) = (scratch("cj-dir"), scratch("cj-logs"));
+            die(run_said(dir.path(), logs.path(), manifest, Some(programs)));
+            claim_here(dir.path(), logs.path())
+                .reopened
+                .expect("reopened")
+        };
+        let reopen = || reopen_from(&manifest, Vec::new());
+        let spawn_verdict = |dir: &str| crate::spawn_folder::folder_fault(dir).is_some();
+        let counted = |gone, unasked| PanesWithoutFolder { gone, unasked };
+
+        let whole = reopen();
+        assert_eq!(
+            whole.panes_without_folder(spawn_verdict),
+            PanesWithoutFolder::NONE
+        );
+        let row =
+            journal_reopened_message(&whole, None, None, None, false, PanesWithoutFolder::NONE);
+        assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN);
+        assert_eq!(
+            row.detail[1],
+            "2 tabs in 1 window restored in their folders from its crash journal"
+        );
+
+        std::fs::remove_dir(&gone).unwrap();
+        let reopened = reopen();
+        let homeless = reopened.panes_without_folder(spawn_verdict);
+        assert_eq!(homeless, counted(1, 0), "the tab whose folder is gone");
+        let row = journal_reopened_message(&reopened, None, None, None, false, homeless);
+        assert_eq!(row.detail[0], JOURNAL_NOTHING_RAN_FOLDERLESS);
+        assert_eq!(
+            row.detail[1],
+            "2 tabs in 1 window restored from its crash journal; 1 pane could not open its folder"
+        );
+        assert!(
+            row.detail
+                .iter()
+                .all(|line| !line.contains("in their folders")),
+            "{:?}",
+            row.detail
+        );
+
+        // The same pane while ssh held it (audit #8): that folder may be
+        // another machine's, so it is not counted, and the restored line
+        // claims no folders. `held` rides the journal's files.
+        let mut ssh = manifest.clone();
+        if let restore::RestoredSplitTree::Leaf {
+            view: restore::RestoredView::Terminal(leaf),
+        } = &mut ssh.windows[0].restored_tabs[1].root
+        {
+            leaf.held = true;
+        }
+        let ssh_ran = || {
+            vec![super::LeafProgram {
+                window: 0,
+                tab: 1,
+                program: "ssh".to_string(),
+                agent: false,
+            }]
+        };
+        let reopened = reopen_from(&ssh, ssh_ran());
+        assert!(
+            matches!(
+                &reopened.manifest.windows[0].restored_tabs[1].root,
+                restore::RestoredSplitTree::Leaf {
+                    view: restore::RestoredView::Terminal(leaf),
+                } if leaf.held
+            ),
+            "held survives the journal"
+        );
+        let unasked = reopened.panes_without_folder(spawn_verdict);
+        assert_eq!(unasked, counted(0, 1));
+        let row = journal_reopened_message(&reopened, None, None, None, false, unasked);
+        assert!(
+            row.detail[0].starts_with("ssh was running in 1 of 2 tabs"),
+            "{:?}",
+            row.detail
+        );
+        assert_eq!(
+            row.detail[1],
+            "2 tabs in 1 window restored from its crash journal"
+        );
+        // Unless the pane carries the agent aterm hosted there: it ran on
+        // this machine, in that folder, so the gone folder is counted.
+        let mut hosted = ssh.clone();
+        if let restore::RestoredSplitTree::Leaf {
+            view: restore::RestoredView::Terminal(leaf),
+        } = &mut hosted.windows[0].restored_tabs[1].root
+        {
+            leaf.agent = Some(Box::new(restore::AgentRestore {
+                pid: 4242,
+                start: "Sat Sep 27 01:02:03 2026".into(),
+                program: "/opt/claude/bin/claude".into(),
+                argv: vec!["/opt/claude/bin/claude".into()],
+                session: None,
+                cwd: gone_str.to_owned(),
+                version: None,
+                codex: None,
+            }));
+        }
+        assert_eq!(
+            reopen_from(&hosted, Vec::new()).panes_without_folder(spawn_verdict),
+            counted(1, 0)
+        );
+    }
+
+    /// AUDIT #7 FINDING 48 — EVERY PANE OF THE TREE A WINDOW RESTORES FROM is
+    /// counted: the second pane of a split tab whose folder is gone, and the
+    /// legacy mirror's panes when a window has no canonical tabs (split or
+    /// not). NEGATIVE CONTROLS: the same layouts with every folder there count
+    /// nothing, and a window that HAS canonical tabs is counted from them
+    /// alone, never from its legacy mirror too.
+    #[test]
+    fn every_pane_of_the_restored_tree_is_counted_split_and_legacy() {
+        use restore::{PaneLayout, RestoredSplitTree, SplitKind};
+        let reopened = |manifest: RestoreManifest| super::Reopened {
+            manifest,
+            class: DeathClass::Killed,
+            sources: vec![JournalId { pid: 9, nanos: 9 }],
+            writers: vec![9],
+            programs: None,
+            second_chance: false,
+        };
+        let gone = |dir: &str| dir.starts_with("/gone");
+        let none = |_: &str| false;
+
+        // A split tab (/here | /gone/a) beside a one-pane tab (/here/too).
+        let mut split = layout(&[("/here", "zsh"), ("/gone/a", "zsh"), ("/here/too", "zsh")]);
+        let tabs = &mut split.windows[0].restored_tabs;
+        let second = tabs.remove(1).root;
+        let first = tabs[0].root.clone();
+        tabs[0].root = RestoredSplitTree::Split {
+            axis: SplitKind::Vertical,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        let split = reopened(split);
+        assert_eq!(split.counts(), (1, 2));
+        let counted = |gone| PanesWithoutFolder { gone, unasked: 0 };
+        assert_eq!(
+            split.panes_without_folder(gone),
+            counted(1),
+            "the split's second pane"
+        );
+        assert_eq!(split.panes_without_folder(none), counted(0));
+
+        let leg = |cwd: &str| PaneLayout::Leaf {
+            cwd: Some(cwd.to_string()),
+            title: "zsh".to_string(),
+            focused: false,
+            local_id: None,
+        };
+        let mirror = vec![
+            PaneLayout::Split {
+                dir: SplitKind::Horizontal,
+                ratio: 0.5,
+                first: Box::new(leg("/here")),
+                second: Box::new(leg("/gone/b")),
+            },
+            leg("/gone/c"),
+        ];
+        let mut legacy = layout(&[]);
+        legacy.windows[0].tabs = mirror.clone();
+        let legacy = reopened(legacy);
+        assert_eq!(
+            legacy.panes_without_folder(gone),
+            counted(2),
+            "the legacy mirror"
+        );
+        assert_eq!(legacy.panes_without_folder(none), counted(0));
+
+        let mut both = layout(&[("/here", "zsh"), ("/here/too", "zsh")]);
+        both.windows[0].tabs = mirror;
+        assert_eq!(
+            reopened(both).panes_without_folder(gone),
+            counted(0),
+            "canonical tabs win; the mirror is not counted beside them"
+        );
     }
 
     /// P6a, RULING 293 — TIER-1 through the real journal: a killed run whose
@@ -1846,6 +2142,7 @@ pub(crate) mod tests {
             session: session.map(str::to_string),
             cwd: "/work/b".into(),
             version: Some("2.1.283".into()),
+            codex: None,
         };
         let agent_in = |tab: u32| super::LeafProgram {
             window: 0,
@@ -1871,7 +2168,7 @@ pub(crate) mod tests {
             "`agent = true` round-trips"
         );
         assert_eq!(only.resumed(true), vec![(0, 1)]);
-        let row = journal_reopened_message(&only, None, None, None, true);
+        let row = journal_reopened_message(&only, None, None, None, true, PanesWithoutFolder::NONE);
         assert_eq!((row.severity, row.hold), (Severity::Info, Hold::LogOnly));
         assert_eq!(row.title, "Tabs restored after aterm stopped");
         assert_eq!(
@@ -1890,7 +2187,8 @@ pub(crate) mod tests {
             Some(claude(Some(CONVERSATION))),
             vec![vim_in(0, 0), agent_in(1)],
         );
-        let row = journal_reopened_message(&beside, None, None, None, true);
+        let row =
+            journal_reopened_message(&beside, None, None, None, true, PanesWithoutFolder::NONE);
         assert_eq!(row.severity, Severity::Warn);
         assert_eq!(row.title, "Tabs restored, vim lost");
         // One sentence (ruling 314): the agent coming back rides detail[0],
@@ -1909,7 +2207,8 @@ pub(crate) mod tests {
         );
 
         // NEGATIVE CONTROLS.
-        let off = journal_reopened_message(&only, None, None, None, false);
+        let off =
+            journal_reopened_message(&only, None, None, None, false, PanesWithoutFolder::NONE);
         assert_eq!(off.severity, Severity::Warn);
         assert_eq!(off.title, "Tabs restored, claude lost");
         assert!(
@@ -1919,10 +2218,18 @@ pub(crate) mod tests {
         );
         let unregistered = reopen(Some(claude(None)), vec![agent_in(1)]);
         assert!(unregistered.resumed(true).is_empty());
-        let row = journal_reopened_message(&unregistered, None, None, None, true);
+        let row = journal_reopened_message(
+            &unregistered,
+            None,
+            None,
+            None,
+            true,
+            PanesWithoutFolder::NONE,
+        );
         assert_eq!(row.title, "Tabs restored, claude lost");
         let planted = reopen(None, vec![agent_in(1)]);
-        let row = journal_reopened_message(&planted, None, None, None, true);
+        let row =
+            journal_reopened_message(&planted, None, None, None, true, PanesWithoutFolder::NONE);
         assert_eq!(row.title, "Tabs restored, claude lost");
     }
 
@@ -2105,6 +2412,7 @@ pub(crate) mod tests {
             session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
             cwd: "/work/b".into(),
             version: Some("2.1.283".into()),
+            codex: None,
         };
         let mut manifest = layout(&[("/work/a", "zsh"), ("/work/b", "claude")]);
         manifest.fill_agents(&|id| (id == 1).then(|| claude.clone()));
@@ -2215,7 +2523,7 @@ pub(crate) mod tests {
         let reopened = claim.reopened.expect("an older build's journal reopens");
         assert_eq!(reopened.manifest.windows[0].rows, 30);
         assert_eq!(
-            reopened.manifest.first_leaf_cwd(),
+            reopened.manifest.first_leaf_cwd().as_deref(),
             Some("/from/0.80"),
             "{:?}",
             reopened.manifest
@@ -2434,6 +2742,10 @@ pub(crate) mod tests {
         let reopened = claim_here(dir.path(), logs.path()).reopened.unwrap();
         assert_eq!(reopened.sources, vec![newer_id, older_id]);
         assert_eq!(cwds(&reopened.manifest), vec!["/newer", "/older"]);
+        // Each window names its own writer: a shell the PTY keeper kept is
+        // placed only in its own window's panes (`keeper_link::place_by_owner`).
+        assert_ne!(newer_id.pid, older_id.pid);
+        assert_eq!(reopened.writers, vec![newer_id.pid, older_id.pid]);
     }
 
     /// The run's own evidence, and only its: a panic report written after the

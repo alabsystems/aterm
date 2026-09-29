@@ -4,8 +4,7 @@
 //! Sparkle Words v3 §6 — **the spec framework**: new sparkle words are data,
 //! not code. A [`WordEffectSpec`] composes three orthogonal axes:
 //!
-//! * **graphic** — a peek-up sprite show ([`Collection::Cats`]; the orca redo
-//!   adds `Orcas` later),
+//! * **graphic** — a peek-up sprite show ([`Collection::Cats`]),
 //! * **ink** — a glyph colorway ([`Colorway`]: two-tone gradient, the
 //!   ultrathink-style rainbow, or the feline self-glow),
 //! * **burst** — a light show ([`BurstKind`]: sparkle, nova, FUCK SUPER NOVA,
@@ -76,7 +75,7 @@ pub struct GraphicSpec {
     pub dwell_ms: (u32, u32),
 }
 
-/// Sprite collections. The orca redo adds `Orcas` later (design §10).
+/// Sprite collections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Collection {
     Cats,

@@ -13,13 +13,15 @@
 //     it links (fontdue, ttf-parser, wgpu's Rust side, ...);
 //   * for allocations >= `MIN_TRACK` bytes, the return-address stack that made
 //     them (`RtlCaptureStackBackTrace`, symbolized through dbghelp at report
-//     time). SYMBOLIZATION DOES NOT WORK ON THIS BOX and the reason is not
-//     understood: `SymInitializeW` returns 1 with `GetLastError` 0, and every
-//     `SymFromAddr` then fails, so `report` prints raw addresses. Sites are
-//     therefore identified by allocation COUNT and SIZE against a known file
-//     table — see `docs/measured/win-heap-2026-08-29.md` §1. Fixing this would
-//     make the instrument considerably more useful on a workload whose sites are
-//     not already known by arithmetic.
+//     time). SYMBOLIZATION FAILED on the one Windows box it ran on
+//     (`SymInitializeW` returns 1 with `GetLastError` 0, then every `SymFromAddr`
+//     fails), so `report` prints raw addresses and sites are identified by
+//     allocation COUNT and SIZE against a known file table
+//     (`docs/measured/win-heap-2026-08-29.md` §1). EXTERNAL — needs a Windows
+//     host to diagnose: first check the build's triple (a `*-windows-gnu` build
+//     carries DWARF, which dbghelp cannot read — resolve through `gimli` there)
+//     and whether the test exe's PDB is found (else pass the exe's directory as
+//     `SymInitializeW`'s search path).
 //   * exact live/peak byte totals for ALL sizes (the sub-threshold ones are
 //     counted, just not attributed).
 //

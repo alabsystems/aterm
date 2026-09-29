@@ -21,10 +21,9 @@
 //! matching `--skip`, `--ignored` or `--bench` runs nothing and passes, and
 //! `--list` names it — so the workspace test run and the measuring stage
 //! select it exactly as they would a `#[test]`. Off macOS there is no
-//! libdispatch main queue to measure, and it passes without running.
-//!
-//! `examples/objc_bound_drive.rs` compiles this same file as the example
-//! `aterm verify`'s objc-bound-drive stage builds and runs.
+//! libdispatch main queue to measure, and it passes without running. On
+//! macOS a NOT RUN (`2`: no main thread, no witness, no probe class) is a
+//! failing exit, never a pass. This test is the drive's only runner.
 //!
 //! # THE PROOF OBLIGATION, and why an argument would not have discharged it
 //!
@@ -78,7 +77,7 @@
 /// The name libtest's argv selects this target by: its `[[test]] name`.
 const TEST_NAME: &str = "main_thread_bound_drive";
 
-pub fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     let code = match asked(std::env::args().skip(1)) {
         Ok(Asked::Run) => run(),
         Ok(Asked::List { selected }) => {

@@ -121,7 +121,7 @@ pub fn log_denial(subsystem: &str, operation: &str, mode: ContainmentMode, reaso
 /// * `subsystem` — The gate's domain (e.g. `"spawn"`, `"process"`, `"network"`).
 /// * `operation` — What was decided (e.g. `"os-network-sandbox"`, `"spawn initial shell"`).
 /// * `mode` — The active containment mode for the decision.
-/// * `reason` — The posture recorded (e.g. `"OS sandbox ACTUATED via sandbox-exec …"`).
+/// * `reason` — The posture recorded (e.g. `"OS sandbox applied: no network; …"`).
 #[inline]
 pub fn log_posture(subsystem: &str, operation: &str, mode: ContainmentMode, reason: &str) {
     // Byte-identical manual assembly of the former

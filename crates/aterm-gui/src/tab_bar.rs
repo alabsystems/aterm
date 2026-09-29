@@ -47,7 +47,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_render::Theme;
 
@@ -2940,7 +2940,8 @@ fn image_data(primitives: &[TabIconPrimitive], color: [u8; 3], cols: u16) -> Arc
         rows: 1,
         z_index: 0,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: ImageScaling::Fit,
+        source_rect: None,
     })
 }
 
@@ -3025,6 +3026,7 @@ fn append_icon_images(
                 image: image.clone(),
                 cell_row: 0,
                 cell_col,
+                kitty: None,
             },
         ));
     }
@@ -3052,6 +3054,7 @@ fn append_status_image(
             image,
             cell_row: 0,
             cell_col: 0,
+            kitty: None,
         },
     ));
 }
@@ -3437,6 +3440,13 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// family of twins that had to keep its HEAD has not flipped — it speaks the
 /// head dialect the loners already do — so it flips nobody. A roomy strip is
 /// untouched: distinct heads there keep the familiar head cut.
+///
+/// A PATH TAKES ITS OWN CUT at every door ([`path_chip_label`]): its end, told
+/// apart from every other path in the window, whether or not those are cut or
+/// seated on this page. Neither the cluster arm nor the flip re-cuts it, so
+/// its label holds still while the strip pages and its neighbours change;
+/// only a twin by subject still takes its ordinal ([`path_ordinal_label`] in a
+/// family of other paths).
 fn distinct_chip_labels(
     segments: &[TabSegment],
     titles: &[String],
@@ -3479,6 +3489,16 @@ fn distinct_chip_labels(
         });
     // (tab, its title width budget) for every label the first cut shortened.
     let mut cut: Vec<(usize, usize)> = Vec::new();
+    // Every tab's SUBJECT — its title less its own state clause — seated or
+    // not, cut or not: what a PATH chip's cut is told apart from
+    // ([`path_chip_label`]).
+    let subjects: Vec<&str> = titles.iter().map(|title| cut_core(title, 0)).collect();
+    // The cut tabs whose subject is a PATH. Their first cut is already the
+    // path's own ([`path_chip_label`]), a function of the subject, the window
+    // and the WHOLE window's subjects and nothing else, so neither the
+    // cluster arm nor the one-dialect flip re-cuts them: a path's label must
+    // not turn on which other chips happen to be cut, or seated, beside it.
+    let mut path_cut = vec![false; titles.len()];
     for seg in segments {
         let TabHit::Select(i) = seg.kind else {
             continue;
@@ -3507,7 +3527,17 @@ fn distinct_chip_labels(
         // only a cut sheds. `cut_core` with no pairwise suffix is exactly "this
         // title minus its own state clause".
         let source = if over { cut_core(raw, 0) } else { raw };
-        labels[i] = Some(truncate_title(source, avail));
+        // A PATH keeps its END. The head cut is right for a name (`cargo bu…`)
+        // and wrong for a directory, whose head is the ancestry every tab
+        // shares: the selected `~\aterm\crates\aterm-cli\src` painted
+        // `~\aterm…` beside a real `~\aterm`, and `C:\Windows\System32` read
+        // `C:\Windows…` or `…ystem32` depending on which door this pass took
+        // that frame (measured, 0.95.0 at 480×360 and 716×539). The path's own
+        // cut is the same whichever door, so its chip holds still.
+        path_cut[i] = over && is_path_subject(source);
+        let path = (path_cut[i] && strip_display_cells(source) > avail)
+            .then(|| path_chip_label(i, &subjects, avail));
+        labels[i] = Some(path.unwrap_or_else(|| truncate_title(source, avail)));
         if over {
             cut.push((i, avail));
         }
@@ -3559,6 +3589,12 @@ fn distinct_chip_labels(
         for window in members.windows(2) {
             suffix = suffix.min(common_suffix_bytes(&titles[window[0]], &titles[window[1]]));
         }
+        // ...from a word boundary, so the shed takes whole words and never the
+        // last letters of one ([`snap_shed`]). Measured on two paths that end
+        // alike in `i\src` (0.95.0 painted `…gu` and `…cl`); paths now take
+        // their own cut ([`path_chip_label`]), and this keeps every other
+        // family from the same fragment.
+        let suffix = snap_shed(&titles[i], suffix);
         // SUBJECT BEFORE STATE. Each member also sheds its OWN composed state
         // clause ([`state_clause_bytes`]) — the half a chip is not there to
         // paint. The pairwise shed cannot find it: a strip of twins shares the
@@ -3620,7 +3656,24 @@ fn distinct_chip_labels(
             family_tail
         };
         let label = if twins >= 2 && i != active {
-            ordinal_chip_label(i, &titles[i], core, remainder, avail, &siblings, tail_cut)
+            if path_cut[i] && !family_of_twins {
+                // A PATH twin among other members carries the path's own cut
+                // behind its ordinal: the family cut splits the directory's
+                // name there (`5 · …ui` for `aterm-gui\src` beside
+                // `aterm-cli\src` in a 7-cell window).
+                path_ordinal_label(i, &subjects, avail)
+            } else {
+                ordinal_chip_label(i, &titles[i], core, remainder, avail, &siblings, tail_cut)
+            }
+        } else if path_cut[i] {
+            // A PATH keeps the label the first cut gave it ([`path_chip_label`]).
+            // The family cut below keeps what follows the last SPACE of the
+            // shared head, and a path has none; worse, it answered only while
+            // this chip's family was cut and seated beside it, so the same
+            // tab read `…stem32` beside `C:\Windows\Temp` and `C:\Win…` once
+            // that tab moved to `C:\Users` (measured, 716×539, a 7-cell
+            // window). Twins by subject still take their ordinal, above.
+            labels[i].clone().unwrap_or_default()
         } else {
             furniture_survivor_recut(
                 &titles[i],
@@ -3661,7 +3714,10 @@ fn distinct_chip_labels(
         // the degenerate corner where only the head dialect distinguishes.
         let mut flips: Vec<(usize, String)> = Vec::new();
         for (a, &(i, avail)) in cut.iter().enumerate() {
-            if relabelled[a] {
+            // A path's first cut is already its own — re-cutting it here is
+            // what split `…ndows\Temp` and `…ystem32`, and only while some
+            // other family happened to be cut on the same strip.
+            if relabelled[a] || path_cut[i] {
                 continue;
             }
             // A loner can share its ENDING without sharing a head: the
@@ -3992,6 +4048,251 @@ fn cut_core(title: &str, shared: usize) -> &str {
     let pairwise = if shared >= title.len() { 0 } else { shared };
     let shed = pairwise.max(state_clause_bytes(title));
     &title[..title.len() - shed]
+}
+
+/// The characters a label may be cut AFTER without splitting a name: the two
+/// path separators, a space, and the punctuation names are joined with.
+fn is_token_boundary(c: char) -> bool {
+    matches!(c, '/' | '\\' | '-' | '_' | '.') || c.is_whitespace()
+}
+
+/// `shared` — a common suffix of `title`, in bytes — narrowed to start at a
+/// token boundary ([`is_token_boundary`]): the shed then takes whole words and
+/// components, never the last letters of one. `…gui\src` and `…cli\src` end
+/// alike in `i\src`, and shedding that cut `gui` to `gu` (measured on 0.95.0);
+/// what they share is `\src`. (A PATH now sheds whole components in its own
+/// cut, [`path_tail`]; this is the cluster's rule for every other title.) A
+/// suffix covering the whole title is returned as is ([`cut_core`] treats it
+/// as nothing to shed).
+fn snap_shed(title: &str, shared: usize) -> usize {
+    if shared == 0 || shared >= title.len() {
+        return shared;
+    }
+    let tail = &title[title.len() - shared..];
+    tail.char_indices()
+        .find(|&(_, c)| is_token_boundary(c))
+        .map_or(0, |(at, _)| tail.len() - at)
+}
+
+/// Whether a chip's SUBJECT is a filesystem PATH — the shape the cwd rung and
+/// shell prompts title a tab with: `~`, `~/…`, `~\…`, `/…`, `C:\…`, `\\host\…`.
+/// Its most telling part is its END, the directory the tab is in.
+fn is_path_subject(subject: &str) -> bool {
+    matches!(
+        subject.as_bytes(),
+        [b'~'] | [b'~', b'/' | b'\\', ..] | [b'/', ..] | [b'\\', b'\\', ..]
+    ) || matches!(
+        subject.as_bytes(),
+        [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic()
+    )
+}
+
+/// The label a cut PATH chip paints in `room` cells: its own tail
+/// ([`path_tail`]), else the head of its directory's name or its position
+/// ([`path_fallback`]). `subjects` are EVERY tab's subject in the window
+/// ([`cut_core`]), and `tab` indexes them.
+///
+/// ITS KIN ARE THE WHOLE WINDOW'S: every other tab whose subject is a
+/// different path, seated or not and cut or not — never only the chips this
+/// frame cut and seated on this page. Measured at 716×539 with fifteen tabs
+/// (five chips a page, a 7-cell window): `~\aterm\crates\aterm-gui\src` and
+/// `…\aterm-cli\src` never shared a page, so each was cut as a loner with no
+/// kin and all three `src` chips read `…src`; and one gui chip read `…gui` or
+/// `…src` as the cli tab happened to be cut on its page or not. So the label
+/// is a function of the subject, the window and the window's subjects, and
+/// holds still while the strip pages and the neighbours change. A tab in the
+/// SAME directory is a twin, not kin: no text tells twins apart, and their
+/// position does ([`ordinal_chip_label`], and the pixel pass's repair).
+/// Only paths are kin: a program title that ends in a directory's name
+/// (`cargo test -p aterm`) is never cut to it, so it cannot collide with it.
+fn path_chip_label(tab: usize, subjects: &[&str], room: usize) -> String {
+    let subject = subjects[tab];
+    let kin = path_kin(subject, subjects);
+    path_tail(subject, room, &kin).unwrap_or_else(|| path_fallback(tab, subject, room, &kin))
+}
+
+/// The paths a PATH chip's cut is told apart from: every subject in the window
+/// that is a path and a different one ([`path_chip_label`]).
+fn path_kin<'a>(subject: &str, subjects: &[&'a str]) -> Vec<&'a str> {
+    subjects
+        .iter()
+        .copied()
+        .filter(|other| *other != subject && is_path_subject(other))
+        .collect()
+}
+
+/// A PATH twin's ORDINAL among a family of other paths: its position, carrying
+/// the path's own cut ([`path_tail`]) where the window affords one behind
+/// ` · `, bare where it does not. The family's tail cut ([`family_tail`]) is
+/// a cut of the whole title and splits the directory's name in a narrow
+/// window. What the number promises, and the mark when not even the digits
+/// fit, are [`ordinal_chip_label`]'s.
+fn path_ordinal_label(tab: usize, subjects: &[&str], avail: usize) -> String {
+    let digits = (tab + 1).to_string();
+    let digit_cells = strip_display_cells(&digits);
+    if digit_cells > avail {
+        return if avail == 0 {
+            String::new()
+        } else {
+            "…".to_string()
+        };
+    }
+    // ` · ` costs 3 cells, and a tail below 2 says nothing worth the space.
+    let room = avail.saturating_sub(digit_cells + 3);
+    let subject = subjects[tab];
+    let tail = if strip_display_cells(subject) <= room {
+        Some(subject.to_string())
+    } else {
+        path_tail(subject, room, &path_kin(subject, subjects))
+    };
+    match tail {
+        Some(tail) if room >= 2 => format!("{digits} · {tail}"),
+        _ => digits,
+    }
+}
+
+/// Whether `text` ends `name` at the START of a token — `gui` ends
+/// `~\x\aterm-gui` and does not end `~\x\argui` — so that a chip labelled
+/// `…text` could be `name`'s.
+fn ends_with_token(name: &str, text: &str) -> bool {
+    name.strip_suffix(text)
+        .is_some_and(|before| before.is_empty() || before.ends_with(is_token_boundary))
+}
+
+/// The cut a PATH `subject` takes when it does not fit `room` cells: the mark
+/// and the LONGEST tail that starts at a token boundary ([`is_token_boundary`])
+/// and fits — `…aterm-gui\src`, then `…gui\src`, `…Temp`, `…Files\Git` — so a
+/// chip keeps the directory it is in and as much of what leads to it as fits,
+/// and never a name cut from inside (`…ndows\Temp`, `…32\drivers`, `…les\Git`:
+/// all measured on 0.95.0).
+///
+/// `kin` are the other paths this chip must be told from ([`path_chip_label`]).
+/// A tail one of them also ends with names neither of them, so it is passed
+/// over — `…src` beside `…aterm-cli\src` — and when no tail of the whole
+/// subject both fits and differs, the search runs again over the subject less
+/// the trailing components it shares with a kin, the shortest shed first. A
+/// shed is whole COMPONENTS: the two `src` directories end alike in `i\src`,
+/// and shedding THAT is what painted `…gu`; what they share is `\src`. That
+/// keeps the component that differs: `…aterm-gui`, `…gui`.
+///
+/// NEVER A STUB: a tail under three cells that does not begin a component
+/// (`…gu`) says nothing. Past every marked tail, the LEAF alone — the
+/// directory's own name, whole, where `…` and it do not both fit: a window
+/// that seated `System32` but not `…System32` painted `…ystem32` (measured,
+/// 716×539). `None` when not even that fits and differs.
+fn path_tail(subject: &str, room: usize, kin: &[&str]) -> Option<String> {
+    let whole = subject.len();
+    let mut sheds: Vec<usize> = kin
+        .iter()
+        .filter_map(|other| {
+            let shared = &subject[whole - common_suffix_bytes(subject, other)..];
+            shared.find(['/', '\\']).map(|at| shared.len() - at)
+        })
+        .filter(|&shed| shed < whole)
+        .collect();
+    sheds.sort_unstable();
+    sheds.dedup();
+    let bodies: Vec<(&str, &str)> = std::iter::once(0)
+        .chain(sheds)
+        .map(|shed| subject.split_at(whole - shed))
+        .collect();
+    // A text a kin also ends with — whole, or less the same shed — names
+    // neither of them.
+    let names_kin = |text: &str, shed: &str| {
+        kin.iter().any(|other| {
+            ends_with_token(other, text)
+                || (!shed.is_empty()
+                    && other
+                        .strip_suffix(shed)
+                        .is_some_and(|rest| ends_with_token(rest, text)))
+        })
+    };
+    for &(body, shed) in &bodies {
+        for (at, c) in body.char_indices() {
+            if !is_token_boundary(c) {
+                continue;
+            }
+            let text = &body[at + c.len_utf8()..];
+            let component = matches!(c, '/' | '\\');
+            let Some(first) = text.chars().next() else {
+                continue;
+            };
+            // `a--b` and `x\ \y` offer a boundary right after a boundary: the
+            // tail there starts with punctuation, not a name. A component may
+            // start with one (`.claude`), a word inside one may not.
+            if (!component && is_token_boundary(first))
+                || matches!(first, '/' | '\\')
+                || first.is_whitespace()
+            {
+                continue;
+            }
+            let cells = strip_display_cells(text);
+            if cells + 1 > room || (cells < 3 && !component) {
+                continue;
+            }
+            if !names_kin(text, shed) {
+                return Some(format!("…{text}"));
+            }
+        }
+    }
+    bodies.iter().find_map(|&(body, shed)| {
+        let leaf = body.rsplit(['/', '\\']).next()?;
+        (!leaf.is_empty()
+            && leaf.len() < body.len()
+            && strip_display_cells(leaf) <= room
+            && !names_kin(leaf, shed))
+        .then(|| leaf.to_string())
+    })
+}
+
+/// What a cut PATH chip paints where no tail or leaf of it both fits and
+/// differs ([`path_tail`]): the HEAD of its directory's own name (`System…`),
+/// which begins that name where the other cuts on offer began inside it. ONE
+/// answer whichever door the chip came through: a 7-cell window seats neither
+/// `…System32` nor `System32`, and the loner and cluster arms each fell back to
+/// a cut of their own, so one tab read `…stem32` beside `C:\Windows\Temp` and
+/// `C:\Win…` once that tab moved away (measured, 716×539).
+///
+/// NEVER A STUB, NEVER A KIN'S NAME: a head that keeps fewer than three of the
+/// name's cells (`Sy…`), or one a kin's directory name also reads as (two
+/// `src` directories), names nothing — and the chip takes its POSITION
+/// instead, bare, the answer the strip gives twins ([`ordinal_chip_label`]),
+/// or the lone mark where not even the digits fit.
+fn path_fallback(tab: usize, subject: &str, room: usize, kin: &[&str]) -> String {
+    let leaf = |path: &str| {
+        path.rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let name = leaf(subject);
+    let head = truncate_title(&name, room);
+    let (kept, marked) = match head.strip_suffix('…') {
+        Some(kept) => (kept, true),
+        None => (head.as_str(), false),
+    };
+    let reads_as_kin = kin.iter().any(|other| {
+        let other = leaf(other);
+        if marked {
+            other.starts_with(kept)
+        } else {
+            other == kept
+        }
+    });
+    if !kept.is_empty()
+        && strip_display_cells(kept) >= strip_display_cells(&name).min(3)
+        && !reads_as_kin
+    {
+        return head;
+    }
+    let digits = (tab + 1).to_string();
+    if room == 0 {
+        String::new()
+    } else if strip_display_cells(&digits) <= room {
+        digits
+    } else {
+        "…".to_string()
+    }
 }
 
 /// Byte length of a composed title's trailing STATE clause — the separator
@@ -4811,7 +5112,8 @@ pub(crate) mod pixel_band {
             // land on the chrome lip above the grid (the renderers' chrome-band
             // lift). 0 only where the strip has no lip of its own.
             band_lift_px: lift as u16,
-            pixel_exact: false,
+            scaling: ImageScaling::Fit,
+            source_rect: None,
         });
 
         // Coverage: every column EXCEPT the fallback segments'. A covered cell's
@@ -4832,6 +5134,7 @@ pub(crate) mod pixel_band {
                                 image: Arc::clone(&image),
                                 cell_row: r as u16,
                                 cell_col: col as u16,
+                                kitty: None,
                             },
                         ));
                     } else if r + 1 == geometry.strip_rows {
@@ -5171,6 +5474,23 @@ pub(crate) mod pixel_band {
                 .filter(|(tab, _)| *tab == active)
                 .map(|(_, text)| text.clone()),
         );
+        // EVERY holder of a shared name takes its position — not every holder
+        // but the first one painted. Claiming in strip order handed the
+        // leftmost of three `~\aterm` chips the bare name beside `12 · ~\aterm`
+        // and `13 · ~\aterm`, so it read exactly like the selected `~\aterm`
+        // (measured, 0.95.0, fifteen tabs). A name two quiet chips share names
+        // neither, so both move; the SELECTION still keeps its own.
+        let shared: Vec<bool> = fitted
+            .iter()
+            .enumerate()
+            .map(|(n, (tab, text))| {
+                *tab != active
+                    && !text.is_empty()
+                    && fitted.iter().enumerate().any(|(m, (other_tab, other))| {
+                        m != n && *other_tab != active && other == text
+                    })
+            })
+            .collect();
         for n in 0..fitted.len() {
             let tab = fitted[n].0;
             if tab == active {
@@ -5182,14 +5502,16 @@ pub(crate) mod pixel_band {
             if fitted[n].1.is_empty() {
                 continue;
             }
-            // THE TWO WAYS THE FIT LOSES A NAME. It collapsed this label onto
+            // THE WAYS A LABEL LOSES ITS NAME. Another quiet chip carries the
+            // same string (`shared`, above); the fit collapsed this label onto
             // one already on the strip; or it cut the label down to nothing but
             // ELISION MARKS, which name nothing at all — and a fit can do that
             // to an ordinal the cell pass had already resolved (`10` at a span
             // that seats one glyph), which would undo the twins' answer on the
             // only lane that paints.
-            let lost =
-                label_says_nothing(&fitted[n].1) || taken.iter().any(|other| *other == fitted[n].1);
+            let lost = shared[n]
+                || label_says_nothing(&fitted[n].1)
+                || taken.iter().any(|other| *other == fitted[n].1);
             if !lost {
                 taken.push(fitted[n].1.clone());
                 continue;
@@ -6045,7 +6367,8 @@ pub(crate) mod pixel_band {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
-                pixel_exact: false,
+                scaling: ImageScaling::Fit,
+                source_rect: None,
             });
             let mk = |col: u16| {
                 (
@@ -6054,6 +6377,7 @@ pub(crate) mod pixel_band {
                         image: Arc::clone(&icon),
                         cell_row: 0,
                         cell_col: 0,
+                        kitty: None,
                     },
                 )
             };
@@ -6684,6 +7008,49 @@ pub(crate) mod pixel_band {
                     "{text:?} would need a SECOND fit at paint time"
                 );
             }
+        }
+
+        /// EVERY QUIET TWIN IS NUMBERED — the first one painted too. Twins that
+        /// FIT reach this pass as the bare name (the cell pass numbers only
+        /// cut ones), and the repair used to number a chip only when its name
+        /// was already TAKEN, so the leftmost `~\aterm` claimed the name and
+        /// read exactly like the selected one while `12 · ~\aterm` and
+        /// `13 · ~\aterm` sat beside it (measured on 0.95.0, fifteen tabs, a
+        /// selection elsewhere). A name two quiet chips share names neither.
+        #[test]
+        fn every_quiet_twin_takes_its_position_the_first_painted_too() {
+            let mono = |_tab: usize, s: &str| s.chars().count() as f32 * CELL_W as f32;
+            let span = mono(0, "13 · ~\\aterm") + 1.0;
+            let entries: Vec<BandLabel> = [
+                (5, "…gui\\src"),
+                (8, "~\\aterm"),
+                (11, "~\\aterm"),
+                (12, "~\\aterm"),
+                (13, "C:\\Temp"),
+            ]
+            .into_iter()
+            .map(|(tab, text)| BandLabel {
+                tab,
+                span_px: span,
+                text: text.to_string(),
+            })
+            .collect();
+            let fitted = fit_labels_distinctly(&entries, 5, &[], &mono);
+            assert_eq!(
+                fitted,
+                [
+                    (5, "…gui\\src".to_string()),
+                    (8, "9 · ~\\aterm".to_string()),
+                    (11, "12 · ~\\aterm".to_string()),
+                    (12, "13 · ~\\aterm".to_string()),
+                    (13, "C:\\Temp".to_string()),
+                ],
+                "every twin carries its position; the selection and the loner \
+                 keep their names"
+            );
+            // CONTROL: a name no other quiet chip carries is left alone.
+            let lone = fit_labels_distinctly(&entries[..2], 5, &[], &mono);
+            assert_eq!(lone[1].1, "~\\aterm");
         }
 
         /// …AND THE MARK IS STILL THE FLOOR. A window too small to seat even
@@ -9163,6 +9530,449 @@ mod tests {
         assert_eq!(truncate_title_tail("日本語", 2), "…");
     }
 
+    /// A cut PATH keeps its END, cut only where a name begins ([`path_tail`]):
+    /// the chips the 0.95.0 re-verification photographed (2026-09-27), at the
+    /// windows they were painted in and around them.
+    #[test]
+    fn a_cut_path_keeps_its_directory_and_never_a_fragment_of_a_name() {
+        // Loners: the longest tail that starts a name and fits.
+        for (subject, room, expected) in [
+            // Painted `…ndows\Temp` and `C:\Windows…`.
+            ("C:\\Windows\\Temp", 12, Some("…Temp")),
+            ("C:\\Windows\\Temp", 13, Some("…Windows\\Temp")),
+            // Painted `…32\drivers`.
+            ("C:\\Windows\\System32\\drivers", 12, Some("…drivers")),
+            (
+                "C:\\Windows\\System32\\drivers",
+                17,
+                Some("…System32\\drivers"),
+            ),
+            // Painted `…les\Git`.
+            ("C:\\Program Files\\Git", 11, Some("…Files\\Git")),
+            (
+                "C:\\Program Files\\Common Files\\microsoft shared",
+                12,
+                Some("…shared"),
+            ),
+            (
+                "C:\\Program Files\\Common Files\\microsoft shared",
+                17,
+                Some("…microsoft shared"),
+            ),
+            // The selected chip at 480×360 painted `~\aterm…` beside `~\aterm`.
+            (
+                "~\\aterm\\crates\\aterm-cli\\src",
+                14,
+                Some("…aterm-cli\\src"),
+            ),
+            ("~\\aterm\\crates\\aterm-cli\\src", 13, Some("…cli\\src")),
+            ("~\\aterm\\crates\\aterm-cli\\src", 4, Some("…src")),
+            ("/home/person/work/api", 9, Some("…work/api")),
+            // The leaf seats and `…` with it does not: the directory's name,
+            // whole (painted `…ystem32` at 716×539).
+            ("C:\\Windows\\System32", 8, Some("System32")),
+            ("~\\aterm\\crates\\aterm-cli\\src", 3, Some("src")),
+            // Nothing but a fragment fits: `path_fallback` answers.
+            ("C:\\Windows\\System32", 7, None),
+            ("~/a/verylongname", 8, None),
+        ] {
+            assert_eq!(
+                path_tail(subject, room, &[]).as_deref(),
+                expected,
+                "{subject:?} in {room} cells"
+            );
+        }
+
+        // A FAMILY: a tail a kin also ends with is passed over, and past the
+        // whole subject the trailing component they share is shed — the
+        // component, `\src`, never the `i\src` the two happen to share.
+        let gui = "~\\aterm\\crates\\aterm-gui\\src";
+        let cli = "~\\aterm\\crates\\aterm-cli\\src";
+        let sys = "C:\\Windows\\System32";
+        assert_eq!(common_suffix_bytes(gui, cli), "i\\src".len(), "fixture");
+        for (room, expected) in [
+            // The selected chip's measured window, where it painted `…gu`.
+            (15, Some("…aterm-gui\\src")),
+            (14, Some("…aterm-gui\\src")),
+            (13, Some("…gui\\src")),
+            (8, Some("…gui\\src")),
+            // `…src` fits, and names both: the shared component goes instead.
+            (7, Some("…gui")),
+            (4, Some("…gui")),
+            (3, None),
+        ] {
+            assert_eq!(
+                path_tail(gui, room, &[cli]).as_deref(),
+                expected,
+                "{room} cells"
+            );
+            if let Some(label) = path_tail(gui, room, &[cli]) {
+                assert_ne!(
+                    Some(label),
+                    path_tail(cli, room, &[gui]),
+                    "{room} cells: the pair stays tellable apart"
+                );
+            }
+        }
+        // Kin that end differently change nothing, and an ANCESTOR is not cut
+        // for a tab below it: `~\aterm\crates` keeps `…crates`.
+        assert_eq!(
+            path_tail(gui, 7, &[cli, sys, "~\\aterm"]).as_deref(),
+            Some("…gui")
+        );
+        assert_eq!(
+            path_tail("~\\aterm\\crates", 7, &[gui]).as_deref(),
+            Some("…crates")
+        );
+        assert!(ends_with_token("~\\x\\aterm-gui", "gui"));
+        assert!(!ends_with_token("~\\x\\argui", "gui"));
+
+        // THE FALLBACK: the head of the directory's name, one answer at every
+        // door; the chip's POSITION where that head is a stub or reads as a
+        // kin's name too.
+        for (tab, subject, room, kin, expected) in [
+            (6, sys, 7, &[][..], "System…"),
+            (6, sys, 4, &[], "Sys…"),
+            (6, sys, 7, &[gui, cli, "C:\\Windows\\Temp"], "System…"),
+            // Two letters of a name are a stub.
+            (6, sys, 3, &[], "7"),
+            // `System…` would name `SystemApps` just as well.
+            (6, sys, 7, &["C:\\Windows\\SystemApps"], "7"),
+            // Both `src` directories: the name alone names neither.
+            (4, gui, 3, &[cli], "5"),
+            // Not even the digits fit: the mark; no window: nothing.
+            (11, sys, 1, &[], "…"),
+            (11, sys, 0, &[], ""),
+        ] {
+            assert_eq!(
+                path_fallback(tab, subject, room, kin),
+                expected,
+                "{subject:?} in {room} cells beside {kin:?}"
+            );
+        }
+
+        // THE WINDOW'S KIN, seated or not — and a twin is not kin: text
+        // cannot tell twins apart, their position does.
+        let subjects = ["~\\aterm", gui, cli, sys, gui, "cargo test -p crates"];
+        assert_eq!(path_chip_label(1, &subjects, 7), "…gui");
+        assert_eq!(path_chip_label(2, &subjects, 7), "…cli");
+        assert_eq!(path_chip_label(4, &subjects, 7), "…gui");
+        assert_eq!(path_chip_label(3, &subjects, 7), "System…");
+        // CONTROL: with no `aterm-cli\src` in the window, `…src` names gui
+        // alone.
+        assert_eq!(path_chip_label(1, &["~\\aterm", gui, sys], 7), "…src");
+        // Only paths are kin: a command naming `crates` is not cut to it.
+        assert_eq!(
+            path_chip_label(0, &["~\\aterm\\crates", "cargo test -p crates"], 7),
+            "…crates"
+        );
+        // A path twin's ordinal carries the path's own cut, or stands bare —
+        // never `5 · …ui`.
+        assert_eq!(path_ordinal_label(4, &subjects, 7), "5");
+        assert_eq!(path_ordinal_label(4, &subjects, 8), "5 · …gui");
+        assert_eq!(path_ordinal_label(4, &subjects, 12), "5 · …gui\\src");
+        assert_eq!(path_ordinal_label(11, &subjects, 1), "…");
+
+        // The shed itself: whole words and components, or nothing.
+        assert_eq!(snap_shed("build-10", 1), 0, "`0` is inside a name");
+        assert_eq!(snap_shed("x · Ready", " · Ready".len()), " · Ready".len());
+        assert_eq!(
+            snap_shed("same", 4),
+            4,
+            "a whole-title suffix is cut_core's"
+        );
+        for (subject, path) in [
+            ("~", true),
+            ("~\\aterm", true),
+            ("~/aterm", true),
+            ("/tmp", true),
+            ("C:\\Windows", true),
+            ("c:/windows", true),
+            ("\\\\build-01\\share", true),
+            ("~aterm", false),
+            ("user@m17-tower: ~/aterm", false),
+            ("cargo build", false),
+            ("C:", false),
+            ("", false),
+        ] {
+            assert_eq!(is_path_subject(subject), path, "{subject:?}");
+        }
+    }
+
+    /// Whether `label` is an honest cut of the PATH `subject` on the chip of
+    /// tab `tab`: the subject whole; a tail behind the mark that starts where a
+    /// name does and ends where one does; the directory's name whole, or its
+    /// head keeping three cells; or the chip's POSITION, bare or ahead of one
+    /// of those. Never a name cut from inside (`…ystem32`, `…gu`) and never
+    /// the ancestry every tab shares (`C:\Win…`, `~\aterm…`).
+    fn honest_path_cut(tab: usize, subject: &str, label: &str) -> bool {
+        let position = (tab + 1).to_string();
+        if label == position || label == "…" {
+            return true;
+        }
+        let label = label
+            .strip_prefix(format!("{position} · ").as_str())
+            .unwrap_or(label);
+        let name = subject.rsplit(['/', '\\']).next().unwrap_or_default();
+        if label == subject || label == name {
+            return true;
+        }
+        if let Some(text) = label.strip_prefix('…') {
+            return !text.is_empty()
+                && subject.match_indices(text).any(|(at, _)| {
+                    subject[..at].ends_with(is_token_boundary)
+                        && subject[at + text.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| matches!(c, '/' | '\\'))
+                });
+        }
+        label.strip_suffix('…').is_some_and(|head| {
+            name.starts_with(head) && strip_display_cells(head) >= strip_display_cells(name).min(3)
+        })
+    }
+
+    /// The title width budget of `tab`'s seated chip, in cells.
+    fn chip_avail(segments: &[TabSegment], tab: usize) -> usize {
+        let seg = segments
+            .iter()
+            .find(|seg| seg.kind == TabHit::Select(tab))
+            .expect("a seated chip has a segment");
+        let layout = tab_content_layout(seg, PLAIN_TAB);
+        usize::from(layout.title_end.saturating_sub(layout.title_start))
+    }
+
+    /// THE MEASURED STRIP, walked over every width: two sibling crates' `src`
+    /// directories, two shells in `~\aterm` and one in `System32`. At 0.95.0
+    /// the pair painted `…gu` / `…cl` (even the selected chip, with room for
+    /// fifteen cells), and `System32` read `…ystem32` beside the pair but
+    /// `C:\Windows…` without it — two labels for one tab, frame to frame.
+    ///
+    /// The laws: a sibling directory's chip names the component that differs
+    /// (`gui`/`cli`) wherever four cells fit, every path cut is honest
+    /// ([`honest_path_cut`]), and a chip's label does not depend on which
+    /// OTHER tabs are cut beside it — `System32` alone, and `System32` in one
+    /// cluster with `C:\Windows\Temp` or `C:\Windows\System32\drivers`, read
+    /// the same at every width.
+    #[test]
+    fn deep_sibling_directories_keep_the_component_that_differs_at_every_width() {
+        let gui = "~\\aterm\\crates\\aterm-gui\\src";
+        let cli = "~\\aterm\\crates\\aterm-cli\\src";
+        let sys = "C:\\Windows\\System32";
+        let strip = |titles: [&str; 5]| -> Vec<String> { titles.map(String::from).to_vec() };
+        let family = strip([gui, cli, "~\\aterm", "~\\aterm", sys]);
+        // `System32` alone, and `System32` sharing its head with a neighbour
+        // the cluster pass admits it with (`C:\Windows\`, eleven cells).
+        let alone = strip(["~\\aterm", "~\\aterm", "~\\aterm", "~\\aterm", sys]);
+        let with_temp = strip(["~\\aterm", "C:\\Windows\\Temp", "~\\aterm", "~\\aterm", sys]);
+        let with_drivers = strip([
+            "~\\aterm",
+            "C:\\Windows\\System32\\drivers",
+            "~\\aterm",
+            "~\\aterm",
+            sys,
+        ]);
+        let mut named = 0usize;
+        let mut clustered = 0usize;
+        for cols in 30..=240u16 {
+            for active in [0usize, 1, 4] {
+                let segments = layout_segments(cols, family.len(), active, false);
+                let with_family = seated(&segments, &family, active);
+                for (tab, label) in &with_family {
+                    let avail = chip_avail(&segments, *tab);
+                    let (subject, name) = match tab {
+                        0 => (gui, "gui"),
+                        1 => (cli, "cli"),
+                        4 => (sys, "System32"),
+                        _ => continue,
+                    };
+                    let at = format!("{cols} cols, active {active}, tab {tab} ({avail} cells)");
+                    assert!(
+                        honest_path_cut(*tab, subject, label),
+                        "{at}: {label:?} is not an honest cut of {subject:?}"
+                    );
+                    // Wherever the name that tells it apart fits (`…gui` is
+                    // four cells, the bare leaf `System32` eight), the chip
+                    // paints it.
+                    if avail >= if *tab == 4 { name.len() } else { 4 } {
+                        named += 1;
+                        assert!(
+                            label.contains(name),
+                            "{at}: {label:?} lost the name that tells it apart"
+                        );
+                    }
+                }
+                // STABLE: System32's chip reads the same beside any
+                // neighbours (same widths — only the other titles differ).
+                let sys_of = |titles: &[String]| {
+                    seated(&segments, titles, active)
+                        .into_iter()
+                        .find(|(tab, _)| *tab == 4)
+                        .map(|(_, label)| label)
+                };
+                let reference = sys_of(&alone);
+                for (neighbours, titles) in [
+                    ("the sibling pair", &family),
+                    ("C:\\Windows\\Temp", &with_temp),
+                    ("C:\\Windows\\System32\\drivers", &with_drivers),
+                ] {
+                    assert_eq!(
+                        sys_of(titles),
+                        reference,
+                        "{cols} cols, active {active}: System32's label turned on {neighbours}"
+                    );
+                }
+                // Non-vacuity: count the frames where System32 and Temp were
+                // BOTH cut with a head that dominates the window — the
+                // cluster door that painted `…stem32`.
+                let both_cut = [1usize, 4].iter().all(|&tab| {
+                    segments.iter().any(|seg| seg.kind == TabHit::Select(tab))
+                        && strip_display_cells(&with_temp[tab]) > chip_avail(&segments, tab)
+                });
+                if both_cut
+                    && "C:\\Windows\\".len() * 2
+                        >= chip_avail(&segments, 1).min(chip_avail(&segments, 4))
+                {
+                    clustered += 1;
+                }
+            }
+        }
+        assert!(
+            named > 100,
+            "vacuous: only {named} sibling chips were checked"
+        );
+        assert!(
+            clustered > 20,
+            "vacuous: System32 clustered with Temp in only {clustered} frames"
+        );
+    }
+
+    /// THE WINDOWED STRIP the re-verification measured (716×539, fifteen tabs,
+    /// five chips a page, a 7-cell title window): the two `aterm-gui\src` tabs
+    /// and the `aterm-cli\src` tab sit on DIFFERENT pages, so a pass that told
+    /// a path only from the chips cut beside it painted `…src` on all three —
+    /// two directories under one label — and `System32` read `…stem32` or
+    /// `C:\Win…` as the `C:\Windows\Temp` tab moved.
+    ///
+    /// The laws, at every width and every selection: gui and cli chips name
+    /// `gui`/`cli` wherever four cells fit (or carry their POSITION, the twin's
+    /// answer); every path cut is honest; a path chip's label is a function of
+    /// its window alone — one label per (tab, width) across every page and
+    /// selection that seats it; and `System32` reads the same when the Temp
+    /// tab moves to `C:\Users`.
+    #[test]
+    fn a_windowed_strip_names_each_path_the_same_on_every_page() {
+        let gui = "~\\aterm\\crates\\aterm-gui\\src";
+        let cli = "~\\aterm\\crates\\aterm-cli\\src";
+        let sys = "C:\\Windows\\System32";
+        let titles: Vec<String> = [
+            "~\\aterm",
+            "~\\aterm",
+            "~\\aterm",
+            "~\\aterm",
+            gui,
+            cli,
+            sys,
+            "C:\\Windows\\Temp",
+            "~\\aterm",
+            "C:\\Program Files\\Git",
+            "C:\\Windows\\System32\\drivers",
+            "~\\aterm",
+            "~\\aterm",
+            gui,
+            "~\\aterm",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut moved = titles.clone();
+        moved[7] = "C:\\Users".to_string();
+        let mut by_width: std::collections::HashMap<(usize, usize), String> =
+            std::collections::HashMap::new();
+        let (mut apart, mut floor) = (0usize, 0usize);
+        for cols in 30..=240u16 {
+            for active in 0..titles.len() {
+                let segments = layout_segments(cols, titles.len(), active, false);
+                let labels = seated(&segments, &titles, active);
+                let on_page = |tab: usize| labels.iter().any(|(seat, _)| *seat == tab);
+                if on_page(4) != on_page(5) {
+                    apart += 1;
+                }
+                for (tab, label) in &labels {
+                    let subject = titles[*tab].as_str();
+                    if !is_path_subject(subject) || subject == "~\\aterm" {
+                        continue;
+                    }
+                    let avail = chip_avail(&segments, *tab);
+                    let at = format!("{cols} cols, active {active}, tab {tab} ({avail} cells)");
+                    assert!(
+                        honest_path_cut(*tab, subject, label),
+                        "{at}: {label:?} is not an honest cut of {subject:?}"
+                    );
+                    let position = format!("{} · ", tab + 1);
+                    let ordinal = *label == (tab + 1).to_string() || label.starts_with(&position);
+                    if let Some(name) = match tab {
+                        4 | 13 => Some("gui"),
+                        5 => Some("cli"),
+                        _ => None,
+                    } && avail >= 4
+                        && !ordinal
+                    {
+                        assert!(
+                            label.contains(name),
+                            "{at}: {label:?} lost the name that tells it apart"
+                        );
+                    }
+                    // By value at the FLOOR's windows — seven cells on the
+                    // chip-card band the re-verification measured, eight on
+                    // the padless one — and the few below them.
+                    if (4..=8).contains(&avail) && matches!(tab, 4..=6) && !ordinal {
+                        floor += 1;
+                        let expected = match (tab, avail) {
+                            (4, 8) => "…gui\\src".to_string(),
+                            (4, _) => "…gui".to_string(),
+                            (5, 8) => "…cli\\src".to_string(),
+                            (5, _) => "…cli".to_string(),
+                            (_, 8) => "System32".to_string(),
+                            // `System…` in the measured seven.
+                            (_, _) => truncate_title("System32", avail),
+                        };
+                        assert_eq!(*label, expected, "{at}: the floor's window");
+                    }
+                    // A twin's ordinal is its position among twins cut beside
+                    // it — the one label here allowed to turn on its page.
+                    if !ordinal {
+                        let first = by_width
+                            .entry((*tab, avail))
+                            .or_insert_with(|| label.clone());
+                        assert_eq!(
+                            label, first,
+                            "{at}: tab {tab} reads differently on another page"
+                        );
+                    }
+                }
+                let sys_of = |titles: &[String]| {
+                    seated(&segments, titles, active)
+                        .into_iter()
+                        .find(|(tab, _)| *tab == 6)
+                        .map(|(_, label)| label)
+                };
+                assert_eq!(
+                    sys_of(&titles),
+                    sys_of(&moved),
+                    "{cols} cols, active {active}: System32's label turned on the Temp tab"
+                );
+            }
+        }
+        assert!(
+            apart > 100,
+            "vacuous: gui and cli shared every page ({apart})"
+        );
+        assert!(
+            floor > 20,
+            "vacuous: the floor's windows were seen {floor} times"
+        );
+    }
+
     /// One label pin, BOTH band geometries: the chip-card interior pad
     /// ([`tab_content_layout`]) costs exactly one title cell, so any pin
     /// tight enough to sit at the budget edge differs by one glyph between
@@ -10303,8 +11113,25 @@ mod tests {
     /// sense: the subject whole, a run of its whole trailing components behind
     /// the mark (with or without the separator before them), or a non-empty
     /// head of it with a trailing mark — never a directory name's cut-off end.
+    /// A chip whose twins are not on the strip, and the SELECTED twin, paint
+    /// the path's own cut ([`path_chip_label`]), which may also be its leaf
+    /// alone, whole (`aterm` where `…aterm` does not fit), or the head of that
+    /// leaf keeping three cells (`ate…`) — the directory's name begun, never
+    /// ended from inside.
     fn is_twin_context(subject: &str, painted: &str) -> bool {
         if painted == subject {
+            return true;
+        }
+        if subject
+            .strip_suffix(painted)
+            .is_some_and(|before| !painted.is_empty() && before.ends_with(['/', '\\']))
+        {
+            return true;
+        }
+        let leaf = subject.rsplit(['/', '\\']).next().unwrap_or_default();
+        if painted.strip_suffix('…').is_some_and(|head| {
+            leaf.starts_with(head) && strip_display_cells(head) >= strip_display_cells(leaf).min(3)
+        }) {
             return true;
         }
         if let Some(tail) = painted.strip_prefix('…') {

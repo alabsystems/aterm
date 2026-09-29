@@ -309,9 +309,22 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let t0 = Instant::now();
     // The status poll proves WHAT the verdict says; how fast it moved is
     // bounded below, between two pushes, never by this poll's spawns.
-    let prompt = status_until(&inst, &sid, Duration::from_secs(10), "agent=prompt", |s| {
-        field(s, "agent") == Some("prompt")
-    });
+    // Until the verdict names the box's kind too: the box's frame can be read
+    // before its body is drawn, and that screen is honestly `prompt` with
+    // `agent_detail=other` — the drawn body then moves the detail (one more
+    // rev and one more push, which everything below reads from this status).
+    // A box that never reads as the rm circuit-breaker still fails here, with
+    // the last status in the message.
+    let prompt = status_until(
+        &inst,
+        &sid,
+        Duration::from_secs(10),
+        "agent=prompt agent_detail=bash:not-read-only",
+        |s| {
+            field(s, "agent") == Some("prompt")
+                && field(s, "agent_detail") == Some("bash:not-read-only")
+        },
+    );
     let took = t0.elapsed();
     eprintln!("agent=prompt {took:?} after the go-file (busy: {busy}; program: {program})");
     assert_eq!(

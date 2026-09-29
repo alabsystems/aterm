@@ -16,7 +16,6 @@ One directory per vendor build, named for the version:
   PermissionRequest/0.json, /1.json    the `echo`, then the `rm`
   PreToolUse/0.json, /1.json
   PostToolUse/0.json, /1.json
-  StatusLine/0.json …      the statusLine JSON, once per refresh
   screen/usage.txt         what the vendor PAINTED (rank-1 evidence)
   screen/usage.status      the `status` line beside it
 ```

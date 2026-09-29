@@ -40,10 +40,16 @@ use rain_common::RainScene;
 const ROWS: usize = 8;
 const COLS: usize = 24;
 
-/// Build a FRESH GpuRenderer (or skip-marker) at the suite's standard px/theme.
+/// Build a FRESH GpuRenderer (or skip-marker) at the suite's standard px/theme,
+/// font-settled: the long-lived renderer and every fresh oracle are compared
+/// byte for byte, so a fallback chain landing between one's frames and the
+/// other's would read as a stale gate.
 fn fresh_gpu() -> Option<GpuRenderer> {
     match GpuRenderer::new(18.0, Theme::default()) {
-        Ok(g) => Some(g),
+        Ok(mut g) => {
+            g.debug_block_on_lazy_fallbacks();
+            Some(g)
+        }
         Err(e) => {
             eprintln!("SKIP: no GPU/font available: {e}");
             None

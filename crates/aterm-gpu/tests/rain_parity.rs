@@ -231,7 +231,7 @@ fn scissored_path_rain_row_filter_matches_full_render() {
 
     // Ground truth: a fresh full render of frame B by an INDEPENDENT renderer
     // (the nova_parity idiom — no shared caches, no shared prev state).
-    let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+    let mut gpu2 = common::independent_gpu(18.0, theme);
     let mut win_fresh = aterm_gpu::WindowGpu::new();
     let gpu_fresh = gpu2.render_input(&mut win_fresh, &in_b, None);
     assert_eq!(

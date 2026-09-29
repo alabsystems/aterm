@@ -226,12 +226,26 @@ impl PendingClose {
         )
     }
 
-    /// The wire refusal of a gesture this question stands in the way of: the
-    /// gesture that PARKED it, or a second one refused while it stands — and the
-    /// `confirm` verb's refusal of a question it may not answer. `invoke CloseTab`
-    /// mints a reply from `pending_action_refusal`, and `OK` over a tab that is
-    /// still there would tell a driver the close happened. The state in words,
-    /// then the one action; `controls front` carries the rest.
+    /// The `invoke` reply of the gesture that PARKED this question
+    /// (`App::invoke_reply`): an `OK`, because asking is what the action does,
+    /// in words no driver can read as a close that happened — `invoked
+    /// CloseTab` would say exactly that over a tab that is still there. The
+    /// state, then the one action.
+    pub(crate) fn wire_pending(&self) -> String {
+        format!(
+            "confirm pending kind={} window={}; `confirm yes|no` answers it",
+            kind(&self.prompt),
+            self.wid.0
+        )
+    }
+
+    /// The wire refusal of a gesture this question stands in the way of: a
+    /// second one refused while it stands — and the `confirm` verb's refusal of
+    /// a question it may not answer. It is also what the parking gesture leaves
+    /// in `pending_action_refusal`, the channel a `tab` verb and every other
+    /// reply-minting consumer reads; `invoke` answers that gesture with
+    /// [`Self::wire_pending`] instead. The state in words, then the one action;
+    /// `controls front` carries the rest.
     pub(crate) fn wire_refusal(&self) -> String {
         let gesture = gesture(&self.prompt);
         if self.wire_may_answer() {
@@ -436,7 +450,13 @@ mod tests {
         assert!(!line.contains("key "), "a keystroke never answers: {line}");
         assert!(!line.contains('\n'), "one line: {line:?}");
         assert_eq!(CONTROLS_CLOSED, "confirm open=false");
-        // The `invoke` reply: the state in words, then the one action.
+        // The `invoke` reply of the gesture that asked: `OK`, the state in
+        // words, then the one action — never `invoked`, which reads as done.
+        assert_eq!(
+            pending.wire_pending(),
+            "confirm pending kind=quit window=3; `confirm yes|no` answers it"
+        );
+        // And the refusal of a second gesture while it stands.
         assert_eq!(
             pending.wire_refusal(),
             "a quit is waiting for an answer in the window; `confirm yes|no` answers it"

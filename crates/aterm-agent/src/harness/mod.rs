@@ -12,12 +12,12 @@
 //!   vocabulary [`usage`] and `harness limits` print.
 //! * [`usage`] — the transcript's usage rows, read into one view; the HUD
 //!   line and the `harness usage --json` shape (design §5.2). Its statusLine
-//!   reader has had NO live producer since the `harness statusline` bridge
-//!   retired (decision B): only the vendor-corpus canary and the
-//!   `harness_try` example feed it, so the view's account windows are empty
-//!   in every live `harness usage`; deleting it reshapes that verb's JSON
-//!   (`windows`), which is the owner's call;
-//!   and the `/usage` panel's painted windows `harness limits` prints beside
+//!   reader, which had no live producer once the `harness statusline` bridge
+//!   retired (decision B), was deleted 2026-09-27 with the window view it
+//!   filled: `"windows"` stays an empty object in the JSON, as every live
+//!   `harness usage` already printed it, and `--utc-offset` (which placed
+//!   their resets) went with it; and the `/usage` panel's painted windows
+//!   `harness limits` prints beside
 //!   the wall the engine's own reader names (`aterm_phase::wall`, the one
 //!   wall classifier). The second classifier that used to live here
 //!   (`limits`: hook values, a pair rule, a banner table that disagreed with
@@ -32,6 +32,11 @@
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
 //!   permission-mode row: model + effort, working directory, branch, read
 //!   from the files Claude Code already keeps (owner direction, 2026-09-24).
+//! * [`session_usage`] — THIS session's usage, one implementation for the
+//!   footer and `harness usage`: its tokens per model, folded incrementally
+//!   from its own transcript and its subagents' (live), and the limit wall
+//!   Claude Code wrote into its transcript when it hit one, while its reset
+//!   is ahead. Nothing of it is read off the screen.
 //! * [`lights`] — the lights at the footer's end (the permission mode, fast
 //!   mode), drawn only while one differs from what the owner expects: read
 //!   from what Claude Code draws, toggled through its own inputs, read back
@@ -45,6 +50,11 @@
 //!   over one tab or every session, and atpkg's activation notice as a push.
 //!   The window's supervisor host takes the steps at each session's idle
 //!   points.
+//! * [`goal_hold`] — THE ONE RECORD OF A CODEX GOAL ATERM PAUSED, per tab:
+//!   which lane holds it (the live upgrade, for its move; the save-then-wait
+//!   switch) and what it still owes — written before each key, so a
+//!   restarted host resumes the goal once, and the two lanes never both hold
+//!   it.
 //! * [`upgrade_codex`] — the same step's CODEX branch, its pure half (the
 //!   daemon rule, the flag table, the exit hint, the rollout and composer
 //!   readers); its I/O half is `upgrade_drive`'s `codex` module. Codex's
@@ -61,6 +71,11 @@
 //!   exit use: an agent that no longer runs started again in its own tab, on
 //!   its own conversation (Claude Code's `--resume`, Codex's `resume`), and
 //!   the host's per-session back-off.
+//! * [`resume`] — THE RESUME COMMAND a person is told to run for a frozen
+//!   Claude Code (2026-09-26): `claude --resume <this process's own
+//!   conversation>` with its launch flags carried, read from Claude Code's
+//!   own `sessions/<pid>.json` — never `claude --continue`, which resumes the
+//!   directory's newest conversation, a sibling tab's where two share it.
 //! * [`netwatch`] — THE API'S REACH, pure: which route an agent takes, what
 //!   one probe of the default route may conclude, and the one instance's
 //!   measure and schedule while a supervised session waits at a wall the
@@ -82,7 +97,7 @@
 //! and it duplicated the engine in [`crate::supervise`], which is the one
 //! supervisor now. Design §0.4 is the record.
 //!
-//! STATUS (docs/README.md honesty ratchet): unit-tested; THIRTEEN bounded
+//! STATUS (docs/README.md honesty ratchet): unit-tested; FIFTEEN bounded
 //! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
 //! real code — `harness_capture_worker_lifecycle_model` ([`align`]'s runner,
 //! in its tests), `harness_upgrade_notice_owner_model` (a READY acted on only
@@ -102,7 +117,12 @@
 //! gates, record transitions, READY, direction and release rules and the
 //! window's reading of each step's word), `harness_worker_lifecycle_model` and
 //! `harness_relaunch_on_exit_model` ([`relaunch`]'s and the window host's
-//! tests), `harness_upgrade_look_model` (the window host's looks at a
+//! tests), `harness_leave_model` (the window host hands a worker its
+//! agent's exit only for an exit — a name its roster could not read while
+//! the agent still holds its tab is none — and the upgrade's own restart in
+//! flight at its exit is carried whatever `[harness] relaunch` says, that
+//! process's alone, [`relaunch::restarted`]: the window host's tests),
+//! `harness_upgrade_look_model` (the window host's looks at a
 //! session over [`upgrade_drive::due`] — never let go for what a look could
 //! not read — and its note behind over [`upgrade_drive::note_behind`], the
 //! state behind from the worker's attach: the host's reaction in the window
@@ -110,6 +130,9 @@
 //! `harness_exit_record_model` (what an exit left of Claude's own
 //! record, read as it is seen: [`upgrade_drive`]'s tests, over the real
 //! [`relaunch::exit_record`] and [`relaunch::after_exit`]),
+//! `harness_codex_exit_witness_model` (a Codex's exit read on its shell's
+//! word alone, the thread lock no witness: the Codex lane's tests, over the
+//! real look, [`relaunch::exit_record`] and the lane's `after_exit`),
 //! `harness_model_priority_model` ([`upgrade_models`], in
 //! `aterm-agent/tests/conformance_upgrade_models/priority.rs`),
 //! `harness_model_ladder_model` (WHEN a due model move is taken —
@@ -165,10 +188,14 @@ pub mod align;
 pub mod cli;
 pub mod disk;
 pub mod footer;
+pub mod goal_hold;
 pub mod lights;
 pub mod netwatch;
 pub mod relaunch;
+pub mod resume;
+pub mod session_usage;
 pub mod source;
+mod transcript;
 pub mod upgrade;
 pub mod upgrade_catalog;
 pub mod upgrade_codex;

@@ -113,7 +113,7 @@ fn a_frozen_worker_is_held_its_badge_withdrawn_and_the_manager_told_once() {
         acts[3],
         "post to=@s-9 kind=ask --wait=0 claude frozen: not reading input for 2m41s (1 B \
          queued, rss 38.8 GB); pressing nothing until it reads again \u{2014} restart it: \
-         signal term (signal kill if it survives), then claude --continue"
+         signal term (signal kill if it survives)"
     );
     let probes = m.requests.iter().filter(|r| *r == "status").count();
     assert!(probes >= 5, "a probe per step: {:?}", m.requests);
@@ -233,6 +233,82 @@ fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
             s.set_manager(Some("@s-9".to_string()));
         });
         assert_eq!(*told.0.lock().unwrap(), want, "{:#?}", m.requests);
+    }
+}
+
+/// THE FROZEN MAIL NAMES THE WORKER'S OWN CONVERSATION (robustness backlog
+/// item 2, 2026-09-26): under a host that read the agent's resume line
+/// ([`IdleHost::resume_command`]: `claude --resume <its id>`, read from
+/// Claude Code's own `sessions/<pid>.json`) and does not relaunch it itself,
+/// the mail's remedy ends with that line; under a host that WOULD relaunch
+/// it ([`IdleHost::relaunches_on_exit`]) it says so and names no command.
+/// Never `claude --continue` — the directory's newest conversation, a
+/// sibling tab's where two share it. NEGATIVE CONTROLS: with no host
+/// (`drive watch`, the tests above) the restart stands alone; and a host
+/// that restarts Claude Code under `[harness] relaunch`
+/// ([`IdleHost::can_restart`]) but whose relaunch would REFUSE this launch
+/// (resume-hint review, 2026-09-26: a flag its rewrite does not know, a
+/// `--worktree`, a nushell tab) names the command — it used to promise the
+/// relaunch, name nothing, and nothing came.
+#[test]
+fn the_frozen_mail_names_the_workers_own_conversation_or_the_hosts_relaunch() {
+    #[derive(Debug)]
+    struct Host {
+        restarts: bool,
+        plans: bool,
+    }
+    impl IdleHost for Host {
+        fn wants(&self) -> bool {
+            false
+        }
+        fn at_idle(&self) -> Option<HostStep> {
+            None
+        }
+        fn owns_turn_end(&self) -> bool {
+            false
+        }
+        fn can_restart(&self) -> bool {
+            self.restarts
+        }
+        fn relaunches_on_exit(&self) -> bool {
+            self.restarts && self.plans
+        }
+        fn resume_command(&self) -> Option<String> {
+            Some("claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".to_string())
+        }
+    }
+    let command = "signal term (signal kill if it survives), then claude --model opus --resume \
+                   5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+    for (restarts, plans, tail) in [
+        (false, false, command),
+        (
+            true,
+            true,
+            "signal term (signal kill if it survives); aterm relaunches it on its conversation",
+        ),
+        // Restarts Claude Code, but its relaunch would refuse this launch.
+        (true, false, command),
+    ] {
+        let relaunches = (restarts, plans);
+        let mut m = box_that_sits();
+        m.input_after = vec![(2, INPUT_STALLED)];
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::new(Host { restarts, plans }) as Arc<dyn IdleHost>),
+            ..auto(30, None)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| {
+            s.set_manager(Some("@s-9".to_string()));
+        });
+        let acts = badge_acts(&m);
+        let mail = acts
+            .iter()
+            .find(|a| a.contains(" claude frozen: "))
+            .unwrap_or_else(|| panic!("the frozen mail: {acts:#?}"));
+        assert!(
+            mail.ends_with(tail),
+            "(restarts, plans)={relaunches:?}: {mail}"
+        );
+        assert!(!mail.contains("--continue"), "{mail}");
     }
 }
 
@@ -359,7 +435,7 @@ fn a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged() 
             [
                 "post to=@s-9 kind=ask --wait=0 claude frozen: not reading input for 2m41s (1 B \
               queued, rss 38.8 GB); pressing nothing until it reads again \u{2014} restart it: \
-              signal term (signal kill if it survives), then claude --continue"
+              signal term (signal kill if it survives)"
             ],
             "{tag}: {:#?}",
             m.requests
@@ -713,7 +789,7 @@ fn a_wait_that_never_read_status_probes_and_holds() {
         [
             "post to=@s-9 kind=ask --wait=0 claude frozen: not reading input for 2m41s (1 B \
              queued, rss 38.8 GB); pressing nothing until it reads again \u{2014} restart it: \
-             signal term (signal kill if it survives), then claude --continue"
+             signal term (signal kill if it survives)"
         ],
         "{:#?}",
         m.requests
@@ -774,4 +850,244 @@ fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
             "input={input:?}: {lines:?}"
         );
     }
+}
+
+/// The incident's worker, frozen past the remedy's bound: eleven minutes.
+const INPUT_STALLED_LONG: &str = "input=stalled input_bytes=1 input_wait_ms=660000 fg_rss_mb=39731";
+
+/// A host that relaunches an agent the stall's remedy ends (the window's,
+/// under `[harness] relaunch`), or not.
+#[derive(Debug)]
+struct Relaunching(bool);
+
+impl IdleHost for Relaunching {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn relaunches_after_stall(&self) -> bool {
+        self.0
+    }
+}
+
+/// A frozen worker under a relaunching host, `input` from the wait's first
+/// probe on; `term_after_s` the policy's `[harness] stall_term_after_s`;
+/// `tweak` the rest. The signal requests, and the lines said.
+fn remedy_run(
+    input: &'static str,
+    relaunches: bool,
+    term_after_s: u32,
+    tweak: impl FnOnce(&mut Mock),
+) -> (Vec<String>, Vec<String>) {
+    let mut m = box_that_sits();
+    m.input_after = vec![(2, input)];
+    tweak(&mut m);
+    let mut opts = SuperviseOpts {
+        idle_host: Some(Arc::new(Relaunching(relaunches)) as Arc<dyn IdleHost>),
+        ..auto(30, None)
+    };
+    opts.policy.stall_term_after_s = term_after_s;
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_manager(Some("@s-9".to_string()));
+    });
+    let signals = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("signal"))
+        .cloned()
+        .collect();
+    (signals, lines)
+}
+
+/// THE STALL'S REMEDY, TAKEN WHEN NOBODY IS THERE (decided 2026-09-27 under
+/// the owner's standing direction, D4): a worker frozen past `[harness]
+/// stall_term_after_s` (ten minutes by default), with no person's hand
+/// within the grace and no other hand on the session, under a host that
+/// relaunches it, gets `signal term` — said as `SIGNALLED … signal=term` —
+/// ONCE: a program that outlives it, frozen on every later read, gets no
+/// `signal kill` (the review of 2026-09-27: the ruling named the term, and
+/// the kill stays the server's attention's, a person's). NEGATIVE CONTROLS:
+/// a stall younger than the bound, a bound written longer, the remedy
+/// switched off (`stall_term_after_s = 0`), a host that does not relaunch
+/// (`drive watch`, `relaunch = false`), a person's keystroke within the
+/// grace, a lease on the session, and a STOPPED job each get no signal.
+#[test]
+fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
+    let default = SupervisorConfig::default().stall_term_after_s;
+    assert_eq!(default, 600, "ten minutes");
+    let (signals, lines) = remedy_run(INPUT_STALLED_LONG, true, default, |_| {});
+    assert_eq!(signals, ["signal term"], "never a kill: {lines:#?}");
+    let said: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("SIGNALLED"))
+        .collect();
+    assert_eq!(said.len(), 1, "{lines:#?}");
+    assert!(
+        said[0].contains(" signal=term input=stalled wait_ms=660000 rss_mb=39731 reply=OK"),
+        "{}",
+        said[0]
+    );
+
+    // NEGATIVE CONTROLS.
+    for (why, input, relaunches, bound, tweak) in [
+        ("younger than the bound", INPUT_STALLED, true, default, None),
+        (
+            "a bound written longer",
+            INPUT_STALLED_LONG,
+            true,
+            3600,
+            None,
+        ),
+        ("the remedy switched off", INPUT_STALLED_LONG, true, 0, None),
+        (
+            "no host relaunches it",
+            INPUT_STALLED_LONG,
+            false,
+            default,
+            None,
+        ),
+        (
+            "a person typed within the grace",
+            INPUT_STALLED_LONG,
+            true,
+            default,
+            Some("person"),
+        ),
+        (
+            "a lease holds the session",
+            INPUT_STALLED_LONG,
+            true,
+            default,
+            Some("lease"),
+        ),
+        (
+            "a stopped job's remedy is `signal cont`, a person's",
+            "input=stopped input_bytes=1 input_wait_ms=660000 fg_rss_mb=-",
+            true,
+            default,
+            None,
+        ),
+    ] {
+        let (signals, lines) = remedy_run(input, relaunches, bound, |m| match tweak {
+            Some("person") => m.human_ms = Some(1_000),
+            Some("lease") => m.hand = "lease:@s-7",
+            _ => {}
+        });
+        assert!(signals.is_empty(), "{why}: {signals:?} {lines:#?}");
+    }
+}
+
+/// A stopped job's `status`, its input waiting `wait_ms`.
+fn input_stopped(aged: bool) -> &'static str {
+    if aged {
+        "input=stopped input_bytes=1 input_wait_ms=660000 fg_rss_mb=-"
+    } else {
+        "input=stopped input_bytes=1 input_wait_ms=161000 fg_rss_mb=-"
+    }
+}
+
+/// TIER-1 of `SupervisorStallRemedy` (aterm-spec
+/// `supervisor_stall_remedy_model`): the REAL loop over a worker the server
+/// says is not reading its input, in EVERY configuration the model reaches
+/// with no term sent yet — frozen or a stopped job, the stall past the
+/// bound or not, the bound switched off, a person's hand within the grace,
+/// a host that relaunches or not — sends `signal term` exactly where the
+/// model's `Term` is enabled, and once: every later read of the wait still
+/// reports the stall, and nothing more is sent (the model's `Term` is not
+/// enabled after it, and it has no kill). An episode that thaws and freezes
+/// again is a new one, and gets its own term, as the model's `Thaw` makes
+/// it. NEGATIVE CONTROLS: the `Buggy = 1` model terms under a person's hand
+/// and kills after the term, where the real loop sends nothing and one term.
+#[test]
+fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    let m = aterm_spec::derive::supervisor_stall_remedy_model();
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([m.init_state()]);
+    // (stalled, aged, off, hand, host) → the model terms there.
+    let mut configs = BTreeMap::new();
+    while let Some(st) = queue.pop_front() {
+        if !seen.insert(st.clone()) {
+            continue;
+        }
+        if st["stalled"] > 0 && st["termed"] == 0 {
+            let key = (st["stalled"], st["aged"], st["off"], st["hand"], st["host"]);
+            configs.insert(key, m.action_enabled("Term", &st));
+            if m.action_enabled("Term", &st) {
+                let mut after = st.clone();
+                assert!(m.fire("Term", &mut after));
+                assert!(!m.action_enabled("Term", &after), "once: {after:?}");
+            }
+        }
+        for action in &m.actions {
+            let mut next = st.clone();
+            if m.fire(action.name, &mut next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    assert_eq!(configs.len(), 32, "every configuration is reachable");
+    assert_eq!(
+        configs.values().filter(|t| **t).count(),
+        1,
+        "one configuration terms: {configs:?}"
+    );
+    for (&(stalled, aged, off, hand, host), &term) in &configs {
+        let input = match (stalled, aged) {
+            (1, 1) => INPUT_STALLED_LONG,
+            (1, _) => INPUT_STALLED,
+            (_, a) => input_stopped(a == 1),
+        };
+        let bound = if off == 1 { 0 } else { 600 };
+        let (signals, lines) = remedy_run(input, host == 1, bound, |mk| {
+            if hand == 1 {
+                mk.human_ms = Some(1_000);
+            }
+        });
+        let want: &[&str] = if term { &["signal term"] } else { &[] };
+        assert_eq!(
+            signals, want,
+            "stalled={stalled} aged={aged} off={off} hand={hand} host={host}: {lines:#?}"
+        );
+    }
+    // A new episode — thawed, frozen again — gets its own term, and only
+    // one: the model's `Thaw` forgets the term.
+    let mut st = m.init_state();
+    for action in ["Freeze", "Age", "Term", "Thaw", "Freeze", "Age"] {
+        assert!(m.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert!(m.action_enabled("Term", &st));
+    let (signals, lines) = remedy_run(INPUT_STALLED_LONG, true, 600, |mk| {
+        mk.input_after = vec![
+            (2, INPUT_STALLED_LONG),
+            (4, INPUT_CLEAR),
+            (6, INPUT_STALLED_LONG),
+        ];
+        mk.vanish_after = Some(8);
+    });
+    assert_eq!(signals, ["signal term", "signal term"], "{lines:#?}");
+
+    // NEGATIVE CONTROLS: where the Buggy model signals, the real loop does not.
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut st = buggy.init_state();
+    for action in ["HandOn", "Freeze", "Age"] {
+        assert!(buggy.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert!(buggy.action_enabled("TermBlind", &st), "blind to the hand");
+    let (signals, _) = remedy_run(INPUT_STALLED_LONG, true, 600, |mk| {
+        mk.human_ms = Some(1_000);
+    });
+    assert!(signals.is_empty(), "{signals:?}");
+    let mut st = buggy.init_state();
+    for action in ["Freeze", "Age", "Term"] {
+        assert!(buggy.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert!(buggy.action_enabled("Kill", &st) && buggy.action_enabled("TermAgain", &st));
+    let (signals, _) = remedy_run(INPUT_STALLED_LONG, true, 600, |_| {});
+    assert_eq!(signals, ["signal term"], "one term, no kill");
 }

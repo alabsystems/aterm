@@ -11,7 +11,7 @@
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, Renderer, SelectionClip, Theme};
+use aterm_render::{Frame, SelectionClip, Theme};
 
 mod common;
 use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
@@ -111,15 +111,9 @@ fn selection_highlight_gpu_matches_cpu() {
 fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(gpu) => gpu,
-        Err(error) => {
-            eprintln!("SKIP: no GPU/font available: {error}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    // The kit's pair is FONT-SETTLED (`common::font_settled`): a chain still
+    // parsing between the two arms would read as a parity failure.
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     let (cw, ch) = cpu.cell_size();
@@ -148,7 +142,8 @@ fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
         rows: 1,
         z_index: aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD - 1,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: aterm_core::grid::extra::ImageScaling::Fit,
+        source_rect: None,
     });
     input.images[0].push((
         5,
@@ -156,6 +151,7 @@ fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
             image,
             cell_row: 0,
             cell_col: 0,
+            kitty: None,
         },
     ));
 
@@ -204,15 +200,9 @@ fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
 fn multiline_selection_clip_matches_cpu_and_never_tints_sibling_cells() {
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(gpu) => gpu,
-        Err(error) => {
-            eprintln!("SKIP: no GPU/font available: {error}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    // The kit's pair is FONT-SETTLED (`common::font_settled`): a chain still
+    // parsing between the two arms would read as a parity failure.
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     let (cw, ch) = cpu.cell_size();

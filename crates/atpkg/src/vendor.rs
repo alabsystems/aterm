@@ -192,11 +192,9 @@ fn refuse(msg: &str) -> FlowError {
     FlowError::VendorRefused(msg.to_string())
 }
 
-/// Refuse with a `<head><detail>` message (manual concat — see `lib.rs` on `format!`).
+/// Refuse with a `<head><detail>` message.
 fn refuse2(head: &str, detail: &str) -> FlowError {
-    let mut m = String::from(head);
-    m.push_str(detail);
-    FlowError::VendorRefused(m)
+    FlowError::VendorRefused(format!("{head}{detail}"))
 }
 
 /// Admit an artifact row BEFORE any byte moves, by its `protocol`:

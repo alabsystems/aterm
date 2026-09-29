@@ -79,28 +79,91 @@ pub struct ImageData {
     /// the first read their source `lift` px lower. With `0` both clauses are
     /// arithmetic no-ops, byte-identical to the pre-lift renderers.
     pub band_lift_px: u16,
-    /// PIXEL-EXACT placement: draw the source raster ONE SOURCE PIXEL TO ONE
-    /// DEVICE PIXEL, anchored at the footprint's TOP-LEFT, and leave the
-    /// remainder of the footprint fully transparent (a partial cell at the
-    /// right/bottom edge simply goes unpainted).
+    /// How the source raster maps onto the footprint: [`ImageScaling::Fit`]
+    /// (the default), [`ImageScaling::Stretch`] or [`ImageScaling::PixelExact`].
+    /// Which one is right depends on what the PROGRAM named — see the variants.
+    pub scaling: ImageScaling,
+    /// The sub-rectangle of the source raster this placement shows (Kitty
+    /// `x=`/`y=`/`w=`/`h=`), or `None` for the whole raster — which every
+    /// protocol but Kitty always passes. The renderer crops FIRST, then applies
+    /// [`scaling`](Self::scaling) to what is left.
+    pub source_rect: Option<SourceRect>,
+}
+
+/// How a placement's source raster maps onto its cell footprint.
+///
+/// The footprint is always a whole number of cells; what differs is what the
+/// program asked the pixels to do inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ImageScaling {
+    /// FIT: scale the raster, aspect PRESERVED, into the largest box that fits
+    /// the footprint and centre it there, the rest fully transparent. Right when
+    /// the program named the target in CELLS (`File=width=40;height=8`, Kitty
+    /// `c=`/`r=`, the host's own chrome rasters): it asked for a cell-sized
+    /// picture, so filling the cells it asked for is the spec — without
+    /// distorting it, since the cell box is only a whole-cell approximation of
+    /// the picture's shape.
+    #[default]
+    Fit,
+    /// STRETCH: scale the raster to the WHOLE footprint, aspect ignored. Only an
+    /// explicit request earns it — iTerm2's `preserveAspectRatio=0` ("stretch
+    /// to fill, ignore the inherent ratio"), where the program sized both axes
+    /// itself and wants exactly that box filled.
+    Stretch,
+    /// PIXEL-EXACT: draw the source ONE SOURCE PIXEL TO ONE DEVICE PIXEL,
+    /// anchored at the footprint's TOP-LEFT, the remainder fully transparent (a
+    /// partial cell at the right/bottom edge simply goes unpainted).
     ///
-    /// `false` — the default, and what the iTerm2 OSC 1337 path and the host's
-    /// own chrome rasters want — means FIT: the renderer scales the raster,
-    /// aspect preserved, into the largest box that fits the footprint and
-    /// centres it there. That is right when the PROGRAM named the target in
-    /// CELLS (`File=width=40;height=8`, Kitty `c=`/`r=`): it asked for a
-    /// cell-sized picture, so filling the cells it asked for is the spec.
-    ///
-    /// `true` is for the protocols that name PIXELS. A sixel raster's footprint
-    /// is DERIVED from its pixel size by rounding UP to whole cells, so scaling
-    /// the raster back out to that rounded box is pure rounding noise: a 40x12
-    /// sixel in a 9x17 cell box would be magnified to 45x14 and a 4x6 sprite to
-    /// 9x14 (2.25x), with an interpolating resample that destroys exactly the
-    /// 1-px features such an image is drawn out of. xterm, foot, mlterm,
-    /// wezterm, contour and mintty all draw sixel 1:1, and every sixel-emitting
-    /// tool sizes its output to the reported cell geometry on that assumption.
-    /// Kitty graphics transmitted WITHOUT `c=`/`r=` are the same case.
-    pub pixel_exact: bool,
+    /// This is for the protocols that name PIXELS. A sixel raster's footprint is
+    /// DERIVED from its pixel size by rounding UP to whole cells, so scaling the
+    /// raster back out to that rounded box is pure rounding noise: a 40x12 sixel
+    /// in a 9x17 cell box would be magnified to 45x14 and a 4x6 sprite to 9x14
+    /// (2.25x), with an interpolating resample that destroys exactly the 1-px
+    /// features such an image is drawn out of. xterm, foot, mlterm, wezterm,
+    /// contour and mintty all draw sixel 1:1, and every sixel-emitting tool
+    /// sizes its output to the reported cell geometry on that assumption. Kitty
+    /// graphics transmitted WITHOUT `c=`/`r=` are the same case.
+    PixelExact,
+}
+
+/// A sub-rectangle of a source raster, in raster pixels (Kitty `x=`, `y=`,
+/// `w=`, `h=`). A `width`/`height` of `0` means "to the raster's right/bottom
+/// edge", as in the Kitty protocol; the renderer clamps the whole rectangle to
+/// the raster, and an empty result draws nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceRect {
+    /// Left edge, in source pixels.
+    pub x: u32,
+    /// Top edge, in source pixels.
+    pub y: u32,
+    /// Width in source pixels; `0` = to the right edge.
+    pub width: u32,
+    /// Height in source pixels; `0` = to the bottom edge.
+    pub height: u32,
+}
+
+impl SourceRect {
+    /// This rectangle clamped to a `src_w × src_h` raster, as
+    /// `(x, y, width, height)`, or `None` when nothing of it lies inside.
+    #[must_use]
+    pub fn clamp_to(self, src_w: u32, src_h: u32) -> Option<(u32, u32, u32, u32)> {
+        if self.x >= src_w || self.y >= src_h {
+            return None;
+        }
+        let max_w = src_w - self.x;
+        let max_h = src_h - self.y;
+        let w = if self.width == 0 {
+            max_w
+        } else {
+            self.width.min(max_w)
+        };
+        let h = if self.height == 0 {
+            max_h
+        } else {
+            self.height.min(max_h)
+        };
+        (w > 0 && h > 0).then_some((self.x, self.y, w, h))
+    }
 }
 
 impl ImageData {

@@ -48,8 +48,10 @@
 //! **Fail closed.** Decided by the owner 2026-09-25: `Containment` NEVER degrades
 //! to a weaker posture. Where [`os_sandbox_actuated`] is false — Linux, Windows,
 //! every non-macOS target — [`decide`] returns [`SpawnDecision::Deny`] naming the
-//! platform gap, and both launchers exit without starting a shell. (A Linux
-//! Landlock/seccomp lane would lift that; nobody is building it.)
+//! platform gap, and both launchers exit without starting a shell. That refusal
+//! is the product off macOS: Containment is macOS-only by scope (decided
+//! 2026-09-27 under the owner's standing direction; `docs/ATERM_DESIGN.md` §5.6
+//! — Landlock/seccomp are not the launch target).
 
 use crate::audit::{log_denial, log_posture};
 use crate::capability::{NetworkCapability, ProcessCapability};
@@ -61,8 +63,7 @@ const SUBSYSTEM: &str = "spawn";
 
 /// Why [`decide`] refuses a `Containment` spawn on a platform with no OS sandbox.
 /// Both launchers print it verbatim.
-pub const NO_OS_SANDBOX_REASON: &str =
-    "aterm sandboxes a shell only on macOS, so no shell was started";
+pub const NO_OS_SANDBOX_REASON: &str = "the sandbox exists only on macOS, so no shell was started";
 
 /// Whether THIS BUILD/PLATFORM can actuate a real OS sandbox at the spawn seam:
 /// `true` only on macOS (Seatbelt via `sandbox-exec`). What that sandbox enforces
@@ -116,6 +117,10 @@ pub enum SpawnDecision {
         os_sandbox: bool,
         /// The SBPL profile to apply via `sandbox-exec`, `Some` iff `os_sandbox`.
         sbpl: Option<String>,
+        /// Whether `sbpl` holds the `$HOME`-scoped rules (the shell-history write
+        /// allowance and the credential and private-data read denies). `false`
+        /// when there is no sandbox, or when `$HOME` did not resolve.
+        home_scoped: bool,
     },
     /// Spawning is denied for this mode; a denial was logged to the containment
     /// audit trail and the launcher must exit without a shell. Reached by
@@ -155,12 +160,17 @@ impl SpawnDecision {
 /// fail closed via [`SpawnDecision::Deny`].
 #[must_use]
 pub fn decide(mode: ContainmentMode) -> SpawnDecision {
-    decide_on(mode, os_sandbox_actuated())
+    decide_on(
+        mode,
+        os_sandbox_actuated(),
+        crate::sbpl::home_dir().as_deref(),
+    )
 }
 
-/// [`decide`] with the platform's sandbox capability as an argument, so the
-/// fail-closed arm is testable on the one platform that has a sandbox.
-fn decide_on(mode: ContainmentMode, sandbox_available: bool) -> SpawnDecision {
+/// [`decide`] with the platform's sandbox capability and the `$HOME` the
+/// profile is scoped under as arguments, so the fail-closed arm is testable on
+/// the one platform that has a sandbox, and the unresolved-home arm anywhere.
+fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>) -> SpawnDecision {
     let process_cap = ContainmentPolicy::process(mode);
     let denies_network = ContainmentPolicy::network(mode) == NetworkCapability::None;
     // Containment demands the OS sandbox. Where the platform has none, refuse
@@ -177,11 +187,13 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool) -> SpawnDecision {
     // per-user profile in that case and `None` otherwise. The two are kept in
     // lockstep (sbpl.is_some() == os_sandbox).
     let os_sandbox = denies_network && sandbox_available;
-    let sbpl: Option<String> = if os_sandbox {
-        crate::sbpl::profile_for(&ContainmentPolicy::capabilities(mode))
+    let scoped: Option<(String, bool)> = if os_sandbox {
+        crate::sbpl::profile_for_scoped(ContainmentPolicy::capabilities(mode), home)
     } else {
         None
     };
+    let home_scoped = scoped.as_ref().is_some_and(|(_, home)| *home);
+    let sbpl: Option<String> = scoped.map(|(profile, _)| profile);
     debug_assert_eq!(
         sbpl.is_some(),
         os_sandbox,
@@ -197,7 +209,7 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool) -> SpawnDecision {
             SUBSYSTEM,
             "os-network-sandbox",
             mode,
-            "OS sandbox ACTUATED via sandbox-exec (deny network*; writes confined to /private/tmp /private/var/tmp $TMPDIR /dev + shell history; deny read+write of secret dirs ~/.ssh ~/.aws ~/.gnupg ~/.config/gh ~/.config/aterm ~/.netrc; deny read+write of private data ~/Documents ~/Desktop ~/Downloads media ~/Library/{Mail,Messages,Keychains,Cookies,Safari} browser-profiles)",
+            applied_posture(home_scoped),
         );
     } else {
         // Explicit, non-silent record that no OS sandbox is in force for this mode
@@ -225,6 +237,7 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool) -> SpawnDecision {
                 mode,
                 os_sandbox,
                 sbpl,
+                home_scoped,
             }
         }
         // Defensive default: any future, more-restrictive variant fails closed.
@@ -234,6 +247,21 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool) -> SpawnDecision {
             log_denial(SUBSYSTEM, "spawn initial shell", mode, reason);
             SpawnDecision::Deny { mode, reason }
         }
+    }
+}
+
+/// What an applied sandbox enforces, from what its profile holds (pass
+/// [`SpawnDecision::Permit`]'s `home_scoped`): the shell-history allowance and
+/// the credential and private-data read denies are joined onto `$HOME`, so a
+/// home that did not resolve gets neither, and a `$HOME` other than the
+/// account's home leaves that home's stores readable. The aterm.log posture
+/// record and the window's `--verbose` line both print this one wording.
+#[must_use]
+pub fn applied_posture(home_scoped: bool) -> &'static str {
+    if home_scoped {
+        "OS sandbox applied: no network; writes only to temp dirs and shell history; no access to credential stores or private data under $HOME"
+    } else {
+        "OS sandbox applied: no network; writes only to temp dirs; $HOME did not resolve, so credential stores and private data can still be read"
     }
 }
 
@@ -294,7 +322,7 @@ mod tests {
         // The owner's ruling (2026-09-25): on a platform with no OS sandbox the
         // Containment spawn is REFUSED, naming the gap — never a weaker shell.
         assert_eq!(
-            decide_on(ContainmentMode::Containment, false),
+            decide_on(ContainmentMode::Containment, false, None),
             SpawnDecision::Deny {
                 mode: ContainmentMode::Containment,
                 reason: NO_OS_SANDBOX_REASON,
@@ -308,17 +336,18 @@ mod tests {
             ContainmentMode::Safety,
         ] {
             assert_eq!(
-                decide_on(mode, false),
+                decide_on(mode, false, None),
                 SpawnDecision::Permit {
                     mode,
                     os_sandbox: false,
-                    sbpl: None
+                    sbpl: None,
+                    home_scoped: false,
                 },
                 "{mode} must not depend on the OS sandbox"
             );
         }
         // Negative control: with a sandbox, Containment is permitted and wrapped.
-        match decide_on(ContainmentMode::Containment, true) {
+        match decide_on(ContainmentMode::Containment, true, None) {
             SpawnDecision::Permit {
                 os_sandbox: true,
                 sbpl: Some(_),
@@ -349,9 +378,14 @@ mod tests {
                     mode: m,
                     os_sandbox,
                     sbpl,
+                    home_scoped,
                 } => {
                     assert_eq!(m, mode);
                     assert_eq!(os_sandbox, expect_os, "os_sandbox posture for {mode}");
+                    assert!(
+                        os_sandbox || !home_scoped,
+                        "{mode}: no sandbox claims no $HOME-scoped rules"
+                    );
                     assert_eq!(
                         sbpl.is_some(),
                         expect_os,
@@ -392,6 +426,51 @@ mod tests {
         }
     }
 
+    /// The applied posture claims the shell-history allowance and the credential
+    /// and private-data denies only when the profile holds them, and scopes the
+    /// claim to `$HOME`, the only home the denies are joined onto.
+    #[test]
+    fn applied_posture_claims_home_denies_only_when_emitted() {
+        assert!(
+            applied_posture(true)
+                .ends_with("no access to credential stores or private data under $HOME")
+        );
+        let homeless = applied_posture(false);
+        assert!(!homeless.contains("no access"), "{homeless}");
+        assert!(!homeless.contains("shell history"), "{homeless}");
+    }
+
+    /// `home_scoped` is decided by whether the home resolved, not by whether a
+    /// sandbox applies: a sandboxed spawn with no home carries neither the
+    /// credential denies nor the claim. Negative control for wiring it as
+    /// `home_scoped: os_sandbox`.
+    #[test]
+    fn home_scoped_follows_the_home_not_the_sandbox() {
+        let secret = |profile: &str| profile.contains("/.ssh\"");
+        match decide_on(ContainmentMode::Containment, true, None) {
+            SpawnDecision::Permit {
+                os_sandbox: true,
+                sbpl: Some(profile),
+                home_scoped: false,
+                ..
+            } => assert!(!secret(&profile), "no home, no credential deny: {profile}"),
+            other => panic!("a homeless sandbox must Permit unscoped, got {other:?}"),
+        }
+        let home = aterm_tempfile::tempdir().unwrap();
+        match decide_on(ContainmentMode::Containment, true, home.path().to_str()) {
+            SpawnDecision::Permit {
+                os_sandbox: true,
+                sbpl: Some(profile),
+                home_scoped: true,
+                ..
+            } => assert!(
+                secret(&profile),
+                "a home carries the credential deny: {profile}"
+            ),
+            other => panic!("a sandbox with a home must Permit scoped, got {other:?}"),
+        }
+    }
+
     #[test]
     fn decision_is_permitted_helper_matches_variant() {
         assert!(
@@ -399,6 +478,7 @@ mod tests {
                 mode: ContainmentMode::User,
                 os_sandbox: false,
                 sbpl: None,
+                home_scoped: false,
             }
             .is_permitted()
         );

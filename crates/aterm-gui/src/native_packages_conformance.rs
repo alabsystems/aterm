@@ -56,6 +56,7 @@ fn report_with_rows(outcome: &str, rows: &[(&str, &str)]) -> PackagesStatusRepor
         last_pass_attempted_index_build: 0,
         last_pass_attempted_at: String::new(),
         pass_seq: 0,
+        stale_index_only_pass_seq: 0,
         programs,
         extra: Default::default(),
     };

@@ -3,7 +3,7 @@
 
 //! The transcript grid, enforced.
 //!
-//! `cargo ship provision` is read by exactly one audience — an operator at a terminal,
+//! `targo --unverified ship provision` is read by exactly one audience — an operator at a terminal,
 //! mildly stressed, doing this once every few months — and the layout is the only thing
 //! that decides which of a hundred lines they actually read. Every assertion here pins a
 //! rule that was broken in a REAL run and cost something:

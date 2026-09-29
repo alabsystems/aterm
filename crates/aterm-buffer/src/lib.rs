@@ -321,7 +321,7 @@ impl EventLog {
 /// (§3.1). It is a text-line model, and it is the native editor's document
 /// spine (`aterm-gui`'s `document_store.rs`: one `Document` owns one
 /// `Surface`). Terminal cells live in `aterm-grid`; the cap-gated one-door
-/// kernel over them is REARCH-PLAN A-2 (parked).
+/// kernel over them was REARCH-PLAN A-2, retired unbuilt (2026-09-27).
 #[derive(Clone, Debug)]
 pub struct Surface {
     /// Immutable snapshot spine. [`Arc::make_mut`] clones this ordered vector

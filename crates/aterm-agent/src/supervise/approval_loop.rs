@@ -4,8 +4,9 @@
 //! The approval policy in the loop: every box a look finds is decided by
 //! [`decide`] — the ONE decider, under the owner's `[harness] approve`
 //! level (full power by default) — and an approval is pressed under the
-//! guard it returns ([`Session::press_one_guarded`], or, for an unnumbered
-//! box, the confirmed focus move of [`Session::press_focused`]). A DECLINE
+//! guard it returns ([`Session::press_one_guarded`], or, for a box answered
+//! by its focus — an unnumbered box, the usage-limit dialog's wait row — the
+//! confirmed focus move of [`Session::press_focused`]). A DECLINE
 //! ([`Decision::Decline`]) is carried out keystroke by keystroke from fresh
 //! reads ([`Session::press_decline`]: one keystroke in flight, never written
 //! twice, and none while a person keys the session; the derived model
@@ -141,9 +142,14 @@
 
 use super::super::policy::WorkerEnv;
 use super::super::policy::approval::{
-    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, DeclineStep, RULE_READ_ONLY, decide,
+    Answer, AnswerTarget, ApprovalCtx, Choice, Decision, DeclineStep, RULE_LIMIT_WAIT,
+    RULE_READ_ONLY, decide,
+};
+use super::super::policy::approval::{
+    NudgeCtx, RULE_GOAL_RESUME, RULE_RATE_NUDGE_KEEP, RULE_RATE_NUDGE_SWITCH,
 };
 use super::super::policy::question::{RULE_ANSWER_RECOMMENDED, begun};
+use super::super::policy::turn_end::WindDown;
 use super::*;
 use crate::harness::upgrade_drive::{LiveTab, roster_rows, unique_tab_for_group};
 use aterm_phase::{QuestionDialog, QuestionFocus, QuestionForm};
@@ -433,7 +439,10 @@ fn shown_subject(subject: &str, command: &str) -> String {
 
 /// The box needs the session's working directory: the vendor's rm/rmdir
 /// circuit breaker of any kind ([`aterm_phase::PromptV2::rm_breaker`]), the
-/// folder-trust dialog, and a Bash box that may run git ([`may_run_git`]).
+/// folder-trust dialog, and a Bash box that may run git ([`may_run_git`]) —
+/// and, where the worker is read from the session, every Bash box, whose
+/// shell startup is read with the project's Claude Code settings
+/// ([`ApprovalCtx::shell`]; the caller adds that).
 fn needs_cwd(p: &aterm_phase::PromptV2) -> bool {
     p.kind == PromptKind::Trust || p.rm_breaker().is_some() || may_run_git(p)
 }
@@ -550,13 +559,18 @@ impl<C: Ctl> Session<'_, C> {
     /// when `fresh_cwd`), for a box that may run git (`git`) the worker's
     /// environment ([`ApprovalCtx::worker`]) and the directories its Bash
     /// tool may stand in, from the transcripts under the worker's own Claude
-    /// Code directory ([`ApprovalCtx::shell_cwds`]), the footer's mode, the
-    /// process's home/uid/`$TMPDIR`, the approve level and trust roots `opts`
-    /// sets.
+    /// Code directory ([`ApprovalCtx::shell_cwds`]), for any Bash box
+    /// (`bash`) the worker's environment and — when it is read from the
+    /// session ([`WorkerSource::Session`]; a fixed one is a test's, whose
+    /// startup [`ApprovalCtx::new`] already holds) — the startup its Bash
+    /// tool's shell runs with ([`ApprovalCtx::shell`]), the footer's mode,
+    /// the process's home/uid/`$TMPDIR`, the approve level and trust roots
+    /// `opts` sets.
     fn approval_ctx(
         &mut self,
         fresh_cwd: bool,
         git: bool,
+        bash: bool,
         opts: &SuperviseOpts,
         allow: &[String],
     ) -> Result<ApprovalCtx, Fail> {
@@ -592,16 +606,35 @@ impl<C: Ctl> Session<'_, C> {
         ctx.approve = opts.policy.approve;
         ctx.answer_questions = opts.policy.answer_questions;
         ctx.model_fallback = opts.policy.model_fallback.is_some();
+        ctx.model_restore = self.turn_end.restore_target(Instant::now());
+        // A goal the live upgrade paused for its move, owed its resume: the
+        // paused goal's box the relaunched Codex opens with is its to answer
+        // — only that Codex's box, still leading its terminal and not left
+        // to a person (`goal_hold::box_is_upgrades`: a person's own `codex
+        // resume` in the tab draws a box of theirs), and never under an open
+        // save-then-wait switch, whose session it is (the goal would run on
+        // the cheaper model).
+        ctx.goal_resume = !self.turn_end.switch_open() && self.goal_box_is_upgrades();
+        ctx.limit_wait = opts.policy.limit_wait;
         ctx.python_allow = allow.to_vec();
-        if git {
+        if git || bash {
+            let session = matches!(env.worker, WorkerSource::Session);
             let worker = match env.worker {
                 WorkerSource::Session => self.worker_env(),
                 WorkerSource::Fixed(worker) => worker,
             };
-            if let (Ok(w), Some(cwd)) = (&worker, cwd.as_deref())
+            if git
+                && let (Ok(w), Some(cwd)) = (&worker, cwd.as_deref())
                 && let Some(claude) = w.claude_dir()
             {
                 ctx.shell_cwds = crate::harness::footer::shell_cwds(&claude, cwd);
+            }
+            if bash && session {
+                ctx.shell = match (&worker, cwd.as_deref()) {
+                    (Ok(w), Some(cwd)) => crate::supervise::policy::shell_startup::read(w, cwd),
+                    (Err(why), _) => Err(format!("the worker's environment is unknown: {why}")),
+                    (Ok(_), None) => Err("the session's cwd is unknown (meta cwd=-)".to_string()),
+                };
             }
             ctx.worker = worker;
         }
@@ -635,7 +668,7 @@ impl<C: Ctl> Session<'_, C> {
         let args = atpkg::caller_shell::process_args(group).ok_or_else(|| {
             format!("the environment of {sid}'s foreground process {group} could not be read")
         })?;
-        let worker = WorkerEnv::new(args);
+        let worker = WorkerEnv::new(args).with_pid(group);
         match worker.var(ENV_PARENT_SESSION_ID) {
             Some(tab) if tab == sid => Ok(worker),
             Some(tab) => Err(format!(
@@ -650,21 +683,27 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The decision on the box on `screen`: read by the reader for the
     /// session's foreground program, then [`decide`]d. Under `approve =
-    /// "none"` nothing is read and the box escalates.
+    /// "none"` nothing is read and the box escalates — but a question, or
+    /// the usage-limit dialog while `limit_wait` is on, each its own rule's.
     pub(super) fn decide_box(
         &mut self,
         screen: &Screen,
         opts: &SuperviseOpts,
         allow: &[String],
     ) -> Result<Decision, Fail> {
-        // A question is no permission: no level limits it, so under `none`
-        // the screen is read (no request) for one before anything is asked.
-        let question = || {
+        // A question is no permission, and neither is the usage-limit
+        // dialog: no level limits either (only `answer_questions` and
+        // `limit_wait`), so under `none` the screen is read (no request) for
+        // one before anything is asked.
+        let own_rule = || {
             aterm_phase::read(None, &screen.rows, None)
                 .prompt
-                .is_some_and(|p| p.kind == PromptKind::Question)
+                .is_some_and(|p| {
+                    p.kind == PromptKind::Question
+                        || p.kind == PromptKind::UsageLimit && opts.policy.limit_wait
+                })
         };
-        if opts.policy.approve == Approve::None && !question() {
+        if opts.policy.approve == Approve::None && !own_rule() {
             return Ok(Decision::Escalate {
                 reason: "approve = \"none\": every box is the owner's".to_string(),
             });
@@ -704,9 +743,32 @@ impl<C: Ctl> Session<'_, C> {
                 );
             }
         }
-        let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd);
         let git = reading.prompt.as_ref().is_some_and(may_run_git);
-        let mut ctx = self.approval_ctx(fresh_cwd, git, opts, allow)?;
+        let bash = reading
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.kind == PromptKind::Bash);
+        let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd)
+            || bash && matches!(self.approval_env.worker, WorkerSource::Session);
+        let mut ctx = self.approval_ctx(fresh_cwd, git, bash, opts, allow)?;
+        // Codex's rate-limit nudge is answered by what Codex's own records
+        // say of its usage window, and by the model the footer last showed
+        // (the box covers the footer).
+        if reading
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.kind == PromptKind::RateNudge)
+        {
+            ctx.nudge = NudgeCtx {
+                enabled: opts.policy.rate_nudge,
+                // A press a restarted loop found only INTENDED (its key may
+                // never have gone) leaves the nudge still up to be decided
+                // again.
+                open: self.turn_end.switch_landed(),
+                from: self.nudge_from(),
+                limits: self.codex_records().limits,
+            };
+        }
         // THE SESSION'S WORD (2026-09-25): a question dialog is answered by
         // this session's own `questions` word where it has one — `ask` hands
         // it to a person, `recommended` answers it — over the table's
@@ -1089,6 +1151,23 @@ impl<C: Ctl> Session<'_, C> {
             (Act::Approve { .. }, None) => format!("approved ({rule_id}): {what}"),
         };
         let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+        // CODEX'S RATE-LIMIT NUDGE'S SWITCH: the save-then-wait switch it
+        // opens is made, stamped as pressed, and ledgered as the press's
+        // INTENT (`phase=intent`), BEFORE the key goes — a loop that dies
+        // between the key and its record still carries the switch on (a
+        // restart seeds it, and the footer then says whether the press
+        // landed). It opens here only once the box is seen leaving; a press
+        // that did not land closes it.
+        let intent = if rule_id == RULE_RATE_NUDGE_SWITCH {
+            let label = what.rsplit_once(" => ").map_or("", |(_, l)| l).to_string();
+            let w = self.nudge_intent(&label);
+            if let Some(w) = &w {
+                self.nudge_intended(w, &what, seq);
+            }
+            w
+        } else {
+            None
+        };
         let pressing = match &act {
             Act::Approve {
                 guard,
@@ -1097,7 +1176,11 @@ impl<C: Ctl> Session<'_, C> {
             Act::Approve {
                 guard,
                 choice: Choice::Focus { steps, label },
-            } => self.press_focused(&p, *steps, label, guard, &turn.screen)?,
+            } => self.press_focused(&p, *steps, label, "enter", guard, &turn.screen)?,
+            Act::Approve {
+                guard,
+                choice: Choice::FocusKey { steps, label, key },
+            } => self.press_focused(&p, *steps, label, key, guard, &turn.screen)?,
             Act::Approve {
                 choice: Choice::Answer(answer),
                 ..
@@ -1111,6 +1194,26 @@ impl<C: Ctl> Session<'_, C> {
             question,
             declined,
         };
+        if let Some(w) = &intent {
+            match &pressing {
+                // Seen through below: open once the box leaves.
+                Pressing::Done(Press::Pressed { .. }) => {}
+                // The key may have landed and nothing saw after it: the
+                // switch is carried as only INTENDED — the footer says
+                // whether it landed (`TurnEndState::footer_seen`, and at the
+                // next point `TurnEndState::observe`); a box still up is
+                // decided again, and nothing of the switch stops or types
+                // anything before the footer shows the cheaper model.
+                Pressing::Lost {
+                    known: Some(Press::Pressed { .. }) | None,
+                    ..
+                } => self.open_wind(WindDown {
+                    intent: true,
+                    ..w.clone()
+                }),
+                _ => self.nudge_missed(w, &what, "the press was not sent", seq),
+            }
+        }
         let press = match pressing {
             Pressing::Done(press) => press,
             Pressing::Unconfirmed { why, retry } => {
@@ -1263,7 +1366,21 @@ impl<C: Ctl> Session<'_, C> {
             Press::Pressed { seq: at } => {
                 self.changed_streak = 0;
                 approved.push(this);
-                append_note(notes, &approved_note)?;
+                // The nudge's switch is open on the screen already: a notes
+                // file that cannot be written is said, never the end of the
+                // loop before the switch is recorded.
+                if let Err(e) = append_note(notes, &approved_note) {
+                    if intent.is_none() {
+                        return Err(e.into());
+                    }
+                    review.note(&format!("NOTES seq={seq} {e}"));
+                }
+                // Its approved row carries the switch too — still only
+                // intended: the box has not been seen leaving yet.
+                let over = match &intent {
+                    Some(w) => format!("{over} {}", self.wind_words(w, "intent")),
+                    None => over,
+                };
                 self.answered(&act, rule_id, &what, &over, (at, seq), review)?;
                 note_unproven(review, at, rule_id, unproven.as_deref());
                 // The box must LEAVE before the next look: `await gone` is
@@ -1278,13 +1395,43 @@ impl<C: Ctl> Session<'_, C> {
                 let screen = match self.box_left(at, &identity, deadline)? {
                     Past::Moved => {
                         self.press_retry = None;
+                        // The switch landed: it opens — the turn the box
+                        // covered ended under it, and a person's keystroke
+                        // before this is no hand in anything after — and the
+                        // goal turn Codex runs under the box is stopped at
+                        // once. The keep: the covered turn ended there too.
+                        if let Some(w) = intent {
+                            self.open_wind(w);
+                            let screen = self.screen()?;
+                            self.stop_codex_turn(&screen, review)?;
+                        } else if rule_id == RULE_RATE_NUDGE_KEEP {
+                            self.nudge_answered();
+                        } else if rule_id == RULE_GOAL_RESUME {
+                            self.goal_resume_pressed("moved");
+                        }
                         return Ok(Step::Again { settle: true });
                     }
-                    Past::Still(Some(screen)) => screen,
+                    Past::Still(Some(screen)) => {
+                        if let Some(w) = &intent {
+                            self.nudge_missed(
+                                w,
+                                &what,
+                                "the box did not change after the press",
+                                seq,
+                            );
+                        }
+                        screen
+                    }
                     // The budget ran out waiting: nothing is read or handed
                     // over after it — the box as last read is the TIMEOUT's
-                    // ([`Self::look`]).
-                    Past::Still(None) => return Ok(Step::Review(turn)),
+                    // ([`Self::look`]). A nudge's switch that may have landed
+                    // is carried as open, as its intent row says.
+                    Past::Still(None) => {
+                        if let Some(w) = intent {
+                            self.open_wind(WindDown { intent: true, ..w });
+                        }
+                        return Ok(Step::Review(turn));
+                    }
                 };
                 let why = "the box did not change after the press";
                 let still = self.turn_of(screen);
@@ -1382,11 +1529,14 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`Self::press_missed`]) rather than handed over: with nobody there
     /// to take it (`watch`, the window's host) — `supervise`'s one look
     /// hands it to the manager it returns to — at full power, or for a
-    /// question's answer (`rule_id`), which no `approve` level limits: only
-    /// `answer_questions`, which already decided it.
+    /// question's answer or the usage-limit dialog's wait (`rule_id`), which
+    /// no `approve` level limits: only `answer_questions` or `limit_wait`,
+    /// which already decided it.
     fn retries_presses(&self, opts: &SuperviseOpts, review: &dyn Review, rule_id: &str) -> bool {
         review.unattended()
-            && (opts.policy.approve == Approve::All || rule_id == RULE_ANSWER_RECOMMENDED)
+            && (opts.policy.approve == Approve::All
+                || rule_id == RULE_ANSWER_RECOMMENDED
+                || rule_id == RULE_LIMIT_WAIT)
     }
 
     /// FULL POWER'S ANSWER TO A PRESS THAT DID NOT LAND (the philosophy review

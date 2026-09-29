@@ -193,6 +193,31 @@ fn inherited_block(text: &mut String, s: &Sorted<'_>, base: &differential::BaseR
          \x20         here and in the receipt (`inherited`) for main to fix:\n",
     );
     since_list(text, &s.inherited, base.now);
+    nearest_block(text, s, base);
+}
+
+/// WHY EACH INHERITED RED QUALIFIED, when the base is a NEAREST one (opt-in,
+/// [`crate::nearest`]) — nothing under the exact rule, so a default run's
+/// verdict is what it always was.
+fn nearest_block(text: &mut String, s: &Sorted<'_>, base: &differential::BaseReds) {
+    let Some(gate) = &base.nearest else {
+        return;
+    };
+    if s.inherited.is_empty() {
+        return;
+    }
+    text.push_str(&format!(
+        "          NEAREST BASE (--nearest-base, opt-in): main's receipt is for {}, {} commit(s)\n\
+         \x20         before the merge-base {}, which has none that serves; each red above was\n\
+         \x20         inherited from it because:\n",
+        short(&base.commit),
+        gate.steps,
+        short(&gate.merge_base)
+    ));
+    for (f, _) in &s.inherited {
+        let why = gate.qualifies(f).unwrap_or("it qualified");
+        text.push_str(&format!("      - {}: {why}\n", f.id));
+    }
 }
 
 /// Render the verdict block and decide the exit code, judging every red
@@ -208,13 +233,17 @@ pub fn verdict_against(mode: Mode, scope: &Scope, t: &Tally, against: &Against) 
 }
 
 /// THE TIMING LABEL (2026-09-26): every failure that reads as a clock running
-/// out ([`Finding::timing`]) from a stage the machine was busy around
+/// out (a [`differential::TIMING_MARKERS`] entry in [`Finding::timing`]) from
+/// a stage the machine was busy around
 /// ([`crate::ladder::StageLoad::loaded`]: load above half its cores), named
 /// with the words that marked it and the load — or nothing, when there is
 /// none. A LABEL, NOT AN EXCUSE: it changes no exit code and no claim, and
 /// nothing is re-run — a retry once hid a real flock defect (4e15ec313:
 /// 9/200 failures with a retry, 33/200 without). It tells the reader which
-/// reds to re-take on a quieter machine before believing them.
+/// reds to re-take on a quieter machine before believing them. A row tagged
+/// only because it printed a measured duration ([`differential::MEASURED_DURATION`]:
+/// a type-check's `in 32s`, a test run's `finished in 243s`) is not labeled:
+/// that tag keeps it from being inherited, and says nothing about a clock.
 #[must_use]
 pub fn under_load_block(t: &Tally) -> String {
     let mut items = Vec::new();
@@ -223,7 +252,7 @@ pub fn under_load_block(t: &Tally) -> String {
             continue;
         };
         for f in t.findings_of(row) {
-            if let Some(marker) = f.timing {
+            if let Some(marker) = f.timing.filter(|m| *m != differential::MEASURED_DURATION) {
                 items.push((f, load, marker));
             }
         }
@@ -336,6 +365,7 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
                 "          INHERITED — red on main with the same failure, so not this change's:\n",
             );
             since_list(&mut text, &sorted.inherited, base.now);
+            nearest_block(&mut text, &sorted, base);
         }
         could_not_run_tail(&mut text, t);
         return Verdict {
@@ -578,6 +608,7 @@ mod tests {
                 hash: (*hash).to_string(),
                 opaque: None,
                 timing: None,
+                package: None,
             })
             .collect();
         // Rows a caller named by hand come first and have no findings; the
@@ -610,6 +641,7 @@ mod tests {
                 })
                 .collect(),
             now: NOW,
+            nearest: None,
         })
     }
 
@@ -626,6 +658,7 @@ mod tests {
             hash: H.into(),
             opaque: None,
             timing,
+            package: None,
         };
         let busy = StageLoad {
             start: 7482,
@@ -658,6 +691,17 @@ mod tests {
             ],
             Some(busy),
         );
+        // A type error from a row that also printed `type-checked in 32s`: the
+        // duration keeps it from being inherited, but it is no clock running out.
+        t.record_under(
+            fail,
+            "gate cells-foreign",
+            &[finding(
+                "gate cells-foreign",
+                Some(differential::MEASURED_DURATION),
+            )],
+            Some(busy),
+        );
         t.record_under(
             fail,
             "gate quiet",
@@ -688,7 +732,12 @@ mod tests {
             "{}",
             v.text
         );
-        for not in ["a::asserts", "b::waits (`", "c::waits (`"] {
+        for not in [
+            "a::asserts",
+            "b::waits (`",
+            "c::waits (`",
+            "gate cells-foreign (`",
+        ] {
             assert!(!v.text.contains(not), "{not} labeled:\n{}", v.text);
         }
         let calm = {
@@ -768,6 +817,64 @@ mod tests {
     /// <sha>)` and main's receipt, then the new reds (why each is new), the
     /// ones past the cap with their age, and the inherited ones — each named
     /// once, and exit 1.
+    /// THROUGH A NEAREST BASE (opt-in) the verdict names the base, the
+    /// merge-base it stands in for, and why each inherited red qualified; a
+    /// red the gate refused is NEW with its reason. Judged by the exact rule
+    /// the same tally prints none of it.
+    #[test]
+    fn a_nearest_base_names_why_each_inherited_red_qualified() {
+        let t = with_row(
+            with_row(
+                tally(0, 0, &[]),
+                "tests of a",
+                &[("-p a --lib -- red_a", H)],
+            ),
+            "tests of c",
+            &[("-p c --lib -- red_c", H)],
+        );
+        let Against::Base(exact) = main_red(&[
+            ("-p a --lib -- red_a", H, 3600),
+            ("-p c --lib -- red_c", H, 3600),
+        ]) else {
+            unreachable!("main_red is a base")
+        };
+        let mut crates = std::collections::BTreeMap::new();
+        crates.insert("a".to_string(), Ok("no file of `a` changed".to_string()));
+        crates.insert("c".to_string(), Err(crate::nearest::RADIUS_CHANGED));
+        let near = differential::BaseReds {
+            nearest: Some(crate::nearest::Gate {
+                merge_base: "1".repeat(40),
+                steps: 7,
+                span_secs: 7200,
+                crates,
+            }),
+            ..exact.clone()
+        };
+        let mut t = t;
+        for (row, package) in [(0, "a"), (1, "c")] {
+            for f in &mut t.findings[row] {
+                f.package = Some(package.to_string());
+            }
+        }
+        let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &Against::Base(near));
+        assert_eq!(v.exit, exit::FAILED, "{}", v.text);
+        assert!(
+            v.text.contains("NEAREST BASE (--nearest-base, opt-in)")
+                && v.text.contains("7 commit(s)")
+                && v.text
+                    .contains("      - -p a --lib -- red_a: no file of `a` changed")
+                && v.text.contains(&format!(
+                    "      - -p c --lib -- red_c — never inherited: {}",
+                    crate::nearest::RADIUS_CHANGED
+                )),
+            "{}",
+            v.text
+        );
+        let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &Against::Base(exact));
+        assert!(v.claims_merge_contract, "{}", v.text);
+        assert!(!v.text.contains("NEAREST"), "{}", v.text);
+    }
+
     #[test]
     fn a_judged_failure_names_new_expired_and_inherited_reds_apart() {
         let t = with_row(

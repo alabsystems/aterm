@@ -72,7 +72,8 @@
 //! gate open or not, so the next holder's first byte is not swallowed.
 //!
 //! Never touched: cursor style/blink, SGR, palette and dynamic colours, titles,
-//! OSC 7/8 state, tab stops, grid/scrollback/images, XTSAVE slots, bidi, modes
+//! OSC 7/8 state (an open OSC 8 link is closed only by the manual reset,
+//! [`Terminal::manual_handback`]), tab stops, grid/scrollback/images, XTSAVE slots, bidi, modes
 //! 3/45/2027, the INACTIVE screen's kitty slot, and every host policy bit.
 
 use core::fmt::Write as _;
@@ -306,6 +307,60 @@ impl Terminal {
         &mut self,
         restore_modes: bool,
     ) -> Option<ForegroundHandback> {
+        let owned = restore_modes && self.program_owns_terminal();
+        self.handback(owned, false)
+    }
+
+    /// THE MANUAL RESET (2026-09-26): the same handback, asked for by a person
+    /// or an operator — the `reset` control verb and the Edit ▸ Reset Terminal
+    /// menu row — instead of by a foreground change.
+    ///
+    /// Why it exists: the automatic handback acts only at a foreground change
+    /// whose old holder is GONE and owned an input-hijacking mode. Everything
+    /// outside that gate had no way back. The robustness audit of 2026-09-26
+    /// found a live session (window pid 6874, `~/publication`, idle about
+    /// 97 000 s) whose zsh prompt still ran under `alt_screen=true
+    /// mouse_mode=any mouse_encoding=sgr kitty_keyboard=disambiguate,…
+    /// modify_other_keys=2`: the modes were armed before the handback existed,
+    /// so the first holder the new reader saw was the live zsh, which is never
+    /// gone, and nothing could ever hand them back. The same is true of a
+    /// shifted charset (`smacs` left on, the prompt drawn in line-drawing
+    /// glyphs), an OSC 8 hyperlink a killed program left open (every later
+    /// character becomes a link), display modes a SIGKILLed `less` left, and
+    /// any foreground change the sampler missed. xterm's answer is Soft Reset
+    /// (DECSTR); aterm's is this, because DECSTR would also reset the SGR pen
+    /// and the saved cursor, and could not be recorded as exactly what moved.
+    ///
+    /// What it does: the byte plan of [`Self::foreground_handback_scoped`],
+    /// WITHOUT the evidence gate — step 0's `CAN` when the parser is
+    /// mid-sequence, then every step 1–12 whose live value differs from its
+    /// host target, then phase B (region, DECOM, DECLRMM, cursor written back)
+    /// — plus one step only a manual reset takes: `OSC 8 ; ; ST` when a
+    /// hyperlink is open (`"hyperlink"`). The bytes are fed through
+    /// [`Self::process_at`] like the automatic handback's, so the host records
+    /// them as `RawIn` and a replay reaches the same state.
+    ///
+    /// What it never does: clear the screen or the scrollback, or touch the
+    /// SGR pen, palette, titles, tab stops or images; phase B writes the
+    /// cursor back where it was. The alternate screen IS left (`?1049l`),
+    /// exactly as the handback leaves it, which shows the main screen, its
+    /// scrollback and its saved cursor again — the alt screen's contents
+    /// belong to a program that is not drawing it. Run while a live
+    /// TUI owns the terminal, it strips that TUI's modes too: the person asked.
+    ///
+    /// Always returns a [`ForegroundHandback`]; its `bytes` are empty when the
+    /// terminal was already at its host defaults (nothing is processed then).
+    pub fn manual_handback(&mut self) -> ForegroundHandback {
+        self.handback(true, true).unwrap_or(ForegroundHandback {
+            bytes: Vec::new(),
+            reverted: Vec::new(),
+        })
+    }
+
+    /// The shared body of [`Self::foreground_handback_scoped`] (`owned` = the
+    /// gate's verdict, `manual` false) and [`Self::manual_handback`] (both
+    /// true). `None` when there was nothing to send.
+    fn handback(&mut self, owned: bool, manual: bool) -> Option<ForegroundHandback> {
         let clock = ClockReading::now();
         let mut bytes: Vec<u8> = Vec::new();
         let mut reverted: Vec<&'static str> = Vec::new();
@@ -313,9 +368,17 @@ impl Terminal {
             bytes.push(0x18);
             reverted.push("parser");
         }
-        let owned = restore_modes && self.program_owns_terminal();
         if owned {
             self.handback_phase_a(&mut bytes, &mut reverted);
+        }
+        // An open OSC 8 link outlives the program that opened it and turns
+        // every later character into a link (audit finding 5, 2026-09-26).
+        // The automatic handback leaves OSC 8 alone by design (module docs);
+        // a person asking for a reset gets it closed. After phase A, so VT52
+        // (step 1) has been left and the OSC parses.
+        if manual && self.transient.current_hyperlink.is_some() {
+            bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
+            reverted.push("hyperlink");
         }
         if bytes.is_empty() {
             return None;

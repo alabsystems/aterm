@@ -75,6 +75,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
         next_turn_id: None,
         // That build wrote no number: its shells predate the healing sessions.
         outgoing_build: None,
+        held: Vec::new(),
         sessions: old
             .sessions
             .into_iter()
@@ -103,6 +104,11 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 history_dropped: 0,
                 history_withheld: false,
                 history_lost: 0,
+                hold: None,
+                supervisor: None,
+                claim_known: false,
+                attention_owners: Vec::new(),
+                viewport_from_bottom: None,
             })
             .collect(),
     })
@@ -688,6 +694,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         connections: Vec::new(),
         next_turn_id: Some(1234),
         outgoing_build: Some(crate::running_build_number()),
+        held: Vec::new(),
         sessions: vec![SessionRecord {
             local_id: 0,
             sid: "s-0".to_string(),
@@ -718,6 +725,11 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             history_dropped: 0,
             history_withheld: false,
             history_lost: 0,
+            hold: None,
+            supervisor: None,
+            claim_known: false,
+            attention_owners: Vec::new(),
+            viewport_from_bottom: None,
         }],
     };
     let wire = new.to_toml().unwrap();

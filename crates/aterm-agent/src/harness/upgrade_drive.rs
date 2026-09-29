@@ -57,8 +57,8 @@ use aterm_types::control_verbs::ScreenGen;
 
 use super::relaunch::{
     Launch, NoPlan, Plan, PromptMark, Relaunch, RelaunchLineError, STALE_S, await_new, carry_on,
-    confirm, expired, last_permission_mode, plan, relaunch, relaunch_of, type_relaunch_line_with,
-    unplanned, wait_until,
+    confirm, expired, fallback_carried, fallback_origin, fallback_record, last_permission_mode,
+    plan, relaunch, relaunch_of, screen_mode, type_relaunch_line_with, unplanned, wait_until,
 };
 use super::upgrade::{self, Candidate, Facts, Phase, Request, SessionFile, Source, Step, Version};
 use super::upgrade_catalog::{self as catalog, Baked};
@@ -71,11 +71,541 @@ mod upgrade_status;
 
 #[path = "upgrade_codex_drive.rs"]
 mod codex;
+
+#[path = "upgrade_watch.rs"]
+mod watch;
 pub(super) use upgrade_status::runs_under;
 pub use upgrade_status::{
-    ATTENTION_OWNER, Ask, HeldBy, REFUSED_STOPPED, Remedy, Row, STALLED_AFTER_S, View, ask,
-    ask_for, refusal_sentence, refused_stopped, rows, status_rows, word_marker,
+    ATTENTION_OWNER, Ask, HeldBy, MOVE_BUDGET_S, REFUSED_STOPPED, Remedy, Row, STALLED_AFTER_S,
+    TELL_S, View, ask, ask_for, refusal_sentence, refused_stopped, rows, status_rows, word_marker,
 };
+#[cfg(all(test, unix))]
+use watch::watch_with;
+pub use watch::{Watched, Watcher, watch};
+
+/// THE WORLD AND THE MUTANTS of `HarnessUpgradeLadder`
+/// (`aterm_spec::derive::harness_upgrade_ladder_model`): its lane's actions
+/// are bound where the real rule runs (`upgrade::rung`, `upgrade::gate`,
+/// `St::still`, `upgrade_codex::daemon_turn`, `upgrade_codex::daemon_step`,
+/// all projected by [`ladder_projection`]); these are the agent's, the
+/// daemon's, a person's and the clock's steps, each one the Tier-1 bind
+/// (`codex::ladder_tests::the_real_ladder_is_the_derived_machine`) performs,
+/// and the `Buggy = 1` members, which no shipping code runs. Compiled only
+/// for proof and test builds: nothing calls it.
+#[cfg(any(test, feature = "spec-anchors"))]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "TurnStarts",
+        reason = "A turn of this client's own root starting: Codex's or Claude Code's step. The Tier-1 bind reads it busy (or streaming under a goal) exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "TurnEnds",
+        reason = "A turn of this client's own root ending: the agent's step. The Tier-1 bind reads its end exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "HiddenStarts",
+        reason = "A turn the screen never draws starting (a subagent's, or a root's with this client the daemon's only Codex): the daemon's step. The Tier-1 bind puts a running thread on the daemon exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "HiddenEnds",
+        reason = "That hidden turn ending: the daemon's step. The Tier-1 bind idles the thread exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "OtherStarts",
+        reason = "A turn in another session on the same daemon starting: another tab's step. The Tier-1 bind runs another root with another client attached exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "OtherEnds",
+        reason = "That other session's turn ending: another tab's step. The Tier-1 bind idles it exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "GoalPursued",
+        reason = "Codex's footer starting to say a goal is pursued: the vendor's step. The Tier-1 bind draws `Pursuing goal (…)` exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "GoalPaused",
+        reason = "Codex's footer no longer saying a goal is pursued — paused, achieved or cleared, by a person, by the goal's own end, or by Codex taking aterm's typed `/goal pause` (that pause bound in HarnessUpgradeGoalPause::GoalPause at `goal_step`): the footer's change is the vendor's step. The Tier-1 bind clears it exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "Repaint",
+        reason = "A redraw with no new words (a footer clock, a goal's counter): the vendor's screen. The Tier-1 bind repaints the counter exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "Still",
+        reason = "The screen's own quiet standing: the vendor's screen and the clock. The Tier-1 bind holds the screen still exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "Type",
+        reason = "A person's keystroke in the tab: a person's step. The Tier-1 bind stamps the keystroke exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "KeysPause",
+        reason = "A person pausing past the keys gap but still near: a person's step and the clock. The Tier-1 bind ages the stamp exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "KeysAway",
+        reason = "A person leaving the tab past the grace: a person's step and the clock. The Tier-1 bind ages the stamp exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "DraftTyped",
+        reason = "A draft left in the composer: a person's step. The Tier-1 bind types one exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "DraftCleared",
+        reason = "That draft cleared: a person's step. The Tier-1 bind clears it exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "BoxUp",
+        reason = "A dialog drawn over the composer: the vendor's step. The Tier-1 bind draws a measured box exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "BoxDown",
+        reason = "That dialog answered: the vendor's step. The Tier-1 bind takes it down exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "MarkChanges",
+        reason = "The input line's mark changing between `›` and 0.158.0's `»`: the vendor's build. The Tier-1 bind swaps the mark exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "SeqSettle",
+        reason = "Buggy=1 negative control only; a look at a pause the ladder counts that waits `settling` for a screen that only repainted (the incident's 120 `wait:settling`), which `St::still` does not"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "AttendedWithoutLadder",
+        reason = "Buggy=1 negative control only; a person merely near the tab holding the move at every rung, where `gate` narrows the grace to the keys gap from KeysOnly"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "BlindReader",
+        reason = "Buggy=1 negative control only; the reader blind to 0.158.0's `»` input line, which the one Codex composer reader reads"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "OtherTurnHolds",
+        reason = "Buggy=1 negative control only; every thread of the daemon holding the client, where `daemon_turn` lets a placed session's turn go"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "PinDropsDue",
+        reason = "Buggy=1 negative control only; a current client on an unpinned daemon let go, where `daemon_step` keeps it due for the pin"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "NowWaivesThePerson",
+        reason = "Buggy=1 negative control only; the owner's `--now` waiving the person outright, where `gate` keeps the keys gap at the last rung"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "MoveOverADraft",
+        reason = "Buggy=1 negative control only; a move typed over a draft, which `gate` never makes"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "MoveOverABox",
+        reason = "Buggy=1 negative control only; a move typed over a dialog, which `gate` never makes"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "MoveMidTurn",
+        reason = "Buggy=1 negative control only; a daemon-mode client ended while its own thread runs a turn, which `daemon_turn` holds"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "PlacedUnderAGoal",
+        reason = "Buggy=1 negative control only; the still run placing this client's own goal turn, where nothing is placed under a goal"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeLadder",
+        action = "PlacedAsItRan",
+        reason = "Buggy=1 negative control only; the still run placing whatever ran through two looks, where only another session's root with another client attached is placed"
+    )
+)]
+#[doc(hidden)]
+pub fn ladder_environment() {}
+
+/// THE LADDER'S PROJECTION (`aterm_spec::derive::harness_upgrade_ladder_model`,
+/// the `#[refines]` anchors on `upgrade::gate`, `upgrade::rung`, `St::still`,
+/// `upgrade_codex::daemon_turn` and `upgrade_codex::daemon_step`): the
+/// model's variables a look's real [`Facts`] stand for — its `rung` (0 Prefer
+/// … 3 Land), `work` (a turn the gate waits for: Claude's status or busy
+/// footer, or a Codex daemon's thread, [`Facts::daemon_turn`]), `quiet` (the
+/// screen's own settle), `seen` (the
+/// reader's run of idle looks at the same last words: 2 once it stood
+/// [`upgrade::QUIET_S`]), `keys` (0 nobody near, 1 a person within the grace
+/// who has not typed within [`upgrade::KEYS_GAP_S`], 2 one who has), `draft`
+/// and `dialog`. `work` is this client's own turn: a Codex daemon's thread
+/// counts only where [`upgrade::Facts::daemon_turn`] holds it (its own
+/// conversation's — a subagent's included — or one not placed in another
+/// session: the model's `work` 2 is a turn the lane never places) — another
+/// session's root's turn is the model's `other`, which no fact of this
+/// client's carries, and the goal its footer
+/// shows is the model's `goal`, which the facts carry only through what it
+/// holds ([`upgrade::DaemonTurn::Goal`], and a turn it leaves unplaced).
+/// Compiled only for proof and test builds.
+#[cfg(any(test, feature = "spec-anchors"))]
+#[doc(hidden)]
+#[must_use]
+pub fn ladder_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i64> {
+    let flag = |b: bool| i64::from(b);
+    std::collections::BTreeMap::from([
+        (
+            "rung",
+            match f.rung {
+                upgrade::Rung::Prefer => 0,
+                upgrade::Rung::Settled => 1,
+                upgrade::Rung::KeysOnly => 2,
+                upgrade::Rung::Land => 3,
+            },
+        ),
+        (
+            "work",
+            flag(f.status != "idle" || f.busy_footer || f.daemon_turn.wait().is_some()),
+        ),
+        (
+            "quiet",
+            flag(f.status_age_s >= upgrade::QUIET_S && f.quiet_s >= upgrade::QUIET_S),
+        ),
+        ("seen", if f.still_s >= upgrade::QUIET_S { 2 } else { 0 }),
+        ("keys", if f.typing { 2 } else { flag(f.attended) }),
+        ("draft", flag(!f.composer_empty)),
+        ("dialog", flag(f.approval_box)),
+    ])
+}
+
+/// THE WORLD AND THE MUTANTS of `HarnessUpgradeGoalPause`
+/// (`aterm_spec::derive::harness_upgrade_goal_pause_model`): its lane's
+/// actions are bound where the real rule runs (`upgrade_codex::goal_step`,
+/// `upgrade_codex::goal_owed` and the ladder's `upgrade_codex::daemon_turn`
+/// for its move, all projected by [`goal_projection`]); these are Codex's, a
+/// person's, the supervisor's switch's and the clock's steps, each one the
+/// Tier-1 bind
+/// (`codex::ladder_tests::goal::the_real_goal_pause_is_the_derived_machine`)
+/// performs, and the `Buggy = 1` members, which no shipping code runs.
+///
+/// THE CLOCK'S THREE STEPS are classified alike: `Advance` (the Land rung),
+/// `MoveOverdue` (the hold's bound) and `Rested` (the rest) are the clock
+/// passing a threshold, which no step of the lane makes; the lane only READS
+/// the clock against its thresholds (`St::rung_at`, `goal_hold_past_bound`,
+/// `goal_rest_until`), and the Tier-1 bind ages each look through that real
+/// reader. None carries a `#[refines]` here: a reader performs no step.
+/// Compiled only for proof and test builds: nothing calls it.
+#[cfg(any(test, feature = "spec-anchors"))]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "Advance",
+        reason = "The ladder's clock reaching its Land rung, or the owner's `--now` (a person's word, the goal look's `hurried`): the clock and a person, which no step of the lane makes; the lane only READS the rung (`St::rung_at` over `upgrade::rung`, whose thresholds are bound as HarnessUpgradeLadder::Advance). The Tier-1 bind builds `land` through the real `St::rung_at` at every rung, `--now` aside, and Advance is enabled exactly where it stands short of Land."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "TurnEnds",
+        reason = "A goal turn ending, and the next beginning at its head at once while the goal is pursued: Codex's step. The Tier-1 bind reads the goal thread's rollout exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "TurnWorks",
+        reason = "A goal turn's first work landing (a reasoning item, a message, a tool call): Codex's step. The Tier-1 bind writes the rollout past its head exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "PauseTakes",
+        reason = "Codex taking a typed `/goal pause` (its footer then reads `Goal paused`): the vendor's step. The Tier-1 bind draws the paused footer exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "PersonResumes",
+        reason = "A person resuming the goal: a person's step. The Tier-1 bind draws `Pursuing goal` and stamps their hand exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "PersonPauses",
+        reason = "A person pausing the goal: a person's step. The Tier-1 bind draws `Goal paused` and stamps their hand exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "SwitchOpens",
+        reason = "A save-then-wait switch opening on the tab: the supervisor's press, never this lane's (bound in its own machine, SupervisorCodexRateNudge::PressSwitch at `approval::rate_nudge` and `TurnEndState::open_switch`); this lane only reads the switch's ledger row (`switch_open`, `approvals::open_wind_down`). The Tier-1 bind opens it exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "SwitchCloses",
+        reason = "That switch closing — at its reset's resume, or a person's own turn: the supervisor's step, never this lane's (bound in SupervisorCodexRateNudge, where its phase returns free: Restore and Resume at `wind_down_act`, a person's turn at `observe`); this lane only reads the ledger row that closes it (`approvals::open_wind_down`: `done` or `released`). The Tier-1 bind closes it exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "MoveOverdue",
+        reason = "Another floor of the ladder's (a draft, a box, a keystroke, other work) holding the move past the hold's bound: the ladder's floors and the clock, which no step of the lane makes; the lane only READS the bound (`goal_hold_past_bound`, `GOAL_HOLD_BOUND_S`, which makes `goal_step`'s resume due, bound as GoalResume). The Tier-1 bind ages the paused hold past `GOAL_HOLD_BOUND_S` exactly there: the aged look projects onto the model's successor (`overdue` through that same reader), and the real `goal_step` decides there, `Resume(\"bound\")`, what the model enables at it."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "Rested",
+        reason = "The rest after a hold that ended without its move running out: the clock, which no step of the lane makes; the lane only READS it (`goal_rest_until`, which keeps `goal_step`'s next pause off, bound as GoalPause). The Tier-1 bind ages the hold past `GOAL_REST_S` exactly there, and the real `goal_rest_until` ends the rest."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "GoalHoldsTheTab",
+        reason = "Buggy=1 negative control only; the rule before the owner's decision, a goal holding its tab like any turn, where `goal_step` pauses it at Land"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "EscMidWork",
+        reason = "Buggy=1 negative control only; the Esc pressed past a goal turn's head, where `goal_step` presses it only at a head"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "PauseUnderSwitch",
+        reason = "Buggy=1 negative control only; the pause made under an open save-then-wait switch, where `goal_step` makes none"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "PauseAtFirstSight",
+        reason = "Buggy=1 negative control only; the pause made before the ladder's Land rung, where `goal_step` waits for it"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "ResumeTwice",
+        reason = "Buggy=1 negative control only; a resume made again over a goal a person paused after aterm's resume, where `goal_step` owes nothing once resumed"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "ResumeOverPerson",
+        reason = "Buggy=1 negative control only; the goal resumed after a person took it from aterm, where `goal_step` releases it"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "LetGoPaused",
+        reason = "Buggy=1 negative control only; the host letting a current tab go with its goal left paused, where `goal_owed` keeps it due"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "HarnessUpgradeGoalPause",
+        action = "ContinuePaused",
+        reason = "Buggy=1 negative control only; the supervisor typing a turn onto the paused thread, where every wait the lane words at a held goal is `goal-held`, which owns the turn end (`goal_wait_word`, `owns_turn_ends`)"
+    )
+)]
+#[doc(hidden)]
+pub fn goal_environment() {}
+
+/// THE GOAL PAUSE'S PROJECTION (`aterm_spec::derive::
+/// harness_upgrade_goal_pause_model`, the `#[refines]` anchors on
+/// `upgrade_codex::goal_step`, `upgrade_codex::goal_owed` and
+/// `upgrade_codex::daemon_turn`): the model's variables one real look
+/// ([`super::upgrade_codex::GoalLook`]) stands for — `behind`, `land`,
+/// `goal` (1 pursued, 2 paused), `turn` (0 none held, 1 a turn at its head,
+/// 2 one past it), `held` (the upgrade's record: 0 none or rested, 1
+/// pausing, 2 paused, 3 resumed, 4 released), `overdue` (the move will not
+/// come now: abandoned, or the paused hold past its bound,
+/// [`super::upgrade_codex::goal_hold_past_bound`] — each of which makes the
+/// resume due), `switch` and `person`. Compiled only for proof and test
+/// builds.
+#[cfg(any(test, feature = "spec-anchors"))]
+#[doc(hidden)]
+#[must_use]
+pub fn goal_projection(
+    look: &super::upgrade_codex::GoalLook,
+) -> std::collections::BTreeMap<&'static str, i64> {
+    use super::goal_hold::{Owner, Stage};
+    let flag = |b: bool| i64::from(b);
+    let held = match look.hold.filter(|h| h.owner == Owner::Upgrade) {
+        Some(h) if h.stage == Stage::Pausing => 1,
+        Some(h) if h.stage.owes() => 2,
+        Some(h) if super::upgrade_codex::goal_rest_until(h, look.now).is_some() => {
+            if h.stage == Stage::Released { 4 } else { 3 }
+        }
+        Some(h) if h.stage == Stage::Resumed && !look.behind => 3,
+        _ => 0,
+    };
+    std::collections::BTreeMap::from([
+        ("behind", flag(look.behind)),
+        ("land", flag(look.land)),
+        (
+            "goal",
+            if look.goal == Some(aterm_phase::codex::CodexGoal::Pursuing) {
+                1
+            } else {
+                2
+            },
+        ),
+        (
+            "turn",
+            match look.head {
+                Some(true) => 1,
+                _ if look.goal_holds => 2,
+                _ => 0,
+            },
+        ),
+        ("held", held),
+        (
+            "overdue",
+            flag(
+                look.abandoned.is_some()
+                    || look.hold.is_some_and(|h| {
+                        h.owner == Owner::Upgrade
+                            && h.stage == Stage::Paused
+                            && super::upgrade_codex::goal_hold_past_bound(h, look.now)
+                    }),
+            ),
+        ),
+        ("switch", flag(look.switch)),
+        ("person", flag(look.person_since)),
+    ])
+}
 
 /// What one sweep is told.
 #[derive(Clone, Debug)]
@@ -218,6 +748,16 @@ pub(super) fn alive(pid: u32) -> bool {
     {
         aterm_uds::process::pid_alive(pid)
     }
+}
+
+/// Whether `pid` LEADS ITS TERMINAL: alive, and its process group its
+/// controlling terminal's foreground group (`ids`) — the supervising loop's
+/// test that the Codex the live upgrade relaunched is still the one in its
+/// tab (`goal_hold::box_is_upgrades`). A pid that is gone, or backgrounded
+/// under a person's own Codex, does not.
+#[must_use]
+pub fn leads_its_terminal(pid: u32) -> bool {
+    pid > 1 && alive(pid) && ids(pid).is_some_and(|(_, pgid, front)| pgid > 0 && pgid == front)
 }
 
 /// `(ppid, pgid, tpgid)` of `pid`.
@@ -627,6 +1167,21 @@ pub(super) fn gave_up_words(agent: upgrade::Agent, held: &[upgrade::Held]) -> St
     } else {
         format!("{why}; still running under the agent: {list}")
     }
+}
+
+/// When `pid` started, unix milliseconds (to the second: `ps`'s elapsed
+/// time), while it runs.
+pub(super) fn started_ms(pid: u32) -> Option<u64> {
+    let etime = ps(&["-o", "etime=", "-p", &pid.to_string()])?;
+    let age_s = parse_etime(etime.trim())?;
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis(),
+    )
+    .ok()?;
+    Some(now_ms.saturating_sub(age_s.saturating_mul(1000)))
 }
 
 /// `ps`'s `etime` (`[[dd-]hh:]mm:ss`) in seconds.
@@ -1229,13 +1784,10 @@ fn is_generation(g: &str) -> bool {
 /// a lost connection, an unexpected shape — reads NOT dim: a suggestion then
 /// waits as a draft would, and nothing is ever typed over a draft.
 pub(super) fn composer_empty(c: &mut Client, sid: &str, scr: &Screen) -> bool {
-    let dim = match scr.cursor {
-        Some((row, 2)) => scr.first.checked_add(row).is_some_and(|at| {
-            c.request_line(&format!("@{sid} cell {at} 2"))
-                .is_ok_and(|line| cell_is_dim(&line))
-        }),
-        _ => false,
-    };
+    let dim = dim_cell(scr).is_some_and(|at| {
+        c.request_line(&format!("@{sid} cell {at} 2"))
+            .is_ok_and(|line| cell_is_dim(&line))
+    });
     upgrade::composer_is_empty(&scr.rows, scr.cursor, dim)
 }
 
@@ -1525,9 +2077,12 @@ pub(super) fn turn(c: &mut Client, sid: &str, text: &str) -> Result<(), String> 
 /// Whether the host's `turn` takes the `if-gen=` fence: its `help turn`
 /// names it. A host older than the fence would TYPE a leading `if-gen=…` as
 /// part of the text (its option parser stops at the first word it does not
-/// know), so the fence is never sent unprobed.
+/// know), so the fence is never sent unprobed. Asked once per connection
+/// ([`RelayClient::help_counted`]), and by [`typing_fence`] BEFORE its read, so the
+/// fenced `turn` finds the answer kept and asks nothing between the read and
+/// the paste.
 fn turn_takes_gen(c: &mut Client) -> bool {
-    c.request_counted("help turn")
+    c.help_counted("turn")
         .is_ok_and(|(head, body)| head.starts_with("OK") && (head + &body).contains("if-gen="))
 }
 
@@ -1834,14 +2389,9 @@ fn model_judge(
 /// `build-restart`: the switch re-reads a history the restart re-reads
 /// anyway). `None` when
 /// nothing is due, or the move is not the harness's to make. The caller
-/// records it as asked for before the one act ([`record_asked`]).
-pub(super) fn riding_model(opts: &Opts, sf: &SessionFile, argv: &[String]) -> Option<String> {
-    let targets = Targets::read(&opts.home);
-    riding_model_in(opts, sf, argv, &ModelCtx::read(opts, &targets))
-}
-
-/// [`riding_model`] against `mctx`: the seam a test reads its own list
-/// through.
+/// records it as asked for before the one act ([`record_asked`]). Judged
+/// against `mctx` ([`restart_models`] reads it; a test reads its own list
+/// through it).
 pub(super) fn riding_model_in(
     opts: &Opts,
     sf: &SessionFile,
@@ -1858,6 +2408,67 @@ pub(super) fn riding_model_in(
         .is_some_and(|e| e.starts_with(native_root(&opts.home)));
     let mread = model_read_for(opts, sf, launch.as_deref(), mctx, native);
     models::model_to(None, &mread.verdict, mread.cold, true, mread.due_for_s)
+}
+
+/// THE MODELS A RESTART MADE FOR ANOTHER REASON CARRIES — a memory
+/// banner's restart in place, an exit's relaunch — of the conversation
+/// `session`, launched with `argv`: the model riding it ([`riding_model_in`];
+/// only when `ride`, and only off the live record `sf`), and the model a
+/// person chose by hand with `/model` ([`hand_model_in`]), which the line asks
+/// for when nothing rides it. The process's start is the record's, else
+/// `start` — its kernel start as `ps` renders it ([`kernel_start`]), what the
+/// host kept of an agent whose record is gone: with none, a `/model` of a
+/// process before it read as this one's. One read of the catalog for both,
+/// and none when neither can be asked (nothing rides and the launch named no
+/// model).
+pub(super) fn restart_models(
+    opts: &Opts,
+    sf: Option<&SessionFile>,
+    start: &str,
+    session: &str,
+    argv: &[String],
+    ride: bool,
+) -> (Option<String>, Option<String>) {
+    let ride = ride && sf.is_some();
+    if !ride && upgrade::launch_model(argv).is_none() {
+        return (None, None);
+    }
+    let mctx = ModelCtx::read(opts, &Targets::read(&opts.home));
+    let riding = sf
+        .filter(|_| ride)
+        .and_then(|sf| riding_model_in(opts, sf, argv, &mctx));
+    let native = sf
+        .and_then(|sf| exe_of(sf.pid))
+        .or_else(|| argv.first().map(PathBuf::from))
+        .is_some_and(|e| e.starts_with(native_root(&opts.home)));
+    let started = sf
+        .and_then(|sf| models::parse_lstart(&sf.proc_start))
+        .or_else(|| models::parse_lstart(start));
+    let hand = hand_model_in(opts, session, argv, started, &mctx, native);
+    (riding, hand)
+}
+
+/// THE MODEL A PERSON CHOSE BY HAND for the conversation `session`, launched
+/// with `argv` by a process started at `started_s` ([`models::hand_model`]):
+/// what it runs now off its transcript's tail ([`models::live_model_at`], a
+/// `/model` display — and a launch alias — read through the catalog of the
+/// build it runs, `native`), against the `/model` choice its record
+/// remembers. `None` when
+/// the launch named no model — Claude's `/model` then saved the choice as the
+/// default the relaunch starts on — or nobody chose one by hand.
+pub(super) fn hand_model_in(
+    opts: &Opts,
+    session: &str,
+    argv: &[String],
+    started_s: Option<u64>,
+    mctx: &ModelCtx,
+    native: bool,
+) -> Option<String> {
+    let launch = upgrade::launch_model(argv)?;
+    let (tail, _) = tail_to_end(&transcript(&opts.home, session)?, TAIL_BYTES);
+    let (baked, _) = mctx.view(native);
+    let human = load_model_record(opts, session).human;
+    models::hand_model(&tail, baked, &human, &launch, started_s)
 }
 
 /// Remember `model` as the one the relaunch of `session` asks for, BEFORE
@@ -2121,6 +2732,9 @@ pub(super) struct Unsent {
     release: String,
     marker: String,
     markers: Vec<String>,
+    /// [`St::fallback_from`] as it stood: a restart that carries a hand
+    /// choice makes that the origin ([`restart`]), and one never sent did not.
+    fallback_from: String,
 }
 
 /// What the sweep remembers about one conversation's upgrade. Everything a
@@ -2171,7 +2785,8 @@ pub(super) struct St {
     pub(super) shell: u32,
     /// The tab the shell lives in.
     pub(super) tab: String,
-    /// The line typed at that prompt.
+    /// The line typed at that prompt — once announced and before the
+    /// signal, the line the announcement was planned on.
     pub(super) line: String,
     /// Where that prompt left the cursor when a relaunch attempt first read it
     /// ([`PromptMark`]): kept across attempts, so a person's typing at the
@@ -2179,7 +2794,8 @@ pub(super) struct St {
     /// their own half-typed command.
     pub(super) prompt: Option<PromptMark>,
     /// The last reason this upgrade was held back that the ledger was told
-    /// ([`held_back`]), so it is said once, not every sweep.
+    /// ([`held_back`]), so it is said once, not every sweep — or the restart
+    /// under way it said is stuck (`stuck:<what>`, [`note_stuck`]).
     pub(super) noted: String,
     /// Why the agent is being relaunched: empty for this module's upgrade,
     /// [`super::relaunch::CAUSE_EXIT`] for a relaunch on exit — which of the
@@ -2204,6 +2820,19 @@ pub(super) struct St {
     /// the launch's own `--model` (or names none): what the outcome says
     /// decided the model after.
     pub(super) model_list: String,
+    /// The model the launch named before a bucket's fallback relaunch
+    /// replaced it (empty: no fallback stands;
+    /// [`super::relaunch::FALLBACK_NO_MODEL`]: one stands and the launch
+    /// named none) — what the way back at the bucket's reset returns to
+    /// ([`super::relaunch::fallback_origin`]). Set by the fallback's restart,
+    /// carried over every restart made for another reason while the
+    /// fallback runs (a memory banner, an exit, the upgrade's record) — made
+    /// the model a person chose by hand since, where that restart carries
+    /// one, which the way back would otherwise undo — and cleared by the way
+    /// back: the fallback's own
+    /// record was the only one that kept it, and a memory restart saved over
+    /// it left the way back nothing to return to.
+    pub(super) fallback_from: String,
     /// Set once the continuation is typed while the resumed session's first
     /// answer is still to be read ([`super::relaunch::confirm`]): the second (since the epoch)
     /// past which a sweep that still finds none records the model as
@@ -2249,6 +2878,13 @@ pub(super) struct St {
     pub(super) wait: String,
     /// When that wait began: the first step that recorded the same word.
     pub(super) wait_since: u64,
+    /// For a PERSON AT THE TAB (`attended`), when a look last recorded it: a
+    /// wait no look has confirmed since is the last point's word, not the
+    /// session's now — what the owner's view tells apart
+    /// ([`upgrade_status::Row::wait_seen`]). `0` for every other wait (no
+    /// other word reads it, and the owner's rows are sent again only when
+    /// they change), and in a state an older build wrote.
+    pub(super) wait_seen: u64,
     /// What ran under the agent at the last look whose step waited, by pid,
     /// name and start ([`HeldBy`], [`St::note_held`]): what the owner is
     /// told holds the move (2026-09-27: the notice named the shells to the
@@ -2268,6 +2904,32 @@ pub(super) struct St {
     pub(super) idle_pid: u32,
     /// When the last of them was taken (unix seconds); `0`: none.
     pub(super) idle_at: u64,
+    /// THE REPAINT-PROOF SETTLE'S RUN ([`St::still`],
+    /// [`upgrade::Facts::still_s`]): the print of the last words the last
+    /// authoritatively idle look read ([`upgrade::still_print`], the process
+    /// in it), when the run of looks reading that same print began, and when
+    /// its latest look was; empty and `0` while no run stands.
+    pub(super) still_print: String,
+    pub(super) still_since: u64,
+    pub(super) still_at: u64,
+    /// Codex: the threads of the client's daemon found running at the looks
+    /// of that run, each with the first look that found it (`<thread>@<unix
+    /// s>`, space-separated; empty while no run stands, and while the screen's
+    /// footer shows a goal being pursued): one still running
+    /// [`upgrade::QUIET_S`] (20 s) after that ran through 20 s of this
+    /// screen's still run ([`codex`]'s `cx::still_through`) — another
+    /// session's, where it is a root and another Codex is attached to the
+    /// daemon (`cx::daemon_turn`; a subagent's turn draws on no screen).
+    pub(super) still_busy: String,
+    /// A WAIT NO RUNG PASSES (`upgrade_status::BLOCKERS`) and since when it
+    /// has blocked the move ([`St::note_blocked`]): the blocker met when the
+    /// gate PASSED and the act was refused (`no-shell-integration`), or when
+    /// the screen could not be read at all (`screen-unreadable`). Kept
+    /// across the other waits a look finds between two such refusals (a goal's
+    /// turns alternate `daemon-turn` with them), and cleared only by a look
+    /// that finds it gone. Empty and `0` while nothing blocks.
+    pub(super) blocked: String,
+    pub(super) blocked_since: u64,
     /// The owner's word ([`Request`]), written by `aterm harness upgrade <sid>
     /// --now|--defer|--skip` under the sweep lock ([`upgrade_status::ask`]).
     pub(super) request: Request,
@@ -2332,6 +2994,16 @@ pub(super) struct St {
     /// look: no stop is for good, the ones that stood before this field
     /// included.
     pub(super) failed_at: u64,
+    /// When the latest notice was TYPED (unix seconds; `0`: none recorded,
+    /// as in a record an older build wrote). Not the re-ask clock: an
+    /// announced round's `at_s` is moved on by a usage limit's episode
+    /// ([`St::hold_clock`]) and by a void's release ([`St::void`]), when
+    /// nothing was asked, so the owner's "last asked" (the Messages row,
+    /// `upgrade_status::Row::noticed_at`) reads this instead (review of
+    /// 2026-09-28: after a limit the row named the episode's end as the time
+    /// a notice was typed). Stamped by every notice of either lane
+    /// ([`St::announced`], the Codex lane's own), never moved otherwise.
+    pub(super) noticed_at: u64,
     /// Why the round BEFORE this one stopped, set by the re-arm that started
     /// this one ([`St::rearm`]) and cleared by its first notice
     /// ([`St::announced`]): the owner's view keeps a refusal's stall through
@@ -2345,9 +3017,113 @@ pub(super) struct St {
     /// and failing again every [`upgrade::RETRY_S`] for ever. Never terminal.
     pub(super) streak_why: String,
     pub(super) stop_streak: u32,
+    // THE WATCH'S FIELDS (design record 2026-09-28, "No upgrade stuck
+    // forever", §3.2 C1): tab #1 sat on 2.1.280 for three days because every
+    // bound the upgrade has lives in a step, and a step runs only at a point
+    // the session offers — the thing keeping the time was the event being
+    // waited for. These say when the record last MOVED, who last looked at
+    // it off a point, and which of the loop's guards withheld the last
+    // point, so a deadline ([`due_by`], [`watch_at`]) can be computed from
+    // the record alone. None of them gates an act.
+    /// When the record's PROGRESS KEY ([`St::progress_key`]) last changed,
+    /// in unix seconds: stamped by the one writer ([`save`]) and by nothing
+    /// else — no caller can forget to stamp it, and none can stamp it by
+    /// accident; [`restore`] puts an earlier record back WITHOUT stamping
+    /// ([`write_verbatim`]), so a rolled-back act never restarts the step's
+    /// clock. A record an older build wrote reads as `max(at, failed_at,
+    /// salt)` ([`St::from_json`]): past due at the first look of a build
+    /// that watches.
+    pub(super) progress_at: u64,
+    /// The key [`St::progress_at`] was stamped for ([`St::progress_key`]):
+    /// what the writer compares the record on disk with.
+    pub(super) progress_key: String,
+    /// When a look OFF A POINT last read this record (the watch of rollout
+    /// step 7; unix seconds, `0`: never), and the aterm build that looked.
+    /// Written by the watch alone; carried by every other save.
+    pub(super) looked_at: u64,
+    pub(super) looked_by: String,
+    /// The last point the session's loop OFFERED the host (an idle point or
+    /// a settled break, unix seconds; `0`: none recorded), and the loop's
+    /// guard that withheld the latest point it did not offer
+    /// ([`crate::supervise::Guard::word`]; empty: none recorded). Copied
+    /// from the window's worker by the watch; nothing here decides by them.
+    pub(super) point_at: u64,
+    pub(super) guard: String,
+    /// THE NOTICE REFUSED, IN A ROW (2026-09-28, s-d3346: the owner's `--now`
+    /// at 14:50:50, the notice refused by its own fence three times by
+    /// 14:52:21, and nothing counted — a refused notice spends no ask, so no
+    /// re-ask, give-up or rest ever followed, and the owner was told only
+    /// "Couldn't upgrade Claude yet" for six hours): how many looks in a row
+    /// could not type the notice (`wait:announce-refused:<why>`,
+    /// [`St::note_step`]) since the upgrade's last act, and when the first of
+    /// them was ([`St::refused_at`]). Any act starts it over; any other wait
+    /// leaves it (the notice is still owed). What the owner is told past
+    /// `upgrade_status::TELL_S` (`upgrade_status::Row::refused_notice`).
+    pub(super) refused: u32,
+    /// When the first of those refusals was (unix seconds; `0`: none now).
+    pub(super) refused_at: u64,
+    /// THE AGENT'S OWN WORK WAS SEEN RUNNING since the round's latest notice —
+    /// a look at a break of it, or one with processes under the agent — while
+    /// the round is open (announced, or resting after it gave up). Cleared by
+    /// every notice ([`St::announced`], set again by that very visit when its
+    /// look saw work) and by a new round. What makes the first idle point with
+    /// nothing under the agent THE END OF ITS WORK ([`St::time_work`],
+    /// [`upgrade::Facts::work_ended`]): the point its "not yet" waited for.
+    pub(super) work_seen: bool,
 }
 
+/// The slack past a step's own deadline before the watch reads its record
+/// ([`due_by`]): the step that keeps the deadline runs at the session's next
+/// point, and a point minutes late is no stall.
+pub const WATCH_SLACK: u64 = 5 * 60;
+
+/// The least time between two watches of one record ([`watch_at`]): the
+/// re-ask interval, so a stuck record is read at most once per
+/// [`upgrade::REASK_S`] and a Mac waking from sleep climbs one step, not
+/// several.
+pub const WATCH_GAP: u64 = upgrade::REASK_S;
+
 impl St {
+    /// THE PROGRESS KEY: what, changed, is the upgrade moving — the phase
+    /// (its word carries the asks and a stop's reason), the phase's own
+    /// stamp (`at_s`), the round's salt, the target, and the release owed.
+    /// A wait word, a look, a held-by list or a READY clock is no progress:
+    /// those change while nothing moves, and the step clock must not restart
+    /// on them. Nor is a notice its own fence REFUSED ([`St::refused`],
+    /// [`St::refused_at`]) or the agent's work seen ([`St::work_seen`]): a
+    /// refusal is the notice NOT typed, and a key that moved on each one
+    /// would push a pending round's deadline back at every look that could
+    /// not type — the watch's bound reset by the very failure it exists to
+    /// see. The notice that finally lands moves the phase, and so the key.
+    pub(super) fn progress_key(&self) -> String {
+        let at = match &self.phase {
+            Phase::Announced { at_s, .. }
+            | Phase::Exiting { at_s }
+            | Phase::Relaunched { at_s } => *at_s,
+            Phase::Pending | Phase::Done | Phase::Failed(_) => 0,
+        };
+        format!(
+            "{} at={at} salt={} to={} release={}",
+            self.phase.word(),
+            self.salt,
+            self.to,
+            self.release
+        )
+    }
+
+    /// [`St::progress_at`] for a record written before it: the latest stamp
+    /// the record carries of its own — the phase's `at_s`, the stop's
+    /// `failed_at`, the round's salt.
+    fn legacy_progress_at(&self) -> u64 {
+        let at = match &self.phase {
+            Phase::Announced { at_s, .. }
+            | Phase::Exiting { at_s }
+            | Phase::Relaunched { at_s } => *at_s,
+            Phase::Pending | Phase::Done | Phase::Failed(_) => 0,
+        };
+        at.max(self.failed_at).max(self.salt)
+    }
+
     /// THE READY CLOCK, stamped ([`upgrade::ready_since`]) and read into
     /// `facts` ([`upgrade::Facts::ready_s`]): how long the READY the upgrade
     /// acts on has stood unacted on — held at the limit, begun again by every
@@ -2368,6 +3144,35 @@ impl St {
     /// [`upgrade::RETRY_S`] ([`upgrade::retry_due`]).
     pub(super) fn time_failed(&self, facts: &mut Facts, now: u64) {
         facts.failed_s = self.failed_for(now);
+    }
+
+    /// THE END OF THE AGENT'S OWN WORK, read into `facts`
+    /// ([`upgrade::Facts::work_ended`]): its work was seen running since the
+    /// round's latest notice ([`St::work_seen`]), and this look is an idle
+    /// point — no break — with nothing under the agent. Claude Code's lane
+    /// alone (the Codex lane's reducer asks nothing of it).
+    pub(super) fn time_work(&self, facts: &mut Facts) {
+        facts.work_ended = self.work_seen
+            && self.open_round()
+            && !facts.background_point
+            && facts.background.is_empty();
+    }
+
+    /// A round the agent's own work may hold open: announced, or resting after
+    /// it gave up ([`upgrade::GAVE_UP`]) — the rounds whose "not yet" the end
+    /// of that work answers.
+    fn open_round(&self) -> bool {
+        matches!(&self.phase, Phase::Announced { .. })
+            || matches!(&self.phase, Phase::Failed(why) if why == upgrade::GAVE_UP)
+    }
+
+    /// What this look saw of the agent's own work, kept for the end of it
+    /// ([`St::work_seen`]): a break of it, or processes under the agent, while
+    /// the round is open.
+    fn saw_work(&mut self, facts: &Facts) {
+        if self.open_round() && (facts.background_point || !facts.background.is_empty()) {
+            self.work_seen = true;
+        }
     }
 
     /// Seconds since this round stopped ([`St::time_failed`]); `0` for a
@@ -2396,7 +3201,10 @@ impl St {
     /// conversation, onto `model`): the prior one when it
     /// names that version and — once announced — that model, else a fresh one
     /// that keeps what still holds while nothing has begun — how long the
-    /// session has been behind, and the owner's word. A skip is of ONE
+    /// session has been behind, and the owner's word — and, whatever has
+    /// begun, the model a bucket's fallback standing replaced
+    /// ([`St::fallback_from`]): an upgrade minted over the fallback's record
+    /// left the way back nothing to return to. A skip is of ONE
     /// version, so it does not follow onto a newer one. An announcement that named another model is
     /// announced again: the READY it asked for was consent to a different
     /// restart.
@@ -2439,6 +3247,7 @@ impl St {
             Some(mut old) if matches!(old.phase, Phase::Pending | Phase::Announced { .. }) => {
                 old.owe_release("retargeted");
                 let pending_since = old.behind_since();
+                let fallback_from = fallback_record(fallback_origin(Some(&old)).as_deref());
                 let (request, request_tab, request_at) = match old.request {
                     Request::Skip(_) => (Request::None, String::new(), 0),
                     kept => (kept, old.request_tab, old.request_at),
@@ -2448,6 +3257,7 @@ impl St {
                     request,
                     request_tab,
                     request_at,
+                    fallback_from,
                     tab: old.tab,
                     release: old.release,
                     asked: old.asked,
@@ -2458,8 +3268,52 @@ impl St {
             }
             // A stopped upgrade's release still owed follows onto the new one,
             // with the notice's fence: it is typed only to the process that
-            // notice reached ([`release_void`]).
+            // notice reached ([`release_void`]). A STOPPED one keeps, too, the
+            // three things a new build does not change, as the arm above keeps
+            // them (the watch's
+            // review, 2026-09-28 — the watch reaches this arm off any point,
+            // and a vendor build about daily reached it at every visit):
+            // how long the session has been BEHIND (the move clock,
+            // [`MOVE_BUDGET_S`], "kept across retargets and rounds" — reset
+            // here, a round that gives up and re-arms for ever never ran it
+            // out), the OWNER'S WORD (a `--defer` dropped here let the next
+            // point announce inside it; a skip names its build, so it is not
+            // carried), and THE SAME STOP IN A ROW (every `Failed` reason is
+            // about the process or its launch line, as the first arm says,
+            // so a new build is no reason to rest it less). Only while the
+            // session still runs the build that round stopped on: one that
+            // has moved since (by hand, say, onto the stopped round's own
+            // target) is behind anew from now, as [`behind_anew`] mints it.
+            // A finished or under-way one keeps none of them: a new build
+            // begins a new wait.
+            Some(old)
+                if matches!(old.phase, Phase::Failed(_))
+                    && Version::parse(&old.from).as_ref() == Some(from) =>
+            {
+                let pending_since = old.behind_since();
+                let fallback_from = fallback_record(fallback_origin(Some(&old)).as_deref());
+                let (request, request_tab, request_at) = match old.request {
+                    Request::Skip(_) => (Request::None, String::new(), 0),
+                    kept => (kept, old.request_tab, old.request_at),
+                };
+                St {
+                    pending_since,
+                    request,
+                    request_tab,
+                    request_at,
+                    streak_why: old.streak_why,
+                    stop_streak: old.stop_streak,
+                    fallback_from,
+                    release: old.release,
+                    asked: old.asked,
+                    tab: old.tab,
+                    notice_pid: old.notice_pid,
+                    notice_start: old.notice_start,
+                    ..St::fresh(from, to, now)
+                }
+            }
             Some(old) => St {
+                fallback_from: fallback_record(fallback_origin(Some(&old)).as_deref()),
                 release: old.release,
                 asked: old.asked,
                 tab: old.tab,
@@ -2491,10 +3345,18 @@ impl St {
     /// notice typed after it (review of 2026-09-25: a re-armed notice reused
     /// its marker). How long the session has been behind is kept: a state an
     /// older build wrote read that off the salt.
+    ///
+    /// The NOTICES REFUSED IN A ROW start over too ([`St::refused`]): the
+    /// round's first notice is owed afresh, under the gates the word left (the
+    /// review of 2026-09-28: an `Upgrade now` pressed on a row that told the
+    /// owner aterm could not type its notice left the count standing, so the
+    /// very next look read the same stall and put the row back at once).
     fn new_round(&mut self, now: u64) {
         if self.pending_since == 0 {
             self.pending_since = self.salt;
         }
+        self.refused = 0;
+        self.refused_at = 0;
         self.salt = now.max(
             self.salt
                 .saturating_add(u64::from(upgrade::MAX_ASKS))
@@ -2512,6 +3374,80 @@ impl St {
         }
     }
 
+    /// WHERE THIS UPGRADE STANDS ON THE LADDER at `now` ([`upgrade::rung`] of
+    /// how long the session has been behind, [`Self::behind_since`]; the
+    /// owner's decision of 2026-09-28). A state with no start at all (none
+    /// recorded, nor a salt) is at the first rung: its age is not known, and
+    /// an unknown age relaxes nothing. What the visit reads the ladder's
+    /// clock by ([`ladder_look`], and the Codex visit's own looks): its rung
+    /// is the goal pause's Land too (the goal look's `land`, with the owner's
+    /// `--now`) — a READ of the clock, so `HarnessUpgradeGoalPause::Advance`
+    /// is waived as the clock's step (`goal_environment`) and aged through
+    /// this reader by its Tier-1 bind.
+    pub(super) fn rung_at(&self, now: u64) -> upgrade::Rung {
+        match self.behind_since() {
+            0 => upgrade::Rung::Prefer,
+            since => upgrade::rung(now.saturating_sub(since)),
+        }
+    }
+
+    /// THE REPAINT-PROOF SETTLE ([`upgrade::Facts::still_s`]): this look's
+    /// `print` of the last words ([`upgrade::still_print`]) — `None` for a
+    /// look that did not read the screen authoritatively idle — carried into
+    /// the run of looks at the same print, none more than [`IDLE_RUN_GAP_S`]
+    /// after the last; the seconds since the run began. A new print, a look
+    /// after a longer gap, or one not idle begins it again (`0`). A repaint
+    /// that leaves the words as they were (a footer's clock, a goal's
+    /// counter, a dim suggestion) is no part of the print, and restarts
+    /// nothing — where it restarted the screen's own quiet at every look of a
+    /// goal-mode Codex (2026-09-28: 120 `wait:settling` in nine hours).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "HarnessUpgradeLadder",
+            action = "Look",
+            project = "aterm_agent::harness::upgrade_drive::ladder_projection"
+        )
+    )]
+    pub(super) fn still(&mut self, print: Option<String>, now: u64) -> u64 {
+        let Some(print) = print else {
+            self.still_print.clear();
+            (self.still_since, self.still_at) = (0, 0);
+            return 0;
+        };
+        let run = self.still_since != 0
+            && self.still_print == print
+            && now.saturating_sub(self.still_at) <= IDLE_RUN_GAP_S;
+        if !run {
+            self.still_print = print;
+            self.still_since = now;
+        }
+        self.still_at = now;
+        now.saturating_sub(self.still_since)
+    }
+
+    /// A WAIT NO RUNG PASSES, met or found gone ([`St::blocked`]): `Some`
+    /// the blocker a look met — its clock kept while the same one stands —
+    /// `None` a look that found the move no longer blocked by it (the gate
+    /// passed and the act went on past it, or the screen read). A look that
+    /// says neither (a floor held the gate) calls nothing, and the clock
+    /// stands: until 2026-09-28 the blocked row was timed by an unbroken run
+    /// of one wait word, and a goal's turns alternating `daemon-turn` with
+    /// `no-shell-integration` kept it from ever forming.
+    pub(super) fn note_blocked(&mut self, blocker: Option<&str>, now: u64) {
+        match blocker {
+            Some(word) if self.blocked == word => {}
+            Some(word) => {
+                self.blocked = word.to_string();
+                self.blocked_since = now;
+            }
+            None => {
+                self.blocked.clear();
+                self.blocked_since = 0;
+            }
+        }
+    }
+
     /// Record the wait `word` a sweep found, keeping when it began while the
     /// same word repeats.
     fn note_wait(&mut self, word: &str, now: u64) {
@@ -2519,6 +3455,7 @@ impl St {
             self.wait = word.to_string();
             self.wait_since = now;
         }
+        self.wait_seen = if word == "attended" { now } else { 0 };
     }
 
     /// What a visit's report says about waiting: a `wait:` step is recorded
@@ -2528,6 +3465,12 @@ impl St {
     /// once ([`attended_once`]: `held-back:attended`, then `wait:attended`),
     /// so it is recorded as that wait — never as an act that cleared one.
     fn note_step(&mut self, step: &str, status: &str, now: u64) {
+        if refused(step) {
+            if self.refused == 0 {
+                self.refused_at = now;
+            }
+            self.refused = self.refused.saturating_add(1);
+        }
         if let Some(why) = step
             .strip_prefix("wait:")
             .or_else(|| step.strip_prefix("held-back:"))
@@ -2536,6 +3479,10 @@ impl St {
         } else if !step.starts_with("skip:") && !step.starts_with("would-") {
             self.wait.clear();
             self.wait_since = 0;
+            self.wait_seen = 0;
+            // An act: the notice owed is typed, or no longer owed.
+            self.refused = 0;
+            self.refused_at = 0;
         }
     }
 
@@ -2601,6 +3548,7 @@ impl St {
             ("model_before", &self.model_before),
             ("launch_model", &self.launch_model),
             ("model_list", &self.model_list),
+            ("fallback_from", &self.fallback_from),
             ("resumed_on", &self.resumed_on),
             ("wait", &self.wait),
             ("request", &self.request.word()),
@@ -2616,6 +3564,12 @@ impl St {
             ("release", &self.release),
             ("last_stop", &self.last_stop),
             ("streak_why", &self.streak_why),
+            ("still_print", &self.still_print),
+            ("still_busy", &self.still_busy),
+            ("blocked", &self.blocked),
+            ("progress_key", &self.progress_key),
+            ("looked_by", &self.looked_by),
+            ("guard", &self.guard),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -2637,6 +3591,7 @@ impl St {
             ("ready_since", self.ready_since),
             ("pending_since", self.pending_since),
             ("wait_since", self.wait_since),
+            ("wait_seen", self.wait_seen),
             ("done_at", self.done_at),
             ("request_at", self.request_at),
             ("exited_at", self.exited_at),
@@ -2645,7 +3600,17 @@ impl St {
             ("idle_pid", u64::from(self.idle_pid)),
             ("idle_at", self.idle_at),
             ("failed_at", self.failed_at),
+            ("noticed_at", self.noticed_at),
             ("stop_streak", u64::from(self.stop_streak)),
+            ("still_since", self.still_since),
+            ("still_at", self.still_at),
+            ("blocked_since", self.blocked_since),
+            ("progress_at", self.progress_at),
+            ("looked_at", self.looked_at),
+            ("point_at", self.point_at),
+            ("refused", u64::from(self.refused)),
+            ("refused_at", self.refused_at),
+            ("work_seen", u64::from(self.work_seen)),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -2698,7 +3663,7 @@ impl St {
             "failed" => Phase::Failed(s("why")),
             _ => return None,
         };
-        Some(St {
+        let mut st = St {
             phase,
             from: s("from"),
             to: s("to"),
@@ -2723,6 +3688,7 @@ impl St {
             mark: n("mark"),
             launch_model: s("launch_model"),
             model_list: s("model_list"),
+            fallback_from: s("fallback_from"),
             confirm_by: n("confirm_by"),
             resumed_on: s("resumed_on"),
             resumed_pid: small("resumed_pid"),
@@ -2733,6 +3699,7 @@ impl St {
             pending_since: n("pending_since"),
             wait: s("wait"),
             wait_since: n("wait_since"),
+            wait_seen: n("wait_seen"),
             // `<pid> <name> <since>` each; a malformed one is left out.
             held_by: list("held_by")
                 .iter()
@@ -2765,14 +3732,58 @@ impl St {
             left_at: n("left_at"),
             exited_at: n("exited_at"),
             failed_at: n("failed_at"),
+            noticed_at: n("noticed_at"),
             last_stop: s("last_stop"),
             streak_why: s("streak_why"),
             stop_streak: small("stop_streak"),
-        })
+            still_print: s("still_print"),
+            still_since: n("still_since"),
+            still_at: n("still_at"),
+            still_busy: s("still_busy"),
+            blocked: s("blocked"),
+            blocked_since: n("blocked_since"),
+            progress_at: n("progress_at"),
+            progress_key: s("progress_key"),
+            looked_at: n("looked_at"),
+            looked_by: s("looked_by"),
+            point_at: n("point_at"),
+            guard: s("guard"),
+            refused: small("refused"),
+            refused_at: n("refused_at"),
+            work_seen: n("work_seen") != 0,
+        };
+        // A record written before the progress stamp ([`St::progress_at`]):
+        // its key is what it holds now, and it last moved no later than the
+        // latest stamp of its own — so the writer stamps it only once it
+        // changes, and a 0.94-shaped record is past due at once.
+        if v.get("progress_key").is_none() {
+            st.progress_key = st.progress_key();
+            st.progress_at = st.legacy_progress_at();
+        }
+        Some(st)
     }
 
     pub(super) fn in_flight(&self) -> bool {
         matches!(self.phase, Phase::Exiting { .. } | Phase::Relaunched { .. })
+    }
+
+    /// A RESTART UNDER WAY THAT HAS NOT MOVED at `now`: `exiting`, `exited`
+    /// or `relaunched` once its phase has stood past [`STALE_S`]
+    /// ([`upgrade_status::stuck_on`] — the predicate the owner's view reads,
+    /// so the ledger's once-only note ([`note_stuck`]) and `--status`'s
+    /// `stalled=stuck:<what>` never disagree); `None` for any other phase,
+    /// and within the bound.
+    pub(super) fn stuck(&self, now: u64) -> Option<&'static str> {
+        upgrade_status::stuck_on(&self.phase, self.exited_at, now)
+    }
+
+    /// Whether this record is an UPGRADE's — the owner's view lists it — and
+    /// not one the relaunch files beside the upgrade's ([`St::cause`]): an
+    /// agent relaunched after an exit, a memory or a model restart is no
+    /// upgrade of the tab; the upgrade's own restart of a conversation with
+    /// no task ([`super::relaunch::CAUSE_UPGRADE_FRESH`]) is.
+    pub(super) fn is_upgrade(&self) -> bool {
+        self.cause.is_empty() || self.cause == super::relaunch::CAUSE_UPGRADE_FRESH
     }
 
     /// THE SIGNALLED AGENT SEEN GONE at `now` ([`St::exited_at`]): kept from
@@ -2916,9 +3927,13 @@ impl St {
         self.resumed_pid = 0;
         self.relaunched_pid = 0;
         self.noted.clear();
+        // A fallback's own record an older build wrote kept its origin in
+        // its cause alone: kept past the cause.
+        self.fallback_from = fallback_record(fallback_origin(Some(self)).as_deref());
         self.cause.clear();
         self.hold_since_s = 0;
         self.hold_seen_s = 0;
+        self.work_seen = false;
         if self.request == Request::Now {
             self.request = Request::None;
             self.request_tab.clear();
@@ -2947,6 +3962,7 @@ impl St {
             release: std::mem::take(&mut self.release),
             marker: std::mem::take(&mut self.marker),
             markers: std::mem::take(&mut self.markers),
+            fallback_from: self.fallback_from.clone(),
         };
         self.pid = pid;
         self.shell = shell;
@@ -2959,12 +3975,14 @@ impl St {
 
     /// The signal of a restart [`St::signalled`] recorded was NEVER SENT (the
     /// session changed before it, the server refused it): the phase, the
-    /// READY and the release it took are put back, as they were.
+    /// READY and the release it took are put back, as they were — and the
+    /// fallback origin, whatever the restart made of it.
     pub(super) fn unsent(&mut self, back: Unsent) {
         self.phase = back.phase;
         self.release = back.release;
         self.marker = back.marker;
         self.markers = back.markers;
+        self.fallback_from = back.fallback_from;
     }
 
     /// The kernel REFUSED the signal of a restart [`St::signalled`] recorded
@@ -3005,9 +4023,15 @@ impl St {
     /// heels. A gave-up upgrade stays given up, its release still owed, and
     /// its rest before the next round begins again at the void
     /// ([`St::failed_at`]): the release the void owes is typed and stands
-    /// a whole [`upgrade::RETRY_S`] before a new round's notice follows it. A
-    /// lane that types no release (Codex) keeps its clock: its re-ask is what
-    /// moves the agent on.
+    /// a whole [`upgrade::RETRY_S`] before a new round's notice follows it —
+    /// stretched as a stop that repeats stretches it
+    /// ([`upgrade::rest_extension`] of the round's streak), and never sooner
+    /// than the rest the stop already earned (round six, F27: the void
+    /// stamped `now` over a rest still six hours out, so a session whose own
+    /// work outlived every round's late READY was asked four times every two
+    /// and a half hours, the back-off never applied to exactly the stop that
+    /// repeats most). A lane that types no release (Codex) keeps its clock:
+    /// its re-ask is what moves the agent on.
     fn void(&mut self, now: u64) {
         self.owe_release("void");
         self.forget_markers();
@@ -3017,7 +4041,8 @@ impl St {
             self.phase = Phase::Announced { at_s: now, asks };
         }
         if matches!(self.phase, Phase::Failed(_)) {
-            self.failed_at = now;
+            let rest = now.saturating_add(upgrade::rest_extension(self.stop_streak));
+            self.failed_at = self.failed_at.max(rest);
         }
     }
 
@@ -3038,9 +4063,13 @@ impl St {
         }
         self.marker = marker;
         self.phase = Phase::Announced { at_s: now, asks };
+        self.noticed_at = now;
         self.release.clear();
         self.ready_since = 0;
         self.last_stop.clear();
+        // Work seen before this notice is no answer to it: the visit that
+        // typed it stamps what it saw ([`St::time_work`]).
+        self.work_seen = false;
     }
 
     /// The release line was typed: nothing is owed, and the agent was told
@@ -3104,6 +4133,7 @@ impl St {
         self.idle_pid = 0;
         self.idle_at = 0;
         self.held_by.clear();
+        self.work_seen = false;
         tab.clone_into(&mut self.tab);
         self.hold_since_s = 0;
         self.hold_seen_s = 0;
@@ -3241,7 +4271,41 @@ pub(super) fn load(opts: &Opts, session: &str) -> Option<St> {
     St::from_json(&std::fs::read_to_string(state_path(opts, session)).ok()?)
 }
 
+/// THE ONE WRITER of `session`'s record: [`save_at`] at this second.
 pub(super) fn save(opts: &Opts, session: &str, st: &St) {
+    save_at(opts, session, st, now_s());
+}
+
+/// Write `st` as `session`'s record at `now`, STAMPING ITS PROGRESS (design
+/// record 2026-09-28, §3.2 C1): when its progress key ([`St::progress_key`])
+/// differs from the record on disk's — or there is none on disk — the record
+/// is written as having moved at `now` ([`St::progress_at`]); when it is the
+/// same, the stamp on disk is kept, whatever the caller's copy holds, so a
+/// state read long ago and saved again restarts no clock. Progress is
+/// detected here, at the single writer: no step can forget to stamp it and
+/// none can stamp it by accident. A dry run writes nothing.
+pub(super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
+    if opts.dry_run {
+        return;
+    }
+    let key = st.progress_key();
+    let on_disk = load(opts, session);
+    let mut out = st.clone();
+    match on_disk {
+        Some(disk) if disk.progress_key == key => out.progress_at = disk.progress_at,
+        _ => out.progress_at = now,
+    }
+    out.progress_key = key;
+    write_verbatim(opts, session, &out);
+}
+
+/// Write `st` as `session`'s record EXACTLY AS IT IS — its progress stamp
+/// included, never set here. [`save_at`] writes through it once it has
+/// stamped; [`restore`] writes through it alone, so putting back the record
+/// an act that did not go ahead found is no progress (the design's review
+/// of 2026-09-28: through `save`, every rolled-back act restarted the step
+/// clock). A dry run writes nothing.
+fn write_verbatim(opts: &Opts, session: &str, st: &St) {
     if opts.dry_run {
         return;
     }
@@ -3256,13 +4320,14 @@ pub(super) fn save(opts: &Opts, session: &str, st: &St) {
 }
 
 /// Put back what `session`'s record was before an act that did not go
-/// ahead: `prior`, or no record at all.
+/// ahead: `prior` as it was read — its progress stamp with it, since
+/// nothing moved ([`write_verbatim`]) — or no record at all.
 pub(super) fn restore(opts: &Opts, session: &str, prior: Option<&St>) {
     if opts.dry_run {
         return;
     }
     match prior {
-        Some(st) => save(opts, session, st),
+        Some(st) => write_verbatim(opts, session, st),
         None => {
             let _ = std::fs::remove_file(state_path(opts, session));
         }
@@ -3331,7 +4396,20 @@ thread_local! {
 
 /// A partial roster cannot prove a conversation has only one live owner. A
 /// sibling JSON may be mid-write, unreadable or malformed; any such entry
-/// invalidates the whole scan until the next sweep.
+/// that a LIVE process may stand behind invalidates the whole scan until the
+/// next sweep.
+///
+/// ONLY A LIVE PROCESS CAN OWN A CONVERSATION (round six, F20): Claude Code
+/// writes `<pid>.json` for its own process, so a record whose file name is
+/// no pid (`*.json` that is not `<digits>.json`) is none of its records, and
+/// one that cannot be read whose pid is not running — a dead agent's
+/// truncated or `{` file no later start cleaned up, one whose shape the
+/// running build no longer matches — names no process that could hold
+/// anything: neither is waited on. Vetoed on those too, one stale sibling
+/// stopped every Claude upgrade in the window for good, `wait:` retried
+/// every minute with nothing on the glass. A record whose file name and
+/// `pid` disagree still vetoes while either process runs: a numeric name
+/// cannot attest another process's record.
 pub(super) fn session_files(home: &Path) -> Option<Vec<SessionFile>> {
     #[cfg(test)]
     SESSION_FILE_SCANS.with(|count| count.set(count.get() + 1));
@@ -3342,13 +4420,22 @@ pub(super) fn session_files(home: &Path) -> Option<Vec<SessionFile>> {
         if path.extension().is_none_or(|x| x != "json") {
             continue;
         }
-        let file_pid = path.file_stem()?.to_str()?.parse::<u32>().ok()?;
-        let text = std::fs::read_to_string(path).ok()?;
-        let file = upgrade::parse_session_file(&text).ok()?;
-        if file.pid != file_pid {
-            return None;
+        let Some(file_pid) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| upgrade::parse_session_file(&text).ok());
+        match file {
+            Some(file) if file.pid == file_pid => files.push(file),
+            Some(file) if !alive(file_pid) && !alive(file.pid) => {}
+            None if !alive(file_pid) => {}
+            _ => return None,
         }
-        files.push(file);
     }
     Some(files)
 }
@@ -3715,12 +4802,19 @@ pub(super) fn tail_to_end(path: &Path, bytes: u64) -> (String, u64) {
         return (String::new(), 0);
     };
     let len = f.metadata().map_or(0, |m| m.len());
+    tail_window(&mut f, len, bytes)
+}
+
+/// Bound the read itself too: a writer may append after `len` was measured.
+/// The returned mark remains the end actually read, so the next `since` read
+/// picks up every byte left behind by the cap.
+fn tail_window(f: &mut (impl Read + Seek), len: u64, bytes: u64) -> (String, u64) {
     let start = len.saturating_sub(bytes);
     if f.seek(SeekFrom::Start(start)).is_err() {
         return (String::new(), 0);
     }
     let mut buf = Vec::new();
-    let _ = f.read_to_end(&mut buf);
+    let _ = f.take(bytes).read_to_end(&mut buf);
     let end = start.saturating_add(buf.len() as u64);
     (lossy(buf), end)
 }
@@ -4264,16 +5358,149 @@ pub const HOLD_LOOK: std::time::Duration = std::time::Duration::from_secs(60);
 const _: () = assert!(upgrade::HOLD_GAP_S >= 2 * HOLD_LOOK.as_secs());
 
 /// [`After`] from one [`step`]'s word, `waits` the session's waits before
-/// this one in a row.
+/// this one in a row. An attended wait's word alone is read as while it owns
+/// the point (the first rung); the window's host, which counts its looks, asks
+/// [`after_attended`] instead.
+///
+/// A WORD NOBODY TAUGHT IT IS LOOKED AT AGAIN, NEVER THE LAST WORD (design
+/// record 2026-09-28, §3.2 C8): the match ended in `_ => After::Finished`,
+/// so a step word added anywhere without a line here — a new wait, a new
+/// lane's act — silently stopped the host looking at that session until the
+/// next activation notice, the one outcome the upgrade must never have. Each
+/// last word is now named ([`is_last_word`]), and anything else is
+/// [`unknown_step`]: looked at again at the ladder's longest pause (nothing
+/// is known of how soon it could move, and a word nobody taught it must not
+/// poll), and the window's host warns of it once.
 #[must_use]
 pub fn after(step: &str, waits: u32) -> After {
-    let later = || {
-        After::Later(
-            crate::supervise::ladder::Ladder(&LATER)
-                .step(usize::try_from(waits).unwrap_or(usize::MAX)),
-        )
+    known_after(step, waits).unwrap_or(After::Later(LATER[LATER.len() - 1]))
+}
+
+/// Whether [`after`] was never taught `step`: it reads [`After::Later`] as a
+/// guess, and the window's host says so once (`harness_host`'s
+/// `UpgradeRun::after`), so the word is added here rather than read as done.
+#[must_use]
+pub fn unknown_step(step: &str) -> bool {
+    known_after(step, 0).is_none()
+}
+
+/// THE STEP DEADLINE OF A RECORD (design record 2026-09-28, §3.2 C2): the
+/// unix second by which the step that moves `st` on should have run, from
+/// the record ALONE — or `None` for a record nothing more is owed on until
+/// a newer build or the owner's next word. Pure: it reads no clock, no
+/// screen and no process, so a timer can keep it where no point comes.
+///
+/// BOUND THE RECORD, NOT THE WORD: it is one exhaustive match over
+/// [`Phase`] and [`Request`] with no wildcard arm, so a new phase or a new
+/// word of the owner's does not compile without a budget, and the seventy
+/// wait words ([`St::wait`]) — each an explanation — never decide one.
+///
+/// | phase | deadline |
+/// |---|---|
+/// | `pending` | [`St::progress_at`] + [`upgrade::REASK_S`]: a round that has typed nothing moves (its first notice) at its next point; a notice its fence refused ([`St::refused`]) is no progress, so refusals never push it back |
+/// | `announced` | `at_s` + `REASK_S` + [`WATCH_SLACK`]: the re-ask's own clock, held by a limit ([`St::hold_clock`]) |
+/// | `failed` | `failed_at` + [`upgrade::RETRY_S`] + `WATCH_SLACK`: the re-arm (`failed_at` already carries a repeated stop's longer rest, [`St::fail`]) |
+/// | `exiting`, `relaunched` | `at_s` + [`STALE_S`] + 1: the instant the owner's view reads it stuck ([`St::stuck`]) |
+/// | `done` | the model confirm's `confirm_by` + `WATCH_SLACK` while it is owed ([`St::confirming`]); else none |
+///
+/// The owner's word: a `--skip` of THIS target holds a round that has not
+/// begun restarting — pending, announced, or stopped and waiting to be
+/// re-armed ([`upgrade::rearm_held`]) — for good (none); a `--defer` holds
+/// the same until its second, and the deadline is the later of that plus
+/// `WATCH_SLACK` and the phase's own; a restart in flight is held by
+/// neither ([`Request::holds`]). The word is the one on the record's own tab
+/// ([`St::request_for`]), as the owner's view reads it.
+#[deny(clippy::wildcard_enum_match_arm)]
+pub(super) fn due_by(st: &St) -> Option<u64> {
+    let step = match &st.phase {
+        Phase::Pending => Some(st.progress_at.saturating_add(upgrade::REASK_S)),
+        Phase::Announced { at_s, .. } => Some(
+            at_s.saturating_add(upgrade::REASK_S)
+                .saturating_add(WATCH_SLACK),
+        ),
+        Phase::Failed(_) => Some(
+            st.failed_at
+                .saturating_add(upgrade::RETRY_S)
+                .saturating_add(WATCH_SLACK),
+        ),
+        Phase::Exiting { at_s } | Phase::Relaunched { at_s } => {
+            Some(at_s.saturating_add(STALE_S).saturating_add(1))
+        }
+        Phase::Done => st
+            .confirming()
+            .then(|| st.confirm_by.saturating_add(WATCH_SLACK)),
     };
-    match step.split_once(':').map_or(step, |(head, _)| head) {
+    // Whether the word holds a round that has not begun restarting, by the
+    // phase: pending, announced, and a stopped round's re-arm.
+    let unbegun = match &st.phase {
+        Phase::Pending | Phase::Announced { .. } | Phase::Failed(_) => true,
+        Phase::Exiting { .. } | Phase::Relaunched { .. } | Phase::Done => false,
+    };
+    match st.request_for(&st.tab) {
+        Request::None | Request::Now => step,
+        Request::Skip(v) => {
+            let this_target = Version::parse(&v).is_some_and(|v| Some(v) == Version::parse(&st.to));
+            if this_target && unbegun { None } else { step }
+        }
+        Request::DeferUntil(t) => {
+            if unbegun {
+                step.map(|s| s.max(t.saturating_add(WATCH_SLACK)))
+            } else {
+                step
+            }
+        }
+    }
+}
+
+/// WHEN THE HOST WATCHES A RECORD (design record 2026-09-28, §3.2 C2): the
+/// earlier of the step deadline ([`due_by`]) and the MOVE CLOCK — the
+/// session behind its target for [`MOVE_BUDGET_S`] ([`St::behind_since`],
+/// kept across retargets and rounds), the one bound a round that asks,
+/// gives up, rests and re-arms for ever cannot reset — but never sooner
+/// than [`WATCH_GAP`] after the last watch ([`St::looked_at`]), so a stuck
+/// record is read at most once per gap. `None` for a record [`due_by`]
+/// owes nothing: finished, or held by the owner's `--skip`.
+pub(super) fn watch_at(st: &St) -> Option<u64> {
+    let step = due_by(st)?;
+    let moved = st.behind_since().saturating_add(MOVE_BUDGET_S);
+    Some(step.min(moved).max(st.looked_at.saturating_add(WATCH_GAP)))
+}
+
+/// THE LAST WORDS: nothing more for this build until the next activation
+/// notice or the owner's next word ([`After::Finished`]). `current` (the
+/// session runs its target), `done`/`done:<how>` (the move finished, Claude
+/// Code's and Codex's alike, afresh or unconfirmed), `ended:<how>` (the
+/// relaunch lane's: the agent ended by itself and nothing is resumed),
+/// `skip:<why>` (this session is not the step's to take: another tab
+/// selected, another home, no TUI, no managed Codex), `daemon-updated` (the
+/// Codex daemon's own pass, whose clients step on their own), a dry run's
+/// `would-<act>` (it did nothing, and no host takes one), and the owner's
+/// `wait:skipped`, which holds it for this build — and the restart's own acts
+/// that END the process this worker looks at ([`moved`]): `terminated`,
+/// `relaunched`, and Codex's `exit-typed`/`exited`. The process that follows
+/// is a new session with a worker of its own; this one has nothing left to
+/// look at (they read as last words through the catch-all until 2026-09-28,
+/// and the merge with the attended ladder's test named `terminated`).
+fn is_last_word(step: &str) -> bool {
+    matches!(
+        step.split_once(':').map_or(step, |(head, _)| head),
+        "current"
+            | "done"
+            | "ended"
+            | "skip"
+            | "daemon-updated"
+            | "terminated"
+            | "relaunched"
+            | "exit-typed"
+            | "exited"
+    ) || step.starts_with("would-")
+        || step == "wait:skipped"
+}
+
+/// [`after`] for a word it was taught; `None` for one it was not.
+fn known_after(step: &str, waits: u32) -> Option<After> {
+    let later = || ladder(waits);
+    Some(match step.split_once(':').map_or(step, |(head, _)| head) {
         // `continued`: the resumed session's answer, the model it came back
         // on, is read at the end of its turn (Claude Code's; a Codex's
         // carry-on is done as it is typed, and that idle point's step finds
@@ -4288,6 +5515,14 @@ pub fn after(step: &str, waits: u32) -> After {
         // word (the 2026-09-26 incident: after `gave-up` the host never looked
         // again, and the READY given at 06:02 was read by nobody).
         "gave-up" | "drain-expired" => After::NextIdle,
+        // THE GOAL PAUSE (`upgrade_codex::goal_step`): the goal paused, or its
+        // head's Esc pressed — the move comes at the next idle point, once the
+        // paused goal's last turn has ended; and so while that turn runs.
+        "goal-paused" | "goal-esc" => After::NextIdle,
+        _ if step == "wait:goal-held" => After::NextIdle,
+        // The goal resumed, released, or its pause given up: the upgrade goes
+        // on as a look finds it.
+        "goal-resumed" | "goal-released" | "goal-pause-refused" | "goal-paused-seen" => later(),
         // `released`: the line is typed; a voided upgrade asks again later, and
         // one that gave up is looked at again, resting until its next round.
         // `rearmed`: a new round, whose first notice the next look types.
@@ -4295,7 +5530,8 @@ pub fn after(step: &str, waits: u32) -> After {
         // The owner's `--skip` holds it for this build: nothing more until a
         // newer one is installed, or the owner's next word (both wake the
         // host). A `--defer` runs out on its own, so it is looked at again.
-        _ if step == "wait:skipped" => After::Finished,
+        // So are the other last words ([`is_last_word`]).
+        _ if is_last_word(step) => After::Finished,
         // A STOPPED round with nothing owed: `wait:failed` is said only when
         // no release is (an owed one is the step's next act, and waits as
         // `wait:release:<why>`, [`release_is_next`]) and no READY can move it
@@ -4312,16 +5548,70 @@ pub fn after(step: &str, waits: u32) -> After {
         // owner's word, it says `wait:skipped`/`wait:deferred`, as here.)
         _ if step == "wait:failed" => later(),
         // A round's own stop, said as it stops (`failed:<why>`,
-        // `refused:<what>`): the next look finds it resting, as above.
-        "failed" | "refused" => later(),
+        // `refused:<what>`, and Codex's `exit-refused`, its `/exit` refused
+        // and its phase put back): the next look finds it resting, as above.
+        "failed" | "refused" | "exit-refused" => later(),
         "busy" if matches!(step, "busy:state-unwritable" | "busy:lock-unopenable") => After::Broken,
         // A person's hold: its dwell is sampled ([`HOLD_LOOK`]).
         _ if matches!(step, "wait:box" | "wait:draft") => After::Later(HOLD_LOOK),
+        // A PERSON AT THE TAB: looked at again at the first rung while the
+        // point is the upgrade's ([`after_attended`], which the host reads
+        // with its count of the looks), so the look that finds the person's
+        // grace lapsed lands within that rung of the lapse — the act it holds
+        // (the notice, or the restart after READY) is due at this very point
+        // ([`owns_turn_ends`]). On the ladder it was looked at 60 s after the
+        // second look, and the loop's own continuation took the point first
+        // (2026-09-27 20:28:42).
+        _ if attended(step) => After::Later(LATER[0]),
         // `left-typed-cleared`: the Codex branch cleared its own text a
         // guarded Enter left in the composer; the act it missed is looked at
-        // again, like any wait.
-        "wait" | "busy" | "held-back" | "left-typed-cleared" => later(),
-        _ => After::Finished,
+        // again, like any wait. So is `left-typed:<what>`, the text recorded
+        // and not yet cleared (it read as a last word through the catch-all
+        // until 2026-09-28, and the record's clearing waited on the next
+        // activation notice).
+        "wait" | "busy" | "held-back" | "left-typed-cleared" | "left-typed" => later(),
+        // `reopened:notice-process-gone`: the notice's process is gone and
+        // the round is pending again for the one that holds the conversation.
+        // The visit ledgers it and goes on, so no step returns it today; it
+        // is taught all the same (review of 2026-09-28), a pending round's
+        // word, looked at again like any wait.
+        "reopened" => later(),
+        _ => return None,
+    })
+}
+
+/// The re-look ladder ([`LATER`]) at its `waits`-th rung (the last once past it).
+fn ladder(waits: u32) -> After {
+    After::Later(
+        crate::supervise::ladder::Ladder(&LATER).step(usize::try_from(waits).unwrap_or(usize::MAX)),
+    )
+}
+
+/// Whether one [`step`]'s word is A PERSON AT THE TAB holding the act due at
+/// this point: `held-back:attended` (said once per upgrade round), then
+/// `wait:attended`.
+#[must_use]
+pub fn attended(step: &str) -> bool {
+    matches!(step, "held-back:attended" | "wait:attended")
+}
+
+/// [`After`] AN ATTENDED WAIT ([`attended`]), `looks` its attended looks in a
+/// row at this point, this one included (what the next look's ownership reads,
+/// [`attended_owned`]), and `same` its waits on the same word before it. At the
+/// first rung while the next look still owns the point, so the look that finds
+/// the person's grace lapsed lands within that rung of the lapse and takes the
+/// act. Past the backstop the point is the loop's again and nothing is won by
+/// looking every twenty seconds: back on the ladder (the review of 2026-09-28:
+/// held at the first rung for good, each look a whole step — a status read, a
+/// process scan, a state save — and a journal row, about 180 an hour against 8
+/// on the ladder, and the session's kept journal of 1024 rows holds under three
+/// hours of them).
+#[must_use]
+pub fn after_attended(looks: u32, same: u32, grace_s: u32) -> After {
+    if attended_owned(looks, grace_s) {
+        After::Later(LATER[0])
+    } else {
+        ladder(same)
     }
 }
 
@@ -4362,6 +5652,12 @@ pub fn moved(step: &str) -> bool {
             "adopted" | "relaunched" | "terminated" | "exit-typed" | "exited"
         )
         || matches!(step, "done:fresh" | "done:unconfirmed")
+        // The goal's own: its head's Esc stopped the turn, and a resumed goal
+        // starts its next one — the point is gone either way.
+        || matches!(
+            step.split_once(':').map_or(step, |(head, _)| head),
+            "goal-esc" | "goal-resumed"
+        )
 }
 
 /// THE UPGRADE'S CLOCKS ARE HELD THROUGH A LIMIT EPISODE its window's loop
@@ -4424,7 +5720,9 @@ pub const OWNED_BACKGROUND_LOOKS: u32 = 3;
 pub const OWNED_SETTLE_LOOKS: u32 = 2;
 
 /// Whether the upgrade OWNS THE SESSION'S TURN ENDS after the step that said
-/// `step` (its `waits` in a row before it) — what the window's host answers
+/// `step` (`looks`: the host's count before it of what bounds its word — for an
+/// attended word ([`attended`]) the ATTENDED LOOKS in a row at this point, for
+/// every other the waits in a row) — what the window's host answers
 /// its supervisor's loop with (`IdleHost::owns_turn_end`), so the turn-end
 /// policy types nothing over a wind-down: an announcement out (the agent is
 /// asked to finish up), and while READY is given and the restart's gate
@@ -4438,24 +5736,171 @@ pub const OWNED_SETTLE_LOOKS: u32 = 2;
 /// 2026-09-26 found a late READY about to restart the agent reported as
 /// `wait:release:ready`, which owned nothing, while its restart's settle
 /// (`wait:settling`) owns the turn ends.
+///
+/// A PERSON AT THE TAB (`held-back:attended`, then `wait:attended`) OWNS THEM
+/// FOR AS LONG AS THE PERSON'S GRACE RUNS (`grace_s`, `[harness] human_grace_s`,
+/// renewed by every touch of theirs), bounded only as a backstop
+/// ([`attended_owned`]) on the attended looks AT THIS POINT — never on every
+/// wait in a row (the review of 2026-09-28: fed the notice's `awaiting-ready`
+/// turn ends and every other wait since the last act, a READY a person held
+/// owned the point for about 19 minutes of their presence instead of half an
+/// hour past their grace, and for none of it after 97 earlier waits — the loop's
+/// `keep going` took the lapse again). That wait arises only where the upgrade has
+/// its act due at this very point — the notice, or the restart after READY —
+/// and the person alone holds it; the supervisor's loop holds off for the same
+/// grace anyway, so what the ownership decides is who takes the point when the
+/// grace lapses. Owning nothing, the loop did, and typed `keep going` over the
+/// agent's READY answer (2026-09-27 20:28:42, s-d3346: READY at 20:27:20,
+/// `held-back:attended` at 20:27:27 for the owner's "ok" of 20:26:42, the
+/// upgrade's next look due at 20:29:10 — and the upgrade then waited 5 h 50 min
+/// for the next idle point of an agent that was never idle again).
 #[must_use]
-pub fn owns_turn_ends(step: &str, waits: u32) -> bool {
+pub fn owns_turn_ends(step: &str, looks: u32, grace_s: u32) -> bool {
+    if attended(step) {
+        return attended_owned(looks, grace_s);
+    }
     match step.split_once(':').map_or(step, |(head, _)| head) {
         "announced" => true,
+        // A GOAL PAUSED FOR THE MOVE (`upgrade_codex::goal_step`): its turn
+        // ends are the move's — nothing continues a session whose goal aterm
+        // holds paused for a moment.
+        "goal-paused" | "goal-esc" => true,
+        "wait" if step.starts_with("wait:goal-") => matches!(
+            step,
+            "wait:goal-held" | "wait:goal-pausing" | "wait:goal-resume" | "wait:goal-resuming"
+        ),
         "wait" => match step {
             // `status-stale`: Claude's status catching up with its idle
             // screen ([`upgrade::gate_announce`]), a settle like `not-idle`.
             "wait:settling" | "wait:not-idle" | "wait:busy" | "wait:status-stale" => {
-                waits < OWNED_SETTLE_LOOKS
+                looks < OWNED_SETTLE_LOOKS
             }
             // A Codex that answered READY waits out its background terminal
             // as Claude Code's restart waits out a shell under it.
-            "wait:background" | "wait:background-terminal" => waits < OWNED_BACKGROUND_LOOKS,
+            "wait:background" | "wait:background-terminal" => looks < OWNED_BACKGROUND_LOOKS,
+            // The notice was due at this very point and its own fence refused
+            // it — a repaint, a keystroke's echo ([`refused`]).
+            _ if refused(step) => looks < OWNED_REFUSED_LOOKS,
             _ => false,
         },
         _ => false,
     }
 }
+
+/// Whether a WAIT counts toward the bound its word is owned for
+/// ([`owns_turn_ends`]): the settle's (`settling`, `not-idle`, `busy`,
+/// `status-stale`) and the drain's (`background`, `background-terminal`) — the
+/// waits of a gate whose act is due at the point, the words whose ownership
+/// the window's host bounds by its waits since the upgrade's last act. Every
+/// other wait owns nothing and bounds nothing: a person at the tab (counted at
+/// its point, [`attended_owned`]), the agent's answer without READY
+/// (`awaiting-ready`), a resting round (`failed`), a box, a draft, a limit.
+/// WHY (2026-09-28, s-5c03a): every wait counted, so six looks at a person at
+/// the tab and the notice's answers without READY spent the settle's looks
+/// before the READY came — its first look owned nothing, and the loop typed
+/// `keep going` over it. A turn of the agent's still never starts the count
+/// over (68c98fd18): only the upgrade's acts do. A NOTICE ITS OWN FENCE
+/// REFUSED ([`refused`]) is bounded by a count of its own, which the owner's
+/// word starts over too — never this one (the review of 2026-09-28: a round
+/// whose notice gate had settled three looks owned nothing at its first
+/// refusal).
+#[must_use]
+pub fn bounded_wait(step: &str) -> bool {
+    matches!(
+        step,
+        "wait:settling"
+            | "wait:not-idle"
+            | "wait:busy"
+            | "wait:status-stale"
+            | "wait:background"
+            | "wait:background-terminal"
+    )
+}
+
+/// Whether one [`step`]'s word is A NOTICE ITS OWN FENCE REFUSED
+/// (`wait:announce-refused:<why>`): the gate said go, the notice was due at
+/// this very point, and the host's `turn` typed nothing — the screen moved
+/// between the fence's read and the paste (`changed`: a repaint, a person's
+/// keystroke echo), a person typed through the park (`yield`), or it refused
+/// outright. Tried again within the visit first ([`NOTICE_FENCE_TRIES`]); past
+/// that the point is owned for [`OWNED_REFUSED_LOOKS`] looks at the first
+/// rung ([`after_refused`]), and the refusals are counted for the owner
+/// (`St::refused`).
+#[must_use]
+pub fn refused(step: &str) -> bool {
+    step.starts_with("wait:announce-refused:")
+}
+
+/// How many refused looks since the upgrade's last act or the owner's last
+/// word a refused notice ([`refused`]) may own the session's turn ends for
+/// ([`owns_turn_ends`]): three of them, [`LATER`]'s first rung apart
+/// ([`after_refused`]) — a minute, each look typing the notice up to
+/// [`NOTICE_FENCE_TRIES`] times. Counted apart from the settle's waits
+/// ([`bounded_wait`]). A turn of the agent's never renews it; an act does, and
+/// so does a word (68c98fd18; the review of 2026-09-28). WHY (2026-09-28,
+/// s-d3346): the owner's `--now` at 14:50:50 found the notice's own fence
+/// refusing it three times, owning nothing, and the loop's `keep going` took
+/// the one idle point the agent offered at 14:52:45 — the upgrade then had no
+/// look for six hours.
+pub const OWNED_REFUSED_LOOKS: u32 = 3;
+
+/// [`After`] a refused notice ([`refused`]), `looks` its waits since the
+/// upgrade's last act before this one (what [`owns_turn_ends`] read) and
+/// `same` its waits on the same word: looked at again at the FIRST RUNG while
+/// the point is still the upgrade's, so the notice is tried again within it;
+/// back on the ladder once it is the loop's.
+#[must_use]
+pub fn after_refused(looks: u32, same: u32) -> After {
+    if looks < OWNED_REFUSED_LOOKS {
+        After::Later(LATER[0])
+    } else {
+        ladder(same)
+    }
+}
+
+/// How many times ONE VISIT types a notice its own fence refused as `changed`
+/// — a repaint, a keystroke's echo — before it waits
+/// (`wait:announce-refused:changed`): each try reads the composer afresh and
+/// is fenced on that read, so a person's draft or a box stops it at once, and
+/// a person typing through the park (`yield`) is never typed at again. A try
+/// after the first types only where that read still shows what the look's
+/// gates required ([`retry_open`]: no person's hand since the look, no turn
+/// running, the reader's idle point).
+pub const NOTICE_FENCE_TRIES: usize = 3;
+
+/// How far apart those tries are ([`NOTICE_FENCE_TRIES`]).
+const NOTICE_FENCE_EVERY: Duration = Duration::from_millis(400);
+
+/// Whether an attended wait ([`owns_turn_ends`]) still owns the session's turn
+/// ends after `looks` attended looks in a row at this point: while those looks,
+/// [`LATER`]'s first rung apart ([`after_attended`]), span no more than the
+/// person's grace (`grace_s`) and [`ATTENDED_OWNED_S`] past it. Every look reads
+/// the person's stamp afresh, so a person still at the tab keeps the point
+/// theirs, and the look after their grace lapses takes the act. The bound is a
+/// BACKSTOP, not the grace: a person who scrolls through the agent's answer for
+/// longer than one grace renews it at every touch, and a bound of one grace gave
+/// that point back to the loop while they read — its `keep going` then raced the
+/// upgrade's look at the lapse, the defect this ownership exists to remove. What
+/// the bound is for is a person stamp that FAILS CLOSED (a server that sends
+/// none, [`upgrade::attended_by`]), which reads attended for ever.
+///
+/// The looks are counted AT ONE POINT, by the window's host: any other step
+/// starts them over, and so does a turn in between — the person's, or the
+/// agent's own READY answer — so a person who held the re-ask for half an hour
+/// before the agent answered READY still leaves the READY's point to the
+/// upgrade (the review of 2026-09-28). A stamp that failed closed under an
+/// agent that wakes itself would own each of its points for this bound; the
+/// hosted stamp is the window's own `status`, whose every `OK` carries one.
+#[must_use]
+pub fn attended_owned(looks: u32, grace_s: u32) -> bool {
+    u64::from(looks).saturating_mul(LATER[0].as_secs())
+        <= u64::from(grace_s).saturating_add(ATTENDED_OWNED_S)
+}
+
+/// How long past the person's grace an attended wait may go on owning the
+/// session's turn ends ([`attended_owned`]): half an hour of a person at the
+/// tab — reading, scrolling, clicking — with the agent's act held for them.
+pub const ATTENDED_OWNED_S: u64 = 30 * 60;
 
 /// Whether a step taken at a BREAK of the agent's own background work
 /// (`IdleHost::at_background`) GIVES BACK the session's turn ends a notice
@@ -4542,6 +5987,38 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
 /// ([`super::relaunch::resume`]) for a Codex record.
 pub(super) fn codex_carry_in_flight(opts: &Opts, r: Report, st: St, session: &str) -> Report {
     codex::carry_in_flight(opts, r, st, session)
+}
+
+/// A Codex TUI's [`super::relaunch::Snapshot`], read while it runs
+/// ([`codex::snapshot`]).
+pub(super) fn codex_snapshot(
+    opts: &Opts,
+    tab: &str,
+    pid: u32,
+    start: String,
+    shell: u32,
+    args: &atpkg::caller_shell::ProcArgs,
+) -> Result<super::relaunch::Snapshot, &'static str> {
+    codex::snapshot(opts, tab, pid, start, shell, args, &Live)
+}
+
+/// One look at a Codex that left its tab ([`codex::look_at_exit`]).
+pub(super) fn codex_look_at_exit(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+) -> super::relaunch::ExitLook {
+    codex::look_at_exit(opts, snap, &Live)
+}
+
+/// A Codex's RELAUNCH ON EXIT ([`codex::after_exit`]).
+pub(super) fn codex_after_exit(
+    opts: &Opts,
+    snap: &super::relaunch::Snapshot,
+    left: &super::relaunch::ExitRecord,
+    upgrade: bool,
+    cause: super::relaunch::ExitCause,
+) -> Report {
+    codex::after_exit(opts, snap, left, upgrade, cause, &Live)
 }
 
 /// The Claude lane's share of one sweep: every live Claude Code session
@@ -4926,7 +6403,11 @@ fn visit_models(
             return said(r, "wait:conversation-in-other-tab");
         }
         if sf.pid == st.pid {
-            return said(r, "wait:exiting");
+            // Still exiting: never a harder signal. A shutdown that hangs
+            // past the bound is said once on the ledger (L4), and waited on.
+            let r = said(r, "wait:exiting");
+            note_stuck(opts, &r, &mut st, &sf.session_id, now_s());
+            return r;
         }
         // A NEW process holds the conversation. It is the relaunch only when
         // the shell the line was typed at started it; resumed by hand anywhere
@@ -4976,6 +6457,19 @@ fn visit_models(
     // one without bound: see `models::model_moves_now`, THE MODEL LADDER.
     let launch = upgrade::launch_model(&args.argv);
     let mread = model_read_for(opts, sf, launch.as_deref(), mctx, running_native);
+    // A model a person chose by hand since the launch, which a restart the
+    // list moves to no model carries in place of the launch's `--model`:
+    // read only where a line is planned, not on every visit.
+    let hand_model = || {
+        hand_model_in(
+            opts,
+            &sf.session_id,
+            &args.argv,
+            models::parse_lstart(&sf.proc_start),
+            mctx,
+            running_native,
+        )
+    };
     // Whether a newer BUILD is due regardless of the model — decided before the
     // model, because a restart already happening is the moment the model rides.
     let build_target = upgrade::choose_target(&running, &targets.for_session(running_native));
@@ -5072,10 +6566,11 @@ fn visit_models(
             return r;
         }
     }
-    let (mut c, mut facts) = match look(opts, sf, &mut st, &tab, host_claim, t, now) {
-        Ok(look) => look,
-        Err(why) => return said(r, format!("wait:{why}")),
-    };
+    let (mut c, mut facts, shown_mode, looked_hand) =
+        match look(opts, sf, &mut st, &tab, host_claim, t, now) {
+            Ok(look) => look,
+            Err(why) => return said(r, format!("wait:{why}")),
+        };
     // The transcript's tail, read at every visit: the login wall is looked
     // for in it ([`login_facts`]); once an announcement is out, or a release
     // is owed, the READY answer is too; and at a restart it also says which
@@ -5094,13 +6589,15 @@ fn visit_models(
     st.time_ready(ready, &mut facts, now);
     // How long a stopped round has rested: past RETRY_S a new one starts.
     st.time_failed(&mut facts, now);
+    // Whether the agent's own work, seen since the latest notice, has ended.
+    st.time_work(&mut facts);
     let request = st.request_for(&tab);
     // A give-up spent on notices that never reached the model is asked about
     // as the upgrade it would have been had they spent no ask
     // ([`upgrade::rearmed`]) — unless a READY came first, which the give-up
     // still hears. The refund is in that phase, so the notice it leads to is
     // the next ask, not the same one.
-    let asked_about = match rearmed {
+    let mut asked_about = match rearmed {
         Some(phase) if !ready => {
             facts.undelivered = false;
             phase
@@ -5113,6 +6610,27 @@ fn visit_models(
     // whatever the plan says.
     if opts.background {
         step = upgrade::break_step(step);
+    }
+    // THE END OF THE AGENT'S OWN WORK RE-ARMS A ROUND THAT GAVE UP AND ASKS
+    // IN THE SAME VISIT ([`upgrade::Facts::work_ended`]; 2026-09-28, s-692e6:
+    // every notice was answered "not yet, my workflow still runs", the round
+    // gave up and rested, and the idle point after the workflow went to the
+    // loop's `keep going`). The re-arm is said in the ledger as any is; the
+    // new round's first notice goes at this very point, under every gate a
+    // first notice is typed under — which the reducer's own open restart gate
+    // already vouched for — so the loop never gets the point in between.
+    // `St::notice_gone` is the precedent: a round carried on in the visit that
+    // found it.
+    let mut rearmed_here = None;
+    if step == Step::Rearm
+        && facts.work_ended
+        && matches!(&asked_about, Phase::Failed(why) if why == upgrade::GAVE_UP)
+        && !opts.dry_run
+    {
+        rearmed_here = Some(rearm(opts, r.clone(), &mut st, now));
+        let request = st.request_for(&tab);
+        step = upgrade::requested_step(&request, &st.phase, &facts, false, now, &st.to);
+        asked_about = st.phase.clone();
     }
     // The last read before anything is typed or signalled: the agent holds its
     // terminal. Suspended (ctrl-z) or put in the background since the first
@@ -5153,10 +6671,12 @@ fn visit_models(
             if let Err(why) = require_unique_owner(&opts.home, sf) {
                 return said(r, format!("wait:{why}"));
             }
-            // The transcript's mode, not the screen's: the upgrade's own
-            // exchanges with the host are fenced and counted, and a read here
-            // would be one they never asked for.
-            let mode = last_permission_mode(&opts.home, &sf.session_id);
+            // The mode the look's pill showed — the live one, which Claude
+            // writes to its transcript only when it re-appends its metadata —
+            // else the transcript's. No read of its own: the upgrade's
+            // exchanges with the host are fenced and counted.
+            let mode = resumed_mode(opts, &sf.session_id, shown_mode.as_deref());
+            let model = model_to.clone().or_else(hand_model);
             let planned = proven.map_or(Err(NoPlan::Wait("ids")), |shell| {
                 plan(
                     opts,
@@ -5164,7 +6684,7 @@ fn visit_models(
                         sf,
                         &args.argv,
                         &target,
-                        model_to.as_deref(),
+                        model.as_deref(),
                         mode.as_deref(),
                         true,
                     ),
@@ -5172,6 +6692,10 @@ fn visit_models(
                     t,
                 )
             });
+            // The line the announcement was planned on, kept with it: what the
+            // restart after the READY answer is to type (it plans its own
+            // again, off its own look).
+            let planned_line = planned.as_ref().map(|p| p.line.clone()).ok();
             let salt = st.salt;
             let asks = upgrade::announce_asks(&asked_about, facts.undelivered);
             let again = if taken_back {
@@ -5191,6 +6715,18 @@ fn visit_models(
                 )
             } else {
                 None
+            };
+            // What a try after the first must still find on the read it is
+            // fenced on ([`retry_open`]): the look's gates, as the owner's
+            // word left them.
+            let retry = Retry {
+                looked: looked_hand,
+                owner_now: st.request_for(&tab) == Request::Now,
+                at_break: facts.background_point,
+                // The person's grace at the look's rung (the ladder): a
+                // person merely near the tab holds a retry no longer than
+                // they held the look.
+                grace_s: upgrade::person_grace(upgrade::rung_in_force(&facts), opts.human_grace_s),
             };
             let result = announce(opts, r, &mut st, planned, now, asks, again, |asks| {
                 let marker = upgrade::ready_marker(
@@ -5216,14 +6752,43 @@ fn visit_models(
                 // The last look before typing: a FRESH read whose composer is
                 // still empty and with no box up, and its generation, which
                 // the typed turn is fenced on (`turn if-gen=`): a screen that
-                // moved since that read (nothing typed) is a wait.
-                let generation = typing_fence(&mut c, &tab).map_err(str::to_string)?;
-                turn_fenced(&mut c, &tab, &text, generation.as_deref())
-                    .map(|()| marker)
-                    .map_err(|e| e.word())
+                // moved since that read typed nothing, and is read and fenced
+                // again, up to NOTICE_FENCE_TRIES times — a repaint is over in
+                // a moment (2026-09-28, s-d3346: three refusals at three
+                // looks, and the loop took the point). A draft, a box, a
+                // person typing through the park or a refusal is never tried
+                // again here — and a try after the first types only where the
+                // read it is fenced on still shows what the look's gates
+                // required ([`retry_open`]): no person's hand since the look,
+                // no turn running, the reader's idle point. The screen that
+                // moved was the program's own output or a person's keys, and
+                // either may have started the turn a notice must not be
+                // queued into (the review of 2026-09-28).
+                let mut tries = 0;
+                loop {
+                    tries += 1;
+                    let again = tries < NOTICE_FENCE_TRIES;
+                    let (generation, read) = match typing_fence_read(&mut c, &tab) {
+                        Ok(fenced) => fenced,
+                        Err("changed") if again => {
+                            std::thread::sleep(NOTICE_FENCE_EVERY);
+                            continue;
+                        }
+                        Err(why) => return Err(why.to_string()),
+                    };
+                    if tries > 1 && !retry_open(&read, &retry) {
+                        return Err(Typed::Changed.word());
+                    }
+                    match turn_fenced(&mut c, &tab, &text, generation.as_deref()) {
+                        Ok(()) => return Ok(marker),
+                        Err(Typed::Changed) if again => std::thread::sleep(NOTICE_FENCE_EVERY),
+                        Err(e) => return Err(e.word()),
+                    }
+                }
             });
             if result.step.starts_with("announced:") {
                 st.model_list = model_to.clone().unwrap_or_default();
+                st.line = planned_line.unwrap_or_default();
                 st.tab.clone_from(&tab);
                 st.notice_pid = sf.pid;
                 st.notice_start = squash(&sf.proc_start);
@@ -5248,18 +6813,28 @@ fn visit_models(
                 (st.model_before, st.mark) = model_and_mark(recent.as_ref());
             }
             st.launch_model = upgrade::launch_model(&args.argv).unwrap_or_default();
+            let hand = st.model_list.is_empty().then(hand_model).flatten();
             let restarting = Restarting {
                 argv: &args.argv,
                 target: &target,
                 host_claim,
-                // Under the owner's `--now` a person at the tab does not
-                // hold the signal back: the word IS that person.
-                grace: if request == Request::Now {
-                    0
-                } else {
-                    opts.human_grace_s
-                },
+                // The person's grace the ladder keeps at this rung (the
+                // owner's decision of 2026-09-28): `[harness]
+                // human_grace_s`, then KEYS_GAP_S from KeysOnly — and at
+                // once under the owner's `--now`, which stands at the last
+                // rung. Never nothing: until then `--now` sent the signal a
+                // second after a keystroke.
+                grace: upgrade::person_grace(
+                    if request == Request::Now {
+                        upgrade::Rung::Land
+                    } else {
+                        facts.rung
+                    },
+                    opts.human_grace_s,
+                ),
                 fresh,
+                mode: shown_mode.as_deref(),
+                model: hand.as_deref(),
             };
             restart(opts, r, &mut st, &mut c, &tab, sf, t, k, &restarting)
         }
@@ -5280,6 +6855,15 @@ fn visit_models(
     } else {
         result
     };
+    // A work-end re-arm whose notice did not go this visit is still the
+    // visit's act: said as the re-arm, so the host starts its counts over and
+    // looks again at the new round's first point.
+    let result = match rearmed_here {
+        Some(rearmed) if !result.step.starts_with("announced:") => rearmed,
+        _ => result,
+    };
+    // What this look saw of the agent's own work, for the end of it.
+    st.saw_work(&facts);
     st.note_step(&result.step, &facts.status, now);
     // What holds a move that waits, named to the owner (`held_by=`): described
     // only where something runs and the step waited.
@@ -5293,6 +6877,102 @@ fn visit_models(
     result
 }
 
+/// THE LADDER'S READING OF ONE LOOK (the owner's decision of 2026-09-28):
+/// what both lanes' looks — Claude Code's [`look`] and the Codex visit — build
+/// their ladder facts by, and what the ladder's Tier-1 bind drives, so the
+/// bind reads a screen exactly as a look does. From one read of the screen
+/// (`scr`) of the agent `agent` (the one reader's name: `claude`, `codex`)
+/// run by `pid`: the rung this upgrade stands at ([`St::rung_at`]); a person
+/// near the tab within `[harness] human_grace_s` (`grace_s`,
+/// [`upgrade::attended_by`]) and a keystroke within [`upgrade::KEYS_GAP_S`]
+/// (an unknown stamp is none here: `attended` fails closed on it below
+/// KeysOnly, and a person typing is a draft); the one reader's reading idle
+/// as evidence, with no wall and no prompt; and the repaint-proof settle —
+/// that reading's last words, look after look ([`St::still`],
+/// [`upgrade::still_print`]).
+pub(super) fn ladder_look(
+    st: &mut St,
+    agent: &str,
+    scr: &Screen,
+    pid: u32,
+    grace_s: u32,
+    now: u64,
+) -> LadderLook {
+    let reading = aterm_phase::read_at(
+        Some(agent),
+        &scr.rows,
+        scr.cursor.map(|(row, _)| row),
+        scr.cursor.map(|(_, col)| col),
+    );
+    let idle_read = reading.phase == aterm_phase::Phase::Idle
+        && reading.phase_authoritative
+        && reading.wall.is_none()
+        && reading.prompt.is_none();
+    let print = reading
+        .composer
+        .as_ref()
+        .filter(|_| idle_read)
+        .map(|(caret, _)| upgrade::still_print(pid, &scr.rows, *caret));
+    LadderLook {
+        rung: st.rung_at(now),
+        attended: upgrade::attended_by(scr.human, grace_s),
+        typing: scr
+            .human
+            .within(upgrade::person_grace(upgrade::Rung::KeysOnly, grace_s))
+            == Some(true),
+        idle_read,
+        still_s: st.still(print, now),
+    }
+}
+
+/// [`ladder_look`]'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LadderLook {
+    /// [`upgrade::Facts::rung`].
+    pub(super) rung: upgrade::Rung,
+    /// [`upgrade::Facts::attended`].
+    pub(super) attended: bool,
+    /// [`upgrade::Facts::typing`].
+    pub(super) typing: bool,
+    /// The one reader read the screen idle as evidence, no wall, no prompt:
+    /// what a run of idle looks counts ([`St::idle_looks`]), and where the
+    /// window's loop would take its step at all.
+    pub(super) idle_read: bool,
+    /// [`upgrade::Facts::still_s`].
+    pub(super) still_s: u64,
+}
+
+/// WHETHER A TURN RUNS BY THE FOOTER (`esc to interrupt`,
+/// [`upgrade::Facts::busy_footer`]): the hint read ONLY in the rows below the
+/// composer (design record 2026-09-28, §3.2 C8) — its bottom rule and the
+/// footer under it, where Claude Code draws it while a turn runs (measured on
+/// every busy fixture since 2.1.267: `  ⏵⏵ auto mode on · esc to interrupt ·
+/// ← for agents`). It was read in ANY row, so a transcript that quoted a
+/// footer — an agent debugging this harness pastes one often — read as a
+/// turn running on an idle screen, and the notice waited `busy` for as long
+/// as the quote stayed on screen. No composer, no footer: a box has replaced
+/// it, which the `box` gate waits on, and nothing is typed without one.
+///
+/// AND THE LIVE STATUS ROW ABOVE IT (review of 2026-09-28): Claude Code also
+/// draws the hint on its spinner row, just above the composer's top rule,
+/// over an idle footer (`✶ Deliberating… (4s · ↑ 1.2k tokens · esc to
+/// interrupt)`, the auto-continue fixture in `aterm-phase`'s `phase.rs`) —
+/// a shape the any-row rule read busy and the below-the-composer rule alone
+/// did not. That row is read as [`aterm_phase::phase::status_row`] finds it
+/// (walking up from the top rule, stopping at the first transcript row), so
+/// a quote in the transcript is still no turn running.
+pub(super) fn busy_footer(rows: &[String]) -> bool {
+    let Some((caret, draft)) = aterm_phase::phase::composer_draft(rows) else {
+        return false;
+    };
+    let busy = aterm_phase::anchors::anchor("busy.interrupt");
+    aterm_phase::phase::status_row(rows).is_some_and(|row| row.contains(busy))
+        || rows
+            .iter()
+            .skip(caret.saturating_add(draft.len()))
+            .any(|row| row.contains(busy))
+}
+
 /// ONE LOOK AT THE SESSION'S TAB, everything the gates are asked over: the
 /// tab dialled and proven live (and, for the window's step, still the PTY
 /// group's claim), its screen read once, and the [`Facts`] of that read — the
@@ -5300,7 +6980,9 @@ fn visit_models(
 /// ([`upgrade::limited`], off the same rows), the work under the agent — with
 /// the screen's quiet and a person's hold timed across looks on `st`, and an
 /// announced upgrade's re-ask clock held while the session is limited
-/// ([`upgrade::clock_held`]). `Err` names the wait.
+/// ([`upgrade::clock_held`]) — and the permission mode that read's pill shows
+/// ([`screen_mode`]), the live mode a relaunch resumes in. `Err` names the
+/// wait.
 fn look(
     opts: &Opts,
     sf: &SessionFile,
@@ -5309,7 +6991,7 @@ fn look(
     host_claim: Option<&HostClaim>,
     t: &[(u32, u32, String)],
     now: u64,
-) -> Result<(Client, Facts), &'static str> {
+) -> Result<(Client, Facts, Option<String>, HandAt), &'static str> {
     let mut c = connect(opts, tab).map_err(|_| "no-socket")?;
     if !roster(&mut c).iter().any(|live| live == tab) {
         return Err("tab-not-live");
@@ -5318,11 +7000,14 @@ fn look(
         return Err("tab-ownership-changed");
     }
     let scr = screen(&mut c, tab).ok_or("screen-unreadable")?;
-    // A person at the tab: the server's per-session person stamp on this
-    // very read, within `[harness] human_grace_s` — the one presence fact,
-    // the same a hand-run sweep and the window's supervisor read
-    // ([`upgrade::attended_by`]).
-    let attended = upgrade::attended_by(scr.human, opts.human_grace_s);
+    // A person at the tab — the server's per-session person stamp on this
+    // very read, within `[harness] human_grace_s`: the one presence fact, the
+    // same a hand-run sweep and the window's supervisor read — and THE LADDER
+    // (the owner's decision of 2026-09-28): the rung this upgrade stands at,
+    // the keystroke within KEYS_GAP_S every rung keeps, and the session's own
+    // reader's reading of this screen, as the window's loop vets an idle
+    // point, with its last words look after look ([`ladder_look`]).
+    let ladder = ladder_look(st, "claude", &scr, sf.pid, opts.human_grace_s, now);
     // One `status` read: the hold and the hands, and the agent's verdict the
     // quiet is measured from ([`quiet_s`], D3 of the live E2E of 2026-09-26).
     let status = status_line(&mut c, tab);
@@ -5332,10 +7017,7 @@ fn look(
         status_age_s: now.saturating_sub(sf.status_updated_at_ms / 1000),
         composer_empty: composer_empty(&mut c, tab, &scr),
         approval_box: aterm_phase::prompt::prompt_box_span(&scr.rows).is_some(),
-        busy_footer: {
-            let busy = aterm_phase::anchors::anchor("busy.interrupt");
-            scr.rows.iter().any(|row| row.contains(busy))
-        },
+        busy_footer: busy_footer(&scr.rows),
         background: background(sf.pid, t),
         // The hold and the hands alone: a person's keystroke is `attended`,
         // which the owner's `--now` waives.
@@ -5343,7 +7025,7 @@ fn look(
         quiet_s: quiet,
         hold_s: 0,
         owner_now: false,
-        attended,
+        attended: ladder.attended,
         background_point: opts.background,
         // Asked only where it can move the step: before anything is ended.
         taskless: matches!(st.phase, Phase::Pending | Phase::Announced { .. })
@@ -5359,20 +7041,18 @@ fn look(
         idle_looks: 0,
         // Stamped by the visit ([`St::time_failed`]).
         failed_s: 0,
+        rung: ladder.rung,
+        typing: ladder.typing,
+        still_s: ladder.still_s,
+        // Claude Code's own work shows in its status and under it.
+        daemon_turn: upgrade::DaemonTurn::None,
+        // Stamped by the visit ([`St::time_work`]).
+        work_ended: false,
     };
     // The session's own reader, as the window's loop vets an idle point: the
     // screen Claude's own status is read against ([`upgrade::IDLE_LOOKS`]).
-    let reading = aterm_phase::read_at(
-        Some("claude"),
-        &scr.rows,
-        scr.cursor.map(|(row, _)| row),
-        scr.cursor.map(|(_, col)| col),
-    );
-    let idle_read = reading.phase == aterm_phase::Phase::Idle
-        && reading.phase_authoritative
-        && reading.wall.is_none()
-        && reading.prompt.is_none();
     // A run is ONE process's looks, in a row ([`St::idle_looks`]).
+    let idle_read = ladder.idle_read;
     let in_a_row = st.idle_pid == sf.pid && now.saturating_sub(st.idle_at) <= IDLE_RUN_GAP_S;
     st.idle_looks = match (idle_read, in_a_row) {
         (false, _) => 0,
@@ -5387,7 +7067,7 @@ fn look(
         facts.hold_s = now.saturating_sub(st.hold_since_s);
     }
     st.phase = upgrade::clock_held(&st.phase, &facts, now);
-    Ok((c, facts))
+    Ok((c, facts, screen_mode(&scr.rows), HandAt::of(scr.human)))
 }
 
 /// How far back a give-up's last notice is looked for when the ordinary tail
@@ -5674,7 +7354,13 @@ fn owed_word(r: Report, why: &str) -> Report {
 /// upgrade's to tell that no restart is coming (the review of
 /// 2026-09-26): the release is dropped ([`release_void`]), and so it is once
 /// the agent took up direction given after its last answer to the upgrade.
-/// Else one look, and the release if it may be typed.
+/// Else one look, and the release if it may be typed. Either way the visit's
+/// step is recorded ([`St::note_step`]): a DROP is `current`, which clears the
+/// wait an earlier look recorded — the release's own gate
+/// (`wait=release:<gate>`) outlived the release it held (the review of the
+/// upgrade's leftovers, 2026-09-28), `--status` read `wait=release:attended …
+/// release=-`, and the owner was told, visit after visit, of a line nothing
+/// owed.
 #[allow(clippy::too_many_arguments)]
 fn release_visit(
     opts: &Opts,
@@ -5694,10 +7380,12 @@ fn release_visit(
             return said(r, format!("would-drop-release:{why}"));
         }
         drop_release(opts, &r, &mut st, why);
+        let r = said(r, "current");
+        st.note_step(&r.step, &sf.status, now);
         save(opts, &sf.session_id, &st);
-        return said(r, "current");
+        return r;
     }
-    let (mut c, facts) = match look(opts, sf, &mut st, tab, host_claim, t, now) {
+    let (mut c, facts, _, _) = match look(opts, sf, &mut st, tab, host_claim, t, now) {
         Ok(look) => look,
         Err(why) => return said(r, format!("wait:release:{why}")),
     };
@@ -5805,10 +7493,26 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
         // A LIVE process holding the conversation is `visit`'s; a session file
         // its dead owner left behind holds nothing, and skipping on it alone
         // stranded the restart (visit acts on live processes only).
-        if conversation_live(files, &session) || alive(st.pid) {
-            continue; // `visit` has it, or the agent is still exiting.
+        if conversation_live(files, &session) {
+            continue; // `visit` has it.
         }
         if opts.only_sid.as_ref().is_some_and(|s| *s != st.tab) {
+            continue;
+        }
+        let r = Report {
+            pid: st.pid,
+            tab: st.tab.clone(),
+            session: session.clone(),
+            from: st.from.clone(),
+            to: format!("{}({})", st.to, st.source),
+            step: String::new(),
+        };
+        // The agent is still exiting — a SIGTERMed Claude Code whose
+        // shutdown removed its session file and then hung: never a harder
+        // signal, and nothing acted on; past the bound it is said once on
+        // the ledger (L4 of the upgrade's leftovers).
+        if alive(st.pid) {
+            note_stuck(opts, &r, &mut st, &session, now_s());
             continue;
         }
         // The expiry is decided on the exit as an EARLIER look saw it — the
@@ -5823,14 +7527,6 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
         if !opts.dry_run && st.seen_gone(now_s()) {
             save(opts, &session, &st);
         }
-        let r = Report {
-            pid: st.pid,
-            tab: st.tab.clone(),
-            session: session.clone(),
-            from: st.from.clone(),
-            to: format!("{}({})", st.to, st.source),
-            step: String::new(),
-        };
         if let Some((why, detail)) = stale {
             if opts.dry_run {
                 out.push(said(r, format!("would-fail:{why}")));
@@ -6074,6 +7770,53 @@ fn held_back(opts: &Opts, r: Report, st: &mut St, session: &str, why: &str) -> R
     r
 }
 
+/// A RESTART UNDER WAY THAT HAS NOT MOVED ([`St::stuck`]: `exiting`, `exited`
+/// or `relaunched` past [`STALE_S`] from its phase's start), SAID ONCE on the
+/// ledger as `stuck:<what>` (L4 of the upgrade's leftovers, 2026-09-28): a
+/// SIGTERMed Claude Code hung in its shutdown (its pid alive — the visit's
+/// `wait:exiting`, or the orphan pass's skip once its session file is gone)
+/// and a relaunched agent whose carry-on never finds it idle wait with no
+/// bound while the conversation is held, and the ledger — the record the
+/// owner diagnoses a strand with, where no window shows the band — ended at
+/// `terminated` or `relaunched` for as long as it lasted, while `--status`
+/// read `stalled=stuck:<what>`. Keyed on [`St::noted`] as [`held_back`] is: a
+/// later visit that finds the same stuck kind writes nothing; another kind
+/// (exiting, then exited) is its own row. A NOTE ONLY — never a failure (a
+/// failed record over an agent that exits later would leave it
+/// un-relaunched), never a signal and never typing; the step's own wait word
+/// stands, and the window's band row (ruling 327) is the live view. Claude
+/// Code's upgrade records only: a Codex restart is bounded and ledgered by
+/// its own lane (`exit_not_taken`, then `stale-exit`; `no-resume`), and a
+/// relaunch's own record is in no `--status`. Never from `--status`, which
+/// is read-only. A dry run writes nothing.
+pub(super) fn note_stuck(opts: &Opts, r: &Report, st: &mut St, session: &str, now: u64) {
+    if opts.dry_run || st.agent != upgrade::Agent::Claude || !st.is_upgrade() {
+        return;
+    }
+    let Some(what) = st.stuck(now) else {
+        return;
+    };
+    let (Phase::Exiting { at_s } | Phase::Relaunched { at_s }) = st.phase else {
+        return;
+    };
+    let key = format!("stuck:{what}");
+    if st.noted == key {
+        return;
+    }
+    st.noted.clone_from(&key);
+    ledger(
+        opts,
+        &said(r.clone(), key),
+        &format!(
+            "under way for {}, past its {} bound: {}",
+            upgrade::span(now.saturating_sub(at_s)),
+            upgrade::span(STALE_S),
+            upgrade_status::stuck_words(st.agent, what)
+        ),
+    );
+    save(opts, session, st);
+}
+
 /// The tab is ATTENDED ([`upgrade::Facts::attended`]) and the owner's `--now`
 /// is not in force: the upgrade waits for the person to step away. A WAIT —
 /// but said ONCE per upgrade, like [`held_back`], in the ledger and as an act
@@ -6138,6 +7881,21 @@ fn announce(
     }
 }
 
+/// The permission mode the upgrade's relaunch resumes `session` in: the mode
+/// the visit's look read off the tab's pill (`shown`, [`screen_mode`]) — the
+/// live one, exactly the person's choice — else the transcript's newest
+/// `permission-mode` row ([`last_permission_mode`]). Claude writes that row
+/// only when it re-appends its session metadata (about every 32 KiB of
+/// transcript, a compaction, a resume, its exit), so a mode chosen at idle —
+/// a session launched in bypass and left in auto, plan left for auto — is on
+/// the screen long before it is in the file, and a relaunch on the file's
+/// alone brought it back in the mode the person had left.
+fn resumed_mode(opts: &Opts, session: &str, shown: Option<&str>) -> Option<String> {
+    shown
+        .map(str::to_owned)
+        .or_else(|| last_permission_mode(&opts.home, session))
+}
+
 /// What the upgrade's relaunch line is made from: the live session's
 /// conversation and directory, its argv, the target build, the model the
 /// conversation moves to, if any, the permission mode it last ran in, and
@@ -6168,30 +7926,210 @@ fn launch_of<'a>(
 /// what the typed turn is fenced on ([`turn_fenced`]). The facts a step was
 /// decided on are a pass's worth of process reads old by the time it types;
 /// this read is one request old, and the fence closes the rest.
+///
+/// NOTHING OF OURS BETWEEN THE READ AND THE `turn` (design record
+/// 2026-09-28, §3.2 C7a). The server checks the generation after its
+/// `yield=0.2` park and types NOTHING when any output came since the read,
+/// a repaint included; tab #1's notice was refused `changed` twice under a
+/// ticking workflow timer, and a refused notice counts no ask, so nothing
+/// bounded it. Two of our own requests sat inside that window: the `cell`
+/// [`composer_empty`] asks when the cursor is at column 2, and the fenced
+/// `turn`'s `help turn` probe. The probe is asked here FIRST (and kept for
+/// the connection, [`turn_takes_gen`]); a read that needs the `cell` asks it
+/// and then reads the screen once more, and it is that last read's
+/// generation the turn is fenced on — its composer row and cursor the ones
+/// the `cell` judged, else `changed` (the fence's own word: the screen moved,
+/// nothing typed, a wait). The window is shorter, not closed: a screen that
+/// repaints faster than the park still refuses (C7b is the narrower fence).
 pub(super) fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static str> {
+    typing_fence_read(c, tab).map(|(generation, _)| generation)
+}
+
+/// [`typing_fence`], and the read its generation names: what a try of the
+/// notice after the first is judged on ([`retry_open`]), so no read sits
+/// between that judgment and the paste's fence.
+fn typing_fence_read(c: &mut Client, tab: &str) -> Result<(Option<String>, Screen), &'static str> {
+    let _ = turn_takes_gen(c);
+    let Some(first) = screen(c, tab) else {
+        return Err("screen-unreadable");
+    };
+    let Some(dim_at) = dim_cell(&first) else {
+        return fence_verdict(&first, false).map(|generation| (generation, first));
+    };
+    let dim = c
+        .request_line(&format!("@{tab} cell {dim_at} 2"))
+        .is_ok_and(|line| cell_is_dim(&line));
     let Some(scr) = screen(c, tab) else {
         return Err("screen-unreadable");
     };
+    if !same_composer(&first, &scr) {
+        return Err("changed");
+    }
+    fence_verdict(&scr, dim).map(|generation| (generation, scr))
+}
+
+/// WHEN A PERSON LAST GAVE THE TAB INPUT, as one read stamped it, on this
+/// process's clock ([`HumanInput`] is an age at the read): what a try of the
+/// notice after the first compares the look's stamp with ([`retry_open`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HandAt {
+    /// The host sent no stamp: nothing can be proved of a person's hand.
+    Unknown,
+    /// No person since the host began serving the session.
+    Never,
+    /// About then.
+    At(Instant),
+}
+
+impl HandAt {
+    /// The stamp of a read taken just now.
+    pub(super) fn of(human: HumanInput) -> HandAt {
+        match human {
+            HumanInput::Unknown => HandAt::Unknown,
+            HumanInput::Never => HandAt::Never,
+            HumanInput::Ago(ms) => Instant::now()
+                .checked_sub(Duration::from_millis(ms))
+                .map_or(HandAt::Unknown, HandAt::At),
+        }
+    }
+
+    /// Whether `later` (a later read's stamp) proves no person gave the tab
+    /// input since this one: the same hand, within [`HAND_SLACK`] — the two
+    /// ages are read off one clock at two replies — or still nobody. An
+    /// unknown stamp on either side proves nothing, so it fails closed.
+    pub(super) fn still(self, later: HandAt) -> bool {
+        match (self, later) {
+            (_, HandAt::Never) => true,
+            (HandAt::At(then), HandAt::At(now)) => now <= then + HAND_SLACK,
+            _ => false,
+        }
+    }
+}
+
+/// How far apart two reads may place the SAME keystroke ([`HandAt::still`]):
+/// each age is the server's at its read, and the reply's trip back is not in
+/// it.
+const HAND_SLACK: Duration = Duration::from_millis(500);
+
+/// What a try of the notice after the first ([`NOTICE_FENCE_TRIES`]) is
+/// judged against ([`retry_open`]): the look's person stamp, whether the
+/// owner's `--now` waives a person at the tab, whether the look was at a break
+/// of the agent's own work, and the person's grace (`[harness]
+/// human_grace_s` at the look's rung, [`upgrade::person_grace`]: from the
+/// ladder's KeysOnly rung a keystroke within [`upgrade::KEYS_GAP_S`]).
+pub(super) struct Retry {
+    pub(super) looked: HandAt,
+    pub(super) owner_now: bool,
+    pub(super) at_break: bool,
+    pub(super) grace_s: u32,
+}
+
+/// Whether a notice its fence refused as `changed` may be typed again IN THE
+/// SAME VISIT ([`NOTICE_FENCE_TRIES`]): `read`, the read the paste is fenced
+/// on, still shows what the look's gates required (the review of 2026-09-28).
+/// The screen that moved was the program's own output or a person's keys, and
+/// either may have begun what the notice must not be typed into: NO PERSON'S
+/// HAND since the look — a message a person submitted between the look and the
+/// paste was followed by the notice, inside the turn it started, the attended
+/// guard the look judged passed by without `--now` — and none at the tab
+/// within the grace unless the owner's `--now` waives it; NO TURN RUNNING —
+/// the busy footer or the live status row ([`busy_footer`]); and, at an idle
+/// point, THE SESSION'S OWN READER AT AN IDLE POINT (idle, authoritatively, no
+/// wall, no box) — a background task's completion that woke the agent reads
+/// busy there. A break of the agent's own work reads busy by definition: its
+/// footer is the turn fact its gate asks. Otherwise the refusal stands, and
+/// the next look judges the screen as it is.
+pub(super) fn retry_open(read: &Screen, retry: &Retry) -> bool {
+    let hand = HandAt::of(read.human);
+    if !retry.looked.still(hand) {
+        return false;
+    }
+    if !retry.owner_now && upgrade::attended_by(read.human, retry.grace_s) {
+        return false;
+    }
+    if busy_footer(&read.rows) {
+        return false;
+    }
+    if retry.at_break {
+        return true;
+    }
+    let reading = aterm_phase::read_at(
+        Some("claude"),
+        &read.rows,
+        read.cursor.map(|(row, _)| row),
+        read.cursor.map(|(_, col)| col),
+    );
+    reading.phase == aterm_phase::Phase::Idle
+        && reading.phase_authoritative
+        && reading.wall.is_none()
+        && reading.prompt.is_none()
+}
+
+/// ONE read's word on the composer, no fence: no box up and the composer
+/// empty (its `cell` asked after the read, as [`composer_empty`] does). For
+/// a line typed UNFENCED — a continuation whose screen never held still
+/// (`relaunch::type_continuation`) — where no generation is carried, so the
+/// order of the reads buys nothing.
+pub(super) fn composer_clear(c: &mut Client, tab: &str) -> bool {
+    screen(c, tab).is_some_and(|scr| {
+        aterm_phase::prompt::prompt_box_span(&scr.rows).is_none() && composer_empty(c, tab, &scr)
+    })
+}
+
+/// [`typing_fence`]'s verdict over one read, `dim` the `cell` answer for its
+/// caret row (`false`: not asked, or not dim).
+fn fence_verdict(scr: &Screen, dim: bool) -> Result<Option<String>, &'static str> {
     if aterm_phase::prompt::prompt_box_span(&scr.rows).is_some() {
         return Err("box");
     }
-    if !composer_empty(c, tab, &scr) {
+    if !upgrade::composer_is_empty(&scr.rows, scr.cursor, dim) {
         return Err("draft");
     }
-    Ok(scr.generation)
+    Ok(scr.generation.clone())
+}
+
+/// The absolute row whose column 2 [`composer_empty`] asks the `cell` of:
+/// the cursor's, when it IS at column 2 — the one case the answer can change.
+fn dim_cell(scr: &Screen) -> Option<usize> {
+    match scr.cursor {
+        Some((row, 2)) => scr.first.checked_add(row),
+        _ => None,
+    }
+}
+
+/// Whether two reads show the same composer — the cursor at the same place,
+/// and the same text on its row — so a `cell` asked between them judged the
+/// later one's caret row too. The rows above it (a spinner, a timer) may
+/// have moved.
+fn same_composer(a: &Screen, b: &Screen) -> bool {
+    fn caret(s: &Screen) -> Option<&str> {
+        s.cursor
+            .and_then(|(row, _)| s.rows.get(row))
+            .map(String::as_str)
+    }
+    a.cursor == b.cursor && a.first == b.first && caret(a) == caret(b)
 }
 
 /// What one [`restart`] is made of beyond the session's own facts: the
 /// launch's argv, the build it moves to, the tab's claim, the person's grace
-/// at the signal (`0` under the owner's `--now`), and whether it starts the
+/// at the signal ([`upgrade::person_grace`] of the rung the upgrade stands
+/// at: `[harness] human_grace_s` until KeysOnly, then
+/// [`upgrade::KEYS_GAP_S`] — and KEYS_GAP_S under the owner's `--now`, the
+/// last rung; never nothing, as `--now` was until 2026-09-28), whether it starts the
 /// agent AFRESH — a conversation with no task ([`Step::Fresh`]): no notice was
-/// typed for it to own, nothing is resumed, and nothing is typed after.
+/// typed for it to own, nothing is resumed, and nothing is typed after — and
+/// the permission mode the visit's look read off the tab's pill
+/// ([`screen_mode`]; `None`: no pill was drawn), and the model a person chose
+/// by hand ([`hand_model_in`]), which the line asks for when the list moves
+/// the conversation to none.
 struct Restarting<'a> {
     argv: &'a [String],
     target: &'a Candidate,
     host_claim: Option<&'a HostClaim>,
     grace: u32,
     fresh: bool,
+    mode: Option<&'a str>,
+    model: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6212,6 +8150,8 @@ fn restart(
         host_claim,
         grace,
         fresh,
+        mode: shown_mode,
+        model: hand_model,
     } = *how;
     // The notice this restart answers is the process's own — or, afresh,
     // there is none, and the conversation must still have no task.
@@ -6249,8 +8189,12 @@ fn restart(
             Err(why) => return said(r, format!("wait:{why}")),
         },
     };
-    let model = (!st.model_list.is_empty()).then(|| st.model_list.clone());
-    let mode = last_permission_mode(&opts.home, &sf.session_id);
+    // The model the list moves it to, else a model a person chose by hand
+    // since the launch: its `--model` would undo that `/model`.
+    let model = (!st.model_list.is_empty())
+        .then(|| st.model_list.clone())
+        .or_else(|| hand_model.map(str::to_owned));
+    let mode = resumed_mode(opts, &sf.session_id, shown_mode);
     let launch = launch_of(sf, argv, target, model.as_deref(), mode.as_deref(), !fresh);
     let Plan { shell, line, .. } = match plan(opts, &launch, proven, t) {
         Ok(p) => p,
@@ -6269,7 +8213,8 @@ fn restart(
         // The last look before the one irreversible act: the same process,
         // still idle, still its shell's foreground job, the composer still
         // empty, nothing running under it, nobody's hand and nobody's unread
-        // input (a person's within `grace`: `0` under the owner's `--now`).
+        // input (a person's within `grace`: `upgrade::person_grace` of the
+        // rung — KEYS_GAP_S under the owner's `--now`, never nothing).
         let again = session_file_of(&opts.home, sf.pid);
         let scr = screen(c, tab);
         let still = again.is_some_and(|a| {
@@ -6301,6 +8246,16 @@ fn restart(
         if fresh {
             super::relaunch::CAUSE_UPGRADE_FRESH.clone_into(&mut st.cause);
         }
+        // A fallback standing whose relaunch carries a model a person chose
+        // by hand since: that `/model` is what the person has now, and the
+        // way back at the bucket's reset returns to it, never undoes it
+        // ([`fallback_carried`]). Put back with the rest if the signal is
+        // never sent.
+        st.fallback_from = fallback_carried(
+            fallback_origin(Some(st)).as_deref(),
+            (!st.model_list.is_empty()).then_some(st.model_list.as_str()),
+            hand_model,
+        );
         save(opts, &sf.session_id, st);
         // A second owner, a job-control change, or a moved terminal during
         // the state write must veto the signal. Re-read the current session

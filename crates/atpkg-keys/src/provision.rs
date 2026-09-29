@@ -175,21 +175,13 @@ pub fn discover_pins_path() -> Result<String, String> {
 /// letters, digits, `-` and `_`.
 pub fn vet_machine_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 32 {
-        return Err(
-            "a machine id must be 1-32 characters (it is typed under pressure \
-                    during a revocation; keep it short and memorable)"
-                .to_string(),
-        );
+        return Err("a machine id must be 1-32 characters".to_string());
     }
     if !id
         .bytes()
         .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
     {
-        return Err(
-            "a machine id may contain only ASCII letters, digits, '-' and '_' — \
-                    anything else invites a homoglyph in a deny-list entry"
-                .to_string(),
-        );
+        return Err("a machine id may contain only ASCII letters, digits, '-' and '_'".to_string());
     }
     Ok(())
 }
@@ -372,7 +364,7 @@ fn roster_txn_path(path: &str) -> String {
 /// verify under the master you typed": an operator sent to re-check a paper phrase that
 /// was never wrong.
 ///
-/// Public because the readers are not all in this crate: `cargo ship provision --check`
+/// Public because the readers are not all in this crate: `targo --unverified ship provision --check`
 /// audits the same pair and promises to write nothing, so it may not take the writer
 /// lock (acquiring it REPAIRS) — it applies this refusal instead, and reports.
 pub fn refuse_pending_roster_transaction(path: &str) -> Result<(), String> {
@@ -761,11 +753,11 @@ fn complete_roster_transaction(path: &str) -> Result<(), String> {
 /// * `atpkg-keys setup` / `join` — [`write_rest`], which takes the lock before its
 ///   premise check and holds it through publication;
 /// * `atpkg-keys machine-revoke` — one lock across read, revoke and publish;
-/// * `cargo ship provision` — its PHASE 1 roster seeding (the kept-copy restore, the
+/// * `targo --unverified ship provision` — its PHASE 1 roster seeding (the kept-copy restore, the
 ///   channel/dist install, and the kept copy written after `authorize_cut`) takes it in
 ///   `aterm-release`'s `provision::lock_roster_pair`, and drops it before the in-process
 ///   mint re-takes it in `write_rest`; and
-/// * `cargo ship recover` — the `reconstruct_roster_assets` rewrite of `dist/` from an
+/// * `targo --unverified ship recover` — the `reconstruct_roster_assets` rewrite of `dist/` from an
 ///   already-published release.
 ///
 /// It is `flock`, so it serializes those writers across PROCESSES; it is per open file
@@ -965,7 +957,7 @@ fn publish_roster(path: &str, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
 /// [`commit_roster_pair`] followed by [`CommittedRoster::complete`]. Naming the commit
 /// point is what lets the property be STATED — every recovery message in this layer
 /// turns on which side of it a failure landed — and it is the only honest way for a
-/// crate that publishes rosters through this layer (`aterm-release`, whose `cargo ship
+/// crate that publishes rosters through this layer (`aterm-release`, whose `targo --unverified ship
 /// provision` seeds the same pair) to prove its own crash recovery: dropping this value
 /// instead of completing it is what a killed process leaves, byte for byte, produced by
 /// the real commit path rather than a hand-built replica of the on-disk layout.
@@ -1543,6 +1535,33 @@ impl std::fmt::Debug for Report {
 /// redo transaction's commit point: before it, undo the key; after it, KEEP the key,
 /// because the pair that authorizes it is durable and the next run installs it.
 pub fn write_rest(planned: Planned) -> Result<Report, String> {
+    // THE RECOVERY DEPENDS ON THE VERB. `setup` armed the anchor before this ran
+    // (`pins_text` is `Some` only then), so a failure that leaves nothing authorized
+    // says to discard the anchor and the paper and start over, where a join (this CLI's,
+    // or `ship provision`'s mint) only undoes its key and retries; and one whose roster
+    // IS recoverable says to commit the anchor — it names the master that roster is
+    // signed by.
+    let armed = planned.pins_text.is_some();
+    let pins = &planned.paths.pins;
+    let start_over = concat(&[
+        "`git checkout -- ",
+        pins,
+        "`, destroy the paper you just wrote, fix the problem above, and run `atpkg-keys \
+         setup` again.",
+    ]);
+    let when_armed = |text: &[&str]| if armed { concat(text) } else { String::new() };
+    let armed_only = when_armed(&[
+        " The anchor is armed but nothing else was written: ",
+        &start_over,
+    ]);
+    // After `rm <key>`.
+    let undo_tail = if armed {
+        concat(&["`, ", &start_over])
+    } else {
+        "`.".to_string()
+    };
+    let then_commit = when_armed(&[" Then commit ", pins, "."]);
+
     // ONE crash-released advisory lock, taken BEFORE the premise check and held through
     // both roster promotions. Every roster writer takes this same lock, which is what
     // closes the compare-then-publish race the old inline check could not: two runs that
@@ -1550,7 +1569,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     // rename, and produce two seq N+1 lineages. Taking it also completes any redo
     // transaction a previous run's death left committed, so the premise this run checks
     // is a consistent pair and not a torn one.
-    let roster_lock = lock_roster(&planned.paths.roster)?;
+    let roster_lock = lock_roster(&planned.paths.roster).map_err(|e| concat(&[&e, &armed_only]))?;
 
     // THE ROSTER'S PREMISE CHECK — the same rule `write_pins` applies to the anchor file,
     // for the same reason: the signed roster this run built extends the pair `plan` read,
@@ -1560,10 +1579,14 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     roster_lock
         .assert_snapshot(planned.roster_snapshot.as_ref())
         .map_err(|e| {
-            concat(&[
-                &e,
-                " NOTHING HAS BEEN WRITTEN: this machine's key does not exist yet.",
-            ])
+            if armed_only.is_empty() {
+                concat(&[
+                    &e,
+                    " NOTHING HAS BEEN WRITTEN: this machine's key does not exist yet.",
+                ])
+            } else {
+                concat(&[&e, &armed_only])
+            }
         })?;
     // Defensive: preflight created this directory before any secret existed. Doing it again
     // costs a syscall and covers the caller who assembled a `Planned` without going through
@@ -1580,6 +1603,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
             &e.to_string(),
             ". No roster was written, so nothing authorizes this machine; if a complete \
              key now exists, move it aside before retrying",
+            &when_armed(&[". The anchor is armed: ", &start_over]),
         ])
     })?;
 
@@ -1593,13 +1617,13 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     // THE RECORD IS THE HALF A PUBLISHER CANNOT DO WITHOUT, so its write is checked, and
     // atomic for the same reason the roster's is. `tools/atpkg-index.sh` refuses to build
     // an index when `machine.toml` is missing, empty or unparseable — the index must state
-    // WHICH machine signed it, and that id is not derivable from the key — and the one
-    // remedy it names is "re-run `atpkg-keys join --id <this-machine-id>`". That remedy is
-    // refused by this module's own preflight the moment `machine.key` exists, and by
-    // `roster_ops::add` for an id the roster already carries. So a discarded error, or the
-    // truncate-then-write window a plain `File::create` leaves, did not cost a retry: it
-    // left a machine that could neither publish nor be re-joined, recoverable only by
-    // hand-writing the file that script tells the operator not to hand-edit.
+    // WHICH machine signed it, and that id is not derivable from the key — and its remedy
+    // is to write the record back by hand (it prints the two lines). `atpkg-keys join`
+    // cannot restore it: this module's own preflight refuses the moment `machine.key`
+    // exists, and `roster_ops::add` refuses an id the roster already carries. So a
+    // discarded error, or the truncate-then-write window a plain `File::create` leaves,
+    // did not cost a retry: it left a machine that could not publish until someone
+    // hand-wrote its record, and could never be re-joined.
     //
     // It stays BEFORE the roster is published, so a failure here leaves exactly the state
     // the key write above leaves — a machine holding a key nothing has authorized — and
@@ -1617,9 +1641,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
                  key file DOES exist; undo it before retrying, or the retry will mint a \
                  second key: `rm ",
                 &planned.paths.key,
-                "` (and `git checkout -- ",
-                &planned.paths.pins,
-                "` if this run armed the master anchor).",
+                &undo_tail,
             ])
         })?;
 
@@ -1650,12 +1672,14 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
                  pair is recoverable: KEEP this machine's key file. Clear the filesystem \
                  obstruction named above, then run any roster command — taking the roster \
                  lock completes the pair forward before reading it.",
+                &then_commit,
             ]),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound && pair_is_target => concat(&[
                 &e,
                 "\nThe exact target roster pair IS installed, even though retiring the \
                  transaction could not be confirmed: KEEP this machine's key file and do \
                  NOT mint again. Rerun once the durability error above is fixed.",
+                &then_commit,
             ]),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => concat(&[
                 &e,
@@ -1664,9 +1688,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
                  key file DOES exist; undo it before retrying, or the retry will mint a \
                  second key: `rm ",
                 &planned.paths.key,
-                "` (and `git checkout -- ",
-                &planned.paths.pins,
-                "` if this run armed the master anchor).",
+                &undo_tail,
             ]),
             Err(err) => concat(&[
                 &e,
@@ -1676,6 +1698,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
                 &err.to_string(),
                 ". KEEP this machine's key file and investigate; do not mint again until \
                  the transaction state is known.",
+                &when_armed(&[" Leave ", pins, " uncommitted until then."]),
             ]),
         }
     })?;
@@ -1768,28 +1791,9 @@ pub fn render_report(r: &Report) -> Vec<String> {
         out.push(numbered(concat(&["review: git diff -- ", &r.paths.pins])));
     }
     if r.verb == Verb::Setup {
-        // WRONG BEFORE: this step named the two tripwire tests below as live work, and
-        // BOTH were deleted by the 2026-08-15 arming commit — neither
-        // `the_paper_master_is_unset_so_the_roster_tier_is_inert` nor
-        // `the_shipped_master_anchor_is_still_empty` is defined anywhere in the tree. A
-        // fork arming from an empty anchor may still carry its own, so the step stays;
-        // the two names are now given as a record, not as an inventory.
         out.push(numbered(
-            "delete any tripwire test that asserts an empty anchor. This tree's own two \
-             went with the 2026-08-15 arming commit; a fork re-armed from an empty anchor \
-             may carry its own. For the record, they were:"
-                .to_string(),
+            "delete any test that asserts the anchor is empty".to_string(),
         ));
-        out.push(
-            "       crates/aterm-update-core/src/pins.rs::tests::\
-             the_paper_master_is_unset_so_the_roster_tier_is_inert"
-                .to_string(),
-        );
-        out.push(
-            "       crates/atpkg-keys/tests/paper_master_to_client.rs::\
-             the_shipped_master_anchor_is_still_empty"
-                .to_string(),
-        );
     }
     if r.pins_changed {
         out.push(numbered("commit — durable from here".to_string()));
@@ -2633,6 +2637,13 @@ mod tests {
         assert!(err.contains("Nothing authorizes this machine yet"), "{err}");
         assert!(err.contains("rm "), "the recovery undoes the key: {err}");
         assert!(
+            err.contains(
+                "destroy the paper you just wrote, fix the problem above, and run \
+                 `atpkg-keys setup` again."
+            ),
+            "setup armed the anchor, so its retry starts over: {err}"
+        );
+        assert!(
             std::path::Path::new(&paths.key).exists(),
             "the key was written first, which is what makes the recovery the two commands \
              the message names"
@@ -2645,6 +2656,63 @@ mod tests {
         assert!(
             !std::path::Path::new(&paths.machine_pub).exists(),
             "and no half-written record is left behind"
+        );
+    }
+
+    /// THE RECOVERY FOLLOWS THE VERB. `join` never touches the anchor, so its failure
+    /// that authorized nothing says `rm <key>` and no more — never `git checkout` or
+    /// "destroy the paper". `setup` armed the anchor before `write_rest` ran, so its
+    /// failure before any key exists says so, rather than "NOTHING HAS BEEN WRITTEN".
+    #[test]
+    fn a_failure_that_authorized_nothing_undoes_only_what_its_verb_did() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("retry-names-the-verb");
+        let paths = paths_in(&dir);
+        write_fixture(&paths);
+        run_setup(&paths, "m3").expect("setup");
+
+        let mut second = paths.clone();
+        second.key = dir.join("m11.key").to_str().unwrap().to_string();
+        let record_dir = dir.join("m11-home");
+        second.machine_pub = record_dir
+            .join("machine.toml")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let pre = preflight(Verb::Join, "m11", &second).expect("preflight");
+        let planned = plan(pre, &seed_of(PAPER), NOW).expect("plan");
+        write_pins(&planned).expect("a join leaves the anchor as it is");
+        std::fs::set_permissions(&record_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = write_rest(planned);
+        std::fs::set_permissions(&record_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains("Nothing authorizes this machine yet"), "{err}");
+        assert!(
+            err.ends_with(&concat(&["`rm ", &second.key, "`."])),
+            "a join undoes its key and retries: {err}"
+        );
+        assert!(
+            !err.contains("git checkout") && !err.contains("destroy the paper"),
+            "a join never armed the anchor: {err}"
+        );
+
+        // `setup`, refused at the roster premise: the anchor is armed, no key exists.
+        let dir = scratch("retry-setup-premise");
+        let paths = paths_in(&dir);
+        write_fixture(&paths);
+        let pre = preflight(Verb::Setup, "m3", &paths).expect("preflight");
+        let planned = plan(pre, &seed_of(PAPER), NOW).expect("plan");
+        write_pins(&planned).expect("the anchor is written");
+        std::fs::write(&paths.roster, b"# appeared after the plan\n").unwrap();
+        let err = write_rest(planned).unwrap_err();
+        assert!(
+            err.contains("The anchor is armed but nothing else was written: `git checkout -- "),
+            "{err}"
+        );
+        assert!(!err.contains("NOTHING HAS BEEN WRITTEN"), "{err}");
+        assert!(
+            !std::path::Path::new(&paths.key).exists(),
+            "refused before the key write"
         );
     }
 
@@ -2904,8 +2972,8 @@ mod tests {
         assert!(text.contains(&report.machine_pubkey), "{text}");
         assert!(text.contains("git diff -- "), "{text}");
         assert!(
-            text.contains("the_paper_master_is_unset_so_the_roster_tier_is_inert"),
-            "setup must name the tripwires it just broke: {text}"
+            text.contains("delete any test that asserts the anchor is empty"),
+            "{text}"
         );
 
         // THE SECRET IS NOT IN THE OUTPUT. The report is built from public identities

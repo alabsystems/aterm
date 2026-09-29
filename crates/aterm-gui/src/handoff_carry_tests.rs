@@ -162,16 +162,49 @@ fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     let (term, turns) = session(80);
     let last = term.lock().unwrap().alt_archive().last();
 
-    // The engine's lock is held (by this thread, which try_lock sees as busy).
+    // The engine's lock is held by ANOTHER thread for as long as the export
+    // runs: the holder lets go when the test says the export is back, or when
+    // its own minute runs out. Its join answers which — the export returned
+    // while the lock was still held (it gave up on it), or the minute released
+    // it (the export waited for the lock). An order, not a stopwatch; the
+    // minute is a hang detector. The order does not see a patience that is
+    // merely long, so two more checks: `LOCK_PATIENCE`, the one bound the
+    // export waits by, against the design's "briefly"; and the export itself,
+    // timed against FIVE SECONDS, a hundred times that constant. THE BUDGET IS
+    // THE SUBJECT there: it sits between the 50 ms the export waits and a
+    // patience of seconds (an export that stopped reading the constant), and a
+    // correct tree fails it only held off the CPU for five seconds — not the
+    // one second the stopwatch this replaced allowed.
     let src = capture(&term, &turns, true);
-    let held = term.lock().unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let term = Arc::clone(&term);
+        std::thread::spawn(move || {
+            let _held = term.lock().unwrap();
+            held_tx.send(()).unwrap();
+            back_rx.recv_timeout(Duration::from_secs(60)).is_ok()
+        })
+    };
+    held_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the holder took the lock");
     let started = Instant::now();
     let carry = decoded(&[src]);
+    let took = started.elapsed();
+    let _ = back_tx.send(());
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        holder.join().unwrap(),
+        "the export gave the lock up while another thread still kept it"
+    );
+    assert!(
+        LOCK_PATIENCE < Duration::from_secs(1),
         "the export waits only briefly"
     );
-    drop(held);
+    assert!(
+        took < Duration::from_secs(5),
+        "the export waits by LOCK_PATIENCE, not seconds: {took:?}"
+    );
     let archive = carry.archive.unwrap();
     assert!(archive.rows.is_empty());
     assert_eq!((archive.first, archive.lost), (last + 1, last));
@@ -322,6 +355,11 @@ fn the_sidecar_round_trips_and_tolerates_what_it_does_not_know() {
     // A status word this build does not print drops that record only.
     let odd = text.replacen("\"settled\"", "\"exploded\"", 1);
     assert_eq!(decode(odd.as_bytes()).unwrap().turns.len(), want.len() - 1);
+    // A turn whose caller hung up during its settle is carried like any other.
+    let hung = text.replacen("\"settled\"", "\"hangup\"", 1);
+    let hung = decode(hung.as_bytes()).unwrap().turns;
+    assert_eq!(hung.len(), want.len());
+    assert!(hung.iter().any(|t| t.status == "hangup"), "{hung:?}");
 }
 
 #[test]

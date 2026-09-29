@@ -98,6 +98,15 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_HANDOFF_READY_FD",
     "ATERM_HANDOFF_RENDEZVOUS",
     "ATERM_HANDOFF_CONTROL_SOCKET_IDENTITY",
+    // The parent → a verified successor that declared the chunked rendezvous grant
+    // in its sealed Info.plist: `chunks1`, so it claims `ATRZ2C`
+    // (`crates/aterm-gui/src/handoff_rendezvous.rs`). Never set for any other child.
+    "ATERM_HANDOFF_GRANT_CAPS",
+    // The fork-lane parent → its successor: the launcher's own soft RLIMIT_NOFILE, so
+    // the successor's shells get what the launcher gave (a forked successor inherits
+    // the parent's RAISED limit and never claims): `ENV_LAUNCHER_NOFILE`
+    // (`crates/aterm-gui/src/handoff_rendezvous.rs`). Never set for any other child.
+    "ATERM_HANDOFF_LAUNCHER_NOFILE",
     // The window/session → the shell integration it injects (its directory, the
     // zsh ZDOTDIR hand-back, the per-shell nonce and the file a re-key of it lands in,
     // the loaded guard, WSL's cwd), and the controller-spawn observation hint.
@@ -109,9 +118,11 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_UNSET_ZDOTDIR",
     "ATERM_WSL_CWD",
     "ATERM_OBSERVE_SESSION_ID",
-    // The harness's state directory, and the drive/mux children.
+    // The window → each shell tab: the program that tab runs, which `aterm doctor`
+    // and `show-config` typed in it report (they cannot see the window's `--shell`).
+    "ATERM_TAB_SHELL",
+    // The harness's state directory, and the mux children.
     "ATERM_HARNESS_STATE",
-    "ATERM_DRIVE_READY",
     "ATERM_MUX",
     "ATERM_MUX_BASE",
     "ATERM_MUX_NOTICE",
@@ -306,6 +317,10 @@ const RETIRED: &[&str] = &[
     // consumer on the books (`apply_policy_engine` on the CLI engine,
     // docs/HARDCORE_BACKLOG.md §4 P0) could never read it.
     "ATERM_SESSION_MODEL",
+    // 2026-09-28: `aterm drive`'s prompt-ready pattern — a person's knob parked on
+    // INTERNAL_PROTOCOL, though nothing in aterm sets it for a child. `--ready` is the
+    // one spelling.
+    "ATERM_DRIVE_READY",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -751,6 +766,18 @@ const RETIRED_DETECTOR: (&str, &str) = ("crates/atpkg/src/doctor.rs", "RETIRED_O
 /// fails as stale. An entry excuses only a PRESUMED read ([`Context::Presumed`]): a
 /// reader call of the same name in the same file (`env::var(NAME)`) is still a read.
 const MENTIONS: &[(&str, &str, &str)] = &[
+    (
+        "crates/aterm-types/src/rust_lane.rs",
+        "ATERM_STOCK_REASON",
+        "the stock-Rust escape WORD, matched in a command's text as an assignment in front of \
+         the command; nothing reads it from an environment (its doc comment says so)",
+    ),
+    (
+        "crates/atpkg/src/lane.rs",
+        "ATERM_STOCK_REASON",
+        "`aterm pkg lane` naming the same command-text escape word; nothing reads it from an \
+         environment",
+    ),
     (
         "crates/aterm-gui/src/app_update_screen.rs",
         "ATERM_DEBUG_RELAUNCH_NUDGE",

@@ -1171,7 +1171,7 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
                 let _ = writeln!(
                     log,
                     "  ✗ FAIL [OB-2] {e} — without the lockfile attest cannot confirm the patch \
-                     took. Run `cargo generate-lockfile` (or `cargo metadata --offline`) first."
+                     took. Run `targo generate-lockfile` (or `targo metadata --offline`) first."
                 );
                 fails += 1;
             }
@@ -1185,7 +1185,7 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
                         log,
                         "  ✗ FAIL [OB-2] Cargo.lock has no source-less `{}` entry — the \
                          [patch.crates-io] redirect to `{}` DID NOT TAKE and every consumer is \
-                         compiling the registry copy. Re-run `cargo metadata --offline` after \
+                         compiling the registry copy. Re-run `targo metadata --offline` after \
                          making the vendored version satisfy the stated requirement.",
                         fork.name, fork.rel
                     );
@@ -1195,7 +1195,7 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
                         log,
                         "  ✗ FAIL [OB-2] Cargo.lock's path entry for `{}` is version {} but \
                          `{}/Cargo.toml` says {} — refresh the lockfile with \
-                         `cargo metadata --offline`.",
+                         `targo metadata --offline`.",
                         fork.name,
                         patched
                             .iter()
@@ -1217,7 +1217,7 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
                         log,
                         "  • NOTE [OB-2] `{}` also resolves UNFORKED from the registry at {} \
                          beside the fork at {}. The fork's fixes do not apply to those copies; \
-                         `cargo forge check` scores that patch-liveness gap per cell.",
+                         `targo --unverified forge check` scores that patch-liveness gap per cell.",
                         fork.name,
                         registry.join(", "),
                         fork.version
@@ -1252,7 +1252,7 @@ fn ob3_workspace_stub(forks: &[VendoredFork], log: &mut String) -> usize {
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-3] `{}/Cargo.toml` has no empty `[workspace]` table, so the crate \
-             cannot be driven standalone. MEASURED on this tree: `cargo metadata` with cwd \
+             cannot be driven standalone. MEASURED on this tree: `targo metadata` with cwd \
              inside the crate exits 101 (\"current package believes it's in a workspace when \
              it's not\"), which is exactly what `targo trust check -p {}` needs to work. FIX: \
              append a bare `[workspace]` line to {}/Cargo.toml.",

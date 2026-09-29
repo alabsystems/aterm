@@ -1441,6 +1441,18 @@ pub fn press_target(
     Ok((index, label))
 }
 
+/// Spend one band press for a press that did not come through `notice act`
+/// — `pointer click` on a capsule (ruling 373): every scripted press of the
+/// band shares [`WIRE_PRESSES_PER_WINDOW`] (ruling 195), whichever verb
+/// carries it, so alternating the two routes buys a loop nothing.
+///
+/// # Errors
+/// The whole `ERR busy notice: … presses a minute retry_ms=<ms>` line when
+/// the window's presses are spent.
+pub fn spend_press(gate: &mut WireGate, now: Instant) -> Result<(), String> {
+    gate.try_press(now).map_err(Busy::reply)
+}
+
 /// `OK acted=<pct label> performed=<1|0>`.
 #[must_use]
 pub fn acted_reply(label: &str, performed: bool, enc: &dyn Fn(&str) -> String) -> String {

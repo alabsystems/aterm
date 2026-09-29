@@ -11,8 +11,11 @@
 //! capture ladder (`aterm-gui`'s `seamless::carry_for_wire`) makes the producer total
 //! over the screen content it can SEE; this file is the escape hatch for the bugs it
 //! cannot see: a capture path that is slow or panics, a proof that mismatches
-//! itself, a park gate that never opens. For one release, the successor can ask
-//! every affected producer to carry less.
+//! itself, a park gate that never opens. From the release that seals it, the
+//! successor can ask every affected producer to carry less — and only while later
+//! releases keep it: a producer reads the policy of the release it hands over to
+//! alone, so one that skipped the rescuing release is covered only if the newest
+//! release still names it (`docs/RELEASING.md`).
 //!
 //! WHERE IT LIVES. The release cutter copies the checked-in [`SOURCE_PATH`]
 //! (`publish/handoff-policy.toml`) into the bundle at [`BUNDLE_PATH`] BEFORE it
@@ -360,6 +363,16 @@ pub enum PolicyRead {
     /// A file that is there but cannot be followed, and why. Ignored: the producer
     /// behaves exactly as with no file.
     Ignored(String),
+    /// The read never reached the file's bytes — the system refused it FOR NOW (no
+    /// descriptor left, no memory, an I/O error, an interrupted call) — and why.
+    ///
+    /// NOT A VERDICT ON THE FILE (round seven, H1 finding 57). Filed as
+    /// [`Self::Ignored`], a moment of descriptor exhaustion was cached with the
+    /// candidate's verified pass as "the successor asks nothing", and for the pass's
+    /// freshness window every park ran the very capture the release had sealed a
+    /// policy to route around. A reader treats this as "unknown": the pre-verify
+    /// refuses as a passing condition, and the next attempt reads the file again.
+    Unread(String),
 }
 
 /// Read the policy of the bundle rooted at `app_root`.
@@ -373,13 +386,63 @@ pub enum PolicyRead {
 #[must_use]
 pub fn read_from_bundle(app_root: &Path) -> PolicyRead {
     let path = app_root.join(BUNDLE_PATH);
-    match read_bounded(&path) {
+    judge(&path, read_bounded(&path))
+}
+
+/// What [`read_bounded`]'s answer for the policy at `path` means.
+fn judge(path: &Path, read: Result<Option<String>, ReadFailure>) -> PolicyRead {
+    match read {
         Ok(None) => PolicyRead::Absent,
         Ok(Some(text)) => match HandoffPolicy::parse(&text) {
             Ok(policy) => PolicyRead::Parsed(policy),
             Err(why) => PolicyRead::Ignored(format!("{}: {why}", path.display())),
         },
-        Err(why) => PolicyRead::Ignored(format!("{}: {why}", path.display())),
+        Err(ReadFailure::File(why)) => PolicyRead::Ignored(format!("{}: {why}", path.display())),
+        Err(ReadFailure::Moment(why)) => PolicyRead::Unread(format!("{}: {why}", path.display())),
+    }
+}
+
+/// Why [`read_bounded`] could not hand back the file's text.
+enum ReadFailure {
+    /// A fact about the FILE: not a regular file, too large, not UTF-8, or an error
+    /// the same file would give again.
+    File(String),
+    /// A fact about this MOMENT ([`is_momentary`]): the bytes were never reached.
+    Moment(String),
+}
+
+/// Whether an I/O error says the system could not serve the read just then, not
+/// that the file is unreadable: out of descriptors (`EMFILE`, `ENFILE`), out of
+/// memory or buffers (`ENOMEM`, `ENOBUFS`), a device error (`EIO`), an interrupted
+/// or would-block call (`EINTR`, `EAGAIN`).
+fn is_momentary(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::OutOfMemory
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS | libc::EIO)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// An I/O error of the read, sorted by [`is_momentary`].
+fn unreadable(error: &std::io::Error) -> ReadFailure {
+    let why = format!("unreadable: {error}");
+    if is_momentary(error) {
+        ReadFailure::Moment(why)
+    } else {
+        ReadFailure::File(why)
     }
 }
 
@@ -394,7 +457,7 @@ pub fn read_from_bundle(app_root: &Path) -> PolicyRead {
 /// with the apply lock held on the staged lane, and every PTY reader parked on the
 /// fork lane (the same race `aterm-gui`'s seamless reader closes the same way).
 /// A FIFO opened non-blocking returns at once and is refused as not a regular file.
-fn read_bounded(path: &Path) -> Result<Option<String>, String> {
+fn read_bounded(path: &Path) -> Result<Option<String>, ReadFailure> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -409,32 +472,34 @@ fn read_bounded(path: &Path) -> Result<Option<String>, String> {
         // `O_NOFOLLOW` on a symbolic link: never followed, never read.
         #[cfg(unix)]
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err("not a regular file (a symbolic link)".to_string());
+            return Err(ReadFailure::File(
+                "not a regular file (a symbolic link)".to_string(),
+            ));
         }
-        Err(error) => return Err(format!("unreadable: {error}")),
+        Err(error) => return Err(unreadable(&error)),
     };
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("unreadable: {error}"))?;
+    let metadata = file.metadata().map_err(|error| unreadable(&error))?;
     if !metadata.file_type().is_file() {
-        return Err("not a regular file".to_string());
+        return Err(ReadFailure::File("not a regular file".to_string()));
     }
     if metadata.len() > MAX_POLICY_BYTES {
-        return Err(format!(
+        return Err(ReadFailure::File(format!(
             "{} bytes, over the {MAX_POLICY_BYTES}-byte bound",
             metadata.len()
-        ));
+        )));
     }
     let mut bytes = Vec::new();
     file.take(MAX_POLICY_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("unreadable: {error}"))?;
+        .map_err(|error| unreadable(&error))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_POLICY_BYTES {
-        return Err(format!("over the {MAX_POLICY_BYTES}-byte bound"));
+        return Err(ReadFailure::File(format!(
+            "over the {MAX_POLICY_BYTES}-byte bound"
+        )));
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|_| "not UTF-8".to_string())
+        .map_err(|_| ReadFailure::File("not UTF-8".to_string()))
 }
 
 /// What a producer running `producer_build` does with what it read.
@@ -457,6 +522,10 @@ impl Adoption {
         match read {
             PolicyRead::Absent => Self::None,
             PolicyRead::Ignored(why) => Self::Ignored(why.clone()),
+            // Never reached through `aterm-update`'s pre-verifications, which refuse
+            // an unread policy as a passing condition before any caller adopts it;
+            // total here, and read as the one thing it can be: nothing to follow.
+            PolicyRead::Unread(why) => Self::Ignored(format!("not read just then: {why}")),
             PolicyRead::Parsed(policy) if !policy.applies_to(producer_build) => {
                 Self::NotForThisBuild(*policy)
             }
@@ -755,6 +824,56 @@ mod tests {
         for root in [absent, parsed, malformed, huge, binary, directory] {
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// A READ THE SYSTEM REFUSED FOR NOW IS UNREAD, NOT IGNORED (round seven, H1
+    /// finding 57). Out of descriptors (a launchd-started window's soft limit of 256
+    /// on a large desk), out of memory, an I/O error: the file's bytes were never
+    /// reached, so nothing is known about what it asks. Filed as `Ignored` — the
+    /// verdict for a malformed file — it was cached as "the successor asks nothing"
+    /// and every park for ten minutes ran the capture the policy was sealed to avoid.
+    /// An error the same file would give again stays a verdict on the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_the_system_refused_for_now_is_unread_and_a_file_error_is_ignored() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::EIO,
+            libc::EINTR,
+            libc::EAGAIN,
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                matches!(unreadable(&error), ReadFailure::Moment(why) if why.contains("unreadable")),
+                "errno {errno} ({error}) is a moment"
+            );
+        }
+        for errno in [libc::EACCES, libc::EPERM, libc::EISDIR, libc::ENOTDIR] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                matches!(unreadable(&error), ReadFailure::File(_)),
+                "errno {errno} ({error}) is a fact about the file"
+            );
+        }
+        // And what each becomes, read off a bundle.
+        let at = std::path::Path::new("/x/Contents/Resources/aterm-handoff-policy.toml");
+        let unread = judge(
+            at,
+            Err(unreadable(&std::io::Error::from_raw_os_error(libc::EMFILE))),
+        );
+        assert!(matches!(
+            judge(
+                at,
+                Err(unreadable(&std::io::Error::from_raw_os_error(libc::EACCES)))
+            ),
+            PolicyRead::Ignored(_)
+        ));
+        assert!(matches!(&unread, PolicyRead::Unread(why) if why.contains("Too many open files")));
+        // Adoption stays total: nothing to follow, never a policy made up.
+        assert_eq!(Adoption::of(&unread, 1).policy(), None);
     }
 
     /// A FIFO WHERE THE POLICY SHOULD BE IS REFUSED AT ONCE, NEVER WAITED ON. The

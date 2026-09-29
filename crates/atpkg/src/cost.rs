@@ -9,115 +9,22 @@
 //! pure decision + formatting helpers; the actual prompt and the free-space query are the
 //! CLI/OS edge.
 
-/// Format a byte count as a short human string (`B`/`KiB`/`MiB`/`GiB`) for the cost surface.
-///
-/// MIRRORED (deliberately, not depended on) by `aterm-release::bundle::human_bytes`,
-/// which renders the sealed toolchain seed's size in the cut transcript: the
-/// release cutter must build without the package manager, so the tiers and the
-/// one-decimal rendering are duplicated there. Change both or neither.
-///
-/// Byte-identical to the previous `format!("{:.1} GiB", n as f64 / GIB as f64)`
-/// spelling for every `n` (see [`one_decimal`]) — rewritten `format!`-free because the
-/// `format!` expansion embeds `fmt::Arguments` construction (with inlined `unsafe`)
-/// that the strict Trust gate cannot lower and fails closed on.
+/// Format a byte count as a short human string (`B`/`KiB`/`MiB`/`GiB`, one decimal) for
+/// the cost surface.
 #[must_use]
 pub fn human_bytes(n: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if n >= GIB {
-        let mut s = one_decimal(n, 30);
-        s.push_str(" GiB");
-        s
+        format!("{:.1} GiB", n as f64 / GIB as f64)
     } else if n >= MIB {
-        let mut s = one_decimal(n, 20);
-        s.push_str(" MiB");
-        s
+        format!("{:.1} MiB", n as f64 / MIB as f64)
     } else if n >= KIB {
-        let mut s = one_decimal(n, 10);
-        s.push_str(" KiB");
-        s
+        format!("{:.1} KiB", n as f64 / KIB as f64)
     } else {
-        let mut s = crate::dec_u64(n);
-        s.push_str(" B");
-        s
+        format!("{n} B")
     }
-}
-
-/// Render `n / 2^k` with exactly one fractional digit — byte-identical to
-/// `format!("{:.1}", n as f64 / (1u64 << k) as f64)` for every `n`, in straight-line
-/// integer arithmetic the strict gate can prove.
-///
-/// Why this is exact, step by step:
-/// 1. `n as f64` rounds `n` to 53 significant bits, ties to even (IEEE 754
-///    round-to-nearest-even) — emulated below, kept as `(mant, exp)` with
-///    `mant <= 2^53`, `exp <= 11`, so `mant << exp` never has to materialize
-///    (for `n` near `u64::MAX` it is exactly `2^64`).
-/// 2. Dividing an f64 by `2^k` only changes the exponent — exact, no rounding
-///    (the quotient here is far from subnormal). So the f64 being formatted is
-///    exactly the dyadic rational `mant / 2^(k - exp)`.
-/// 3. `{:.1}` cuts the exact decimal expansion at one fractional digit, rounding
-///    to nearest with ties to even on the kept tenths digit (`flt2dec` exact
-///    mode; verified against `format!` over a case table that includes both
-///    decimal ties and both sides of 2^53, in `human_bytes_matches_float_format`, this
-///    module's only oracle test. It never was `one_decimal_matches_format`,
-///    which this line named and which is defined nowhere in the tree.)
-///
-/// All shifts are `wrapping_*` (total, no panic obligations); shift amounts are
-/// in-range on every reachable input, as argued inline.
-fn one_decimal(n: u64, k: u32) -> String {
-    // 1. Emulate `n as f64`. `lz >= 11` means `n < 2^53`: exactly representable.
-    let lz = n.leading_zeros();
-    let (mant, exp) = if lz >= 11 {
-        (n, 0u32)
-    } else {
-        let excess = 11 - lz; // 1..=11
-        let keep = n.wrapping_shr(excess);
-        let rem = n & 1u64.wrapping_shl(excess).wrapping_sub(1);
-        let half = 1u64.wrapping_shl(excess.wrapping_sub(1));
-        let round_up = rem > half || (rem == half && keep & 1 == 1);
-        // `keep <= 2^53 - 1`, so the increment cannot wrap; saturating spells
-        // that for the prover (identical value on every reachable input).
-        let m = if round_up {
-            keep.saturating_add(1)
-        } else {
-            keep
-        };
-        // A carry to `m == 2^53` is fine: we keep the value as `m * 2^excess`
-        // and never materialize the (possibly 65-bit) product.
-        (m, excess)
-    };
-    // 2. The formatted value is exactly `mant / 2^sh`. `exp > 0` only when
-    //    `n >= 2^53`, which forces the GiB branch (`k == 30`), so `sh >= 19`;
-    //    in the KiB/MiB branches `exp == 0` and `sh == k >= 10`.
-    let sh = k.saturating_sub(exp);
-    // 3. Tenths digit cut, round to nearest, ties to even:
-    //    `t10 / 2^sh` with the remainder deciding the direction.
-    //    `mant <= 2^53` by construction; the clamp is a no-op that hands the
-    //    prover the dominating bound, so `mant * 10 < 2^57` cannot overflow.
-    let mant = if mant <= (1u64 << 53) {
-        mant
-    } else {
-        1u64 << 53
-    };
-    // `mant <= 2^53`, so this cannot saturate (`10 * 2^53 < 2^57 < 2^64`); the
-    // saturating spelling replaces the overflow obligation the gate could not
-    // carry through the clamp, with identical value on every reachable input.
-    let t10 = mant.saturating_mul(10);
-    let d = t10.wrapping_shr(sh);
-    let rem = t10 & 1u64.wrapping_shl(sh).wrapping_sub(1);
-    let half = 1u64.wrapping_shl(sh.wrapping_sub(1));
-    // `d < 2^57 / 2^sh <= 2^47`, so the round-up increment cannot wrap.
-    let d = if rem > half || (rem == half && d & 1 == 1) {
-        d.saturating_add(1)
-    } else {
-        d
-    };
-    // 4. Render "<integer part>.<tenths digit>".
-    let mut s = crate::dec_u64(d / 10);
-    s.push('.');
-    s.push(char::from(b'0'.wrapping_add((d % 10) as u8)));
-    s
 }
 
 /// Disk preflight (§9/§10.2): whether `required` installed bytes fit in `available` while
@@ -145,55 +52,9 @@ mod tests {
         assert_eq!(human_bytes(1 << 20), "1.0 MiB");
         assert_eq!(human_bytes(3 * (1 << 30)), "3.0 GiB");
         assert_eq!(human_bytes((3 << 30) / 2), "1.5 GiB");
-    }
-
-    /// The manual `one_decimal` rendering must be byte-identical to the previous
-    /// `format!("{:.1}", n as f64 / unit as f64)` spelling — including decimal
-    /// ties (round half to even: 1.25 MiB renders "1.2") and the `u64 -> f64`
-    /// precision loss above 2^53.
-    #[test]
-    #[allow(clippy::cast_precision_loss)]
-    fn human_bytes_matches_float_format() {
-        const KIB: u64 = 1 << 10;
-        const MIB: u64 = 1 << 20;
-        const GIB: u64 = 1 << 30;
-        let cases: &[u64] = &[
-            0,
-            1,
-            512,
-            KIB - 1,
-            KIB,
-            KIB + 1,
-            1536,
-            MIB - 1,
-            MIB,
-            MIB + 1,
-            1_310_720, // exactly 1.25 MiB — a decimal tie, rounds half-to-even to "1.2"
-            3_932_160, // exactly 3.75 MiB — tie the other way, rounds to "3.8"
-            GIB - 1,
-            GIB,
-            GIB + 1,
-            (3 << 30) / 2,
-            3 * GIB,
-            (1 << 53) - 1,
-            1 << 53,
-            (1 << 53) + 1, // above 2^53: `as f64` rounds; emulation must match
-            (1 << 53) + 3,
-            u64::MAX - 1,
-            u64::MAX,
-        ];
-        for &n in cases {
-            let expected = if n >= GIB {
-                format!("{:.1} GiB", n as f64 / GIB as f64)
-            } else if n >= MIB {
-                format!("{:.1} MiB", n as f64 / MIB as f64)
-            } else if n >= KIB {
-                format!("{:.1} KiB", n as f64 / KIB as f64)
-            } else {
-                format!("{n} B")
-            };
-            assert_eq!(human_bytes(n), expected, "n = {n}");
-        }
+        // `{:.1}` rounds half to even on the tenths digit: exactly 1.25 MiB is "1.2".
+        assert_eq!(human_bytes(1_310_720), "1.2 MiB");
+        assert_eq!(human_bytes(u64::MAX), "17179869184.0 GiB");
     }
 
     #[test]

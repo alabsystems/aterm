@@ -23,22 +23,23 @@ use aterm_spec::derive::{
     alt_selection_park_model, anchored_artifact_transaction_model, artifact_handoff_capacity_model,
     artifact_reader_lease_model, artifact_reply_publication_model, asymmetric_pad_layout_model,
     capture_after_present_model, channel_bind_model, chrome_face_gate_model,
-    claude_footer_watch_model, claude_idle_at_composer_model, clipboard_mailbox_model,
-    closed_recovery_ledgers_model, coalesce_model, companion_tenure_flicker_model,
-    composed_sync_hold_model, composite_accessibility_route_model, config_catalog_snapshot_model,
-    config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
-    control_lane_tenure_model, ct_frac_bearing_model, cursor_cat_curse_wince_model,
-    cursor_cat_earn_floor_model, cursor_cat_fold_model, cursor_cat_model,
-    cursor_cat_motion_pulse_routing_model, cursor_companion_owner_lifecycle_model,
-    cursor_cutout_clip_model, cursor_effect_scroll_model, cursor_hint_license_model, cursor_model,
-    cursor_scroll_signal_model, cursor_viewport_lifecycle_model, damage_to_present_model,
-    deco_band_containment_model, deco_phase_model, done_mark_lru_model, dsu_quiescence_model,
-    echo_ledger_bridge_model, effect_phase_lock_model, effect_present_rebase_model,
-    effect_presentability_settle_model, emacs_search_navigation_model, evict_full_model,
-    exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
-    fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
-    flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
-    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
+    claude_footer_model_model, claude_footer_watch_model, claude_idle_at_composer_model,
+    clipboard_mailbox_model, closed_recovery_ledgers_model, coalesce_model,
+    companion_tenure_flicker_model, composed_sync_hold_model, composite_accessibility_route_model,
+    config_catalog_snapshot_model, config_file_commit_cas_model, contrast_floor_model,
+    control_connection_admission_model, control_lane_tenure_model, ct_frac_bearing_model,
+    cursor_cat_curse_wince_model, cursor_cat_earn_floor_model, cursor_cat_fold_model,
+    cursor_cat_model, cursor_cat_motion_pulse_routing_model,
+    cursor_companion_owner_lifecycle_model, cursor_cutout_clip_model, cursor_effect_scroll_model,
+    cursor_hint_license_model, cursor_model, cursor_scroll_signal_model,
+    cursor_viewport_lifecycle_model, damage_to_present_model, deco_band_containment_model,
+    deco_phase_model, done_mark_lru_model, dsu_quiescence_model, echo_ledger_bridge_model,
+    effect_phase_lock_model, effect_present_rebase_model, effect_presentability_settle_model,
+    emacs_search_navigation_model, evict_full_model, exact_instance_retention_model,
+    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
+    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
+    flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
+    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
     harness_model_ladder_model, harness_model_priority_model, harness_model_switch_model,
     hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
     idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
@@ -332,6 +333,110 @@ fn derived_claude_footer_watch_retires_and_keeps_a_replacement() {
     assert!(model.fire("StopSession", &mut state));
     assert_eq!(state["watch"], 0);
     assert!(!model.action_enabled("IdleRead", &state));
+}
+
+/// WHICH MODEL THE CLAUDE FOOTER NAMES: `ty` proves the footer shows only the
+/// model the process runs (or nothing), names a choice the moment it is read,
+/// keeps the process's model across a `/clear` and across a `/resume` the
+/// process pinned — a restore pins it, at an in-REPL `/resume` or a launch
+/// `--resume` — and names the model Claude restored, from a conversation
+/// another process began since this one started too; and it catches the
+/// readers it replaces — the `/model` row that voided the model until the
+/// next answer, the floorless read of the resumed conversation's own rows,
+/// the tail window a huge row flushed, the reader that kept nothing of the
+/// process across a `/clear`, the one that read an in-REPL `/resume` as a
+/// `/clear`, the one that took a restore for no pin, and the one that told
+/// a `/resume` from a `/clear` by the floor alone. Each law is the only one
+/// some mutant step breaks. Tier-1: aterm-agent's `conformance_footer_model`
+/// drives the real transcript reader.
+#[test]
+fn derived_claude_footer_model_names_the_running_model_at_once() {
+    let model = claude_footer_model_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_breaks_first(&model, &[]);
+
+    let run = |m: &aterm_spec::derive::Model, actions: &[&str]| {
+        let mut state = m.init_state();
+        for action in actions {
+            assert!(m.fire(action, &mut state), "{action} on {state:?}");
+        }
+        (state["runs"], state["shown"])
+    };
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    // The owner's session: a `/model` choice, read before any answer.
+    assert_eq!(
+        run(&model, &["DrawCard", "Read", "ChooseB", "Read"]),
+        (2, 2)
+    );
+    // A huge row does not take it away…
+    assert_eq!(
+        run(&model, &["DrawCard", "Read", "ChooseB", "Flood", "Read"]),
+        (2, 2)
+    );
+    // …where the mutant reader loses it to the card's starting model.
+    assert_eq!(
+        run(&buggy, &["DrawCard", "Read", "ChooseB", "Flood", "Read"]),
+        (2, 1)
+    );
+    // A `/clear` keeps it: the process runs what it chose, not its flag…
+    assert_eq!(
+        run(&model, &["Flag", "Read", "ChooseB", "Clear", "Read"]),
+        (2, 2)
+    );
+    // …and the mutant falls back to the launch flag's.
+    assert_eq!(
+        run(&buggy, &["Flag", "Read", "ChooseB", "Clear", "Read"]),
+        (2, 1)
+    );
+    // An in-REPL `/resume` of a process that pinned nothing runs the
+    // conversation's model (`Pred`), and the footer names it; the mutant
+    // reads the resume as a clear — the answer it carried.
+    let resume = ["Read", "Answer", "Read", "Resume", "Read"];
+    assert_eq!(run(&model, &resume), (2, 2));
+    assert_eq!(run(&buggy, &resume), (2, 1));
+    // A pinned one keeps its own, and so does the footer.
+    assert_eq!(
+        run(&model, &["Read", "ChooseA", "Read", "Resume", "Read"]),
+        (1, 1)
+    );
+    // A RESTORE PINS (the reviewer's R1): the second `/resume` keeps the
+    // restored `Pred`, where the reader that took a restore for no pin
+    // restores `Other`.
+    let r1 = [
+        "Read", "Answer", "Read", "Resume", "Read", "Answer", "Read", "Resume", "Read",
+    ];
+    assert_eq!(run(&model, &r1), (2, 2));
+    assert_eq!(run(&buggy, &r1), (2, 1));
+    // A LAUNCH RESUME restores and pins (the reviewer's R2): the footer
+    // names `Pred` at first sight, and an in-REPL `/resume` keeps it.
+    let r2 = ["LaunchResume", "Read", "Answer", "Read", "Resume", "Read"];
+    assert_eq!(run(&model, &["LaunchResume", "Read"]), (2, 2));
+    assert_eq!(run(&model, &r2), (2, 2));
+    assert_eq!(run(&buggy, &r2), (2, 1));
+    // Under a `--model` it restores nothing: the flag's model, where the
+    // floorless reader names the resumed conversation's own.
+    let flagged = ["Flag", "LaunchResume", "Read"];
+    assert_eq!(run(&model, &flagged), (1, 1));
+    assert_eq!(run(&buggy, &flagged), (1, 2));
+    // A `/resume` into D, a conversation another process began since this
+    // one started, restores and pins like any (the reviewer's H5): the next
+    // `/resume` keeps `Pred`, where the floor-only judge restores `Other`…
+    let h5 = [
+        "Read",
+        "Answer",
+        "Read",
+        "ResumeLate",
+        "Read",
+        "Resume",
+        "Read",
+    ];
+    assert_eq!(run(&model, &h5), (2, 2));
+    assert_eq!(run(&buggy, &h5), (2, 1));
+    // …and a pinned process keeps its own model in D, where that judge
+    // names D's own answer.
+    let pinned_late = ["Read", "ChooseA", "Read", "ResumeLate", "Read"];
+    assert_eq!(run(&model, &pinned_late), (1, 1));
+    assert_eq!(run(&buggy, &pinned_late), (1, 2));
 }
 
 /// TERMINAL MODES: `ty` proves that either reset (DECSTR / RIS) leaves the
@@ -1590,7 +1695,7 @@ fn derived_hdr_reconfigure_retag_proves_and_catches_ignored_failure() {
 /// animates at unit amplitude (the non-vacuity twin). `ty` PROVES all three
 /// (Buggy=0) and CATCHES the pre-W11 defect — the OS Reduce Motion flag was
 /// never queried, so auto mode kept animating (Buggy=1 → counterexample).
-/// Bound to the shipping resolver by aterm-gui's exhaustive
+/// Bound to the shipping resolver by aterm-effects' exhaustive
 /// `motion::tests::reduced_motion_totality` (Tier-1, complete over the finite
 /// domain × the enumerated `MotionEffect::ALL` set).
 #[test]
@@ -1630,12 +1735,15 @@ fn derived_emacs_search_navigation_proves_and_catches_each_regression() {
 /// M1/W11 (smooth-scroll convergence + accessibility settlement): a Full-policy
 /// wheel glide makes strict bounded progress and disarms exactly at its target;
 /// a Full→Reduced edge lands there and disarms AT ONCE, so Reduced owns no glide
-/// deadline. `ty` proves `BoundedWakes`, `DisarmedAtTarget`, and
-/// `ReducedSettled` (Buggy=0), and catches the audited mutant that keeps the
-/// intermediate row + armed deadline across `SetReduced` (Buggy=1).
+/// deadline; output that re-pins the viewport mid-glide shifts the target with
+/// it. `ty` proves `BoundedWakes`, `DisarmedAtTarget`, `ReducedSettled` and
+/// `TargetIsAnchored` (Buggy=0), and catches the audited mutant that keeps the
+/// intermediate row + armed deadline across `SetReduced` and the pre-2026-09-22
+/// tick that left the target behind the machine's re-pin (Buggy=1).
 /// Bound to the shipping `scroll_motion::Glide` and App settle reducer by
 /// aterm-gui's convergence lattice tests plus
-/// `reduced_motion_settle_conforms_to_scroll_glide_model` (Tier-1).
+/// `reduced_motion_settle_conforms_to_scroll_glide_model` and
+/// `output_mid_glide_conforms_to_scroll_glide_model` (Tier-1).
 #[test]
 fn derived_scroll_glide_proves_and_catches_unsettled_reduced_edge() {
     assert_proves_and_catches(&scroll_glide_model());
@@ -6925,6 +7033,7 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     // checking the same machine concurrently race over its emitted module in
     // the external `ty` tier).
     ladder_never_retries_a_capture_refusal_as_activity(&model);
+    ladder_never_converges_a_passing_failure(&model, &keys_only);
     ladder_keeps_a_latch_across_its_own_bundle_swap(&model, &latched);
     ladder_lets_a_newer_release_clear_a_converged_activation_latch(&model, &latched);
 }
@@ -7218,6 +7327,67 @@ fn ladder_lets_a_newer_release_clear_a_converged_activation_latch(
 /// v0.87–v0.91 shipped — clears it, the activation arms half a second later,
 /// and a structural failure's ten-minute confirming retry runs at once.
 /// `NoEarlyRelease` catches it.
+/// ROUND FOUR OF THE 2026-09 UPDATE ROBUSTNESS WORK (plan item 2): a failure
+/// on a passing MOMENT — the pre-park `codesign` past the apply budget, the
+/// apply lock held past its wait, a successor that exited 75 because its swap
+/// was deferred for one of those — latches the lane with a deadline, and the
+/// deadline releases it: the ladder resumes where the clock is. No structural
+/// verdict is ever minted from it, even after the bundle swap that makes one
+/// reachable for a genuine failure.
+///
+/// The mutant is what shipped: the cached verdict of that moment booked
+/// STRUCTURAL, so the latch converged — a healthy build held for the day's
+/// re-sample, or for good as "the installed copy's". The healthy lane has no
+/// such step; `APassingFailureNeverConverges` catches the mutant's. The ladder's
+/// liveness cannot (a converged latch with nothing newer is Law 2's rest), which
+/// is the reason the invariant exists.
+fn ladder_never_converges_a_passing_failure(model: &Model, keys_only: &aterm_spec::interp::State) {
+    let passing = model.successors("PassingFailure", keys_only)[0].clone();
+    assert_eq!(
+        (
+            passing["latched"],
+            passing["failures"],
+            passing["passing"],
+            passing["due"],
+            passing["converged"]
+        ),
+        (1, 1, 1, 0, 0),
+        "a passing failure latches the lane with a deadline still to come"
+    );
+    assert!(model.check_invariant("APassingFailureNeverConverges", &passing));
+    // Even once the bundle swap re-keys it — the step that makes a genuine
+    // failure's convergence reachable — a passing latch never converges.
+    let swapped = model.successors("BundleSwap", &passing)[0].clone();
+    assert!(
+        model.successors("Converge", &swapped).is_empty(),
+        "no structural verdict is minted from a moment"
+    );
+    let due = model.successors("Due", &passing)[0].clone();
+    let lapsed = model.successors("Lapse", &due)[0].clone();
+    assert_eq!(lapsed["latched"], 0, "its deadline releases it");
+    assert_eq!(
+        lapsed["phase"], passing["phase"],
+        "and the ladder resumes where the clock is"
+    );
+    assert!(model.check_invariant("NoEarlyRelease", &lapsed));
+
+    // THE MUTANT: the same moment filed structural converges the latch.
+    assert!(
+        model
+            .successors("PassingFailureConverges", &passing)
+            .is_empty(),
+        "the healthy ladder has no step that converges a passing failure"
+    );
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
+    let held = buggy.successors("PassingFailureConverges", &passing)[0].clone();
+    assert_eq!((held["latched"], held["converged"], held["due"]), (1, 1, 0));
+    assert!(
+        buggy.successors("Due", &held).is_empty(),
+        "the mutant's latch has no ordinary deadline left: the 24 h hold"
+    );
+    assert!(!buggy.check_invariant("APassingFailureNeverConverges", &held));
+}
+
 fn ladder_keeps_a_latch_across_its_own_bundle_swap(
     model: &Model,
     latched: &aterm_spec::interp::State,

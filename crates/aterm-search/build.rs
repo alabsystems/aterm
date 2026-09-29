@@ -32,22 +32,11 @@ fn gate_streaming_search() {
 
     // `prove_and_catch_scalar` asserts the scalar shape, so the interpreter tier
     // ran for both configurations; `Covered::TyOnly` would mean it did not, and
-    // this gate must never report a green it did not earn in-process.
+    // this gate must never pass on a check it did not run in-process. A pass
+    // prints nothing: a violated or vacuous invariant already panics above and
+    // fails the build (the same rule as aterm-grid's build script).
     assert!(
         wrap1 != Covered::TyOnly && wrap0 != Covered::TyOnly,
         "scalar StreamingSearch models must always run in the embedded interpreter"
     );
-    if wrap1 == Covered::InterpreterAndTy && wrap0 == Covered::InterpreterAndTy {
-        println!(
-            "cargo:warning=temporal gate ✓ {} proven and non-vacuous for Wrap=0/1 by the \
-             embedded exhaustive interpreter and Trust ty",
-            m.name
-        );
-    } else {
-        println!(
-            "cargo:warning=temporal gate ✓ {} proven and non-vacuous for Wrap=0/1 by the \
-             embedded exhaustive interpreter; Trust ty did not discharge both configurations",
-            m.name
-        );
-    }
 }

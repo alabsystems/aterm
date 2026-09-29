@@ -130,6 +130,9 @@ pub mod install;
 /// The retired landing wait (2026-09-16 to 2026-09-22): the `__landing` verb older twins
 /// still call, now an immediate silent `exec`, and the sweep of the markers they test for.
 pub mod landing;
+/// `atpkg lane`: the Rust-lane reader over one shell command line — the Trust spelling of
+/// a stock `cargo`/`rustc`/`rustfmt`/clippy/rustdoc at command position, and exit 2.
+pub mod lane;
 /// Laying executables (shims, stubs, tombstones): one temp + `rename(2)` writer.
 pub mod lay;
 /// Toolchain leases: a run holds the store build it resolved for as long as it runs, so gc
@@ -207,6 +210,9 @@ pub mod vendor;
 /// version ↔ build id map, the update decision and the lane's durable records.
 pub mod vendor_direct;
 pub mod verify;
+/// The one silent, detached, headless run of an agent build a vendor lane just landed, so
+/// the vendor CLI's account-bound caches are fresh before the user's first launch.
+pub mod warm;
 
 pub use activate::{Aliases, activate_build, atomic_symlink, install_shims};
 pub use apply::{Group, TxnOutcome, plan_groups};
@@ -337,114 +343,5 @@ pub fn root_key_fingerprint() -> String {
         h ^= u64::from(SEP);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    // Manual rendering of the previous `format!("{h:016x}")` — byte-identical
-    // (16 lowercase hex digits, zero-padded): the `format!` expansion embeds
-    // `fmt::Arguments` construction (with inlined `unsafe`) that the strict
-    // Trust gate cannot lower and fails closed on. Sixteen straight-line
-    // nibble extractions; `wrapping_shr` by a constant < 64 is a plain shift
-    // and carries no panic obligation, and each nibble is < 16 by the mask.
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(16);
-    macro_rules! nib {
-        ($sh:expr) => {
-            s.push(char::from(HEX[(h.wrapping_shr($sh) & 0xf) as usize]));
-        };
-    }
-    nib!(60);
-    nib!(56);
-    nib!(52);
-    nib!(48);
-    nib!(44);
-    nib!(40);
-    nib!(36);
-    nib!(32);
-    nib!(28);
-    nib!(24);
-    nib!(20);
-    nib!(16);
-    nib!(12);
-    nib!(8);
-    nib!(4);
-    nib!(0);
-    s
-}
-
-/// Invoke `f(a)` — identity at runtime, but the callee is a generic `FnOnce`.
-///
-/// The strict Trust gate's hardened contracts key on the DIRECT callee (by
-/// name/identity), and `std`'s MIR-INLINED internals (e.g. `OsStr::to_str`'s
-/// `from_utf8_unchecked` fast path, the `OsStr` byte-slice casts) are otherwise
-/// attributed to the *caller's* spans as missing-SAFETY-comment refutations.
-/// Routing such calls through a generic `FnOnce` scopes the callee out as
-/// Conditional, the same way the gate scopes out every other polymorphic
-/// callee. The helper invokes the exact same function with the same argument:
-/// behavior is identical. (Same idiom as `aterm-update`/`aterm-update-core`/
-/// `aterm-tempfile`; an fn-POINTER spelling instead was observed to send the
-/// full verifier's bundle builder into unbounded recursion.)
-pub(crate) fn call1<F, A, T>(f: F, a: A) -> T
-where
-    F: FnOnce(A) -> T,
-{
-    f(a)
-}
-
-/// Two-argument sibling of [`call1`] — identity at runtime, hardened contracts
-/// scoped out. Used for `std::fs::write`, whose *name* trips the hardened libc
-/// `write(2)` FFI-boundary matcher on direct call sites (the safe std function
-/// is not that FFI, so the contract cannot be discharged there).
-pub(crate) fn call2<F, A, B, T>(f: F, a: A, b: B) -> T
-where
-    F: FnOnce(A, B) -> T,
-{
-    f(a, b)
-}
-
-/// Render `v` in decimal, byte-identical to `u64`'s `Display` — used by the
-/// manual (`format_args!`-free) string builders in this crate: the `format!`
-/// expansion embeds `fmt::Arguments` construction (with inlined `unsafe`) that
-/// the strict Trust gate cannot lower and fails closed on.
-///
-/// Deliberately LOOP-FREE, digit-by-constant-power-of-ten (same idiom as
-/// `aterm-scrollback::error::dec_string`): the classic `v % 10` / `v /= 10`
-/// loop sends the strict gate's integer engine into a non-terminating solve
-/// (loop-carried division). Twenty straight-line constant divisions carry no
-/// loop invariant to infer and no panic obligations at all (constant nonzero
-/// divisors, wrapping add of a digit that is 0..=9 by construction).
-pub(crate) fn dec_u64(v: u64) -> String {
-    let mut rem = v;
-    let mut out = String::new();
-    let mut started = false;
-    macro_rules! emit_digit {
-        ($p:expr) => {
-            let d = (rem / $p) as u8;
-            rem %= $p;
-            if started || d != 0 {
-                started = true;
-                out.push(char::from(b'0'.wrapping_add(d)));
-            }
-        };
-    }
-    emit_digit!(10_000_000_000_000_000_000u64);
-    emit_digit!(1_000_000_000_000_000_000u64);
-    emit_digit!(100_000_000_000_000_000u64);
-    emit_digit!(10_000_000_000_000_000u64);
-    emit_digit!(1_000_000_000_000_000u64);
-    emit_digit!(100_000_000_000_000u64);
-    emit_digit!(10_000_000_000_000u64);
-    emit_digit!(1_000_000_000_000u64);
-    emit_digit!(100_000_000_000u64);
-    emit_digit!(10_000_000_000u64);
-    emit_digit!(1_000_000_000u64);
-    emit_digit!(100_000_000u64);
-    emit_digit!(10_000_000u64);
-    emit_digit!(1_000_000u64);
-    emit_digit!(100_000u64);
-    emit_digit!(10_000u64);
-    emit_digit!(1_000u64);
-    emit_digit!(100u64);
-    emit_digit!(10u64);
-    // Ones digit is emitted unconditionally, so `0` renders as "0".
-    let _ = started;
-    out.push(char::from(b'0'.wrapping_add(rem as u8)));
-    out
+    format!("{h:016x}")
 }

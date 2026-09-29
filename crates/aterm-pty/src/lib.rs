@@ -58,13 +58,14 @@ pub struct SpawnedShell {
 /// injected vars (TERM, shell integration) are always preserved.
 ///
 /// Called by [`spawn_shell_with_pid`] in the PARENT (before `forkpty`), so it stays
-/// async-signal-safe (no child-side allocation). Non-UTF-8 keys bypass the
-/// deny-list check, which is safe because every deny-listed name is ASCII. Pure in
+/// async-signal-safe (no child-side allocation). A non-UTF-8 key is classified by
+/// its lossy spelling, so a deny-listed PREFIX on one still denies it. Pure in
 /// its inputs so the wiring is unit-tested without mutating the process-global env
 /// (the same approach `classify_write_result` uses for `write_all`'s branch ladder).
 /// Shared verbatim by BOTH platform spawns (the Windows env-block builder applies
 /// its case-insensitive dedupe on top of this exact output). The deny check itself
-/// is case-insensitive on Windows only — see [`is_denied_env_key`].
+/// is case-insensitive on Windows only — see
+/// [`aterm_types::domain::is_ai_env_key`], the one classifier.
 // Skip: the `impl Iterator` parameter is CALLER-CHOSEN code — `next` is an
 // open-trait dispatch on a type parameter (the genuinely-fatal class; the
 // spawn call sites pass std::env::vars_os, but the signature admits any
@@ -84,7 +85,7 @@ fn build_child_env(
     // adapter pipeline on every input.
     let mut env_pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for (k, v) in inherited {
-        if !is_denied_env_key(&k) {
+        if !aterm_types::domain::is_ai_env_key(&k) {
             env_pairs.push((k, v));
         }
     }
@@ -103,26 +104,6 @@ fn build_child_env(
         }
     }
     env_pairs
-}
-
-/// Whether an inherited env key is deny-listed
-/// ([`aterm_types::domain::is_ai_env_var`]). Windows env names are
-/// case-insensitive, so there the key is ASCII-uppercased before the check
-/// (every deny-listed name/prefix is uppercase ASCII) — otherwise a
-/// non-canonical-case `anthropic_api_key` would leak into the child. Unix env
-/// names are case-sensitive; the exact-case check stays.
-fn is_denied_env_key(key: &std::ffi::OsStr) -> bool {
-    let Some(k) = key.to_str() else {
-        return false; // non-UTF-8 bypasses: every deny-listed name is ASCII
-    };
-    #[cfg(windows)]
-    {
-        aterm_types::domain::is_ai_env_var(&k.to_ascii_uppercase())
-    }
-    #[cfg(not(windows))]
-    {
-        aterm_types::domain::is_ai_env_var(k)
-    }
 }
 
 /// What the line discipline will do with the NEXT byte typed into a PTY —
@@ -195,6 +176,93 @@ impl TtySignals {
     pub fn signals(self, byte: u8) -> bool {
         [self.intr, self.quit, self.susp].contains(&Some(byte))
     }
+}
+
+/// WHICH process a session's shell pid named when the session took it — the
+/// identity every pid-addressed signal at teardown must re-verify first.
+///
+/// THE DEFECT THIS CLOSES (robustness audit, 2026-09-26, backlog item 5): the
+/// GUI's `Session::drop` sent `killpg(pid, SIGHUP)` and, 250 ms later from the
+/// reaper, `killpg(pid, SIGKILL)` to whatever the shell's pid named at CLOSE
+/// time. For a shell this process spawned that is sound until the status path
+/// reaps it (it latches that). For a shell ADOPTED across a seamless update it
+/// was not: launchd is the parent, so nothing here ever reaps it, the pid is
+/// freed the moment it exits, and the only guard left was `reap`'s
+/// `getpgid(pid) == pid` — which every job-control group leader and every
+/// daemon passes. The trigger is an adopted shell that exits while the pane
+/// stays open (`--hold`, or a disowned job keeping the terminal open), the
+/// kernel reissuing its pid, then the tab closing: SIGHUP then SIGKILL to an
+/// unrelated process group — a build in another terminal, say. 4 of the 5
+/// live tabs in the owner's window that day were adopted.
+///
+/// So the session records the identity when it TAKES the shell, while it is
+/// provably the shell ([`record_spawned_shell`]: our own unreaped child;
+/// [`record_adopted_shell`]: the session leader of the carried PTY), and every
+/// signal sent by pid re-reads the kernel and compares ([`ShellIdentity::verify`]).
+/// The recorded fact is the process's START TIME (`proc_pidinfo`
+/// `PROC_PIDTBSDINFO` `pbi_start_tvsec/usec` on macOS, `/proc/<pid>/stat`
+/// field 22 on Linux): a reissued pid has a different one. When nothing can be
+/// proven the teardown signals only the terminal's own foreground group
+/// ([`hangup_shell`]), never a pid.
+///
+/// A value, not a capability: the fields are readable and [`Self::from_parts`]
+/// builds one from recorded parts, because the check is always against the
+/// kernel's CURRENT answer, which no caller can forge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellIdentity {
+    /// The shell's pid (== its process-group and session id: `login_tty` ran
+    /// `setsid` in the child).
+    pub pid: i32,
+    /// The process start time recorded when the session took the shell, in an
+    /// opaque per-platform unit (microseconds since the epoch on macOS, clock
+    /// ticks since boot on Linux). `None` when it could not be recorded — the
+    /// platform has no reader, or an adopted shell was not provably the
+    /// carried terminal's session leader any more.
+    pub birth: Option<u64>,
+    /// The shell is THIS process's own child (a fresh spawn, never an
+    /// adoption). While we have not reaped it the kernel cannot reissue its
+    /// pid, so an unreaped-child answer from `waitid(WNOWAIT)` is itself a
+    /// proof — the one that still holds once the shell is a zombie, whose start
+    /// time libproc refuses to report.
+    pub own_child: bool,
+}
+
+impl ShellIdentity {
+    /// An identity from its recorded parts. Production records through
+    /// [`record_spawned_shell`] / [`record_adopted_shell`]; this exists for a
+    /// caller that carries a recorded identity, and for tests that must hand
+    /// the teardown a pid whose recorded birth no longer matches.
+    #[must_use]
+    pub const fn from_parts(pid: i32, birth: Option<u64>, own_child: bool) -> Self {
+        Self {
+            pid,
+            birth,
+            own_child,
+        }
+    }
+
+    /// Nothing recorded, nothing ever proven: [`Self::verify`] is `false` for
+    /// every pid, so teardown never signals by pid. Stub sessions (pid `-1`)
+    /// carry this.
+    #[must_use]
+    pub const fn unproven(pid: i32) -> Self {
+        Self::from_parts(pid, None, false)
+    }
+}
+
+/// What [`hangup_shell`] actually signalled — returned so teardown's choice is
+/// observable in tests rather than inferred from a process dying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellHangup {
+    /// The recorded shell was verified and its process group got `SIGHUP`
+    /// (the historical teardown, `docs/DESIGN-pty-keeper-2026-09-26.md` F3).
+    Shell(i32),
+    /// The shell could not be verified; the terminal's own foreground process
+    /// group (`tcgetpgrp(master)` — a group that is on this tty by definition)
+    /// got `SIGHUP` instead.
+    Foreground(i32),
+    /// Neither: nothing was signalled.
+    Nothing,
 }
 
 /// How a spawned child ended, as far as the platform can actually say.
@@ -282,6 +350,29 @@ mod tests {
             &os("xterm-256color"),
             "env_add must override inherited TERM"
         );
+    }
+
+    /// A NON-UTF-8 key that carries a deny-listed PREFIX is still denied
+    /// (2026-09-27). `is_denied_env_key` let every non-UTF-8 key through on the
+    /// grounds that "every deny-listed name is ASCII" — true of the exact names,
+    /// but the prefixes match a key's leading bytes, so `ANTHROPIC_\xffX` kept
+    /// its `ANTHROPIC_` and reached the child shell. The last key is the control:
+    /// a non-UTF-8 key with no deny-listed prefix still passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_key_with_a_denied_prefix_is_still_denied() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = |b: &[u8]| std::ffi::OsString::from_vec(b.to_vec());
+        let inherited = vec![
+            (raw(b"ANTHROPIC_\xffX"), raw(b"secret")),
+            (raw(b"CLAUDE\xfe"), raw(b"1")),
+            (raw(b"PLAIN_\xffKEY"), raw(b"kept")),
+        ];
+        let keys: Vec<Vec<u8>> = build_child_env(inherited.into_iter(), &[])
+            .into_iter()
+            .map(|(k, _)| k.into_vec())
+            .collect();
+        assert_eq!(keys, vec![b"PLAIN_\xffKEY".to_vec()]);
     }
 
     /// THE IDENTITY SEAM (session identities, 2026-09-17). A session spawned

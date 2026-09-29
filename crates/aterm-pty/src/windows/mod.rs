@@ -37,10 +37,17 @@
 //! other key still flows as plain xterm VT input; conhost accepts the mixed
 //! stream. (3) conhost issues
 //! DSR/CPR queries; the existing reader-thread `take_response()` reply path
-//! answers them with zero changes.
+//! answers them with zero changes. (4) A resize makes the MSYS2 runtime (Git
+//! Bash) drop the next input record — a bracketed paste then loses its ESC
+//! and bash runs `[200~…` — so the first writes after a size change lead with
+//! a Shift key-up record no reader acts on, for it to drop instead. That
+//! record, like (2)'s, switches conhost's parser to holding a trailing lone
+//! ESC, so once one has gone out a raw lone ESC is sent as the Escape key's
+//! record pair; see [`resize_guard`].
 
 mod cmdline;
 mod ffi;
+mod resize_guard;
 mod shell;
 mod winpath;
 
@@ -60,6 +67,7 @@ use aterm_types::MutexExt;
 
 use crate::SpawnedShell;
 use cmdline::{build_command_line, build_env_block, wide_nul};
+use resize_guard::ResizeGuard;
 
 /// One live ConPTY session: the real HANDLEs behind an opaque `i32` master key.
 /// HANDLEs are stored as `isize` (plain integers, not pointers) so the map is
@@ -125,6 +133,9 @@ struct WinSession {
     pid: u32,
     /// Exit code recorded by the waiter thread (or by [`reap`]).
     exit_code: Mutex<Option<u32>>,
+    /// The inert record the first writes after a resize lead with, and the
+    /// state that decides when it may be written ([`resize_guard`]).
+    resize_guard: ResizeGuard,
 }
 
 impl Drop for WinSession {
@@ -845,6 +856,10 @@ pub fn spawn_shell_with_pid_cell_px(
         close_evt: close_evt.into_raw(),
         pid: pi.dwProcessId,
         exit_code: Mutex::new(None),
+        resize_guard: {
+            let size = coord(cols, rows);
+            ResizeGuard::new(Some((size.y, size.x)))
+        },
     });
     let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
     SESSIONS.lock_or_recover().insert(key, Arc::clone(&session));
@@ -1000,6 +1015,9 @@ pub fn adopt_handoff(
         close_evt,
         pid,
         exit_code: Mutex::new(None),
+        // conhost sized this pseudoconsole before the handoff and did not say
+        // to what, so the first resize counts as a change.
+        resize_guard: ResizeGuard::new(None),
     });
     let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
     SESSIONS.lock_or_recover().insert(key, Arc::clone(&session));
@@ -1135,6 +1153,56 @@ pub fn exit_code(pid: i32) -> Option<i32> {
     code.map(|c| c as i32)
 }
 
+/// The Unix start-time reader's twin (2026-09-26, backlog item 5). Windows
+/// needs none: every pid-addressed teardown here resolves the pid through
+/// THIS process's own session registry ([`session_by_pid`]), which holds the
+/// process handle — and a held handle keeps the kernel from reissuing the pid.
+#[must_use]
+pub fn process_birth(_pid: i32) -> Option<u64> {
+    None
+}
+
+/// The Unix recorder's twin: nothing to record (see [`process_birth`]); the
+/// registry is the identity.
+#[must_use]
+pub fn record_spawned_shell(pid: i32) -> crate::ShellIdentity {
+    crate::ShellIdentity::from_parts(pid, None, true)
+}
+
+/// The Unix recorder's twin. There is no seamless handoff off Unix, so nothing
+/// is adopted this way; the registry is the identity all the same.
+#[must_use]
+pub fn record_adopted_shell(pid: i32, _master: i32) -> crate::ShellIdentity {
+    crate::ShellIdentity::from_parts(pid, None, false)
+}
+
+impl crate::ShellIdentity {
+    /// On Windows a pid "still names the shell" exactly when this process's
+    /// session registry resolves it unambiguously — the same lookup
+    /// [`hangup`] and [`reap`] make before they act.
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        self.pid > 1 && session_by_pid(self.pid).is_some()
+    }
+}
+
+/// The Unix [`hangup_shell`] twin: [`hangup`] already resolves the pid through
+/// the registry, so the identity adds nothing it does not already check. There
+/// is no foreground-group fallback (no process groups for a ConPTY).
+pub fn hangup_shell(identity: &crate::ShellIdentity, _master: i32) -> crate::ShellHangup {
+    if identity.verify() {
+        hangup(identity.pid);
+        crate::ShellHangup::Shell(identity.pid)
+    } else {
+        crate::ShellHangup::Nothing
+    }
+}
+
+/// The Unix [`reap_shell`] twin: [`reap`] resolves the pid through the registry.
+pub fn reap_shell(identity: crate::ShellIdentity) {
+    reap(identity.pid);
+}
+
 /// Platform-neutral twin of the Unix collector: the recorded exit code, if the
 /// waiter thread has already observed the child end.
 ///
@@ -1222,6 +1290,7 @@ pub fn read(master: i32, buf: &mut [u8]) -> isize {
         )
     };
     if ok != 0 {
+        s.resize_guard.note_output(&buf[..n as usize]);
         return n as isize;
     }
     let err = io::Error::last_os_error();
@@ -1351,29 +1420,18 @@ pub fn write_all(master: i32, bytes: &[u8]) {
     };
     let mut data = bytes;
     while !data.is_empty() {
-        let mut written: u32 = 0;
-        let want = u32::try_from(data.len()).unwrap_or(u32::MAX);
-        // SAFETY: `data` is a valid slice of >= `want` bytes; the input handle
-        // stays open for the call because we hold the session Arc.
-        let ok = unsafe {
-            ffi::WriteFile(
-                s.input,
-                data.as_ptr(),
-                want,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 || written == 0 {
-            break;
+        match s.resize_guard.write_with(data, |b| write_input(&s, b)) {
+            Ok(written) if written > 0 => data = &data[written..],
+            _ => break,
         }
-        data = &data[written as usize..];
     }
 }
 
 /// Write `bytes` with a single `WriteFile`, returning the count the kernel
 /// ACCEPTED (the true count the routing-fabric `SinkWriter` is built on).
-/// Blocking — identical to the sink's documented Phase-0 posture.
+/// Blocking — identical to the sink's documented Phase-0 posture. The first
+/// writes after a resize also carry the [`resize_guard`] record, which the
+/// count leaves out: it reports the CALLER's bytes.
 ///
 /// # Errors
 /// `NotFound` for a fabricated/closed key; otherwise the OS error when the
@@ -1388,10 +1446,16 @@ pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
             "unknown PTY master key (closed or never spawned)",
         ));
     };
+    s.resize_guard.write_with(bytes, |b| write_input(&s, b))
+}
+
+/// One `WriteFile` of `bytes` to the session's input pipe: the count the
+/// kernel accepted, or the OS error.
+fn write_input(s: &WinSession, bytes: &[u8]) -> io::Result<usize> {
     let mut written: u32 = 0;
     let want = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
     // SAFETY: `bytes` is a valid slice of >= `want` bytes; the input handle
-    // stays open for the call because we hold the session Arc.
+    // stays open for the call because the caller holds the session Arc.
     let ok = unsafe {
         ffi::WriteFile(
             s.input,
@@ -1507,11 +1571,14 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(
     let Some(s) = session(master) else {
         return;
     };
+    let size = coord(cols, rows);
     let g = s.hpc.lock_or_recover();
     if *g != 0 {
         // SAFETY: the HPCON is live while the lock is held (the waiter swaps it
         // to 0 under this same lock before closing).
-        let _ = unsafe { ffi::ResizePseudoConsole(*g, coord(cols, rows)) };
+        if unsafe { ffi::ResizePseudoConsole(*g, size) } >= 0 {
+            s.resize_guard.note_resize(size.y, size.x);
+        }
         return;
     }
     // Adopted lane. The `signal` MUTEX — not the `hpc` guard `g` — is what keeps
@@ -1529,7 +1596,7 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(
         // branch's return code and the Unix `TIOCSWINSZ`'s: a dead conhost just
         // means the session is already going away.
         // SAFETY: `*sig` is a live pipe handle for as long as this guard is held.
-        let _ = unsafe {
+        let sent = unsafe {
             ffi::WriteFile(
                 *sig,
                 buf.as_ptr(),
@@ -1538,6 +1605,9 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, _cell_px: Option<(
                 std::ptr::null_mut(),
             )
         };
+        if sent != 0 {
+            s.resize_guard.note_resize(size.y, size.x);
+        }
     }
 }
 
@@ -1892,6 +1962,152 @@ mod tests {
         assert!(
             cols as i16 > 0 && rows as i16 > 0,
             "a clamped COORD must stay positive when reinterpreted as i16"
+        );
+    }
+
+    /// Run Windows PowerShell 5.1 in a real ConPTY as a reader that reports
+    /// key UPs too (`RawUI.ReadKey` with `IncludeKeyUp`), hand the master to
+    /// `drive` once it is reading, and return its report: every key it read,
+    /// as `Vk/KeyDown` joined by `;`, up to and including a `q` key-down.
+    /// Windows PowerShell because it ships with every Windows this seam runs on.
+    fn keys_read_through_conpty(drive: impl FnOnce(i32)) -> String {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        // SAFETY: test-process mint; the trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let script = "$ui = $Host.UI.RawUI; [Console]::Out.Write('READY'); $keys = @(); \
+                      do { $k = $ui.ReadKey('NoEcho,IncludeKeyDown,IncludeKeyUp'); \
+                      $keys += ('{0}/{1}' -f $k.VirtualKeyCode, $k.KeyDown) } \
+                      until ($k.VirtualKeyCode -eq 81 -and $k.KeyDown); \
+                      [Console]::Out.Write('KEYS ' + ($keys -join ';') + ' END')";
+        let shell = spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&[
+                "powershell.exe".to_string(),
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                script.to_string(),
+            ]),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+        )
+        .expect("ConPTY spawn of powershell.exe must succeed");
+        let master = shell.master;
+        // The reader goes through `read`, which is where the seam watches for
+        // conhost's win32-input-mode request.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = read(master, &mut buf);
+                if n <= 0 || tx.send(buf[..n as usize].to_vec()).is_err() {
+                    return;
+                }
+            }
+        });
+        // conhost RENDERS the child's text, so strip its CSI/OSC framing before
+        // looking for a marker it may have painted in pieces.
+        fn text_of(stream: &[u8]) -> String {
+            let mut text = Vec::new();
+            let mut i = 0;
+            while i < stream.len() {
+                match (stream[i], stream.get(i + 1)) {
+                    (0x1b, Some(b'[')) => {
+                        i += 2;
+                        while i < stream.len() && !(0x40..=0x7e).contains(&stream[i]) {
+                            i += 1;
+                        }
+                    }
+                    (0x1b, Some(b']')) => {
+                        i += 2;
+                        while i < stream.len() && !matches!(stream[i], 0x07 | 0x1b) {
+                            i += 1;
+                        }
+                        // ST is two bytes; the loop's step skips the second.
+                        if stream.get(i) == Some(&0x1b) {
+                            i += 1;
+                        }
+                    }
+                    (b, _) => text.push(b),
+                }
+                i += 1;
+            }
+            String::from_utf8_lossy(&text).into_owned()
+        }
+        let mut seen = Vec::new();
+        let mut wait_for = |marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !text_of(&seen).contains(marker) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(chunk) => seen.extend_from_slice(&chunk),
+                    Err(_) => {
+                        hangup(shell.pid);
+                        panic!("no {marker:?} from powershell: {:?}", text_of(&seen));
+                    }
+                }
+            }
+            text_of(&seen)
+        };
+        wait_for("READY");
+        drive(master);
+        let out = wait_for(" END");
+        hangup(shell.pid);
+        out.split("KEYS ")
+            .nth(1)
+            .and_then(|tail| tail.split(" END").next())
+            .expect("the KEYS report")
+            .to_string()
+    }
+
+    // THE RESIZE GUARD, end to end on a real ConPTY: an input before any
+    // resize arrives untouched, and the first write after a size change
+    // arrives behind exactly one Shift key-up — the record the MSYS2 runtime
+    // may drop in place of the user's first key (see `resize_guard`).
+    #[test]
+    fn the_first_write_after_a_resize_reaches_the_reader_behind_one_shift_key_up() {
+        let keys = keys_read_through_conpty(|master| {
+            write_all(master, b"a");
+            resize(master, 25, 80);
+            write_all(master, b"xq");
+        });
+        assert_eq!(
+            keys, "65/True;65/False;16/False;88/True;88/False;81/True",
+            "`a` before the resize arrives as typed; `xq` after it arrives behind \
+             one Shift key-up and nothing else"
+        );
+    }
+
+    // THE SWITCH, end to end: once the guard's record has gone to conhost, its
+    // parser holds a read that ends in a lone ESC (measured: the ESC then
+    // joined the next key as Alt+Q), so a raw lone ESC written after it must
+    // reach the reader as the Escape key — here behind the second guard
+    // record, and with a pause before `q` so conhost reads the ESC alone.
+    #[test]
+    fn a_lone_esc_after_the_guard_record_reaches_the_reader_as_escape() {
+        let keys = keys_read_through_conpty(|master| {
+            write_all(master, b"a");
+            resize(master, 25, 80);
+            write_all(master, b"x");
+            write_all(master, b"\x1b");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            write_all(master, b"q");
+        });
+        assert_eq!(
+            keys, "65/True;65/False;16/False;88/True;88/False;16/False;27/True;27/False;81/True",
+            "after the switch a lone ESC is Escape (27), not held into Alt+Q"
         );
     }
 

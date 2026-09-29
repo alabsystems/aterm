@@ -107,7 +107,7 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
 
     let mut effects = EffectsPipeline::new();
     effects.set_sparkle_enabled(true);
-    effects.set_sparkle_classes(true, true, false, true);
+    effects.set_sparkle_classes(true, true, true);
     effects.set_sparkle_feline("cat", true, true, false);
     effects.set_sparkle_reduced_motion(true);
 
@@ -169,7 +169,7 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
 
     let _ = gpu.present_input_readback(&mut win, &rain_only);
     let gpu_rain_cat = gpu.present_input_readback(&mut win, &rain_and_cat).pixels;
-    let mut fresh = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+    let mut fresh = common::independent_gpu(18.0, theme);
     fresh.set_pad(14);
     let mut fresh_win = aterm_gpu::WindowGpu::new();
     let gpu_rain_only = fresh.render_input(&mut fresh_win, &rain_only, None).pixels;

@@ -18,6 +18,50 @@
 
 use serde::{Deserialize, Serialize};
 
+#[test]
+fn ignored_strings_validate_the_same_bytes_as_materialized_values() {
+    use serde::de::IgnoredAny;
+
+    let mut cases = vec![
+        br#""ordinary UTF-8""#.to_vec(),
+        "\"日本語 👩🏽‍💻\"".as_bytes().to_vec(),
+        br#""\"\\\/\b\f\n\r\t\u0000\uD83D\uDE80""#.to_vec(),
+        br#""\uD800""#.to_vec(),
+        br#""\uDC00""#.to_vec(),
+        br#""\uD800\u0041""#.to_vec(),
+        br#""\uD800\x0000""#.to_vec(),
+        br#""\u0xx0""#.to_vec(),
+        br#""\q""#.to_vec(),
+        b"\"unterminated\\".to_vec(),
+        b"\"a\nb\"".to_vec(),
+        b"\"\xff\"".to_vec(),
+        b"\"\xff\\n\"".to_vec(),
+        b"\"\\n\xff\"".to_vec(),
+        b"\"\xc3\\n\xa9\"".to_vec(),
+    ];
+    let mut rng = Rng(0x1_6202_0928);
+    for _ in 0..1000 {
+        let mut text = String::new();
+        random_json(&mut rng, 0, &mut text);
+        cases.push(text.into_bytes());
+    }
+    for raw in cases {
+        // Test values, nested values, and escaped map keys: every discarded
+        // string path must reject malformed UTF-8 and escapes alike.
+        let mut nested = b"{\"ignored\":[".to_vec();
+        nested.extend_from_slice(&raw);
+        nested.extend_from_slice(b"]}");
+        let mut key = b"{".to_vec();
+        key.extend_from_slice(&raw);
+        key.extend_from_slice(b":0}");
+        for bytes in [raw, nested, key] {
+            let full = aterm_json::from_slice::<aterm_json::Value>(&bytes);
+            let skipped = aterm_json::from_slice::<IgnoredAny>(&bytes);
+            assert_eq!(full.is_ok(), skipped.is_ok(), "{bytes:?}");
+        }
+    }
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /// Both parse to their own `Value`, and both must agree on the verdict AND the

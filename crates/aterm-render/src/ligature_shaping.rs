@@ -397,9 +397,9 @@ pub fn shape_ligature_run(
 ) -> Option<ShapedRun> {
     // Convenience wrapper: parse then delegate. The per-frame hot path
     // ([`crate::Renderer::row_glyph_plan`]) does NOT come through here — it builds
-    // the `Face` at most once per row and calls [`shape_ligature_run_with_face`],
-    // so a scroll of unique runs no longer re-walks the font's table directory
-    // per cache miss. This byte-slice form remains for tests and one-shot callers.
+    // the `Face` at most once per row and uses [`RowShaper`] to reuse compatible
+    // plans and cleared shaping buffers across cache misses. This byte-slice form
+    // remains for tests and one-shot callers.
     //
     // `index` selects the face inside a collection (W6: a styled run can shape
     // from a `.ttc` sibling at index > 0); a plain file is always index 0. W9:
@@ -408,7 +408,7 @@ pub fn shape_ligature_run(
     // variation substitution can never select a glyph the raster path wouldn't.
     // Empty for non-variable faces (the common path, unchanged). The hot path in
     // `row_glyph_plan` applies the identical index+variations when it builds its
-    // per-row face, then calls [`shape_ligature_run_with_face`] directly.
+    // per-row face, then constructs its [`RowShaper`].
     let mut face = rustybuzz::Face::from_slice(rb_bytes, index)?;
     if !variations.is_empty() {
         face.set_variations(variations);
@@ -416,9 +416,9 @@ pub fn shape_ligature_run(
     shape_ligature_run_with_face(&face, run, run_chars, enable, admit_collapsed, features)
 }
 
-/// [`shape_ligature_run`] on an ALREADY-PARSED face — the hot-path form. Shaping
-/// semantics are identical; only the `Face::from_slice` cost moves to the caller,
-/// which can amortize it across every run of a row.
+/// [`shape_ligature_run`] on an ALREADY-PARSED face. Shaping semantics are identical;
+/// only the `Face::from_slice` cost moves to the caller. The row planner uses
+/// `RowShaper` to reuse shaping plans and buffers as well as the face.
 ///
 /// The caller is responsible for building `face` at the correct collection
 /// `index` (W6) and applying the variation coords (W9) BEFORE calling this — the
@@ -445,7 +445,130 @@ pub fn shape_ligature_run_with_face(
     let mut buf = rustybuzz::UnicodeBuffer::new();
     buf.push_str(run);
     let shaped = rustybuzz::shape(face, features, buf);
-    let infos = shaped.glyph_infos();
+    map_shaped_run(face, run, run_chars, admit_collapsed, shaped.glyph_infos())
+}
+
+/// One row's fixed font instance and feature list. The renderer already parses
+/// each face once per row; reuse its shaping plans as well. Newly streamed text
+/// misses the run cache, but every ordinary Latin token can use the same plan.
+/// No plan survives its face or crosses a font/feature/variation change.
+pub(crate) struct RowShaper<'a> {
+    face: rustybuzz::Face<'a>,
+    features: &'a [rustybuzz::Feature],
+    plans: Vec<(SegmentProperties, rustybuzz::ShapePlan)>,
+}
+
+#[derive(PartialEq)]
+struct SegmentProperties {
+    direction: rustybuzz::Direction,
+    script: Option<rustybuzz::Script>,
+    language: Option<rustybuzz::Language>,
+}
+
+impl<'a> RowShaper<'a> {
+    pub(crate) fn new(face: rustybuzz::Face<'a>, features: &'a [rustybuzz::Feature]) -> Self {
+        Self {
+            face,
+            features,
+            plans: Vec::new(),
+        }
+    }
+
+    pub(crate) fn shape(
+        &mut self,
+        run: &str,
+        run_chars: &[char],
+        admit_collapsed: bool,
+        scratch: &mut rustybuzz::UnicodeBuffer,
+    ) -> Option<ShapedRun> {
+        let min_run = if self.features.len() > 2 { 1 } else { 2 };
+        if run_chars.len() < min_run {
+            return None;
+        }
+        let shaped = self.shape_buffer(run, scratch);
+        let result = map_shaped_run(
+            &self.face,
+            run,
+            run_chars,
+            admit_collapsed,
+            shaped.glyph_infos(),
+        );
+        // Clear resets segment properties as well as text, so a Latin run
+        // cannot lend its direction/script to the next Arabic or common run.
+        // Always return the allocation, including unmappable/rejected shapes.
+        *scratch = shaped.clear();
+        result
+    }
+
+    fn shape_buffer(
+        &mut self,
+        run: &str,
+        scratch: &mut rustybuzz::UnicodeBuffer,
+    ) -> rustybuzz::GlyphBuffer {
+        let mut buffer = std::mem::take(scratch);
+        buffer.push_str(run);
+        buffer.guess_segment_properties();
+        // The input buffer is always freshly cleared and has no explicitly set
+        // script. Rustybuzz leaves it absent for all-common/inherited text, and
+        // its public getter reports UNKNOWN for that absence. Preserve None in
+        // ShapePlan::new, exactly as rustybuzz::shape does internally.
+        let script = buffer.script();
+        let props = SegmentProperties {
+            direction: buffer.direction(),
+            script: (script != rustybuzz::script::UNKNOWN).then_some(script),
+            language: buffer.language(),
+        };
+        let slot = self
+            .plans
+            .iter()
+            .position(|(p, _)| *p == props)
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                note_shape_plan_build();
+                let plan = rustybuzz::ShapePlan::new(
+                    &self.face,
+                    props.direction,
+                    props.script,
+                    props.language.as_ref(),
+                    self.features,
+                );
+                // A bounded row-local memo: keep the first three script families
+                // and replace the fourth for a row mixing many scripts. Eviction
+                // changes only compilation work, never the selected plan's inputs.
+                if self.plans.len() == 4 {
+                    self.plans[3] = (props, plan);
+                    3
+                } else {
+                    self.plans.push((props, plan));
+                    self.plans.len() - 1
+                }
+            });
+        rustybuzz::shape_with_plan(&self.face, &self.plans[slot].1, buffer)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHAPE_PLANS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_shape_plan_build() {
+    SHAPE_PLANS_BUILT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn take_shape_plan_builds() -> usize {
+    SHAPE_PLANS_BUILT.with(|count| count.replace(0))
+}
+
+fn map_shaped_run(
+    face: &rustybuzz::Face<'_>,
+    run: &str,
+    run_chars: &[char],
+    admit_collapsed: bool,
+    infos: &[rustybuzz::GlyphInfo],
+) -> Option<ShapedRun> {
     // M4: classify the shape against the grid-mappable forms. `OneToOne`
     // (Fira/JetBrains spacer convention) is the historical accept, drawn as one
     // gid per column below. `Collapsed` (Cascadia N:1) is admitted ONLY when
@@ -713,6 +836,101 @@ pub fn plan_row_runs<S, F, R>(
 mod tests {
     use super::*;
     use aterm_core::terminal::{RenderCell, UnderlineStyle};
+
+    #[test]
+    fn row_shaper_matches_fresh_plans_across_segment_and_font_changes() {
+        let mut fonts = vec![
+            include_bytes!("../assets/DejaVuSansMono.ttf").to_vec(),
+            include_bytes!("../tests/fixtures/jetbrains-mono.ttf").to_vec(),
+        ];
+        if cfg!(target_os = "macos")
+            && let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf")
+        {
+            fonts.push(bytes);
+        }
+        let feature_sets = [
+            build_feature_list(&[], true),
+            build_feature_list(&[FontFeature::new(*b"zero", 1)], true),
+            build_feature_list(&[FontFeature::new(*b"ss01", 1)], false),
+        ];
+        let runs = [
+            "function",
+            "=>",
+            "000",
+            "office",
+            "éè",
+            "Русский",
+            "العربية",
+            "עברית",
+            "देवनागरी",
+            "Ελληνικά",
+            "漢字",
+            "e\u{301}",
+            "!=",
+            "",
+            "0",
+            "x",
+            "tail",
+        ];
+        let mut scratch = rustybuzz::UnicodeBuffer::new();
+        let mut changed_glyphs = false;
+        for bytes in &fonts {
+            for features in &feature_sets {
+                for weight in [350.0, 700.0] {
+                    let mut face = rustybuzz::Face::from_slice(bytes, 0).expect("fixture face");
+                    face.set_variations(&[rustybuzz::Variation {
+                        tag: ttf_parser::Tag::from_bytes(b"wght"),
+                        value: weight,
+                    }]);
+                    let mut shaper = RowShaper::new(face, features);
+                    for run in runs.iter().chain(runs.iter().rev()) {
+                        let mut fresh = rustybuzz::UnicodeBuffer::new();
+                        fresh.push_str(run);
+                        let expected = rustybuzz::shape(&shaper.face, features, fresh);
+                        let actual = shaper.shape_buffer(run, &mut scratch);
+                        let infos = |buffer: &rustybuzz::GlyphBuffer| {
+                            buffer
+                                .glyph_infos()
+                                .iter()
+                                .map(|g| (g.glyph_id, g.cluster))
+                                .collect::<Vec<_>>()
+                        };
+                        let positions = |buffer: &rustybuzz::GlyphBuffer| {
+                            buffer
+                                .glyph_positions()
+                                .iter()
+                                .map(|g| (g.x_advance, g.y_advance, g.x_offset, g.y_offset))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(infos(&actual), infos(&expected), "glyphs: {run}");
+                        assert_eq!(positions(&actual), positions(&expected), "positions: {run}");
+                        assert!(shaper.plans.len() <= 4);
+                        scratch = actual.clear();
+                        assert!(scratch.is_empty());
+                        assert_eq!(scratch.direction(), rustybuzz::Direction::Invalid);
+                        assert_eq!(scratch.script(), rustybuzz::script::UNKNOWN);
+                        assert_eq!(scratch.language(), None);
+                        let chars = run.chars().collect::<Vec<_>>();
+                        let actual = shaper.shape(run, &chars, true, &mut scratch);
+                        let expected = shape_ligature_run_with_face(
+                            &shaper.face,
+                            run,
+                            &chars,
+                            true,
+                            true,
+                            features,
+                        );
+                        assert_eq!(actual, expected, "mapped columns: {run}");
+                        changed_glyphs |= actual.is_some();
+                    }
+                }
+            }
+        }
+        assert!(
+            changed_glyphs,
+            "the corpus must include actual substitutions"
+        );
+    }
 
     /// WIRE-FONTFEAT — the EMPTY-features path is unchanged: with no user
     /// features the built array is exactly the base `[liga, calt]` pair (the

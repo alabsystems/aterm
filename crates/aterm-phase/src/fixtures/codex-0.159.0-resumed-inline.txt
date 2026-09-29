@@ -1,0 +1,41 @@
+# codex 0.159.0 · MEASURED 2026-09-29, `aterm ctl text` of a private headless aterm 120x40 (tools/test-codex-live-upgrade.sh lane D: network denied, a loopback Responses API; read only, cursor=37,2) · an INLINE client (`--no-alt-screen`, its own CODEX_HOME) the live upgrade relaunched (`codex resume --no-alt-screen <thread>` onto 0.159.0): the tail of a long answer, its user message scrolled off, the end row `Worked for <1s • 3:22 AM` (U+2022), the `›` composer, and the one-row footer ending `· ← for agents`
+  line 13 of a long answer
+  line 14 of a long answer
+  line 15 of a long answer
+  line 16 of a long answer
+  line 17 of a long answer
+  line 18 of a long answer
+  line 19 of a long answer
+  line 20 of a long answer
+  line 21 of a long answer
+  line 22 of a long answer
+  line 23 of a long answer
+  line 24 of a long answer
+  line 25 of a long answer
+  line 26 of a long answer
+  line 27 of a long answer
+  line 28 of a long answer
+  line 29 of a long answer
+  line 30 of a long answer
+  line 31 of a long answer
+  line 32 of a long answer
+  line 33 of a long answer
+  line 34 of a long answer
+  line 35 of a long answer
+  line 36 of a long answer
+  line 37 of a long answer
+  line 38 of a long answer
+  line 39 of a long answer
+  line 40 of a long answer
+  line 41 of a long answer
+  line 42 of a long answer
+  line 43 of a long answer
+  line 44 of a long answer
+  line 45 of a long answer
+
+  Worked for <1s • 3:22 AM
+
+
+› Ask Codex to do anything
+
+  fake-model default · /private/tmp/cxlive.xxxx/work · ← for agents

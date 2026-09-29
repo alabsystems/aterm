@@ -73,8 +73,11 @@ pub enum EndClass {
     Clean,
     /// It handed its sessions to an update successor: the successor's own row says so.
     Handoff,
-    /// No signal handler ran and no exit path ran: SIGKILL (Force Quit, jetsam, a
-    /// harness), a kernel kill, power loss. Its empty marker outlived it.
+    /// No crash signal was caught and no exit path ran: SIGKILL (Force Quit, jetsam,
+    /// a harness), a kernel kill, power loss — and SIGTERM, SIGINT or SIGHUP, whose
+    /// handler (aterm-gui's `owned_endpoint`) takes only the control socket, token
+    /// and alias away before re-raising the default action. Its empty marker
+    /// outlived it.
     Killed,
     /// A fatal signal the handler caught (SIGSEGV 11, SIGABRT 6, SIGBUS 10, SIGILL 4,
     /// SIGFPE 8); the number is what the handler wrote into the marker.
@@ -134,7 +137,7 @@ impl EndClass {
         match self {
             Self::Clean => "clean".into(),
             Self::Handoff => "handed off to an update".into(),
-            Self::Killed => "killed (no signal handler, no exit path)".into(),
+            Self::Killed => "killed (no crash signal, no exit path)".into(),
             Self::Signal(n) => format!("fatal signal {n} ({})", signal_name(n)),
             Self::Panic => "panic".into(),
             Self::Running => "still running when the launch after it began".into(),
@@ -792,6 +795,18 @@ mod tests {
         });
         exact.launch = LaunchKind::Successor;
         assert_eq!(Row::parse(&exact.to_line()), Some(exact));
+    }
+
+    #[test]
+    fn a_killed_end_is_worded_by_what_is_missing_not_by_a_handler_that_ran() {
+        // A SIGTERM, SIGINT or SIGHUP runs aterm-gui's `owned_endpoint` handler
+        // (it takes the control socket, token and alias away, then re-raises), so
+        // "no signal handler" is false for the commonest killed end; what every
+        // killed end lacks is a crash signal and an exit path — the words the
+        // console's own line (`logging::KillEvidence`) uses.
+        let words = EndClass::Killed.describe();
+        assert_eq!(words, "killed (no crash signal, no exit path)");
+        assert!(!words.contains("handler"), "{words}");
     }
 
     #[test]

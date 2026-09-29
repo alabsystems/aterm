@@ -112,7 +112,7 @@ __pycache__/
 # one untracked line, `?? .fabric-wt/`, and `gates::clean_tree`
 # (crates/aterm-release/src/gates.rs) refuses to claim a release on ANY
 # `git status --porcelain` line — so an unignored `.fabric-wt/` is a hard stop on
-# `cargo ship cut`, not noise. MEASURED here: 1,072,342 entries under
+# `targo --unverified ship cut`, not noise. MEASURED here: 1,072,342 entries under
 # `.fabric-wt/a1a2` alone (`find .fabric-wt/a1a2 -mindepth 1 | wc -l`), of which
 # 871,344 — 81% — are that checkout's own `target/`.
 #
@@ -125,8 +125,8 @@ __pycache__/
 # enter git (docs/THIRD_PARTY_SURFACE_PLAN.md, Lane 1: the mirror is delivered
 # as a signed bundle, not as repository content). `tools/cargo-mirror-config.toml`
 # points cargo's `local-registry` at exactly this path, so it is where
-# `cargo forge mirror unbundle --out mirror` lands; unignored, it would stop
-# `cargo ship cut` at `gates::clean_tree` the moment anyone delivered one.
+# `targo --unverified forge mirror unbundle --out mirror` lands; unignored, it would stop
+# `targo --unverified ship cut` at `gates::clean_tree` the moment anyone delivered one.
 /mirror/
 
 # `ty`'s result cache (`.ty/cache.json`), written into the working directory of

@@ -170,7 +170,7 @@ impl Authority {
     /// no-mint-reachability seal: no parser / control handler / extension path can
     /// reach a mint, because the mint is not in its compiled surface. It stays
     /// `unsafe` (the audit marker) and `#[doc(hidden)]` (an unwelcoming, undiscoverable
-    /// shape), mirroring `aterm_provenance`'s `__new_for_capability_only` seal.
+    /// shape).
     ///
     /// The property is proven abstractly by
     /// [`aterm_spec::derive::mint_reachability_model`] (invariant `NoUntrustedTop`,

@@ -56,8 +56,9 @@ struct Opts {
     cmd: Vec<String>,
 }
 
-/// Resolve the prompt-ready pattern: `--ready` beats `$ATERM_DRIVE_READY`, which
-/// beats the built-in default.
+/// Resolve the prompt-ready pattern: `--ready`, else the built-in default. The
+/// flag is the one spelling: `$ATERM_DRIVE_READY` was retired (no environment
+/// alternatives in a shipped binary, `aterm-update-core/tests/env_reads.rs`).
 ///
 /// The default ([`crate::claude_prompt_ready_pattern`]) matches a Claude input
 /// caret, which is only correct when the driven session IS Claude. Driving any
@@ -66,8 +67,7 @@ struct Opts {
 /// extra settle either way: a non-matching pattern costs a bounded wait, never
 /// a failed turn.
 fn resolve_ready(flag: Option<String>) -> String {
-    flag.or_else(|| std::env::var("ATERM_DRIVE_READY").ok())
-        .unwrap_or_else(|| crate::claude_prompt_ready_pattern().to_string())
+    flag.unwrap_or_else(|| crate::claude_prompt_ready_pattern().to_string())
 }
 
 fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
@@ -1960,10 +1960,10 @@ mod tests {
     /// matches a Claude input caret, so driving any other REPL — or a plain
     /// shell, which wants no confirm at all — needs an override.
     #[test]
-    fn ready_pattern_precedence_flag_beats_env_beats_default() {
+    fn ready_pattern_is_the_flag_else_the_default() {
         let dflt = crate::claude_prompt_ready_pattern();
 
-        // Flag wins outright (no env read needed for this branch).
+        // The flag wins outright.
         assert_eq!(resolve_ready(Some(r"^\$ ".to_string())), r"^\$ ");
 
         // An EMPTY flag is meaningful — idle-only — and must NOT fall through
@@ -1971,11 +1971,9 @@ mod tests {
         // would silently break.
         assert_eq!(resolve_ready(Some(String::new())), "");
 
-        // No flag, no env -> the built-in default.
-        // (Guarded: another test in this process could have set the var.)
-        if std::env::var("ATERM_DRIVE_READY").is_err() {
-            assert_eq!(resolve_ready(None), dflt);
-        }
+        // No flag -> the built-in default, whatever the environment holds: the
+        // retired `$ATERM_DRIVE_READY` is read by nothing.
+        assert_eq!(resolve_ready(None), dflt);
     }
 
     /// `<verb> --help` is a request for help and never an action. `prompt --help`

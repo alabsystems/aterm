@@ -5,8 +5,9 @@ use super::super::relaunch::{
     AtPrompt, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES, ENDED_AT_ONCE, EXIT_LOOK, EXIT_SETTLE,
     ExitRecord, HELD_WAIT_IN_TEST, MODEL_WAIT, RELAUNCH_FENCE_TRIES, RelaunchLineError, Restart,
     STALE_S, Snapshot, after_exit, after_host_ended, await_new, carry_on_with_tab_probe,
-    continuation_session, exit_record, line_for, look_at_exit, owed, relaunch_by_parent,
-    restart_from, resume, resumed_prompt, shell_dialect, type_relaunch_line,
+    continuation_session, exit_fallback, exit_record, fallback_origin, line_for, look_at_exit,
+    model_restart, owed, relaunch_by_parent, restart_from, restart_with, resume, resumed_prompt,
+    shell_dialect, type_relaunch_line, with_model,
 };
 use super::super::upgrade::Dialect;
 use super::*;
@@ -1984,7 +1985,11 @@ fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("state file");
-    let sibling_pid = dead_pid();
+    // A LIVE sibling (round six, F20): only a running process can hold a
+    // conversation, so only its unreadable record makes the roster partial.
+    let mut sibling_agent = parked().spawn().expect("sibling");
+    wait_exec(sibling_agent.id());
+    let sibling_pid = sibling_agent.id();
     assert_ne!(sibling_pid, sf.pid);
     let sibling = opts
         .home
@@ -2038,6 +2043,63 @@ fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
     );
     std::fs::remove_file(&sibling).expect("remove mismatched record");
     assert!(session_files(&opts.home).is_some());
+    sibling_agent.kill().expect("stop sibling");
+    sibling_agent.wait().expect("reap sibling");
+    agent.kill().expect("stop agent");
+    agent.wait().expect("reap agent");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// ONE STALE SIBLING NO LONGER STOPS EVERY CLAUDE UPGRADE (round six, F20).
+/// A dead agent's truncated record, an unreadable one, one in a shape this
+/// build does not read, and a `*.json` whose name is no pid name no process
+/// that could hold a conversation: the roster stays whole, and the live
+/// owner's record is in it. A stale record whose `pid` names a LIVE process
+/// under another file name still vetoes (a numeric name cannot attest
+/// another process's record).
+///
+/// FAILS WITHOUT THE FIX: `session_files` returned `None` for every one of
+/// them, for good — `wait:session-files-unreadable` at every Claude tab in
+/// the window, retried every minute, with no row.
+#[test]
+fn a_dead_or_foreign_sibling_leaves_the_roster_whole() {
+    let dir = scratch("stale-sibling");
+    let opts = drive(&dir);
+    let mut agent = parked().spawn().expect("agent");
+    wait_exec(agent.id());
+    let sf = register(&opts.home, agent.id(), SESSION);
+    let sessions = opts.home.join(".claude/sessions");
+    let gone = dead_pid();
+    assert!(!alive(gone));
+    let stale = sessions.join(format!("{gone}.json"));
+    for shape in ["half", "dir", "schema", "foreign"] {
+        match shape {
+            "half" => std::fs::write(&stale, "{").expect("truncated"),
+            "dir" => std::fs::create_dir(&stale).expect("unreadable"),
+            "schema" => std::fs::write(
+                &stale,
+                format!(r#"{{"pid":{gone},"sessionId":"{SESSION}","cwd":"/"}}"#),
+            )
+            .expect("an older shape"),
+            _ => std::fs::write(sessions.join("notes.json"), "{").expect("not a pid record"),
+        }
+        let roster = session_files(&opts.home)
+            .unwrap_or_else(|| panic!("{shape}: a stale sibling vetoed the roster"));
+        assert_eq!(roster, vec![sf.clone()], "{shape}");
+        assert_eq!(require_unique_owner(&opts.home, &sf), Ok(()), "{shape}");
+        match shape {
+            "dir" => std::fs::remove_dir(&stale).expect("remove"),
+            "foreign" => std::fs::remove_file(sessions.join("notes.json")).expect("remove"),
+            _ => std::fs::remove_file(&stale).expect("remove"),
+        }
+    }
+    // NEGATIVE CONTROL: a dead pid's file name over a LIVE process's record.
+    std::fs::copy(sessions.join(format!("{}.json", sf.pid)), &stale).expect("copy");
+    assert!(
+        session_files(&opts.home).is_none(),
+        "a live pid still vetoes"
+    );
+    std::fs::remove_file(&stale).expect("remove");
     agent.kill().expect("stop agent");
     agent.wait().expect("reap agent");
     let _ = std::fs::remove_dir_all(dir);
@@ -2149,6 +2211,25 @@ fn a_ready_answer_is_read_when_the_tail_window_starts_inside_a_character() {
 }
 
 // ---------------------------------------------------------------- the composer
+
+#[test]
+fn a_transcript_append_cannot_grow_a_tail_read_past_its_budget() {
+    // The file had eight bytes when metadata was read; by the time it was
+    // read it had grown to sixteen. No timing race or writer thread needed.
+    let body = b"0123456789abcdef";
+    let mut file = std::io::Cursor::new(body);
+    let (tail, mark) = tail_window(&mut file, 8, 4);
+    assert_eq!(tail, "4567");
+    assert_eq!(mark, 8);
+    let mut unread = String::new();
+    file.read_to_string(&mut unread).expect("remaining bytes");
+    assert_eq!(unread, "89abcdef", "the returned mark skips no append");
+
+    let mut file = std::io::Cursor::new(body);
+    assert_eq!(tail_window(&mut file, 2, 4), ("0123".to_owned(), 4));
+    let mut file = std::io::Cursor::new(body);
+    assert_eq!(tail_window(&mut file, 8, 0), (String::new(), 8));
+}
 
 /// `cell` replies measured 2026-09-23 on s-b5cf… under Claude Code 2.1.281,
 /// read only: the placeholder's first letter at the caret row's column 2, the
@@ -4003,6 +4084,211 @@ fn a_restart_whose_agent_the_orphan_pass_sees_gone_says_when() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The ledger rows of `opts` whose step is `step`, by the conversation each
+/// names.
+fn noted_for(opts: &Opts, step: &str, session: &str) -> usize {
+    std::fs::read_to_string(ledger_path(opts))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+        .filter(|v| v.get("step").and_then(Value::as_str) == Some(step))
+        .filter(|v| v.get("session").and_then(Value::as_str) == Some(session))
+        .count()
+}
+
+/// L4 OF THE UPGRADE'S LEFTOVERS (2026-09-28): A RESTART UNDER WAY THAT HAS
+/// NOT MOVED IS SAID ONCE ON THE LEDGER. A Claude Code the upgrade SIGTERMed
+/// that hangs in its own shutdown (a hook, an MCP teardown) keeps its session
+/// file and its pid: every visit answered `wait:exiting` and wrote nothing,
+/// nothing bounds that wait, and `aterm harness ledger upgrade` ended at
+/// `terminated` for as long as it hung while `--status` read
+/// `stalled=stuck:exiting`. Past [`STALE_S`] the visit now says it ONCE
+/// (`stuck:exiting`, keyed on [`St::noted`] as a held-back wait is), in the
+/// words the owner's view uses; a later visit that finds it standing writes
+/// nothing more. It stays a NOTE: the visit still waits, the record stays in
+/// flight (never a failure, which would leave an agent that exits later
+/// un-relaunched), and nothing is signalled or typed. The ledger and
+/// `--status` agree. NEGATIVE CONTROL: within the bound nothing is said.
+#[cfg(unix)]
+#[test]
+fn a_hung_exit_past_its_bound_is_noted_once_and_nothing_is_forced() {
+    for (case, age, notes) in [("past", STALE_S + 60, 1), ("within", 60, 0)] {
+        let h = Parked::new(
+            &format!("stuck-exiting-{case}"),
+            Answers::default(),
+            settled(),
+            3600,
+        );
+        let at_s = now_s() - age;
+        save(
+            &h.opts,
+            SESSION,
+            &St {
+                phase: Phase::Exiting { at_s },
+                pid: h.sf.pid,
+                ..settled()
+            },
+        );
+        let steps = [h.visit().step, h.visit().step];
+        assert_eq!(steps, ["wait:exiting", "wait:exiting"], "{case}");
+        let said = h.details("stuck:exiting");
+        assert_eq!(said.len(), notes, "{case}: said once: {said:?}");
+        if let Some(detail) = said.first() {
+            assert!(detail.contains("has not exited"), "{detail}");
+            assert!(detail.contains("nothing is forced"), "{detail}");
+        }
+        let kept = load(&h.opts, SESSION).expect("state");
+        assert_eq!(
+            kept.phase,
+            Phase::Exiting { at_s },
+            "{case}: still in flight, never a failure"
+        );
+        let signalled = h
+            .asked
+            .lock()
+            .map_or(true, |a| a.iter().any(|l| l.contains(" signal ")));
+        assert!(!signalled, "{case}: nothing is signalled");
+        assert!(h.typed().is_empty(), "{case}: nothing is typed");
+        let shown = rows(&h.opts);
+        assert_eq!(
+            shown.first().and_then(|r| r.stall(now_s())).as_deref(),
+            (notes == 1).then_some("stuck:exiting"),
+            "{case}: the ledger and --status agree"
+        );
+    }
+}
+
+/// L4, the orphan pass: a hung agent that has already removed its session
+/// file (Claude's graceful shutdown removes it first) is no conversation a
+/// visit sees, and the orphan pass skips it for as long as its pid lives.
+/// Past [`STALE_S`] that skip says it once too; nothing is acted on — the
+/// pass reports nothing for it, and its record stays in flight. NEGATIVE
+/// CONTROLS: within the bound nothing is said, and a dry run writes nothing.
+#[test]
+fn a_hung_exit_with_no_session_file_is_noted_once_by_the_orphan_pass() {
+    let dir = scratch("stuck-orphan");
+    let opts = drive(&dir);
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let (me, now) = (std::process::id(), now_s());
+    let cases = [
+        (
+            "aaaaaaaa-0000-0000-0000-000000000031",
+            now - STALE_S - 60,
+            1,
+        ),
+        ("aaaaaaaa-0000-0000-0000-000000000032", now - 60, 0),
+    ];
+    for (session, at_s, _) in cases {
+        let st = St {
+            phase: Phase::Exiting { at_s },
+            pid: me,
+            shell: me,
+            tab: TAB.to_string(),
+            to: "2.1.281".to_string(),
+            source: "native".to_string(),
+            ..St::default()
+        };
+        save(&opts, session, &st);
+    }
+    let dry = Opts {
+        dry_run: true,
+        ..opts.clone()
+    };
+    assert!(orphans(&dry, &[], None).is_empty());
+    assert_eq!(
+        noted_for(&opts, "stuck:exiting", cases[0].0),
+        0,
+        "a dry run"
+    );
+    let first = orphans(&opts, &[], None);
+    let second = orphans(&opts, &[], None);
+    assert!(
+        first.is_empty() && second.is_empty(),
+        "nothing acted on: {first:?} {second:?}"
+    );
+    for (session, at_s, notes) in cases {
+        assert_eq!(
+            noted_for(&opts, "stuck:exiting", session),
+            notes,
+            "{session}"
+        );
+        assert_eq!(
+            load(&opts, session).map(|s| s.phase),
+            Some(Phase::Exiting { at_s }),
+            "{session}: still in flight"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L4, a relaunched agent that never carries on: the line that resumes it
+/// was typed and the new process holds the conversation, but its carry-on
+/// waits (never idle — a box on its screen — or a tab whose ownership moved)
+/// and nothing bounds that while the conversation is held. Past [`STALE_S`]
+/// from the relaunch, the carry-on's wait says it once
+/// (`stuck:relaunched`); nothing is typed and the record stays relaunched.
+/// NEGATIVE CONTROLS: within the bound nothing is said, and a relaunch on
+/// exit's record (no upgrade, and in no `--status`) says nothing either.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_that_never_carries_on_is_noted_once_past_its_bound() {
+    for (case, age, cause, notes) in [
+        ("past", STALE_S + 60, "", 1),
+        ("within", 60, "", 0),
+        ("on-exit", STALE_S + 60, CAUSE_EXIT, 0),
+    ] {
+        // Short: the instance's socket path is bounded (`SUN_LEN`).
+        let dir = scratch(&format!("stuck-rl-{case}"));
+        let (sock, asked) = instance(&dir);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        let mut agent = parked().spawn().expect("agent");
+        wait_exec(agent.id());
+        let sf = register(&opts.home, agent.id(), SESSION);
+        let at_s = now_s() - age;
+        let mut st = St {
+            phase: Phase::Relaunched { at_s },
+            from: "1.0.0".to_string(),
+            to: "9.9.9".to_string(),
+            source: "managed".to_string(),
+            tab: TAB.to_string(),
+            cause: cause.to_string(),
+            ..St::default()
+        };
+        save(&opts, SESSION, &st);
+        let mut c = connect(&opts, TAB).expect("control connection");
+        let mut steps = Vec::new();
+        for _ in 0..2 {
+            let r = carry_on_with_tab_probe(
+                &opts,
+                blank(&sf),
+                &mut st,
+                &mut c,
+                SESSION,
+                &sf,
+                MODEL_WAIT,
+                |_, _, _| false,
+            );
+            steps.push(r.step);
+        }
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let said = ledger_details(&opts, "stuck:relaunched");
+        let kept = load(&opts, SESSION).map(|s| s.phase);
+        let typed = turns(&asked);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(steps, ["wait:tab-ownership-changed"; 2], "{case}");
+        assert_eq!(said.len(), notes, "{case}: said once: {said:?}");
+        if let Some(detail) = said.first() {
+            assert!(detail.contains("has not reached an idle point"), "{detail}");
+        }
+        assert_eq!(typed, 0, "{case}: nothing is typed");
+        assert_eq!(kept, Some(Phase::Relaunched { at_s }), "{case}");
+    }
+}
+
 /// S1, the relaunch's own look: once the kernel says the signalled agent is
 /// gone ([`super::super::upgrade_wake::wait_exit`]) its record says when,
 /// though the shell's prompt is not back yet and nothing is typed.
@@ -4055,6 +4341,284 @@ fn a_restart_whose_agent_the_relaunch_sees_gone_says_when() {
     assert!(matches!(st.phase, Phase::Exiting { .. }), "still in flight");
     assert_ne!(st.exited_at, 0, "seen gone");
     assert_eq!(turns(&asked), 0, "nothing typed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// EVERY STEP WORD IS TAUGHT, AND AN UNTAUGHT ONE IS NO LAST WORD (design
+/// record 2026-09-28, §3.2 C8): [`after`] ended in `_ => After::Finished`, so
+/// a word nobody added a line for stopped the host looking at that session
+/// until the next activation notice. The last words are named; every word
+/// the lanes say is taught ([`unknown_step`] false); a word nobody taught it
+/// is looked at again at the ladder's longest pause, and the host warns of
+/// it. NEGATIVE CONTROL: the old catch-all, replayed, reads the same untaught
+/// word as the last one.
+#[test]
+fn every_step_word_is_taught_and_an_untaught_one_is_looked_at_again() {
+    for last in [
+        "current",
+        "done",
+        "done:fresh",
+        "done:taskless",
+        "done:no-continue",
+        "done:unconfirmed",
+        "ended:graceful-exit",
+        "ended:one-shot",
+        "skip:not-selected",
+        "skip:another-home",
+        "skip:not-a-tui",
+        "skip:no-managed-codex",
+        "daemon-updated",
+        "would-announce",
+        "would-restart:fresh",
+        "would-release:gave-up",
+        "wait:skipped",
+        "terminated",
+        "relaunched",
+        "exit-typed",
+        "exited",
+    ] {
+        assert_eq!(after(last, 0), After::Finished, "{last}");
+        assert!(!unknown_step(last), "{last}");
+    }
+    // The words each lane says as it acts or waits, none of them a guess.
+    for word in [
+        "announced:1",
+        "continued",
+        "adopted",
+        "gave-up",
+        "drain-expired:box",
+        "released:gave-up",
+        "rearmed:unanswered",
+        "failed:no-resume",
+        "refused:not-a-shell-job",
+        "exit-refused",
+        "busy:another-sweep",
+        "busy:state-unwritable",
+        "held-back:terminal:tmux",
+        "left-typed-cleared",
+        "left-typed:notice",
+        "wait:announce-refused:changed",
+        "wait:not-idle:busy",
+        "wait:failed",
+        "wait:box",
+        "reopened:notice-process-gone",
+        // The Codex ladder's and the goal pause's words (rulings 380 and 381;
+        // the merge of 2026-09-28 pins them here): each is looked at again,
+        // none of them the last word.
+        "goal-paused",
+        "goal-esc",
+        "goal-paused-seen",
+        "goal-resumed",
+        "goal-resumed:moved",
+        "goal-released:by-hand",
+        "goal-pause-refused",
+        "left-typed:goal-pause",
+        "wait:goal",
+        "wait:goal:record",
+        "wait:goal:switch",
+        "wait:goal-held",
+        "wait:goal-pausing",
+        "wait:goal-pausing:no-fence",
+        "wait:goal-pause-refused:held",
+        "wait:goal-resume",
+        "wait:goal-resuming",
+        "wait:goal-left-paused",
+        "wait:goal-sandboxed",
+        "wait:switch",
+        "wait:daemon-turn",
+        "wait:daemon-busy",
+        "wait:pin:busy-thread",
+        "wait:changed",
+        "wait:in-flight",
+        "wait:no-shell-integration",
+        "wait:screen-unreadable",
+        "wait:failed:no-resume",
+    ] {
+        assert!(!unknown_step(word), "{word}");
+        assert_ne!(after(word, 0), After::Finished, "{word}");
+    }
+    // The goal pause's own acts hand the next move to the next idle point:
+    // the paused goal's last turn ends there.
+    for word in ["goal-paused", "goal-esc", "wait:goal-held"] {
+        assert_eq!(after(word, 0), After::NextIdle, "{word}");
+    }
+    // An untaught word: looked at again, at the longest pause, however many
+    // looks came before, and said to be untaught.
+    for (word, waits) in [("brand-new", 0), ("brand-new:thing", 9), ("", 3)] {
+        assert!(unknown_step(word), "{word}");
+        assert_eq!(
+            after(word, waits),
+            After::Later(LATER[LATER.len() - 1]),
+            "{word}"
+        );
+    }
+    // NEGATIVE CONTROL: the match as it ended until this day.
+    let old = |step: &str| {
+        if unknown_step(step) {
+            After::Finished
+        } else {
+            after(step, 0)
+        }
+    };
+    assert_eq!(old("brand-new"), After::Finished);
+    assert_ne!(after("brand-new", 0), old("brand-new"));
+}
+
+/// THE BUSY FOOTER IS READ BELOW THE COMPOSER, NOT IN THE TRANSCRIPT (design
+/// record 2026-09-28, §3.2 C8): `esc to interrupt` in ANY row read as a turn
+/// running, so an idle screen whose scrollback quoted a footer — an agent
+/// debugging this harness quotes one often — waited `busy` for as long as the
+/// quote stayed on screen. NEGATIVE CONTROL: the any-row rule, replayed, reads
+/// the quote as busy.
+#[test]
+fn a_footer_quoted_in_the_transcript_is_no_turn_running() {
+    let rule = "─".repeat(40);
+    let footer = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt";
+    let rows = |lines: &[&str]| -> Vec<String> { lines.iter().map(|l| (*l).to_string()).collect() };
+    let quoted = rows(&[
+        "⏺ The footer read:",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt",
+        "",
+        &rule,
+        "❯ ",
+        &rule,
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ]);
+    assert!(!busy_footer(&quoted), "a quote above the composer");
+    let running = rows(&["⏺ Bash(sleep 600)", "", &rule, "❯ ", &rule, footer]);
+    assert!(busy_footer(&running), "the footer under the composer");
+    // The measured reply the drive tests start from: its footer is under the
+    // composer, with no full rule between them.
+    assert!(busy_footer(&parse_screen(SCREEN).expect("parses").rows));
+    // A multi-row draft that quotes the hint is the composer, not its footer.
+    let drafted = rows(&[
+        "",
+        &rule,
+        "❯ see the footer:",
+        "  esc to interrupt",
+        &rule,
+        "  ⏵⏵ auto",
+    ]);
+    assert!(!busy_footer(&drafted));
+    // No composer on screen (a box replaced it): no footer to read.
+    assert!(!busy_footer(&rows(&[
+        "Do you want to proceed?",
+        "  esc to interrupt"
+    ])));
+    // The spinner row above the composer carries the hint over an idle
+    // footer (the auto-continue fixture in `aterm-phase`, review of
+    // 2026-09-28): a turn running, read by the live status row.
+    let spinning = rows(&[
+        "⏺ Bash(./run.sh --queue 8)",
+        "  ⎿  queued 8 runs",
+        "",
+        "✶ Deliberating… (4s · ↑ 1.2k tokens · esc to interrupt)",
+        "",
+        &rule,
+        "❯ ",
+        &rule,
+        "  ⏵⏵ auto mode on (shift+tab to cycle)",
+    ]);
+    assert!(busy_footer(&spinning), "the spinner row above the composer");
+    // NEGATIVE CONTROL: the rule as it stood.
+    let any_row = |rows: &[String]| rows.iter().any(|r| r.contains("esc to interrupt"));
+    assert!(any_row(&quoted));
+}
+
+/// THE FENCED NOTICE ASKS NOTHING BETWEEN ITS READ AND ITS `turn` (design
+/// record 2026-09-28, §3.2 C7a): the server types nothing when output came
+/// after the generation it is handed, and two requests of ours sat in that
+/// window — the `cell` the composer check asks at column 2, and the `turn`'s
+/// `help turn` probe. Now the probe is asked first and kept for the
+/// connection, and a read that needs the `cell` is read once more after it:
+/// the last `text` read is followed by the `turn` itself. A composer that
+/// moved between the two reads is `changed`, nothing typed. NEGATIVE CONTROL:
+/// the old order, replayed on a fresh connection, sends the `cell` and the
+/// probe after the read the turn is fenced on.
+#[cfg(unix)]
+#[test]
+fn the_fenced_notice_asks_nothing_between_its_read_and_its_turn() {
+    let rule = "─".repeat(20);
+    let at = |col: u32, text: &str| {
+        format!(
+            r#"{{"rows":["✻ Pondering… (3s)","{rule}","❯ {text}","{rule}"],"cursor":{{"row":2,"col":{col}}},"seq":77,"first":0,"gen":"4.77","human_ms":null}}"#
+        )
+    };
+    let verbs = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
+        asked
+            .lock()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l.split_whitespace().find(|w| !w.starts_with('@')))
+                    .filter(|v| *v != "AUTH")
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let rig = |name: &str, answers: Answers| {
+        let dir = scratch(name);
+        let (sock, asked) = instance_with(&dir, answers);
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        let c = connect(&opts, TAB).expect("control connection");
+        (dir, c, asked)
+    };
+    let answers = |after: Option<(usize, String)>| Answers {
+        screen: at(2, ""),
+        after,
+        help: FENCED_HELP,
+        turn: vec!["OK 0 id=2 submitted=1 status=settled"],
+        ..Answers::default()
+    };
+    // Twice on one connection: the probe once, and each `turn` straight
+    // after the read its generation came from.
+    let (dir, mut c, asked) = rig("fence-order", answers(None));
+    for _ in 0..2 {
+        let generation = typing_fence(&mut c, TAB).expect("empty composer");
+        assert_eq!(generation.as_deref(), Some("4.77"));
+        turn_fenced(&mut c, TAB, "[aterm harness] hi", generation.as_deref()).expect("typed");
+    }
+    drop(c);
+    let got = verbs(&asked);
+    assert_eq!(
+        got,
+        [
+            "help", "text", "cell", "text", "turn", "text", "cell", "text", "turn"
+        ],
+        "{got:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // A cursor off column 2 asks no `cell`, and reads once.
+    let (dir, mut c, asked) = rig(
+        "fence-no-cell",
+        Answers {
+            screen: at(4, "x"),
+            ..answers(None)
+        },
+    );
+    assert_eq!(typing_fence(&mut c, TAB), Err("draft"), "a typed draft");
+    drop(c);
+    assert_eq!(verbs(&asked), ["help", "text"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    // The composer moved between the two reads: `changed`, nothing typed.
+    let (dir, mut c, asked) = rig("fence-moved", answers(Some((1, at(3, "a")))));
+    assert_eq!(typing_fence(&mut c, TAB), Err("changed"));
+    drop(c);
+    assert!(!verbs(&asked).contains(&"turn".to_string()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // NEGATIVE CONTROL: the order as it stood until this day.
+    let (dir, mut c, asked) = rig("fence-old-order", answers(None));
+    let scr = screen(&mut c, TAB).expect("a read");
+    assert!(composer_empty(&mut c, TAB, &scr));
+    turn_fenced(&mut c, TAB, "[aterm harness] hi", scr.generation.as_deref()).expect("typed");
+    drop(c);
+    let got = verbs(&asked);
+    let read = got.iter().position(|v| v == "text").expect("read");
+    let turn = got.iter().position(|v| v == "turn").expect("turn");
+    assert_eq!(&got[read + 1..turn], ["cell", "help"], "{got:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4196,19 +4760,29 @@ fn a_step_that_typed_or_ended_the_agent_moved_the_session() {
 /// owned nothing, and the supervisor could type over the answer).
 #[test]
 fn the_upgrade_owns_turn_ends_only_while_its_step_says_so() {
-    assert!(owns_turn_ends("announced", 0));
-    assert!(owns_turn_ends("announced:2", 0));
-    assert!(owns_turn_ends("wait:settling", 0));
-    assert!(!owns_turn_ends("wait:settling", OWNED_SETTLE_LOOKS));
+    const GRACE: u32 = 120;
+    assert!(owns_turn_ends("announced", 0, GRACE));
+    assert!(owns_turn_ends("announced:2", 0, GRACE));
+    assert!(owns_turn_ends("wait:settling", 0, GRACE));
+    assert!(!owns_turn_ends("wait:settling", OWNED_SETTLE_LOOKS, GRACE));
     // Claude's status catching up with its idle screen settles as its own
     // `not-idle` does (2026-09-27), bounded the same.
-    assert!(owns_turn_ends("wait:status-stale", 0));
-    assert!(!owns_turn_ends("wait:status-stale", OWNED_SETTLE_LOOKS));
+    assert!(owns_turn_ends("wait:status-stale", 0, GRACE));
+    assert!(!owns_turn_ends(
+        "wait:status-stale",
+        OWNED_SETTLE_LOOKS,
+        GRACE
+    ));
     assert!(owns_turn_ends(
         "wait:background",
-        OWNED_BACKGROUND_LOOKS - 1
+        OWNED_BACKGROUND_LOOKS - 1,
+        GRACE
     ));
-    assert!(!owns_turn_ends("wait:background", OWNED_BACKGROUND_LOOKS));
+    assert!(!owns_turn_ends(
+        "wait:background",
+        OWNED_BACKGROUND_LOOKS,
+        GRACE
+    ));
     for last in [
         "wait:awaiting-ready",
         "wait:release:settling",
@@ -4223,8 +4797,82 @@ fn the_upgrade_owns_turn_ends_only_while_its_step_says_so() {
         "continued",
         "current",
     ] {
-        assert!(!owns_turn_ends(last, 0), "{last}");
+        assert!(!owns_turn_ends(last, 0, GRACE), "{last}");
     }
+}
+
+/// A PERSON AT THE TAB OWNS THE TURN END FOR THE PERSON'S GRACE (the
+/// 2026-09-27 20:27 point, s-d3346, live records): the agent answered READY at
+/// 20:27:20, the owner had typed "ok" at 20:26:42, and the upgrade waited
+/// `held-back:attended` (20:27:27), then `wait:attended` (20:27:49, 20:28:10)
+/// OWNING NOTHING, its next look climbing to 60 s — so at the grace's lapse
+/// (20:28:42) the loop typed `keep going` over the READY, and the upgrade then
+/// waited 5 h 50 min for an idle point that never came. Now the attended wait
+/// owns the point while the person's grace runs — every look reads it afresh,
+/// and a person scrolling through the answer renews it — and is looked at again
+/// at the first rung while the next look owns it ([`after_attended`]), so the
+/// look that finds the grace lapsed lands within 20 s of it and takes the
+/// restart. NEGATIVE CONTROLS: past the backstop ([`ATTENDED_OWNED_S`] beyond
+/// the grace) it owns nothing, so a stamp that fails closed never holds the loop
+/// for good, and its looks go back on the ladder; `awaiting-ready`, a
+/// person's hold, a give-up and an adoption still own nothing; a break still
+/// gives an attended wait's claim back; and every other wait keeps its ladder.
+#[test]
+fn a_person_at_the_tab_owns_the_turn_end_for_their_grace() {
+    const GRACE: u32 = 120;
+    let look = LATER[0].as_secs();
+    // The live sequence: held back once, then waiting, every look owned —
+    // including a person who keeps reading well past one grace.
+    assert!(owns_turn_ends("held-back:attended", 0, GRACE));
+    for waits in [0, 1, 2, 7, 8, 30] {
+        assert!(owns_turn_ends("wait:attended", waits, GRACE), "{waits}");
+    }
+    // The backstop: (120 s + 30 min) / 20 s = 96 looks, then given back.
+    let last = u32::try_from((u64::from(GRACE) + ATTENDED_OWNED_S) / look).unwrap();
+    assert_eq!(last, 96);
+    assert!(owns_turn_ends("wait:attended", last, GRACE));
+    assert!(!owns_turn_ends("wait:attended", last + 1, GRACE));
+    assert!(!owns_turn_ends("held-back:attended", last + 1, GRACE));
+    // A longer grace owns longer.
+    assert!(owns_turn_ends("wait:attended", last + 1, 600));
+    // Looked at again at the first rung, however long it waits.
+    for waits in [0, 1, 2, 3, 9, 40] {
+        assert_eq!(
+            after("wait:attended", waits),
+            After::Later(LATER[0]),
+            "{waits}"
+        );
+        assert_eq!(
+            after("held-back:attended", waits),
+            After::Later(LATER[0]),
+            "{waits}"
+        );
+    }
+    // The host, counting its looks: the first rung while the next look owns
+    // the point, then back on the ladder (the review of 2026-09-28).
+    assert_eq!(after_attended(1, 0, GRACE), After::Later(LATER[0]));
+    assert_eq!(after_attended(last, 40, GRACE), After::Later(LATER[0]));
+    assert_eq!(after_attended(last + 1, 0, GRACE), After::Later(LATER[0]));
+    assert_eq!(after_attended(last + 1, 1, GRACE), After::Later(LATER[1]));
+    assert_eq!(after_attended(last + 1, 95, GRACE), After::Later(LATER[3]));
+    assert!(attended("held-back:attended") && attended("wait:attended"));
+    assert!(!attended("wait:awaiting-ready") && !attended("held-back:person"));
+    // NEGATIVE CONTROLS.
+    for owns_nothing in [
+        "wait:awaiting-ready",
+        "held-back:person",
+        "gave-up",
+        "adopted",
+    ] {
+        assert!(!owns_turn_ends(owns_nothing, 0, GRACE), "{owns_nothing}");
+    }
+    assert!(released_at_break("wait:attended"), "a break gives it back");
+    assert_eq!(
+        after("wait:settling", 1),
+        After::Later(LATER[1]),
+        "the ladder stands"
+    );
+    assert_eq!(after("held-back:terminal:tmux", 2), After::Later(LATER[2]));
 }
 
 /// THE RELEASE IS TYPED ONLY WHERE IT IS THE UPGRADE'S NEXT ACT
@@ -4627,7 +5275,14 @@ fn a_launch_is_waited_on_for_its_record_only_within_its_window() {
     let dir = scratch("records");
     assert_eq!(claude_records(&dir), Some(Vec::new()), "none kept here");
     std::fs::create_dir_all(dir.join(".claude/sessions")).expect("sessions");
-    std::fs::write(dir.join(".claude/sessions/101.json"), "{\"pid\": 1").expect("half");
+    // Half-written by a LIVE process (this one): only a running process's
+    // record can be mid-write (round six, F20).
+    let me = std::process::id();
+    std::fs::write(
+        dir.join(format!(".claude/sessions/{me}.json")),
+        "{\"pid\": 1",
+    )
+    .expect("half");
     assert_eq!(claude_records(&dir), None, "caught half-written: unread");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4974,6 +5629,8 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
         session: session.map(str::to_string),
         cwd: "/".to_string(),
         version: None,
+        codex: None,
+        dialect: Some(Dialect::Zsh),
     };
     // Each step reads Claude's record at the attempt: an exit nothing could
     // read as it was seen ([`ExitRecord::Unread`]; the look at the exit is the
@@ -5138,6 +5795,8 @@ impl DeadAgent {
             session: Some(SESSION.to_string()),
             cwd: "/".to_string(),
             version: None,
+            codex: None,
+            dialect: Some(Dialect::Zsh),
         };
         let record = sessions.join(format!("{dead}.json"));
         DeadAgent {
@@ -5434,7 +6093,7 @@ fn an_exit_the_harness_own_restart_made_is_never_read_as_graceful() {
 /// S0 AND S3 OF THE IN-FLIGHT REVIEW (2026-09-27): THE HOST FINDS THE
 /// RESTART THAT ENDED THE AGENT THAT LEFT ([`restarted`]), before whose exit
 /// it was — Claude Code's by the process that left, Codex's by its tab (a
-/// Codex worker keeps no snapshot) — and CARRIES it ([`carry_restart`]):
+/// Codex restart's record is filed per tab) — and CARRIES it ([`carry_restart`]):
 /// on to the tab while it may act — [`STALE_S`] from the exit the carry
 /// saw, never from the signal, however long the shutdown took —
 /// `refused:<why>` once it cannot (said again while it is still that
@@ -5687,6 +6346,8 @@ fn an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab() {
         after_host_ended(&a.opts, &a.snap, true).step,
         "would-relaunch"
     );
+    // …and the relaunch's carry-on types that, never the upgrade's words.
+    assert!(super::super::relaunch::relaunch_cause(CAUSE_HOST));
     assert!(
         resumed_prompt("2.1.283", CAUSE_HOST).contains("aterm ended while this session ran"),
         "{}",
@@ -5887,6 +6548,8 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
         session: Some(SESSION.to_string()),
         cwd: "/".to_string(),
         version: Some("1.0.0".to_string()),
+        codex: None,
+        dialect: Some(Dialect::Zsh),
     };
     let claude = ["/opt/claude/bin/claude", "--verbose"];
     // Not read: a wait, nothing else.
@@ -5959,6 +6622,11 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
         restart_from(&opts, &back(None), Ok(snap(&claude))).step,
         "would-restart:model=claude-fable-5-1"
     );
+    // The notice's alias does not override the recorded origin.
+    assert_eq!(
+        restart_from(&opts, &back(Some("fable")), Ok(snap(&claude))).step,
+        "would-restart:model=claude-fable-5-1"
+    );
     // A restart in flight for the conversation is carried on, not doubled.
     let st = St {
         phase: Phase::Exiting { at_s: now_s() },
@@ -5978,6 +6646,789 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
     let _ = shell.kill();
     let _ = shell.wait();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A main-chain answer by `model` stamped `at` (RFC 3339): what the live
+/// model is read from past a process's start ([`models::live_model_at`]).
+#[cfg(unix)]
+fn answer_at(model: &str, at: &str) -> String {
+    format!(
+        r#"{{"isSidechain":false,"type":"assistant","timestamp":"{at}","message":{{"model":"{model}","role":"assistant","content":[{{"type":"text","text":"Done."}}]}},"version":"2.1.283"}}"#
+    )
+}
+
+/// The conversation `SESSION`'s transcript under `home`: `rows`, one a line.
+#[cfg(unix)]
+fn write_transcript(home: &Path, rows: &[String]) {
+    let project = home.join(".claude/projects/p");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::write(
+        project.join(format!("{SESSION}.jsonl")),
+        rows.join("\n") + "\n",
+    )
+    .expect("transcript");
+}
+
+/// The model a person chose for `SESSION` with `/model`, as the harness's
+/// record remembers it past the answers that follow ([`ModelRecord::human`]).
+#[cfg(unix)]
+fn chose_by_hand(opts: &Opts, model: &str) {
+    let dir = state_dir(opts).join("models");
+    std::fs::create_dir_all(&dir).expect("models");
+    let rec = ModelRecord {
+        human: model.to_string(),
+        ..ModelRecord::default()
+    };
+    std::fs::write(dir.join(format!("{SESSION}.json")), rec.render()).expect("record");
+}
+
+/// A `/model` CHOICE SURVIVES A MEMORY RESTART: a command-line `--model`
+/// overrides the default Claude's `/model` saves, so the restart in place,
+/// carrying the launch's flags, put a session its person had moved to Opus
+/// with `/model` back on the launch's Sonnet. The line now asks for the
+/// model chosen by hand. NEGATIVE CONTROLS: nobody chose one — the launch's
+/// flags, no model asked for; a launch that named no model — `/model` saved
+/// the choice as the default the relaunch starts on, nothing asked for.
+#[cfg(unix)]
+#[test]
+fn a_memory_restart_carries_a_model_chosen_by_hand_not_the_launchs() {
+    let dir = scratch("memory-hand-model");
+    let opts = Opts {
+        dry_run: true,
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    let mut shell = stand_in_shell();
+    let mut agent = parked().spawn().expect("agent");
+    wait_exec(agent.id());
+    let start = kernel_start(agent.id()).expect("lstart");
+    let snap = |argv: &[&str]| Snapshot {
+        tab: TAB.to_string(),
+        pid: agent.id(),
+        start: start.clone(),
+        shell: shell.id(),
+        program: PathBuf::from("/opt/claude/bin/claude"),
+        argv: argv.iter().map(|a| (*a).to_string()).collect(),
+        session: Some(SESSION.to_string()),
+        cwd: "/".to_string(),
+        version: Some("1.0.0".to_string()),
+        codex: None,
+        dialect: None,
+    };
+    register(&opts.home, agent.id(), SESSION);
+    let sonnet = ["/opt/claude/bin/claude", "--model", "claude-sonnet-5-5"];
+    // Answered past this process's start (its clock is now).
+    let later = "2099-01-01T00:00:00Z";
+    // NEGATIVE CONTROL: the launch's model runs, nobody chose another.
+    write_transcript(&opts.home, &[answer_at("claude-sonnet-5-5", later)]);
+    assert_eq!(
+        restart_from(&opts, &Restart::Memory, Ok(snap(&sonnet))).step,
+        "would-restart"
+    );
+    // A person moved it to Opus with `/model`, and it has answered on Opus.
+    write_transcript(&opts.home, &[answer_at("claude-opus-5-5", later)]);
+    chose_by_hand(&opts, "claude-opus-5-5");
+    assert_eq!(
+        restart_from(&opts, &Restart::Memory, Ok(snap(&sonnet))).step,
+        "would-restart:model=claude-opus-5-5"
+    );
+    // NEGATIVE CONTROL: a launch that named no model keeps its flags.
+    assert_eq!(
+        restart_from(
+            &opts,
+            &Restart::Memory,
+            Ok(snap(&["/opt/claude/bin/claude", "--verbose"]))
+        )
+        .step,
+        "would-restart"
+    );
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `/model` CHOICE SURVIVES AN EXIT'S RELAUNCH: a crashed agent launched
+/// with `--model claude-sonnet-5` and moved to Opus by hand is relaunched
+/// asking for Opus, not the launch's Sonnet. NEGATIVE CONTROL: nobody chose
+/// one — relaunched on the launch's own flags.
+#[cfg(unix)]
+#[test]
+fn an_exit_relaunch_carries_a_model_chosen_by_hand_not_the_launchs() {
+    let mut a = DeadAgent::new("exit-hand-model");
+    a.snap.argv = ["/opt/claude/bin/claude", "--model", "claude-sonnet-5"]
+        .iter()
+        .map(|w| (*w).to_string())
+        .collect();
+    // Answered past the agent's start (Sep 24 2026).
+    let later = "2026-09-25T00:00:00Z";
+    write_transcript(&a.opts.home, &[answer_at("claude-opus-5-5", later)]);
+    a.write_record();
+    let left = a.look(|_| {});
+    assert!(matches!(&left, ExitRecord::Survived(_)), "{left:?}");
+    // NEGATIVE CONTROL: no `/model` remembered — the answer on another model
+    // is no one's choice this module can name, and the launch's flags stand.
+    assert_eq!(a.attempt(&left), "would-relaunch");
+    chose_by_hand(&a.opts, "claude-opus-5-5");
+    assert_eq!(a.attempt(&left), "would-relaunch:model=claude-opus-5-5");
+}
+
+/// A CHOICE BEFORE THE PROCESS IS NOT ITS CHOICE: a stalled agent ended with
+/// no record left (the stall's remedy relaunches it anyway) had no process
+/// start to read, and the older-than-this-process guard was skipped — so the
+/// choice a person made for an EARLIER process, whose relaunch did not carry
+/// it, was carried as this one's, moving the conversation off the launch's
+/// `--model claude-sonnet-5`. The start is now the host's own snapshot's.
+/// NEGATIVE CONTROL: the same choice answered after the process started is
+/// carried.
+#[cfg(unix)]
+#[test]
+fn an_exit_relaunch_with_no_record_carries_no_choice_older_than_the_process() {
+    let mut a = DeadAgent::new("exit-hand-older");
+    a.snap.argv = ["/opt/claude/bin/claude", "--model", "claude-sonnet-5"]
+        .iter()
+        .map(|w| (*w).to_string())
+        .collect();
+    chose_by_hand(&a.opts, "claude-opus-5-5");
+    let stalled = |a: &DeadAgent| after_exit(&a.opts, &a.snap, &ExitRecord::Removed, true, true);
+    // Answered on Opus the day before this agent started (Sep 24 2026).
+    write_transcript(
+        &a.opts.home,
+        &[answer_at("claude-opus-5-5", "2026-09-23T00:00:00Z")],
+    );
+    assert_eq!(stalled(&a).step, "would-relaunch");
+    // NEGATIVE CONTROL: answered on Opus since it started.
+    write_transcript(
+        &a.opts.home,
+        &[answer_at("claude-opus-5-5", "2026-09-25T00:00:00Z")],
+    );
+    assert_eq!(stalled(&a).step, "would-relaunch:model=claude-opus-5-5");
+}
+
+/// THE WAY BACK FROM A FALLBACK OUTLIVES A MEMORY RESTART: the model the
+/// launch named before a bucket's fallback replaced it was kept on the
+/// fallback's record alone, so a memory restart saved over it left the way
+/// back (`ModelBack` with no model named) nothing to return to — and the
+/// relaunch dropped `--model` entirely, Claude's default instead of the
+/// launched model. It is now carried on every record while the fallback
+/// stands ([`St::fallback_from`]), and spent by the way back. NEGATIVE
+/// CONTROLS: with no fallback standing the way back drops `--model`, as
+/// before; a second fallback keeps the first's origin; and a fallback's
+/// record an older build wrote (no origin field) still returns to the launch
+/// model it kept.
+#[test]
+fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_restart() {
+    let launched = "claude-fable-5-1";
+    let fallback = "claude-opus-5";
+    let fell = model_restart(
+        &Restart::Model {
+            to: fallback.to_string(),
+        },
+        None,
+        launched.to_string(),
+        None,
+        None,
+    );
+    assert_eq!(fell.model.as_deref(), Some(fallback));
+    // The fallback's process runs `--model <fallback>`: a memory restart of
+    // it keeps the launch's (the fallback's) flags and the origin.
+    let memory = model_restart(
+        &Restart::Memory,
+        Some(&saved_restart(&fell)),
+        fallback.to_string(),
+        None,
+        None,
+    );
+    assert_eq!(memory.cause, "memory");
+    assert_eq!(memory.model, None);
+    assert_eq!(memory.fallback_from, launched);
+    let back = model_restart(
+        &Restart::ModelBack { to: None },
+        Some(&saved_restart(&memory)),
+        fallback.to_string(),
+        None,
+        None,
+    );
+    assert_eq!(back.model.as_deref(), Some(launched));
+    assert_eq!(back.cause, format!("model-back:{launched}"));
+    // The line: the fallback's `--model` replaced by the launched one.
+    let argv = |w: &[&str]| w.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        with_model(
+            argv(&["--model", fallback, "--resume", SESSION]),
+            back.model.as_deref()
+        ),
+        argv(&["--model", launched, "--resume", SESSION])
+    );
+    // Spent: no fallback stands after the way back.
+    assert_eq!(fallback_origin(Some(&saved_restart(&back))), None);
+    let again = model_restart(
+        &Restart::ModelBack { to: None },
+        Some(&saved_restart(&back)),
+        launched.to_string(),
+        None,
+        None,
+    );
+    assert_eq!(again.model.as_deref(), Some(""), "no fallback: none");
+    // A second fallback keeps the first's origin.
+    let second = model_restart(
+        &Restart::Model {
+            to: "claude-sonnet-5".to_string(),
+        },
+        Some(&saved_restart(&memory)),
+        fallback.to_string(),
+        None,
+        None,
+    );
+    assert_eq!(second.fallback_from, launched);
+    // An older build's fallback record: its kept launch model.
+    let legacy = St {
+        phase: Phase::Done,
+        cause: format!("model:{fallback}"),
+        launch_model: launched.to_string(),
+        ..St::default()
+    };
+    assert_eq!(fallback_origin(Some(&legacy)).as_deref(), Some(launched));
+}
+
+/// THE WAY BACK RETURNS TO WHAT THE PERSON HAD, NOT TO THE NOTICE'S ALIAS
+/// (review, 2026-09-28). A bucket's notice almost always names its family
+/// ("You've reached your Fable limit" → `fable`), and the way back used to
+/// ask for that alias ahead of the recorded origin — so the exact model the
+/// conversation had before the fallback (a `[1m]` window, a hand `/model`
+/// a relaunch carried) was never read on the real path, and a `/model` made
+/// since the fallback was replaced at the reset. Now: a hand choice since the
+/// fallback, else the origin, else the notice's alias. NEGATIVE CONTROL: no
+/// fallback on record and no hand choice — the notice's alias.
+#[test]
+fn the_way_back_prefers_the_persons_model_over_the_notices_alias() {
+    let launched = "claude-fable-5-1[1m]";
+    let fell = model_restart(
+        &Restart::Model {
+            to: "claude-opus-5-5".to_string(),
+        },
+        None,
+        launched.to_string(),
+        None,
+        None,
+    );
+    let named = || Restart::ModelBack {
+        to: Some("fable".to_string()),
+    };
+    let back = model_restart(
+        &named(),
+        Some(&saved_restart(&fell)),
+        "claude-opus-5-5".to_string(),
+        None,
+        None,
+    );
+    assert_eq!(back.model.as_deref(), Some(launched), "the exact origin");
+    let chosen = model_restart(
+        &named(),
+        Some(&saved_restart(&fell)),
+        "claude-opus-5-5".to_string(),
+        None,
+        Some("claude-sonnet-5-5".to_string()),
+    );
+    assert_eq!(
+        chosen.model.as_deref(),
+        Some("claude-sonnet-5-5"),
+        "a /model since the fallback is kept"
+    );
+    // A launch that named no model: the way back drops `--model`.
+    let bare = model_restart(
+        &Restart::Model {
+            to: "claude-opus-5-5".to_string(),
+        },
+        None,
+        String::new(),
+        None,
+        None,
+    );
+    let to_default = model_restart(
+        &named(),
+        Some(&saved_restart(&bare)),
+        "claude-opus-5-5".to_string(),
+        None,
+        None,
+    );
+    assert_eq!(to_default.model.as_deref(), Some(""));
+    // The control: nothing on record, nobody's `/model`.
+    let alias = model_restart(&named(), None, "claude-opus-5-5".to_string(), None, None);
+    assert_eq!(alias.model.as_deref(), Some("fable"));
+}
+
+/// The record a restart saves, as the state file keeps it.
+fn saved_restart(r: &super::super::relaunch::ModelRestart) -> St {
+    let st = St {
+        phase: Phase::Done,
+        cause: r.cause.clone(),
+        launch_model: r.launch_model.clone(),
+        fallback_from: r.fallback_from.clone(),
+        ..St::default()
+    };
+    St::from_json(&st.to_json()).expect("the record reads back")
+}
+
+/// A FALLBACK FROM A LAUNCH THAT NAMED NO MODEL IS STILL A FALLBACK: its
+/// origin (no `--model`) was recorded as empty, the same as "no fallback
+/// stands", so a second fallback read no origin, took the first fallback's
+/// model for one, and the way back returned to that fallback instead of
+/// Claude's default. A fallback standing is now recorded apart from the
+/// model it replaced. NEGATIVE CONTROL: one fallback from no model — the way
+/// back drops `--model`.
+#[test]
+fn a_second_fallback_from_a_launch_with_no_model_goes_back_to_no_model() {
+    let first = model_restart(
+        &Restart::Model {
+            to: "claude-opus-5".to_string(),
+        },
+        None,
+        String::new(),
+        None,
+        None,
+    );
+    assert_eq!(
+        fallback_origin(Some(&saved_restart(&first))).as_deref(),
+        Some(""),
+        "a fallback stands, from no model"
+    );
+    let back_once = model_restart(
+        &Restart::ModelBack { to: None },
+        Some(&saved_restart(&first)),
+        "claude-opus-5".to_string(),
+        None,
+        None,
+    );
+    assert_eq!(back_once.model.as_deref(), Some(""));
+    let second = model_restart(
+        &Restart::Model {
+            to: "claude-sonnet-5".to_string(),
+        },
+        Some(&saved_restart(&first)),
+        "claude-opus-5".to_string(),
+        None,
+        None,
+    );
+    let back = model_restart(
+        &Restart::ModelBack { to: None },
+        Some(&saved_restart(&second)),
+        "claude-sonnet-5".to_string(),
+        None,
+        None,
+    );
+    assert_eq!(
+        back.model.as_deref(),
+        Some(""),
+        "drop --model: Claude's default"
+    );
+    assert_eq!(
+        with_model(
+            vec!["--model".into(), "claude-sonnet-5".into()],
+            back.model.as_deref()
+        ),
+        Vec::<String>::new()
+    );
+}
+
+/// A `/MODEL` SINCE A FALLBACK OUTRANKS THE WAY BACK: a fallback onto Opus
+/// from Fable, then a person's `/model` to Sonnet, then an exit relaunched
+/// asking for Sonnet (the hand choice) — its record still carried the
+/// fallback's origin, and at the bucket's reset the way back put Fable over
+/// the person's Sonnet. A relaunch that carries a hand choice now makes it
+/// the origin, and the way back asks for Sonnet: what the person has.
+/// NEGATIVE CONTROLS: the same exit with nobody's `/model` carries the
+/// origin, and the way back returns to Fable; the memory restart's record
+/// reads the same way; with no fallback standing, the hand choice makes
+/// none.
+#[test]
+fn a_model_chosen_by_hand_after_a_fallback_is_not_undone_by_the_way_back() {
+    let dir = scratch("hand-over-fallback");
+    let opts = drive(&dir);
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    let origin = "claude-fable-5-1";
+    let fallback = "claude-opus-5";
+    let hand = "claude-sonnet-5";
+    let fell = model_restart(
+        &Restart::Model {
+            to: fallback.to_string(),
+        },
+        None,
+        origin.to_string(),
+        None,
+        None,
+    );
+    save(&opts, SESSION, &saved_restart(&fell));
+    let exit_record = |fallback_from: String, launch: &str| St {
+        phase: Phase::Done,
+        cause: CAUSE_EXIT.to_string(),
+        launch_model: launch.to_string(),
+        fallback_from,
+        ..St::default()
+    };
+    let way_back = |st: &St, launch: &str| {
+        model_restart(
+            &Restart::ModelBack { to: None },
+            Some(st),
+            launch.to_string(),
+            None,
+            None,
+        )
+        .model
+    };
+    // The exit relaunched on the person's Sonnet.
+    let carried = exit_record(exit_fallback(&opts, SESSION, None, Some(hand)), hand);
+    assert_eq!(
+        way_back(&carried, hand).as_deref(),
+        Some(hand),
+        "the hand choice stands"
+    );
+    // NEGATIVE CONTROL: nobody's `/model` — the origin rides the exit.
+    let plain = exit_record(exit_fallback(&opts, SESSION, None, None), fallback);
+    assert_eq!(way_back(&plain, fallback).as_deref(), Some(origin));
+    // The memory restart, the same.
+    let memory = model_restart(
+        &Restart::Memory,
+        Some(&saved_restart(&fell)),
+        fallback.to_string(),
+        None,
+        Some(hand.to_string()),
+    );
+    assert_eq!(memory.model.as_deref(), Some(hand));
+    assert_eq!(
+        way_back(&saved_restart(&memory), hand).as_deref(),
+        Some(hand)
+    );
+    // No fallback standing: a hand choice is no fallback's origin.
+    save(
+        &opts,
+        SESSION,
+        &St {
+            phase: Phase::Done,
+            ..St::default()
+        },
+    );
+    assert_eq!(exit_fallback(&opts, SESSION, None, Some(hand)), "");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE WAY BACK OUTLIVES AN UPGRADE: an upgrade minted over a fallback's
+/// record ([`St::for_target`]) started from a fresh state, dropping the
+/// origin, and the way back at the bucket's reset had nothing to return to.
+/// The origin is carried onto every state it mints. NEGATIVE CONTROL: a
+/// record with no fallback standing mints none.
+#[test]
+fn an_upgrade_record_keeps_the_fallbacks_origin() {
+    let from = Version::parse("2.1.280").expect("v");
+    let to = Candidate {
+        exe: PathBuf::from("/pkg/agents/claude"),
+        version: Version::parse("2.1.283").expect("v"),
+        source: Source::Managed,
+    };
+    let fell = saved_restart(&model_restart(
+        &Restart::Model {
+            to: "claude-opus-5".to_string(),
+        },
+        None,
+        "claude-fable-5-1".to_string(),
+        None,
+        None,
+    ));
+    let pending = St {
+        phase: Phase::Pending,
+        to: "2.1.282".to_string(),
+        ..fell.clone()
+    };
+    for (name, prior) in [("done", fell.clone()), ("retargeted", pending)] {
+        let next = St::for_target(Some(prior), &from, &to, None, 900);
+        assert_eq!(
+            fallback_origin(Some(&next)).as_deref(),
+            Some("claude-fable-5-1"),
+            "{name}"
+        );
+    }
+    // Re-armed after a stop, an older build's fallback record keeps it too.
+    let mut legacy = St {
+        phase: Phase::Failed("unanswered".to_string()),
+        cause: "model:claude-opus-5".to_string(),
+        launch_model: "claude-fable-5-1".to_string(),
+        ..St::default()
+    };
+    legacy.rearm(900);
+    assert_eq!(
+        fallback_origin(Some(&legacy)).as_deref(),
+        Some("claude-fable-5-1")
+    );
+    let none = St::for_target(
+        Some(St {
+            phase: Phase::Done,
+            ..St::default()
+        }),
+        &from,
+        &to,
+        None,
+        900,
+    );
+    assert_eq!(fallback_origin(Some(&none)), None);
+}
+
+/// A `/MODEL` BEFORE A FALLBACK IS WHAT THE WAY BACK RETURNS TO: launched
+/// `--model claude-fable-5-1`, moved to Sonnet by hand, then a bucket's
+/// fallback onto Opus — whose restart recorded the launch's Fable as the
+/// origin, so the way back at the bucket's reset put Fable over the person's
+/// Sonnet. The fallback now records the hand choice. NEGATIVE CONTROLS:
+/// nobody's `/model` — the launch's Fable; a fallback already standing keeps
+/// its origin over a hand choice.
+#[test]
+fn a_fallback_after_a_model_chosen_by_hand_goes_back_to_that_model() {
+    let launched = "claude-fable-5-1";
+    let hand = "claude-sonnet-5";
+    let fallback = Restart::Model {
+        to: "claude-opus-5".to_string(),
+    };
+    let way_back = |fell: &super::super::relaunch::ModelRestart| {
+        model_restart(
+            &Restart::ModelBack { to: None },
+            Some(&saved_restart(fell)),
+            "claude-opus-5".to_string(),
+            None,
+            None,
+        )
+        .model
+    };
+    let fell = model_restart(
+        &fallback,
+        None,
+        launched.to_string(),
+        None,
+        Some(hand.to_string()),
+    );
+    assert_eq!(fell.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(fell.fallback_from, hand);
+    assert_eq!(way_back(&fell).as_deref(), Some(hand));
+    // NEGATIVE CONTROL: nobody's `/model`.
+    let plain = model_restart(&fallback, None, launched.to_string(), None, None);
+    assert_eq!(way_back(&plain).as_deref(), Some(launched));
+    // NEGATIVE CONTROL: a second fallback keeps the first's origin.
+    let second = model_restart(
+        &fallback,
+        Some(&saved_restart(&plain)),
+        "claude-haiku-5".to_string(),
+        None,
+        Some(hand.to_string()),
+    );
+    assert_eq!(second.fallback_from, launched);
+}
+
+/// A restart in place of a stand-in agent launched `--model <launch>`,
+/// driven for real ([`restart_with`], its job and terminal scripted): the
+/// conversation's last record `prior`, a `/model` of `hand` answered since
+/// the agent started — and what it says, and the record it saved.
+#[cfg(unix)]
+fn restart_saved(
+    name: &str,
+    why: &Restart,
+    launch: &str,
+    prior: Option<&St>,
+    hand: Option<&str>,
+) -> (Report, Option<St>) {
+    let dir = scratch(name);
+    let (sock, _) = instance_with(&dir, Answers::default());
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        ..drive(&dir)
+    };
+    let mut shell = stand_in_shell();
+    let mut agent = Command::new(std::env::current_exe().expect("exe"))
+        .arg(PARK[0])
+        .env(PARK_ENV, "1")
+        .env("ATERM_PARENT_SESSION_ID", TAB)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("agent");
+    wait_exec(agent.id());
+    register(&opts.home, agent.id(), SESSION);
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    if let Some(prior) = prior {
+        save(&opts, SESSION, prior);
+    }
+    // Answered past this process's start (its clock is now).
+    let answered = hand.unwrap_or(launch);
+    write_transcript(&opts.home, &[answer_at(answered, "2099-01-01T00:00:00Z")]);
+    if let Some(hand) = hand {
+        chose_by_hand(&opts, hand);
+    }
+    let snap = Snapshot {
+        tab: TAB.to_string(),
+        pid: agent.id(),
+        start: kernel_start(agent.id()).expect("lstart"),
+        shell: shell.id(),
+        program: PathBuf::from("/opt/claude/bin/claude"),
+        argv: ["/opt/claude/bin/claude", "--model", launch]
+            .iter()
+            .map(|w| (*w).to_string())
+            .collect(),
+        session: Some(SESSION.to_string()),
+        cwd: "/".to_string(),
+        version: Some("1.0.0".to_string()),
+        codex: None,
+        dialect: None,
+    };
+    let r = restart_with(
+        &opts,
+        why,
+        Ok(snap),
+        &Script::new(shell.id(), usize::MAX, None),
+    );
+    let saved = load(&opts, SESSION);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    (r, saved)
+}
+
+/// THE RESTART IN PLACE SAVES THE FALLBACK ORIGIN IT DECIDES, driven past
+/// its signal to the record it keeps: a memory restart of a fallback that
+/// carries a `/model` made since makes it the origin; a fallback made after
+/// a `/model` records that. Each wire of [`restart_from`] into
+/// [`model_restart`] is read off the saved record — the hand choice read for
+/// either restart, and the origin written. NEGATIVE CONTROL: the same memory
+/// restart with nobody's `/model` carries the fallback's own origin.
+#[cfg(unix)]
+#[test]
+fn a_restart_in_place_saves_the_fallback_origin_it_decides() {
+    let origin = "claude-fable-5-1";
+    let fallback = "claude-sonnet-5-5";
+    let hand = "claude-opus-5-5";
+    let fell = saved_restart(&model_restart(
+        &Restart::Model {
+            to: fallback.to_string(),
+        },
+        None,
+        origin.to_string(),
+        None,
+        None,
+    ));
+    // (case, restart, the launch's model, the prior record, the `/model`,
+    // the model the line asks for, the origin saved)
+    for (name, why, launch, prior, chose, asks, want) in [
+        (
+            "saved-memory-hand",
+            Restart::Memory,
+            fallback,
+            Some(&fell),
+            Some(hand),
+            hand,
+            hand,
+        ),
+        (
+            "saved-memory-nobody",
+            Restart::Memory,
+            fallback,
+            Some(&fell),
+            None,
+            fallback,
+            origin,
+        ),
+        (
+            "saved-fallback-hand",
+            Restart::Model {
+                to: fallback.to_string(),
+            },
+            origin,
+            None,
+            Some(hand),
+            fallback,
+            hand,
+        ),
+    ] {
+        let (r, saved) = restart_saved(name, &why, launch, prior, chose);
+        let saved = saved.unwrap_or_else(|| panic!("{name}: no record: {r:?}"));
+        assert!(
+            !matches!(saved.phase, Phase::Pending | Phase::Done),
+            "{name}: signalled: {r:?} {saved:?}"
+        );
+        assert_eq!(saved.fallback_from, want, "{name}: {r:?}");
+        assert!(
+            saved.line.contains(&format!("'--model' '{asks}'")),
+            "{name}: {}",
+            saved.line
+        );
+    }
+}
+
+/// AN EXIT'S RELAUNCH SAVES THE FALLBACK ORIGIN IT DECIDES, driven (not
+/// dry) to the record it keeps: a crashed agent of a standing fallback,
+/// moved to Opus by hand since, is relaunched asking for Opus with Opus as
+/// the origin — the wire of [`after_exit`] into [`exit_fallback`], the hand
+/// choice with it, read off the saved record. NEGATIVE CONTROL: nobody's
+/// `/model` — the fallback's own origin carried. The two run side by side:
+/// each waits out the stand-in shell's prompt that never comes back.
+#[cfg(unix)]
+#[test]
+fn an_exit_relaunch_saves_the_fallback_origin_it_decides() {
+    let origin = "claude-fable-5-1";
+    let fallback = "claude-sonnet-5-5";
+    let hand = "claude-opus-5-5";
+    let case = |name: &str, chose: Option<&str>, want: &str| {
+        let mut a = DeadAgent::new(name);
+        let (sock, _) = instance_with(&a.dir, Answers::default());
+        a.opts = Opts {
+            sock: Some(sock),
+            dry_run: false,
+            ..a.opts.clone()
+        };
+        a.snap.argv = ["/opt/claude/bin/claude", "--model", fallback]
+            .iter()
+            .map(|w| (*w).to_string())
+            .collect();
+        // Answered past the agent's start (Sep 24 2026).
+        write_transcript(
+            &a.opts.home,
+            &[answer_at(chose.unwrap_or(fallback), "2026-09-25T00:00:00Z")],
+        );
+        if let Some(hand) = chose {
+            chose_by_hand(&a.opts, hand);
+        }
+        std::fs::create_dir_all(state_dir(&a.opts)).expect("state");
+        save(
+            &a.opts,
+            SESSION,
+            &saved_restart(&model_restart(
+                &Restart::Model {
+                    to: fallback.to_string(),
+                },
+                None,
+                origin.to_string(),
+                None,
+                None,
+            )),
+        );
+        a.write_record();
+        let left = a.look(|_| {});
+        let r = after_exit(&a.opts, &a.snap, &left, true, false);
+        let saved = load(&a.opts, SESSION).expect("state");
+        assert_eq!(saved.cause, CAUSE_EXIT, "{name}: {r:?}");
+        assert_eq!(saved.fallback_from, want, "{name}: {r:?}");
+        assert!(
+            saved
+                .line
+                .contains(&format!("'--model' '{}'", chose.unwrap_or(fallback))),
+            "{name}: {}",
+            saved.line
+        );
+    };
+    std::thread::scope(|scope| {
+        let hand_case = scope.spawn(|| case("exit-saved-hand", Some(hand), hand));
+        case("exit-saved-nobody", None, origin);
+        hand_case.join().expect("exit-saved-hand");
+    });
 }
 
 /// A RELAUNCH HANDED BACK: where a supervisor loop takes the relaunched agent
@@ -6931,6 +8382,8 @@ fn a_new_upgrade_waits_for_the_last_restarts_model() {
         ..St::default()
     };
     save(&opts, SESSION, &pending);
+    // As written: the one writer stamps its progress (`St::progress_at`).
+    let pending = load(&opts, SESSION).expect("saved");
     let r = visit(&opts, &sf, &[], &newer(), &Script::new(1, usize::MAX, None));
     assert_eq!(r.step, "wait:confirming", "{r:?}");
     assert_eq!(
@@ -7600,6 +9053,12 @@ fn unsettled() -> St {
         last_seq: 76,
         seq_since_s: now_s(),
         salt: 1,
+        // Found behind just now: the ladder's first rung (the owner's
+        // decision of 2026-09-28), where the natural idle point is asked for
+        // — a person within `human_grace_s`, the full settle. With no start
+        // recorded the salt (1, 1970) would stand for it, and every rig
+        // would stand at the last rung.
+        pending_since: now_s(),
         ..St::default()
     }
 }
@@ -7686,10 +9145,15 @@ fn an_attended_tab_has_a_person_at_it_and_is_said_once() {
 /// paste were separate steps, and a keystroke between them was typed in front
 /// of the notice. Where the host's `turn` takes the fence (`help turn` names
 /// `if-gen=`), the notice is typed with `if-gen=<the fresh read's generation>
-/// yield=0.2`; a host that answers `skipped reason=changed` typed nothing,
-/// and the step is a wait with the upgrade still pending. NEGATIVE CONTROL:
-/// a host without the fence gets the plain turn, never an `if-gen=` it would
-/// type as text.
+/// yield=0.2`; a host that answers `skipped reason=changed` typed nothing.
+/// The visit reads and fences it again, [`NOTICE_FENCE_TRIES`] times in all
+/// (2026-09-28, s-d3346: three refusals at three looks, and the loop took the
+/// point): a moment's repaint is typed at the next try, and one that outlasts
+/// them is a wait with the upgrade still pending — counted for the owner
+/// (`St::refused`, from the first refusal). A person typing through the park
+/// (`ERR yield timeout`) is never typed at again. NEGATIVE CONTROL: a host
+/// without the fence gets the plain turn, never an `if-gen=` it would type as
+/// text.
 #[cfg(unix)]
 #[test]
 fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
@@ -7714,18 +9178,124 @@ fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
         3600,
     );
     assert_eq!(h.visit().step, "wait:announce-refused:changed");
-    assert_eq!(
-        load(&h.opts, SESSION).map(|st| st.phase),
-        Some(Phase::Pending)
-    );
+    let st = load(&h.opts, SESSION).expect("the record");
+    assert_eq!(st.phase, Phase::Pending);
+    assert_eq!(st.refused, 1, "one look refused");
+    assert_ne!(st.refused_at, 0, "since when");
     let typed = h.typed();
-    assert_eq!(typed.len(), 1);
+    assert_eq!(typed.len(), NOTICE_FENCE_TRIES, "{typed:#?}");
     assert!(
-        typed[0].contains(&format!(
+        typed.iter().all(|t| t.contains(&format!(
             " turn if-gen=4.77 yield=0.2 {TURN_WAIT} [aterm harness]"
-        )),
+        ))),
         "{typed:?}"
     );
+    // How many screen reads come before the first paste: the look's and the
+    // first fence's. A later screen after them is what a RETRY reads.
+    let reads = {
+        let asked = h.asked.lock().expect("asked").clone();
+        asked
+            .iter()
+            .take_while(|l| !l.contains(" turn "))
+            .filter(|l| l.contains(" text "))
+            .count()
+    };
+    assert!(reads >= 2, "the look's read and the fence's: {reads}");
+    // The next look that cannot type it counts on, from the same first one.
+    let first = st.refused_at;
+    assert_eq!(h.visit().step, "wait:announce-refused:changed");
+    let st = load(&h.opts, SESSION).expect("the record");
+    assert_eq!((st.refused, st.refused_at), (2, first));
+    drop(h);
+    // A RETRY TYPES ONLY WHERE THE LOOK'S GATES STILL HOLD (the review of
+    // 2026-09-28): the screen that moved was a person's keys or the program's
+    // own output. A person gave the tab input since the look (a message
+    // submitted between the look and the paste), or the agent woke into a
+    // turn (its spinner and busy footer): the refusal stands, and nothing is
+    // typed again — never a notice queued behind the person's message or into
+    // the live turn.
+    let busy_screen = format!(
+        r#"{{"rows":["✻ Pondering… (3s · esc to interrupt)","{rule}","❯ ","{rule}"],"cursor":{{"row":2,"col":2}},"seq":79,"first":0,"gen":"4.79","human_ms":null}}"#
+    );
+    for (case, later) in [
+        (
+            "hand",
+            fenced_screen.replace(r#""human_ms":null"#, r#""human_ms":40"#),
+        ),
+        ("turn", busy_screen),
+    ] {
+        let h = Parked::new(
+            &format!("fence-retry-{case}"),
+            Answers {
+                after: Some((reads, later)),
+                ..answers(vec![
+                    "OK 0 turn skipped reason=changed submitted=0 seq=78 id=1",
+                    "OK 0 id=2 submitted=1 status=settled",
+                ])
+            },
+            settled(),
+            3600,
+        );
+        assert_eq!(
+            h.visit().step,
+            "wait:announce-refused:changed",
+            "{case}: the refusal stands"
+        );
+        assert_eq!(h.typed().len(), 1, "{case}: typed once, never again");
+        let st = load(&h.opts, SESSION).expect("the record");
+        assert_eq!((st.phase, st.refused), (Phase::Pending, 1), "{case}");
+        drop(h);
+    }
+    // NEGATIVE CONTROL: the same retry over a screen that only repainted (the
+    // look's gates hold) is typed.
+    let h = Parked::new(
+        "fence-retry-repaint",
+        Answers {
+            after: Some((reads, fenced_screen.replace("4.77", "4.78"))),
+            ..answers(vec![
+                "OK 0 turn skipped reason=changed submitted=0 seq=78 id=1",
+                "OK 0 id=2 submitted=1 status=settled",
+            ])
+        },
+        settled(),
+        3600,
+    );
+    assert_eq!(h.visit().step, "announced:1");
+    assert_eq!(h.typed().len(), 2);
+    assert!(
+        h.typed()[1].contains(" turn if-gen=4.78 "),
+        "{:?}",
+        h.typed()
+    );
+    drop(h);
+    // A moment's repaint: typed at the next try, within the same visit.
+    let h = Parked::new(
+        "fence-changed-once",
+        answers(vec![
+            "OK 0 turn skipped reason=changed submitted=0 seq=78 id=1",
+            "OK 0 id=2 submitted=1 status=settled",
+        ]),
+        settled(),
+        3600,
+    );
+    assert_eq!(h.visit().step, "announced:1");
+    assert_eq!(h.typed().len(), 2);
+    let st = load(&h.opts, SESSION).expect("the record");
+    assert_eq!(
+        (st.refused, st.refused_at),
+        (0, 0),
+        "typed: nothing refused"
+    );
+    drop(h);
+    // A person typing through the park: never typed at again.
+    let h = Parked::new(
+        "fence-yield",
+        answers(vec!["ERR yield timeout momentum=0.84"]),
+        settled(),
+        3600,
+    );
+    assert_eq!(h.visit().step, "wait:announce-refused:yield");
+    assert_eq!(h.typed().len(), 1);
     drop(h);
     // Taken.
     let h = Parked::new(
@@ -8501,11 +10071,23 @@ fn a_relaunch_typed_at_bash_takes_the_key_its_live_shell_names() {
     assert!(read < typed && relaunch[typed..].contains("\n        dialect,\n"));
     // A relaunch on exit — the agent's own, or its host's — is typed in
     // `after_exit_as`, the one body both of those wrap.
-    for caller in ["\npub(super) fn restart_from(\n", "\nfn after_exit_as(\n"] {
-        assert!(
-            body_of(caller).contains("relaunch(opts, r, &mut st, &mut c, &session, &Live)"),
-            "{caller}"
-        );
+    // The restart in place relaunches through its kernel seam, which the
+    // host's own entry fills with the live kernel.
+    for (caller, call) in [
+        (
+            "\npub(super) fn restart_with(\n",
+            "relaunch(opts, r, &mut st, &mut c, &session, k)",
+        ),
+        (
+            "\npub(super) fn restart_from(\n",
+            "restart_with(opts, why, snap, &Live)",
+        ),
+        (
+            "\nfn after_exit_as(\n",
+            "relaunch(opts, r, &mut st, &mut c, &session, &Live)",
+        ),
+    ] {
+        assert!(body_of(caller).contains(call), "{caller}");
     }
     assert!(
         include_str!("upgrade_drive.rs").contains("relaunch(opts, r, st, c, &sf.session_id, k)"),
@@ -9157,8 +10739,11 @@ fn typeahead_before_the_first_read_is_never_the_mark() {
 /// the tab it is in and how long the session has been behind — and a second
 /// sweep with the same wait keeps the SAME start. That is the negative
 /// control: with no request, nothing is typed. `aterm harness upgrade <tab>
-/// --now` ([`ask`]) waives exactly that window, and the next visit types the
-/// notice; the act clears the kept wait.
+/// --now` ([`ask`]) waives exactly that window — it stands the upgrade at the
+/// ladder's last rung — and the next visit types the notice; the act clears
+/// the kept wait. Ten minutes behind (the ladder's first rung, the owner's
+/// decision of 2026-09-28): two hours behind, where this rig stood until
+/// then, is the last rung already, and waits for no settle of its own.
 #[cfg(unix)]
 #[test]
 fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
@@ -9179,7 +10764,7 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
         .expect("agent");
     wait_exec(agent.id());
     let sf = register(&opts.home, agent.id(), SESSION);
-    let behind = now_s() - 7_200;
+    let behind = now_s() - 600;
     let st = St {
         phase: Phase::Pending,
         from: "1.0.0".to_string(),
@@ -9229,7 +10814,11 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
     assert_eq!(kept.tab, TAB, "a pending upgrade names its tab");
     assert_eq!(kept.behind_since(), behind);
     assert_eq!(row.request, Request::Now);
-    assert_eq!(row.stall(now_s()), None, "two hours behind is not stalled");
+    assert_eq!(
+        row.stall(now_s()),
+        None,
+        "ten minutes behind is not stalled"
+    );
     assert_eq!(
         moved.step, "announced:1",
         "the owner's word waived the window"
@@ -9238,6 +10827,145 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
     assert!(after.wait.is_empty(), "an act clears the kept wait");
     assert_eq!(after.behind_since(), behind, "the age is the session's");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE LADDER, DRIVEN ON CLAUDE CODE (the review of 2026-09-28: the ladder's
+/// Tier-1 bind reassembled the look's facts by hand, and no drive test read
+/// the rung, the keystroke or the repaint-proof settle through the real
+/// look). The real `visit`, whose `look` builds them by the same
+/// `ladder_look` the Codex visit does, across two looks — the clock between
+/// them moved by rewinding the state the first saved (its still run, the
+/// screen's `seq`, as the next look finds them):
+///
+/// * A REPAINT AT SETTLED ANNOUNCES: the screen's `seq` moved at each look
+///   (its own quiet restarting) while its words stood still a minute — the
+///   second look types the notice. NEGATIVE CONTROL: the same two looks at
+///   the Prefer rung wait `settling`.
+/// * A PERSON NEAR THE TAB AT KEYSONLY ANNOUNCES (their input a minute old).
+///   NEGATIVE CONTROL: the same person at Settled holds it.
+/// * A KEYSTROKE WITHIN 20 S AT LAND WAITS, look after look.
+#[cfg(unix)]
+#[test]
+fn the_real_look_climbs_the_ladder_on_claude_code() {
+    let near = idle_screen().replace(r#""human_ms":null"#, r#""human_ms":60000"#);
+    let typing = idle_screen().replace(r#""human_ms":null"#, r#""human_ms":1000"#);
+    let case = |name: &str, behind_s: u64, screen: &str, quiet: bool, looks: usize| {
+        let dir = scratch(name);
+        let (sock, asked) = instance_with(
+            &dir,
+            Answers {
+                screen: screen.to_string(),
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        // The stand-in agent with an argv the relaunch plan can carry (no
+        // harness flag of its own).
+        let mut agent = Command::new(std::env::current_exe().expect("exe"))
+            .arg(PARK[0])
+            .env(PARK_ENV, "1")
+            .env("ATERM_PARENT_SESSION_ID", TAB)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("agent");
+        wait_exec(agent.id());
+        let sf = register(&opts.home, agent.id(), SESSION);
+        let now = now_s();
+        let st = St {
+            phase: Phase::Pending,
+            from: "1.0.0".to_string(),
+            to: "9.9.9".to_string(),
+            source: "managed".to_string(),
+            // The screen `instance` shows is `seq` 77: last read as it is and
+            // quiet a minute, or as 76 a moment ago (it just repainted).
+            last_seq: if quiet { 77 } else { 76 },
+            seq_since_s: if quiet { now - 60 } else { now },
+            pending_since: now - behind_s,
+            ..St::default()
+        };
+        std::fs::create_dir_all(state_dir(&opts)).expect("state");
+        std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
+        let shell = dead_pid();
+        let table = vec![(shell, 1, "zsh".to_string())];
+        let mut steps = Vec::new();
+        for n in 0..looks {
+            if n > 0 {
+                // QUIET_S (20 s) on: the still run began 20 s earlier, and
+                // the screen repainted again unless it was quiet.
+                let mut st = load(&opts, SESSION).expect("state");
+                assert!(st.still_since != 0, "{name}: the look began a still run");
+                st.still_since -= upgrade::QUIET_S;
+                st.still_at -= upgrade::QUIET_S;
+                if !quiet {
+                    st.last_seq = 76;
+                    st.seq_since_s = now_s();
+                }
+                std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
+            }
+            let r = visit(
+                &opts,
+                &sf,
+                &table,
+                &newer(),
+                &Script::new(shell, usize::MAX, None),
+            );
+            steps.push(r.step);
+        }
+        let typed = turns(&asked);
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        (steps, typed)
+    };
+    let settled = upgrade::RUNG_SETTLED_S + 60;
+    // A repaint at Settled: the second look announces.
+    assert_eq!(
+        case("ladder-c-repaint", settled, &idle_screen(), false, 2),
+        (
+            vec!["wait:settling".to_string(), "announced:1".to_string()],
+            1
+        )
+    );
+    // NEGATIVE CONTROL: at Prefer the screen's own quiet is asked.
+    assert_eq!(
+        case("ladder-c-prefer", 600, &idle_screen(), false, 2),
+        (
+            vec!["wait:settling".to_string(), "wait:settling".to_string()],
+            0
+        )
+    );
+    // A person near the tab at KeysOnly: announced.
+    assert_eq!(
+        case("ladder-c-near", upgrade::RUNG_KEYS_S + 60, &near, true, 1),
+        (vec!["announced:1".to_string()], 1)
+    );
+    // NEGATIVE CONTROL: the same person at Settled holds it.
+    assert_eq!(
+        case("ladder-c-near-settled", settled, &near, true, 1),
+        (vec!["held-back:attended".to_string()], 0)
+    );
+    // A keystroke within KEYS_GAP_S at Land: waited out, look after look.
+    assert_eq!(
+        case(
+            "ladder-c-typing",
+            upgrade::RUNG_LAND_S + 60,
+            &typing,
+            true,
+            2
+        ),
+        (
+            vec![
+                "held-back:attended".to_string(),
+                "wait:attended".to_string()
+            ],
+            0
+        )
+    );
 }
 
 /// THE OWNER'S WORD IS ON THE TAB IT NAMED (review of 2026-09-25: it was kept
@@ -9547,6 +11275,96 @@ fn a_newer_target_keeps_the_age_and_the_owners_word_but_not_a_skip() {
     );
 }
 
+/// A STOPPED UPGRADE RETARGETED KEEPS ITS MOVE CLOCK, THE OWNER'S WORD AND ITS
+/// STOP STREAK (the watch's review, 2026-09-28): the `Failed` arm built on
+/// `St::fresh` and carried none of them, so a tab that gave up, rested and
+/// re-armed for ever had its `behind_since` reset by every vendor build —
+/// [`MOVE_BUDGET_S`], "kept across retargets and rounds", never ran out —
+/// and an owner's `--defer` was dropped, so the next point could announce
+/// inside it. The watch now reaches this arm off any point. NEGATIVE
+/// CONTROLS: a skip names its build and is not carried; a stopped round
+/// whose session has MOVED since (it runs another build than the one the
+/// round stopped on — `behind_anew`'s case, N3) and a FINISHED upgrade each
+/// begin a new wait from now, their word and streak gone; and on the code
+/// before this fix the first three assertions fail.
+#[test]
+fn a_stopped_upgrade_retargeted_keeps_its_clock_word_and_streak() {
+    let from = Version::parse("2.1.280").expect("v");
+    let to = Candidate {
+        exe: PathBuf::from("/pkg/agents/claude"),
+        version: Version::parse("2.1.283").expect("v"),
+        source: Source::Managed,
+    };
+    let prior = St {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        from: "2.1.280".to_string(),
+        to: "2.1.282".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        pending_since: 100,
+        request: Request::DeferUntil(5_000),
+        request_tab: TAB.to_string(),
+        request_at: 50,
+        streak_why: upgrade::GAVE_UP.to_string(),
+        stop_streak: 3,
+        ..St::default()
+    };
+    let next = St::for_target(Some(prior.clone()), &from, &to, None, 900);
+    assert_eq!(next.phase, Phase::Pending, "a new target is asked afresh");
+    assert_eq!(next.behind_since(), 100, "the move clock is kept");
+    assert_eq!(
+        next.request,
+        Request::DeferUntil(5_000),
+        "the defer is kept"
+    );
+    assert_eq!((next.request_tab.as_str(), next.request_at), (TAB, 50));
+    assert_eq!(
+        (next.streak_why.as_str(), next.stop_streak),
+        (upgrade::GAVE_UP, 3),
+        "the same stop in a row is kept"
+    );
+    assert_eq!(next.tab, TAB);
+    let skipped = St::for_target(
+        Some(St {
+            request: Request::Skip("2.1.282".to_string()),
+            ..prior.clone()
+        }),
+        &from,
+        &to,
+        None,
+        900,
+    );
+    assert_eq!(skipped.request, Request::None, "a skip is of one build");
+    assert!(skipped.request_tab.is_empty());
+    assert_eq!(skipped.behind_since(), 100);
+    let moved = St::for_target(
+        Some(St {
+            from: "2.1.279".to_string(),
+            ..prior.clone()
+        }),
+        &from,
+        &to,
+        None,
+        900,
+    );
+    assert_eq!(moved.behind_since(), 900, "moved since: behind from now");
+    assert_eq!(moved.request, Request::None);
+    assert_eq!(moved.stop_streak, 0);
+    let done = St::for_target(
+        Some(St {
+            phase: Phase::Done,
+            ..prior
+        }),
+        &from,
+        &to,
+        None,
+        900,
+    );
+    assert_eq!(done.behind_since(), 900, "a finished one: behind from now");
+    assert_eq!(done.request, Request::None);
+    assert_eq!(done.stop_streak, 0);
+}
+
 /// THE LABEL FOLLOWS THE BUILD until the restart begins: managed and native
 /// builds share a version, and a state minted for one kept naming it after
 /// the sweep moved to the other (measured 2026-09-25: the ledger said
@@ -9697,11 +11515,19 @@ fn a_report_records_its_wait_and_an_act_clears_it() {
     // `wait:attended`: ONE wait from its first sweep, never an act between.
     st.note_step("held-back:attended", "idle", 300);
     assert_eq!((st.wait.as_str(), st.wait_since), ("attended", 300));
+    assert_eq!(st.wait_seen, 300);
     st.note_step("wait:attended", "idle", 360);
     assert_eq!(st.wait_since, 300, "the same wait keeps its start");
+    // …and each look that finds the person is recorded (the owner's view
+    // names them only while one has lately: `Row::wait_seen`).
+    assert_eq!(st.wait_seen, 360, "the last look that saw the person");
+    // Another wait carries no look time: its rows change only with the upgrade.
+    st.note_step("wait:settling", "idle", 380);
+    assert_eq!(st.wait_seen, 0);
+    st.note_step("wait:attended", "idle", 400);
     // The give-up is an act.
     st.note_step("gave-up", "idle", 420);
-    assert!(st.wait.is_empty() && st.wait_since == 0);
+    assert!(st.wait.is_empty() && st.wait_since == 0 && st.wait_seen == 0);
 }
 
 /// THE LEDGER IS BOUNDED (it grew without one until 2026-09-24): past the
@@ -10002,8 +11828,10 @@ fn an_unwanted_model_restart_is_forgotten_before_it_begins() {
         ("an announced one", &announced),
     ] {
         save(&opts, SESSION, st);
+        // As written: the one writer stamps its progress (`St::progress_at`).
+        let written = load(&opts, SESSION);
         forget_unwanted_model_restart(&opts, SESSION, Some(st), &running);
-        assert_eq!(load(&opts, SESSION).as_ref(), Some(st), "{why} is kept");
+        assert_eq!(load(&opts, SESSION), written, "{why} is kept");
     }
     save(&opts, SESSION, &model_only);
     let dry = Opts {
@@ -10646,6 +12474,38 @@ fn visit_answered(
     ledger: Option<&[&str]>,
     answers: Answers,
 ) -> (Report, Option<St>, Vec<String>) {
+    visit_launched(
+        name,
+        rows,
+        dry_run,
+        kernel,
+        last_seq,
+        status,
+        ledger,
+        answers,
+        &[],
+        &|_| {},
+    )
+}
+
+/// [`visit_answered`], the agent's argv carrying `launch` after its own
+/// words — the flags a person launched it with, which the relaunch carries —
+/// and `seed` run over the sweep's options before the visit (the harness's
+/// own records a test lays down: a `/model` choice remembered).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn visit_launched(
+    name: &str,
+    rows: &[String],
+    dry_run: bool,
+    kernel: &Script,
+    last_seq: u64,
+    status: Option<&str>,
+    ledger: Option<&[&str]>,
+    answers: Answers,
+    launch: &[&str],
+    seed: &dyn Fn(&Opts),
+) -> (Report, Option<St>, Vec<String>) {
     use crate::supervise::approvals;
     let dir = scratch(name);
     let (sock, asked) = instance_with(&dir, answers);
@@ -10709,9 +12569,11 @@ fn visit_answered(
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
+    seed(&opts);
     let table = vec![(kernel.shell, 1, "zsh".to_string())];
     let files = session_files(&opts.home);
-    let args = atpkg::caller_shell::process_args(agent.id()).expect("agent argv");
+    let mut args = atpkg::caller_shell::process_args(agent.id()).expect("agent argv");
+    args.argv.extend(launch.iter().map(|w| (*w).to_string()));
     let r = visit_with_claim(
         &opts,
         &sf,
@@ -10828,6 +12690,336 @@ fn a_fresh_restart_types_nothing_plans_no_resume_and_keeps_every_last_look() {
     assert!(saved.cause.is_empty(), "{:?}", saved.cause);
     assert!(saved.line.contains("/nonexistent/claude"), "{}", saved.line);
     assert!(!saved.line.contains("--resume"), "afresh: {}", saved.line);
+}
+
+/// THE UPGRADE RESUMES IN THE MODE THE PILL SHOWS: Claude writes its
+/// `permission-mode` row only when it re-appends its session metadata, not as
+/// the mode changes, so a session launched with
+/// `--dangerously-skip-permissions` and switched to auto at idle still reads
+/// bypass in its transcript — and the upgrade, reading the transcript alone,
+/// relaunched it in bypass (and a plan session left for auto in plan). The
+/// relaunch now takes the mode the visit's look read off the tab's pill, with
+/// no read of its own. NEGATIVE CONTROL: with no pill on the screen, the
+/// transcript's mode decides, as before.
+#[cfg(unix)]
+#[test]
+fn an_upgrade_resumes_in_the_mode_the_pill_shows_not_the_transcripts_older_one() {
+    let shell = dead_pid();
+    let mode_row = |mode: &str| {
+        format!(r#"{{"type":"permission-mode","permissionMode":"{mode}","sessionId":"{SESSION}"}}"#)
+    };
+    let rows = |mode: &str| {
+        vec![
+            harness_row("Claude Code 2.1.283 (managed) is installed"),
+            mode_row(mode),
+            turn_by("claude-haiku-4-5", "I cannot stop now."),
+        ]
+    };
+    let rule = "─".repeat(20);
+    let auto_pill = format!(
+        r#"{{"rows":["{rule}","❯ ","{rule}","  ⏵⏵ auto mode on (shift+tab to cycle)"],"cursor":{{"row":1,"col":2}},"seq":77,"human_ms":null,"first":0}}"#
+    );
+    let bypass = ["--dangerously-skip-permissions"];
+    for (name, transcript, screen, launch, want, gone) in [
+        // Launched in bypass, left in auto: auto, the bypass flag gone.
+        (
+            "pill-auto-over-bypass",
+            "bypassPermissions",
+            auto_pill.clone(),
+            &bypass[..],
+            Some("'--permission-mode' 'auto'"),
+            Some("'--dangerously-skip-permissions'"),
+        ),
+        // Plan left for auto: auto, never plan.
+        (
+            "pill-auto-over-plan",
+            "plan",
+            auto_pill.clone(),
+            &[][..],
+            Some("'--permission-mode' 'auto'"),
+            Some("'plan'"),
+        ),
+        // NEGATIVE CONTROL: no pill drawn — the transcript's plan.
+        (
+            "no-pill-transcript-plan",
+            "plan",
+            idle_screen(),
+            &[][..],
+            Some("'--permission-mode' 'plan'"),
+            Some("'auto'"),
+        ),
+        // NEGATIVE CONTROL: no pill, the transcript's bypass — the launch's
+        // own flags, never moved.
+        (
+            "no-pill-transcript-bypass",
+            "bypassPermissions",
+            idle_screen(),
+            &bypass[..],
+            Some("'--dangerously-skip-permissions'"),
+            Some("'--permission-mode'"),
+        ),
+    ] {
+        // Foreground for the visit's two job reads and the restart's two,
+        // then backgrounded: the read right before the signal refuses it,
+        // the planned line kept on the record.
+        let (r, saved, _) = visit_launched(
+            name,
+            &rows(transcript),
+            false,
+            &Script::new(shell, 4, None),
+            77,
+            None,
+            None,
+            Answers {
+                screen,
+                ..Answers::default()
+            },
+            launch,
+            &|_| {},
+        );
+        assert_eq!(r.step, "wait:changed-before-signal", "{name}: {r:?}");
+        let line = saved.expect("state").line;
+        if let Some(want) = want {
+            assert!(line.contains(want), "{name}: {line}");
+        }
+        if let Some(gone) = gone {
+            assert!(!line.contains(gone), "{name}: {line}");
+        }
+    }
+}
+
+/// THE ANNOUNCEMENT IS PLANNED IN THE MODE THE PILL SHOWS: the notice is
+/// typed only once a relaunch line is planned, and that plan read the
+/// transcript's mode alone — a session launched in bypass and left in auto
+/// was planned back into bypass. It now takes the look's pill, as the
+/// restart does, and the line it planned is kept with the announcement.
+/// NEGATIVE CONTROL: with no pill on the screen, the transcript's bypass —
+/// the launch's own flags, never moved.
+#[cfg(unix)]
+#[test]
+fn an_announcement_is_planned_in_the_mode_the_pill_shows() {
+    let shell = dead_pid();
+    let rows = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        format!(
+            r#"{{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"{SESSION}"}}"#
+        ),
+        user_row("fix the parser"),
+        turn_by("claude-haiku-4-5", "Fixed."),
+    ];
+    let rule = "─".repeat(20);
+    let auto_pill = format!(
+        r#"{{"rows":["{rule}","❯ ","{rule}","  ⏵⏵ auto mode on (shift+tab to cycle)"],"cursor":{{"row":1,"col":2}},"seq":77,"human_ms":null,"first":0}}"#
+    );
+    for (name, screen, want, gone) in [
+        (
+            "announce-pill-auto",
+            auto_pill,
+            "'--permission-mode' 'auto'",
+            "'--dangerously-skip-permissions'",
+        ),
+        (
+            "announce-no-pill",
+            idle_screen(),
+            "'--dangerously-skip-permissions'",
+            "'--permission-mode'",
+        ),
+    ] {
+        let (r, saved, _) = visit_launched(
+            name,
+            &rows,
+            false,
+            &Script::new(shell, usize::MAX, None),
+            77,
+            None,
+            None,
+            Answers {
+                screen,
+                ..Answers::default()
+            },
+            &["--dangerously-skip-permissions"],
+            &|_| {},
+        );
+        assert_eq!(r.step, "announced:1", "{name}: {r:?}");
+        let line = saved.expect("state").line;
+        assert!(line.contains(want), "{name}: {line}");
+        assert!(!line.contains(gone), "{name}: {line}");
+    }
+}
+
+/// THE UPGRADE CARRIES A MODEL CHOSEN BY HAND: a session launched
+/// `--model claude-sonnet-5-5` and moved to Opus with `/model` — answered on
+/// Opus since — was relaunched by the upgrade on the launch's Sonnet when the
+/// list moved it to no model (its `model_list` empty), in the line its
+/// announcement planned and in the fresh restart's. Both now ask for Opus.
+/// NEGATIVE CONTROL: nobody's `/model` remembered — the launch's flags.
+#[cfg(unix)]
+#[test]
+fn an_upgrade_carries_a_model_chosen_by_hand_when_the_list_moves_none() {
+    let shell = dead_pid();
+    // Answered past the stand-in agent's start (its clock is now).
+    let later = "2099-01-01T00:00:00Z";
+    let task = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        user_row("fix the parser"),
+        answer_at("claude-opus-5-5", later),
+    ];
+    let fresh = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        answer_at("claude-opus-5-5", later),
+    ];
+    let launch = ["--model", "claude-sonnet-5-5"];
+    let chose = |opts: &Opts| chose_by_hand(opts, "claude-opus-5-5");
+    for (name, rows, kernel, step, chosen) in [
+        ("hand-announce", &task, usize::MAX, "announced:1", true),
+        ("hand-fresh", &fresh, 4, "wait:changed-before-signal", true),
+        ("nobody-announce", &task, usize::MAX, "announced:1", false),
+        (
+            "nobody-fresh",
+            &fresh,
+            4,
+            "wait:changed-before-signal",
+            false,
+        ),
+    ] {
+        let seed: &dyn Fn(&Opts) = if chosen { &chose } else { &|_| {} };
+        let (r, saved, _) = visit_launched(
+            name,
+            rows,
+            false,
+            &Script::new(shell, kernel, None),
+            77,
+            None,
+            None,
+            Answers::default(),
+            &launch,
+            seed,
+        );
+        assert_eq!(r.step, step, "{name}: {r:?}");
+        let saved = saved.expect("state");
+        assert!(saved.model_list.is_empty(), "{name}: the list moved none");
+        let (want, gone) = if chosen {
+            ("'claude-opus-5-5'", "'claude-sonnet-5-5'")
+        } else {
+            ("'claude-sonnet-5-5'", "'claude-opus-5-5'")
+        };
+        assert!(saved.line.contains(want), "{name}: {}", saved.line);
+        assert!(!saved.line.contains(gone), "{name}: {}", saved.line);
+    }
+}
+
+/// THE UPGRADE'S RESTART MAKES A HAND CHOICE IT CARRIES THE FALLBACK'S
+/// ORIGIN: a session on a bucket's fallback (`--model claude-sonnet-5-5`,
+/// launched on Fable), moved to Opus with `/model` since, was relaunched by
+/// the upgrade asking for Opus — but its record still named Fable as the
+/// origin, and the way back at the bucket's reset put Fable over the
+/// person's Opus. Once the signal is sent the saved record names Opus.
+/// NEGATIVE CONTROLS: nobody's `/model` — Fable carried; a restart that
+/// stops short of its signal (the job moved before it, the server refused
+/// it) leaves the origin as it was.
+#[cfg(unix)]
+#[test]
+fn an_upgrade_restart_makes_the_hand_choice_it_carries_the_fallbacks_origin() {
+    let shell = dead_pid();
+    let origin = "claude-fable-5-1";
+    let hand = "claude-opus-5-5";
+    // Answered past the stand-in agent's start (its clock is now).
+    let later = "2099-01-01T00:00:00Z";
+    let rows = |model: &str| {
+        vec![
+            harness_row("Claude Code 2.1.283 (managed) is installed"),
+            answer_at(model, later),
+        ]
+    };
+    let seed = |chose: bool| {
+        move |opts: &Opts| {
+            let mut st = load(opts, SESSION).expect("state");
+            st.fallback_from = origin.to_string();
+            save(opts, SESSION, &st);
+            if chose {
+                chose_by_hand(opts, hand);
+            }
+        }
+    };
+    let refused = Answers {
+        signal: "ERR busy",
+        ..Answers::default()
+    };
+    // (case, a `/model` made, job reads in the foreground, the server's
+    // answers, the step, the origin saved)
+    let cases = [
+        (
+            "origin-hand-sent",
+            true,
+            usize::MAX,
+            Answers::default(),
+            None,
+            hand,
+        ),
+        (
+            "origin-nobody-sent",
+            false,
+            usize::MAX,
+            Answers::default(),
+            None,
+            origin,
+        ),
+        (
+            "origin-hand-changed",
+            true,
+            4,
+            Answers::default(),
+            Some("wait:changed-before-signal"),
+            origin,
+        ),
+        (
+            "origin-hand-refused",
+            true,
+            usize::MAX,
+            refused,
+            Some("wait:signal-held"),
+            origin,
+        ),
+    ];
+    // Side by side: a sent restart waits out the stand-in shell's prompt.
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = cases
+            .into_iter()
+            .map(|(name, chose, foreground, answers, step, want)| {
+                let seed = seed(chose);
+                scope.spawn(move || {
+                    let model = if chose { hand } else { "claude-sonnet-5-5" };
+                    let (r, saved, asked) = visit_launched(
+                        name,
+                        &rows(model),
+                        false,
+                        &Script::new(shell, foreground, None),
+                        77,
+                        None,
+                        None,
+                        answers,
+                        &["--model", "claude-sonnet-5-5"],
+                        &seed,
+                    );
+                    let signalled = asked.iter().any(|l| l.contains(" signal "));
+                    match step {
+                        Some(step) => assert_eq!(r.step, step, "{name}: {r:?}"),
+                        None => assert!(signalled, "{name}: {r:?}"),
+                    }
+                    let saved = saved.expect("state");
+                    assert_eq!(saved.fallback_from, want, "{name}: {r:?}");
+                    assert!(
+                        saved.line.contains(&format!("'--model' '{model}'")),
+                        "{name}: {}",
+                        saved.line
+                    );
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().expect("case");
+        }
+    });
 }
 
 /// ND1 OF THE LIVE RE-TEST OF 2026-09-26: A RESTART HOLDS THE TAB FROM ITS
@@ -11080,24 +13272,28 @@ fn the_settle_is_measured_from_the_agents_verdict_not_from_a_repaint() {
 /// the session's loop while the loop is still, and typed `idle=1500
 /// timeout=30000`: the tab was held up to 30 s and the answer the carry-on
 /// started ended inside the step, unseen by the loop — `keep going` followed
-/// it half a second later. Here the stand-in agent answers for 3 s after
-/// every submit: the carry-on and the notice each return at once, asked
-/// `idle=1 timeout=10000` ([`TURN_WAIT`]). NEGATIVE CONTROL: a turn asked to
-/// settle on quiet, as they were, waits the answer out.
+/// it half a second later. Here the stand-in agent answers for two minutes
+/// after every submit: the carry-on and the notice each return inside a
+/// minute's hang detector, asked `idle=1 timeout=10000` ([`TURN_WAIT`]) — a
+/// step that waited the answer out is told from one that did not whatever
+/// the machine's load. NEGATIVE CONTROL: a turn asked to settle on quiet, as
+/// they were, waits the answer out (a stand-in answering for 3 s, so the
+/// control costs seconds, not minutes).
 #[cfg(unix)]
 #[test]
 fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
-    let answer = Duration::from_secs(3);
-    let answers = || Answers {
+    const HANG: Duration = Duration::from_secs(60);
+    let answers = |answer: Duration| Answers {
         answer,
         ..Answers::default()
     };
+    let long = || answers(2 * HANG);
     let asked = [
         user_row("Reply with one short sentence saying hello."),
         turn_by("claude-haiku-4-5", "Hello."),
     ];
     // The carry-on.
-    let rig = Rig::with("turn-wait-carry", &asked, answers());
+    let rig = Rig::with("turn-wait-carry", &asked, long());
     let mut st = rig.st.clone();
     let t0 = Instant::now();
     let r = rig.carry_on_from(&mut st, MODEL_WAIT);
@@ -11105,12 +13301,17 @@ fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
     let typed = rig.typed();
     assert_eq!(typed.len(), 1, "{r:?}");
     assert!(typed[0].contains(&format!(" {TURN_WAIT} ")), "{typed:?}");
-    assert!(
-        took < answer,
-        "the carry-on waited the answer out: {took:?}"
-    );
-    // NEGATIVE CONTROL: the old settle waits it out.
-    let mut c = connect(&rig.opts, TAB).expect("control connection");
+    assert!(took < HANG, "the carry-on waited the answer out: {took:?}");
+    drop(rig);
+    // NEGATIVE CONTROL: the old settle waits the stand-in's answer out.
+    let answer = Duration::from_secs(3);
+    let dir = scratch("turn-wait-control");
+    let (sock, _) = instance_with(&dir, answers(answer));
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let mut c = connect(&opts, TAB).expect("control connection");
     let t0 = Instant::now();
     let (head, _) = c
         .request_counted(&format!("@{TAB} turn yield=0.2 idle=1500 timeout=30000 hi"))
@@ -11120,10 +13321,10 @@ fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
         t0.elapsed() >= answer,
         "the stand-in answers as the server settles"
     );
-    drop(rig);
+    let _ = std::fs::remove_dir_all(dir);
     // The notice.
     let dir = scratch("turn-wait-notice");
-    let (sock, log) = instance_with(&dir, answers());
+    let (sock, log) = instance_with(&dir, long());
     let opts = Opts {
         sock: Some(sock),
         ..drive(&dir)
@@ -11134,7 +13335,7 @@ fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
         turn_fenced(&mut c, TAB, "[aterm harness] notice", None),
         Ok(())
     );
-    assert!(t0.elapsed() < answer, "the notice waited the answer out");
+    assert!(t0.elapsed() < HANG, "the notice waited the answer out");
     assert!(
         log.lock()
             .expect("log")
@@ -11203,3 +13404,79 @@ fn a_stop_that_repeats_rests_longer_and_never_for_good() {
 /// `harness_login_wall_model` to the real code.
 #[path = "upgrade_login_wall_tests.rs"]
 mod login_wall;
+
+/// The record's progress stamp and its deadlines (design record 2026-09-28,
+/// rollout step 5: T1-d and T1-e).
+#[path = "upgrade_watch_tests.rs"]
+mod watch;
+
+/// THE END OF THE AGENT'S OWN WORK RE-ARMS A ROUND THAT GAVE UP AND ASKS IN
+/// THE SAME VISIT (2026-09-28, s-692e6): the round asked four times at breaks
+/// of a workflow, each answered "not yet", gave up at 16:57 and rested; the
+/// idle point after the workflow went to the loop's `keep going`. Here the
+/// record as it rests — gave up an hour ago, the agent's work seen since its
+/// latest notice (`St::work_seen`) — meets an idle point with nothing under
+/// the agent: the round is re-armed (`rearmed:unanswered`, in the ledger) and
+/// its first notice typed in the same visit (`announced:1`), so the loop never
+/// has the point in between; the stamp is spent with the notice. An announced
+/// round there asks again at once, as its next ask. NEGATIVE CONTROLS: the
+/// same record with no work seen rests (`wait:failed`), and the announced one
+/// waits for its answer (`wait:awaiting-ready`) — what 0.98 and main did.
+#[cfg(unix)]
+#[test]
+fn the_end_of_the_agents_work_re_arms_and_asks_in_the_same_visit() {
+    let gave_up = |work_seen: bool| St {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        failed_at: now_s() - 3_600,
+        streak_why: upgrade::GAVE_UP.to_string(),
+        stop_streak: 1,
+        work_seen,
+        ..settled()
+    };
+    let h = Parked::new("work-end-rearm", Answers::default(), gave_up(true), 3600);
+    assert_eq!(h.visit().step, "announced:1");
+    assert_eq!(
+        h.details("rearmed:unanswered").len(),
+        1,
+        "the re-arm is said"
+    );
+    assert_eq!(h.typed().len(), 1, "one notice");
+    let st = load(&h.opts, SESSION).expect("the record");
+    assert!(
+        matches!(st.phase, Phase::Announced { asks: 1, .. }),
+        "{:?}",
+        st.phase
+    );
+    assert!(!st.work_seen, "spent with the notice");
+    drop(h);
+    // NEGATIVE CONTROL: no work seen since the notice — it rests.
+    let h = Parked::new("work-end-none", Answers::default(), gave_up(false), 3600);
+    assert_eq!(h.visit().step, "wait:failed");
+    assert!(h.typed().is_empty());
+    drop(h);
+
+    // An announced round: asked again at once, its next ask.
+    for (work_seen, want) in [(true, "announced:2"), (false, "wait:awaiting-ready")] {
+        let h = Parked::new(
+            &format!("work-end-announced-{work_seen}"),
+            Answers::default(),
+            settled(),
+            3600,
+        );
+        let st = St {
+            phase: Phase::Announced {
+                at_s: now_s() - 60,
+                asks: 1,
+            },
+            marker: "ATERM-UPGRADE-READY-00000001".to_string(),
+            notice_pid: h.sf.pid,
+            notice_start: squash(&h.sf.proc_start),
+            noticed_at: now_s() - 60,
+            work_seen,
+            ..settled()
+        };
+        std::fs::write(state_path(&h.opts, SESSION), st.to_json()).expect("write");
+        assert_eq!(h.visit().step, want, "work seen: {work_seen}");
+        drop(h);
+    }
+}

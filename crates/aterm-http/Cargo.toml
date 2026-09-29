@@ -54,7 +54,7 @@ windows-sys = { version = "0.61", default-features = false, features = [
 # removed, `the_first_party_verifier_matches_its_recorded_expectations` still
 # holds the measured verdicts.
 #
-# `cargo forge` resolves each cell with `cargo tree --edges normal`
+# `targo --unverified forge` resolves each cell with `cargo tree --edges normal`
 # (crates/aterm-forge/src/resolve.rs:340), so a dev-dependency is outside every
 # cell figure. It does keep its ~7 entries in Cargo.lock, so the ratcheted
 # `lock third_party_packages` ceiling does NOT fall for this change.

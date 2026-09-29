@@ -22,6 +22,8 @@ mod builder;
 mod callback_setters;
 mod callbacks;
 mod checkpoint;
+#[cfg(feature = "serde")]
+mod checkpoint_parser;
 mod checkpoint_state;
 pub(crate) mod clipboard_auth;
 pub mod color_resolve;
@@ -70,6 +72,7 @@ mod policy_gates;
 mod processing;
 mod render_cells;
 mod reset;
+mod resize_journal;
 mod response_capability;
 mod response_rate_limiter;
 mod selection;
@@ -121,10 +124,12 @@ pub use alt_archive::{
     AltArchiveCarry, AltArchiveDiffer, AltArchiveFence, AltArchiveGap, AltArchiveGapKind,
     AltArchiveImport, AltArchiveQuery, AltArchiveRead, alt_archive_row_charge,
 };
+pub use aterm_parser::{CarryRefusal, ParserCarry};
 pub(crate) use aterm_types::charset::CharacterSetState;
 pub use aterm_types::{ColorPalette, Rgb};
 pub use aterm_types::{KittyKeyboardFlags, KittyKeyboardState};
 pub use blocks_api::BlockText;
+pub use buffer_api::HistoryShed;
 pub use builder::{TIERED_RING_CAP_DEFAULT, TerminalBuilder};
 pub use callbacks::{SshConductorCallbackEvent, TmuxCallbackEvent};
 #[cfg(feature = "serde")]
@@ -132,9 +137,11 @@ pub use checkpoint::CheckpointMeta;
 pub use checkpoint::{
     GridCursorRepr, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
 };
+#[cfg(feature = "serde")]
+pub use checkpoint_parser::ParserRepr;
 pub use checkpoint_state::{
     ColorRepr, ColorSlotRepr, ColorStackEntryRepr, OutputBlockRepr, PaletteOverrideRepr, ShellRepr,
-    ShellSpanRepr,
+    ShellSpanRepr, TitleRepr,
 };
 pub use custody::CustodyTransition;
 pub use foreground_handback::{ForegroundHandback, evidence as program_evidence};
@@ -158,6 +165,7 @@ pub use aterm_types::XtermKeyboardState;
 pub use aterm_types::{WindowOperation, WindowResponse};
 pub use clipboard_auth::ClipboardAccess;
 pub use render_cells::{RenderCell, UnderlineStyle};
+pub use resize_journal::{RESIZE_JOURNAL_CAP, ResizeReport};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
 pub use state::{
     CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,

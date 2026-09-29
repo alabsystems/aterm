@@ -266,7 +266,6 @@ repo = "aterm"
             yanked: vec![],
             pin: pins.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
             pin_by_target: Default::default(),
-            meta: BTreeMap::new(),
         }
     }
 

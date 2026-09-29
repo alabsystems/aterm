@@ -26,8 +26,8 @@ expose = ["aterm"] # THE one command — window + session + every verb IN ONE BI
 # One binary since the one-binary collapse: ctl/pkg/fleet/drive/help are
 # in-process subcommands of `aterm`, and the window is its no-TTY/--window
 # mode. Distribution ships argv0 compat SYMLINKS (aterm-ctl, atpkg,
-# aterm-fleet, aterm-drive, aterm-gui, aterm-cli) beside it — dispatched by
-# argv[0] — so nothing else lands in `bundle` as a separate binary.
+# aterm-fleet, aterm-drive, aterm-link, aterm-gui, aterm-cli) beside it —
+# dispatched by argv[0] — so nothing else lands in `bundle` as a separate binary.
 bundle = []
 # THE PACKAGE-INDEX ACCOUNT: the GitHub owner atpkg's signed index + program
 # releases are published under — the compiled-in account every shipped atpkg
@@ -80,7 +80,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.98.0"
+version = "0.99.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -147,7 +147,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # trust MODEL is unchanged: the operating system's store, never a root set
 # compiled into the binary. It stays here as the differential test's reference
 # implementation and is declared ONLY under `[dev-dependencies]`, so it is
-# outside every `cargo forge` cell (which resolve with `--edges normal`).
+# outside every `targo --unverified forge` cell (which resolve with `--edges normal`).
 rustls-platform-verifier = "0.6"
 # Distributed-slice collection across crates: the #[refines]/#[spec_unmodeled]
 # anchor emitters submit RefinementEntry/Waiver records into an inventory slice
@@ -190,6 +190,9 @@ aterm-net = { path = "crates/aterm-net" }
 # Portable control-socket stream: std Unix-domain sockets on Unix, AF_UNIX
 # over winsock (afunix.sys) on Windows. Std-only; no external deps.
 aterm-uds = { path = "crates/aterm-uds" }
+# The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md): a per-login holder of a
+# custody copy of every terminal's master. Links no AppKit/CoreGraphics/winit.
+aterm-keeper = { path = "crates/aterm-keeper" }
 # The coding-agent primer installer (`aterm agents` + the auto-prime every GUI
 # session runs). Std-only leaf, so the CLI and the GUI share ONE installer.
 aterm-primer = { path = "crates/aterm-primer" }
@@ -368,7 +371,7 @@ aterm-update-core = { path = "crates/aterm-update-core" }
 # The toolchain package manager (Settings ▸ Packages reads its status/link state
 # in-process; the network verbs still run only via the co-located `atpkg` binary).
 atpkg = { path = "crates/atpkg" }
-# The owner-side provisioning/signing engine — a LIBRARY here so `cargo ship
+# The owner-side provisioning/signing engine — a LIBRARY here so `targo --unverified ship
 # provision` can drive the join ceremony in-process (one /dev/tty phrase prompt,
 # no second binary). Never shipped to clients; POSIX-only (#![cfg(unix)]).
 atpkg-keys = { path = "crates/atpkg-keys" }
@@ -457,7 +460,7 @@ log = { path = "crates/aterm-log-shim" }
 # --- workspace-wide lint policy (inherited via `[lints] workspace = true`) ---
 # One central ratchet for every crate. The whole tree is kept clean under
 # `targo-tippy --workspace --all-targets --keep-going -- -D warnings` (tools/verify.sh
-# and `cargo xtask gate lint` both run exactly that, from one argv builder —
+# and `targo --unverified run -p xtask -- gate lint` both run exactly that, from one argv builder —
 # `aterm_verify::stages::tippy_args`); there is no CI, so this local gate IS the
 # contract. TWO WORDS IN IT ARE LOAD-BEARING. `targo-tippy`, not `cargo clippy`: the
 # pinned stage2 ships no `cargo-clippy`, so `cargo clippy` finds stock Rust's on PATH
@@ -477,6 +480,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+# Every `#[ignore]` says why (`#[ignore = "…"]`): an ignored test with no
+# reason reads as broken or pending, and a census instrument is neither.
+ignore_without_reason = "warn"
 
 # LINE TABLES, NOT FULL DWARF (2026-09-25, decided under the owner's standing
 # direction; AGENTS.md "Concurrent sessions & build coordination" rule 5).
@@ -492,7 +498,7 @@ debug = "line-tables-only"
 # 1425 .rs files under crates/) that never ships — nothing in `expose` or
 # `bundle` depends on it. It is also on the critical path of every local gate
 # run: `cargo test -p aterm-census` runs 98 tests that each walk the real tree,
-# and `cargo xtask gate mainloop` is one of the three verbs
+# and `targo --unverified run -p xtask -- gate mainloop` is one of the three verbs
 # `tools/verify.sh` executes. Unoptimized, that scanning dominates both.
 #
 # Measured on this tree, arms alternated ABBA across 3 rounds, 98/98 tests
@@ -649,7 +655,7 @@ smol_str = { path = "vendor/smol_str" }
 # `tracing` 0.1.44 so the four `^0.1.3x/4x` requirements still resolve): it is
 # NOT vendored upstream source, so it carries none of the redistribution
 # obligations `vendor/` does — no NOTICE row, no REVIEWED_VENDORED_CRATES row,
-# no `vendor/forge.toml` block. `cargo forge attest`/`check` and the census
+# no `vendor/forge.toml` block. `targo --unverified forge attest`/`check` and the census
 # classify a `crates/` patch target as first-party for exactly that reason.
 tracing = { path = "crates/aterm-tracing" }
 
@@ -722,7 +728,7 @@ arrayvec = { path = "crates/aterm-arrayvec" }
 # requirement in the graph is `^0.2.182` (rustix 1.1.4), then `^0.2.172`
 # (wgpu-hal) and `^0.2.171` (jobserver); the lock held 0.2.186. A shim numbered
 # below any of those makes the row silently inert — cargo emits no warning,
-# `cargo forge check` does. crates/aterm-alloc records that happening to
+# `targo --unverified forge check` does. crates/aterm-alloc records that happening to
 # `arrayvec`.
 #
 # THE OBLIGATION IS THE `--all-targets` GRAPH, NOT THE SHIPPED ONE, and that is

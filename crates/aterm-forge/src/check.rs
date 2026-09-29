@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo forge check` — THE GATE VERB, wired as `xtask gate forge`.
+//! `targo --unverified forge check` — THE GATE VERB, wired as `xtask gate forge`.
 //!
 //! [`check_report`] is the symbol the roster calls. It answers one question —
 //! *is aterm's third-party surface still the surface this repository says it
@@ -123,7 +123,7 @@ pub fn check_report(root: &Path) -> (bool, String) {
     (v.ok, v.log)
 }
 
-/// The verb behind `cargo forge check [--cell NAME]...`.
+/// The verb behind `targo --unverified forge check [--cell NAME]...`.
 ///
 /// `Err` is reserved for could-not-run (exit 3): a bad `--cell`, an unreadable
 /// workspace, a cell cargo refused to resolve. A policy violation is
@@ -182,7 +182,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     // -- [OB-1]..[OB-10] provenance, license, NOTICE, markers ---------------
     let _ = writeln!(
         log,
-        "  [OB-1..OB-10] PROVENANCE, LICENSE & NOTICE — delegated to `cargo forge attest`:"
+        "  [OB-1..OB-10] PROVENANCE, LICENSE & NOTICE — delegated to `targo --unverified forge attest`:"
     );
     let (attest_ok, attest_log) = attest::report(root);
     for line in attest_log.lines() {
@@ -193,7 +193,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-1..OB-10] the provenance/license attestation above is RED. Fix: run \
-             `cargo forge attest` and clear each obligation it names — the vendored copies are \
+             `targo --unverified forge attest` and clear each obligation it names — the vendored copies are \
              REDISTRIBUTED source, so these are license obligations, not style ones."
         );
     }
@@ -336,15 +336,6 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
             "    (no path forks declared in {})",
             manifest.display()
         );
-    } else {
-        notes += 1;
-        let _ = writeln!(
-            log,
-            "    • NOTE [OB-11 scope] only the FORWARD direction is scored here, and it is \
-             scored against the compiled-in registry for ANY root: a path fork no reviewed row \
-             names is unreviewed wherever it sits. The reverse directions belong to attest \
-             [OB-1] and to the census scan-set derivation at build time."
-        );
     }
 
     // -- [OB-12] patch liveness, per cell -----------------------------------
@@ -397,7 +388,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                         log,
                         "  ✗ FAIL [OB-12] cell `{}` ({}) resolves an UNPATCHED `{}` alongside \
                          the fork: `{}` comes from {}, not from `{}`, so the fork's fix is \
-                         ABSENT from the copy that compiles. Fix: run `cargo tree --target {} \
+                         ABSENT from the copy that compiles. Fix: run `targo tree --target {} \
                          --edges normal -i {}` to find the requiring edge, then either bump the \
                          fork to that major and repoint `[patch.crates-io].{}`, or change the \
                          dependency that demands it.",
@@ -421,15 +412,21 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
 
     // Absence is judged ACROSS cells: a fork live nowhere is a dead patch; one
     // live somewhere and absent elsewhere is a platform fact, not a defect.
+    // Counted, because the GREEN verdict says how many are live where: it read
+    // "all live across N cell(s)" while a fork live in some cells, or only in a
+    // build closure, passed beside it as a NOTE or a ✓ of its own.
+    let (mut live_all, mut live_some, mut live_build) = (0usize, 0usize, 0usize);
     if !missing_on_disk {
         let mut build_probe: Option<Result<Resolved, String>> = None;
         for e in &patches {
             let live = live_in.get(e.name.as_str()).map_or(0, Vec::len);
             if live == cells.len() && !cells.is_empty() {
+                live_all += 1;
                 let _ = writeln!(log, "    ✓ {} live in all {} cell(s)", e.name, cells.len());
                 continue;
             }
             if live > 0 {
+                live_some += 1;
                 notes += 1;
                 let _ = writeln!(
                     log,
@@ -459,6 +456,9 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                 Ok((graph, paths)) => {
                     let want = canon(&root.join(&e.path));
                     let (blive, bsibs) = classify(graph, paths, &e.name, &want);
+                    if blive {
+                        live_build += 1;
+                    }
                     if blive && build_only {
                         let _ = writeln!(
                             log,
@@ -483,7 +483,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                             "  ✗ FAIL [OB-12] DEAD PATCH: `{}` is patched to `{}` but resolves \
                              in NO cell — not in any `--edges normal` graph and not in the build \
                              closure of `{}`. cargo reports this as a warning at exit 0, so \
-                             nothing else in this repository would notice. Fix: run `cargo tree \
+                             nothing else in this repository would notice. Fix: run `targo tree \
                              --edges all -i {}` to see whether anything still requires it, then \
                              either delete `[patch.crates-io].{}` (with its vendored copy, its \
                              NOTICE line and its REVIEWED_VENDORED_CRATES row) or restore the \
@@ -575,9 +575,9 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
                     let _ = writeln!(
                         log,
                         "  ✗ FAIL [OB-14] the ratchet above is RED. Fix: shrink the surface, or \
-                         — if the growth is deliberate — run `cargo forge budget --update \
-                         --allow-regress \"<reason of 80+ characters>\"`, which writes the reason \
-                         into {BUDGET_FILE} and reprints it on every run thereafter."
+                         — if the growth is deliberate — run `targo --unverified forge budget --update \
+                         --allow-regress \"<reason of 80+ characters>\"`, which records the reason \
+                         in {BUDGET_FILE}."
                     );
                 }
             }
@@ -596,7 +596,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
             log,
             "    • NOTE [OB-14] no ratchet rows yet ({BUDGET_FILE} absent) — this surface is \
              MEASURED but not yet RATCHETED, so nothing here stops it growing. Fix: run \
-             `cargo forge budget --update` to seed the ceilings from today's measurement."
+             `targo --unverified forge budget --update` to seed the ceilings from today's measurement."
         );
     }
 
@@ -716,24 +716,8 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
             "    OK — nothing in this tree claims a mirror it does not have."
         );
     }
-    // The limits, stated in the gate's own output rather than in a doc nobody
-    // reads next to the verdict. An obligation that does not say what it
-    // leaves unproven is read as proving everything.
-    let _ = writeln!(
-        log,
-        "    • NOTE [OB-16 scope] this proves AGREEMENT WITH `Cargo.lock` plus, where this \
-         machine has a cargo cache, that each mirrored index row is UPSTREAM'S OWN BYTES — \
-         `deps` and `features` included, which no checksum in a mirror covers. It does NOT \
-         prove the tarballs are upstream's (a lock written against a compromised registry \
-         mirrors that compromise faithfully, with every checksum matching); on a machine with \
-         NO cargo cache the row comparison degrades to Cargo.lock's resolved dependency edges, \
-         which record no features at all, and the verify report says how many rows it could \
-         anchor; it does NOT prove any build actually USED a mirror, because nothing here \
-         flips a default; it does NOT verify a bundle (`cargo forge mirror check-bundle`) or \
-         any signature — delivery is deferred and will ride a signed atpkg pkg manifest \
-         outside this crate; and it runs no cargo and no network, so upstream yank \
-         status is outside it entirely."
-    );
+    // What [OB-16] leaves unproven is stated once, in `cargo forge --help`
+    // (`cli::USAGE`, under `check`), not reprinted beside every verdict.
 
     // -- [OB-17] the fork ledger ----------------------------------------------
     // Until 2026-09-25 only `cargo test -p aterm-forge` read the `[forge]` and
@@ -774,13 +758,17 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     if fails == 0 {
         let _ = writeln!(
             log,
-            "gate forge: GREEN — {} vendored fork(s) reviewed + {} first-party patch \
-             target(s), all live across {} cell(s) with no unpatched sibling; {} carved \
-             path(s) still absent; provenance attested; {notes} note(s).",
-            patches.len() - first_party_count,
-            first_party_count,
-            cells.len(),
-            carved.len()
+            "{}",
+            green_verdict(&GreenCounts {
+                forks: patches.len() - first_party_count,
+                first_party: first_party_count,
+                cells: cells.len(),
+                live_all,
+                live_some,
+                live_build,
+                carved: carved.len(),
+                notes,
+            })
         );
     } else {
         let _ = writeln!(
@@ -801,6 +789,34 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
 // ---------------------------------------------------------------------------
 // Pieces
 // ---------------------------------------------------------------------------
+
+/// What a GREEN `gate forge` run measured, for [`green_verdict`].
+struct GreenCounts {
+    /// Vendored forks (third-party source under review).
+    forks: usize,
+    /// First-party patch targets (workspace members).
+    first_party: usize,
+    cells: usize,
+    /// Patch entries live in every cell's normal graph.
+    live_all: usize,
+    /// Live in some cells' normal graphs and absent from others.
+    live_some: usize,
+    /// Live in no normal graph, only in the first cell's build closure.
+    live_build: usize,
+    carved: usize,
+    notes: usize,
+}
+
+/// The sentence a GREEN run ends on: where the patch targets are live, as
+/// measured — never "all live across N cell(s)" for a fork live in some.
+fn green_verdict(c: &GreenCounts) -> String {
+    format!(
+        "gate forge: GREEN — {} vendored fork(s) + {} first-party patch target(s): {} live in \
+         all {} cells, {} in some, {} build-only; no unpatched sibling; {} carved path(s) \
+         absent; provenance attested; {} note(s).",
+        c.forks, c.first_party, c.live_all, c.cells, c.live_some, c.live_build, c.carved, c.notes
+    )
+}
 
 /// `[OB-17]`: one line per way the fork ledger disagrees with the tree.
 ///
@@ -958,7 +974,7 @@ fn read_manifest_patches(root: &Path) -> Result<(Vec<PatchEntry>, Vec<String>), 
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest).map_err(|e| {
         format!(
-            "cannot read {}: {e} — `cargo forge check` must run against a workspace root. Fix: \
+            "cannot read {}: {e} — `targo --unverified forge check` must run against a workspace root. Fix: \
              pass `--root <workspace dir>`.",
             manifest.display()
         )
@@ -1099,9 +1115,9 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
 /// normal` — at a quarter of the cost (`--no-dedupe` prints 379,170 lines for
 /// the linux cell against 886).
 fn build_closure(root: &Path, cell: &Cell) -> Result<Resolved, String> {
-    // `CARGO` is set by cargo itself, so a nested invocation uses the toolchain
-    // that launched forge rather than whatever `cargo` is on PATH.
-    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // `CARGO` is set by targo itself, so a nested invocation uses the toolchain
+    // that launched forge; unset, it is Trust's `targo`, never a stock `cargo`.
+    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
     let mut cmd = Command::new(exe);
     cmd.arg("tree")
         .arg("--manifest-path")
@@ -1119,8 +1135,8 @@ fn build_closure(root: &Path, cell: &Cell) -> Result<Resolved, String> {
         .current_dir(root);
     let out = cmd.output().map_err(|e| {
         format!(
-            "could not execute `cargo tree`: {e} — install a cargo on PATH, or set CARGO to the \
-             binary to use"
+            "could not execute `targo tree`: {e} — install the Trust toolchain (`aterm pkg \
+             install trust`), or set CARGO to the targo to use"
         )
     })?;
     if !out.status.success() {
@@ -1296,6 +1312,30 @@ mod tests {
                 Ok(aterm_census::scan_set::PatchTargetKind::FirstParty)
             )
         })
+    }
+
+    /// The GREEN sentence says where the patch targets are live, as measured.
+    /// It read "all live across 8 cell(s)" on every green run while winit was
+    /// live in 6 of 8 cells and pkg-config only in a build closure.
+    #[test]
+    fn the_green_verdict_counts_partial_and_build_only_forks_apart() {
+        let v = green_verdict(&GreenCounts {
+            forks: 7,
+            first_party: 2,
+            cells: 8,
+            live_all: 7,
+            live_some: 1,
+            live_build: 1,
+            carved: 3,
+            notes: 1,
+        });
+        assert_eq!(
+            v,
+            "gate forge: GREEN — 7 vendored fork(s) + 2 first-party patch target(s): 7 live in \
+             all 8 cells, 1 in some, 1 build-only; no unpatched sibling; 3 carved path(s) \
+             absent; provenance attested; 1 note(s)."
+        );
+        assert!(!v.contains("all live"), "{v}");
     }
 
     /// The patch table is read as path patches, PARTITIONED. The `vendor/<name>`
@@ -1515,7 +1555,7 @@ reason = \"no arch intrinsics reach the shipped build\"
     /// Nothing is lost on the detection side. The logic that FINDS a sibling is
     /// proved by `tests/red_fixtures.rs::an_unpatched_sibling_version_reds_the
     /// _forge_verb`, which plants a synthetic violation in a scratch tree and
-    /// requires `cargo forge check` to go RED on it — a fixture, so it keeps
+    /// requires `targo --unverified forge check` to go RED on it — a fixture, so it keeps
     /// working whatever the real graph does.
     #[test]
     fn no_cell_carries_an_unpatched_sibling_of_a_vendored_fork() {
@@ -1556,7 +1596,7 @@ reason = \"no arch intrinsics reach the shipped build\"
             assert_eq!(
                 found, expected,
                 "cell `{}` resolves an unpatched sibling beside a vendored fork — \
-                 `cargo forge blame <name>` names the edge that drags it in",
+                 `targo --unverified forge blame <name>` names the edge that drags it in",
                 cell.name
             );
             assert!(

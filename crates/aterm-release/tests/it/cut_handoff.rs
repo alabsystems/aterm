@@ -206,7 +206,11 @@ fn assert_operator_checkout_unmoved(s: &Scratch) {
 #[test]
 fn a_cut_is_handed_to_the_published_commits_cutter_once_and_the_checkout_never_moves() {
     let s = scratch("fresh");
-    let out = cutter(&s, &["cut", "--min-build", "1790000001"], None);
+    let out = cutter(
+        &s,
+        &["cut", "--mac-only", "--min-build", "1790000001"],
+        None,
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
@@ -386,7 +390,11 @@ fn a_finished_older_journal_is_history_to_a_fresh_cut() {
             "unlock",
         ],
     );
-    let out = cutter(&s, &["cut", "--min-build", "1790000001"], None);
+    let out = cutter(
+        &s,
+        &["cut", "--mac-only", "--min-build", "1790000001"],
+        None,
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
@@ -401,7 +409,11 @@ fn a_finished_older_journal_is_history_to_a_fresh_cut() {
         &s,
         &["lock", "build", "selfcheck", "draft", "upload", "preflip"],
     );
-    let out = cutter(&s, &["cut", "--min-build", "1790000001"], None);
+    let out = cutter(
+        &s,
+        &["cut", "--mac-only", "--min-build", "1790000001"],
+        None,
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(

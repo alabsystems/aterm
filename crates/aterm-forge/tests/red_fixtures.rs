@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NON-VACUITY PROOFS for `cargo forge check`.
+//! THE NON-VACUITY PROOFS for `targo --unverified forge check`.
 //!
 //! `crates/xtask/src/gate.rs`'s `NON_VACUITY_REGISTRY` requires every roster
 //! gate to name a real test that PLANTS A VIOLATION and asserts the gate goes
@@ -221,13 +221,15 @@ impl Fixture {
     /// Re-resolve after a manifest edit. `check` resolves with `--locked`, so a
     /// stale lockfile would fail the cell rather than the obligation under test.
     fn regen_lock(&self) {
-        let exe = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        // `$CARGO` (targo under `targo --unverified test`), else Trust's `targo`;
+        // `generate-lockfile` takes no lane flag.
+        let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
         let out = Command::new(exe)
             .args(["generate-lockfile", "--offline", "--manifest-path"])
             .arg(self.path("Cargo.toml"))
             .current_dir(&self.root)
             .output()
-            .expect("cargo must be runnable to build a fixture workspace");
+            .expect("targo must be runnable to build a fixture workspace");
         assert!(
             out.status.success(),
             "fixture `{}` did not resolve:\n{}",
@@ -686,7 +688,7 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         "the refusal must name the crate and the sibling version:\n{log}"
     );
     assert!(
-        log.contains("cargo tree --target") && log.contains("-i indexmap@3.0.0"),
+        log.contains("targo tree --target") && log.contains("-i indexmap@3.0.0"),
         "the refusal must name the command that finds the requiring edge:\n{log}"
     );
     // Every cell, not just one: the fork is patched for all five.

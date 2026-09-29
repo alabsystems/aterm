@@ -904,6 +904,14 @@ fn publish_if_current(
 mod tests {
     use super::*;
 
+    /// How long the resolver queue tests wait for something that MUST happen:
+    /// the worker entering a lookup, a completion wake, the queue draining, a
+    /// panicked worker exiting. A hang detector, never a latency budget: each
+    /// passes in milliseconds alone, and a lost wake or a wedged worker never
+    /// arrives at all, so a minute catches it as surely as 2 s did. The checks
+    /// that something does NOT happen keep their own short windows.
+    const MUST_HAPPEN: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// A [`Lookup`] that names the program only — no copy, no PATH verdict —
     /// for the queue tests, which are about WHICH answer publishes.
     fn names(f: impl Fn(i32) -> Option<String> + Send + Sync + 'static) -> Lookup {
@@ -1188,7 +1196,7 @@ mod tests {
         second.lock().unwrap().note_foreground_group(30);
         resolver.request(1, &first, 10, 0, None);
         started_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(MUST_HAPPEN)
             .expect("worker entered old lookup");
 
         first.lock().unwrap().note_foreground_group(20);
@@ -1203,8 +1211,8 @@ mod tests {
         assert_eq!(resolver.pending.lock().unwrap().by_session.len(), 3);
         release_tx.send(()).unwrap();
 
-        assert_eq!(wake_rx.recv_timeout(Duration::from_secs(2)), Ok(2));
-        assert_eq!(wake_rx.recv_timeout(Duration::from_secs(2)), Ok(1));
+        assert_eq!(wake_rx.recv_timeout(MUST_HAPPEN), Ok(2));
+        assert_eq!(wake_rx.recv_timeout(MUST_HAPPEN), Ok(1));
         assert_eq!(
             first.lock().unwrap().agent().program.as_deref(),
             Some("bash")
@@ -1218,7 +1226,7 @@ mod tests {
             wake_rx.recv_timeout(Duration::from_millis(50)),
             Err(RecvTimeoutError::Timeout)
         );
-        let drained_by = std::time::Instant::now() + Duration::from_secs(2);
+        let drained_by = std::time::Instant::now() + MUST_HAPPEN;
         while !resolver.pending.lock().unwrap().by_session.is_empty() {
             assert!(
                 std::time::Instant::now() < drained_by,
@@ -1231,7 +1239,6 @@ mod tests {
     #[test]
     fn slow_same_group_lookup_can_publish_while_retries_coalesce() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
 
         let (entered_tx, entered_rx) = channel::<()>();
         let (release_tx, release_rx) = channel::<()>();
@@ -1263,7 +1270,7 @@ mod tests {
         };
         resolver.request(1, &timeline, 10, 0, None);
         entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(MUST_HAPPEN)
             .expect("first lookup started");
         for _ in 0..100 {
             resolver.request(1, &timeline, 10, 0, None);
@@ -1271,21 +1278,13 @@ mod tests {
         assert_eq!(resolver.pending.lock().unwrap().by_session.len(), 1);
         release_tx.send(()).unwrap();
 
-        assert_eq!(
-            wake_rx.recv_timeout(Duration::from_secs(2)),
-            Ok(Some("sh".into()))
-        );
-        assert_eq!(
-            wake_rx.recv_timeout(Duration::from_secs(2)),
-            Ok(Some("bash".into()))
-        );
+        assert_eq!(wake_rx.recv_timeout(MUST_HAPPEN), Ok(Some("sh".into())));
+        assert_eq!(wake_rx.recv_timeout(MUST_HAPPEN), Ok(Some("bash".into())));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn disabling_status_discards_a_late_inflight_answer() {
-        use std::time::Duration;
-
         let (entered_tx, entered_rx) = channel::<()>();
         let (release_tx, release_rx) = channel::<()>();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -1308,7 +1307,7 @@ mod tests {
         old.lock().unwrap().note_foreground_group(10);
         resolver.request(1, &old, 10, 0, None);
         entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(MUST_HAPPEN)
             .expect("old lookup started");
         resolver.clear_pending();
 
@@ -1318,7 +1317,7 @@ mod tests {
         current.lock().unwrap().note_foreground_group(20);
         resolver.request(2, &current, 20, 0, None);
         release_tx.send(()).unwrap();
-        assert_eq!(wake_rx.recv_timeout(Duration::from_secs(2)), Ok(2));
+        assert_eq!(wake_rx.recv_timeout(MUST_HAPPEN), Ok(2));
         assert_eq!(old.lock().unwrap().agent().program.as_deref(), None);
         assert_eq!(
             current.lock().unwrap().agent().program.as_deref(),
@@ -1359,14 +1358,14 @@ mod tests {
         timeline.lock().unwrap().note_foreground_group(10);
         resolver.request(1, &timeline, 10, 0, None);
         entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(MUST_HAPPEN)
             .expect("old request entered lookup");
         resolver.clear_pending();
         resolver.request(1, &timeline, 10, 0, None);
         assert_eq!(resolver.pending.lock().unwrap().by_session.len(), 1);
         release_tx.send(()).unwrap();
 
-        assert_eq!(wake_rx.recv_timeout(Duration::from_secs(2)), Ok(1));
+        assert_eq!(wake_rx.recv_timeout(MUST_HAPPEN), Ok(1));
         assert_eq!(
             timeline.lock().unwrap().agent().program.as_deref(),
             Some("new")
@@ -1404,9 +1403,9 @@ mod tests {
         timeline.lock().unwrap().note_foreground_group(10);
         resolver.request(1, &timeline, 10, 0, None);
         entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(MUST_HAPPEN)
             .expect("worker started");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MUST_HAPPEN;
         while !resolver
             .worker
             .as_ref()
@@ -1417,12 +1416,12 @@ mod tests {
         }
         timeline.lock().unwrap().note_foreground_group(20);
         resolver.request(1, &timeline, 20, 0, None);
-        assert_eq!(wake_rx.recv_timeout(Duration::from_secs(2)), Ok(1));
+        assert_eq!(wake_rx.recv_timeout(MUST_HAPPEN), Ok(1));
         assert_eq!(
             timeline.lock().unwrap().agent().program.as_deref(),
             Some("bash")
         );
-        let drained_by = Instant::now() + Duration::from_secs(2);
+        let drained_by = Instant::now() + MUST_HAPPEN;
         while !resolver.pending.lock().unwrap().by_session.is_empty() {
             assert!(
                 Instant::now() < drained_by,

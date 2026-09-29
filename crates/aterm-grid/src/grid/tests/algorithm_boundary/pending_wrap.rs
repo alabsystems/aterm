@@ -336,13 +336,14 @@ fn back_tab_preserves_pending_wrap() {
     );
 }
 
-/// The DECLRMM-aware back tab preserves it too — same function, same reason.
+/// The margin-aware back tab preserves it too — same function, same reason.
+/// (Origin mode on, so the left-margin branch is the one exercised.)
 #[test]
 fn back_tab_margin_preserves_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 20);
     grid.set_horizontal_margins(4, 19);
 
-    grid.back_tab_margin(true);
+    grid.back_tab_margin(true, true);
 
     assert!(
         grid.pending_wrap(),

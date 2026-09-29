@@ -51,7 +51,7 @@ description = "Inline-optimized collections for aterm: SmallVec + ArrayVec with 
 # and the release differs only outside `src/`. The oracle stays in Cargo.lock as
 # a dev-only node, exactly as aterm-digest keeps sha2/hmac and aterm-toml keeps
 # toml/toml_edit; it is invisible to the shipped graph, which is what
-# `cargo forge survey` measures.
+# `targo --unverified forge survey` measures.
 arrayvec_upstream = { package = "arrayvec", version = "=0.7.7" }
 # THE SHIM ITSELF, on the same package, and this edge is what lets
 # `targo test -p aterm-alloc -p <anything that reaches wgpu or naga>` resolve

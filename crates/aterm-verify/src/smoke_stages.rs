@@ -108,18 +108,19 @@ pub struct EffectLane {
 
 /// THE EFFECT LANES: the cursor effects OFF — `cursor_trail = false`, the
 /// family's master, which also silences the trail sounds (their cues come from
-/// the engine it gates), and `cursor_momentum_glow = false`, the typing glow,
-/// which is its own default-on effect outside that master (with it on, the
-/// master-off lane still armed ~430 `cursor_effect` deadlines a burst, measured
-/// 2026-09-27) — then ON at the shipped default style with trail sounds off and
-/// on. The OFF lane is the baseline the ON lanes are reported against, and the
-/// negative control for the engagement witnesses: it must compose no ribbon.
+/// the engine it gates) and, since 2026-09-27, the typing-momentum glow (before
+/// that fix the glow sat outside the master, and a master-off lane that left it
+/// on armed ~430 `cursor_effect` deadlines a burst, so this lane also switched
+/// it off by hand) — then ON at the shipped default style with trail sounds off
+/// and on. The OFF lane is what a user who turns the effects off writes: the
+/// baseline the ON lanes are reported against, and the negative control for the
+/// engagement witnesses — it must compose no ribbon.
 #[must_use]
 pub fn effect_lanes() -> [EffectLane; 3] {
     [
         EffectLane {
             label: "effects=off",
-            config: "cursor_trail = false\ncursor_momentum_glow = false\ntrail_sounds = false\n",
+            config: "cursor_trail = false\ntrail_sounds = false\n",
             effects_on: false,
         },
         EffectLane {
@@ -358,9 +359,21 @@ const ACQUIRE_P99_CEILING_MS: u64 = 50;
 /// a CPU backend, a non-macOS present and a process that installs no sink register
 /// no presented handler at all, and an absent slice is not a slow one.
 const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
-/// The socket-bind budget: 100 polls at 100 ms.
-const SOCKET_POLLS: usize = 100;
-const POLL_GAP: Duration = Duration::from_millis(100);
+/// The socket-listen budget: how many times a smoke looks at its instance's
+/// control socket, [`POLL_GAP`] apart, before `control socket never started
+/// listening` ([`wait_to_listen`]) — ten seconds of sleeps, plus what each
+/// look (a `try_wait`, a stat and a connect) costs on the machine of the day.
+///
+/// COUNTED IN LOOKS, NEVER TIMED BY THE CLOCK (the review of 2026-09-28).
+/// f6921d3de timed it at "exactly 10 s", which can only be shorter than the
+/// looks it replaced: the review measured 0.26-0.40 s less under load 4.5-7,
+/// and an instance listening 10.15-10.3 s after its spawn, which passed the
+/// smoke before, red. The gate's own fixtures wait the same: the stand-in
+/// instance their build writes is run once by that build, so its first exec
+/// is paid there.
+pub const SOCKET_POLLS: usize = 100;
+/// The pause between two looks of a smoke's waits.
+pub const POLL_GAP: Duration = Duration::from_millis(100);
 
 /// A running smoke's disposable state, torn down on every exit path.
 struct Sandbox {
@@ -600,24 +613,41 @@ fn bring_up(
     let sock = sb.sock();
     // Up means LISTENING, not bound: the file appears at bind(2), before
     // listen(2), and a first ctl call in that gap is refused.
-    let up = |sock: &Path| is_socket_or_symlink(sock) && socket_listening(sock);
+    let up = || is_socket_or_symlink(&sock) && socket_listening(&sock);
+    match wait_to_listen(|| child_exited(sb), up) {
+        Listen::Up => return Ready::Up { ctl },
+        Listen::Exited => r.fail(format!("{tag}: aterm-gui exited early")),
+        Listen::Never => r.fail(format!("{tag}: control socket never started listening")),
+    }
+    r.raw(smoke_log_tail(log_label, &sb.gui_log));
+    Ready::Stopped
+}
+
+/// What a smoke's listen wait found ([`wait_to_listen`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Listen {
+    /// The instance listens.
+    Up,
+    /// It exited first.
+    Exited,
+    /// It never listened within the wait.
+    Never,
+}
+
+/// THE LISTEN WAIT: [`SOCKET_POLLS`] looks at `exited` and then `up`,
+/// [`POLL_GAP`] apart, and one last look at `up` after them. However long a
+/// look takes, every one is taken: the wait is never shorter than its sleeps.
+fn wait_to_listen(mut exited: impl FnMut() -> bool, mut up: impl FnMut() -> bool) -> Listen {
     for _ in 0..SOCKET_POLLS {
-        if child_exited(sb) {
-            r.fail(format!("{tag}: aterm-gui exited early"));
-            r.raw(smoke_log_tail(log_label, &sb.gui_log));
-            return Ready::Stopped;
+        if exited() {
+            return Listen::Exited;
         }
-        if up(&sock) {
-            return Ready::Up { ctl };
+        if up() {
+            return Listen::Up;
         }
         std::thread::sleep(POLL_GAP);
     }
-    if up(&sock) {
-        return Ready::Up { ctl };
-    }
-    r.fail(format!("{tag}: control socket never started listening"));
-    r.raw(smoke_log_tail(log_label, &sb.gui_log));
-    Ready::Stopped
+    if up() { Listen::Up } else { Listen::Never }
 }
 
 fn child_exited(sb: &mut Sandbox) -> bool {
@@ -1131,6 +1161,44 @@ mod tests {
         )
     }
 
+    /// A REAL RUN'S LISTEN WAIT IS [`SOCKET_POLLS`] LOOKS, WHATEVER EACH COSTS
+    /// (the review of 2026-09-28). The wait was a hundred polls, each a
+    /// `try_wait`, a stat and a connect before its 100 ms sleep, so it stood
+    /// for ten seconds plus what those cost on the machine of the day.
+    /// f6921d3de timed it by the clock instead, "exactly 10 s", which can only
+    /// be shorter: the review measured 0.26-0.40 s less under load 4.5-7, and
+    /// an instance listening 10.15-10.3 s after its spawn passed the old smoke
+    /// and was red in the new one — the slow-first-exec exposure the change
+    /// was for, in a real run. A look here costs 15 ms: every poll is still
+    /// taken, and the last look after them. Cheap controls: an instance that
+    /// listens, or exits, ends the wait at that look.
+    #[test]
+    fn a_real_runs_listen_wait_takes_every_poll_whatever_each_costs() {
+        let looks = std::cell::Cell::new(0usize);
+        let costly = || {
+            looks.set(looks.get() + 1);
+            std::thread::sleep(Duration::from_millis(15));
+            false
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(wait_to_listen(|| false, costly), Listen::Never);
+        assert_eq!(
+            looks.get(),
+            SOCKET_POLLS + 1,
+            "every poll, and the last look"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(10));
+
+        let third = std::cell::Cell::new(0usize);
+        let up_at_third = || {
+            third.set(third.get() + 1);
+            third.get() == 3
+        };
+        assert_eq!(wait_to_listen(|| false, up_at_third), Listen::Up);
+        assert_eq!(third.get(), 3);
+        assert_eq!(wait_to_listen(|| true, || false), Listen::Exited);
+    }
+
     #[test]
     fn the_smoke_build_is_a_driver_lane_build() {
         let c = ctx();
@@ -1303,8 +1371,9 @@ mod tests {
         assert_eq!(off.len(), 1, "one effects-off baseline");
         assert!(off[0].config.contains("cursor_trail = false"));
         assert!(
-            off[0].config.contains("cursor_momentum_glow = false"),
-            "the momentum glow sits outside the master: an OFF lane turns it off too"
+            !off[0].config.contains("cursor_momentum_glow"),
+            "the master alone is the off switch (the momentum glow obeys it since \
+             2026-09-27): the OFF lane is what a user writes"
         );
         let on: Vec<_> = lanes.iter().filter(|l| l.effects_on).collect();
         assert!(on.iter().all(|l| l.config.contains("cursor_trail = true")));

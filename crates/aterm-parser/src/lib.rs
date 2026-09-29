@@ -17,7 +17,7 @@
 //! ## Verification
 //!
 //! - TLA+ spec: `tla/Parser.tla`
-//! - Kani proofs: see `proofs.rs` + `proofs_utf8.rs` (27 harnesses), including:
+//! - Kani proofs: see `proofs.rs` + `proofs_utf8.rs`, including:
 //!   - Core invariants: `parser_never_panics`, `params_bounded`, `intermediates_bounded`,
 //!     `state_always_valid`, `printable_slice_is_valid_utf8`.
 //!   - Parameter safety: `param_accumulation_saturates`, `param_finalize_bounded`,
@@ -28,8 +28,10 @@
 //!     `dcs_sequence_terminates`, `cancel_returns_to_ground`, `utf8_continuation_safe`,
 //!     `utf8_malformed_sequences_preserve_decoder_invariants`, `transition_table_lookup_safe`.
 //!   - SIMD safety: `simd_avx2_offset_no_overflow`, `simd_neon_offset_no_overflow`,
-//!     `simd_pointer_within_bounds`, `simd_scalar_fallback_range_valid`,
+//!     `simd_scalar_fallback_range_valid` (models of the chunk-loop shape),
 //!     `simd_scalar_predicate_equivalence`, `simd_avx2_bias_correct`.
+//!   - Seamless-update carry: `restore_carry_yields_valid_state` (every carry
+//!     `restore_carry` accepts keeps the TypeInvariant; a refusal installs nothing).
 //! - Fuzz target: `fuzz/fuzz_targets/parser.rs`
 //!
 //! ## Performance
@@ -111,6 +113,7 @@
 )]
 
 mod action;
+mod carry;
 mod csi;
 mod dispatch;
 mod invariants;
@@ -130,6 +133,7 @@ mod utf8;
 mod utf8_simd;
 
 pub use action::{Action, ActionSink, NullSink};
+pub use carry::{CarryRefusal, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX};
 // `BatchActionSink` powers the test-only batch dispatch path; it is gated out
 // of release builds along with `advance_batch`/`process_byte_batch`.
 #[cfg(test)]
@@ -258,6 +262,13 @@ pub struct Parser {
     pub(crate) params: ArrayVec<u16, MAX_PARAMS>,
     pub(crate) intermediates: ArrayVec<u8, MAX_INTERMEDIATES>,
     pub(crate) osc_data: Vec<u8>,
+    /// The OSC string being collected is DISCARDED at its terminator instead
+    /// of dispatched. Set only by [`Parser::restore_carry`] for an OSC whose
+    /// head was over [`OSC_CARRY_CAP`] when a seamless update carried it: the
+    /// successor never saw the head, so dispatching the tail alone would act
+    /// on a truncated payload (a clipped clipboard write, a broken image).
+    /// Cleared by every OSC exit (`dispatch_osc`) and by [`Parser::reset`].
+    pub(crate) osc_discard: bool,
     pub(crate) current_param: u32,
     pub(crate) param_started: bool,
     pub(crate) dcs_active: bool,
@@ -306,6 +317,7 @@ impl Parser {
             params: ArrayVec::new_const(),
             intermediates: ArrayVec::new_const(),
             osc_data: Vec::with_capacity(128),
+            osc_discard: false,
             current_param: 0,
             param_started: false,
             dcs_active: false,
@@ -330,6 +342,7 @@ impl Parser {
             params: ArrayVec::new_const(),
             intermediates: ArrayVec::new_const(),
             osc_data: Vec::new(),
+            osc_discard: false,
             current_param: 0,
             param_started: false,
             dcs_active: false,
@@ -362,6 +375,7 @@ impl Parser {
         self.params.clear();
         self.intermediates.clear();
         self.osc_data.clear();
+        self.osc_discard = false;
         self.current_param = 0;
         self.param_started = false;
         self.dcs_active = false;

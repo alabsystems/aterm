@@ -1138,6 +1138,39 @@ pub struct ScrolledRowExtras {
 }
 
 impl ScrolledRowExtras {
+    /// Estimated bytes retained by this boxed extras value, including vector
+    /// capacities and out-of-line strings. Shared strings are conservatively
+    /// charged per holder; image payloads use the same per-row share as lines.
+    pub(crate) fn retained_memory_used(&self) -> usize {
+        fn capacity_bytes<T>(values: &Vec<T>) -> usize {
+            values.capacity() * std::mem::size_of::<T>()
+        }
+        let mut total = std::mem::size_of::<Self>()
+            + capacity_bytes(&self.hyperlinks)
+            + capacity_bytes(&self.complex_chars)
+            + capacity_bytes(&self.combining)
+            + capacity_bytes(&self.rgb_fg)
+            + capacity_bytes(&self.rgb_bg)
+            + capacity_bytes(&self.underline_colors)
+            + capacity_bytes(&self.images);
+        for span in &self.hyperlinks {
+            total += span.url.len() + span.id.as_ref().map_or(0, |id| id.len());
+        }
+        for (_, text) in &self.complex_chars {
+            total += text.len();
+        }
+        for (_, marks) in &self.combining {
+            if marks.spilled() {
+                total += marks.capacity() * std::mem::size_of::<char>();
+            }
+        }
+        for span in &self.images {
+            // The vector capacity above already includes ImageSpan itself.
+            total = total.saturating_add(span.image.per_row_bytes());
+        }
+        total
+    }
+
     /// True when all fields are empty (common case: plain ASCII text).
     ///
     /// Used to avoid allocating a boxed extras struct for rows that have

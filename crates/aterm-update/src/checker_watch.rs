@@ -130,6 +130,24 @@ impl CheckerPhase {
 /// hung, which is exactly the holder that used to park this thread forever.
 pub const CHECKER_LOCK_WAIT: Duration = Duration::from_secs(60);
 
+/// After how many consecutive cycles that found `checker.lock` held past
+/// [`CHECKER_LOCK_WAIT`] BY A HOLDER SHOWING NO PROGRESS a process stops deferring
+/// to it and checks without the lock (round four of the 2026-09 update robustness
+/// work, plan item 14). A holder that is checking rewrites the lock while it works
+/// (the check loop's holder beat, a download included), so a deferral to one is
+/// the ordinary kind and counts toward nothing; three cycles in a row — each an
+/// interval apart — behind a lock nobody has written is a holder that is not
+/// making progress: an aterm STOPPED mid-check (a `SIGSTOP`, a ctrl-z of a terminal
+/// session running one), or hung. Cycles alone could not tell that holder from one
+/// twenty minutes into a download on a slow link (the round-four review).
+/// Deferring to it for good stopped every update check on the machine with no
+/// notice. The gate is a cost device, never a correctness one: checking without it
+/// costs one request per interval while the holder stays stopped, and the stage
+/// lock (bounded, `install::BACKGROUND_LOCK_WAIT`) still serializes the download.
+/// The window's watchdog raises its warning when a streak reaches it
+/// (`aterm-gui`'s `update_checker_watch`).
+pub const CHECKER_UNGATED_AFTER: u64 = 3;
+
 /// The longest a check may run between two heartbeats: the steps inside a check
 /// that are not a download, each bounded on its own — the API and HEAD requests
 /// (30 s each, retried), the stage and publish lock waits (2 min each), the
@@ -218,7 +236,10 @@ pub struct CheckerBeat {
     /// Replacement threads this process has started.
     pub respawns: u64,
     /// Consecutive cycles that found `checker.lock` held past
-    /// [`CHECKER_LOCK_WAIT`] and deferred — 0 while cycles are getting it.
+    /// [`CHECKER_LOCK_WAIT`] by a holder showing NO progress, and deferred — 0
+    /// while cycles are getting it, and while the holder is seen working (a
+    /// deferral to a holder that is still checking is the ordinary kind, and
+    /// nothing a watchdog should warn about).
     pub deferrals: u64,
     /// Consecutive times the host did not answer the settings query.
     pub settings_misses: u64,
@@ -462,7 +483,8 @@ impl CheckerWatch {
         }
     }
 
-    /// Publish the consecutive `checker.lock` deferral count.
+    /// Publish the consecutive count of `checker.lock` deferrals to a holder
+    /// showing no progress ([`CheckerBeat::deferrals`]).
     pub fn set_deferrals(&self, generation: u64, n: u64) {
         if self.is_current(generation) {
             self.deferrals.store(n, Ordering::Relaxed);
@@ -672,6 +694,9 @@ mod tests {
     /// `run_checker`): its schedule's `max_wait`, which is `LONGEST_WAIT`.
     #[test]
     fn the_loop_registers_its_one_cadences_longest_wait() {
+        // The loop and its `Cadence` are macOS's (`mod cadence` is gated); the
+        // bound is every target's.
+        #[cfg(target_os = "macos")]
         assert_eq!(
             crate::cadence::Cadence::new(Duration::from_secs(crate::cadence::INTERVAL_SECS))
                 .max_wait()

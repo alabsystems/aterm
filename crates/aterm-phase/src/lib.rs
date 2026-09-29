@@ -66,8 +66,8 @@ pub mod wall;
 
 pub use anchors::{ANCHORS, Anchor, AnchorKind, CODEX_ANCHORS, anchor, anchor_text};
 pub use phase::{
-    Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
-    transcript_end, worker_phase,
+    Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, notice_reset,
+    survey_open, transcript_end, worker_phase,
 };
 pub use prompt::{
     Cancel, CancelEffect, Header, Opt, Origin, OwnerReview, Prompt, PromptKind, PromptV2,
@@ -80,12 +80,13 @@ pub use question::{
 };
 pub use reader::{
     AGENT_RUNTIMES, ClaudeReader, CodexReader, GenericReader, Program, Reading, ScreenReader,
-    identify, live_zone_start, may_host_agent, program_of, read, read_at, resume_hint,
+    identify, live_zone_start, may_host_agent, program_of, read, read_at,
 };
 pub use turn::{
-    Progress, continuation_suggestion, goal_active, interrupted, said_tail, status_row_progress,
-    status_row_stall,
+    LaunchCard, Progress, continuation_suggestion, goal_active, interrupted, launch_card,
+    said_tail, status_row_progress, status_row_stall,
 };
 pub use wall::{
-    ApiCause, Placement, Wall, WallKind, classify_wall, login_restored, memory_wall, wall,
+    ApiCause, Placement, Wall, WallKind, classify_wall, login_restored, memory_banner_head,
+    memory_wall, wall,
 };

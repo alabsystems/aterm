@@ -433,6 +433,14 @@ pub struct Terminal {
     /// this slot is untouched, which is correct: its main-screen occupant was never
     /// restored, so it is still parked.
     pub(super) parked_text_selection: crate::selection::TextSelection,
+    /// The active selection as it stood before the first shrink of an open
+    /// grid RESIZE UNDO (`aterm_grid`'s `resize_undo`), put back when that undo
+    /// is handed back whole. The rows-only shrink transform CLAMPS an anchor
+    /// on a demoted row (the alt grid keeps no history to anchor it in), and
+    /// the grow's reveal shift then lands it one row low: without this, a
+    /// content-exact flap still moved a highlight. See
+    /// [`super::resize_journal::ResizeUndoSelection`].
+    pub(super) resize_undo_selection: Option<super::resize_journal::ResizeUndoSelection>,
     /// PRESS CUSTODY — which custody transition last fired (see
     /// [`super::custody`]). One byte: a fieldless enum in an `Option`, written by a
     /// single store at each site that DECIDES custody and read by the `custody`
@@ -462,6 +470,15 @@ pub struct Terminal {
     /// `last_custody_change` because that one is overwritten by a deliberate
     /// deselect, which is never the answer anyone is looking for.
     pub(super) last_selection_taker: Option<super::custody::CustodyTransition>,
+    /// How many reader gestures this session has recorded
+    /// ([`super::custody::CustodyTransition::is_reader_gesture`]): typing, a
+    /// paste, a scroll, a selection, a return to live — even one that moved
+    /// nothing. A counter, never a last-event slot, so output (the record's
+    /// most frequent writer) cannot hide a gesture behind it. What the
+    /// self-update's scrollback restore compares to learn whether the person
+    /// used the session between the adopt and the import (round six, finding
+    /// 24). Session-only and not checkpointed, like the records above.
+    pub(super) reader_gestures: u64,
     /// Secure keyboard entry mode.
     ///
     /// When enabled, indicates that the UI layer should enable platform-specific
@@ -610,6 +627,12 @@ pub struct Terminal {
     /// these cumulative counters can be observed independently by multiple
     /// renderers without one consumer starving another.
     pub(super) content_scroll_state: ContentScrollState,
+    /// What each resize did to the active grid, newest
+    /// [`RESIZE_JOURNAL_CAP`](super::RESIZE_JOURNAL_CAP) kept, with a lifetime
+    /// ordinal (see [`super::resize_journal`]). Session-only, like
+    /// `content_scroll_state`: written by the two resize entry points, never
+    /// by a VT dispatch, and never checkpointed.
+    pub(super) resize_journal: super::resize_journal::ResizeJournal,
 }
 
 // Grouped sub-state structs extracted to grouped_state.rs (#1977).

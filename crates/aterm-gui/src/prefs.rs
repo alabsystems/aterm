@@ -398,6 +398,13 @@ pub(crate) const EDIT_TAB_CONNECTION_BADGE: &str = "tab_connection_badge";
 /// Rendered on Settings ▸ Messages (`settings/messages/explain-load`); its
 /// registry section is Performance, which no ordinary page lists.
 pub(crate) const EDIT_EXPLAIN_HEAVY_LOAD: &str = "explain_heavy_load";
+/// Whether aterm posts its OWN notices as desktop notifications
+/// (`Config::desktop_alerts`, default OFF — owner, 2026-09-28): the herald's
+/// escalations, the operator's, the consent path's and the update-health
+/// banner. An ordinary Settings ▸ Security row, in its own "Notifications"
+/// box beside the Permissions box that holds `allow_notifications` (the
+/// PROGRAMS' notifications) — the two notification switches on one page.
+pub(crate) const EDIT_DESKTOP_ALERTS: &str = "desktop_alerts";
 pub(crate) const EDIT_SEARCH_HISTORY_LINES: &str = "search_history_lines";
 pub(crate) const EDIT_ALLOW_OSC52_QUERY: &str = "allow_osc52_query";
 /// macOS Secure Keyboard Entry (`Config::secure_keyboard_entry`, default OFF):
@@ -918,12 +925,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Feline: record Kitty Log",
         kind: EditKind::Bool,
     },
-    // [sparkle_words.orca] / [sparkle_words.ink] / [sparkle_words.emphasis]
-    NestedLeaf {
-        key: "sparkle_words.orca.enabled",
-        label: "Orca splash",
-        kind: EditKind::Bool,
-    },
+    // [sparkle_words.ink] / [sparkle_words.emphasis]
     NestedLeaf {
         key: "sparkle_words.ink.enabled",
         label: "Ink shimmer",
@@ -1098,6 +1100,13 @@ pub(crate) fn nested_leaf(key: &str) -> Option<&'static NestedLeaf> {
 /// introspection surface; deferring it requires writing the reason down.
 #[cfg(test)]
 pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
+    (
+        "keeper",
+        "the PTY keeper's opt-in ([keeper] enabled, P3 of docs/DESIGN-pty-keeper-2026-09-26.md), \
+         read once at launch: while it is opt-in and needs `aterm keeper start` beside it, a \
+         Settings toggle would offer half a feature. P4 makes it the default and gives it its \
+         row; until then the Manual completes and explains the key",
+    ),
     (
         "privacy",
         "the macOS consent posture ([privacy] enabled/check/notice/warmup/observer/…). It has \
@@ -1404,6 +1413,9 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // The strain row is a message-band row raised by a loaded MACHINE: the
     // workbench scene has no band and no load to explain.
     EDIT_EXPLAIN_HEAVY_LOAD,
+    // A desktop notification is drawn by the operating system, outside any
+    // window: the workbench scene has nothing to project it onto.
+    EDIT_DESKTOP_ALERTS,
     EDIT_STREAM_FADE,
     EDIT_STREAM_FADE_MS,
     // The split's focus mark is a RELATION between panes — it inks the divider
@@ -1804,6 +1816,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TAB_STATUS_BADGE
         | EDIT_TAB_CONNECTION_BADGE
         | EDIT_EXPLAIN_HEAVY_LOAD
+        | EDIT_DESKTOP_ALERTS
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION
         | EDIT_CURSOR_TRAIL_RING
@@ -2480,7 +2493,6 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
     let sw = cfg.sparkle_words.as_ref();
     let prof = sw.and_then(|s| s.profanity.as_ref());
     let fel = sw.and_then(|s| s.feline.as_ref());
-    let orca = sw.and_then(|s| s.orca.as_ref());
     let ink = sw.and_then(|s| s.ink.as_ref());
     let emph = sw.and_then(|s| s.emphasis.as_ref());
     let mr = cfg.matrix_rain.as_ref();
@@ -2567,7 +2579,6 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
             boolean(fel.and_then(|f| f.cjk_single_char), false)
         }
         "sparkle_words.feline.log" => boolean(fel.and_then(|f| f.log), true),
-        "sparkle_words.orca.enabled" => boolean(orca.and_then(|o| o.enabled), true),
         "sparkle_words.ink.enabled" => boolean(ink.and_then(|i| i.enabled), true),
         "sparkle_words.ink.strength" => num(ink.and_then(|i| i.strength), "0.75 (default)"),
         "sparkle_words.ink.sweep_ms" => num(ink.and_then(|i| i.sweep_ms), "2200 (default)"),
@@ -2818,6 +2829,10 @@ pub(crate) fn section_of(key: &str) -> Section {
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING | EDIT_EXPLAIN_HEAVY_LOAD => {
             Section::Performance
         }
+        // aterm's own desktop notifications ride the Security page beside the
+        // programs' (`allow_notifications`): one page answers "who may put a
+        // notification on my desktop".
+        EDIT_DESKTOP_ALERTS => Section::Security,
         // The [packages] maintenance switches live on the special Packages page;
         // this section keeps them findable (Search/Modified) without also
         // duplicating them onto an ordinary registry page.
@@ -3052,6 +3067,8 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING | EDIT_EXPLAIN_HEAVY_LOAD => {
             ("System", 1)
         }
+        // Security › aterm's own desktop notifications, under the permissions.
+        EDIT_DESKTOP_ALERTS => ("Notifications", 2),
         // Packages › the ALab tools switches ride together.
         EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_INSTALL | EDIT_REROUTE_ANNOUNCE => {
             ("ALab Tools", 0)
@@ -3176,6 +3193,10 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         "Permissions" => {
             "Off by default. Programs request access; Secure Keyboard Entry stops \
              snooping. Notifications: macOS and Windows."
+        }
+        // Short on purpose (the "This Mac" note above says why).
+        "Notifications" => {
+            "Off, aterm's own alerts stay in the message band, the menu bar and Messages."
         }
         "Window padding" => {
             "Top padding cannot exceed all-edge padding; constrained values show their effective size."
@@ -3631,6 +3652,17 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_TEMPORAL_RECORDING => &["temporal", "recording", "replay", "history", "time"],
         EDIT_EXPLAIN_HEAVY_LOAD => &[
             "load", "cpu", "memory", "heat", "slow", "typing", "lag", "strain", "messages",
+        ],
+        EDIT_DESKTOP_ALERTS => &[
+            "notification",
+            "notifications",
+            "alert",
+            "alerts",
+            "banner",
+            "desktop",
+            "messages",
+            "script",
+            "editor",
         ],
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => {
             &["padding", "margin", "border", "spacing", "inset", "edge"]
@@ -5325,6 +5357,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
+            label: "Desktop notifications from aterm",
+            key: EDIT_DESKTOP_ALERTS,
+            kind: EditKind::Bool,
+            // The RESOLVED state (default OFF): the owner turned them off.
+            seed: Some(cfg.desktop_alerts_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
             label: "Temporal recording",
             key: EDIT_TEMPORAL_RECORDING,
             kind: EditKind::Bool,
@@ -5484,7 +5524,9 @@ pub(crate) fn save_prefs_snapshot_observed(
             Ok(contents) => contents,
             Err(error) => {
                 return ConfigSnapshotSaveResult {
-                    outcome: SaveOutcome::Error(format!("{} unreadable ({error})", path.display())),
+                    outcome: SaveOutcome::Error(crate::native_config_service::config_read_error(
+                        &path, error,
+                    )),
                     observed: None,
                 };
             }

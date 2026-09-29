@@ -21,6 +21,8 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use aterm_primer::CLAUDE_TOP_EFFORT_KEY;
+
 use crate::store::Layout;
 
 const GIB: u64 = 1 << 30;
@@ -419,10 +421,11 @@ pub struct Probes {
     /// The C toolchain's verdict ([`crate::prereq::probe`]), or `None` when this report
     /// does not probe it (the default: a fixture never meets the machine's compiler).
     pub cc: Option<crate::prereq::CcVerdict>,
-    /// Claude Code's session-quality survey, as `~/.claude/settings.json` leaves it
-    /// ([`claude_survey_off`]), or `None` when this report does not read that file (the
-    /// default: a fixture has no Claude settings).
-    pub claude_survey_off: Option<bool>,
+    /// The Claude Code defaults the owner runs with, as `~/.claude/settings.json`
+    /// leaves each — or why the window adds none to that file
+    /// ([`claude_defaults_state`]) — or `None` when this report does not read that
+    /// file (the default: a fixture has no Claude settings).
+    pub claude_defaults: Option<Result<Vec<(&'static str, DefaultState)>, String>>,
 }
 
 impl Default for Probes {
@@ -439,7 +442,7 @@ impl Default for Probes {
             stub_env: crate::reroute::StubEnv::default(),
             index_head: false,
             cc: None,
-            claude_survey_off: None,
+            claude_defaults: None,
         }
     }
 }
@@ -472,6 +475,221 @@ pub fn claude_survey_off(settings_json: &str) -> bool {
         .and_then(|e| e.get("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"))
         .and_then(aterm_json::Value::as_str)
         .is_some_and(|x| !matches!(x.trim(), "" | "0" | "false"))
+}
+
+/// The Claude Code defaults the owner runs with — `(key, value as JSON text)` —
+/// MIRRORED from `aterm_primer::CLAUDE_DEFAULTS`, which the window writes where a
+/// key is unset. The values are JSON text here and typed there, so the table is a
+/// mirror, not a re-export: atpkg takes only the top-effort key's one spelling from
+/// aterm-primer ([`CLAUDE_TOP_EFFORT_KEY`]), and the two tables are pinned equal by
+/// a test in aterm-gui (which depends on both).
+pub const CLAUDE_DEFAULTS: [(&str, &str); 3] = [
+    (CLAUDE_TOP_EFFORT_KEY, "true"),
+    ("effortLevel", "\"xhigh\""),
+    ("feedbackSurveyRate", "0"),
+];
+
+/// The defaults that SET AN EFFORT — MIRRORED from
+/// `aterm_primer::CLAUDE_EFFORT_DEFAULTS`, pinned equal by the same aterm-gui test
+/// module. The window adds neither while a person's own effort stands
+/// ([`claude_efforts_set_by_hand`]): Claude Code resolves the effort to `xhigh`
+/// whenever the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) is true, before it reads
+/// the level a person chose.
+pub const CLAUDE_EFFORT_DEFAULTS: [&str; 2] = [CLAUDE_TOP_EFFORT_KEY, "effortLevel"];
+
+/// Every effort a person set BY HAND in the Claude settings text `settings_json`
+/// that is not the default's `xhigh`, as `(path, value as JSON text)`: the
+/// top-level `effortLevel` first, then each `modelSettings.<model>.effortLevel`
+/// (where `/effort <level>` saves it) in model-name order, the last of a duplicate
+/// key winning. Empty when there is none, and for text that does not parse.
+///
+/// MIRRORED from `aterm_primer::claude_efforts_set_by_hand` — the rule by which
+/// the window holds [`CLAUDE_EFFORT_DEFAULTS`] back — and pinned equal to it by a
+/// test in aterm-gui, as [`CLAUDE_DEFAULTS`] is.
+#[must_use]
+pub fn claude_efforts_set_by_hand(settings_json: &str) -> Vec<(String, String)> {
+    aterm_json::from_str::<aterm_json::Value>(settings_json)
+        .map(|v| efforts_set_by_hand(&v))
+        .unwrap_or_default()
+}
+
+/// [`claude_efforts_set_by_hand`] over a parsed document. [`aterm_json::Map`] is
+/// sorted and keeps the last of a duplicate key, which is the order and the rule
+/// the mirror states.
+fn efforts_set_by_hand(v: &aterm_json::Value) -> Vec<(String, String)> {
+    let xhigh = CLAUDE_DEFAULTS
+        .iter()
+        .find(|(k, _)| *k == "effortLevel")
+        .map_or("", |(_, want)| *want);
+    let mut found = Vec::new();
+    let mut note = |path: String, effort: &aterm_json::Value| {
+        let text = aterm_json::to_string(effort).unwrap_or_default();
+        if text != xhigh {
+            found.push((path, text));
+        }
+    };
+    if let Some(effort) = v.get("effortLevel") {
+        note("effortLevel".to_string(), effort);
+    }
+    if let Some(models) = v
+        .get("modelSettings")
+        .and_then(aterm_json::Value::as_object)
+    {
+        for (model, settings) in models {
+            if let Some(effort) = settings.get("effortLevel") {
+                note(format!("modelSettings.{model}.effortLevel"), effort);
+            }
+        }
+    }
+    found
+}
+
+/// Where one default stands in a person's Claude settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultState {
+    /// Set to the default (or, for the survey, turned off another way).
+    Default,
+    /// Set by hand to something else — kept, never overwritten.
+    Manual(String),
+    /// Not set, and not added: one of [`CLAUDE_EFFORT_DEFAULTS`] while a person's
+    /// own effort stands — named here, `<path> = <value>` (several joined by `, `).
+    HeldForEffort(String),
+    /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) `true` beside an effort a
+    /// person set by hand — named here as [`DefaultState::HeldForEffort`] names it.
+    /// Claude Code resolves the effort to `xhigh` whenever that key is true, so that
+    /// effort is never used. The window no longer adds the key over a hand-set
+    /// effort, but the build of 2026-09-28 that first added the defaults did, and
+    /// left every key set; nothing can tell who wrote the key, so the window never
+    /// removes it — the doctor names it and the person decides.
+    OverridesEffort(String),
+    /// Not set: an aterm window adds the default at its next start.
+    Unset,
+}
+
+/// Each of [`CLAUDE_DEFAULTS`] as `settings_json` leaves it, by the window's own
+/// rule (`aterm_primer::add_claude_defaults`): an unset key is added, except the
+/// effort defaults while a person's own effort stands — and a set top-effort key
+/// ([`CLAUDE_TOP_EFFORT_KEY`]) that overrides such an effort is
+/// [`DefaultState::OverridesEffort`], never the default.
+///
+/// # Errors
+///
+/// A file the window refuses to add to, and leaves exactly as it is: the parse
+/// error (an empty file included), or "the top level is not a JSON object". No
+/// key is reported for it — "an aterm window adds …" would promise a repair that
+/// never happens.
+pub fn claude_defaults_state(
+    settings_json: &str,
+) -> Result<Vec<(&'static str, DefaultState)>, String> {
+    let v = aterm_json::from_str::<aterm_json::Value>(settings_json).map_err(|e| e.to_string())?;
+    if v.as_object().is_none() {
+        return Err("the top level is not a JSON object".to_string());
+    }
+    let survey_off = claude_survey_off(settings_json);
+    let by_hand: Vec<String> = efforts_set_by_hand(&v)
+        .into_iter()
+        .map(|(path, value)| format!("{path} = {value}"))
+        .collect();
+    Ok(CLAUDE_DEFAULTS
+        .iter()
+        .map(|&(key, want)| {
+            let state = match v.get(key) {
+                None if key == "feedbackSurveyRate" && survey_off => DefaultState::Default,
+                None if CLAUDE_EFFORT_DEFAULTS.contains(&key) && !by_hand.is_empty() => {
+                    DefaultState::HeldForEffort(by_hand.join(", "))
+                }
+                None => DefaultState::Unset,
+                Some(have) => {
+                    let text = aterm_json::to_string(have).unwrap_or_default();
+                    let is_default = text == want || (key == "feedbackSurveyRate" && survey_off);
+                    if key == CLAUDE_TOP_EFFORT_KEY && text == "true" && !by_hand.is_empty() {
+                        DefaultState::OverridesEffort(by_hand.join(", "))
+                    } else if is_default {
+                        DefaultState::Default
+                    } else {
+                        DefaultState::Manual(text)
+                    }
+                }
+            };
+            (key, state)
+        })
+        .collect())
+}
+
+/// Whether an aterm window would write to a settings file with this text: the
+/// window's own rule (`aterm_primer::add_claude_defaults`) — a key of
+/// [`CLAUDE_DEFAULTS`] absent from the top level, unless it is an effort default
+/// held back by a person's own effort. Not the rows' `Unset`: a
+/// `feedbackSurveyRate` the `env` survey switch already covers reads as the
+/// default, yet the window still adds it.
+fn window_adds(settings_json: &str) -> bool {
+    let Ok(v) = aterm_json::from_str::<aterm_json::Value>(settings_json) else {
+        return false;
+    };
+    let held = !efforts_set_by_hand(&v).is_empty();
+    CLAUDE_DEFAULTS
+        .iter()
+        .any(|(key, _)| v.get(key).is_none() && !(held && CLAUDE_EFFORT_DEFAULTS.contains(key)))
+}
+
+/// What (10h) reads of the Claude settings file at `path` (`~/.claude/settings.json`):
+/// [`claude_defaults_state`] over its text, or `None` when there is no file (and no
+/// link) at all. What the text cannot show makes it, instead, the `Err` the one
+/// refusal row names:
+///
+/// * A file that cannot be read — a link loop, a directory at that path, bytes that
+///   are not UTF-8, a file this user may not read. `aterm_primer::add_claude_defaults`
+///   reads it the same way and refuses it at every start.
+/// * A symlink whose target does not exist — a dotfiles link to a file not there
+///   yet — which `aterm_primer::add_claude_defaults` refuses at every start rather
+///   than replace the link with a plain file. Read through the link it looked like
+///   no file at all, and the doctor said nothing.
+/// * A file whose REAL directory (a link's target's: the window's atomic write puts
+///   its temp file there and renames it over the target) this user cannot write — a
+///   link into a read-only store, as home-manager lays one out — while the text
+///   leaves a key the window would add ([`window_adds`]). Every window start tries
+///   that write and fails, so the row promising the addition was false. A file that
+///   needs nothing added is judged by its text alone: the window writes nothing to
+///   it, and its rows (a hand-set value kept, a top-effort key over a hand-set
+///   effort) still hold.
+fn probe_claude_settings(path: &Path) -> Option<Result<Vec<(&'static str, DefaultState)>, String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // NotFound through a link means the LINK is there and its target is not:
+            // the window's own reading (`add_claude_defaults`).
+            let meta = std::fs::symlink_metadata(path).ok()?;
+            if !meta.file_type().is_symlink() {
+                return None;
+            }
+            let target = std::fs::read_link(path)
+                .map_or_else(|_| "?".to_string(), |t| t.display().to_string());
+            return Some(Err(format!("a symlink to {target}, which does not exist")));
+        }
+        Err(e) => return Some(Err(format!("it cannot be read: {e}"))),
+    };
+    let states = claude_defaults_state(&text);
+    if states.is_ok() && window_adds(&text) {
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(dir) = real.parent()
+            && !crate::platform::dir_writable_by_caller(dir)
+        {
+            let linked = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+            return Some(Err(if linked {
+                format!(
+                    "a symlink to {}, whose directory {} this user cannot write",
+                    real.display(),
+                    dir.display()
+                )
+            } else {
+                format!(
+                    "its directory {} is not writable by this user",
+                    dir.display()
+                )
+            }));
+        }
+    }
+    Some(states)
 }
 
 /// The environment knobs deleted on 2026-09-23 (Phase 4's update opt-outs) and
@@ -615,6 +833,8 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ("ATERM_NET_CERT", "[net] cert"),
     ("ATERM_NET_KEY", "[net] key"),
     ("ATERM_VERBOSE", "aterm --verbose"),
+    // 2026-09-28: `aterm drive`'s prompt-ready pattern.
+    ("ATERM_DRIVE_READY", "aterm drive --ready <regex>"),
 ];
 
 /// Which [`RETIRED_OPT_OUTS`] are exported to this process (set at all, whatever the
@@ -768,11 +988,9 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         config_notes: cfg.config_notes(),
         ignored_prefix: cfg.ignored_prefix.clone(),
         retired_env: retired_opt_outs_exported(),
-        claude_survey_off: home.as_deref().and_then(|h| {
-            std::fs::read_to_string(h.join(".claude").join("settings.json"))
-                .ok()
-                .map(|t| claude_survey_off(&t))
-        }),
+        claude_defaults: home
+            .as_deref()
+            .and_then(|h| probe_claude_settings(&h.join(".claude").join("settings.json"))),
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
@@ -2429,25 +2647,86 @@ pub fn run_with(
         };
         let _ = writeln!(out, "{p}: ok — {program}: {line}");
     }
-    // (10h) CLAUDE CODE'S SESSION SURVEY. Its optional rating prompt
-    // draws under the input of a session the harness supervises and waits for a key. It
-    // is a Claude Code SETTING, so this report says which way it is set and names the one
-    // line that turns it off — aterm writes nothing into an agent's settings itself.
+    // (10h) CLAUDE CODE'S DEFAULTS (owner, 2026-09-28): the top-effort mode
+    // (`CLAUDE_TOP_EFFORT_KEY`), `xhigh` effort, and the session-quality survey off.
+    // An aterm window ADDS each where it is unset (`aterm_primer::add_claude_defaults`)
+    // and never touches one set by hand, so this says which is which: the defaults as
+    // one `ok`, a person's own value as an `ok` that names it, an effort default held
+    // back by a person's own effort as an `ok` that names that effort, a top-effort
+    // key that overrides such an effort as a `warn` naming both and the fix, and an
+    // unset key as a `warn` naming what the next window start adds. A file the window
+    // refuses to add to is one `warn` naming why, and no key: nothing will be added
+    // to it. Every row prints the key from the constant, so a person reads the very
+    // key their settings file holds.
     if installed.iter().any(|(program, _)| *program == "claude")
-        && let Some(off) = probes.claude_survey_off
+        && let Some(states) = &probes.claude_defaults
     {
-        if off {
+        let states = match states {
+            Ok(states) => states.as_slice(),
+            Err(why) => {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — claude: ~/.claude/settings.json cannot take aterm's defaults \
+                     ({why}) — an aterm window leaves the file exactly as it is and adds none \
+                     of them"
+                );
+                &[]
+            }
+        };
+        let defaults: Vec<&str> = states
+            .iter()
+            .filter(|(_, s)| *s == DefaultState::Default)
+            .map(|(k, _)| *k)
+            .collect();
+        if !defaults.is_empty() {
             let _ = writeln!(
                 out,
-                "{p}: ok — claude: the session-quality survey is off (~/.claude/settings.json)"
+                "{p}: ok — claude: {} set to aterm's defaults ({CLAUDE_TOP_EFFORT_KEY}, \
+                 xhigh effort, the session-quality survey off) in ~/.claude/settings.json",
+                defaults.join(", ")
             );
-        } else {
-            let _ = writeln!(
-                out,
-                "{p}: warn — claude: the session-quality survey (Claude Code's optional rating \
-                 prompt) can appear and wait under a supervised prompt — turn it off with \
-                 \"feedbackSurveyRate\": 0 in ~/.claude/settings.json"
-            );
+        }
+        for (key, state) in states {
+            match state {
+                DefaultState::Default => {}
+                DefaultState::Manual(value) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: ok — claude: {key} is {value}, set by hand — kept (aterm adds \
+                         its default only where a key is unset)"
+                    );
+                }
+                DefaultState::HeldForEffort(effort) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: ok — claude: {key} is unset and stays so — an effort is set by \
+                         hand ({effort}), and aterm adds {CLAUDE_TOP_EFFORT_KEY} and xhigh \
+                         effort only where no other effort was chosen"
+                    );
+                }
+                DefaultState::OverridesEffort(effort) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: warn — claude: \"{key}\": true in ~/.claude/settings.json \
+                         overrides the effort set by hand ({effort}) — Claude Code runs xhigh \
+                         while it stands — fix: remove \"{key}\" from ~/.claude/settings.json \
+                         to use that effort (an aterm build of 2026-09-28 may have added it; \
+                         the ~/.claude/settings.json.bak-<unix> it wrote then holds the file \
+                         from before)"
+                    );
+                }
+                DefaultState::Unset => {
+                    let want = CLAUDE_DEFAULTS
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map_or("", |(_, v)| *v);
+                    let _ = writeln!(
+                        out,
+                        "{p}: warn — claude: {key} is unset in ~/.claude/settings.json — an \
+                         aterm window adds \"{key}\": {want} at its next start"
+                    );
+                }
+            }
         }
     }
     // EVERY problem, not the first one. This scan used to `.find()`, so a second failing
@@ -2646,7 +2925,8 @@ pub fn run_with(
             crate::prereq::CcVerdict::NotProbed => {
                 let _ = writeln!(out, "{p}: note — {line}");
             }
-            crate::prereq::CcVerdict::Unanswered { .. } => {
+            crate::prereq::CcVerdict::Unanswered { .. }
+            | crate::prereq::CcVerdict::Unproven { .. } => {
                 let _ = writeln!(out, "{p}: warn — {line}");
             }
             _ => {
@@ -2702,7 +2982,13 @@ pub fn run_with(
             ))
         } else if next_prereq {
             // No amount of updating installs a C compiler: the prerequisite outranks it.
-            Some(String::from(crate::prereq::act()))
+            // A compiler that refuses with no one act to name (macOS: it is installed,
+            // and its own stderr is the cause) has its remedy inline: no `next` line.
+            probes
+                .cc
+                .as_ref()
+                .and_then(crate::prereq::CcVerdict::fix)
+                .map(String::from)
         } else if next_publish {
             Some(format!(
                 "publish the newer Trust coherence group ({PUBLISH_RUSTC_GROUP} on a \
@@ -3690,7 +3976,7 @@ fn report_aterm_posture_at(
     let named = |build: &str| -> String {
         versions
             .iter()
-            .find(|(b, _)| crate::dec_u64(*b) == build)
+            .find(|(b, _)| b.to_string() == build)
             .map_or_else(|| format!("build {build}"), |(_, v)| v.clone())
     };
     // Two builds as a person tells them apart: by version, unless both read the same (a dev
@@ -3709,12 +3995,19 @@ fn report_aterm_posture_at(
             // (automatic within a minute by default, one click otherwise); the shells keep
             // running. A terminal session never applies, so the note names the window for a
             // Mac that has none open, and never asks the user to reopen anything.
-            let (staged, current) = pair(&staged, &current);
-            // The window's installs of it keep failing (health.toml's apply streak, the one
-            // `aterm update` reads): no install is on its way, so none is promised.
-            let tries = field("health.toml", "apply_failures")
+            // The window's installs of THIS build keep failing: no install is on its way,
+            // so none is promised. The count is health.toml's per-target one, keyed to the
+            // build it tried — the escalation streak `apply_failures` carries a superseded
+            // build's tries onto a fresh download nothing has tried yet.
+            let tries = field("health.toml", "apply_failures_for_target")
                 .and_then(|n| n.parse::<u32>().ok())
-                .filter(|n| *n > 0);
+                .filter(|n| *n > 0)
+                .filter(|_| {
+                    let tried = field("health.toml", "last_apply_failure_target_build")
+                        .and_then(|b| b.parse::<u64>().ok());
+                    tried.is_some() && tried == staged.parse::<u64>().ok()
+                });
+            let (staged, current) = pair(&staged, &current);
             if let Some(n) = tries {
                 let tries = if n == 1 {
                     String::from("1 try")
@@ -3764,10 +4057,7 @@ fn report_aterm_posture_at(
             // `aterm build 1790305290 installed` named a ledger epoch nobody can map to
             // 0.93.0). With no such bundle readable the row stays build-only, so it never
             // names a version it did not read off that build.
-            match versions
-                .iter()
-                .find(|(b, _)| crate::dec_u64(*b) == installed)
-            {
+            match versions.iter().find(|(b, _)| b.to_string() == installed) {
                 Some((_, v)) => {
                     let _ = writeln!(out, "{p}: ok — aterm {v} (build {installed}) installed");
                 }
@@ -4527,12 +4817,42 @@ mod tests {
             out.contains(&format!("next — {}", crate::prereq::act())),
             "the prerequisite's act, not `update`: {out}"
         );
+        // A compiler that is there and refuses: a FAIL all the same, but on macOS the
+        // install act would only say the tools are installed, so no `next` names it.
+        let (healthy, out, err) = report(crate::prereq::CcVerdict::Broken {
+            driver: PathBuf::from("/opt/cc/bin/cc"),
+            why: "stdio.h: No such file or directory".to_string(),
+        });
+        assert!(!healthy, "{out}{err}");
+        assert!(
+            err.contains("FAIL — the C compiler at /opt/cc/bin/cc cannot build a program"),
+            "{err}"
+        );
+        assert_eq!(
+            out.contains(&format!("next — {}", crate::prereq::act())),
+            !cfg!(target_os = "macos"),
+            "{out}"
+        );
+        assert!(!out.contains("next — aterm pkg update"), "{out}");
         let (healthy, out, _) = report(crate::prereq::CcVerdict::Ready {
             driver: PathBuf::from("/opt/cc/bin/clang"),
         });
         assert!(healthy, "{out}");
         assert!(
-            out.contains("ok — C toolchain: /opt/cc/bin/clang answers"),
+            out.contains("ok — C toolchain: /opt/cc/bin/clang builds a C program"),
+            "{out}"
+        );
+        // A probe that could not run (no private temp directory) is unknown: a warn,
+        // never the FAIL a broken compiler is.
+        let (healthy, out, _) = report(crate::prereq::CcVerdict::Unproven {
+            driver: PathBuf::from("/opt/cc/bin/cc"),
+            why: "no private directory under /ro: read-only".to_string(),
+        });
+        assert!(healthy, "an unproven compiler is not a problem: {out}");
+        assert!(
+            out.contains(
+                "warn — the C compiler at /opt/cc/bin/cc answers, but the build probe could not run"
+            ),
             "{out}"
         );
         let (healthy, out, _) = report(crate::prereq::CcVerdict::Unanswered {
@@ -5975,6 +6295,7 @@ mod tests {
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
                 pass_seq: 0,
+                stale_index_only_pass_seq: 0,
                 programs,
                 extra: Default::default(),
             },
@@ -6498,20 +6819,58 @@ mod tests {
         assert!(!claude_survey_off("not json"));
     }
 
-    /// (10h) The row: a managed `claude` gets `ok` with the survey off, `warn` naming the
-    /// one line to add with it on, and no row at all when the report did not read the
-    /// settings (every fixture).
+    /// Claude Code's top-effort key, as every (10h) fixture below names it: its one
+    /// spelling, [`CLAUDE_TOP_EFFORT_KEY`] (the publication baseline bans the joined
+    /// word in exported source).
+    const TOP: &str = CLAUDE_TOP_EFFORT_KEY;
+
+    /// The settings text `json` with each `<top>` replaced by [`TOP`]: the fixtures
+    /// stay readable JSON, and no source line spells the key.
+    fn top(json: &str) -> String {
+        json.replace("<top>", TOP)
+    }
+
+    /// (10h) The rows: the defaults as one `ok`, a hand-set value as an `ok` that
+    /// names it and says it is kept, an unset key as a `warn` naming what the next
+    /// window start adds — and no row at all when the report did not read the
+    /// settings (every fixture). The reader also pins the survey's second switch.
     #[test]
-    fn a_managed_claude_reports_its_session_survey_setting() {
-        let l = layout("agent-survey");
+    fn a_managed_claude_reports_each_default_as_set_by_hand_or_unset() {
+        use DefaultState::{Default as D, Manual, Unset};
+        assert_eq!(
+            claude_defaults_state(&top(
+                r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0}"#
+            )),
+            Ok(vec![
+                (TOP, D),
+                ("effortLevel", D),
+                ("feedbackSurveyRate", D)
+            ])
+        );
+        assert_eq!(
+            claude_defaults_state(&top(r#"{"<top>": false, "effortLevel": "medium"}"#)),
+            Ok(vec![
+                (TOP, Manual("false".into())),
+                ("effortLevel", Manual("\"medium\"".into())),
+                ("feedbackSurveyRate", Unset),
+            ])
+        );
+        assert_eq!(
+            claude_defaults_state(r#"{"env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}}"#)
+                .unwrap()[2],
+            ("feedbackSurveyRate", D),
+            "the environment switch also turns the survey off"
+        );
+
+        let l = layout("agent-defaults");
         let v283 = crate::vendor_direct::Version::parse("2.1.283")
             .unwrap()
             .build_id();
         install(&l, "claude", v283);
-        let home = synthetic_home("agent-survey");
+        let home = synthetic_home("agent-defaults");
         let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
-        let rows = |off: Option<bool>| -> Vec<String> {
+        let rows = |defaults: Option<Result<Vec<(&'static str, DefaultState)>, String>>| {
             let mut out: Vec<u8> = Vec::new();
             let _ = run_with(
                 &l,
@@ -6521,7 +6880,7 @@ mod tests {
                 None,
                 "doctor",
                 &Probes {
-                    claude_survey_off: off,
+                    claude_defaults: defaults,
                     ..Probes::default()
                 },
                 &mut out,
@@ -6529,33 +6888,483 @@ mod tests {
             );
             String::from_utf8_lossy(&out)
                 .lines()
-                .filter(|line| line.contains("session-quality survey"))
+                .filter(|line| {
+                    line.contains("— claude: ") && line.contains("settings")
+                        || line.contains("set by hand")
+                })
                 .map(str::to_owned)
-                .collect()
+                .collect::<Vec<String>>()
         };
-        let on = rows(Some(false));
-        assert_eq!(on.len(), 1, "{on:?}");
-        assert!(on[0].contains("doctor: warn — claude:"), "{on:?}");
+        let all = rows(Some(claude_defaults_state(&top(
+            r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0}"#,
+        ))));
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(all[0].contains(&format!(
+            "doctor: ok — claude: {TOP}, effortLevel, feedbackSurveyRate"
+        )));
+        // A top-level effort set by hand: kept, and it holds the top-effort key back
+        // (this row used to promise the window would add that key `true`, which
+        // would have overridden the `medium`).
+        let mixed = rows(Some(claude_defaults_state(r#"{"effortLevel": "medium"}"#)));
         assert!(
-            on[0].contains(r#""feedbackSurveyRate": 0"#),
-            "names the fix: {on:?}"
+            mixed
+                .iter()
+                .any(|r| r.contains("ok — claude: effortLevel is \"medium\", set by hand — kept")),
+            "{mixed:?}"
         );
-        let off = rows(Some(true));
-        assert_eq!(off.len(), 1, "{off:?}");
-        assert!(off[0].contains("doctor: ok — claude:"), "{off:?}");
+        assert!(
+            mixed.iter().any(|r| r.contains(&format!(
+                "ok — claude: {TOP} is unset and stays so — an effort is set by hand \
+                 (effortLevel = \"medium\")"
+            ))),
+            "{mixed:?}"
+        );
+        assert!(
+            mixed
+                .iter()
+                .any(|r| r.contains("warn — claude: feedbackSurveyRate is unset")
+                    && r.contains("\"feedbackSurveyRate\": 0")),
+            "the survey rate is no effort, and is still added: {mixed:?}"
+        );
+        assert!(
+            !mixed
+                .iter()
+                .any(|r| r.contains(&format!("\"{TOP}\": true"))),
+            "{mixed:?}"
+        );
         assert!(rows(None).is_empty(), "no settings read, no row");
     }
 
-    /// OUTSIDE ATERM WITH THE STUB LAID, THE USER'S OWN COPY IS THE DESIGN — ON ANY PATH
-    /// (2026-09-24). An iTerm shell has no reroute directory on its PATH at all, so no stub
-    /// answers first there, and this report fell back to `SHADOWED in this shell` with the
-    /// rc-hook remedy — a remedy whose own false arm demotes `agents/` outside aterm, i.e.
-    /// advice that does nothing (owner law, 03513b5d7: the managed copy leads inside aterm
-    /// only). Three cases, one per answer: outside aterm with the stub laid (no reroute dir
-    /// on PATH, or one behind the foreign copy) — a note naming this shell's own copy, no
-    /// SHADOWED, no remedy; inside aterm with the stub first — routed, an `ok`; the stub
-    /// absent — outside aterm the same note (review, 2026-09-24: laid or not, no stub
-    /// answers in such a shell), inside aterm SHADOWED with the remedy.
+    /// (10h) THE WINDOW'S EFFORT RULE, as the doctor reports it: while an effort
+    /// other than `xhigh` is set by hand — the per-model one `/effort medium` saves,
+    /// or a top-level one — the top-effort key and `effortLevel` are reported kept
+    /// unset, naming that effort, and never as a `warn` promising the window adds
+    /// them; the survey rate is still added. A hand-set `xhigh` holds nothing back.
+    #[test]
+    fn an_effort_set_by_hand_holds_top_effort_and_xhigh_back_in_the_report() {
+        use DefaultState::{HeldForEffort, Manual, Unset};
+        let per_model = r#"{"modelSettings": {"claude-opus-5-5": {"effortLevel": "medium"}}}"#;
+        let named = "modelSettings.claude-opus-5-5.effortLevel = \"medium\"";
+        assert_eq!(
+            claude_defaults_state(per_model),
+            Ok(vec![
+                (TOP, HeldForEffort(named.into())),
+                ("effortLevel", HeldForEffort(named.into())),
+                ("feedbackSurveyRate", Unset),
+            ])
+        );
+        assert_eq!(
+            claude_defaults_state(r#"{"effortLevel": "medium"}"#),
+            Ok(vec![
+                (TOP, HeldForEffort("effortLevel = \"medium\"".into())),
+                ("effortLevel", Manual("\"medium\"".into())),
+                ("feedbackSurveyRate", Unset),
+            ])
+        );
+        assert_eq!(
+            claude_defaults_state(
+                r#"{"modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh"}}}"#
+            ),
+            Ok(vec![
+                (TOP, Unset),
+                ("effortLevel", Unset),
+                ("feedbackSurveyRate", Unset),
+            ]),
+            "a hand-set xhigh is the default's own effort"
+        );
+
+        let l = layout("agent-effort");
+        let v283 = crate::vendor_direct::Version::parse("2.1.283")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v283);
+        let home = synthetic_home("agent-effort");
+        let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            "doctor",
+            &Probes {
+                claude_defaults: Some(claude_defaults_state(per_model)),
+                ..Probes::default()
+            },
+            &mut out,
+            &mut std::io::sink(),
+        );
+        let out = String::from_utf8_lossy(&out);
+        for key in [TOP, "effortLevel"] {
+            assert!(
+                out.contains(&format!(
+                    "doctor: ok — claude: {key} is unset and stays so — an effort is set by hand \
+                     ({named}), and aterm adds {TOP} and xhigh effort only where no other \
+                     effort was chosen"
+                )),
+                "{out}"
+            );
+            assert!(
+                !out.contains(&format!("warn — claude: {key} is unset")),
+                "no promise to add {key}: {out}"
+            );
+        }
+        assert!(
+            out.contains("doctor: warn — claude: feedbackSurveyRate is unset"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (10h) A settings file the window REFUSES to add to — it does not parse, it
+    /// is empty, or its top level is not a JSON object — is one `warn` naming why,
+    /// and no per-key row: every key used to read as unset, each promising "an
+    /// aterm window adds … at its next start", a repair that never happens.
+    #[test]
+    fn a_settings_file_the_window_refuses_is_one_warn_naming_why() {
+        for text in ["not json", "", "  \n"] {
+            let refused = claude_defaults_state(text);
+            assert!(refused.is_err(), "{text:?}: {refused:?}");
+        }
+        assert_eq!(
+            claude_defaults_state(&top(r#"["<top>"]"#)),
+            Err("the top level is not a JSON object".to_string())
+        );
+
+        let l = layout("agent-refused");
+        let v283 = crate::vendor_direct::Version::parse("2.1.283")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v283);
+        let home = synthetic_home("agent-refused");
+        let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        for text in ["{ not json".to_string(), top(r#"["<top>"]"#)] {
+            let why = claude_defaults_state(&text).unwrap_err();
+            let mut out: Vec<u8> = Vec::new();
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                "doctor",
+                &Probes {
+                    claude_defaults: Some(Err(why.clone())),
+                    ..Probes::default()
+                },
+                &mut out,
+                &mut std::io::sink(),
+            );
+            let out = String::from_utf8_lossy(&out);
+            let rows: Vec<&str> = out
+                .lines()
+                .filter(|line| line.contains("— claude: ") && line.contains("settings"))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![format!(
+                    "doctor: warn — claude: ~/.claude/settings.json cannot take aterm's defaults \
+                     ({why}) — an aterm window leaves the file exactly as it is and adds none of \
+                     them"
+                )],
+                "{out}"
+            );
+            assert!(!out.contains("at its next start"), "no promise: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (10h) THE DAMAGE THE FIRST BUILD LEFT. The window of 2026-09-28 (f07e3b3b2)
+    /// added every default wherever its key was unset, and so turned the per-model
+    /// `medium` that `/effort medium` saves into exactly the file below: every key
+    /// set, so this report said "set to aterm's defaults" while Claude Code ran
+    /// xhigh over the person's `medium`. That top-effort key is a `warn` naming the
+    /// effort it overrides and the fix — never an `ok` — and, because the window
+    /// does not take it away (nothing tells who wrote it), the default report's
+    /// short row keeps the fix. The controls: the top-effort key beside no effort of
+    /// a person's own, or beside a hand-set `xhigh`, is the default, and a hand-set
+    /// `false` is kept as it was.
+    #[test]
+    fn a_top_effort_key_over_an_effort_set_by_hand_is_a_warn_naming_the_fix() {
+        use DefaultState::{Default as D, Manual, OverridesEffort};
+        // What f07e3b3b2's `add_claude_defaults` wrote over
+        // `{"modelSettings":{"claude-opus-5-5":{"effortLevel":"medium"}}}`.
+        let damaged = &top(
+            "{\n  \"modelSettings\": {\n    \"claude-opus-5-5\": {\n      \
+             \"effortLevel\": \"medium\"\n    }\n  },\n  \"<top>\": true,\n  \
+             \"effortLevel\": \"xhigh\",\n  \"feedbackSurveyRate\": 0\n}\n",
+        );
+        let named = "modelSettings.claude-opus-5-5.effortLevel = \"medium\"";
+        assert_eq!(
+            claude_defaults_state(damaged),
+            Ok(vec![
+                (TOP, OverridesEffort(named.into())),
+                ("effortLevel", D),
+                ("feedbackSurveyRate", D),
+            ])
+        );
+        assert_eq!(
+            claude_defaults_state(&top(r#"{"<top>": true, "effortLevel": "low"}"#)).unwrap()[0],
+            (TOP, OverridesEffort("effortLevel = \"low\"".into())),
+            "a top-level effort set by hand is overridden the same way"
+        );
+        for (text, want) in [
+            (r#"{"<top>": true}"#, D),
+            (
+                r#"{"<top>": true, "modelSettings": {"m": {"effortLevel": "xhigh"}}}"#,
+                D,
+            ),
+            (
+                r#"{"<top>": false, "effortLevel": "low"}"#,
+                Manual("false".into()),
+            ),
+        ] {
+            let text = top(text);
+            assert_eq!(
+                claude_defaults_state(&text).unwrap()[0],
+                (TOP, want),
+                "{text}"
+            );
+        }
+
+        let l = layout("agent-overrides");
+        let v283 = crate::vendor_direct::Version::parse("2.1.283")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v283);
+        let home = synthetic_home("agent-overrides");
+        let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            "doctor",
+            &Probes {
+                claude_defaults: Some(claude_defaults_state(damaged)),
+                ..Probes::default()
+            },
+            &mut out,
+            &mut std::io::sink(),
+        );
+        let out = String::from_utf8_lossy(&out).into_owned();
+        let warn = format!(
+            "doctor: warn — claude: \"{TOP}\": true in ~/.claude/settings.json overrides the \
+             effort set by hand ({named}) — Claude Code runs xhigh while it stands — fix: remove \
+             \"{TOP}\" from ~/.claude/settings.json to use that effort (an aterm build of \
+             2026-09-28 may have added it; the ~/.claude/settings.json.bak-<unix> it wrote then \
+             holds the file from before)"
+        );
+        assert!(out.lines().any(|line| line == warn), "{out}");
+        assert!(
+            out.contains("doctor: ok — claude: effortLevel, feedbackSurveyRate set to aterm's"),
+            "{out}"
+        );
+        assert!(
+            !out.contains(&format!("ok — claude: {TOP}")),
+            "the override is never an ok: {out}"
+        );
+        // The default report, where a long row is cut to its fact and its fix.
+        let shown = present(&out, "", "doctor", Detail::Problems);
+        let short: Vec<&str> = shown
+            .rest
+            .lines()
+            .filter(|line| line.contains(&format!("warn — claude: \"{TOP}\": true")))
+            .collect();
+        assert_eq!(short.len(), 1, "{}", shown.rest);
+        assert!(
+            short[0].ends_with(&format!(
+                " — fix: remove \"{TOP}\" from ~/.claude/settings.json to use that effort"
+            )) && short[0].chars().count() <= SHORT_ROW,
+            "{short:?}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (10h) The two refusals the settings TEXT cannot show, read off real links in a
+    /// scratch home (never the real one): a symlink whose target does not exist, which
+    /// the window refuses at every start, and a file in a directory this user cannot
+    /// write — a link into a read-only store as home-manager lays it out, or the plain
+    /// file itself — while a key is left to add, which every window start fails to
+    /// write. Each is the one refusal `warn`, and no per-key row promises an addition.
+    /// The controls: no file is no row, the same text in a writable directory is judged
+    /// by its keys, and a read-only file that needs nothing added keeps its rows.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
+        use DefaultState::{Default as D, Unset};
+        if crate::platform::our_uid() == 0 {
+            return; // root writes through mode 0; the unwritable case does not exist.
+        }
+        let home = synthetic_home("claude-links");
+        let claude = home.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        assert_eq!(probe_claude_settings(&settings), None, "no file, no row");
+
+        // A dotfiles link to a file not there yet.
+        let missing = home.join("dotfiles").join("settings.json");
+        std::os::unix::fs::symlink(&missing, &settings).unwrap();
+        let dangling = probe_claude_settings(&settings);
+        std::fs::remove_file(&settings).unwrap();
+
+        // A link into a store this user cannot write: a file with keys left to add,
+        // and one with every default set.
+        let store = home.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let bare = store.join("bare.json");
+        std::fs::write(&bare, "{}").unwrap();
+        let complete = store.join("complete.json");
+        std::fs::write(
+            &complete,
+            top(r#"{"<top>": true, "effortLevel": "xhigh", "feedbackSurveyRate": 0}"#),
+        )
+        .unwrap();
+        // The survey off through `env` only: the rows read the default, but the
+        // window still adds `feedbackSurveyRate` — so it still writes.
+        let env_only = store.join("env-only.json");
+        std::fs::write(
+            &env_only,
+            top(
+                r#"{"env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}, "<top>": true, "effortLevel": "xhigh"}"#,
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&bare, &settings).unwrap();
+        let writable = probe_claude_settings(&settings);
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let linked_read_only = probe_claude_settings(&settings);
+        std::fs::remove_file(&settings).unwrap();
+        std::os::unix::fs::symlink(&complete, &settings).unwrap();
+        let complete_read_only = probe_claude_settings(&settings);
+        std::fs::remove_file(&settings).unwrap();
+        std::os::unix::fs::symlink(&env_only, &settings).unwrap();
+        let env_only_read_only = probe_claude_settings(&settings);
+        std::fs::remove_file(&settings).unwrap();
+        // The plain file in a directory this user cannot write.
+        std::fs::write(&settings, "{}").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let plain_read_only = probe_claude_settings(&settings);
+        // Put the permissions back before asserting, so the scratch home can go.
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A link to itself: the read fails (a loop), and the window refuses it too.
+        std::fs::remove_file(&settings).unwrap();
+        std::os::unix::fs::symlink(&settings, &settings).unwrap();
+        let looped = probe_claude_settings(&settings);
+        std::fs::remove_file(&settings).unwrap();
+
+        assert_eq!(
+            dangling,
+            Some(Err(format!(
+                "a symlink to {}, which does not exist",
+                missing.display()
+            )))
+        );
+        assert_eq!(
+            writable,
+            Some(Ok(vec![
+                (TOP, Unset),
+                ("effortLevel", Unset),
+                ("feedbackSurveyRate", Unset),
+            ])),
+            "the same link into a writable directory is judged by its keys"
+        );
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap();
+        assert_eq!(
+            linked_read_only,
+            Some(Err(format!(
+                "a symlink to {}, whose directory {} this user cannot write",
+                real(&bare).display(),
+                real(&store).display()
+            )))
+        );
+        assert_eq!(
+            complete_read_only,
+            Some(Ok(vec![
+                (TOP, D),
+                ("effortLevel", D),
+                ("feedbackSurveyRate", D)
+            ])),
+            "nothing to add, nothing written: the rows still hold"
+        );
+        assert_eq!(
+            env_only_read_only,
+            Some(Err(format!(
+                "a symlink to {}, whose directory {} this user cannot write",
+                real(&env_only).display(),
+                real(&store).display()
+            ))),
+            "the window adds feedbackSurveyRate though the env switch covers it"
+        );
+        assert!(
+            matches!(&looped, Some(Err(why)) if why.starts_with("it cannot be read: ")),
+            "a file that cannot be read is the refusal, not silence: {looped:?}"
+        );
+        assert_eq!(
+            plain_read_only,
+            Some(Err(format!(
+                "its directory {} is not writable by this user",
+                real(&claude).display()
+            )))
+        );
+
+        // As the report says it: the one refusal row, no promise.
+        let l = layout("claude-links");
+        let v283 = crate::vendor_direct::Version::parse("2.1.283")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v283);
+        let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        for probed in [dangling, linked_read_only, plain_read_only, looped] {
+            let Some(Err(why)) = probed.clone() else {
+                panic!("a refusal: {probed:?}");
+            };
+            let mut out: Vec<u8> = Vec::new();
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                "doctor",
+                &Probes {
+                    claude_defaults: probed,
+                    ..Probes::default()
+                },
+                &mut out,
+                &mut std::io::sink(),
+            );
+            let out = String::from_utf8_lossy(&out);
+            let rows: Vec<&str> = out
+                .lines()
+                .filter(|line| line.contains("— claude: ") && line.contains("settings"))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![format!(
+                    "doctor: warn — claude: ~/.claude/settings.json cannot take aterm's defaults \
+                     ({why}) — an aterm window leaves the file exactly as it is and adds none of \
+                     them"
+                )],
+                "{out}"
+            );
+            assert!(!out.contains("at its next start"), "no promise: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[cfg(unix)]
     #[test]
     fn outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed() {
@@ -6813,6 +7622,7 @@ mod tests {
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
                 pass_seq: 0,
+                stale_index_only_pass_seq: 0,
                 programs,
                 extra: Default::default(),
             },
@@ -7153,7 +7963,12 @@ mod tests {
         );
         // The window's installs of it keep failing (health.toml's apply streak): no install
         // is promised, whichever way `auto_apply` reads — `aterm update`'s words.
-        std::fs::write(updates.join("health.toml"), "apply_failures = 3\n").unwrap();
+        std::fs::write(
+            updates.join("health.toml"),
+            "apply_failures = 3\napply_failures_for_target = 3\n\
+             last_apply_failure_target_build = 1788077184\n",
+        )
+        .unwrap();
         for by_itself in [true, false] {
             assert_eq!(
                 report_with(&lay, by_itself),
@@ -7161,9 +7976,27 @@ mod tests {
                  but didn\u{2019}t install (3 tries)\n"
             );
         }
-        std::fs::write(updates.join("health.toml"), "apply_failures = 1\n").unwrap();
+        std::fs::write(
+            updates.join("health.toml"),
+            "apply_failures_for_target = 1\nlast_apply_failure_target_build = 1788077184\n",
+        )
+        .unwrap();
         assert!(report(&lay).ends_with("but didn\u{2019}t install (1 try)\n"));
-        std::fs::write(updates.join("health.toml"), "apply_failures = 0\n").unwrap();
+        std::fs::write(
+            updates.join("health.toml"),
+            "apply_failures_for_target = 0\nlast_apply_failure_target_build = 1788077184\n",
+        )
+        .unwrap();
+        assert!(report(&lay).contains("installs within a minute"));
+        // An EARLIER build's failed installs are not this download's: the escalation
+        // streak and the per-target count both name build 1788035000, and 1788077184 is
+        // still promised.
+        std::fs::write(
+            updates.join("health.toml"),
+            "apply_failures = 3\napply_failures_for_target = 3\n\
+             last_apply_failure_target_build = 1788035000\n",
+        )
+        .unwrap();
         assert!(report(&lay).contains("installs within a minute"));
         std::fs::remove_file(updates.join("health.toml")).unwrap();
 
@@ -9239,6 +10072,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs: Default::default(),
             extra: Default::default(),
         };
@@ -9556,6 +10390,7 @@ mod tests {
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
                 pass_seq: 0,
+                stale_index_only_pass_seq: 0,
                 programs: Default::default(),
                 extra: Default::default(),
             },

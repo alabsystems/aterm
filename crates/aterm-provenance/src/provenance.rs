@@ -21,8 +21,7 @@ use crate::origin::{Host, Origin, OriginTag, Pty};
 /// `Provenance<T, Host>` upcasts in generic code.
 ///
 /// `Provenance` does not implement `Deref` or any auto-converting trait;
-/// consumers must call [`Provenance::as_ref`] or one of the
-/// `authorize_*` ceremonies explicitly.
+/// consumers must call [`Provenance::as_ref`] explicitly.
 ///
 /// # Origins do not convert
 ///
@@ -48,9 +47,6 @@ use crate::origin::{Host, Origin, OriginTag, Pty};
 /// let pty = Provenance::<_, Pty>::from_pty(String::from("sudo"));
 /// let _user: Provenance<String, User> = pty.into();
 /// ```
-///
-/// (The token that [`crate::authorize_pty_to_host`] consumes is feature-sealed
-/// behind `internal-mint`; `aterm-core/tests/capability_ceremony.rs` gates that.)
 #[repr(transparent)]
 pub struct Provenance<T: ?Sized, O: Origin> {
     // `_origin` is placed before `value` so the unsized-trailing layout works

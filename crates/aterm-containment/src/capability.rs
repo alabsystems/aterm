@@ -17,7 +17,13 @@
 
 /// Network capability levels.
 ///
-/// Discriminants: None=0, Allowlist=1, Full=2.
+/// Discriminants: None=0, Full=1.
+///
+/// There is no level between them. An `Allowlist` level (Safety mode) was
+/// retired on 2026-09-27 under the owner's standing direction: Seatbelt filters
+/// only by port or localhost, not by host, so a destination allowlist would have
+/// needed an egress proxy nobody is building, and the level behaved exactly like
+/// `Full` while its name promised filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -25,12 +31,8 @@ pub enum NetworkCapability {
     /// No network access. Containment mode — enforced by the macOS Seatbelt
     /// `(deny network*)`.
     None = 0,
-    /// Safety mode. Nothing narrows the network for it: Seatbelt can filter only
-    /// by port or localhost, not by host, so a destination allowlist would need a
-    /// proxy nobody is building. At runtime this behaves exactly like `Full`.
-    Allowlist = 1,
-    /// Unrestricted network. Master/User mode.
-    Full = 2,
+    /// Unrestricted network. Master, User and Safety mode.
+    Full = 1,
 }
 
 /// Filesystem capability levels.
@@ -74,8 +76,7 @@ mod tests {
 
     #[test]
     fn test_network_ordering() {
-        assert!(NetworkCapability::Full > NetworkCapability::Allowlist);
-        assert!(NetworkCapability::Allowlist > NetworkCapability::None);
+        assert!(NetworkCapability::Full > NetworkCapability::None);
     }
 
     #[test]
@@ -88,8 +89,7 @@ mod tests {
     #[test]
     fn test_repr_encoding() {
         assert_eq!(NetworkCapability::None as u8, 0);
-        assert_eq!(NetworkCapability::Allowlist as u8, 1);
-        assert_eq!(NetworkCapability::Full as u8, 2);
+        assert_eq!(NetworkCapability::Full as u8, 1);
 
         assert_eq!(FsCapability::TmpOnly as u8, 0);
         assert_eq!(FsCapability::ProjectReadWrite as u8, 1);

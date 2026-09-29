@@ -67,14 +67,19 @@ bitflags! {
         /// has no byte for Shift+Enter or Ctrl+Enter, and conhost reads aterm's
         /// legacy Shift+Enter LF (0x0a) as Ctrl+Enter (measured 2026-09-22:
         /// `ReadKey` → `KEY=Enter MODS=Control CHAR=0xA`, so PSReadLine ran
-        /// InsertLineAbove instead of AddLine).
+        /// InsertLineAbove instead of AddLine). Once conhost has read ONE record
+        /// it also stops settling a lone ESC by the end of the read, so the
+        /// keys whose legacy bytes are a bare or dangling ESC — Escape, Ctrl+[,
+        /// Alt+[, Alt+Backspace, … — go out as records too, or the Escape key
+        /// dies in that tab for good (measured 2026-09-27; the list is
+        /// `conhost_holds_once_switched` in `encode.rs`).
         ///
         /// A NEGOTIATION BIT WITH THE HOST, NOT A KITTY FLAG. It lives in this
         /// word only because the encoder reads one word; it is never part of
         /// the `CSI ? flags u` answer, the kitty push/pop stack, or any
         /// projection an application sees (`kitty_suppresses_predictive_echo`,
         /// `kitty_reports_functional_keys`). In the ENCODER, though, it
-        /// outranks a kitty push for the chords it covers: under ConPTY conhost
+        /// outranks a kitty push for the keys it covers: under ConPTY conhost
         /// is the only reader, an application's `CSI > 1 u` reaches this
         /// terminal verbatim through the pipe, and conhost's input parser then
         /// DROPS the `CSI 13;2 u` written back (measured 2026-09-22: no record

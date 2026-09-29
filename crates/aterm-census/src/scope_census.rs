@@ -694,9 +694,9 @@ fn run_scope_census_over(
     for viol in &hard {
         let _ = writeln!(log, "{}", viol.message);
     }
+    let mut standing_blocks: Vec<String> = Vec::new();
     for (f, viol) in &standing {
-        let _ = writeln!(
-            log,
+        let block = format!(
             "  ! STANDING FINDING [{}] claim `{}` (subject `{}`) — REGISTERED, real, \
              deliberately unfixed; re-detected this run and reprinted in full (never a \
              waiver):\n\x20     {}\n\x20   detected as: {}",
@@ -706,6 +706,8 @@ fn run_scope_census_over(
             f.finding,
             viol.message.trim_start()
         );
+        let _ = writeln!(log, "{block}");
+        standing_blocks.push(block);
     }
     let mut failures = hard.len();
     for (i, f) in findings.iter().enumerate() {
@@ -736,20 +738,19 @@ fn run_scope_census_over(
         let _ = write!(log, "{SCOPE_PRECISION_NOTE}");
         let _ = writeln!(
             log,
-            "gate scope: FAILED — {failures} obligation violation(s) across {} claim(s). \
-             This census blocks BOTH `targo --unverified run -p aterm-census -- --scope` \
+            "scope-cardinality census: FAILED — {failures} obligation violation(s) across {} \
+             claim(s). This census blocks BOTH `targo --unverified run -p aterm-census -- --scope` \
              and the build of tools/freeze-safety-gate. OB-13/14/15/16/18 have NO waiver \
              channel.",
             claims.len()
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
     let _ = writeln!(
         log,
-        "gate scope: GREEN — {} scope claim(s) re-derived from the tree ({} pinned chain \
-         link(s), {} accounted replica(s), {} closed token(s)); {} STANDING finding(s) \
-         reported above (registered, re-detected and reprinted every run — not waivers); \
-         {} reserved-vocabulary doc block(s) waived explicitly.",
+        "scope-cardinality census: GREEN — {} scope claim(s) re-derived from the tree ({} \
+         pinned chain link(s), {} accounted replica(s), {} closed token(s)); {} standing \
+         finding(s); {} reserved-vocabulary doc block(s) waived explicitly.",
         claims.len(),
         claims.iter().map(|c| c.chain.len()).sum::<usize>(),
         claims.iter().map(|c| c.replicas.len()).sum::<usize>(),
@@ -762,7 +763,11 @@ fn run_scope_census_over(
         "    scope: verbatim declaration pinning + a closure sweep over non-test \
          crates/**/*.rs (precision limits: docs/temporal-safety-gate.md)."
     );
-    CensusOutcome { ok: true, log }
+    CensusOutcome {
+        ok: true,
+        log,
+        standing: standing_blocks,
+    }
 }
 
 /// The WHY + REPAIR block every cardinality diagnostic ends with. Printed in
@@ -1597,7 +1602,8 @@ mod tests {
         let mut files = claim_files(claim);
         for extra in [
             "crates/aterm-gui/src/metrics.rs",
-            "crates/aterm-gui/src/motion.rs",
+            "crates/aterm-effects/src/motion.rs",
+            "crates/aterm-effects/src/sound_policy.rs",
         ] {
             files.push(extra.to_string());
         }
@@ -1611,16 +1617,18 @@ mod tests {
             metrics.contains("WordDecorations = 21,"),
             "enum variant gone"
         );
-        let motion = std::fs::read_to_string(root.join("crates/aterm-gui/src/motion.rs"))
+        let motion = std::fs::read_to_string(root.join("crates/aterm-effects/src/motion.rs"))
             .expect("read motion.rs");
         assert!(
             motion.contains("SeriousEffect::WordDecorations"),
             "qualified variant gone"
         );
-        let render = std::fs::read_to_string(root.join("crates/aterm-gui/src/app_render.rs"))
-            .expect("read app_render.rs");
+        // The curse-bonk drain's `decos` parameter (the sound policy moved
+        // into the engine with host-boundary Phase 4, 2026-09-27).
+        let drain = std::fs::read_to_string(root.join("crates/aterm-effects/src/sound_policy.rs"))
+            .expect("read sound_policy.rs");
         assert!(
-            render.contains("decos: &mut aterm_effects::word_decorations::WordDecorations,"),
+            drain.contains("decos: &mut crate::word_decorations::WordDecorations,"),
             "fn parameter gone"
         );
         let engine =
@@ -1684,6 +1692,49 @@ mod tests {
             out.log
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A REGISTERED standing finding keeps the census GREEN and comes back in
+    /// `standing`, whole, beside the log. The build gate prints a green build's
+    /// transcript nowhere a reader sees it and forwards `standing` as warnings,
+    /// so this field is the only road a standing hazard has to the owner; before
+    /// it existed a green build said "N STANDING finding(s) reported above"
+    /// about text cargo had hidden.
+    #[test]
+    fn a_registered_standing_finding_is_returned_whole_beside_the_log() {
+        let root = copy_root("supernova-registered", &all_claim_files());
+        mutate(
+            &root,
+            "crates/aterm-effects/src/word_decorations.rs",
+            "        for p in self.parked.values() {",
+            "        for p in std::iter::empty::<&ParkedPane>() {",
+        );
+        let registered = [StandingScopeFinding {
+            claim: "supernova-burst-mutex",
+            obligation: "OB-15",
+            detail: "self.parked",
+            finding: "registered by this test so the aggregator scan is a standing hazard",
+        }];
+        let out = run_scope_census_over(&root, SCOPE_CLAIMS, &registered);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(out.ok, "a registered finding must not block:\n{}", out.log);
+        assert_eq!(out.standing.len(), 1, "log:\n{}", out.log);
+        let block = &out.standing[0];
+        assert!(
+            block.starts_with("  ! STANDING FINDING [OB-15] claim `supernova-burst-mutex`")
+                && block.contains("registered by this test")
+                && block.contains("detected as:"),
+            "{block}"
+        );
+        assert!(
+            out.log.contains(block.as_str()),
+            "the log carries the same block"
+        );
+        assert!(
+            out.log.contains("1 standing finding(s);"),
+            "the verdict counts it:\n{}",
+            out.log
+        );
     }
 
     /// No standing finding is registered. The supernova aggregator finding

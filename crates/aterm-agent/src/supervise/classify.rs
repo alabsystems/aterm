@@ -52,6 +52,15 @@
 //! evaluate — running `cmd`. A tool with no write form at all (`ls`, `cat`,
 //! `grep`, `wc`, `echo`, `cd`) keeps its expansion arguments.
 //!
+//! zsh's ARITHMETIC runs a command substitution inside an array subscript,
+//! from a quoted word, a variable's value or a file name a glob makes
+//! (`printf %d 'path[$(cmd)]'`, measured; bash 3.2 does not). So a word zsh
+//! evaluates as arithmetic — `printf`'s arguments under a numeric format,
+//! the operand of `-t` in `test`/`[`/`[[`, an `export -i`/`-E`/`-F` value,
+//! a value for one of zsh's integer variables ([`ZSH_ARITHMETIC_VARS`]) —
+//! must be a plain number ([`arithmetic_scan`]), and a `test`/`[` word the
+//! shell may brace-expand or glob into `-t` is refused.
+//!
 //! What that costs, deliberately: reads a person would clear at a glance —
 //! `git diff $(git merge-base HEAD origin/main)`, `find "$d" -name x`, an
 //! integer test on a substitution — now ask. An escalation only asks a
@@ -67,6 +76,13 @@
 //! (`supervise::policy::approval`). False negatives (a read handed to the
 //! manager) cost a human a glance; a false positive would auto-approve a write,
 //! so every tie breaks toward "not read-only".
+//!
+//! It reads the line as zsh 5.9 and bash 3.2 do under their DEFAULT options,
+//! with no user alias or function. Claude Code's Bash tool runs each command
+//! after replaying the person's shell startup (its shell snapshot), so the
+//! approval rule that asks this check also reads that startup
+//! (`supervise::policy::shell_startup`) and approves nothing where it
+//! differs.
 
 /// The verdict on one command line: `read_only`, and `reason` naming the rule
 /// that decided it (the token or segment head), so a supervisor's notes say WHY
@@ -137,6 +153,23 @@ const QUOTE_SUB_MARK: char = '\u{1}';
 /// Substitutions nested deeper than this are not read: the line is refused
 /// ([`prelex`]), so no reader after it recurses further.
 pub(crate) const MAX_SUBSTITUTION_DEPTH: usize = 16;
+
+/// Why an unquoted `(` inside a word is no read: zsh reads it as a glob
+/// group, or as a glob QUALIFIER, and the `e:…:` and `+cmd` qualifiers run
+/// a command while the glob expands — `ls -d /(e:'print -u2 X':)`, `echo
+/// "/"(e:…:)`, `echo $(print /)(e:…:)`, `X=/; echo $X(e:…:)`, `echo
+/// {/,/}(e:…:)`, `echo x=(e:…:)` and, beside a file `5`, `echo <->(e:…:)`
+/// each print `X`; `ls -d /(+print)` runs `print` (measured, zsh 5.9 -f).
+const GLOB_QUALIFIER_RUNS: &str =
+    "a ( inside a word (zsh reads a glob qualifier, and `(e:…:)` or `(+cmd)` runs a command)";
+
+/// Why zsh's `~` parameter flag is no read: `$~N`, `$^~N`, `$~^N` (and
+/// `${~N}`, which [`braced_is_literal`] refuses with every flag) make the
+/// value a PATTERN (`GLOB_SUBST`), whose glob qualifier runs a command:
+/// `N='/(e:print -u2 X:)'; echo $~N` prints `X`, and so do `ls -d $~N`, `[
+/// -e $~N ]` and `for f in $~N` (measured, zsh 5.9 -f). Inside double
+/// quotes zsh does not glob it; it is refused there all the same.
+const GLOB_SUBST_RUNS: &str = "zsh's $~ flag (the value is globbed as a pattern, and a qualifier `(e:…:)` in it runs a command)";
 
 /// The python scripts a worker may run as reads when no `--allow-python` glob
 /// is given: none. A script is a program of the worker's choosing, and a name
@@ -239,6 +272,43 @@ const KEYWORD_PREFIX: &[&str] = &[
     "do", "then", "else", "if", "elif", "while", "until", "!", "{",
 ];
 
+/// Whether a word closes a `{` group in zsh (the other closing word is
+/// `]]`, [`danger_scan`]). zsh runs a command written after a closing word
+/// in the same list: `{ ls } always { cmd }`, `if [[ -n a ]] cmd`, `if {
+/// ls } cmd`, `while [[ -z $d ]] cmd` and `if [[ -n a ]] then cmd; fi` run
+/// `cmd` (measured, zsh 5.9 -f), which the segment reader took for an
+/// argument of the first command. A closing word is therefore the last
+/// word of its segment, or followed by its compound's redirects and
+/// closing words only: a word after such a redirect (`{ ls; } 2>&1 cmd`)
+/// is a parse error (measured, zsh 5.9 -f and bash 3.2). A `}` on a line
+/// with no `{` word, and a `]]` on one with no `[[`, closes nothing: zsh
+/// refuses `echo } x` as a parse error and runs nothing of the line, and
+/// bash prints it, as both print `echo ]] x` (measured).
+///
+/// A `}` closes as `}` itself or glued to the end of a word, unless the
+/// word's own braces open it: `{ echo a} always { cmd }`, `if { echo a}
+/// cmd`, `{ echo ${HOME}} always { cmd }`, `{ echo x{a,b}} always { cmd
+/// }` and `{ echo "a"} always { cmd }` ran `cmd` (measured, zsh 5.9 -f; a
+/// quoted `}` is data and the quotes reach this as `""`), while `{a,b}`,
+/// `${HOME}` and `{}` close nothing (`{ echo {a,b} x }` printed `a b x`)
+/// and neither does an escaped `}` (`{ echo a\} …` is a parse error).
+fn closes_a_brace(tok: &str) -> bool {
+    let mut depth = 0usize;
+    let mut chars = tok.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '{' => depth += 1,
+            '}' if chars.peek().is_none() => return depth == 0,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The directories a program may be named from by path and still be the program
 /// its basename says: `/bin/ls` is `ls`, `/tmp/evil/ls` is not.
 const SYSTEM_BIN_DIRS: &[&str] = &["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"];
@@ -246,9 +316,20 @@ const SYSTEM_BIN_DIRS: &[&str] = &["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"]
 /// Variables whose assignment changes what a LATER program runs or reads:
 /// the search path, the shell's own start-up and splitting, the pagers and
 /// editors a read tool may exec, the config roots git and rg read. `PATH` is
-/// allowed when every entry is a [`SYSTEM_BIN_DIRS`] directory.
+/// allowed when every entry is a [`SYSTEM_BIN_DIRS`] directory. zsh's own
+/// ([`ZSH_RUNS_A_VALUE`]): `NULLCMD` and `READNULLCMD` name the command a
+/// bare redirect runs (`NULLCMD=/tmp/x; > f` runs `/tmp/x`), `MODULE_PATH`
+/// is where zsh loads the module behind a parameter it autoloads (`echo
+/// $terminfo` loads `$MODULE_PATH/zsh/terminfo.so`), and `STTY` in a
+/// command's prefix is run as code on a terminal (`STTY='; cmd' ls`,
+/// measured under `script(1)`). An array zsh ties to one of these is the
+/// same variable ([`ZSH_TIED`]).
 const HAZARD_VARS: &[&str] = &[
     "PATH",
+    "NULLCMD",
+    "READNULLCMD",
+    "MODULE_PATH",
+    "STTY",
     "IFS",
     "BASH_ENV",
     "ENV",
@@ -276,6 +357,44 @@ const HAZARD_VARS: &[&str] = &[
 
 /// Prefixes of [`HAZARD_VARS`]: the dynamic loader's and git's whole families.
 const HAZARD_VAR_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_", "BASH_FUNC_"];
+
+/// zsh's TIED pairs, array then scalar: assigning the array assigns the
+/// scalar (`path=/tmp/x ls`, `path=/tmp/x; ls`, `for path in /tmp/x; do ls;
+/// done` and `for x path in 1 /tmp/x` run `/tmp/x/ls` — measured, zsh 5.9
+/// -f). Every pair `zsh -f` declares (`${parameters}` types `*-tied-*`), kept
+/// so by `zsh_tied_arrays_are_the_measured_ones`. An assignment to the array
+/// is judged as one to its scalar ([`assignment_hazard`]).
+const ZSH_TIED: &[(&str, &str)] = &[
+    ("cdpath", "CDPATH"),
+    ("fignore", "FIGNORE"),
+    ("fpath", "FPATH"),
+    ("mailpath", "MAILPATH"),
+    ("manpath", "MANPATH"),
+    ("module_path", "MODULE_PATH"),
+    ("path", "PATH"),
+    ("psvar", "PSVAR"),
+    ("zsh_eval_context", "ZSH_EVAL_CONTEXT"),
+];
+
+/// The variables whose VALUE zsh 5.9 runs, loads or sources during an
+/// ordinary line — measured, not recalled: each name `zsh -f` declares or
+/// zshparam(1) documents (and the hook arrays of zshmisc(1)) was assigned a
+/// path to a program that prints a marker, a function's name, a command
+/// line and a directory, as `NAME=v`, `NAME=v cmd` and `for NAME in v`,
+/// before a line of reads (`ls`, `< f`, `> /dev/null`, `cd`, `echo
+/// $terminfo`, a pipe, a here-string). These ran the value or loaded from
+/// it, and no other name did (2026-09-28); `zsh_parameters_it_runs_are_the_measured_ones`
+/// measures it again where zsh is installed. `STTY` runs only on a terminal
+/// and is in [`HAZARD_VARS`] without this measurement.
+#[cfg(test)]
+const ZSH_RUNS_A_VALUE: &[&str] = &[
+    "MODULE_PATH",
+    "NULLCMD",
+    "PATH",
+    "READNULLCMD",
+    "module_path",
+    "path",
+];
 
 /// `git <sub>` reads. `worktree` and `stash` are read-only ONLY as `list`.
 const GIT_READ: &[&str] = &[
@@ -367,6 +486,10 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
             return Verdict::no(reason);
         }
     }
+    // (f) The words zsh evaluates as arithmetic.
+    if let Some(reason) = arithmetic_scan(&cmd) {
+        return Verdict::no(reason);
+    }
     Verdict {
         read_only: true,
         reason: "every segment read-only".to_string(),
@@ -380,26 +503,45 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
 /// (`supervise::policy::rm_breaker`). What the rm circuit-breaker rule
 /// requires besides the resolver's verdict: the rule is only safe because a
 /// bypass session would run the rest unasked anyway, and the bypass it
-/// knows of was read off a footer the box has since replaced.
+/// knows of was read off a footer the box has since replaced. The
+/// assignments of the segments it leaves out are still judged
+/// ([`assignment_hazard`]): `REPORTTIME=A; cat f | cat; rm …` runs the
+/// command in `A`'s value, and the resolver refuses only the names the shell
+/// keeps. So are their redirects ([`redirect_hazard`]): `mktemp >
+/// ~/.zshrc; rm -rf <scratch>/x` truncates the file, and the resolver
+/// judges a redirect on the `rm` only.
 pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
     let lexed = match prelex(cmd) {
         Ok(cmd) => cmd,
         Err(reason) => return Verdict::no(reason),
     };
     let lexed = strip_alarm_idiom(&lexed);
-    let segments: Vec<Vec<String>> = split_segments(&strip_quotes(&lexed))
-        .into_iter()
-        .filter(|seg| {
-            let head = seg.iter().find(|t| !is_assignment(t));
-            match head {
-                None => false,
-                Some(h) => {
-                    let p = program(h).to_ascii_lowercase();
-                    p != "rm" && p != "mktemp"
+    let (segments, left_out): (Vec<Vec<String>>, Vec<Vec<String>>) =
+        split_segments(&strip_quotes(&lexed))
+            .into_iter()
+            .partition(|seg| {
+                let head = seg.iter().find(|t| !is_assignment(t));
+                match head {
+                    None => false,
+                    Some(h) => {
+                        let p = program(h).to_ascii_lowercase();
+                        p != "rm" && p != "mktemp"
+                    }
                 }
-            }
-        })
-        .collect();
+            });
+    if let Some(reason) = left_out
+        .iter()
+        .flat_map(|seg| seg.iter().take_while(|t| is_assignment(t)))
+        .find_map(|t| assignment_hazard(t))
+    {
+        return Verdict::no(reason);
+    }
+    if let Some(reason) = left_out
+        .iter()
+        .find_map(|seg| (0..seg.len()).find_map(|i| redirect_hazard(seg, i)))
+    {
+        return Verdict::no(reason);
+    }
     if let Some(reason) = danger_scan(&segments) {
         return Verdict::no(reason);
     }
@@ -407,13 +549,37 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
         return Verdict::no(reason);
     }
     for seg in &segments {
+        if is_mktemp_guard(seg) {
+            continue;
+        }
         if let Some(reason) = segment_head(seg, python_allow) {
             return Verdict::no(reason);
         }
     }
+    if let Some(reason) = arithmetic_scan(&lexed) {
+        return Verdict::no(reason);
+    }
     Verdict {
         read_only: true,
         reason: "every segment but the rm and mktemp commands read-only".to_string(),
+    }
+}
+
+/// A segment the rm rule's resolver reads as a guard on a `$(mktemp -d)`
+/// (`supervise::policy::rm_breaker`): `exit` or `exit <n>` (`D=$(mktemp -d)
+/// || exit 1`), and `:` with its words (`: "${D:?}"`), which the shell
+/// expands and runs nothing of. Neither writes; a redirect on either, and a
+/// substitution in a word, are still judged ([`danger_scan`],
+/// [`program_scan`], which see every segment). `exit` takes digits only:
+/// zsh evaluates its word as arithmetic, whose array subscript runs a
+/// command substitution from inside quotes (`exit 'a[$(cmd)]'` runs `cmd`,
+/// measured, zsh 5.9), and `exit 1 2` does not exit zsh at all.
+fn is_mktemp_guard(seg: &[String]) -> bool {
+    match seg {
+        [head, ..] if head == ":" => true,
+        [head] => head == "exit",
+        [head, n] => head == "exit" && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        _ => false,
     }
 }
 
@@ -483,6 +649,26 @@ impl Prelex {
         self.i == 0
             || self.chars[self.i - 1].is_whitespace()
             || matches!(self.chars[self.i - 1], ';' | '&' | '|' | '(' | ')')
+    }
+
+    /// Whether the unquoted `(` at the cursor is part of a WORD — after a
+    /// letter, a quote, a `)`, a `}`, a glob, a `~`, a `=` or a `<…>` range
+    /// inside one — which zsh reads as a glob group or a glob qualifier
+    /// ([`GLOB_QUALIFIER_RUNS`]). Not one that opens a subshell, a group or
+    /// an arithmetic `((…))`, and not `<(…)`, `>(…)` or zsh's `=(…)`, a
+    /// process substitution whose body is read as a command.
+    fn glued_paren(&self) -> bool {
+        let boundary = |k: usize| {
+            k == 0 || {
+                let p = self.chars[k - 1];
+                p.is_whitespace() || matches!(p, ';' | '&' | '|' | '(')
+            }
+        };
+        if boundary(self.i) {
+            return false;
+        }
+        let p = self.chars[self.i - 1];
+        !(matches!(p, '<' | '>' | '=') && boundary(self.i - 1))
     }
 
     /// One substitution deeper: its body, read by [`Self::run`] up to and
@@ -575,6 +761,9 @@ impl Prelex {
                     self.i += 1;
                     self.substitution('`')?;
                     self.out.push('`');
+                }
+                '(' if self.glued_paren() => {
+                    return Err(GLOB_QUALIFIER_RUNS.to_string());
                 }
                 '(' => {
                     depth += 1;
@@ -678,36 +867,51 @@ impl Prelex {
     }
 
     /// A `$` that opens neither `${`, `$(`, `$'` nor `$"`: copied, unless it
-    /// opens an ARITHMETIC evaluation — `$[x]` (bash's old `$((x))`) or
-    /// zsh's unbraced subscript `$name[x]` — whose subscript expansion runs a
-    /// substitution held in the variable's value (`x='a[$(touch M)]'; echo
-    /// $[x]`, measured).
+    /// is a form [`Self::parameter_hazard`] refuses.
     fn bare_parameter(&mut self) -> Result<(), String> {
-        if self.peek(1) == Some('[') {
-            return Err("a $[…] arithmetic expansion".to_string());
-        }
-        let mut k = 1;
-        while self
-            .peek(k)
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            k += 1;
-        }
-        if k > 1 && self.peek(k) == Some('[') {
-            return Err("a $name[…] subscript (zsh evaluates it as arithmetic)".to_string());
+        if let Some(why) = self.parameter_hazard() {
+            return Err(why);
         }
         self.out.push('$');
         self.i += 1;
         Ok(())
     }
 
+    /// Whether the `$` at the cursor opens an ARITHMETIC evaluation — `$[x]`
+    /// (bash's old `$((x))`) or zsh's unbraced subscript `$name[x]`, behind
+    /// any of zsh's flags (`$=A[x]`, `$#A[x]`) and on a special parameter
+    /// (`$*[x]`, `$#[x]`; [`dollar_arithmetic`]) — whose subscript expansion
+    /// runs a substitution held in the variable's value (`x='a[$(touch M)]';
+    /// echo $[x]`, `A='path[$(cmd)]'; echo $=A[A]`, measured), or carries
+    /// zsh's `~` flag, which globs the value as a pattern
+    /// ([`GLOB_SUBST_RUNS`]). The same wherever the `$` stands: bare, in
+    /// double quotes, or inside a `${…}` operand ([`Self::braced_parameter`]).
+    fn parameter_hazard(&self) -> Option<String> {
+        let after = &self.chars[self.i + 1..];
+        // zsh's flags before a bare name (`$=V`, `$^V`, `$+V`, `$#V`), in
+        // any order: `~` among them globs the value.
+        if after
+            .iter()
+            .take_while(|c| ZSH_PARAMETER_FLAGS.contains(**c))
+            .any(|&c| c == '~')
+        {
+            return Some(GLOB_SUBST_RUNS.to_string());
+        }
+        dollar_arithmetic(after).map(str::to_string)
+    }
+
     /// `${…}`: copied when it holds no quote, substitution or nested `${`,
     /// which is every form a read uses (`${VAR}`, `${VAR:-x}`, `${#VAR}`),
-    /// and when every ARITHMETIC part of it is a literal ([`braced_is_literal`]):
+    /// when every ARITHMETIC part of it is a literal ([`braced_is_literal`]):
     /// an array subscript and a substring offset or length are evaluated as
     /// arithmetic, which expands a subscript in a variable's value and runs
     /// the substitution it holds (`x='a[$(touch M)]'; echo ${a[x]}`, `${y:x}`,
-    /// `${a[@]:x}`, measured under bash; `${#a[x]}` under both shells).
+    /// `${a[@]:x}`, measured under bash; `${#a[x]}` under both shells) — and
+    /// when no `$` in it is a form refused bare ([`Self::parameter_hazard`]):
+    /// an operand is expanded as a word is (`A='path[$(cmd)]'; echo
+    /// ${x:-$path[A]}`, `${x:-$[A]}`, `${x-$A[A]}`, `${x#$A[A]}` and
+    /// `N='/(e:cmd:)'; echo ${x:-$~N}` run `cmd`, quoted or not — measured,
+    /// zsh 5.9 -f).
     fn braced_parameter(&mut self) -> Result<(), String> {
         let start = self.i;
         self.i += 2;
@@ -727,6 +931,12 @@ impl Prelex {
                 }
                 '$' if matches!(self.peek(1), Some('(' | '{')) => {
                     return Err("a ${…} expansion holding a substitution".to_string());
+                }
+                '$' => {
+                    if let Some(why) = self.parameter_hazard() {
+                        return Err(format!("{why}, inside a ${{…}} expansion"));
+                    }
+                    self.i += 1;
                 }
                 _ => self.i += 1,
             }
@@ -835,11 +1045,18 @@ impl Prelex {
 /// The arithmetic parts of a `${…}` body (the text between `${` and `}`)
 /// are literals: its subscript is an integer, `@` or `*`, and a substring
 /// offset or length (`${y:1}`, `${y: -2:3}`) is an integer. The name is a
-/// plain name, a positional or a special parameter, optionally led by `#`
-/// or `!`; a form this reader does not know — zsh's `${(e)x}` flags among
+/// plain name, a positional or a special parameter, optionally led by `#`;
+/// a `!` is `${!}` itself or a listing of indices or names, never an
+/// indirection, and no `${NAME@OP}` transformation passes; a form this
+/// reader does not know — zsh's `${(e)x}` flags among
 /// them, which evaluate the value as a command line — is refused. The
 /// default-value forms (`:-`, `:=`, `:+`, `:?`) and the pattern forms
-/// (`#`, `%`, `/`) evaluate no arithmetic.
+/// (`#`, `%`, `/`) evaluate no arithmetic, but `:=` and `=` assign: zsh
+/// evaluates `${REPORTTIME:=A}` as arithmetic when a forked job ends
+/// (`A='path[$(cmd)]'; echo ${REPORTTIME:=A}; cat f | cat`, and
+/// `${DIRSTACKSIZE:=A}` before a `cd`, `${ERRNO:=A}` at once, run `cmd` —
+/// measured, zsh 5.9 -f), so such an assignment is judged as one written
+/// `NAME=v` is.
 fn braced_is_literal(body: &str) -> Result<(), String> {
     let refuse = |why: &str| Err(format!("a ${{{body}}} expansion with {why}"));
     let int = |t: &str| {
@@ -852,6 +1069,29 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
         if r.is_empty() {
             // `${#}` and `${!}`: the special parameters themselves.
             return Ok(());
+        }
+        if body == "!#" {
+            // bash's `${!#}` is the last positional parameter: `$#` is a
+            // count, so it names a positional, whose value is not read as
+            // a name in turn (`set -- 'a[$(cmd)]'; echo "${!#}"` prints
+            // the word, measured, bash 3.2; zsh 5.9 -f prints `0`).
+            return Ok(());
+        }
+        if body.starts_with('!') {
+            // bash's `${!NAME…}` expands the parameter NAME's VALUE names,
+            // subscript and all: `A='a[$(cmd)]'; echo "${!A}"` (and
+            // `${!A:-x}`, `${!A#x}`, `${!A[0]}`, `set -- 'a[$(cmd)]'; echo
+            // "${!1}"`) runs `cmd` (measured, bash 3.2; zsh 5.9 -f refuses
+            // the form). Only the listings, which name no parameter to
+            // expand, stay: `${!A[@]}`/`${!A[*]}` (the indices) and
+            // `${!A@}`/`${!A*}` (the names that begin with `A`).
+            let name = ["[@]", "[*]", "@", "*"]
+                .iter()
+                .find_map(|listing| r.strip_suffix(listing));
+            return match name {
+                Some(n) if is_name(n) => Ok(()),
+                _ => refuse("an indirection (bash expands the parameter its value names)"),
+            };
         }
         rest = r;
     }
@@ -866,6 +1106,7 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
     } else {
         return refuse("a form this reader does not follow");
     };
+    let name = &rest[..name_len];
     rest = &rest[name_len..];
     if let Some(r) = rest.strip_prefix('[') {
         let Some(end) = r.find(']') else {
@@ -877,6 +1118,12 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
         }
         rest = &r[end + 1..];
     }
+    if rest.starts_with('@') {
+        // bash 4.4's `${NAME@OP}` transformations; `@P` expands the value
+        // as a prompt string, substitutions and all (bash(1); not measured
+        // here: bash 3.2 and zsh 5.9 reject the form as a bad substitution).
+        return refuse("a transformation (bash's @P expands the value as a prompt)");
+    }
     if let Some(r) = rest.strip_prefix(':')
         && !r.starts_with(['-', '=', '+', '?'])
     {
@@ -885,31 +1132,67 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
             return refuse("a substring offset that is not a literal (evaluated as arithmetic)");
         }
     }
+    // `${NAME:=v}` and `${NAME=v}` ASSIGN `NAME` (an element of it, behind
+    // a subscript; its length or indirection, behind `#` or `!`, after
+    // the assignment): judged as `NAME=v` is ([`assignment_hazard`]).
+    if let Some(value) = rest.strip_prefix(":=").or_else(|| rest.strip_prefix('='))
+        && let Some(why) = assignment_hazard(&format!("{name}={value}"))
+    {
+        return refuse(&format!("a default assignment, {why}"));
+    }
     Ok(())
 }
 
+/// zsh's parameter flags, any run of which may stand between a `$` and the
+/// name (`$=V`, `$^V`, `$+V`, `$#V`, `$~V`).
+const ZSH_PARAMETER_FLAGS: &str = "=^+#~";
+
+/// Whether the text after a `$` (`after`) opens an ARITHMETIC evaluation:
+/// `$[x]`, or zsh's unbraced subscript — any run of its flags
+/// ([`ZSH_PARAMETER_FLAGS`]), then a name or ONE special parameter
+/// (`*`, `@`, `?`, `-`, `!`, `$`, `#`) or neither, then `[`. zsh
+/// subscripts a special parameter as it does a name, and a lone `#` flag
+/// is `$#` itself: `A='path[$(cmd)]'; echo $*[A]` (and `$@[A]`, `"$@[A]"`,
+/// `$-[A]`, `$?[A]`, `$![A]`, `$#[A]`, `$=*[A]`, `$#*[A]`, `$^*[A]`) runs
+/// `cmd`, and `A=S=0; echo "$#[A]"` sets `S` (measured, zsh 5.9 -f).
+fn dollar_arithmetic(after: &[char]) -> Option<&'static str> {
+    if after.first() == Some(&'[') {
+        return Some("a $[…] arithmetic expansion");
+    }
+    let name_char = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    let mut k = after
+        .iter()
+        .take_while(|c| ZSH_PARAMETER_FLAGS.contains(**c))
+        .count();
+    if after.get(k).is_some_and(name_char) {
+        k += after[k..].iter().take_while(|c| name_char(c)).count();
+    } else if after
+        .get(k)
+        .is_some_and(|c| matches!(c, '*' | '@' | '?' | '-' | '!' | '$' | '#'))
+    {
+        k += 1;
+    }
+    (k > 0 && after.get(k) == Some(&'['))
+        .then_some("a $name[…] subscript (zsh evaluates it as arithmetic)")
+}
+
 /// The arithmetic an UNQUOTED here-document body expands is literal: its
-/// `${…}` forms pass [`braced_is_literal`], and it holds no `$[…]` and no
-/// `$name[…]` (the body of `cat <<EOF` is expanded as a double-quoted word).
+/// `${…}` forms pass [`braced_is_literal`], and no `$` in it — inside a
+/// `${…}` too — opens `$[…]` or a subscript ([`dollar_arithmetic`]; the
+/// body of `cat <<EOF` is expanded as a double-quoted word).
 fn body_arithmetic_is_literal(line: &str) -> Result<(), String> {
     let mut rest = line;
     while let Some(at) = rest.find('$') {
         let after = &rest[at + 1..];
-        if after.starts_with('[') {
-            return Err("a here-document body with a $[…] arithmetic expansion".to_string());
+        let chars: Vec<char> = after.chars().collect();
+        if let Some(why) = dollar_arithmetic(&chars) {
+            return Err(format!("a here-document body with {why}"));
         }
         if let Some(b) = after.strip_prefix('{') {
             let Some(end) = b.find('}') else {
                 return Err("an unterminated ${ in a here-document body".to_string());
             };
             braced_is_literal(&b[..end])?;
-        } else {
-            let n = after
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(after.len());
-            if n > 0 && after[n..].starts_with('[') {
-                return Err("a here-document body with a $name[…] subscript".to_string());
-            }
         }
         rest = after;
     }
@@ -1283,6 +1566,21 @@ fn redirect_is_safe(target: &str) -> bool {
         })
 }
 
+/// `Some(reason)` when `seg[i]` is a redirect that writes a file: `<>`
+/// (read-write, creating it), or `>`, `>>`, `>|`, `&>` or `N>` to a target
+/// other than `/dev/null` or a descriptor ([`redirect_is_safe`]).
+fn redirect_hazard(seg: &[String], i: usize) -> Option<String> {
+    let tok = seg[i].as_str();
+    if tok.contains("<>") {
+        return Some(format!("redirect <> {tok}"));
+    }
+    match redirect_target(tok)?.or(seg.get(i + 1).map(String::as_str)) {
+        Some(t) if redirect_is_safe(t) => None,
+        Some(t) => Some(format!("redirect > {t}")),
+        None => Some("redirect > (no target)".to_string()),
+    }
+}
+
 /// Skip `git`'s global options to its subcommand: `-C <dir>`, `-c <k=v>`,
 /// `--git-dir=…`, `--work-tree=…`, `--no-pager`, `-P`, and any other flag.
 fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
@@ -1301,20 +1599,41 @@ fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
 }
 
 /// The NEGATIVE filter, over every token: a redirect to a file, a `find
-/// -delete` / `-exec <writer>`, `sed -i`, an inline-code interpreter, a python
-/// heredoc, `xargs` feeding a writer, a git write or a git flag that runs a
-/// program or writes a file, the flags by which `rg`, `sort`, `less` and
-/// `printf` do the same, a clock-setting `date`, and an assignment to a
+/// -delete` / `-exec <writer>`, `sed -i` (or `-I`), an inline-code
+/// interpreter, a python heredoc, `xargs` feeding a writer, a git write or
+/// a git flag that runs a program or writes a file, the flags by which
+/// `rg`, `sort`, `less` and `printf` do the same, a clock-setting `date`, a
+/// word after a closing `}` ([`closes_a_brace`]) or `]]`, and an assignment to a
 /// [`HAZARD_VARS`] variable. A program NAME is not judged here: that is the
 /// head check's, so `grep -rn open src` is a read and `open src` is not.
 fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
+    // A `}` or `]]` closes something only on a line with a `{` or `[[`
+    // word, before it or not, and a `}` glued to a word's end closes too
+    // ([`closes_a_brace`]).
+    let has = |open: &str| segments.iter().flatten().any(|t| t == open);
+    let (braces, brackets) = (has("{"), has("[["));
+    let closing = |t: &str| (braces && closes_a_brace(t)) || (brackets && t == "]]");
     for seg in segments {
+        if let Some(reason) = loop_assignment_hazard(seg) {
+            return Some(reason);
+        }
         for (i, tok) in seg.iter().enumerate() {
             let prog = program(tok);
             let next = seg.get(i + 1).map(String::as_str);
             let next_prog = next.map(program);
             if let Some(reason) = assignment_hazard(tok) {
                 return Some(reason);
+            }
+            if closing(tok) {
+                // The compound's own redirects (`{ …; } 2>&1`, `[[ … ]]
+                // 2>/dev/null`) are judged as every redirect is.
+                let mut k = i + 1;
+                while let Some(span) = seg.get(k).map(|t| redirect_span(t)).filter(|&n| n > 0) {
+                    k += span;
+                }
+                if seg.get(k).is_some_and(|n| !closing(n)) {
+                    return Some(format!("a word after a closing {tok} (zsh may run it)"));
+                }
             }
             if prog == "xargs" {
                 // `xargs [-0] [-n N] [-I {}] <cmd>`: name the fed command.
@@ -1355,10 +1674,24 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 {
                     return Some(format!("{tok} {op} (evaluates arithmetic)"));
                 }
+                // A word the shell brace-expands or globs may become `-t`
+                // and its operand (zsh runs `[ {-t,A} ]` as `[ -t A ]`, and
+                // `[ * ]` — or, under EXTENDED_GLOB, `[ ^-vS ]` — as `[ -t
+                // S=5 ]` beside files `-t`, `-vS` and `S=5`, measured), whose
+                // arithmetic [`arithmetic_scan`] cannot see; a word that
+                // starts with `/` expands to paths only. `[[` expands neither.
+                if let Some(t) = seg[i + 1..]
+                    .iter()
+                    .take_while(|t| *t != "]")
+                    .find(|t| tok != "[[" && !t.starts_with('/') && expands_apart(t))
+                {
+                    return Some(format!(
+                        "{tok} {t} (the shell may expand it into `-t` and an operand)"
+                    ));
+                }
             }
-            if tok.contains("<>") {
-                // Opens the file read-write, creating it.
-                return Some(format!("redirect <> {tok}"));
+            if let Some(reason) = redirect_hazard(seg, i) {
+                return Some(reason);
             }
             if tok == "-delete" {
                 return Some("find -delete".to_string());
@@ -1409,19 +1742,17 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                     None => return Some(format!("find {tok}")),
                 }
             }
-            if let Some(target) = redirect_target(tok) {
-                let target = target.or(next);
-                match target {
-                    Some(t) if redirect_is_safe(t) => {}
-                    Some(t) => return Some(format!("redirect > {t}")),
-                    None => return Some("redirect > (no target)".to_string()),
-                }
-            }
             if prog == "sed" {
+                // macOS sed edits in place under `-I` as under `-i` (sed(1):
+                // `-I extension  Edit files in-place`; `sed -I '' p
+                // /dev/null` fails with "in-place editing only works for
+                // regular files", measured), alone or in a cluster (`-nI`).
                 for t in &seg[i + 1..] {
                     if t == "--in-place"
                         || t.starts_with("--in-place=")
-                        || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('i'))
+                        || (t.starts_with('-')
+                            && !t.starts_with("--")
+                            && t[1..].contains(['i', 'I']))
                     {
                         return Some("sed -i".to_string());
                     }
@@ -1572,17 +1903,128 @@ fn is_system_search_path(value: &str) -> bool {
 /// [`HAZARD_VAR_PREFIXES`] families). `PATH` passes when every entry is a
 /// system directory (`env -i PATH=/bin ls`), and nothing else does: an entry
 /// read from a variable (`PATH=/x:$PATH`) or a quote is not a known directory.
+/// An array zsh ties to a scalar is judged as the scalar ([`ZSH_TIED`]):
+/// `path=/bin ls` passes, `path=/tmp/x ls` does not.
 fn assignment_hazard(tok: &str) -> Option<String> {
     if !is_assignment(tok) {
         return None;
     }
-    let (name, value) = tok.split_once('=')?;
+    let (written, value) = tok.split_once('=')?;
+    let name = ZSH_TIED
+        .iter()
+        .find(|(array, _)| *array == written)
+        .map_or(written, |(_, scalar)| *scalar);
     if name == "PATH" {
         return (!is_system_search_path(value))
-            .then(|| format!("{name}= (changes which program a name runs)"));
+            .then(|| format!("{written}= (changes which program a name runs)"));
+    }
+    if ZSH_ARITHMETIC_VARS.contains(&name) && !plain_number(value) {
+        return Some(format!(
+            "{written}= (zsh evaluates the value as arithmetic, whose subscript can run a command)"
+        ));
     }
     (HAZARD_VARS.contains(&name) || HAZARD_VAR_PREFIXES.iter().any(|p| name.starts_with(p)))
-        .then(|| format!("{name}= (changes what a later program runs or reads)"))
+        .then(|| format!("{written}= (changes what a later program runs or reads)"))
+}
+
+/// A `for` loop assigns each of its words to its variables
+/// (`for NAME… in WORD…`), as an assignment does, and zsh evaluates each as
+/// arithmetic when the variable is one of [`ZSH_ARITHMETIC_VARS`]: `for
+/// SECONDS in 'path[$(cmd)]'`, `A='path[$(cmd)]'; for COLUMNS in A` and
+/// `for x SECONDS in 1 'path[$(cmd)]'` run `cmd` (measured, zsh 5.9 -f). So
+/// every name the loop assigns is judged with every word it may take
+/// ([`assignment_hazard`]); a loop whose words are not in the segment
+/// (`for N; do` takes the positional parameters, `for N (…)` zsh's short
+/// form) is judged with a word this check cannot read. `PATH` and the other
+/// [`HAZARD_VARS`] are refused the same way (`for PATH in /tmp/x; do ls`).
+fn loop_assignment_hazard(seg: &[String]) -> Option<String> {
+    let j = skip_prefixes(seg, 0);
+    if seg.get(j).map(String::as_str) != Some("for") {
+        return None;
+    }
+    let names: Vec<&str> = seg[j + 1..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|t| is_name(t) && *t != "in")
+        .collect();
+    let after = j + 1 + names.len();
+    let unreadable = [SUBSTITUTION.to_string()];
+    let words = match seg.get(after).map(String::as_str) {
+        Some("in") => &seg[after + 1..],
+        _ => &unreadable[..],
+    };
+    names.iter().find_map(|name| {
+        words
+            .iter()
+            .find_map(|w| assignment_hazard(&format!("{name}={w}")))
+            .map(|why| format!("for {why}"))
+    })
+}
+
+/// The variables zsh 5.9 evaluates an assigned value of as arithmetic:
+/// an assignment to one (`NAME=v`, `NAME=v cmd`, `for NAME in v`) runs a
+/// command from the value's subscript (`SECONDS='path[$(cmd)]'`,
+/// `A='path[$(cmd)]'; COLUMNS=A`), so only a plain number may be assigned
+/// ([`plain_number`]). MEASURED, not recalled: each of the 298 names `zsh
+/// -f` declares (`${(k)parameters}`) or zshparam(1) documents was assigned
+/// `'path[$(print -u2 RAN)]'` in those three forms, and exactly 20 printed
+/// `RAN`, in all three (zsh 5.9 -f, 2026-09-27; `ERRNO` and
+/// `ZLE_RPROMPT_INDENT` are documented but unset under `-f`) — and 22 after
+/// a `[[ … =~ … ]]` that matched, which declares `MBEGIN` and `MEND`
+/// integer (`[[ a =~ a ]]; MBEGIN='path[$(cmd)]'` runs `cmd`, measured).
+/// Three more evaluate the value only when zsh USES it, which those forms
+/// never did (2026-09-28): `DIRSTACKSIZE` at a `cd`, `REPORTTIME` and
+/// `REPORTMEMORY` when a forked job ends (`REPORTTIME=A; cat f | cat` runs
+/// the command in `A`'s subscript) — 25 in all.
+/// `zsh_arithmetic_vars_are_the_measured_ones` measures it again where zsh
+/// is installed, the three uses included.
+const ZSH_ARITHMETIC_VARS: &[&str] = &[
+    "COLUMNS",
+    "DIRSTACKSIZE",
+    "EGID",
+    "ERRNO",
+    "EUID",
+    "FUNCNEST",
+    "GID",
+    "HISTSIZE",
+    "KEYTIMEOUT",
+    "LINES",
+    "LISTMAX",
+    "MAILCHECK",
+    "MBEGIN",
+    "MEND",
+    "OPTIND",
+    "RANDOM",
+    "REPORTMEMORY",
+    "REPORTTIME",
+    "SAVEHIST",
+    "SECONDS",
+    "SHLVL",
+    "TRY_BLOCK_ERROR",
+    "TRY_BLOCK_INTERRUPT",
+    "UID",
+    "ZLE_RPROMPT_INDENT",
+];
+
+/// The characters by which zsh expands a word into MORE file names than
+/// the one it spells: `*`, `?`, `[`, and — under `EXTENDED_GLOB`, which a
+/// user's `setopt` carries into Claude Code's shell snapshot (2.1.284 turns
+/// it off again before every command; kept, it costs only escalations) —
+/// `^`, `#` and
+/// a `(` group (`(a|b)`, and the qualifiers [`GLOB_QUALIFIER_RUNS`] names).
+/// Measured, zsh 5.9 -f with `setopt extendedglob`, beside files `-t`,
+/// `-vS` and `S=5`: `[ ^-vS ]` is `[ -t S=5 ]`, which sets `S`. Its `~`
+/// only EXCLUDES names from what the pattern before it matches (`x~y` is
+/// at most `x`), so it widens no path; but it changes the word's text
+/// (`-t~y` is `-t` beside a file `-t`), and [`expands_apart`] counts it.
+pub(crate) const GLOB_CHARS: &[char] = &['*', '?', '[', '^', '#', '('];
+
+/// Whether the shell may make other words of the (quote-stripped) word
+/// `t`, or another text: an unquoted `{` it brace-expands, a [`GLOB_CHARS`]
+/// character, or `EXTENDED_GLOB`'s `~` past the word's first character (a
+/// leading one is a directory, one path).
+fn expands_apart(t: &str) -> bool {
+    t.contains('{') || t.contains(GLOB_CHARS) || t.chars().skip(1).any(|c| c == '~')
 }
 
 /// The read tools whose write or run form an ARGUMENT selects (`sort -o`,
@@ -1657,24 +2099,35 @@ fn test_expansions_are_operands(ops: &[String]) -> bool {
     if ops.iter().any(|t| has_unquoted_expansion(t)) {
         return false;
     }
-    const UNARY: &[&str] = &[
-        "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-p", "-r", "-s", "-t", "-u", "-w", "-x",
-        "-L", "-O", "-G", "-N", "-S", "-z", "-n",
-    ];
-    const BINARY: &[&str] = &[
-        "=", "==", "!=", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-gt", "-ge", "-lt", "-le",
-    ];
     let is = |k: usize, set: &[&str]| {
         ops.get(k)
             .is_some_and(|t| !has_expansion(t) && set.contains(&t.as_str()))
     };
     match ops.len() {
         0 | 1 => true,
-        2 => is(0, &["!"]) || is(0, UNARY),
-        3 => is(1, BINARY) || (is(0, &["!"]) && is(1, UNARY)),
+        2 => is(0, &["!"]) || is(0, TEST_UNARY),
+        3 => is(1, TEST_BINARY) || (is(0, &["!"]) && is(1, TEST_UNARY)),
         _ => !ops.iter().any(|t| has_expansion(t)),
     }
 }
+
+/// The unary primaries of `test`/`[` whose operand is a string or a file
+/// ([`test_expansions_are_operands`]; the rm rule's reading of a quoted
+/// word is the same). `-t`'s operand is arithmetic in zsh, judged apart
+/// ([`arithmetic_scan`]); `-v` and `-R` name a variable, whose subscript is
+/// evaluated (zsh's `[ -v "$x" ]` runs a substitution held in `x`'s
+/// subscript, measured), so they are not here.
+pub(crate) const TEST_UNARY: &[&str] = &[
+    "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-p", "-r", "-s", "-t", "-u", "-w", "-x", "-L",
+    "-O", "-G", "-N", "-S", "-z", "-n",
+];
+
+/// The binary primaries of `test`/`[` ([`TEST_UNARY`]). A numeric one
+/// does not evaluate its operands as arithmetic in `[`/`test` (measured,
+/// zsh 5.9 and bash 3.2; only bash's `[[` does).
+pub(crate) const TEST_BINARY: &[&str] = &[
+    "=", "==", "!=", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-gt", "-ge", "-lt", "-le",
+];
 
 /// The flags by which a read tool, at a segment head, runs a program or
 /// writes: `rg --pre <prog>`, `sort --compress-program=<prog>`, `printf -v
@@ -1703,11 +2156,14 @@ fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
             .map(|t| flag(t)),
         "printf" => {
             // Its options, then its format: a substitution among them may
-            // be `-v NAME`; after the format every word is data.
+            // be `-v NAME`, and so may a word the shell brace-expands
+            // (`{-vS,%s}` and `-{vS,-}` are bash's `printf -vS`, measured)
+            // or globs (`-*` matches a file `-vS`, [`expands_apart`]); after
+            // the format every word is data.
             let format = args.iter().position(|t| !t.starts_with('-'));
             let opts = &args[..format.map_or(args.len(), |k| k + 1)];
             opts.iter()
-                .find(|t| has_expansion(t))
+                .find(|t| has_expansion(t) || expands_apart(t))
                 .map(|t| unreadable(t))
                 .or_else(|| {
                     args.iter()
@@ -2228,6 +2684,14 @@ fn head_from<S: AsRef<str>>(seg: &[String], j: usize, python_allow: &[S]) -> Opt
                 if !(t.starts_with('-') || is_assignment(t) || is_name(t)) {
                     return Some(format!("export {t} (an assignment this check cannot read)"));
                 }
+                if t.starts_with('-') && t.contains(['i', 'E', 'F']) {
+                    // zsh's integer and float types: the value is
+                    // arithmetic, whose subscript runs a command
+                    // (`export -i N='path[$(cmd)]'`, measured).
+                    return Some(format!(
+                        "export {t} (zsh evaluates the values as arithmetic)"
+                    ));
+                }
                 k += 1;
             }
             None
@@ -2292,6 +2756,7 @@ const ATERM_CTL_READ: &[&str] = &[
     "blocktext",
     "metrics",
     "timeline",
+    "resizes",
     "history",
     "panes",
     "ready",
@@ -2403,6 +2868,143 @@ fn program_scan(cmd: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether zsh's `printf` reads its arguments as arithmetic under `format`:
+/// a `*` width or precision, or any conversion but `%s`, `%b`, `%q`, `%c`
+/// and `%%` (measured, zsh 5.9: `%s`, `%b`, `%q`, `%c`, `%5.3s`, `%1$s` and
+/// `%%d` leave `S` after `printf FMT S=5`; `%d`, `%*s`, `%.*s` set it). A
+/// length modifier (`%ls`) or a letter this does not know reads as numeric.
+/// The format is read as zsh reads it: its Unicode escapes decoded first
+/// ([`decode_unicode_escapes`]), so an escaped `%` is one (`printf` with a
+/// format of a backslash, `u0025d`, reads its argument as `%d` does, and a
+/// backslash, `u0025s`, as `%s` — measured, zsh 5.9; octal and `x` escapes
+/// of `%` print a `%` and convert nothing, and bash 3.2's `printf` decodes
+/// none). A Unicode escape this cannot decode reads as numeric.
+pub(crate) fn numeric_format(format: &str) -> bool {
+    let Some(format) = decode_unicode_escapes(format) else {
+        return true;
+    };
+    let mut cs = format.chars();
+    while let Some(c) = cs.next() {
+        if c != '%' {
+            continue;
+        }
+        loop {
+            match cs.next() {
+                Some('%' | 's' | 'b' | 'q' | 'c') => break,
+                Some('0'..='9' | '$' | '.' | '-' | '+' | ' ' | '#' | '\'') => {}
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
+/// `format` with each Unicode escape decoded, in one pass, as zsh's
+/// `printf` decodes them before it reads the conversions: a backslash, `u`
+/// and up to 4 hex digits, or `U` and up to 8 (a backslash, `u25d`, is
+/// U+025D, not `%d`; measured, zsh 5.9 -f). Any other escape stays as
+/// written, a doubled backslash included. `None` for an escape with no hex
+/// digit or no character.
+fn decode_unicode_escapes(format: &str) -> Option<String> {
+    let mut out = String::with_capacity(format.len());
+    let mut cs = format.chars().peekable();
+    while let Some(c) = cs.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits = match cs.next() {
+            Some('u') => 4,
+            Some('U') => 8,
+            Some(e) => {
+                out.extend([c, e]);
+                continue;
+            }
+            None => {
+                out.push(c);
+                break;
+            }
+        };
+        let mut code = String::new();
+        while code.len() < digits
+            && let Some(d) = cs.next_if(char::is_ascii_hexdigit)
+        {
+            code.push(d);
+        }
+        out.push(
+            u32::from_str_radix(&code, 16)
+                .ok()
+                .and_then(char::from_u32)?,
+        );
+    }
+    Some(out)
+}
+
+/// The words zsh evaluates as ARITHMETIC, read from the RAW words
+/// ([`program_words`]): `printf`'s arguments after a format that may be
+/// numeric ([`numeric_format`]; zsh takes a first word other than `--` as
+/// the format, `-%d` too), and the operand after a `-t` of `test`, `[` and
+/// `[[`. zsh's arithmetic expands an array subscript, and runs a command
+/// substitution in it — from a quoted word (`printf %d 'path[$(cmd)]'`),
+/// from a variable's value the arithmetic reads by name (`A='path[$(cmd)]';
+/// printf %d A`), from `"$A"`, from a file name a glob makes (measured, zsh
+/// 5.9; bash 3.2 evaluates none of these). So each such word must be a
+/// plain number ([`plain_number`]), or the line is not a read.
+fn arithmetic_scan(cmd: &str) -> Option<String> {
+    for seg in program_words(cmd) {
+        let Ok(Some(r)) = runs(&seg) else {
+            continue;
+        };
+        let head = program(&seg[r.at]);
+        let args = &seg[r.at + 1..];
+        let evaluated: Vec<&String> = match head {
+            "printf" => {
+                let f = usize::from(args.first().is_some_and(|a| a == "--"));
+                match args.get(f) {
+                    Some(format) if !format.contains(SUBSTITUTION) && !numeric_format(format) => {
+                        Vec::new()
+                    }
+                    _ => args.iter().skip(f + 1).collect(),
+                }
+            }
+            "test" | "[" | "[[" => args
+                .windows(2)
+                .filter(|w| w[0] == "-t" && w[1] != "]" && w[1] != "]]")
+                .map(|w| &w[1])
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(w) = evaluated.into_iter().find(|w| !plain_number(w)) {
+            return Some(format!(
+                "{head} {w} (zsh evaluates it as arithmetic, whose subscript can run a command)"
+            ));
+        }
+    }
+    None
+}
+
+/// A word zsh's arithmetic reads as a number and nothing else: digits, a
+/// sign, a point, blanks, and letters only inside a number (`0x1f`, `1e5`,
+/// `16#ff`) — no name, whose value is read as arithmetic in turn, no
+/// subscript, no quote, no expansion, no glob. Under `EXTENDED_GLOB` a `#`
+/// repeats the character before it, zero times too, so `8#A` globs to a
+/// file `A` — a name — while `16#ff` and `2#101` match only names that
+/// start with a digit ([`GLOB_CHARS`]).
+fn plain_number(w: &str) -> bool {
+    let digit = |r: &str| r.starts_with(|c: char| c.is_ascii_digit());
+    w.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '#' | '.' | '+' | '-' | ' ' | '\t'))
+        && w.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '#'))
+            .all(|run| {
+                run.is_empty()
+                    || (digit(run)
+                        && !run
+                            .get(1..)
+                            .and_then(|r| r.strip_prefix('#'))
+                            .is_some_and(|r| !digit(r)))
+            })
 }
 
 /// `awk [-F s] [-v a=b]... 'program' files…`: the first non-flag word is the
@@ -3824,6 +4426,7 @@ mod tests {
             "aterm ctl @s-1 meta",
             "aterm ctl @s-1 inbox",
             "aterm ctl @s-1 inbox get 3",
+            "aterm ctl @s-1 resizes 20 since=4",
             "aterm ctl turn --help",
             "aterm-ctl status",
             "aterm --version",
@@ -4279,6 +4882,106 @@ mod tests {
         }
     }
 
+    /// THE RECHECK (2026-09-27, high): zsh's arithmetic expands an array
+    /// subscript and runs a command substitution in it (bash 3.2 does
+    /// not), and zsh evaluates as arithmetic `printf`'s arguments under a
+    /// numeric format, the operand after `-t` in `test`, `[` and `[[`, the
+    /// values of `export -i`/`-E`/`-F`, and a value assigned to one of its
+    /// integer variables (each measured, zsh 5.9 -f, with `print -u2 X` in
+    /// the subscript: `printf %d 'path[$(print -u2 X)]'` prints `X`) — from
+    /// a quoted word, from a variable's value the arithmetic reads by name,
+    /// from `"$A"`, from a file name a glob makes. Each was a read. Negative
+    /// controls: the same text under a `%s` format or in a plain `export`,
+    /// numbers, `-t` on a descriptor.
+    #[test]
+    fn zsh_arithmetic_that_can_run_a_command_is_not_a_read() {
+        for cmd in [
+            "printf %d 'path[$(print -u2 X)]'",
+            "printf -- %d 'path[$(print -u2 X)]'",
+            "printf -%d 'path[$(print -u2 X)]'",
+            "printf '%s %d\\n' x 'path[`print -u2 X`]'",
+            "printf '%*s' 'path[$(print -u2 X)]' x",
+            "printf '%d' \"path[\\$(print -u2 X)]\"",
+            "A='path[$(print -u2 X)]'; printf %d A",
+            "A='path[$(print -u2 X)]'; printf %d \"$A\"",
+            "printf %d *",
+            "printf '%d\\n' \"$(cat f)\"",
+            "[ -t 'path[$(print -u2 X)]' ]",
+            "test -t 'path[$(print -u2 X)]'",
+            "test ! -t 'path[$(print -u2 X)]'",
+            "A='path[$(print -u2 X)]'; [ -t \"$A\" ]",
+            "A='path[$(print -u2 X)]'; [ -t A ]",
+            "[[ -t 'path[$(print -u2 X)]' ]]",
+            "A='path[$(print -u2 X)]'; [ {-t,A} ]",
+            "[ * ]",
+            "test -t S=[5]",
+            "export -i N='path[$(print -u2 X)]'",
+            "export -F N=1",
+            "SECONDS='path[$(print -u2 X)]'",
+            "A='path[$(print -u2 X)]'; COLUMNS=A ls",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            assert!(
+                v.reason.contains("arithmetic") || v.reason.contains("into `-t`"),
+                "{cmd:?}: {v:?}"
+            );
+        }
+        for cmd in [
+            "printf '%s\\n' 'path[$(print -u2 X)]'",
+            "printf '%d files\\n' 3",
+            "printf '%d\\n' 16#ff 0x1f 1e2 -3 ''",
+            "printf '%s\\n' \"$A\"",
+            "printf %d",
+            "[ -t 1 ] && echo tty",
+            "test -t 0",
+            "[[ -t 2 ]]",
+            "[ -t ]",
+            "export N='path[$(print -u2 X)]'",
+            "COLUMNS=200 ls",
+            "[ -e /tmp/w/*.log ] && echo y",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+        let v = classify_except_rm(
+            "printf %d 'path[$(print -u2 X)]'; rm -rf /private/tmp/claude-502/w/x",
+            DEFAULT_PYTHON_ALLOW,
+        );
+        assert!(!v.read_only, "{v:?}");
+    }
+
+    /// THE RECHECK (2026-09-27, high): bash brace-expands `printf {-vS,%s}
+    /// /etc`, `printf -{vS,-} /etc` and `printf -v{S,} /etc` into `printf
+    /// -vS …`, which assigns `S` (measured, bash 3.2), and so does `printf
+    /// -v? /etc` with a file `-vS` in the working directory; the `-v` check
+    /// read only words that START with `-v`. A word with an unquoted `{` or
+    /// glob up to the format is refused. Negative controls: a quoted brace,
+    /// and brace-expanded data after the format.
+    #[test]
+    fn a_brace_or_glob_word_before_printfs_format_may_be_its_v_option() {
+        for cmd in [
+            "printf {-vS,%s} /etc",
+            "printf -{vS,-} /etc",
+            "printf -{vT,vS} /etc",
+            "printf -v{S,} /etc",
+            "printf -* /etc",
+            "printf -v? /etc",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            assert!(v.reason.contains("may be a flag"), "{cmd:?}: {v:?}");
+        }
+        for cmd in [
+            "printf '{%s}\\n' x",
+            "printf \"{-vS,%s}\" x",
+            "printf '%s\\n' {a,b}",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
     /// A git read's argument this check cannot read is refused anywhere before
     /// `--` (2026-09-24): unquoted it splits, quoted it is one word whose value
     /// decides whether it is the VERB (`remote "$(echo add)"`), the COUNT
@@ -4321,6 +5024,952 @@ mod tests {
             "git config --get user.name; git config --list",
             "git remote -v; git remote show origin",
             "git log --oneline -5",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// THE FOURTH CHECK (2026-09-27, high): a `for` loop assigns its words
+    /// to its variables, and zsh evaluates each as arithmetic when the
+    /// variable is one of [`ZSH_ARITHMETIC_VARS`] — `for SECONDS in
+    /// 'path[$(print -u2 X)]'`, `A='path[$(…)]'; for COLUMNS in A` and `for x
+    /// SECONDS in 1 'path[$(…)]'` print `X` (measured, zsh 5.9 -f). The
+    /// check read only `NAME=` words, so each was a read. Negative controls:
+    /// numbers, a variable zsh does not evaluate, a globbed loop.
+    #[test]
+    fn a_for_loop_over_a_zsh_arithmetic_variable_is_not_a_read() {
+        for cmd in [
+            "for SECONDS in 'path[$(print -u2 X)]'; do echo; done",
+            "A='path[$(print -u2 X)]'; for COLUMNS in A; do echo; done",
+            "for x SECONDS in 1 'path[$(print -u2 X)]'; do echo; done",
+            "for ERRNO in 'path[$(print -u2 X)]'; do echo; done",
+            "for SECONDS in 'path[$(print -u2 X)]'; echo",
+            "if true; then for LINES in A; do :; done; fi",
+            "for SECONDS; do echo; done",
+            "for PATH in /tmp/x; do ls; done",
+            "[[ a =~ a ]]; for MEND in 'path[$(print -u2 X)]'; do :; done",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            assert!(v.reason.starts_with("for "), "{cmd:?}: {v:?}");
+        }
+        for cmd in [
+            "[[ a =~ a ]]; MBEGIN='path[$(print -u2 X)]'",
+            "ZLE_RPROMPT_INDENT='path[$(print -u2 X)]' ls",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            assert!(v.reason.contains("arithmetic"), "{cmd:?}: {v:?}");
+        }
+        for cmd in [
+            "for SECONDS in 1 2; do echo; done",
+            "for x in 'path[$(print -u2 X)]'; do echo; done",
+            "for f in *.log; do echo \"$f\"; done",
+            "for i in {1..3}; do echo $i; done",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// The names zshparam(1) documents that `zsh -f` leaves unset, so
+    /// `${(k)parameters}` does not list them: the measurements below assign
+    /// each as well.
+    #[cfg(unix)]
+    const ZSHPARAM_UNSET: &[&str] = &[
+        "ARGV0",
+        "BAUD",
+        "CORRECT_IGNORE",
+        "CORRECT_IGNORE_FILE",
+        "DIRSTACKSIZE",
+        "ENV",
+        "ERRNO",
+        "FCEDIT",
+        "HISTFILE",
+        "HISTORY_IGNORE",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "MAIL",
+        "MATCH",
+        "MBEGIN",
+        "MEND",
+        "POSTEDIT",
+        "PROMPT_EOL_MARK",
+        "REPLY",
+        "REPORTMEMORY",
+        "REPORTTIME",
+        "RPROMPT",
+        "RPROMPT2",
+        "RPS1",
+        "RPS2",
+        "STTY",
+        "TERMINFO",
+        "TERMINFO_DIRS",
+        "TMOUT",
+        "TMPSUFFIX",
+        "ZBEEP",
+        "ZDOTDIR",
+        "ZLE_LINE_ABORTED",
+        "ZLE_REMOVE_SUFFIX_CHARS",
+        "ZLE_RPROMPT_INDENT",
+        "ZLE_SPACE_SUFFIX_CHARS",
+        "ZSH_SCRIPT",
+        "match",
+        "mbegin",
+        "mend",
+        "reply",
+        "zle_bracketed_paste",
+        "zle_highlight",
+    ];
+
+    /// [`ZSH_ARITHMETIC_VARS`] is a MEASUREMENT, taken again here where zsh
+    /// is installed: every name `zsh -f` declares (`${(k)parameters}`),
+    /// every name zshparam(1) documents that `-f` leaves unset, and the
+    /// list itself, each assigned a value whose subscript prints a marker —
+    /// as `NAME=v`, `NAME=v :`, `for NAME in v`, and `NAME=v` and `echo
+    /// ${NAME:=v}` before a `cd` and a forked program, which USE three of
+    /// them — in a subshell of its
+    /// own, stdin closed, under a 60-second alarm, after a `[[ a =~ a ]]`
+    /// (which makes `MBEGIN` and `MEND` integer). The names that print it
+    /// are the list, no more and no fewer (zsh 5.9: 25 of 298). Round 3's
+    /// list, read off `${parameters}`' `integer` types, missed `ERRNO` and
+    /// `ZLE_RPROMPT_INDENT`, which `-f` leaves unset, and those two; round
+    /// 4's, which only assigned, missed `DIRSTACKSIZE`, `REPORTMEMORY` and
+    /// `REPORTTIME`.
+    #[cfg(unix)]
+    #[test]
+    fn zsh_arithmetic_vars_are_the_measured_ones() {
+        let (zsh, perl) = (std::path::Path::new("/bin/zsh"), "/usr/bin/perl");
+        if !zsh.exists() || !std::path::Path::new(perl).exists() {
+            return;
+        }
+        let extra: Vec<&str> = ZSHPARAM_UNSET
+            .iter()
+            .chain(ZSH_ARITHMETIC_VARS)
+            .copied()
+            .collect();
+        let probe = format!(
+            "[[ a =~ a ]]; \
+             for n in ${{(ou)${{(k)parameters}}}} {}; do \
+               [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] || continue; \
+               v=\"'path[\\$(print -u2 RAN_\\$((6*7)))]'\"; \
+               out=$( ( eval \"$n=$v\" ) 2>&1; ( eval \"$n=$v :\" ) 2>&1; \
+                      ( eval \"for $n in $v; do :; done\" ) 2>&1; \
+                      ( eval \"$n=$v; cd .; /usr/bin/true; :\" ) 2>&1; \
+                      ( eval \"echo \\${{$n:=$v}} >/dev/null; cd .; /usr/bin/true; :\" ) 2>&1 ); \
+               [[ $out == *RAN_42* ]] && print -r -- $n; \
+             done",
+            extra.join(" ")
+        );
+        let out = std::process::Command::new(perl)
+            .args(["-e", "alarm 60; exec @ARGV", "/bin/zsh", "-f", "-c", &probe])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("zsh runs");
+        let mut measured: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        measured.sort();
+        measured.dedup();
+        let mut want: Vec<String> = ZSH_ARITHMETIC_VARS.iter().map(|n| n.to_string()).collect();
+        want.sort();
+        assert_eq!(measured, want, "zsh's arithmetic variables, measured");
+    }
+
+    /// THE FOURTH CHECK (2026-09-27, high, pre-existing upstream): zsh's `~`
+    /// parameter flag makes a value a pattern, and an unquoted `(` inside a
+    /// word is a glob qualifier; `(e:…:)` and `(+cmd)` run a command while
+    /// the glob expands (`N='/(e:print -u2 X:)'; echo $~N` prints `X`, and so
+    /// do `ls $~N`, `echo $^~N`, `echo ${~N}`, `echo "/"(e:…:)`, `echo
+    /// $(print /)(e:…:)`, `X=/; echo $X(e:…:)`, `echo x=(e:…:)` — measured,
+    /// zsh 5.9 -f). Each `$~` form was a read. Negative controls: a subshell,
+    /// a group, `$((…))`, a process substitution, a leading `~`.
+    #[test]
+    fn a_glob_qualifier_that_can_run_a_command_is_not_a_read() {
+        for cmd in [
+            "N='/(e:print -u2 X:)'; echo $~N",
+            "N='/(e:print -u2 X:)'; ls -d $~N",
+            "N='/(e:print -u2 X:)'; echo $^~N",
+            "N='/(e:print -u2 X:)'; echo $~^N",
+            "N='/(e:print -u2 X:)'; echo $=~N",
+            "N='/(e:print -u2 X:)'; echo x$~N",
+            "N='/(e:print -u2 X:)'; [ -e $~N ]",
+            "N='/(e:print -u2 X:)'; for f in $~N; do :; done",
+            "N='/(e:print -u2 X:)'; echo ${~N}",
+            "N='/(e:print -u2 X:)'; echo ${(~)N}",
+            "N='/(e:print -u2 X:)'; echo ${${~N}}",
+            "ls -d /(e:'print -u2 X':)",
+            "echo \"/\"(e:'print -u2 X':)",
+            "echo $(print /)(e:'print -u2 X':)",
+            "X=/; echo $X(e:'print -u2 X':)",
+            "echo {/,/}(e:'print -u2 X':)",
+            "echo ~(e:'print -u2 X':)",
+            "echo x=(e:'print -u2 X':)",
+            "echo <->(e:'print -u2 X':)",
+            "ls -d /(+print)",
+            "ls *(e:ls:)",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for (cmd, why) in [
+            ("N='/(e:print -u2 X:)'; echo $~N", GLOB_SUBST_RUNS),
+            ("N=x; echo $^~N", GLOB_SUBST_RUNS),
+            ("echo \"/\"(e:'print -u2 X':)", GLOB_QUALIFIER_RUNS),
+            ("echo $(print /)(e:'print -u2 X':)", GLOB_QUALIFIER_RUNS),
+        ] {
+            assert_eq!(classify_command(cmd).reason, why, "{cmd:?}");
+        }
+        for cmd in [
+            "(cd /tmp && ls)",
+            "diff <(ls a) <(ls b)",
+            "ls ~/x; echo ~",
+            "find . \\( -name a -o -name b \\)",
+            "echo \"$HOME\" $HOME",
+            "echo '(e:x:)' \"(e:x:)\"",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// THE FOURTH CHECK (2026-09-27, medium): under `EXTENDED_GLOB` — which a
+    /// user's `setopt` carries into Claude Code's shell snapshot — `^`, `#`
+    /// and `~` glob too: beside files `-t`, `-vS` and `S=5`, `[ ^-vS ]` is `[
+    /// -t S=5 ]`, which sets `S`, and `printf %d 8#A` beside a file `A` reads
+    /// `A`'s value as arithmetic (measured, zsh 5.9 -f, `setopt
+    /// extendedglob`). The checks knew `*?[` only ([`GLOB_CHARS`]).
+    /// Negative controls: a leading `~`, an absolute word, a base-16 number.
+    #[test]
+    fn an_extended_glob_word_may_become_a_flag_or_a_name() {
+        for cmd in [
+            "[ ^-vS ]",
+            "test ^x",
+            "[ x~y ]",
+            "[ 1#-t S=5 ]",
+            "printf ^-vS /etc",
+            "printf %d 8#A",
+            "A='path[$(print -u2 X)]'; printf %d 1#A",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for cmd in [
+            "[ -d ~/x ] && echo y",
+            "[ -e /tmp/w/^x ] && echo y",
+            "printf '%d\\n' 16#ff 2#101",
+            "printf '%s\\n' ^x",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// `zsh -f -c script` run from `dir` (the test's own), stdin closed,
+    /// under a `secs`-second alarm: its stdout, or `None` where zsh or perl
+    /// is not installed.
+    #[cfg(unix)]
+    fn zsh_in(dir: &std::path::Path, script: &str, secs: u32) -> Option<String> {
+        let (zsh, perl) = ("/bin/zsh", "/usr/bin/perl");
+        if !std::path::Path::new(zsh).exists() || !std::path::Path::new(perl).exists() {
+            return None;
+        }
+        let alarm = format!("alarm {secs}; exec @ARGV");
+        let out = std::process::Command::new(perl)
+            .args(["-e", &alarm, zsh, "-f", "-c", script])
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("zsh runs");
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// THE FIFTH CHECK (2026-09-28): zsh TIES an array to a scalar, so
+    /// `path=DIR ls`, `path=DIR; ls`, `for path in DIR; do ls; done` and
+    /// `for x path in 1 DIR` run `DIR/ls` (measured, zsh 5.9 -f), and
+    /// `module_path=DIR; echo $terminfo` loads `DIR/zsh/terminfo.so`. The
+    /// hazard list matched only the scalars. Negative controls: a tied array
+    /// of system directories, a pair whose scalar is no hazard, a name that
+    /// only starts like one.
+    #[test]
+    fn a_tied_array_is_assigned_as_its_scalar() {
+        for cmd in [
+            "path=/tmp/x ls",
+            "path=/tmp/x; ls",
+            "for path in /tmp/x; do ls; done",
+            "for x path in 1 /tmp/x; do ls; done",
+            "path=/bin:/tmp/x ls",
+            "module_path=/tmp/x; echo $terminfo",
+            "for module_path in /tmp/x; do echo $terminfo; done",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        assert_eq!(
+            classify_command("path=/tmp/x ls").reason,
+            "path= (changes which program a name runs)"
+        );
+        for cmd in [
+            "path=/bin ls",
+            "path=/bin:/usr/bin ls",
+            "cdpath=/tmp/x; cd x",
+            "for p in /tmp/x; do ls; done",
+            "paths=/tmp/x; ls",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// [`ZSH_TIED`] is every pair `zsh -f` ties, measured where zsh is
+    /// installed: the names whose `${parameters}` type is tied are the
+    /// table's, and assigning each array `(/m1 /m2)` makes its scalar
+    /// `/m1:/m2` (`zsh_eval_context` is read-only).
+    #[cfg(unix)]
+    #[test]
+    fn zsh_tied_arrays_are_the_measured_ones() {
+        let pairs: Vec<String> = ZSH_TIED.iter().map(|(a, s)| format!("{a}:{s}")).collect();
+        let probe = format!(
+            "for k in ${{(ok)parameters}}; do \
+               [[ $parameters[$k] == *-tied-* ]] && print -r -- \"tied $k\"; \
+             done; \
+             for p in {}; do \
+               a=${{p%%:*}}; s=${{p#*:}}; \
+               ( eval \"$a=(/m1 /m2)\" 2>/dev/null && print -r -- \"$a ${{(P)s}}\" ); \
+             done",
+            pairs.join(" ")
+        );
+        let Some(out) = zsh_in(std::path::Path::new("/"), &probe, 60) else {
+            return;
+        };
+        let mut tied: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("tied "))
+            .collect();
+        tied.sort_unstable();
+        let mut want: Vec<&str> = ZSH_TIED.iter().flat_map(|(a, s)| [*a, *s]).collect();
+        want.sort_unstable();
+        assert_eq!(tied, want, "zsh's tied parameters, measured");
+        for (array, _) in ZSH_TIED.iter().filter(|(a, _)| *a != "zsh_eval_context") {
+            assert!(
+                out.lines().any(|l| l == format!("{array} /m1:/m2")),
+                "{array} is tied to its scalar: {out}"
+            );
+        }
+    }
+
+    /// THE FIFTH CHECK (2026-09-28): a parameter whose VALUE zsh runs or
+    /// loads during a line of reads ([`ZSH_RUNS_A_VALUE`]), and `STTY`,
+    /// which a command's prefix runs as code on a terminal: `READNULLCMD=DIR/x;
+    /// < f` and `NULLCMD=DIR/x; > /dev/null` run `DIR/x` (measured, zsh 5.9
+    /// -f). Neither name was a hazard. Beside an rm the assignment-only
+    /// segment was not judged at all ([`classify_except_rm`]), so the same
+    /// held for every hazard the resolver does not keep (`PAGER=…; git log;
+    /// rm …`). Negative controls: the same reads without the assignment.
+    #[test]
+    fn a_parameter_zsh_runs_is_a_hazard() {
+        for cmd in [
+            "READNULLCMD=/tmp/x; < f",
+            "NULLCMD=/tmp/x; > /dev/null",
+            "READNULLCMD=/tmp/x < f",
+            "for NULLCMD in /tmp/x; do > /dev/null; done",
+            "MODULE_PATH=/tmp/x; echo $terminfo",
+            "STTY='; cmd' ls",
+            "export READNULLCMD=/tmp/x; < f",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for name in ZSH_RUNS_A_VALUE {
+            assert!(
+                assignment_hazard(&format!("{name}=/tmp/x")).is_some(),
+                "{name}"
+            );
+        }
+        for cmd in [
+            "REPORTTIME=A; cat f | cat; rm -rf /tmp/w/x",
+            "DIRSTACKSIZE=A; cd .; rm -rf /tmp/w/x",
+            "PAGER=/tmp/x; git log; rm -rf /tmp/w/x",
+            "READNULLCMD=/tmp/x; < f; rm -rf /tmp/w/x",
+            "path=/tmp/x; ls; rm -rf /tmp/w/x",
+            "PATH=/tmp/x rm -rf /tmp/w/x",
+            "PATH=/tmp/x mktemp -d",
+        ] {
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for cmd in ["cat f", "> /dev/null", "echo $terminfo", "ls"] {
+            assert!(classify_command(cmd).read_only, "{cmd:?}");
+        }
+        for cmd in [
+            "S=/tmp/w; rm -rf \"$S/x\"",
+            "D=$(mktemp -d) && rm -rf \"$D\"",
+            "REPORTTIME=5; S=/tmp/w; rm -rf \"$S/x\"",
+        ] {
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// [`ZSH_RUNS_A_VALUE`] is a MEASUREMENT, taken again here where zsh is
+    /// installed: every name `zsh -f` declares, every name zshparam(1)
+    /// documents that it leaves unset, zshmisc(1)'s hook arrays and the
+    /// hazard lists, each assigned a path to a program that prints a
+    /// marker, a function's name, a command line and a directory (as
+    /// `NAME=v`, `for NAME in v` and `echo ${NAME:=v}`) before a line of
+    /// reads. The names after
+    /// which the marker prints, or zsh loads a module from the directory,
+    /// are the list, no more and no fewer (zsh 5.9: 6).
+    #[cfg(unix)]
+    #[test]
+    fn zsh_parameters_it_runs_are_the_measured_ones() {
+        let dir = crate::supervise::test_scratch_path("classify", "zsh-runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the test's dir");
+        let program = "#!/bin/sh\necho RAN_$((6*7)) >&2\n";
+        for name in ["x", "ls"] {
+            let path = dir.join(name);
+            std::fs::write(&path, program).expect("a program");
+            let mut perms = std::fs::metadata(&path).expect("it").permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod");
+        }
+        std::fs::write(dir.join("f"), "f\n").expect("a file");
+        let d = dir.to_string_lossy().trim_end_matches('/').to_string();
+        let hooks = [
+            "chpwd_functions",
+            "precmd_functions",
+            "preexec_functions",
+            "periodic_functions",
+            "zshexit_functions",
+            "zshaddhistory_functions",
+            "PERIOD",
+        ];
+        let extra: Vec<&str> = ZSHPARAM_UNSET
+            .iter()
+            .chain(HAZARD_VARS)
+            .chain(ZSH_RUNS_A_VALUE)
+            .chain(&hooks)
+            .copied()
+            .collect();
+        let probe = format!(
+            "d='{d}'; f() {{ print -u2 RAN_$((6*7)); }}; \
+             reads='ls >/dev/null; < f; > /dev/null; print ok >/dev/null; \
+               echo $terminfo[colors] >/dev/null; true | cat >/dev/null; \
+               cat <<< x >/dev/null; cd . >/dev/null'; \
+             vals=(\"$d/x\" f 'print -u2 RAN_$((6*7))' \"$d\"); \
+             for n in ${{(ou)${{(k)parameters}}}} {}; do \
+               [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] || continue; \
+               for v in $vals; do \
+                 out=$( ( eval \"$n=\\$v; $reads\" ) 2>&1; \
+                        ( eval \"for $n in \\\"\\$v\\\"; do $reads; done\" ) 2>&1; \
+                        ( eval \"echo \\${{$n:=\\$v}} >/dev/null; $reads\" ) 2>&1 ); \
+                 if [[ $out == *RAN_42* || $out == *$d/zsh/* ]]; then \
+                   print -r -- $n; break; \
+                 fi; \
+               done; \
+             done",
+            extra.join(" ")
+        );
+        let out = zsh_in(&dir, &probe, 120);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(out) = out else {
+            return;
+        };
+        let mut measured: Vec<&str> = out.lines().collect();
+        measured.sort_unstable();
+        measured.dedup();
+        let mut want: Vec<&str> = ZSH_RUNS_A_VALUE.to_vec();
+        want.sort_unstable();
+        assert_eq!(measured, want, "the parameters zsh runs or loads, measured");
+    }
+
+    /// THE FIFTH CHECK (2026-09-28): inside a `${…}` operand a `$` form is
+    /// expanded as it is bare, so the forms refused bare ran from there:
+    /// `A='path[$(cmd)]'; echo ${x:-$path[A]}` (and `$[A]`, `$A[A]`, in any
+    /// operand, quoted or not) and `N='/(e:cmd:)'; echo ${x:-$~N}` run
+    /// `cmd` (measured, zsh 5.9 -f). And bare, a subscript behind zsh's
+    /// flags (`$=A[A]`, `$#A[A]`) ran too. Negative controls: a plain
+    /// variable, a positional or special parameter, a lone `$`.
+    #[test]
+    fn a_dollar_form_inside_a_braced_operand_is_refused_as_it_is_bare() {
+        for cmd in [
+            "A='path[$(cmd)]'; echo ${x:-$path[A]}",
+            "A='path[$(cmd)]'; echo \"${x:-$path[A]}\"",
+            "A='path[$(cmd)]'; echo ${x:-$[A]}",
+            "A='path[$(cmd)]'; echo \"${x:-$[A]}\"",
+            "A='path[$(cmd)]'; echo ${x:-$A[A]}",
+            "A='path[$(cmd)]'; echo ${x-$A[A]}",
+            "A='path[$(cmd)]'; echo ${x:=$[A]}",
+            "A='path[$(cmd)]'; echo ${x#$A[A]}",
+            "A='path[$(cmd)]'; echo ${x/$A[A]/y}",
+            "A='path[$(cmd)]'; echo ${x:-a$A[A]}",
+            "A='path[$(cmd)]'; echo ${x:-$=A[A]}",
+            "A='path[$(cmd)]'; echo \"${x:-$#A[A]}\"",
+            "N='/(e:cmd:)'; echo ${x:-$~N}",
+            "N='/(e:cmd:)'; echo \"${x:-$~N}\"",
+            "N='/(e:cmd:)'; echo ${x:-$^~N}",
+            "N='/(e:cmd:)'; echo ${x:-$=~N}",
+            "A='path[$(cmd)]'; echo $=A[A]",
+            "A='path[$(cmd)]'; echo $^A[A]",
+            "A='path[$(cmd)]'; echo $#A[A]",
+            "A='path[$(cmd)]'; echo \"$+A[A]\"",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for cmd in [
+            "echo ${x:-$HOME} ${x:-$1} \"${x:-$HOME/y}\" ${x:-$#} ${x:-$=y}",
+            "echo ${x:-$} ${x:-a$} \"${HOME:-$PWD}\"",
+            "echo ${x:-$y} \"${x:+$y}\" $#x $=x",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// THE FIFTH CHECK, reviewed (2026-09-28, high): zsh subscripts a
+    /// special parameter as it does a name, so `A='path[$(cmd)]'; echo
+    /// $*[A]` — and `$@[A]`, `"$@[A]"`, `$-[A]`, `$?[A]`, `$![A]`, `$#[A]`,
+    /// `$=*[A]`, `$#*[A]`, `$^*[A]`, the same inside a `${…}` operand and in
+    /// an unquoted here-document body — runs `cmd`, and `A=S=0; echo
+    /// "$#[A]"` sets `S` (measured, zsh 5.9 -f). The name check took only
+    /// `[A-Za-z0-9_]` after the flags ([`dollar_arithmetic`]). Negative
+    /// controls: the special parameters without a subscript, a glob after a
+    /// name, `$#` at a `${…}`'s end.
+    #[test]
+    fn a_subscript_on_a_special_parameter_is_refused() {
+        for sub in [
+            "$*[A]",
+            "$@[A]",
+            "\"$@[A]\"",
+            "$-[A]",
+            "$?[A]",
+            "$![A]",
+            "$#[A]",
+            "$$[A]",
+            "$=*[A]",
+            "$#*[A]",
+            "$^*[A]",
+            "$##[A]",
+            "$1[A]",
+            "${x:-$*[A]}",
+            "\"${x:-$@[A]}\"",
+            "${x:-$-[A]}",
+            "${x:-$#[A]}",
+            "${x-$?[A]}",
+        ] {
+            let cmd = format!("A='path[$(cmd)]'; echo {sub}");
+            let v = classify_command(&cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            let body = format!("cat <<EOF\n{}\nEOF", sub.trim_matches('"'));
+            let v = classify_command(&body);
+            assert!(!v.read_only, "{body:?} must not be read-only: {v:?}");
+        }
+        let v = classify_except_rm(
+            "A=S=0; S=/tmp/w; echo \"$#[A]\"; rm -rf \"$S/x\"",
+            &[] as &[&str],
+        );
+        assert!(!v.read_only, "{v:?}");
+        for cmd in [
+            "echo $# $? \"$@\" $* $- $! $$ \"$#\" ${x:-$#} ${x:-$?}",
+            "echo $x-[ab] $x*[ab] \"$1\"[x] ${#}",
+            "ls $HOME/*[0-9]",
+            "cat <<EOF\n$# $? $@ $x-[ab]\nEOF",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// THE FIFTH CHECK, reviewed (2026-09-28, high): `${NAME:=v}` and
+    /// `${NAME=v}` assign as `NAME=v` does, and round 5 judged only that
+    /// spelling: `A='path[$(cmd)]'; echo ${REPORTTIME:=A}; cat f | cat`
+    /// (and `"${REPORTTIME:=A}"`, `${REPORTTIME=A}`, `${REPORTMEMORY:=A}`
+    /// before a pipe, `${DIRSTACKSIZE:=A}` before a `cd`, and
+    /// `${ZLE_RPROMPT_INDENT:=A}` and `${ERRNO:=A}` alone) runs `cmd`
+    /// (measured, zsh 5.9 -f), and `${NULLCMD:=DIR/x}` and
+    /// `${READNULLCMD:=DIR/x}` do what `NULLCMD=DIR/x` does where the
+    /// snapshot leaves them unset. The same in a here-document body.
+    /// Negative controls: a plain number, a harmless name, the other
+    /// default forms.
+    #[test]
+    fn a_default_assignment_is_judged_as_an_assignment() {
+        for cmd in [
+            "A='path[$(cmd)]'; echo ${REPORTTIME:=A}; cat f | cat",
+            "A='path[$(cmd)]'; echo \"${REPORTTIME:=A}\"; cat f | cat",
+            "A='path[$(cmd)]'; echo ${REPORTTIME=A}; cat f | cat",
+            "A='path[$(cmd)]'; echo ${REPORTMEMORY:=A}; cat f | cat",
+            "A='path[$(cmd)]'; echo ${DIRSTACKSIZE:=A}; cd .",
+            "A='path[$(cmd)]'; echo ${ZLE_RPROMPT_INDENT:=A}",
+            "A='path[$(cmd)]'; echo ${ERRNO:=A}",
+            "A='path[$(cmd)]'; echo ${#ERRNO:=A}",
+            "A='path[$(cmd)]'; echo ${ERRNO[1]=A}",
+            "echo ${READNULLCMD:=/tmp/x}; < f",
+            "echo ${NULLCMD=/tmp/x}; > /dev/null",
+            "echo ${PATH:=/tmp/x}; ls",
+            "echo ${path=/tmp/x}; ls",
+            "echo ${PAGER:=$x}; git log",
+            "A='path[$(cmd)]'; cat <<EOF\n${REPORTTIME:=A}\nEOF\ncat f | cat",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for cmd in [
+            "echo ${x:=1} ${y=a} \"${z:=$HOME}\"",
+            "echo ${REPORTTIME:=5} ${COLUMNS:=80} ${PATH:=/usr/bin:/bin}",
+            "echo ${REPORTTIME:-A} ${REPORTTIME:+A} ${REPORTTIME:?A}",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// THE FIFTH CHECK, reviewed (2026-09-28, high, pre-existing upstream):
+    /// [`classify_except_rm`] leaves the `rm` and `mktemp` segments out of
+    /// the danger scan, redirects included, and the rm resolver refuses a
+    /// write redirect on the `rm` only: `mktemp > /Users/_owner/.zshrc; rm
+    /// -rf /tmp/w/x` (and `>>`, `2>`, `&>`, `3>`, `1<>`, a quoted target,
+    /// `mktemp -d > ~/.zshrc &&`, an `rm … 2>/dev/null; mktemp >
+    /// .git/HEAD`) pressed, and the shell truncates the file. Negative
+    /// controls: `/dev/null`, a descriptor, an input redirect.
+    #[test]
+    fn a_redirect_on_a_left_out_segment_is_judged() {
+        for cmd in [
+            "mktemp > /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+            "mktemp >> /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+            "mktemp 2> /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+            "mktemp &> /Users/_owner/.zshrc; rm -rf /tmp/w/x",
+            "mktemp 3>/Users/_owner/.zshrc; rm -rf /tmp/w/x",
+            "mktemp -d 1<>/Users/_owner/f; rm -rf /tmp/w/x",
+            "mktemp >\"$HOME/.zshrc\"; rm -rf /tmp/w/x",
+            "mktemp -d > ~/.zshrc && rm -rf /tmp/w/x",
+            "rm -rf /tmp/w/x 2>/dev/null; mktemp > .git/HEAD",
+            "rm -rf /tmp/w/x > /Users/_owner/f",
+        ] {
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            assert!(v.reason.starts_with("redirect "), "{cmd:?}: {v:?}");
+        }
+        for cmd in [
+            "mktemp -d > /dev/null; rm -rf /tmp/w/x",
+            "mktemp -d >&2; rm -rf /tmp/w/x",
+            "mktemp -d 2>&1; rm -rf /tmp/w/x",
+            "mktemp -d < /dev/null; rm -rf /tmp/w/x",
+            "rm -rf /tmp/w/x 2>/dev/null",
+            "D=$(mktemp -d) && rm -rf \"$D\"",
+        ] {
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// THE FIFTH CHECK (2026-09-28): zsh's `printf` decodes a Unicode
+    /// escape in its format before it reads the conversions, so a format of
+    /// a backslash and `u0025d` is `%d`: `printf` with it and
+    /// `'path[$(cmd)]'` runs `cmd`, and the rm rule, which shares
+    /// [`numeric_format`], let `x=S=0; printf <it> "$x"; rm -rf "$S/x"`
+    /// prove while zsh sets `S=0` (measured, zsh 5.9 -f). Negative
+    /// controls: octal and `x` escapes of `%`, which print a `%` and convert
+    /// nothing (measured), and the plain formats.
+    #[test]
+    fn a_unicode_escape_in_a_printf_format_may_be_a_conversion() {
+        for format in [
+            "BSu0025d",
+            "BSU00000025d",
+            "%sBSu0025",
+            "%BSu0064",
+            "BSu0025BSu0064",
+            "BSu0025*s",
+            "%BSu002ad",
+            "BSu005c%d",
+            "BSu",
+            "BSuzz%s",
+            "BSUffffffff%s",
+        ] {
+            let format = format.replace("BS", "\\");
+            assert!(numeric_format(&format), "{format:?}");
+        }
+        // Measured too (zsh 5.9 -f): these decode to no numeric conversion
+        // and evaluate nothing.
+        for format in [
+            "%s\\n",
+            "BS045d",
+            "BSx25d",
+            "%sBSn",
+            "BSe%s",
+            "BSu0025s",
+            "BSu0025.1s",
+            "%BSu0073",
+            "BSu2713 %sBSn",
+            "BSU0001F600 %s",
+            "BSu25d",
+            "BSU25d",
+            "BSu00025d",
+            "BSu005cu0025d",
+            "BSBSu0025d",
+        ] {
+            let format = format.replace("BS", "\\");
+            assert!(!numeric_format(&format), "{format:?}");
+        }
+        for cmd in [
+            "printf 'BSu0025d' 'path[$(cmd)]'",
+            "A='path[$(cmd)]'; printf 'BSu0025d' A",
+            "printf 'BSU00000025d' 'path[$(cmd)]'",
+            "printf \"BSu0025d\" 'path[$(cmd)]'",
+        ] {
+            let cmd = cmd.replace("BS", "\\");
+            let v = classify_command(&cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for cmd in [
+            "printf 'BS045d' 'path[$(cmd)]'",
+            "printf '%sBSn' \"$x\"",
+            "printf 'BSu2713 %sBSn' done",
+        ] {
+            let cmd = cmd.replace("BS", "\\");
+            let v = classify_command(&cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// ROUND 7 VERIFY (2026-09-28, high, pre-existing): macOS sed edits in
+    /// place under `-I` too (sed(1): `-I extension  Edit files in-place`;
+    /// `sed -I '' s/a/b/ /dev/null`, `sed -I.bak …` and `sed -nI '' p
+    /// /dev/null` each fail with "in-place editing only works for regular
+    /// files", while `sed -e p /dev/null` succeeds — measured, macOS sed),
+    /// and the flag check read a lowercase `i` only: every line below was
+    /// read-only, the one beside an rm in the rm rule too. Negative
+    /// controls: `-n`, `-E` and an `I` flag inside the script.
+    #[test]
+    fn sed_capital_i_edits_in_place() {
+        for cmd in [
+            "sed -I '' s/a/b/ f",
+            "sed -I.bak s/a/b/ f",
+            "sed -nI '' p f",
+            "sed -E -I '' s/a/b/ f",
+            "/usr/bin/sed -I '' s/a/b/ f",
+            "env sed -I '' s/a/b/ f",
+            "git ls-files | xargs sed -I '' s/a/b/",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            assert_eq!(v.reason, "sed -i", "{cmd:?}");
+        }
+        let v = classify_except_rm("sed -I '' s/a/b/ f; rm -rf /tmp/a/x", &[] as &[&str]);
+        assert!(!v.read_only, "{v:?}");
+        for cmd in ["sed -n p f", "sed -E 's/a/b/I' f", "sed -n '/x/Ip' f"] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+        let v = classify_except_rm("sed -n p f; rm -rf /tmp/a/x", &[] as &[&str]);
+        assert!(v.read_only, "{v:?}");
+    }
+
+    /// ROUND 7 VERIFY (2026-09-28, medium, pre-existing, bash only):
+    /// `${!NAME}` expands the parameter NAME's value names, and bash
+    /// evaluates the subscript in that name as arithmetic: `A='a[$(echo
+    /// X$((1+1))Y >&2)]'; echo "${!A}"` prints X2Y (and `${!A:-x}`,
+    /// `"${!A#x}"`, `${!A[0]}`, `[ -n "${!A}" ]`, `"${!1}"` after `set --`;
+    /// measured, bash 3.2.57), and [`braced_is_literal`] took the `!` prefix
+    /// with any name after it. Refused now, in a here-document body too;
+    /// the listings `${!A[@]}`, `${!A[*]}`, `${!A@}` and `${!A*}` name no
+    /// parameter to expand (measured: they print indices and names, run
+    /// nothing) and stay read-only, as do `${!}` and `${#A}`. bash 4.4's
+    /// `${A@P}` expands a value as a prompt (bash(1)); refused unmeasured.
+    #[test]
+    fn a_bash_indirection_is_not_literal() {
+        for cmd in [
+            "A='a[$(echo X >&2)]'; echo \"${!A}\"",
+            "A='a[$(echo X >&2)]'; echo ${!A:-x}",
+            "A='a[$(echo X >&2)]'; echo \"${!A#x}\"",
+            "A='a[$(echo X >&2)]'; echo ${!A[0]}",
+            "A='a[$(echo X >&2)]'; [ -n \"${!A}\" ]",
+            "A='a[$(echo X >&2)]'; ls \"${!A}\"",
+            "echo \"${!1}\"",
+            "echo ${!A=v}",
+            "A='a[$(echo X >&2)]'; cat <<EOF\n${!A}\nEOF",
+            "echo \"${A@P}\"",
+            "echo ${A[0]@Q}",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        let v = classify_except_rm("echo \"${!A}\"; rm -rf /tmp/a/x", &[] as &[&str]);
+        assert!(!v.read_only, "{v:?}");
+        for cmd in [
+            "echo ${!A[@]} \"${!A[*]}\" ${!A@} ${!A*}",
+            "echo ${!} ${#} ${#A} \"${A:-x}\" ${A#x}",
+            "echo {a,b}",
+            "printf '%s\\n' \"$x\"",
+            "[ -n \"$x\" ]",
+            "cat <<EOF\n${!A[@]} ${HOME}\nEOF",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// ROUND 7 VERIFY (2026-09-28, medium, pre-existing, zsh only): zsh
+    /// runs a command written after a closing `}` or `]]` in the same
+    /// list — `{ ls } always { ./p/x }`, `if [[ -n a ]] ./p/x`, `if { ls }
+    /// ./p/x`, `if [[ -z a ]] { ls } else { ./p/x }` and `if [[ -n a ]]
+    /// then ./p/x; fi` each ran the fake program `./p/x` (measured, zsh 5.9
+    /// -f) — and the segment reader took `./p/x` for an argument of `ls`
+    /// or `[[`: every line below was read-only, and [`classify_except_rm`]
+    /// said the same beside an rm (only the resolver's compound refusal
+    /// kept the rm rule from pressing). Negative controls: a closing word
+    /// that ends its segment, nested closings, and a quoted `}`.
+    #[test]
+    fn a_word_after_a_closing_brace_is_a_command() {
+        for cmd in [
+            "{ ls } always { ./p/x }",
+            "{ ls } always { ./p/x } && ls",
+            "{ echo } always { ./p/x }",
+            "{ ls } always { touch x }",
+            "if ls; then ls; fi; { ls } always { touch ~/.zshrc }",
+            "if [[ -n a ]] ./p/x",
+            "while [[ -z $d ]] ./p/x",
+            "if { ls } ./p/x",
+            "if [[ -z a ]] { ls } else { ./p/x }",
+            "if [[ -n a ]] then ./p/x; fi",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(
+                !v.read_only,
+                "{cmd:?} must not be read-only beside an rm: {v:?}"
+            );
+        }
+        for cmd in [
+            "{ ls }",
+            "{ { ls } }",
+            "[[ -n $x ]] && ls",
+            "if [[ -n $x ]]; then ls; fi",
+            "echo '}' x",
+            "awk '{print $1}' f",
+            "find . -name x -exec ls {} +",
+            "echo {a,b}",
+            "ls *.log",
+            "grep -n foo *.rs",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+        }
+    }
+
+    /// ROUND 7 SECOND VERIFY (2026-09-28, low, fail-safe regressions of
+    /// the two tests above, each read-only before them). A redirect after
+    /// a closing word is the compound's own (`{ ls; echo } 2>&1 | head`,
+    /// `[[ -f x ]] 2>/dev/null`), and a word after that redirect is a parse error in
+    /// zsh 5.9 -f and bash 3.2 (measured), so only the redirect is
+    /// skipped; `redirect_hazard` still judges its target. A `}` or `]]`
+    /// with no `{` or `[[` word on the line closes nothing: zsh 5.9 -f
+    /// refuses `echo } x` as a parse error and runs nothing of the line,
+    /// bash prints it, and `echo ]] x` prints in both (measured). bash's
+    /// `${!#}` is the last positional parameter, whose value is not read
+    /// as a name (`set -- 'a[$(cmd)]'; echo "${!#}"` printed the word, ran
+    /// nothing, bash 3.2; zsh 5.9 -f printed `0`). `${!1}` and
+    /// `${!A[@]:-x}` are indirections and stay refused: each ran `cmd`
+    /// from `'a[$(cmd)]'` (measured, bash 3.2).
+    #[test]
+    fn a_closing_word_redirect_and_an_unopened_close_stay_reads() {
+        for cmd in [
+            "{ ls } 2>/dev/null",
+            "{ ls; echo } 2>&1 | head",
+            "{ ls } >/dev/null 2>&1",
+            "{ ls } &>/dev/null",
+            "[[ -f x ]] 2>/dev/null",
+            "[[ -f x ]] 2>/dev/null && cat x",
+            "if [[ -f x ]] 2>/dev/null; then cat x; fi",
+            "echo } x",
+            "echo ]] x",
+            "echo \"${!#}\"",
+            "cat <<EOF\n${!#}\nEOF",
+        ] {
+            let v = classify_command(cmd);
+            assert!(v.read_only, "{cmd:?} must be read-only: {v:?}");
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(v.read_only, "{cmd:?} must be read-only beside an rm: {v:?}");
+        }
+        for cmd in [
+            "{ ls } 2>/dev/null ./p/x",
+            "{ ls; } 2>&1 ./p/x",
+            "{ ls } < /dev/null ./p/x",
+            "[[ -f x ]] 2>/dev/null ./p/x",
+            "{ ls } > out",
+            "{ echo } ./p/x }",
+            "echo } ./p/x; { ls; }",
+            "if [[ -n a ]] ./p/x",
+            "echo \"${!1}\"",
+            "echo \"${!A[@]:-x}\" ${!A[*]:-x}",
+            "echo \"${!#[0]}\"",
+            "echo ${!#:-x}",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(
+                !v.read_only,
+                "{cmd:?} must not be read-only beside an rm: {v:?}"
+            );
+        }
+    }
+
+    /// ROUND 7 SECOND VERIFY (2026-09-28, medium, pre-existing, zsh only):
+    /// zsh closes a `{` group at a `}` glued to the end of a word too, the
+    /// word's own balanced braces aside: `{ echo a} always { cmd }`, `if {
+    /// echo a} cmd`, `while { echo a} cmd`, `{ echo ${HOME}} always { cmd
+    /// }`, `{ echo x{a,b}} always { cmd }` and `{ echo "a"} always { cmd }`
+    /// each ran `cmd` (measured, zsh 5.9 -f), and the closing-word check
+    /// saw a bare `}` only, so each line with `ls` in place of `echo` and
+    /// `./p/x` for `cmd` was read-only. Negative controls: a word whose
+    /// braces balance (`{a,b}`, `${HOME}`, `{}`) closes nothing (`{ echo
+    /// {a,b} x }` printed `x`), nor does an escaped `}` (`a\}`: a parse
+    /// error, measured), and a glued close that ends its segment stays a
+    /// read.
+    #[test]
+    fn a_brace_glued_to_a_word_closes_the_group() {
+        for cmd in [
+            "{ ls a} always { ./p/x}",
+            "{ ls a} always { ./p/x }",
+            "if { ls a} ./p/x",
+            "while { ls a} ./p/x",
+            "{ ls ${HOME}} always { ./p/x }",
+            "{ ls x{a,b}} always { ./p/x }",
+            "{ ls \"a\"} always { ./p/x }",
+            "{ ls 'a'} always { ./p/x }",
+            "{ ls a}} always { ./p/x }",
+            "{ ls a} 2>/dev/null ./p/x",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+            let v = classify_except_rm(cmd, &[] as &[&str]);
+            assert!(
+                !v.read_only,
+                "{cmd:?} must not be read-only beside an rm: {v:?}"
+            );
+        }
+        for cmd in [
+            "{ ls a}",
+            "{ ls a} 2>/dev/null",
+            "{ ls a}; ls b",
+            "{ echo {a,b} x }",
+            "{ echo ${HOME} x }",
+            "{ find . -exec ls {} + }",
+            "{ echo a\\} x }",
+            "echo a} x",
+            "find . -name x -exec ls {} +",
         ] {
             let v = classify_command(cmd);
             assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");

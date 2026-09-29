@@ -4,6 +4,7 @@ description = "astream capability mint: an unforgeable, HMAC-SHA256-signed capab
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 

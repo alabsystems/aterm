@@ -178,7 +178,7 @@ fn timeline() -> CtlReply {
 
 /// The journal the watcher wrote, on disk.
 fn journal_file(tag: &str, lines: &[String]) -> (std::path::PathBuf, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("aterm-ledger-{tag}-{}", std::process::id()));
+    let dir = crate::supervise::test_scratch_path("ledger-journal", tag);
     std::fs::create_dir_all(&dir).expect("tmp dir");
     let path = dir.join("journal.jsonl");
     let mut text = String::new();

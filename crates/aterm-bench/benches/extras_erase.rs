@@ -29,10 +29,11 @@
 //   ESC[2K          EL-2  -> Grid::erase_line -> CellExtras::clear_row
 //                            -> RgbColorRing::clear_ROW + a whole-map `retain`.
 //                            A DIFFERENT function from clear_range, with a
-//                            different cost — hence its own workload. With
-//                            DECLRMM margins armed and the cursor inside them it
-//                            switches lanes entirely (measured: one 101-column
-//                            `clear_range`, no `clear_row` at all).
+//                            different cost — hence its own workload. It takes
+//                            the `clear_row` lane whether or not DECLRMM margins
+//                            are armed: DECSLRM no longer bounds EL/DECSEL/ECH
+//                            (fix 320a4b366), so the old margin lane (one
+//                            101-column `clear_range`, no `clear_row`) is gone.
 //   ESC[t;l;b;r$z   DECERA-> Grid::erase_rect -> CellExtras::clear_rect
 //                            -> ComplexCharRing::clear_range (per row)
 //                            +  RgbColorRing::clear_range (per row)

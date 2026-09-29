@@ -223,8 +223,20 @@ pub(crate) fn point_label(reader: &dyn ScreenReader, point: &Turn) -> String {
 /// cut at 120 cells and then to what the label leaves of the server's
 /// [`ATTENTION_BYTES`] — `…` where it was cut and its `)` kept, so the whole
 /// is always one entry the server takes.
+///
+/// A resume line the reason names (`…, then resume with claude … --resume
+/// <id>`: the memory wall's) is never cut: it is kept whole, else in its
+/// bare form, else dropped with its clause
+/// ([`crate::harness::resume::never_cut`], resume-hint review 2026-09-26 —
+/// the cut left `--resume 5f1c2d3e-…-0a…` in the stored attention, an id
+/// that names no conversation).
 pub(crate) fn attention_text(reader: &dyn ScreenReader, point: &Turn, reason: &str) -> String {
     let label = point_label(reader, point);
+    crate::harness::resume::never_cut(reason, |reason| fit_reason(&label, reason))
+}
+
+/// `<label> (<reason>)`, the reason cut to fit ([`attention_text`]).
+fn fit_reason(label: &str, reason: &str) -> String {
     let reason = clip_to(reason, REASON_CELLS);
     let room = ATTENTION_BYTES.saturating_sub(label.len() + " ()".len());
     let reason = if reason.len() <= room {
@@ -593,6 +605,80 @@ mod tests {
         assert!(t.len() <= ATTENTION_BYTES, "{}", t.len());
         assert!(t.starts_with("claude bash: echo é"), "{t}");
         assert!(t.contains('…'));
+    }
+
+    /// THE MEMORY WALL'S ESCALATION NEVER CUTS ITS RESUME LINE (resume-hint
+    /// review, 2026-09-26). Built the way the loop builds it — the memory
+    /// reason with a long flag set, under a label whose subject takes its
+    /// 64 cells, and again behind a failed restart's `the restart could not
+    /// be made (<step>): ` prefix — the stored attention names the
+    /// conversation whole (flagged or bare) or names no command; every
+    /// `--resume` in it is followed by the whole id.
+    ///
+    /// NEGATIVE CONTROL: the same label and reason through the cutting
+    /// renderer alone ([`fit_reason`], the old `attention_text`) name the
+    /// command and cut its conversation away.
+    #[test]
+    fn the_memory_escalation_names_its_conversation_whole_or_not_at_all() {
+        const ID: &str = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+        let mut rows = aterm_phase::prompt::fixtures::bash_one_row();
+        let at = rows
+            .iter()
+            .position(|r| r == "   git log --oneline -5")
+            .expect("row");
+        rows[at] = format!("   echo {}", "x".repeat(200));
+        let point = turn(Phase::Prompt, rows);
+        let banner = format!("{} (140.4GB)", aterm_phase::anchor_text("wall.memory"));
+        let flagged =
+            format!("claude --dangerously-skip-permissions --model claude-opus-4-1 --resume {ID}");
+        let reason = |line: &str| {
+            format!(
+                "memory critical: restart it{}{line}: {banner}",
+                crate::harness::resume::THEN_RESUME_WITH
+            )
+        };
+        // Every command named is whole: each `resume with claude` runs to
+        // `--resume <the whole id>`.
+        let whole_or_absent = |t: &str| {
+            t.match_indices("resume with claude")
+                .all(|(i, _)| t[i..].contains(&format!("--resume {ID}")))
+                && t.match_indices("--resum")
+                    .all(|(i, _)| t[i..].starts_with(&format!("--resume {ID}")))
+        };
+        for (name, reason) in [
+            ("flagged", reason(&flagged)),
+            (
+                "flagged, (relaunch is off)",
+                format!("{} (relaunch is off)", reason(&flagged)),
+            ),
+            (
+                "behind a failed restart",
+                format!(
+                    "the restart could not be made (failed:signal-refused): {}",
+                    reason(&flagged)
+                ),
+            ),
+            ("bare", reason(&format!("claude --resume {ID}"))),
+        ] {
+            let t = attention_text(CLAUDE, &point, &reason);
+            assert!(t.len() <= ATTENTION_BYTES, "{name}: {}", t.len());
+            assert!(whole_or_absent(&t), "{name}: a cut id: {t}");
+            assert!(t.starts_with("claude bash: echo x"), "{name}: {t}");
+        }
+        // The flagged line does not fit beside this label: the bare one does.
+        let t = attention_text(CLAUDE, &point, &reason(&flagged));
+        assert!(
+            t.contains(&format!("then resume with claude --resume {ID}")),
+            "{t}"
+        );
+        // THE NEGATIVE CONTROL: the cutting renderer alone cuts the command
+        // — it is named, and its conversation is not.
+        let label = point_label(CLAUDE, &point);
+        let old = fit_reason(&label, &reason(&flagged));
+        assert!(
+            old.contains("then resume with claude --") && !old.contains(ID),
+            "{old}"
+        );
     }
 
     #[test]

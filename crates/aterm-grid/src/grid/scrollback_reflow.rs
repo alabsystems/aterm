@@ -128,7 +128,7 @@ impl Grid {
             ));
         }
         // Drop the scrollback rows; keep only the visible window.
-        self.storage.rows.drain(..ring_scrollback);
+        self.storage.recycle_rows(0..ring_scrollback);
         self.storage.ring_extras.clear();
         self.storage.total_lines = self.storage.rows.len();
         lines
@@ -205,6 +205,9 @@ impl Grid {
             for line in &lines[..skip] {
                 let (row, extras) = self.build_scrollback_row(line, new_cols);
                 self.storage.lazy_buffer.push_row(&row, extras);
+                // SAFETY: build_scrollback_row allocated this temporary row in
+                // self.storage.pages; lazy_buffer owns its copied cell data.
+                unsafe { row.recycle(&mut self.storage.pages) };
             }
         }
         let kept = &lines[skip..];

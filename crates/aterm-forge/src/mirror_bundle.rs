@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo forge mirror bundle | unbundle | check-bundle` — the Lane 1 DELIVERY
+//! `targo --unverified forge mirror bundle | unbundle | check-bundle` — the Lane 1 DELIVERY
 //! format: one deterministic file carrying an emitted `local-registry`, its
 //! package ledger, and every digest needed to refuse a tampered copy BEFORE a
 //! byte of it is unpacked.
@@ -904,7 +904,7 @@ fn collect_files(dir: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// `cargo forge mirror bundle --dir DIR --out FILE`.
+/// `targo --unverified forge mirror bundle --dir DIR --out FILE`.
 pub fn run_bundle(root: &Path, dir: &Path, out: &Path) -> Result<Outcome, String> {
     bundle(root, dir, out, &mirror::RowAnchor::discover()).map(|(o, _)| o)
 }
@@ -1332,7 +1332,7 @@ fn judge_index_entry(
     }
 }
 
-/// `cargo forge mirror check-bundle --file FILE`. Verifies WITHOUT unpacking.
+/// `targo --unverified forge mirror check-bundle --file FILE`. Verifies WITHOUT unpacking.
 pub fn run_check_bundle(root: &Path, file: &Path) -> Result<Outcome, String> {
     check_bundle(LockUse::Match(root), file, &mirror::RowAnchor::discover()).map(|(o, _, _)| o)
 }
@@ -1607,7 +1607,7 @@ pub fn check_bundle(
 // unbundle
 // ---------------------------------------------------------------------------
 
-/// `cargo forge mirror unbundle --file FILE --out DIR [--force]`.
+/// `targo --unverified forge mirror unbundle --file FILE --out DIR [--force]`.
 ///
 /// `root` is passed as [`LockUse::EdgesOnly`]: a bundle built for another lock
 /// is still extractable, but the edges THIS lock resolved are the only row
@@ -2023,7 +2023,7 @@ pub fn unbundle(
     }
     let _ = writeln!(
         log,
-        "  next: `cargo forge mirror verify --dir {}` re-derives the lock/index/tarball triple \
+        "  next: `targo --unverified forge mirror verify --dir {}` re-derives the lock/index/tarball triple \
          from disk.",
         out.display()
     );

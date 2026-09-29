@@ -224,7 +224,7 @@ pub const fn roster_tier_armed() -> bool {
 ///    label you choose; nothing else derives meaning from it.
 ///
 /// 3. **Name that profile in the release-credentials file** — the same 0600 file
-///    `cargo ship cut --release-credentials <path>` already reads for the Ed25519
+///    `targo --unverified ship cut --release-credentials <path>` already reads for the Ed25519
 ///    signing key. Add one line:
 ///    ```toml
 ///    notary_profile = "<profile-name>"          # from step 2
@@ -258,17 +258,17 @@ pub const fn roster_tier_armed() -> bool {
 pub const APPLE_TEAM_ID: &str = "A66A9P66Z7";
 
 /// The Windows code-signing **publisher** for the optional Tier WINDOWS anchor —
-/// the Windows twin of [`APPLE_TEAM_ID`], read by `cargo winsign`
+/// the Windows twin of [`APPLE_TEAM_ID`], read by `targo --unverified winsign`
 /// (`crates/aterm-winsign`).
 ///
 /// # This one line is the whole switch
 ///
-/// Empty (as committed) → Tier WINDOWS is INACTIVE: `cargo winsign sign` signs
+/// Empty (as committed) → Tier WINDOWS is INACTIVE: `targo --unverified winsign sign` signs
 /// when a lane is configured and reports honestly when none is, and nothing
 /// fails a build over a missing or self-signed signature. Set → ACTIVE: every
 /// shipped `aterm.exe` must be signed, timestamped, chain to a root the default
 /// Authenticode policy trusts, and its leaf certificate must be issued to
-/// EXACTLY this string — or `cargo winsign` refuses. The value is the leaf's
+/// EXACTLY this string — or `targo --unverified winsign` refuses. The value is the leaf's
 /// subject Common Name as `signtool verify /v` prints it after `Issued to:`
 /// (the `Publisher` an MSIX manifest carries is the full DN; this is its CN).
 ///
@@ -287,7 +287,7 @@ pub const APPLE_TEAM_ID: &str = "A66A9P66Z7";
 ///
 /// 1. Obtain the identity (apps/aterm-win/SIGNING.md walks both lanes).
 /// 2. Sign a build with it while the anchor is still empty and read the
-///    `Issued to:` line `cargo winsign verify` prints back — THAT string, byte for
+///    `Issued to:` line `targo --unverified winsign verify` prints back — THAT string, byte for
 ///    byte, is the value to commit here.
 /// 3. Commit it. From that commit on, an unsigned or wrongly signed Windows
 ///    exe is refused by the tool, never shipped by accident.
@@ -328,7 +328,7 @@ mod tests {
 
     /// The Windows anchor is the leaf certificate's subject CN exactly as
     /// `signtool verify /v` prints it after `Issued to:` — never a full DN
-    /// (`CN=…, O=…`), never padded. `cargo winsign` compares it byte for byte,
+    /// (`CN=…, O=…`), never padded. `targo --unverified winsign` compares it byte for byte,
     /// so a DN or stray whitespace would refuse every correctly signed build.
     #[test]
     fn the_windows_anchor_is_a_bare_common_name_or_empty() {

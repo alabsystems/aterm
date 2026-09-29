@@ -55,6 +55,10 @@ pub const NAMES: [&str; 3] = ["ty", "trust-ir", "ay"];
 
 /// How long one `--version` may take: `aterm-spec`'s own bound. A checker that
 /// does not answer in time is recorded without a version, never waited for.
+/// Every run asks under it, the gate's own fixtures too: a checker they have
+/// just written is run once before the run, so its first exec — which waits
+/// on macOS's assessment of the new file — is paid outside this bound
+/// (`tests/common`'s `run_once`, the review of 2026-09-28).
 pub const VERSION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The size bound on a shim this will read — atpkg's `MAX_SHIM_BYTES`, as
@@ -120,15 +124,25 @@ pub struct Checkers {
 
 impl Checkers {
     /// Resolve the three under `home` and `path_env`, and ask each one found
-    /// for its version.
+    /// for its version within [`VERSION_DEADLINE`].
     #[must_use]
     pub fn capture(home: &Path, path_env: &OsStr) -> Self {
+        Self::capture_within(home, path_env, VERSION_DEADLINE)
+    }
+
+    /// [`Self::capture`], each `--version` bounded at `deadline` instead:
+    /// [`VERSION_DEADLINE`] for every run, a shorter one where a test pins
+    /// the bound itself.
+    #[must_use]
+    fn capture_within(home: &Path, path_env: &OsStr, deadline: Duration) -> Self {
         let store_bin = store_bin_dir(home);
         let each = NAMES
             .iter()
             .map(|&name| {
                 let found = locate(name, &store_bin, path_env);
-                let version = found.as_ref().and_then(|f| version_of(&f.path, path_env));
+                let version = found
+                    .as_ref()
+                    .and_then(|f| version_of(&f.path, path_env, deadline));
                 Checker {
                     name,
                     found,
@@ -301,11 +315,11 @@ fn is_pending_stub(cand: &Path) -> bool {
 
 /// The first non-empty line `bin --version` printed (stdout, else stderr),
 /// at most 120 characters, or `None` when it could not run, failed, or did
-/// not answer within [`VERSION_DEADLINE`].
-fn version_of(bin: &Path, path_env: &OsStr) -> Option<String> {
+/// not answer within `deadline` ([`VERSION_DEADLINE`] in every run).
+fn version_of(bin: &Path, path_env: &OsStr, deadline: Duration) -> Option<String> {
     let mut cmd = Command::new(bin);
     cmd.arg("--version").env("PATH", path_env);
-    let out = crate::disk::output_within(cmd, VERSION_DEADLINE).ok()?;
+    let out = crate::disk::output_within(cmd, deadline).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -329,6 +343,20 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
         std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// Run `path --version` once, unbounded, output discarded (`aterm-cli`'s
+    /// `manual.rs` `run_once`): the FIRST exec of a file this process wrote
+    /// waits on macOS's assessment of it (tens of seconds with the assessor
+    /// busy) and later execs do not, so paying it here keeps it out of the
+    /// [`VERSION_DEADLINE`] a capture asks the same file under.
+    fn run_once(path: &Path) {
+        let _ = std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     /// The `sh` exec stub atpkg lays, forwarding to `target`.
@@ -374,6 +402,13 @@ mod tests {
             "# atpkg pending-program stub\nexec \"$ATPKG\" run ay \"$@\"",
         );
         let path_env = OsString::from(on_path.as_os_str());
+        // Each stand-in the capture asks its version, run once first: the
+        // capture bounds each at VERSION_DEADLINE, and a first exec slower
+        // than that read `None` where this asserts the version (the review of
+        // 2026-09-28, reproduced with a 6 s first exec).
+        for asked in [&ty, &on_path.join("trust-ir")] {
+            run_once(asked);
+        }
 
         let c = Checkers::capture(&home, &path_env);
         let ty_found = c.each[0].found.as_ref().expect("ty");
@@ -472,6 +507,28 @@ mod tests {
             "{}",
             c.summary()
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// THE DEADLINE BOUNDS THE QUESTION. A checker slower than the deadline it
+    /// is asked under is named without a version, never waited for; here the
+    /// deadline is shorter than [`VERSION_DEADLINE`], so the test is quick.
+    /// The stand-in sleeps whatever its exec costs, so a slow start only
+    /// makes it later. (By its absolute path: the checker runs with the PATH
+    /// it was found on, which holds nothing but itself.)
+    #[cfg(unix)]
+    #[test]
+    fn a_checker_slower_than_its_deadline_is_named_without_a_version() {
+        let tmp = crate::mktemp_dir("atv-checkers-deadline").expect("mktemp");
+        let on_path = tmp.join("path");
+        script(&on_path.join("ty"), "/bin/sleep 2; echo 'ty late'");
+        let c = Checkers::capture_within(
+            &tmp.join("home"),
+            on_path.as_os_str(),
+            Duration::from_millis(300),
+        );
+        assert!(c.each[0].found.is_some(), "{}", c.summary());
+        assert_eq!(c.each[0].version, None, "{}", c.summary());
         std::fs::remove_dir_all(&tmp).ok();
     }
 

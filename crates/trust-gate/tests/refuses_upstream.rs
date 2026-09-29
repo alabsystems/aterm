@@ -24,8 +24,9 @@ const INSTALL_URL: &str =
     "https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh";
 
 /// The compiler running THIS test: `RUSTC` if the caller pinned one, else the
-/// rustc beside the cargo that spawned us (cargo sets `CARGO`; with rustup that
-/// is the toolchain's own binary), else whatever `rustc` PATH gives.
+/// rustc beside the driver that spawned us (targo sets `CARGO`; the store's
+/// `rustc` is a hard link of `trustc`), else Trust's `trustc` on PATH — never a
+/// stock `rustc` (owner directive 2026-09-28).
 fn real_rustc() -> PathBuf {
     if let Some(r) = env::var_os("RUSTC") {
         return PathBuf::from(r);
@@ -36,11 +37,12 @@ fn real_rustc() -> PathBuf {
             return beside;
         }
     }
-    PathBuf::from("rustc")
+    PathBuf::from("trustc")
 }
 
+/// `$CARGO` (the driver running this test), else Trust's `targo`.
 fn cargo() -> PathBuf {
-    env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from)
+    env::var_os("CARGO").map_or_else(|| PathBuf::from("targo"), PathBuf::from)
 }
 
 fn write_exec(path: &Path, body: &str) {

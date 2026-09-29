@@ -321,7 +321,7 @@ impl TypedKittySummon {
                 canine: self.keys_typed >= DOG_SUMMON_KEYS,
                 ..TypedHit::default()
             },
-            // Other classes (orca, emphasis) carry no companion reaction.
+            // Other classes (animal, emphasis) carry no companion reaction.
             _ => TypedHit::default(),
         }
     }
@@ -473,7 +473,7 @@ mod tests {
             for (k, ch) in line.chars().enumerate() {
                 let expect = reference.note_char(ch, &lexicon, &opts);
                 let got = det.note_char(now, 7, ch, &lexicon, &opts);
-                // `TypedHit` surfaces three classes; other completions (orca,
+                // `TypedHit` surfaces three classes; other completions (animal,
                 // emphasis) are a hit for the reference and `default()` for the
                 // detector, and the canine REACTION is further gated on
                 // `keys_typed` — so compare the completion via the one fact

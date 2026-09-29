@@ -679,12 +679,12 @@ fn arm_wake(p: &mut EffectsPipeline) {
     p.set_cursor_trail(true, 650, 512, Some(TRAIL_BASE), THEME_CURSOR);
 }
 
-/// Arm sparkle words exactly as bench_design's state setup does: all shipped
-/// classes but orca, the rainbow profanity style with a supernova chance, and
-/// animated ink — the full resolved config a real session runs.
+/// Arm sparkle words exactly as bench_design's state setup does: every shipped
+/// class, the rainbow profanity style with a supernova chance, and animated
+/// ink — the full resolved config a real session runs.
 fn arm_sparkle(p: &mut EffectsPipeline) {
     p.set_sparkle_enabled(true);
-    p.set_sparkle_classes(true, true, false, true);
+    p.set_sparkle_classes(true, true, true);
     p.set_sparkle_profanity("rainbow", 8, 900, 3, 1.0, true, 10);
     p.set_sparkle_ink(true, 1.0, 1200, false);
 }

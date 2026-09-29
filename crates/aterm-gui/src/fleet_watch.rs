@@ -286,6 +286,9 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
             supervised: false,
             // Likewise its input stall: the sibling's own menu raises it.
             input_stall: None,
+            resume: None,
+            // Nor does this instance's host restart a sibling's agent.
+            restarts: false,
         };
         if meta_alive && !s.typed && s.has_meta && lookups < MAX_META_LOOKUPS {
             lookups += 1;

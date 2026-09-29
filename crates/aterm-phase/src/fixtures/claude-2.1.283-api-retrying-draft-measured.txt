@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm 0.96.0 (144x50), the managed 2.1.283 launched by path with a scratch `CLAUDE_CONFIG_DIR`, a dummy `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL=https://api.invalid`, so every request fails `ENOTFOUND` (the default 10 retries) · mid-retry with a draft typed in the composer: the mode row drops `esc to interrupt` and `← for agents`, the spinner row stays · user, host and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Opus 5.5 (1M context) · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user000-aterm/00000000-0000-0000-0000-000000000000/scratchpad/run/proj
+
+
+❯ say hi
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✻ Can't reach the API server — check your internet or DNS (ENOTFOUND) · Retrying in 14s · attempt 6/10
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ also say bye
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -562,6 +562,9 @@ impl Lanes {
         } = conn;
         let stream: &CtlStream = stream;
         let _serving = Serving::enter(tenure.id, &mut tenure.claimed);
+        // A blocking verb served here gives the lane back when this caller
+        // hangs up (`super::caller_hung_up`).
+        let _hangup = super::ServingFd::enter(stream);
         let mut reader = BufReader::new(stream);
         let scope = match *scope {
             Some(scope) => scope,

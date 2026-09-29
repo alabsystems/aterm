@@ -24,7 +24,7 @@ use std::collections::HashSet;
 /// Spanish/Portuguese she-cat, `chien`/`chiot` the French dog/puppy, `gos` the
 /// Catalan dog.
 const INTENTIONAL: &[&str] = &[
-    "kitten", "kitty", "pussycat", "orca", "gata", "dog", "dogs", "doggy", "doggo", "pooch", "pup",
+    "kitten", "kitty", "pussycat", "gata", "dog", "dogs", "doggy", "doggo", "pooch", "pup",
     "puppy", "woof", "chien", "chiot", "gos",
 ];
 

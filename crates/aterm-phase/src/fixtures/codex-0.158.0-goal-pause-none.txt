@@ -1,0 +1,41 @@
+# codex 0.158.0 · MEASURED 2026-09-28, `aterm ctl text` of a private headless aterm 120x40 (a scratch launch from the owner's home, `--no-daemon --dangerously-bypass-approvals-and-sandbox`; no prompt was ever submitted, and the picker was left with Esc) · `/goal` then `/goal pause` at idle with no goal set: the usage row, then `■ Failed to update thread goal: …` — a `■` row no wall
+
+  >_ OpenAI Codex (v0.158.0)
+     ~
+  permissions: YOLO mode
+
+  Ah, the terminal. A classic meeting spot.
+
+• Usage: /goal [<objective>|clear|edit|pause|resume] No goal is currently set.
+
+■ Failed to update thread goal: thread/goal/set failed in TUI
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Ask Codex to do anything
+
+  GPT-6-Astra medium · ~
+  ? for shortcuts

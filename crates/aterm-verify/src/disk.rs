@@ -159,6 +159,23 @@ pub const CELLS_COLD_BYTES: u64 = 3 * GIB;
 /// measurement, which is a projection from one lane, not a measured bump.
 pub const CELLS_WARM_GROWTH_BYTES: u64 = 2 * GIB;
 
+/// What the Trust verification lane writes while it runs, and removes: 6 GiB,
+/// IN FLIGHT ([`Budget::in_flight`]).
+///
+/// `targo trust` gives every unit of a run a unique compiler-session flag and
+/// accepts no warm cache as evidence, so nothing it builds is reused: each run
+/// re-checks each selected library's whole dependency graph into scratch slots
+/// under `target-trust/`, which `tools/trust-gate-all.sh` empties before the run
+/// and removes after it. So the lane holds nothing at rest: its bytes are a term
+/// of what a run NEEDS free, never of what the held lanes may grow to — counted
+/// in the cold footprint and the warm growth (as it was for a few hours on
+/// 2026-09-27), it raised [`LANE_CAP_BYTES`] by 12 GiB for lanes that hold none
+/// of it (review, the same day). MEASURED 2026-09-27: one slot peaked at 1.7 GiB
+/// (`du -sh`) checking aterm-gui's whole graph, and the script runs at most
+/// three slots on this machine (`--jobs auto`, one per six cores): 5.1 GiB,
+/// read up to 6.
+pub const TRUST_LANE_BYTES: u64 = 6 * GIB;
+
 /// What a run on WARM lanes still adds to them: 16 GiB.
 ///
 /// Warm lanes grow, because cargo deletes no artifact a later build stops
@@ -201,7 +218,8 @@ pub const RESERVE_BYTES: u64 = 6 * GIB;
 
 /// The most a snapshot's lanes may hold when a run starts: 45 GiB,
 /// [`COLD_BYTES`] plus [`WARM_GROWTH_BYTES`] — a cold footprint and one warm
-/// run's growth (40 GiB until the cells lane joined them on 2026-09-27).
+/// run's growth (40 GiB until the cells lane joined them on 2026-09-27). The
+/// trust lane's in-flight bytes are not in it: that lane holds none at rest.
 ///
 /// Nothing else bounds them: a warm run grows the lanes, and only a new
 /// compiler empties them ([`crate::snapshot`]'s prune). Over the cap they are
@@ -250,6 +268,9 @@ pub struct Budget {
     pub cold: u64,
     /// What a run on warm lanes still adds ([`WARM_GROWTH_BYTES`]).
     pub warm_growth: u64,
+    /// What a run writes and removes again before it ends — the trust lane's
+    /// scratch slots ([`TRUST_LANE_BYTES`]): needed free, never held.
+    pub in_flight: u64,
     /// Room kept free beyond both ([`RESERVE_BYTES`]).
     pub reserve: u64,
     /// Lanes over this are removed before the run ([`LANE_CAP_BYTES`]).
@@ -261,11 +282,12 @@ impl Budget {
     pub const MEASURED: Self = Self {
         cold: COLD_BYTES,
         warm_growth: WARM_GROWTH_BYTES,
+        in_flight: TRUST_LANE_BYTES,
         reserve: RESERVE_BYTES,
         lane_cap: LANE_CAP_BYTES,
     };
 
-    /// `max(cold - credited, warm_growth) + reserve`: the free space a run
+    /// `max(cold - credited, warm_growth) + in_flight + reserve`: the free space a run
     /// whose lanes already hold `credited` bytes needs. Saturating, so no
     /// synthetic number can wrap it into a small one.
     #[must_use]
@@ -273,6 +295,7 @@ impl Budget {
         self.cold
             .saturating_sub(credited)
             .max(self.warm_growth)
+            .saturating_add(self.in_flight)
             .saturating_add(self.reserve)
     }
 }
@@ -569,11 +592,12 @@ impl Plan {
         match self.floor {
             Some(f) => format!("need {} (--disk-floor: exactly this, no estimate)", gib(f)),
             None => format!(
-                "need {} = max({} cold - {} credited, {} warm growth) + {} reserve",
+                "need {} = max({} cold - {} credited, {} warm growth) + {} in flight + {} reserve",
                 gib(self.need),
                 gib(self.budget.cold),
                 gib(self.credited),
                 gib(self.budget.warm_growth),
+                gib(self.budget.in_flight),
                 gib(self.budget.reserve)
             ),
         }
@@ -725,10 +749,11 @@ pub fn remedy(
             "  or free space elsewhere on the volume. The requirement is what this run writes \
              plus a reserve: a cold footprint less what its build dirs already hold, but never \
              less than a warm run still adds to them (cargo deletes no artifact a later build \
-             stops using), and a {} reserve for its own writes outside them. What other writers \
-             put on the volume while it runs is not in it: no preflight can budget that, and a \
-             run that runs out of space ends COULD NOT RUN. --disk-floor <GiB> replaces the \
-             estimate for one run.",
+             stops using), plus the {} its trust lane writes and removes again, and a {} reserve \
+             for its own writes outside them. What other writers put on the volume while it \
+             runs is not in it: no preflight can budget that, and a run that runs out of space \
+             ends COULD NOT RUN. --disk-floor <GiB> replaces the estimate for one run.",
+            gib(plan.budget.in_flight),
             gib(plan.budget.reserve)
         ),
     });
@@ -781,9 +806,10 @@ fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> S
         (Owner::Snapshot, None) => {
             s.push_str(&format!(
                 ". Removing them gives that back, and the next run is then cold and needs {} \
-                 ({} cold + {} reserve)",
+                 ({} cold + {} in flight + {} reserve)",
                 gib(cold),
                 gib(plan.budget.cold),
+                gib(plan.budget.in_flight),
                 gib(plan.budget.reserve)
             ));
             if let Reading::Free(free) = reading {
@@ -1013,27 +1039,30 @@ mod tests {
     }
 
     /// THE ESTIMATE, on synthetic numbers: `max(cold - credited, warm) +
-    /// reserve`, and never a wrapped one.
+    /// in_flight + reserve`, and never a wrapped one. The in-flight term is paid
+    /// cold AND warm — the trust lane's slots are written every run.
     #[test]
     fn the_requirement_is_the_cold_footprint_less_the_lanes_but_never_less_than_a_warm_run() {
         let b = Budget {
             cold: 100,
             warm_growth: 30,
+            in_flight: 5,
             reserve: 7,
             lane_cap: 1000,
         };
-        assert_eq!(b.need(0), 107, "cold: the whole footprint");
-        assert_eq!(b.need(40), 67, "partly warm: the rest of it");
-        assert_eq!(b.need(70), 37, "at cold - warm the two terms meet");
+        assert_eq!(b.need(0), 112, "cold: the whole footprint");
+        assert_eq!(b.need(40), 72, "partly warm: the rest of it");
+        assert_eq!(b.need(70), 42, "at cold - warm the two terms meet");
         assert_eq!(
             b.need(95),
-            37,
+            42,
             "warm: a run's growth, however full the lanes"
         );
-        assert_eq!(b.need(u64::MAX), 37);
+        assert_eq!(b.need(u64::MAX), 42);
         let huge = Budget {
             cold: u64::MAX,
             warm_growth: 0,
+            in_flight: 0,
             reserve: u64::MAX,
             lane_cap: u64::MAX,
         };
@@ -1046,8 +1075,9 @@ mod tests {
     /// the 22.2 GiB the volume then read; the estimate asked for a warm run's
     /// growth plus the reserve, 22.0 GiB, and admitted it. Since the cells lane
     /// joined the lanes (2026-09-27) a warm run grows them 2 GiB more, so the
-    /// same lanes need 24.0 GiB — that 22.2 GiB reading is now refused, and the
-    /// estimate still asks 16 GiB less than the flat floor did.
+    /// same lanes need 24.0 GiB; and the trust lane's scratch slots, written and
+    /// removed by every run, 6 GiB more: 30.0 GiB. That 22.2 GiB reading is now
+    /// refused, and the estimate still asks 10 GiB less than the flat floor did.
     #[test]
     fn a_warm_snapshot_needs_its_growth_not_the_flat_floor() {
         let root = Path::new("/Users//x/aterm-verify.noindex");
@@ -1059,31 +1089,34 @@ mod tests {
         );
         assert!(!warm.remove);
         assert_eq!(warm.credited, 21_220_340 * 1024);
-        assert_eq!(warm.need, WARM_GROWTH_BYTES + RESERVE_BYTES);
-        assert_eq!(gib(warm.need), "24.0 GiB");
-        // One byte over the 24.2 GiB boundary: `GIB / 5` alone is just under a
+        assert_eq!(
+            warm.need,
+            WARM_GROWTH_BYTES + TRUST_LANE_BYTES + RESERVE_BYTES
+        );
+        assert_eq!(gib(warm.need), "30.0 GiB");
+        // One byte over the 30.2 GiB boundary: `GIB / 5` alone is just under a
         // real fifth.
-        let read = 24 * GIB + GIB / 5 + 1;
-        assert_eq!(gib(read), "24.2 GiB");
+        let read = 30 * GIB + GIB / 5 + 1;
+        assert_eq!(gib(read), "30.2 GiB");
         assert_eq!(decide(&Reading::Free(read), &warm, root), Ok(()));
-        assert_eq!(decide(&Reading::Free(24 * GIB), &warm, root), Ok(()));
-        let why = decide(&Reading::Free(24 * GIB - 1), &warm, root).expect_err("under 24");
+        assert_eq!(decide(&Reading::Free(30 * GIB), &warm, root), Ok(()));
+        let why = decide(&Reading::Free(30 * GIB - 1), &warm, root).expect_err("under 30");
         assert!(
-            why.starts_with("disk: 23.9 GiB free on the volume holding /Users//x/"),
+            why.starts_with("disk: 29.9 GiB free on the volume holding /Users//x/"),
             "{why}"
         );
-        assert!(why.contains("under the 24.0 GiB this run needs"), "{why}");
+        assert!(why.contains("under the 30.0 GiB this run needs"), "{why}");
         assert!(why.ends_with("nothing was built"), "{why}");
-        // The 2026-09-23 reading, short by the cells lane's growth.
+        // The 2026-09-23 reading, short by the cells and trust lanes.
         assert!(decide(&Reading::Free(22 * GIB + GIB / 5 + 1), &warm, root).is_err());
 
         // From empty lanes the same budget asks for the whole footprint.
         let cold = plan(Budget::MEASURED, None, &held(0), Owner::Snapshot);
-        assert_eq!(cold.need, COLD_BYTES + RESERVE_BYTES);
-        assert_eq!(gib(cold.need), "33.0 GiB");
-        assert!(decide(&Reading::Free(24 * GIB), &cold, root).is_err());
-        assert_eq!(decide(&Reading::Free(33 * GIB), &cold, root), Ok(()));
-        assert!(decide(&Reading::Free(33 * GIB - 1), &cold, root).is_err());
+        assert_eq!(cold.need, COLD_BYTES + TRUST_LANE_BYTES + RESERVE_BYTES);
+        assert_eq!(gib(cold.need), "39.0 GiB");
+        assert!(decide(&Reading::Free(30 * GIB), &cold, root).is_err());
+        assert_eq!(decide(&Reading::Free(39 * GIB), &cold, root), Ok(()));
+        assert!(decide(&Reading::Free(39 * GIB - 1), &cold, root).is_err());
     }
 
     /// THE CELLS LANE IS IN THE BUDGET (2026-09-27): `gate cells-foreign`'s
@@ -1111,12 +1144,15 @@ mod tests {
         let at_cap = plan(b, None, &held(LANE_CAP_BYTES), Owner::Snapshot);
         assert!(!at_cap.remove, "at the cap is not over it");
         assert_eq!(at_cap.credited, LANE_CAP_BYTES);
-        assert_eq!(at_cap.need, WARM_GROWTH_BYTES + RESERVE_BYTES);
+        assert_eq!(
+            at_cap.need,
+            WARM_GROWTH_BYTES + TRUST_LANE_BYTES + RESERVE_BYTES
+        );
 
         let over = plan(b, None, &held(LANE_CAP_BYTES + 1), Owner::Snapshot);
         assert!(over.remove);
         assert_eq!(over.credited, 0, "removed lanes are not credited");
-        assert_eq!(over.need, COLD_BYTES + RESERVE_BYTES);
+        assert_eq!(over.need, COLD_BYTES + TRUST_LANE_BYTES + RESERVE_BYTES);
 
         let unknown = plan(
             b,
@@ -1129,9 +1165,11 @@ mod tests {
             "an unmeasured tree is not known to be over"
         );
         assert_eq!(unknown.credited, 0);
-        assert_eq!(unknown.need, COLD_BYTES + RESERVE_BYTES);
+        assert_eq!(unknown.need, COLD_BYTES + TRUST_LANE_BYTES + RESERVE_BYTES);
 
-        // The cap is the sum it is documented as.
+        // The cap is the sum it is documented as — the held lanes' — and the
+        // trust lane's in-flight bytes are not in it (review, 2026-09-27: they
+        // had raised it to 57 GiB for lanes that hold none of them).
         assert_eq!(LANE_CAP_BYTES, COLD_BYTES + WARM_GROWTH_BYTES);
         assert_eq!(gib(LANE_CAP_BYTES), "45.0 GiB");
     }
@@ -1198,17 +1236,17 @@ mod tests {
         );
         assert_eq!(
             header_line(&free, &warm, root),
-            "verify: disk 22.2 GiB free on the volume holding /r; build dirs 20.2 GiB; need 24.0 \
-             GiB = max(27.0 GiB cold - 20.2 GiB credited, 18.0 GiB warm growth) + 6.0 GiB \
-             reserve\n"
+            "verify: disk 22.2 GiB free on the volume holding /r; build dirs 20.2 GiB; need 30.0 \
+             GiB = max(27.0 GiB cold - 20.2 GiB credited, 18.0 GiB warm growth) + 6.0 GiB in \
+             flight + 6.0 GiB reserve\n"
         );
 
-        let mut over = plan(Budget::MEASURED, None, &held(50 * GIB), Owner::Snapshot);
+        let mut over = plan(Budget::MEASURED, None, &held(60 * GIB), Owner::Snapshot);
         let line = header_line(&free, &over, root);
         assert!(
             line.contains(
-                "; build dirs 50.0 GiB, over the 45.0 GiB cap, so removed before the free \
-                           space was read; need 33.0 GiB = max(27.0 GiB cold - 0.0 GiB credited"
+                "; build dirs 60.0 GiB, over the 45.0 GiB cap, so removed before the free \
+                           space was read; need 39.0 GiB = max(27.0 GiB cold - 0.0 GiB credited"
             ),
             "{line}"
         );
@@ -1228,7 +1266,7 @@ mod tests {
         );
         assert!(
             header_line(&free, &unknown, root).contains(
-                "; build dirs unmeasured (du -sk failed), so none credited; need 33.0 GiB"
+                "; build dirs unmeasured (du -sk failed), so none credited; need 39.0 GiB"
             )
         );
         let floor = plan(Budget::MEASURED, Some(0), &held(GIB), Owner::Snapshot);
@@ -1451,10 +1489,10 @@ mod tests {
         }
         assert!(!text.contains("target.noindex"), "{text}");
         assert!(
-            text.contains("the next run is then cold and needs 33.0 GiB"),
+            text.contains("the next run is then cold and needs 39.0 GiB"),
             "{text}"
         );
-        assert!(text.contains("still "), "1 GiB free is short of 33: {text}");
+        assert!(text.contains("still "), "1 GiB free is short of 39: {text}");
         assert!(text.contains("--disk-floor <GiB>"), "{text}");
 
         // A nested lane beneath a symlink is somewhere else, never this run's.
@@ -1490,19 +1528,20 @@ mod tests {
         let root = Path::new("/nonexistent/root");
         let lanes = held(20 * GIB);
         let warm = plan(Budget::MEASURED, None, &lanes, Owner::Snapshot);
-        let text = remedy(root, &warm, &lanes, &Reading::Free(14 * GIB), None);
+        let text = remedy(root, &warm, &lanes, &Reading::Free(20 * GIB), None);
         assert!(
             text.contains(
                 "this run's build dirs hold 20.0 GiB, all of it regenerable. Removing \
-                           them gives that back, and the next run is then cold and needs 33.0 GiB \
-                           (27.0 GiB cold + 6.0 GiB reserve): 34.0 GiB would be free — enough:\n"
+                           them gives that back, and the next run is then cold and needs 39.0 GiB \
+                           (27.0 GiB cold + 6.0 GiB in flight + 6.0 GiB reserve): 40.0 GiB would be \
+                           free — enough:\n"
             ),
             "{text}"
         );
         assert!(text.contains("      20.0 GiB  target/\n"), "{text}");
         let text = remedy(root, &warm, &lanes, &Reading::Free(5 * GIB), None);
         assert!(
-            text.contains("25.0 GiB would be free — still 8.0 GiB short"),
+            text.contains("25.0 GiB would be free — still 14.0 GiB short"),
             "{text}"
         );
     }

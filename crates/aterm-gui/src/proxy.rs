@@ -716,6 +716,22 @@ pub(crate) fn forward_first_line(edge_hex: &str, verb: &str) -> String {
     format!("TOKEN {edge_hex} {verb}\n")
 }
 
+/// The inverse of [`forward_first_line`]: `(edge_hex, verb)`, or `None` for a
+/// line that is not a `TOKEN <hex> <verb>` handshake.
+fn split_forward_line(first_line: &str) -> Option<(&str, &str)> {
+    let line = first_line.strip_suffix('\n').unwrap_or(first_line);
+    let (token, verb) = line.strip_prefix("TOKEN ")?.split_once(' ')?;
+    (!token.is_empty() && !verb.is_empty()).then_some((token, verb))
+}
+
+/// How long a forward waits for the child to prove it is SERVING the
+/// connection (its answer to the connect probe) before the caller is told the
+/// child accepted nothing. The same bound `aterm ctl` gives its own connect
+/// phase: a child whose listener is wedged — connections queued, never
+/// accepted — must not hold the caller (and this lane) for a whole verb
+/// deadline.
+pub(crate) const FORWARD_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Connect to `child_sock`, present `first_line`, and RELAY bytes transparently in
 /// both directions until either side closes. Format-agnostic: carries any verb's
 /// framing (status lines, `OK <n>` bodies, subscribe push frames, binary). The
@@ -723,7 +739,9 @@ pub(crate) fn forward_first_line(edge_hex: &str, verb: &str) -> String {
 /// the request line) are forwarded to the child FIRST so nothing is lost.
 ///
 /// Returns `Ok(())` on a clean close, or an `io::Error` if the dial / handshake
-/// failed before any relay (so the caller can answer `ERR`).
+/// failed before any relay (so the caller can answer `ERR`) — including a child
+/// that did not answer the connect probe within [`FORWARD_ACCEPT_DEADLINE`]
+/// (`ErrorKind::TimedOut`).
 pub(crate) fn connect_and_relay(
     child_sock: &str,
     first_line: &str,
@@ -735,8 +753,89 @@ pub(crate) fn connect_and_relay(
         first_line,
         client,
         client_prebuffered,
+        FORWARD_ACCEPT_DEADLINE,
         relay_bidirectional,
     )
+}
+
+/// Whether a connect-probe answer refuses the CONNECTION rather than answering
+/// the probe: the token was refused (`ERR auth`, after which the server
+/// closes), or no lane could take it (`ERR control server busy; retry`).
+pub(crate) fn is_connection_refusal(line: &str) -> bool {
+    line == "ERR auth" || line.starts_with("ERR control server busy")
+}
+
+/// THE CONNECT PROBE of a forward: authenticate with `token` and ask `version`
+/// — answered by every aterm generation, for any scope, with one line and no
+/// main-thread hop — then read that one line within `within`. Only a child that
+/// answers is sent the caller's verb, so a child whose listener queues
+/// connections without accepting them costs the caller seconds, not the verb's
+/// deadline, and receives nothing. The reply is consumed here, never relayed.
+///
+/// The verb then travels as the connection's next request line, which the
+/// child serves exactly as it would have served it folded into the handshake.
+fn prove_child_serving(
+    child: &CtlStream,
+    token: &str,
+    within: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let mut hello = String::with_capacity(token.len() + 16);
+    hello.push_str("TOKEN ");
+    hello.push_str(token);
+    hello.push_str(" version\n");
+    (&*child).write_all(hello.as_bytes())?;
+    (&*child).flush()?;
+    // Byte at a time: nothing past the one line may be consumed here (the
+    // child sends nothing more before the verb, but a relay must never lose a
+    // byte it did not mean to eat).
+    let deadline = std::time::Instant::now() + within;
+    let mut line = Vec::with_capacity(160);
+    let mut byte = [0u8; 1];
+    let not_accepted = || {
+        Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "the child accepted no connection within {}s",
+                within.as_secs().max(1)
+            ),
+        )
+    };
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(not_accepted());
+        }
+        // One deadline across every read, so a child that dribbles cannot
+        // stretch it. (Darwin refuses the bound once the peer detached; its
+        // queued bytes and EOF still read at once.)
+        let _ = child.set_read_timeout(Some(deadline - now));
+        match (&*child).read(&mut byte) {
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "the child closed the connection before answering",
+                ));
+            }
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if line.len() >= 4096 => {
+                return Err(Error::new(ErrorKind::InvalidData, "runaway probe reply"));
+            }
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(not_accepted());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let line = String::from_utf8_lossy(&line);
+    let line = line.trim_end_matches('\r');
+    // A refusal ends the connection: the verb is never sent.
+    if is_connection_refusal(line) {
+        return Err(Error::other(format!("the child answered {line:?}")));
+    }
+    child.set_read_timeout(None)
 }
 
 /// [`connect_and_relay`] with its relay stage as a parameter: the REPLY-FIDELITY
@@ -749,11 +848,21 @@ fn deliver_then_relay(
     first_line: &str,
     client: &CtlStream,
     client_prebuffered: &[u8],
+    accept_within: std::time::Duration,
     relay: impl FnOnce(&CtlStream, &CtlStream) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let child = CtlStream::connect(child_sock)?;
-    // Present the handshake + folded, rewritten verb.
-    (&child).write_all(first_line.as_bytes())?;
+    // Prove the child is serving before it is handed the verb, then send the
+    // rewritten verb as the next request line. (A line that is not a TOKEN
+    // handshake is presented as it is.)
+    match split_forward_line(first_line) {
+        Some((token, verb)) => {
+            prove_child_serving(&child, token, accept_within)?;
+            (&child).write_all(verb.as_bytes())?;
+            (&child).write_all(b"\n")?;
+        }
+        None => (&child).write_all(first_line.as_bytes())?,
+    }
     if !client_prebuffered.is_empty() {
         (&child).write_all(client_prebuffered)?;
     }
@@ -784,23 +893,45 @@ fn relay_bidirectional(client: &CtlStream, child: &CtlStream) -> std::io::Result
     let mut s2c_w = client.try_clone()?;
     let w_client = client.try_clone()?;
     let w_child = child.try_clone()?;
-    // child -> client on a worker; client -> child here.
-    let worker = std::thread::spawn(move || match copy_until_eof(&mut s2c_r, &mut s2c_w) {
-        Ok(()) => {
-            let _ = w_client.shutdown(std::net::Shutdown::Write);
+    // child -> client on a worker; client -> child here. The worker says when
+    // it is done (its sender drops even if it unwinds), so the hangup watch
+    // below costs no latency on a relay that ends normally.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        match copy_until_eof(&mut s2c_r, &mut s2c_w) {
+            Ok(()) => {
+                let _ = w_client.shutdown(std::net::Shutdown::Write);
+            }
+            Err(_) => {
+                let _ = w_client.shutdown(std::net::Shutdown::Both);
+                let _ = w_child.shutdown(std::net::Shutdown::Both);
+            }
         }
-        Err(_) => {
-            let _ = w_client.shutdown(std::net::Shutdown::Both);
-            let _ = w_child.shutdown(std::net::Shutdown::Both);
-        }
+        let _ = done_tx.send(());
     });
     match copy_until_eof(&mut c2s_r, &mut c2s_w) {
-        Ok(()) => {
+        // The client's EOF: a half-close still wants the answer, but a client
+        // that is GONE (closed both halves) has nobody to answer — tear both
+        // sides down so the child's blocking verb and this lane end now.
+        Ok(()) if !aterm_uds::hangup::peer_closed(client) => {
             let _ = child.shutdown(std::net::Shutdown::Write);
         }
-        Err(_) => {
+        Ok(()) | Err(_) => {
             let _ = client.shutdown(std::net::Shutdown::Both);
             let _ = child.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    // A client that half-closed and THEN died is seen by nobody above (this
+    // thread no longer reads it, the worker is parked on the child): watch for
+    // that hangup while the answer is still coming, so a dead client's lane is
+    // given back within a poll instead of when the child's verb times out.
+    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+        done_rx.recv_timeout(crate::control::HANGUP_POLL)
+    {
+        if aterm_uds::hangup::peer_closed(client) {
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            let _ = child.shutdown(std::net::Shutdown::Both);
+            break;
         }
     }
     let _ = worker.join();
@@ -1014,6 +1145,80 @@ mod tests {
             forward_first_line("abcd", "@. screen"),
             "TOKEN abcd @. screen\n"
         );
+        assert_eq!(
+            split_forward_line(&forward_first_line("abcd", "@. screen")),
+            Some(("abcd", "@. screen"))
+        );
+        assert_eq!(split_forward_line("AUTH abcd\n"), None);
+        assert_eq!(split_forward_line("TOKEN abcd\n"), None);
+    }
+
+    /// THE WEDGED CHILD. A child whose listener queues connections without
+    /// accepting them (the 2026-09-25 incident's state) is reported within the
+    /// connect-probe bound as having accepted nothing — an error BEFORE any
+    /// relay, so the caller answers it — and the verb never reaches it. The
+    /// served child in the test above is the negative control.
+    #[test]
+    fn a_child_that_accepts_nothing_fails_the_forward_fast() {
+        let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
+        let sock = dir.path().join("wedged.sock");
+        let _listener = aterm_uds::CtlListener::bind(&sock).expect("bind, never accept");
+        let (_client_app, client_relay) = CtlStream::pair().expect("pair");
+        let started = std::time::Instant::now();
+        let mut relayed = false;
+        let result = deliver_then_relay(
+            &sock.to_string_lossy(),
+            &forward_first_line("tok-hex", "@. text"),
+            &client_relay,
+            &[],
+            std::time::Duration::from_millis(400),
+            |_, _| {
+                relayed = true;
+                Ok(())
+            },
+        );
+        let error = result.expect_err("a child that accepts nothing is an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("accepted no connection"),
+            "{error}"
+        );
+        assert!(!relayed, "nothing is relayed to a child that never served");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the probe bound held: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A child that refuses the probe (a stale edge token: `ERR auth`) fails the
+    /// forward before the verb is sent.
+    #[test]
+    fn a_child_that_refuses_the_probe_never_receives_the_verb() {
+        let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
+        let sock = dir.path().join("refuse.sock");
+        let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
+        let child = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut rdr = BufReader::new(conn.try_clone().unwrap());
+            let mut first = String::new();
+            rdr.read_line(&mut first).unwrap();
+            conn.write_all(b"ERR auth\n").unwrap();
+            let mut rest = String::new();
+            let _ = rdr.read_to_string(&mut rest);
+            rest
+        });
+        let (_client_app, client_relay) = CtlStream::pair().expect("pair");
+        let result = deliver_then_relay(
+            &sock.to_string_lossy(),
+            &forward_first_line("stale", "@. key enter"),
+            &client_relay,
+            &[],
+            std::time::Duration::from_secs(5),
+            |_, _| Ok(()),
+        );
+        assert!(result.is_err(), "a refused probe is a failed forward");
+        assert_eq!(child.join().unwrap(), "", "the verb was never sent");
     }
 
     /// The relay carries an arbitrary request → response (incl. a multi-line body
@@ -1028,17 +1233,19 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind child");
 
-        // The fake child: read the TOKEN line, then reply with a framed body that
-        // includes a raw 0xff byte, then echo one more line, then close.
+        // The fake child: answer the TOKEN handshake's connect probe, read the
+        // verb, then reply with a framed body that includes a raw 0xff byte,
+        // then echo one more line, then close.
         let child = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().expect("accept");
             let mut rdr = BufReader::new(conn.try_clone().unwrap());
             let mut first = String::new();
             rdr.read_line(&mut first).unwrap();
-            assert!(
-                first.starts_with("TOKEN tok-hex screen"),
-                "handshake: {first:?}"
-            );
+            assert_eq!(first, "TOKEN tok-hex version\n", "handshake + probe");
+            conn.write_all(b"OK version=child\n").unwrap();
+            let mut verb = String::new();
+            rdr.read_line(&mut verb).unwrap();
+            assert_eq!(verb, "screen\n", "the verb follows the probe");
             conn.write_all(b"OK 1\n{\"k\":1}\n").unwrap();
             conn.write_all(&[0xffu8, b'\n']).unwrap();
             conn.flush().unwrap();

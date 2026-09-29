@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo forge blame` — why is this package here?
+//! `targo --unverified forge blame` — why is this package here?
 //!
 //! Answers three questions a `cargo tree | grep` cannot:
 //!
@@ -75,7 +75,7 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
         Some(_) => {
             return Err(format!(
                 "`{pkg}` is not a package spec — Fix: pass `name` or `name@version`, e.g. \
-                 `cargo forge blame indexmap` or `cargo forge blame indexmap@2.14.0`."
+                 `targo --unverified forge blame indexmap` or `targo --unverified forge blame indexmap@2.14.0`."
             ));
         }
         None => (pkg.to_string(), None),
@@ -100,7 +100,7 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
         }
         return Err(format!(
             "not one requested cell resolved, so `{pkg}` cannot be located:\n{why}    \
-             Fix: run `cargo fetch --locked` once in {}, then re-run.",
+             Fix: run `targo fetch --locked` once in {}, then re-run.",
             root.display()
         ));
     }
@@ -311,13 +311,13 @@ fn liveness_block(
     let _ = writeln!(
         log,
         "  Fix, in preference order:\n    \
-         1. cut the edge — `cargo forge blame` above names the first-party dependant; drop\n       \
+         1. cut the edge — `targo --unverified forge blame` above names the first-party dependant; drop\n       \
             the feature or dependency that drags the second major in;\n    \
          2. move the fork forward — re-fork `{name}` at the other major under vendor/ so\n       \
-            patched copy satisfies both requirements, then re-run `cargo forge attest`;\n    \
+            patched copy satisfies both requirements, then re-run `targo --unverified forge attest`;\n    \
          3. record it — add the exemption, with the reason and a re-review date, to\n       \
-            vendor/forge.toml, which `cargo forge check` reads.\n  \
-         `cargo forge check` is the gate that FAILS on this; blame only reports it."
+            vendor/forge.toml, which `targo --unverified forge check` reads.\n  \
+         `targo --unverified forge check` is the gate that FAILS on this; blame only reports it."
     );
 }
 
@@ -448,7 +448,7 @@ fn package_block(
                         "NOTE: those facts are the PRISTINE registry copy of {} {}, which \
                          `loc::package_dir` prefers by design so the ledger cannot move while \
                          the fork is being edited. The fork itself ({}) is {} lines, {}{} \
-                         against upstream; that drift is `cargo forge attest`'s business.",
+                         against upstream; that drift is `targo --unverified forge attest`'s business.",
                         id.name,
                         id.version,
                         path,
@@ -583,7 +583,7 @@ fn not_found(
             let _ = writeln!(
                 log,
                 "  `{name}` IS resolved, but not at {v} — resolved version(s): {}.\n  \
-                 Fix: `cargo forge blame {name}` (bare name) shows every version.",
+                 Fix: `targo --unverified forge blame {name}` (bare name) shows every version.",
                 others.into_iter().collect::<Vec<_>>().join(", ")
             );
             return;
@@ -597,7 +597,7 @@ fn not_found(
             "  It IS in Cargo.lock at {} — so it is reached only by dev/build edges, or by a\n  \
              workspace member that is not the cell's root package. The survey walks NORMAL\n  \
              edges from the shipped root by design.\n  \
-             Fix: `cargo tree -p aterm -e all -i {name}` to see the dev/build edge that keeps it.",
+             Fix: `targo tree -p aterm -e all -i {name}` to see the dev/build edge that keeps it.",
             locked.join(", "),
             name = name
         );
@@ -612,7 +612,7 @@ fn not_found(
     }
     let _ = writeln!(
         log,
-        "  Fix: `cargo forge survey --top 0` lists every resolved package with its exact\n  \
+        "  Fix: `targo --unverified forge survey --top 0` lists every resolved package with its exact\n  \
          version; `blame` takes `name` or `name@version` copied from there."
     );
 }
@@ -796,7 +796,7 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest).map_err(|e| {
         format!(
-            "cannot read {}: {e} — Fix: run `cargo forge` from inside the workspace, or pass \
+            "cannot read {}: {e} — Fix: run `targo --unverified forge` from inside the workspace, or pass \
              `--root <workspace>`.",
             manifest.display()
         )

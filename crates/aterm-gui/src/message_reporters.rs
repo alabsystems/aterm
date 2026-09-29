@@ -69,6 +69,7 @@ use aterm_messages::{
     TITLE_CAP, Tag, tags,
 };
 
+use crate::crash_journal::PanesWithoutFolder;
 use crate::native_settings::SettingsRoute;
 
 /// What earns a row on the glass (the owner's attention rule, 2026-09-23). The
@@ -468,9 +469,9 @@ impl ConfigWarnings {
 /// An unknown key's excerpt from the validator's sentence (its `config `
 /// shed): `windw_padding → window_padding?` from `line 3: windw_padding —
 /// did you mean "window_padding"? (…)`, and the bare key from `line 4: foo
-/// is unknown to this aterm build; …` — the title already says unknown, and
-/// the line number is the sentence's, behind Details. `None` for a sentence
-/// in neither shape.
+/// is unknown to this build and has no effect` — the title already says
+/// unknown, and the line number is the sentence's, behind Details. `None` for
+/// a sentence in neither shape.
 fn unknown_key_excerpt(sentence: &str) -> Option<String> {
     let s = sentence
         .strip_prefix("line ")
@@ -553,9 +554,9 @@ fn toml_words(rows: &[String]) -> Option<String> {
 /// sentence) — and fits `cap` characters; the whole sentence when none does
 /// (the band's width law shapes it from there). The seams are the ones the
 /// config sentences use: the near-miss key keeps its `did you mean` and sheds
-/// the forward-compatibility aside, the plain unknown key keeps `is unknown to
-/// this aterm build` and sheds `it will be preserved …`, a font sentence keeps
-/// its verdict and `(not found)` and sheds `; ignored`.
+/// `(no effect in this build)`, a font sentence keeps its verdict and `(not
+/// found)` and sheds `; ignored`; the plain unknown key has no seam and is its
+/// own head.
 pub(crate) fn excerpt_head(sentence: &str, cap: usize) -> &str {
     const SEAMS: [&str; 3] = [" (", "; ", " \u{2014} "];
     let mut best = None;
@@ -739,6 +740,34 @@ pub(crate) fn killed_message(evidence: &crate::logging::KillEvidence) -> Message
         .key(KEY_CRASH)
 }
 
+/// THE PTY KEEPER'S RECOVERY ROW (P3, design §5.3 step 7): the last window
+/// crashed or was killed, and the keeper kept `n` of its sessions running;
+/// this launch reattached them. It takes the crash row's slot. `End
+/// sessions` hangs every reattached shell up (Force Quit and jetsam look the
+/// same, decision 4); `refused` offers the admission turned down are counted.
+pub(crate) fn keeper_recovered_message(n: usize, refused: usize) -> Message {
+    let mut message = Message::new(tags::CRASH, Severity::Warn, "aterm stopped unexpectedly")
+        .glyph(Glyph::or_fallback('\u{21bb}'))
+        .line(format!(
+            "{} kept running and {} reattached",
+            counted(n, "session"),
+            if n == 1 { "was" } else { "were" }
+        ))
+        .line("each screen was redrawn by its program; the scrollback before the stop is not here");
+    if refused > 0 {
+        message = message.line(format!(
+            "{} could not be reattached and {} ended",
+            counted(refused, "session"),
+            if refused == 1 { "was" } else { "were" }
+        ));
+    }
+    message
+        .no_excerpt()
+        .action(Intent::EndRecovered)
+        .hold(Hold::For(HOLD_LAUNCH))
+        .key(KEY_CRASH)
+}
+
 /// The reopened layout's loss line: what a crash journal cannot bring back.
 pub(crate) const JOURNAL_LOSS: &str =
     "the programs that were running in them, and their scrollback, did not survive";
@@ -760,10 +789,18 @@ fn counted(n: usize, word: &str) -> String {
 /// agent that resumes its conversation (ruling 293): nothing else was lost.
 pub(crate) const JOURNAL_ONLY_SCROLLBACK: &str = "only the scrollback did not survive";
 
+/// [`JOURNAL_ONLY_SCROLLBACK`] when a pane also could not open its folder:
+/// the scrollback was not all that was lost.
+pub(crate) const JOURNAL_SCROLLBACK: &str = "the scrollback did not survive";
+
 /// The reopened layout's quiet line (D16, ruling 282): every leaf sat at its
 /// shell's prompt, so nothing a person ran was lost.
 pub(crate) const JOURNAL_NOTHING_RAN: &str =
     "nothing was running in them: only their scrollback did not survive";
+
+/// [`JOURNAL_NOTHING_RAN`] when a pane also could not open its folder.
+pub(crate) const JOURNAL_NOTHING_RAN_FOLDERLESS: &str =
+    "nothing was running in them: their scrollback did not survive";
 
 /// `names` as a person reads a list — `vim`, `vim and claude`, `vim, claude
 /// and less` — at most three named and the rest counted, then `unnamed`
@@ -866,6 +903,39 @@ fn journal_resumed_line(resumed: &[(u32, u32)], windows: usize) -> String {
     format!("aterm starts Claude again on {conversations} in {place}")
 }
 
+/// What the reopened layout brought back, and from how many journals: `2 tabs
+/// in 1 window restored in their folders from its crash journal`. The panes
+/// whose folder is not here
+/// ([`crate::crash_journal::Reopened::panes_without_folder`], audit #7
+/// finding 48): those whose folder no shell could start in are counted,
+/// whether the home folder stood in for them or not; with only panes a
+/// program held (audit #8), the line claims no folders.
+fn journal_restored_line(
+    tabs: usize,
+    windows: usize,
+    sources: usize,
+    folders: PanesWithoutFolder,
+) -> String {
+    let restored = format!("{} in {}", counted(tabs, "tab"), counted(windows, "window"));
+    let from = match sources {
+        1 => "its crash journal".to_string(),
+        n => format!("{n} crash journals"),
+    };
+    match folders.gone {
+        0 if folders == PanesWithoutFolder::NONE => format!(
+            "{restored} restored in {} from {from}",
+            if tabs == 1 {
+                "its folder"
+            } else {
+                "their folders"
+            }
+        ),
+        0 => format!("{restored} restored from {from}"),
+        1 => format!("{restored} restored from {from}; 1 pane could not open its folder"),
+        n => format!("{restored} restored from {from}; {n} panes could not open their folders"),
+    }
+}
+
 /// The reopened layout's title when programs were lost: the one program by
 /// its name (day five, D19: `a program lost` said not which), else how many.
 fn journal_lost_title(lost: Option<&crate::crash_journal::Lost>) -> String {
@@ -901,13 +971,13 @@ fn journal_tag(class: crate::crash_journal::DeathClass) -> Tag {
 ///
 /// A QUIET RELAUNCH (D16, ruling 282): the journal also says which leaves had
 /// a program running ([`crate::crash_journal::Reopened::lost`]). When none
-/// did, a kill lost nothing a person ran — every tab came back at its prompt
-/// in its folder — so it is a RECORD (`Info`, [`Hold::LogOnly`]) that says so,
-/// and the band stays quiet. A crash with nothing lost keeps its row: aterm
-/// failed, and the crash log is the person's to open or send; its words say
-/// nothing was running. When programs ran, the row names how many tabs lost
-/// one and which programs; a journal from before the field (`None`) reads as
-/// it always did.
+/// did, a kill lost nothing a person ran — every tab came back at its prompt,
+/// in its folder when the restored line says so — so it is a RECORD (`Info`,
+/// [`Hold::LogOnly`]) that says so, and the band stays quiet. A crash with
+/// nothing lost keeps its row: aterm failed, and the crash log is the
+/// person's to open or send; its words say nothing was running. When
+/// programs ran, the row names how many tabs lost one and which programs; a
+/// journal from before the field (`None`) reads as it always did.
 ///
 /// THE ANSWER IS THE SENTENCE (day five, D19): `detail[0]` — the plain
 /// sentence Settings ▸ Messages sets above the technical block — says what
@@ -925,12 +995,21 @@ fn journal_tag(class: crate::crash_journal::DeathClass) -> Tag {
 /// record; when another program was lost, the warning names that one and its
 /// sentence says which agent resumes (ruling 314). If the relaunch then fails, the host says
 /// so once ([`restored_agents_not_resumed`]).
+///
+/// A PANE WHOSE FOLDER NO SHELL CAN START IN did not come back in it (audit
+/// #7 finding 48): `folders` counts them, and the restored line says how many
+/// rather than that every tab came back in its folder
+/// ([`journal_restored_line`]). A pane a program held whose folder is not
+/// here is not counted, and the line then claims no folders (audit #8).
+/// Either way the loss sentence drops its `only`: the scrollback was not all
+/// that was lost.
 pub(crate) fn journal_reopened_message(
     reopened: &crate::crash_journal::Reopened,
     crash: Option<&crate::logging::CrashEvidence>,
     killed: Option<&crate::logging::KillEvidence>,
     log: Option<&std::path::Path>,
     relaunching: bool,
+    folders: PanesWithoutFolder,
 ) -> Message {
     let (windows, tabs) = reopened.counts();
     let lost = reopened.lost_given(relaunching);
@@ -969,13 +1048,19 @@ pub(crate) fn journal_reopened_message(
     } else {
         journal_lost_title(lost.as_ref())
     };
+    // ONLY THE SCROLLBACK holds while every pane came back in its folder.
+    let (idle_line, scrollback_line) = if folders == PanesWithoutFolder::NONE {
+        (JOURNAL_NOTHING_RAN, JOURNAL_ONLY_SCROLLBACK)
+    } else {
+        (JOURNAL_NOTHING_RAN_FOLDERLESS, JOURNAL_SCROLLBACK)
+    };
     // ONE SENTENCE (ruling 314, day eight E2): the agent coming back rides
     // the loss sentence, never a detail of its own — Settings ▸ Messages sets
     // every detail after the first as technical text, and `aterm starts
     // Claude again …` stood there in monospace.
     let loss = match &lost {
-        Some(lost) if lost.tabs == 0 && resumed.is_empty() => JOURNAL_NOTHING_RAN.to_string(),
-        Some(lost) if lost.tabs == 0 => format!("{resumed}; {JOURNAL_ONLY_SCROLLBACK}"),
+        Some(lost) if lost.tabs == 0 && resumed.is_empty() => idle_line.to_string(),
+        Some(lost) if lost.tabs == 0 => format!("{resumed}; {scrollback_line}"),
         None if resumed.is_empty() => JOURNAL_LOSS.to_string(),
         None => format!("{JOURNAL_LOSS}; {resumed}"),
         Some(lost) if resumed.is_empty() => journal_loss_line(lost, tabs),
@@ -986,19 +1071,11 @@ pub(crate) fn journal_reopened_message(
     // working `↻`, which read as a restore still under way.
     let mut msg = Message::new(journal_tag(reopened.class), severity, title).line(loss);
     msg = msg
-        .line(format!(
-            "{} in {} restored in {} from {}",
-            counted(tabs, "tab"),
-            counted(windows, "window"),
-            if tabs == 1 {
-                "its folder"
-            } else {
-                "their folders"
-            },
-            match reopened.sources.len() {
-                1 => "its crash journal".to_string(),
-                n => format!("{n} crash journals"),
-            }
+        .line(journal_restored_line(
+            tabs,
+            windows,
+            reopened.sources.len(),
+            folders,
         ))
         .line(reopened.class.sentence())
         .lines(evidence_lines);
@@ -1686,6 +1763,119 @@ pub(crate) fn restored_tab_failed(error: &str) -> Message {
     .no_excerpt()
 }
 
+/// The supersede key of the row that says shells started in the home folder
+/// because their folder was not there ([`folder_row`]): one row, however many
+/// folders.
+pub(crate) const KEY_FOLDER_NOT_FOUND: &str = "spawn.folder-not-found";
+
+/// The supersede key of the row that says shells started in the home folder
+/// because their folder could not be entered ([`folder_row`]).
+pub(crate) const KEY_FOLDER_NOT_OPENED: &str = "spawn.folder-not-opened";
+
+/// The most folders [`folder_row`] names one per line; the rest are counted
+/// on the line after them.
+const FOLDERS_NAMED: usize = DETAIL_LINES_CAP - 2;
+
+/// The one-folder row's line, before the folder.
+const FOLDER_INSTEAD_OF: &str = "opened in your home folder instead of ";
+
+/// The many-folder row's first line, before the folders.
+const FOLDERS_INSTEAD: &str = "opened in your home folder instead";
+
+/// The supersede key of `fault`'s row.
+pub(crate) const fn folder_row_key(fault: crate::spawn_folder::Fault) -> &'static str {
+    match fault {
+        crate::spawn_folder::Fault::Missing => KEY_FOLDER_NOT_FOUND,
+        crate::spawn_folder::Fault::Shut => KEY_FOLDER_NOT_OPENED,
+    }
+}
+
+/// Fresh shells started in the home folder because the folder each was asked
+/// to start in was not there, or could not be entered — a restored pane's
+/// saved folder, the one a New Tab inherited, a profile's (audit #7 finding
+/// 48; [`crate::spawn_folder`]). ONE row per fault for every such folder while
+/// it is up (`App::fold_folder_faults`, keyed [`folder_row_key`]). A failure
+/// in the one grammar (`Couldn't find the folder`, `Couldn't open 3 folders`):
+/// the shell is not where the person asked. `detail[0]` is where it is
+/// instead, naming the one folder; several are named one per line behind it,
+/// and past the line cap the rest, with any a carried row counted without
+/// naming ([`crate::spawn_folder::Named::unnamed`]), are counted.
+pub(crate) fn folder_row(
+    fault: crate::spawn_folder::Fault,
+    named: &crate::spawn_folder::Named,
+) -> Message {
+    debug_assert!(!named.dirs.is_empty(), "a row about no folder");
+    let verb = match fault {
+        crate::spawn_folder::Fault::Missing => "find",
+        crate::spawn_folder::Fault::Shut => "open",
+    };
+    let total = named.dirs.len() + named.unnamed;
+    let msg = match named.dirs.as_slice() {
+        [one] if total == 1 => Message::new(
+            tags::WINDOW,
+            Severity::Warn,
+            format!("Couldn't {verb} the folder"),
+        )
+        .sentence(format!("{FOLDER_INSTEAD_OF}{one}")),
+        many => {
+            let unnamed = total.saturating_sub(many.len().min(FOLDERS_NAMED));
+            let msg = Message::new(
+                tags::WINDOW,
+                Severity::Warn,
+                format!("Couldn't {verb} {total} folders"),
+            )
+            .line(FOLDERS_INSTEAD)
+            .lines(many.iter().take(FOLDERS_NAMED).cloned());
+            if unnamed == 0 {
+                msg
+            } else {
+                msg.line(format!("and {unnamed} more"))
+            }
+        }
+    };
+    msg.key(folder_row_key(fault))
+}
+
+/// The folders a [`folder_row`] names, read back from the row: how a row
+/// carried across an update keeps its folders when the next one joins it
+/// (the new instance's list starts empty). `None` for a row of another shape.
+pub(crate) fn folder_row_named(msg: &Message) -> Option<crate::spawn_folder::Named> {
+    if msg.detail.first().map(String::as_str) == Some(FOLDERS_INSTEAD) {
+        let rest = &msg.detail[1..];
+        let (dirs, unnamed) = match rest.split_last() {
+            Some((count, dirs)) if rest.len() == FOLDERS_NAMED + 1 => (
+                dirs,
+                count
+                    .strip_prefix("and ")
+                    .and_then(|n| n.strip_suffix(" more"))
+                    .and_then(|n| n.parse().ok())?,
+            ),
+            _ => (rest, 0),
+        };
+        return Some(crate::spawn_folder::Named {
+            dirs: dirs.to_vec(),
+            unnamed,
+        });
+    }
+    // The one-folder form is one sentence, split across lines only when it
+    // is longer than a line: at the space before the folder and then hard
+    // when the folder has no space in it, else at its spaces.
+    let (head, rest) = msg.detail.split_first()?;
+    let one = if head == FOLDER_INSTEAD_OF.trim_end() && !rest.is_empty() {
+        rest.concat()
+    } else {
+        let first = head.strip_prefix(FOLDER_INSTEAD_OF)?;
+        std::iter::once(first)
+            .chain(rest.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Some(crate::spawn_folder::Named {
+        dirs: vec![one],
+        unnamed: 0,
+    })
+}
+
 /// The Open-log press refused (the path was not a regular file under the log
 /// dir, or nothing could be spawned to open it): the person's gesture, so a
 /// short row naming the path behind Details.
@@ -1760,55 +1950,133 @@ pub(crate) fn harness_note(text: &str) -> Message {
     .hold(Hold::LogOnly)
 }
 
+/// A SESSION SUPERVISOR'S INFORMATION (`aterm_agent::supervise::IdleHost::
+/// inform`, from the window's own supervise loop for session `sid`): a
+/// `harness`-tagged RECORD, never a row — nothing is asked of the person.
+/// Codex's save-then-wait hold begins with one (2026-09-28: a hold can last
+/// days, the session idle through it). Keyed per session: the next one
+/// replaces it.
+pub(crate) fn supervisor_note(sid: &str, text: &str) -> Message {
+    Message::new(
+        tags::HARNESS,
+        Severity::Info,
+        atpkg::progress::sanitize_for_tty(&format!("@{sid}: {text}"), 200),
+    )
+    .hold(Hold::LogOnly)
+    .key(format!("harness.supervisor.{sid}").as_str())
+}
+
 /// The live agent upgrade's supersede key: each new waiting record replaces
 /// the last one recorded under it.
 pub(crate) const KEY_AGENT_UPGRADE: &str = "harness.upgrade";
 
 /// THE LIVE AGENT UPGRADE, WAITING (gap audit 2026-09-24: two sessions sat one
 /// and two releases behind for 8h22m and nothing said so). A RECORD, never a
-/// row — waiting for a turn end is the upgrade working, and the band carries
+/// row — waiting for its moment is the upgrade working, and the band carries
 /// only what the person acts on (ruling e83d7d233) — so it is on Settings ▸
 /// Messages, `messages.log` and `appstatus` as `kind=harness`. `product` is
 /// the agent the waiting sessions run (`Claude Code`, `Codex`; `Claude Code
 /// and Codex` for a mix, named in the detail under the generic title),
 /// `waiting` the versions they move to, one per session; `None` when none
-/// waits.
+/// waits. ONE session's record is [`agent_upgrade_waiting_in`]'s.
+///
+/// IT SAYS THERE IS NOTHING TO DO (the owner, 2026-09-28: "do I need to do
+/// something? It's not clear. I want upgrades to be applied automatically"),
+/// and never "at its next turn end" — false of a goal-mode Codex, whose next
+/// turn begins within 14 ms of the last: the upgrade starts at a quiet
+/// moment, the longer it waits the less it asks of one (the ladder).
 pub(crate) fn agent_upgrade_waiting(product: &str, waiting: &[&str]) -> Option<Message> {
     let first = *waiting.first()?;
     let n = waiting.len();
-    let sessions = if n == 1 { "session" } else { "sessions" };
     // A MIX of products (`Claude Code and Codex`) is named in the detail:
-    // the title keeps to the eight-word rule with the generic word.
+    // the title keeps to the six-word rule with the generic word.
     let (titled, mixed) = if product.contains(" and ") {
         ("agent", Some(product))
     } else {
         (product, None)
     };
-    let target = if waiting.iter().all(|v| *v == first) {
-        format!("{titled} {}", atpkg::progress::sanitize_for_tty(first, 24))
+    let title = if waiting.iter().all(|v| *v == first) {
+        let target = format!("{titled} {}", atpkg::progress::sanitize_for_tty(first, 24));
+        if n == 1 {
+            format!("{target} installs itself")
+        } else {
+            format!("{target} installs itself in {n} tabs")
+        }
     } else {
-        format!("Newer {titled} builds")
+        format!("Newer {titled} builds install themselves")
     };
-    let mut msg = Message::new(
-        tags::HARNESS,
-        Severity::Info,
-        format!("{target} ready for {n} {sessions}"),
-    );
+    let mut msg = Message::new(tags::HARNESS, Severity::Info, title);
     if let Some(both) = mixed {
         msg = msg.line(format!("{both} sessions"));
     }
     msg = msg.line(if n == 1 {
-        "it moves onto it at its next turn end"
+        "nothing to do: it starts on its own at a quiet moment in its tab"
     } else {
-        "each moves onto it at its next turn end"
+        "nothing to do: each starts on its own at a quiet moment in its tab"
     });
     Some(msg.no_excerpt().hold(Hold::LogOnly).key(KEY_AGENT_UPGRADE))
 }
 
+/// ONE SESSION'S UPGRADE, WAITING (the owner's decision of 2026-09-28): a
+/// RECORD titled by its tab — `Codex 0.158.0 installs itself in tab 1` —
+/// whose sentence is WORDED BY WHAT HOLDS IT
+/// ([`aterm_agent::harness::upgrade_drive::Row::waiting_line`]): where only
+/// the ladder's comfort does, that there is nothing to do and when the
+/// ladder stops waiting for it — `nothing to do: it starts on its own at a
+/// quiet moment in the tab, and from 2:15 PM as soon as it is idle and nobody
+/// has typed there for 20 seconds` (its Land rung,
+/// [`aterm_agent::harness::upgrade_drive::Row::lands_by`], on the person's
+/// clock; `from two hours behind` where the local clock's offset is
+/// unknown); where a floor stands — a draft, a dialog, a goal or a turn of
+/// this tab's in its Codex daemon, a turn in another session there, the
+/// shell integration — what it is and when it moves, never the pause in the
+/// person's typing (the review of 2026-09-28: it promised that of a goal
+/// that held the tab). A clock time, not a countdown: said once, it stays
+/// true. Then the tab and the move. No tab mark and no warning: the upgrade
+/// is working (rulings 275 and 283, amended by ruling 380). `place` names the
+/// tab (`in tab 1`); the title drops it where it would break the title rule,
+/// and the move line keeps it.
+pub(crate) fn agent_upgrade_waiting_in(
+    row: &aterm_agent::harness::upgrade_drive::Row,
+    place: &str,
+) -> Message {
+    let clean = |s: &str| atpkg::progress::sanitize_for_tty(s, 64);
+    let head = format!("{} {} installs itself", row.agent.product(), clean(&row.to));
+    let placed = format!("{head} {place}");
+    let title = if aterm_messages::text::glass_title_fault(&placed).is_none() {
+        placed
+    } else {
+        head
+    };
+    // The Land rung's own time, past or to come: the words stay what they
+    // were, so the record is written once (a time that followed the clock
+    // past it would be a new record at every look). What holds it may change
+    // from look to look; the host says each sentence once, and keeps a
+    // floor's over the ladder's comfort (`App::record_upgrade_waiting`).
+    let from = row
+        .lands_by()
+        .and_then(|at| {
+            let offset = crate::presence::local_offset_s()?;
+            Some(aterm_messages::words::clock_words(
+                at.saturating_mul(1000),
+                offset,
+            ))
+        })
+        .unwrap_or_else(|| "two hours behind".to_string());
+    Message::new(tags::HARNESS, Severity::Info, title)
+        .line(row.waiting_line(&from))
+        .line(format!("{place} \u{00b7} {}", clean(&row.move_words())))
+        .no_excerpt()
+        .hold(Hold::LogOnly)
+        .key(KEY_AGENT_UPGRADE)
+}
+
 /// THE LIVE AGENT UPGRADE, STALLED: a ROW, because only the person can move it
 /// — it was refused, stopped the same way round after round, runs where
-/// typing into the tab cannot reach, or has been behind for six hours
-/// ([`aterm_agent::harness::upgrade_drive::Row::stall`]). One that will ask
+/// typing into the tab cannot reach, waits on what no rung of the ladder
+/// passes (`blocked:*`), or has stood four hours on the ladder's last rung
+/// with no pause (`overdue`, six hours behind:
+/// [`aterm_agent::harness::upgrade_drive::Row::stall`]). One that will ask
 /// again on its own — still asking, or resting after a round that gave up or
 /// stopped once — is a RECORD with no tab mark
 /// ([`aterm_agent::harness::upgrade_drive::Row::asks_on_its_own`], rulings
@@ -1824,9 +2092,12 @@ pub(crate) fn agent_upgrade_waiting(product: &str, waiting: &[&str]) -> Option<M
 ///
 /// THE REMEDY IS THE ONE THAT WORKS FOR THIS KIND OF STALL (review of
 /// 2026-09-25: it named `--now` for every kind, and `--now` moves only two).
-/// Overdue: `--now` moves it at its next turn end — unless it waits on what
-/// `--now` does not waive (the READY answer, a draft, a box, a hold, work under
-/// the agent), which is named instead. Gave up: `--now` asks it
+/// Overdue: it has stood on the ladder's last rung for hours, which `--now`
+/// is too (ruling 380), so what it waits on is named — a turn running (a
+/// goal that never pauses), the READY answer, a draft, a box, a hold, work
+/// under the agent — and `--now` is offered only where it still moves it
+/// (its own text left typed, a full queue). Blocked (`blocked:*`): no rung
+/// passes it — quit it in its tab and resume it there. Gave up: `--now` asks it
 /// again (at once, where its own next round is at a clock time). Held back in
 /// a pane: typing into the tab cannot reach it, so no word moves it — quit it
 /// in its pane and resume it there, or `--skip`. Refused or failed: the
@@ -1846,6 +2117,49 @@ pub(crate) fn agent_upgrade_stalled(
     use aterm_agent::harness::upgrade_drive::Remedy;
     use aterm_messages::UpgradeWord;
     let clean = |s: &str| atpkg::progress::sanitize_for_tty(s, 64);
+    // A CODEX GOAL THE MOVE PAUSED AND HAS NOT RESUMED (the owner's decision
+    // of 2026-09-28: aterm pauses a goal only for a moment, and never leaves
+    // it paused): a row of its own, whatever became of the move, with the one
+    // hand step. No word of the upgrade's moves it. Worded as the wait it is
+    // — aterm still resumes it where it can — never as a failure, and never
+    // raised while aterm itself holds it as it should (`Row::with_goal`: a
+    // switch open, the paused goal's last turn running; the goal-pause review
+    // of 2026-09-28). One LEFT PAUSED ON PURPOSE — its thread fell into a
+    // sandbox — names the relaunch that brings it out.
+    let goal_row = row.stall(now);
+    if matches!(goal_row.as_deref(), Some("goal-paused" | "goal-sandboxed")) {
+        let tab = clean(&row.tab);
+        let (title, why, step) = if goal_row.as_deref() == Some("goal-sandboxed") {
+            (
+                "Codex goal left paused",
+                "aterm paused this tab's Codex goal to install the new Codex, and leaves it \
+                 paused: its thread fell into a sandbox, where it can neither commit nor push",
+                "quit Codex in the tab, resume the thread with its launch flags (codex resume \
+                 --dangerously-bypass-approvals-and-sandbox <thread>), then type /goal resume",
+            )
+        } else {
+            (
+                "Codex goal still paused",
+                "aterm paused this tab's Codex goal for a moment to install the new Codex, and \
+                 has not been able to resume it yet",
+                "type /goal resume in the tab to go on with the goal now",
+            )
+        };
+        return Message::new(
+            tags::HARNESS,
+            Severity::Warn,
+            placed_title(title, place, ""),
+        )
+        .line(why)
+        .line(step)
+        .line(format!("{place} \u{00b7} {}", clean(&row.move_words())))
+        .line(String::new())
+        .line(format!(
+            "the same in any shell: `aterm harness upgrade {tab} --status`"
+        ))
+        .hold(Hold::Standing)
+        .key(&agent_upgrade_key(&row.tab));
+    }
     // The band's excerpt: a person's words, no code quoting (ruling 270;
     // `` `/exit` ended it `` read as a command to run).
     let why = row
@@ -1917,22 +2231,77 @@ pub(crate) fn agent_upgrade_stalled(
                 "--now` or `--skip",
             )
         }
+        // A ROUND RE-ARMED AFTER A GIVE-UP, ITS OWN WORK HOLDING IT (ruling
+        // 364): a record, and `Upgrade now` moved nothing sooner there — the
+        // agent had answered every notice "not yet, my work still runs". Its
+        // words promised it anyway, and offered the button (round 35, D5).
+        Some(Remedy::Now) if own_work_round(row, now) => (
+            format!(
+                "{now_word} cannot move it past its own work: it moves once that ends or the \
+                 agent stops it; {skip}"
+            ),
+            "--skip",
+        ),
+        // Its own text left typed, backing off (the only other wait `--now`
+        // still moves once the ladder stands at its last rung): tried again
+        // at once. Never "at its next turn end" (the owner, 2026-09-28: a
+        // goal-mode Codex's turns never end).
         Some(Remedy::Now) | None => (
-            format!("{now_word} moves it at its next turn end; {skip}"),
+            format!("{now_word} tries it again at its next pause; {skip}"),
             "--now` or `--skip",
+        ),
+        // A TURN OF THIS TAB'S OWN running in its Codex daemon, hours past
+        // the ladder's last rung: a goal that never pauses (2026-09-28).
+        // Nothing ends that turn for the upgrade. Only where the kernel named
+        // the conversation as this tab's (`goal`, `daemon-turn`: its root's
+        // turn or a subagent's it spawned) is the owner told to pause
+        // anything here — never for a turn aterm could not place
+        // (`daemon-busy`: another tab's goal, or a subagent of this tab's own
+        // it could not name; the reviews of 2026-09-28).
+        // A goal still running hours past the Land rung, where aterm pauses it
+        // for a moment: something kept the pause off (an open save-then-wait
+        // switch, a rest after a move that did not come, a person's hand).
+        Some(Remedy::Waits) if row.wait == "goal" || row.wait.starts_with("goal:") => (
+            format!(
+                "aterm pauses the goal for a moment to move it once nothing else holds the tab, \
+                 and resumes it after; pausing it in this tab moves it now; {skip}"
+            ),
+            "--skip",
+        ),
+        Some(Remedy::Waits) if row.wait == "daemon-turn" => (
+            format!("it moves as soon as this tab's turn is over; {skip}"),
+            "--skip",
+        ),
+        Some(Remedy::Waits) if row.wait == "daemon-busy" => (
+            format!(
+                "it moves once that turn is over, or once aterm can tell it runs in another tab \
+                 (`codex agents` lists the sessions); {skip}"
+            ),
+            "--skip",
         ),
         // The agent's own work is never ended for it. The move comes once that
         // work ends, or once the agent stops it. After a notice, the agent is
-        // asked again every half hour (four notices end in a give-up, a stall
-        // of its own). The line stays under `DETAIL_LINE_CAP`, which clips.
+        // asked again once half an hour has passed — at a pause of its own, a
+        // break or an idle point, never between them: "every 30 minutes" was
+        // said of a session a stop hook kept from pausing for seven hours
+        // (2026-09-27, s-d3346: notices at 13:13 and 20:14), and of tab #1's
+        // 28 silent hours (2026-09-28). Four notices end in a give-up, a stall
+        // of its own. When it was last asked is the record's
+        // (`Row::noticed_at`), said as a clock time, and the last notice says
+        // the give-up comes next ([`asked_again_words`]). The line stays under
+        // `DETAIL_LINE_CAP`, which clips.
         Some(Remedy::Waits) if matches!(row.wait.as_str(), "background" | "not-idle:shell") => {
-            let asked = if matches!(
-                row.phase,
-                aterm_agent::harness::upgrade::Phase::Announced { .. }
-            ) {
-                ", asked again every 30 minutes"
-            } else {
-                ""
+            let asked = match row.phase {
+                aterm_agent::harness::upgrade::Phase::Announced { at_s, asks } => {
+                    asked_again_words(
+                        row.noticed_at,
+                        at_s,
+                        asks,
+                        now,
+                        crate::presence::local_offset_s(),
+                    )
+                }
+                _ => String::new(),
             };
             // No raw wait word (round 18, day four, D3: `past its own work
             // (background)`): the shell line below names the command.
@@ -1944,6 +2313,18 @@ pub(crate) fn agent_upgrade_stalled(
                 "--skip",
             )
         }
+        // ATERM'S OWN FENCE FAILS UNDER THE OWNER'S `--now` (the review of
+        // 2026-09-28): the word is in force and asked for the very notice
+        // aterm cannot type, so the row says whose failure it is, offers no
+        // `Upgrade now` (pressed, it put the same row back at once), and names
+        // what the owner can still do.
+        Some(Remedy::Waits) if row.fence_fails_under_now() => (
+            format!(
+                "{now_word} is already in force; what fails is aterm typing its notice, and it \
+                 tries again at the agent's turn ends; {skip}"
+            ),
+            "--skip",
+        ),
         Some(Remedy::Waits) => (
             format!("{now_word} does not move it past that wait: it moves once that ends; {skip}"),
             "--skip",
@@ -1951,10 +2332,10 @@ pub(crate) fn agent_upgrade_stalled(
         Some(Remedy::AskAgain) => (
             match next_round_clock(row, now) {
                 Some(at) => format!(
-                    "it asks again on its own at {at}; {now_word} asks it at its next turn end; \
+                    "it asks again on its own at {at}; {now_word} asks it at its next pause; \
                      {skip}"
                 ),
-                None => format!("{now_word} asks it again at its next turn end; {skip}"),
+                None => format!("{now_word} asks it again at its next pause; {skip}"),
             },
             "--now` or `--skip",
         ),
@@ -1972,6 +2353,30 @@ pub(crate) fn agent_upgrade_stalled(
         // Never `the harness` (day five, D24): the upgrade asks again, at
         // the clock time its next round starts — the repeating stop's too
         // (D25), or now while its re-armed round is asking.
+        // A WAIT NO RUNG PASSES AND NO PAUSE ENDS (`blocked:*`, the owner's
+        // decision of 2026-09-28: a warning only where something is really
+        // broken): the one way it moves.
+        Some(Remedy::ByHand)
+            if row.stall(now).as_deref() == Some("blocked:no-shell-integration") =>
+        {
+            (
+                format!(
+                    "to move it now, quit Codex in its tab and resume it with the `codex resume` \
+                     line it prints; {skip}"
+                ),
+                "--skip",
+            )
+        }
+        Some(Remedy::ByHand)
+            if row
+                .stall(now)
+                .is_some_and(|stall| stall.starts_with("blocked:")) =>
+        {
+            (
+                format!("to move it now, quit it in its tab and resume it there; {skip}"),
+                "--skip",
+            )
+        }
         Some(Remedy::ByHand) => {
             let when = next_round_clock(row, now).map_or_else(
                 || {
@@ -2030,17 +2435,34 @@ pub(crate) fn agent_upgrade_stalled(
         // A round that stopped and asks again on its own (ruling 283): the
         // upgrade working, said as such.
         _ if resting => format!("{who} upgrade retries later {place}"),
-        Some(Remedy::Now) => placed_title(&format!("{who} upgrade waits"), place, ""),
-        Some(Remedy::Waits) => placed_title(&format!("Couldn't upgrade {who}"), place, " yet"),
+        // Never `… upgrade waits in tab 1` (the owner, 2026-09-28: "What is
+        // this alert about 'Codex upgrade waits in tab 1'??? that is
+        // confusing to me"): a row is shown only once the ladder's last rung
+        // has stood for hours, and then it could not be done yet.
+        Some(Remedy::Now | Remedy::Waits) => {
+            placed_title(&format!("Couldn't upgrade {who}"), place, " yet")
+        }
         _ => placed_title(&format!("Couldn't upgrade {who}"), place, ""),
     };
     // STILL ASKING ON ITS OWN (D5): an announced move on its own work is
-    // asked again every half hour and ends in a give-up — a row of its own —
-    // so until then it is the upgrade working: a record, never the glass.
-    let (severity, hold) = if row.asks_on_its_own(now) {
-        (Severity::Info, Hold::LogOnly)
-    } else {
-        (Severity::Warn, Hold::Standing)
+    // asked again at its breaks and idle points, half an hour apart at the
+    // least, and ends in a give-up, a rest and a new round — so until the
+    // move clock runs out (a day behind, `MOVE_BUDGET_S`, round six F7) it is
+    // the upgrade working: a record, never the glass. One a person holds (a
+    // draft, a box, a hold: F6) is never asked again, and is a row.
+    //
+    // UNLESS THE OWNER ASKED FOR IT (2026-09-28: "when I pressed 'update' in
+    // the claude version update button, nothing seemed to happen?"). Their
+    // `Upgrade now` withdrew the warn row they pressed, and the answer — it
+    // cannot move past the agent's own work yet — went straight to the log in
+    // the same instant, so the press read as nothing. While their word stands
+    // the answer stays on the glass, calm (`Info`): what it waits on, and
+    // that it moves once that ends.
+    let owner_asked = row.request == aterm_agent::harness::upgrade::Request::Now;
+    let (severity, hold) = match (row.asks_on_its_own(now), owner_asked) {
+        (true, false) => (Severity::Info, Hold::LogOnly),
+        (true, true) => (Severity::Info, Hold::Standing),
+        (false, _) => (Severity::Warn, Hold::Standing),
     };
     // WHAT HOLDS IT, by pid, name and age (2026-09-27: the agent's notice
     // named the shells under it, and the owner read only "its own work
@@ -2080,6 +2502,99 @@ fn pane_words(owner: &str) -> String {
     }
 }
 
+/// WHEN AN ANNOUNCED MOVE WAS LAST ASKED, AND WHEN IT IS ASKED AGAIN — from
+/// the record, never a promise (design record 2026-09-28, §1.4 and §3.2 C8).
+/// The row said "asked again every 30 minutes" as a fixed phrase, and on tab
+/// #1 nothing had asked for 28 hours: the re-ask is taken only at the
+/// session's next break or idle point, and a session that offers neither is
+/// asked nothing, whatever the clock says.
+///
+/// * `noticed_at` — when the latest notice was TYPED (`Row::noticed_at`;
+///   `0`: not recorded, and no "last asked" is said). Not `clock_s`: that
+///   one a usage limit's episode and a void's release move on with nothing
+///   asked (review of 2026-09-28: after a limit the row named the episode's
+///   end as a notice's time).
+/// * `clock_s` — the re-ask clock's start (`Phase::Announced::at_s`): the
+///   re-ask is due [`upgrade::REASK_S`] after it.
+/// * `asks` — the notices typed this round. At [`upgrade::MAX_ASKS`] the
+///   step past the clock is the give-up, not a fifth notice (the same
+///   review), and the words say so.
+/// * `offset` — the local zone's ([`crate::presence::local_offset_s`]):
+///   times said on the clock, with the day when it is not today
+///   ([`clock_on_day`]: `yesterday 10:48 AM`, the review's 29-hours-old
+///   notice read as this morning); `None`: said as ages.
+///
+/// So: `, last asked 2:04 PM, asked again at its next break or idle point
+/// from 2:34 PM` while not yet due; `, last asked yesterday 2:04 PM; asks
+/// again at its next break or idle point` once due — nothing can say when a
+/// point comes; `, last asked 2:04 PM (the last of 4 notices); gives up at
+/// its next break or idle point` on the last.
+///
+/// [`upgrade::REASK_S`]: aterm_agent::harness::upgrade::REASK_S
+/// [`upgrade::MAX_ASKS`]: aterm_agent::harness::upgrade::MAX_ASKS
+fn asked_again_words(
+    noticed_at: u64,
+    clock_s: u64,
+    asks: u32,
+    now: u64,
+    offset: Option<i64>,
+) -> String {
+    use aterm_agent::harness::upgrade::{MAX_ASKS, REASK_S, span};
+    const POINT: &str = "at its next break or idle point";
+    let when = |at: u64, ago: bool| match offset {
+        Some(offset) => clock_on_day(at, now, offset),
+        None if ago => format!("{} ago", span(now.saturating_sub(at))),
+        None => format!("in {}", span(at.saturating_sub(now))),
+    };
+    let last = (noticed_at != 0).then(|| when(noticed_at, true));
+    let due = (clock_s != 0)
+        .then(|| clock_s.saturating_add(REASK_S))
+        .filter(|due| now < *due)
+        .map(|due| {
+            if offset.is_some() {
+                format!(" from {}", when(due, false))
+            } else {
+                format!(" {} or later", when(due, false))
+            }
+        });
+    if asks >= MAX_ASKS {
+        let last = last.map_or_else(String::new, |l| format!(", last asked {l}"));
+        let from = due.unwrap_or_default();
+        return format!("{last} (the last of {MAX_ASKS} notices); gives up {POINT}{from}");
+    }
+    match (last, due) {
+        (Some(last), Some(from)) => format!(", last asked {last}, asked again {POINT}{from}"),
+        (Some(last), None) => format!(", last asked {last}; asks again {POINT}"),
+        (None, from) => format!(", asked again {POINT}{}", from.unwrap_or_default()),
+    }
+}
+
+/// `at` (unix seconds) on the reader's clock `offset` from UTC, with its day
+/// when that is not `now`'s: `2:04 PM`, `yesterday 2:04 PM`, `tomorrow 12:10
+/// AM`, else the day as a Messages header says it (`Thursday 2:04 PM`, `Fri,
+/// 18 Sep, 2:04 PM`). A Messages row sits under the day it was POSTED, not
+/// the day of a time it names, so a bare clock time more than a day old reads
+/// as today's (review of 2026-09-28).
+fn clock_on_day(at: u64, now: u64, offset: i64) -> String {
+    use aterm_messages::words::{clock_words, day_heading, local_day};
+    let ms = |s: u64| s.saturating_mul(1000);
+    let clock = clock_words(ms(at), offset);
+    let (day, today) = (local_day(ms(at), offset), local_day(ms(now), offset));
+    match day.saturating_sub(today) {
+        0 => clock,
+        -1 => format!("yesterday {clock}"),
+        1 => format!("tomorrow {clock}"),
+        _ => {
+            let words = day_heading(today, day, true);
+            if words.contains(',') {
+                format!("{words}, {clock}")
+            } else {
+                format!("{words} {clock}")
+            }
+        }
+    }
+}
+
 /// When a stopped round's next one starts, on the person's clock (`4:10 PM`),
 /// or `None` while it is due, not stopped, or held by the owner's word
 /// ([`aterm_agent::harness::upgrade_drive::Row::next_round_in`]). A clock
@@ -2104,6 +2619,251 @@ pub(crate) fn agent_upgrade_key(tab: &str) -> String {
         "{KEY_AGENT_UPGRADE}.{}",
         atpkg::progress::sanitize_for_tty(tab, 64)
     )
+}
+
+/// The key AN AGENT'S ONE ROW for its stalled tabs is posted under
+/// ([`agent_upgrade_stalled_group`]): `harness.upgrades.claude`,
+/// `harness.upgrades.codex`. Never a tab's key: [`agent_upgrade_key_tab`] reads
+/// `None` for it, so the per-tab sweeps leave it alone.
+pub(crate) fn agent_upgrade_group_key(agent: aterm_agent::harness::upgrade::Agent) -> String {
+    let name = match agent {
+        aterm_agent::harness::upgrade::Agent::Claude => "claude",
+        aterm_agent::harness::upgrade::Agent::Codex => "codex",
+    };
+    format!("{KEY_AGENT_UPGRADE}s.{name}")
+}
+
+/// Whether `key` is an agent's one row for its stalled tabs
+/// ([`agent_upgrade_group_key`]).
+pub(crate) fn agent_upgrade_group_key_is(key: &str) -> bool {
+    key.strip_prefix(KEY_AGENT_UPGRADE)
+        .and_then(|rest| rest.strip_prefix("s."))
+        .is_some_and(|agent| matches!(agent, "claude" | "codex"))
+}
+
+/// The STALLS an agent's one row named, read back from its detail's last line
+/// ([`agent_upgrade_stalled_group`]: `… — tabs s-aaa@2.1.284, s-bbb@2.1.284`):
+/// each tab (`s-<hex>`) and the build it was stalled on its way to. What the
+/// window reads a row the owner saw through by, after a restart and in this
+/// process alike, so the same stalls are not posted again — and what keeps a
+/// tab in its agent's row across a restart. A tab named without a build (no
+/// `@`) is read with none, which no stall matches. Empty for a detail that
+/// names none.
+pub(crate) fn agent_upgrade_group_members(detail: &[String]) -> Vec<(String, String)> {
+    detail
+        .iter()
+        .rev()
+        .find_map(|line| line.rsplit_once(GROUP_TABS))
+        .map(|(_, tabs)| {
+            tabs.split(", ")
+                .filter(|t| t.starts_with("s-"))
+                .map(|t| {
+                    let (tab, to) = t.split_once('@').unwrap_or((t, ""));
+                    (tab.to_string(), to.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One stall of an agent's one row, as its last line names it
+/// ([`agent_upgrade_group_members`]): `s-aaa@2.1.284`.
+pub(crate) fn agent_upgrade_group_member(tab: &str, to: &str) -> String {
+    format!(
+        "{}@{}",
+        atpkg::progress::sanitize_for_tty(tab, 64),
+        atpkg::progress::sanitize_for_tty(to, 32)
+    )
+}
+
+/// What opens the list of stalls on an agent's one row's last line.
+const GROUP_TABS: &str = " \u{2014} tabs ";
+
+/// How many of an agent's stalled tabs its one row names a line each: the
+/// rest are counted, and `--status` lists them (the detail holds
+/// `DETAIL_LINES_CAP` lines).
+const GROUP_TABS_NAMED: usize = 12;
+
+/// THE ONE ROW FOR AN AGENT'S STALLED TABS (2026-09-28, the owner: "also fix
+/// this stacking failures of claude upgrades!" — three stalled tabs were three
+/// rows, the band's whole height, each "Couldn't upgrade Claude yet" with its
+/// own buttons). `members`: each stalled tab's row and its place (`in window
+/// 2, tab 1`), any order.
+///
+/// ONE TAB reads as its own row does ([`agent_upgrade_stalled`]), under this
+/// key, its buttons the row's own word for that tab and its shell line naming
+/// the stall it stands for. SEVERAL: the title counts them, in the most
+/// serious of their words — one that could not be done over one that could
+/// not be done yet (`Couldn't upgrade Claude in 3 tabs`, `… in 3 tabs yet`;
+/// never `… upgrade waits in 3 tabs`, ruling 380); the first
+/// line names the tabs, most behind first (`window 2, tab 1 for 26 h · window
+/// 1, tab 2 for 7 h`), the second what the row's own buttons do, and behind
+/// them each tab's own words — its place and move, why it stands, what holds
+/// it — and the shell spelling with every stall, each tab's id and its target
+/// ([`agent_upgrade_group_members`] reads them back). Each button is the word
+/// for exactly the listed tabs that take it ([`Intent::AgentUpgradeTabs`]); a
+/// tab's own menu has its own words.
+pub(crate) fn agent_upgrade_stalled_group(
+    members: &[(&aterm_agent::harness::upgrade_drive::Row, String)],
+    now: u64,
+) -> Option<Message> {
+    use aterm_agent::harness::upgrade_drive::Remedy;
+    use aterm_messages::UpgradeWord;
+    let (first, _) = members.first()?;
+    let agent = first.agent;
+    let key = agent_upgrade_group_key(agent);
+    // ONE TAB LEFT reads as its own row, under the agent's key, with two
+    // differences a person never reads (the review of 2026-09-28): its
+    // buttons are the row's own word for that one tab (so a press answers
+    // THIS row, never a tab's record behind it), and its shell line ends with
+    // the stall it stands for (so the row is read back as the agent's after a
+    // restart, never posted again as the tab's own).
+    if let [(row, place)] = members {
+        let mut msg = agent_upgrade_stalled(row, now, place);
+        msg.key = Some(key);
+        msg.actions = msg
+            .actions
+            .iter()
+            .map(|intent| match intent {
+                Intent::AgentUpgrade { tab, to, word } => Intent::AgentUpgradeTabs {
+                    word: *word,
+                    moves: vec![(tab.clone(), to.clone())],
+                },
+                other => other.clone(),
+            })
+            .collect();
+        if let Some(shell) = msg.detail.last_mut() {
+            shell.push_str(GROUP_TABS);
+            shell.push_str(&agent_upgrade_group_member(&row.tab, &row.to));
+        }
+        return Some(msg);
+    }
+    let clean = |s: &str| atpkg::progress::sanitize_for_tty(s, 64);
+    let who = agent_word(agent);
+    let n = members.len();
+    let mut sorted: Vec<&(&aterm_agent::harness::upgrade_drive::Row, String)> =
+        members.iter().collect();
+    sorted.sort_by_key(|(row, place)| (row.behind_since, place.clone()));
+    // The most serious of their words.
+    let tier = |row: &aterm_agent::harness::upgrade_drive::Row| match row.remedy(now) {
+        Some(Remedy::Now | Remedy::AskAgain) | None => 0,
+        Some(Remedy::Waits) => 1,
+        Some(Remedy::InItsPane | Remedy::ByHand | Remedy::ResumeInTab) => 2,
+    };
+    let title = match sorted.iter().map(|(row, _)| tier(row)).max().unwrap_or(0) {
+        // Never `… upgrade waits in N tabs` (ruling 380, the owner's words
+        // of 2026-09-28: "What is this alert about 'Codex upgrade waits in
+        // tab 1'???"): a row stands only once the ladder's last rung has
+        // stood for hours, and then it could not be done yet — each tab's
+        // own row's words ([`agent_upgrade_stalled`]).
+        0 | 1 => format!("Couldn't upgrade {who} in {n} tabs yet"),
+        _ => format!("Couldn't upgrade {who} in {n} tabs"),
+    };
+    let bare = |place: &str| place.strip_prefix("in ").unwrap_or(place).to_string();
+    let named = sorted
+        .iter()
+        .map(|(row, place)| match row.behind_for(now) {
+            Some(b) => format!("{} for {b}", bare(place)),
+            None => bare(place),
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{00b7} ");
+    // Each button, for exactly the listed tabs that take its word.
+    let takes = |word: UpgradeWord| -> Vec<(String, String)> {
+        sorted
+            .iter()
+            .filter(|(row, _)| agent_upgrade_words(row, now).contains(&word))
+            .map(|(row, _)| (row.tab.clone(), row.to.clone()))
+            .collect()
+    };
+    let words: Vec<(UpgradeWord, Vec<(String, String)>)> = UpgradeWord::ALL
+        .into_iter()
+        .map(|word| (word, takes(word)))
+        .filter(|(_, moves)| !moves.is_empty())
+        .take(2)
+        .collect();
+    // What those buttons do, in the row's own words (ruling 288).
+    let mut does: Vec<String> = Vec::new();
+    for (word, moves) in &words {
+        let k = moves.len();
+        // Two tabs are `both`, never `all 2` (round 35, D4).
+        let which = if k == n && n == 2 {
+            "both".to_string()
+        } else if k == n {
+            format!("all {n}")
+        } else if k == 1 {
+            sorted
+                .iter()
+                .find(|(row, _)| row.tab == moves[0].0)
+                .map_or_else(|| "one".to_string(), |(_, place)| bare(place))
+        } else {
+            format!("{k} of them")
+        };
+        // The tabs `Upgrade now` cannot move, in number.
+        let rest = if n - k == 1 {
+            "the other one moves once what holds it ends".to_string()
+        } else {
+            format!("the other {} move once what holds them ends", n - k)
+        };
+        // At their next PAUSES, as each tab's own row says it (ruling 380:
+        // never "at its next turn end" — a goal-mode Codex's turns never
+        // end).
+        does.push(match word {
+            UpgradeWord::Now if k == n => {
+                format!("{} moves {which} at their next pauses", word.label())
+            }
+            UpgradeWord::Now if k == 1 => {
+                format!("{} moves {which} at its next pause; {rest}", word.label())
+            }
+            UpgradeWord::Now => {
+                format!(
+                    "{} moves {which} at their next pauses; {rest}",
+                    word.label()
+                )
+            }
+            UpgradeWord::NotToday => format!("{} puts {which} off until tomorrow", word.label()),
+            UpgradeWord::Skip => format!("{} keeps {which} where they are", word.label()),
+        });
+    }
+    does.push("for one tab alone, use its tab's menu".to_string());
+    let mut msg = Message::new(tags::HARNESS, Severity::Warn, title)
+        .line(atpkg::progress::sanitize_for_tty(&named, 160))
+        .line(does.join("; "));
+    for (row, place) in sorted.iter().take(GROUP_TABS_NAMED) {
+        let why = row
+            .stall_words(now)
+            .unwrap_or_else(|| "it is not moving".to_string())
+            .replace('`', "");
+        let held = row
+            .held_words(now)
+            .map_or_else(String::new, |w| format!("; held by {w}"));
+        msg = msg.line(atpkg::progress::sanitize_for_tty(
+            &format!(
+                "{} \u{00b7} {}: {why}{held}",
+                bare(place),
+                clean(&row.move_words())
+            ),
+            aterm_messages::DETAIL_LINE_CAP,
+        ));
+    }
+    if n > GROUP_TABS_NAMED {
+        msg = msg.line(format!(
+            "and {} more \u{2014} `aterm harness upgrade --status` lists them",
+            n - GROUP_TABS_NAMED
+        ));
+    }
+    let tabs: Vec<String> = sorted
+        .iter()
+        .map(|(row, _)| agent_upgrade_group_member(&row.tab, &row.to))
+        .collect();
+    msg = msg.line(format!(
+        "the same in any shell: `aterm harness upgrade <tab> --now` or `--skip`{GROUP_TABS}{}",
+        tabs.join(", ")
+    ));
+    for (word, moves) in words {
+        msg = msg.action(Intent::AgentUpgradeTabs { word, moves });
+    }
+    Some(msg.hold(Hold::Standing).key(&key))
 }
 
 /// The tab a key names when it is one tab's [`agent_upgrade_key`] — this
@@ -2164,7 +2924,7 @@ fn stall_lines(d: &[String]) -> Option<(&str, &str)> {
 /// E2): Settings ▸ Messages sets them as a person's words and the rest as
 /// technical lines. One for every record but a tab's upgrade row
 /// ([`agent_upgrade_stalled`]), whose why and next step — `it asks again on
-/// its own at 12:55 AM; Upgrade now asks it at its next turn end; …` — stand
+/// its own at 12:55 AM; Upgrade now asks it at its next pause; …` — stand
 /// above its move line (found by its place, as [`stall_lines`] finds it, so a
 /// refused press's restated row keeps its refusal, why and remedy together).
 /// A record a key does not name, or one with no move line, keeps one.
@@ -2173,6 +2933,14 @@ pub(crate) fn sentence_lines(key: Option<&str>, detail: &[String]) -> usize {
         && let Some(at) = detail.iter().position(|l| strip_place(l).is_some())
     {
         return at.max(1);
+    }
+    // An agent's one row for its stalled tabs: its tabs, and what its buttons
+    // do — one tab's reads as that tab's own row.
+    if key.is_some_and(agent_upgrade_group_key_is) {
+        if let Some(at) = detail.iter().position(|l| strip_place(l).is_some()) {
+            return at.max(1);
+        }
+        return 2.min(detail.len()).max(1);
     }
     1
 }
@@ -2289,6 +3057,14 @@ fn agent_word(agent: aterm_agent::harness::upgrade::Agent) -> &'static str {
     }
 }
 
+/// A ROUND RE-ARMED AFTER A GIVE-UP THAT ITS AGENT'S OWN WORK HOLDS (ruling
+/// 364, `Row::asks_on_its_own`'s pending arm; a usage limit, the other one,
+/// waits anyway): the upgrade working, and no word the owner presses moves it
+/// sooner — the move comes at the end of that work (round 35, D5).
+fn own_work_round(row: &aterm_agent::harness::upgrade_drive::Row, now: u64) -> bool {
+    row.phase == aterm_agent::harness::upgrade::Phase::Pending && row.asks_on_its_own(now)
+}
+
 /// THE OWNER'S WORDS THAT DO SOMETHING FOR THIS UPGRADE (gap #21), most
 /// useful first — the tab menu offers them all, a row its first two (two
 /// authored capsules: `MAX_ACTIONS`). None while a restart is under way or
@@ -2313,6 +3089,13 @@ pub(crate) fn agent_upgrade_words(
         Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
     ) || row.tab.is_empty()
         || row.to.is_empty()
+        // A goal left paused is moved by `/goal resume` alone (or, fallen
+        // into a sandbox, a relaunch by hand): no word of the upgrade's is
+        // offered on its row.
+        || matches!(
+            row.stall(now).as_deref(),
+            Some("goal-paused" | "goal-sandboxed")
+        )
     {
         return Vec::new();
     }
@@ -2324,7 +3107,8 @@ pub(crate) fn agent_upgrade_words(
             !matches!(row.phase, Phase::Failed(_))
                 && row.request != aterm_agent::harness::upgrade::Request::Now
         }
-        Some(Remedy::Now | Remedy::AskAgain) => true,
+        Some(Remedy::Now) => !own_work_round(row, now),
+        Some(Remedy::AskAgain) => true,
         Some(Remedy::Waits | Remedy::InItsPane | Remedy::ByHand | Remedy::ResumeInTab) => false,
     };
     // THE WORD IN FORCE IS NOT OFFERED AGAIN (ruling 270; day three: the
@@ -2392,9 +3176,14 @@ pub(crate) fn agent_upgrade_worded(
             format!("{who} is asked again {place}"),
             format!("the upgrade's question is typed once more; it moves when {who} reads it"),
         ),
+        // The ladder's last rung (ruling 380): the first pause, never "when
+        // its turn ends" — a goal-mode Codex's turns never end.
         UpgradeWord::Now => (
-            format!("{who} moves when its turn ends"),
-            format!("the wait for a quiet tab is waived; it still waits for {who} to go idle"),
+            format!("{who} moves at its next pause"),
+            format!(
+                "the wait for a quiet tab is waived; it still waits for {who} to go idle, and \
+                 never moves over typing, a draft, a dialog or running work"
+            ),
         ),
         UpgradeWord::NotToday => (
             format!("{who} stays on {from} until tomorrow"),
@@ -2410,6 +3199,142 @@ pub(crate) fn agent_upgrade_worded(
         .line(format!("{place} \u{00b7} {}", clean(&row.move_words())))
         .hold(Hold::LogOnly)
         .key(&agent_upgrade_key(&row.tab))
+}
+
+/// WHAT THE OWNER'S WORD ON AN AGENT'S ONE ROW ASKED
+/// ([`agent_upgrade_stalled_group`], [`Intent::AgentUpgradeTabs`]): the words
+/// the row is ANSWERED with, of the `n` tabs that took the word — `Claude
+/// waits until tomorrow in 3 tabs`, `Claude skips this build in 3 tabs`,
+/// `Claude moves in 3 tabs when idle` — never a `✓`: a choice is not delivered
+/// work, and `Upgrade now` has moved nothing yet. What each tab's word did is
+/// that tab's own record ([`agent_upgrade_worded`]).
+pub(crate) fn agent_upgrade_group_worded(
+    agent: aterm_agent::harness::upgrade::Agent,
+    word: aterm_messages::UpgradeWord,
+    n: usize,
+) -> Message {
+    use aterm_messages::UpgradeWord;
+    let who = agent_word(agent);
+    let tabs = if n == 1 {
+        "in 1 tab".to_string()
+    } else {
+        format!("in {n} tabs")
+    };
+    let (title, then) = match word {
+        UpgradeWord::Now => (
+            format!("{who} moves {tabs} when idle"),
+            "the wait for a quiet tab is waived; each still waits for its agent to go idle",
+        ),
+        UpgradeWord::NotToday => (
+            format!("{who} waits until tomorrow {tabs}"),
+            "the upgrade asks each again this time tomorrow",
+        ),
+        UpgradeWord::Skip => (
+            format!("{who} skips this build {tabs}"),
+            "each stays where it is until a newer build comes",
+        ),
+    };
+    Message::new(tags::HARNESS, Severity::Info, title)
+        .line(then)
+        .hold(Hold::LogOnly)
+        .key(&agent_upgrade_group_key(agent))
+}
+
+/// AN AGENT'S ONE ROW'S STALLS ENDED WHILE THE ROW WAS DOWN (the review of
+/// 2026-09-28; [`agent_upgrade_stall_over`] for one tab's row): the owner read
+/// or dismissed the row, and no tab it named stalls in it any more. The log's
+/// last word under the agent's key would stay the owner's read, and the same
+/// stalls coming back — the same tabs overdue again, days later — would be
+/// taken for the row already seen and never shown. This RECORD, under the
+/// row's own key, is their end: the same stalls back are news. `detail` is
+/// the row's: its title is kept as what it was, with the tabs it named.
+pub(crate) fn agent_upgrade_group_over(
+    agent: aterm_agent::harness::upgrade::Agent,
+    title: &str,
+    detail: &[String],
+) -> Message {
+    let who = agent_word(agent);
+    let n = agent_upgrade_group_members(detail).len().max(1);
+    let tabs = if n == 1 {
+        "in 1 tab".to_string()
+    } else {
+        format!("in {n} tabs")
+    };
+    let mut msg = Message::new(
+        tags::HARNESS,
+        Severity::Info,
+        format!("{who} upgrade wait ended {tabs}"),
+    )
+    .line(format!(
+        "was: {}",
+        atpkg::progress::sanitize_for_tty(title, 120)
+    ));
+    if let Some(first) = detail.first() {
+        msg = msg.line(first.clone());
+    }
+    msg.hold(Hold::LogOnly).key(&agent_upgrade_group_key(agent))
+}
+
+/// The finished words of an agent's one row whose tabs all moved (the review
+/// of 2026-09-28; day five's D26 for one tab's row,
+/// [`agent_upgrade_went_through`]): `Claude upgraded in 3 tabs` — or, one tab,
+/// that tab's own words — the `✓` record's title in the log, never the row's
+/// `⚠ Couldn't upgrade …` beside the success records.
+pub(crate) fn agent_upgrade_group_went_through(
+    agent: aterm_agent::harness::upgrade::Agent,
+    n: usize,
+    place: Option<&str>,
+) -> String {
+    let who = agent_word(agent);
+    match (n, place) {
+        (1, Some(place)) => format!("{who} upgraded {place}"),
+        (1, None) => format!("{who} upgraded in 1 tab"),
+        _ => format!("{who} upgraded in {n} tabs"),
+    }
+}
+
+/// THE OWNER'S WORD ON AN AGENT'S ONE ROW, REFUSED FOR EVERY TAB IT WAS SENT
+/// FOR (the review of 2026-09-28): nothing was written for any of the `n`
+/// tabs, and why — the first tab's refusal (`why`), in the words one tab's
+/// row takes ([`agent_upgrade_word_refused`]; `to`, the build the row named,
+/// for a skip's title). The row pressed takes these words above its own and
+/// keeps its buttons, as one tab's row does; with no live row, one
+/// gesture-failure row for the press — never a row per tab stacked under it.
+pub(crate) fn agent_upgrade_group_word_refused(
+    agent: aterm_agent::harness::upgrade::Agent,
+    word: aterm_messages::UpgradeWord,
+    n: usize,
+    (to, why): (&str, &str),
+) -> Message {
+    let tabs = if n == 1 {
+        "in 1 tab".to_string()
+    } else {
+        format!("in {n} tabs")
+    };
+    let mut msg = agent_upgrade_word_refused(word, agent, ("", to), why, &tabs);
+    msg.key = Some(agent_upgrade_group_key(agent));
+    msg
+}
+
+/// The line an ANSWERED agent's row carries for the tabs its word was not
+/// written for (`n` of them), and why — the first refusal's remedy, in the
+/// words one tab's row takes ([`agent_upgrade_word_refused`]).
+pub(crate) fn agent_upgrade_group_word_refused_line(
+    agent: aterm_agent::harness::upgrade::Agent,
+    word: aterm_messages::UpgradeWord,
+    n: usize,
+    why: &str,
+) -> String {
+    let refused = agent_upgrade_group_word_refused(agent, word, n, ("", why));
+    let tabs = if n == 1 {
+        "1 tab".to_string()
+    } else {
+        format!("{n} tabs")
+    };
+    match refused.detail.first() {
+        Some(reason) => format!("not written for {tabs}: {reason}"),
+        None => format!("not written for {tabs}"),
+    }
 }
 
 /// THE OWNER'S WORD REFUSED (gap #21): nothing was written, and why — another
@@ -2850,6 +3775,101 @@ mod tests {
         assert!(msg.detail.iter().all(|l| !l.starts_with("held by")));
     }
 
+    /// "ASKED AGAIN EVERY 30 MINUTES" IS NEVER A FIXED PHRASE (design record
+    /// 2026-09-28, §1.4): tab #1's row said it for 28 hours in which nothing
+    /// asked. The words come from the record: when the latest notice was
+    /// typed, with its day once that is not today; while the re-ask is not
+    /// yet due, the time it becomes due, taken at the next break or idle
+    /// point; once due, only that the next point asks — never an interval;
+    /// and on the last notice, that the next point gives up. What would have
+    /// caught the old phrase: every form below says when it was last asked
+    /// and none says "every".
+    #[test]
+    fn the_asked_again_words_come_from_the_record_never_a_cadence() {
+        use aterm_agent::harness::upgrade::{MAX_ASKS, REASK_S};
+        // 2026-09-27 17:48:00 UTC; the zone at UTC and at PDT (-7 h).
+        const AT: u64 = 1_790_531_280;
+        let words = |noticed: u64, clock: u64, now: u64, offset: Option<i64>| {
+            super::asked_again_words(noticed, clock, 2, now, offset)
+        };
+        assert_eq!(
+            words(AT, AT, AT + 600, Some(0)),
+            ", last asked 5:48 PM, asked again at its next break or idle point from 6:18 PM"
+        );
+        assert_eq!(
+            words(AT, AT, AT + 600, Some(-7 * 3_600)),
+            ", last asked 10:48 AM, asked again at its next break or idle point from 11:18 AM"
+        );
+        // Due: no promise of when.
+        assert_eq!(
+            words(AT, AT, AT + REASK_S, Some(0)),
+            ", last asked 5:48 PM; asks again at its next break or idle point"
+        );
+        // A DAY ON (review of 2026-09-28): tab #1's notice, read 28 hours
+        // later, is yesterday's — a bare `5:48 PM` under today's header read
+        // as this afternoon. Further back, the day as a header says it.
+        assert_eq!(
+            words(AT, AT, AT + 28 * 3_600, Some(0)),
+            ", last asked yesterday 5:48 PM; asks again at its next break or idle point"
+        );
+        assert!(
+            words(AT, AT, AT + 3 * 86_400, Some(0)).starts_with(", last asked Sunday 5:48 PM;"),
+            "{}",
+            words(AT, AT, AT + 3 * 86_400, Some(0))
+        );
+        assert!(
+            words(AT, AT, AT + 30 * 86_400, Some(0))
+                .starts_with(", last asked Sun, 27 Sep, 5:48 PM;"),
+            "{}",
+            words(AT, AT, AT + 30 * 86_400, Some(0))
+        );
+        // No zone: said as ages.
+        assert_eq!(
+            words(AT, AT, AT + 600, None),
+            ", last asked 10m ago, asked again at its next break or idle point in 20m or later"
+        );
+        assert_eq!(
+            words(AT, AT, AT + 28 * 3_600, None),
+            ", last asked 1d4h ago; asks again at its next break or idle point"
+        );
+        // An unknown notice time names none.
+        assert_eq!(
+            words(0, 0, AT, Some(0)),
+            ", asked again at its next break or idle point"
+        );
+        // A LIMIT'S EPISODE MOVES THE CLOCK, NOT THE NOTICE (review of
+        // 2026-09-28): typed at 17:48, the limit's episode closed at 21:58
+        // and held the clock to then. The row names the notice's time, and
+        // the re-ask's due time from the held clock.
+        let held = AT + 4 * 3_600 + 600;
+        assert_eq!(
+            words(AT, held, held + 60, Some(0)),
+            ", last asked 5:48 PM, asked again at its next break or idle point from 10:28 PM"
+        );
+        // THE LAST NOTICE (same review): the step past its clock is the
+        // give-up, never a fifth notice.
+        assert_eq!(
+            super::asked_again_words(AT, AT, MAX_ASKS, AT + 600, Some(0)),
+            ", last asked 5:48 PM (the last of 4 notices); gives up at its next break or \
+             idle point from 6:18 PM"
+        );
+        assert_eq!(
+            super::asked_again_words(AT, AT, MAX_ASKS, AT + REASK_S, Some(0)),
+            ", last asked 5:48 PM (the last of 4 notices); gives up at its next break or \
+             idle point"
+        );
+        for now in [AT + 600, AT + REASK_S, AT + 28 * 3_600] {
+            for offset in [Some(0), None] {
+                for asks in [1, MAX_ASKS] {
+                    let w = super::asked_again_words(AT, AT, asks, now, offset);
+                    assert!(!w.contains("every"), "{w}");
+                    assert!(w.contains("last asked"), "{w}");
+                    assert_eq!(w.contains("gives up"), asks == MAX_ASKS, "{w}");
+                }
+            }
+        }
+    }
+
     /// THE STALLED ROW NAMES THE REMEDY THAT MOVES ITS KIND OF STALL (review
     /// of 2026-09-25: `--now` was named for all five kinds, and it moves two —
     /// a held-back agent is never reached, a refused or failed one stays
@@ -2866,13 +3886,16 @@ mod tests {
             to: "2.1.282".into(),
             phase: Phase::Pending,
             behind_since: NOW - 60,
+            noticed_at: NOW - 3_600,
             ..Row::default()
         };
         let remedy = |phase: Phase, wait: &str, behind: u64| {
             // Round 18 (D2/D4): a move still waiting says so; one that
-            // stopped or cannot be reached could not be done.
+            // stopped or cannot be reached could not be done. Ruling 380
+            // (the owner, 2026-09-28): never `… upgrade waits in tab 2` — a
+            // waiting row is shown only once the ladder's last rung has
+            // stood for hours, and then it could not be done YET.
             let waits = !matches!(phase, Phase::Failed(_)) && !wait.starts_with("terminal:");
-            let now_moves = waits && wait == "not-idle:busy";
             // Ruling 283: a round that stopped once (not refused) or gave
             // up asks again on its own — it retries later.
             let resting = matches!(&phase, Phase::Failed(why)
@@ -2891,8 +3914,6 @@ mod tests {
                 msg.title,
                 if resting {
                     "Claude upgrade retries later in tab 2"
-                } else if now_moves {
-                    "Claude upgrade waits in tab 2"
                 } else if waits {
                     "Couldn't upgrade Claude in tab 2 yet"
                 } else {
@@ -2919,29 +3940,97 @@ mod tests {
         };
         let shell =
             |words: &str| format!("the same in any shell: `aterm harness upgrade {tab} {words}`");
+        // Overdue on a turn still running (ruling 380): hours on the ladder's
+        // last rung, which `--now` is too — it is not named as moving it, and
+        // never "at its next turn end" (a goal-mode session's turns never
+        // end: the owner's tab, 2026-09-28).
         assert_eq!(
             remedy(Phase::Pending, "not-idle:busy", 7 * 3_600),
             (
-                "Upgrade now moves it at its next turn end; Skip This Version in the tab's menu \
-                 keeps it on 2.1.281"
+                "Upgrade now does not move it past that wait: it moves once that ends; Skip \
+                 version keeps it on 2.1.281"
+                    .to_string(),
+                shell("--skip")
+            ),
+            "overdue: the row's own buttons, the shell's spelling last"
+        );
+        // What `--now` still moves: the lane's own text left typed, tried
+        // again at once.
+        assert_eq!(
+            remedy(Phase::Pending, "left-typed-backoff", 7 * 3_600),
+            (
+                "Upgrade now tries it again at its next pause; Skip This Version in the tab's \
+                 menu keeps it on 2.1.281"
                     .to_string(),
                 shell("--now` or `--skip")
             ),
-            "overdue: the row's own buttons, the shell's spelling last"
+            "overdue, left typed"
         );
         assert_eq!(
             remedy(Phase::Failed("unanswered".into()), "", 60),
             (
-                "Upgrade now asks it again at its next turn end; Skip This Version in the tab's \
+                "Upgrade now asks it again at its next pause; Skip This Version in the tab's \
                  menu keeps it on 2.1.281"
                     .to_string(),
                 shell("--now` or `--skip")
             ),
             "gave up"
         );
+        // A wait no rung passes (ruling 380, `blocked:*`): what is wrong, said
+        // plainly, and the one way it moves — having blocked the move a
+        // re-ask's interval, whatever other wait the last look found.
+        let blocked = super::agent_upgrade_stalled(
+            &Row {
+                wait: "daemon-turn".into(),
+                wait_since: NOW - 60,
+                blocked: "no-shell-integration".into(),
+                blocked_since: NOW - 1_800,
+                agent: aterm_agent::harness::upgrade::Agent::Codex,
+                ..base.clone()
+            },
+            NOW,
+            "in tab 2",
+        );
+        assert_eq!(blocked.title, "Couldn't upgrade Codex in tab 2");
+        assert_eq!(
+            (blocked.severity, blocked.hold),
+            (Severity::Warn, Hold::Standing)
+        );
+        assert!(
+            blocked.detail[0].starts_with(
+                "its tab's shell integration is not reaching aterm (as after an aterm update)"
+            ),
+            "{:?}",
+            blocked.detail
+        );
+        assert_eq!(
+            blocked.detail[1],
+            "to move it now, quit Codex in its tab and resume it with the `codex resume` line it \
+             prints; Skip version keeps it on 2.1.281"
+        );
+        let unreadable = super::agent_upgrade_stalled(
+            &Row {
+                wait: "screen-unreadable".into(),
+                wait_since: NOW - 1_800,
+                blocked: "screen-unreadable".into(),
+                blocked_since: NOW - 1_800,
+                agent: aterm_agent::harness::upgrade::Agent::Codex,
+                ..base.clone()
+            },
+            NOW,
+            "in tab 2",
+        );
+        assert_eq!(
+            unreadable.detail[1],
+            "to move it now, quit it in its tab and resume it there; Skip version keeps it on \
+             2.1.281"
+        );
         // The agent's own work under it (2026-09-26: a tab behind poll loops
         // that could never end read "it moves once that ends"). `--now` is not
-        // named as moving it. The agent stopping the work does.
+        // named as moving it. The agent stopping the work does. When it was
+        // last asked is the record's, and no cadence is promised (design
+        // record 2026-09-28: "asked again every 30 minutes" stood over a tab
+        // nothing had asked for 28 hours).
         for wait in ["background", "not-idle:shell"] {
             let working = remedy(
                 Phase::Announced {
@@ -2951,19 +4040,32 @@ mod tests {
                 wait,
                 7 * 3_600,
             );
+            let asked = super::asked_again_words(
+                NOW - 3_600,
+                NOW - 3_600,
+                2,
+                NOW,
+                crate::presence::local_offset_s(),
+            );
+            assert!(
+                asked.ends_with("; asks again at its next break or idle point"),
+                "{asked}"
+            );
             assert_eq!(
                 working,
                 (
-                    "Upgrade now cannot move it past its own work: it moves once that ends or \
-                     the agent stops it, asked again every 30 minutes; Skip version keeps it on \
-                     2.1.281"
-                        .to_string(),
+                    format!(
+                        "Upgrade now cannot move it past its own work: it moves once that ends \
+                         or the agent stops it{asked}; Skip version keeps it on 2.1.281"
+                    ),
                     shell("--skip")
                 ),
                 "{wait}"
             );
             assert!(working.0.chars().count() <= aterm_messages::DETAIL_LINE_CAP);
             assert!(!working.0.contains("now moves"), "{working:?}");
+            // The old fixed phrase is gone.
+            assert!(!working.0.contains("every 30 minutes"), "{working:?}");
         }
         // Before any notice, nothing is said of asking again.
         let (pending, _) = remedy(Phase::Pending, "not-idle:shell", 7 * 3_600);
@@ -3327,9 +4429,11 @@ mod tests {
 
     /// AN UPGRADE STILL ASKING ON ITS OWN IS A RECORD (round 18, day four,
     /// D5): an announced move on the agent's own work is asked again every
-    /// half hour and ends in a give-up of its own, so it stands on no glass.
-    /// NEGATIVE CONTROL: the same wait before any notice, and a turn still
-    /// running, are rows.
+    /// half hour and ends in a give-up of its own, so it stands on no glass —
+    /// and so, since ruling 380 (the owner, 2026-09-28), does an announced
+    /// move whose turn is still running: `--now` is the ladder's last rung,
+    /// where it has stood for hours, and moves it no sooner. NEGATIVE
+    /// CONTROL: the same waits before any notice are rows.
     #[test]
     fn an_upgrade_still_asking_on_its_own_is_a_record() {
         use aterm_agent::harness::upgrade::Phase;
@@ -3359,19 +4463,122 @@ mod tests {
             let msg = super::agent_upgrade_stalled(&limited, NOW, "in tab 2");
             assert_eq!((msg.severity, msg.hold), (Severity::Info, Hold::LogOnly));
         }
-        for (phase, wait) in [(Phase::Pending, "background"), (asked, "not-idle:busy")] {
-            let msg = super::agent_upgrade_stalled(&row(phase, wait), NOW, "in tab 2");
+        let turn = super::agent_upgrade_stalled(&row(asked, "not-idle:busy"), NOW, "in tab 2");
+        assert_eq!((turn.severity, turn.hold), (Severity::Info, Hold::LogOnly));
+        for wait in ["background", "not-idle:busy"] {
+            let msg = super::agent_upgrade_stalled(&row(Phase::Pending, wait), NOW, "in tab 2");
             assert_eq!(msg.hold, Hold::Standing, "{wait}");
         }
+    }
+
+    /// THE OWNER'S `Upgrade now` IS ANSWERED ON THE GLASS (2026-09-28: "when I
+    /// pressed 'update' in the claude version update button, nothing seemed
+    /// to happen?"). The press answers its row in place, and `--now` quiets
+    /// the stall for `NOW_QUIETS_S`; after that the host posts the tab's
+    /// stall again, and a move waiting on the agent's own work — which
+    /// `--now` does not waive — was a record posted and folded in the same
+    /// millisecond (messages.log, ids 64 and 66), withdrawing the answered
+    /// row under the same key. The owner's word still stood; nothing on the
+    /// glass said so. While it stands the answer is a calm standing row that
+    /// says what it waits on; with no word it stays a record (D5).
+    ///
+    /// FAILS WITHOUT THE FIX: the hurried row is `LogOnly`, as the unasked
+    /// one is.
+    #[test]
+    fn the_owners_upgrade_now_is_answered_on_the_glass() {
+        use aterm_agent::harness::upgrade::{Phase, Request};
+        use aterm_agent::harness::upgrade_drive::Row;
+        const NOW: u64 = 1_790_311_076;
+        let row = |request: Request| Row {
+            tab: "s-b5cf2faabac5ce5127bd".into(),
+            from: "2.1.280".into(),
+            to: "2.1.284".into(),
+            phase: Phase::Announced {
+                at_s: NOW - 600,
+                asks: 3,
+            },
+            wait: "background".into(),
+            // Inside the move clock (`MOVE_BUDGET_S`): past it the stall is a
+            // row whoever asked (below).
+            behind_since: NOW - 8 * 3_600,
+            request,
+            // Pressed longer ago than `--now` quiets a stall
+            // (`NOW_QUIETS_S`, which is `REASK_S`): the stall is back, and so is
+            // the host's row.
+            request_at: NOW - aterm_agent::harness::upgrade::REASK_S - 60,
+            ..Row::default()
+        };
+        let hurried = row(Request::Now);
+        assert!(hurried.asks_on_its_own(NOW), "still the upgrade working");
+        let msg = super::agent_upgrade_stalled(&hurried, NOW, "in tab 1");
+        assert_eq!((msg.severity, msg.hold), (Severity::Info, Hold::Standing));
+        assert!(
+            msg.detail[1].contains("cannot move it past its own work"),
+            "it says why the press did not move it: {:?}",
+            msg.detail
+        );
+        // NEGATIVE CONTROL: no word from the owner, the same wait — a record.
+        let msg = super::agent_upgrade_stalled(&row(Request::None), NOW, "in tab 1");
+        assert_eq!((msg.severity, msg.hold), (Severity::Info, Hold::LogOnly));
+    }
+
+    /// THE OWNER'S PRESS IS NOT WITHDRAWN BY THE ROUND'S GIVE-UP (round six,
+    /// F7): tab #1, three days behind its own never-ending work, the owner
+    /// pressed `Upgrade now`, the round gave up — which spends the word
+    /// (`St::give_up`) — and the next post under the tab's key was a log
+    /// record that replaced the standing answer: nothing on the glass said
+    /// the press was given up on, or that the tab was still behind. Past the
+    /// move clock (`MOVE_BUDGET_S`) it is a warn row with its mark, asked or
+    /// not.
+    ///
+    /// FAILS WITHOUT THE FIX: `Hold::LogOnly`.
+    #[test]
+    fn a_give_up_after_the_owners_press_stays_on_the_glass() {
+        use aterm_agent::harness::upgrade::{GAVE_UP, Phase, Request};
+        use aterm_agent::harness::upgrade_drive::Row;
+        const NOW: u64 = 1_790_311_076;
+        let hurried = Row {
+            tab: "s-b5cf2faabac5ce5127bd".into(),
+            from: "2.1.280".into(),
+            to: "2.1.284".into(),
+            phase: Phase::Announced {
+                at_s: NOW - 600,
+                asks: 3,
+            },
+            wait: "background".into(),
+            behind_since: NOW - 3 * 86_400,
+            request: Request::Now,
+            request_at: NOW - aterm_agent::harness::upgrade::REASK_S - 60,
+            ..Row::default()
+        };
+        let msg = super::agent_upgrade_stalled(&hurried, NOW, "in tab 1");
+        assert_eq!(msg.hold, Hold::Standing, "the press is answered");
+        // What `St::give_up` does: the round stops, the word is spent.
+        let gave_up = Row {
+            phase: Phase::Failed(GAVE_UP.into()),
+            streak_why: GAVE_UP.into(),
+            stop_streak: 1,
+            wait: "failed".into(),
+            request: Request::None,
+            request_at: 0,
+            ..hurried
+        };
+        let msg = super::agent_upgrade_stalled(&gave_up, NOW, "in tab 1");
+        assert_eq!(
+            (msg.severity, msg.hold),
+            (Severity::Warn, Hold::Standing),
+            "three days behind after the owner's press stays on the glass"
+        );
     }
 
     /// THE STALLED ROW CARRIES THE OWNER'S WORDS THAT MOVE IT (gap #21: the
     /// owner could steer an upgrade only by typing `aterm harness upgrade
     /// <tab> --now|--defer|--skip` into another shell). Two capsules, for
     /// THIS tab and THIS build: `Upgrade now` + `Not today` where `--now`
-    /// moves it (overdue on a turn end, gave up — and a healthy wait, the
-    /// waiting record's), `Not today` + `Skip version` where it would not
-    /// (waiting on the READY answer, in a pane, stopped for good, or already
+    /// moves it (gave up — and a healthy wait, the waiting record's, which it
+    /// stands at the ladder's last rung), `Not today` + `Skip version` where
+    /// it would not (overdue on a turn still running: hours on that rung
+    /// already, ruling 380; waiting on the READY answer, in a pane, stopped for good, or already
     /// hurried by the owner's `--now` — a second press would only arm a new
     /// round); none once
     /// a restart is under way or done, where the harness refuses a word. The
@@ -3411,7 +4618,7 @@ mod tests {
             (
                 "overdue",
                 row(Phase::Pending, "not-idle:busy", 7 * 3_600),
-                &[Now, NotToday, Skip],
+                &[NotToday, Skip],
             ),
             (
                 "gave up",
@@ -3590,9 +4797,48 @@ mod tests {
                             "/Users/_an/Library/Logs/aterm/aterm.log",
                         )),
                         relaunching,
+                        PanesWithoutFolder::NONE,
                     ));
                 }
             }
+        }
+        // A pane whose folder no shell could start in (audit #7 finding 48):
+        // the reopened line that counts it, and each fault's row; and a pane
+        // a program held whose folder is not here (audit #8).
+        for (gone, unasked) in [(1, 0), (2, 0), (0, 1)] {
+            all.push(journal_reopened_message(
+                &reopened_fixture(crate::crash_journal::DeathClass::Killed),
+                None,
+                None,
+                None,
+                false,
+                PanesWithoutFolder { gone, unasked },
+            ));
+        }
+        for class in [
+            crate::crash_journal::DeathClass::Killed,
+            crate::crash_journal::DeathClass::Signal,
+        ] {
+            for reopened in [
+                reopened_with_programs(class, &[]),
+                reopened_with_agent(class, &[]),
+            ] {
+                all.push(journal_reopened_message(
+                    &reopened,
+                    None,
+                    None,
+                    None,
+                    true,
+                    PanesWithoutFolder {
+                        gone: 1,
+                        unasked: 0,
+                    },
+                ));
+            }
+        }
+        for fault in crate::spawn_folder::Fault::ALL {
+            all.push(folder_row(fault, &named(&["/Users/_an/src/old"])));
+            all.push(folder_row(fault, &named(&["/a", "/b"])));
         }
         for note in journal_note_fixtures() {
             all.push(journal_note_message(
@@ -3710,6 +4956,35 @@ mod tests {
             &["2.1.282", "2.1.283"],
         ));
         all.extend(agent_upgrade_waiting("Codex", &["0.157.1"]));
+        // One session's record (ruling 380), by its tab and in a second
+        // window, Claude Code's longer product name included.
+        for (agent, from, to) in [
+            (
+                aterm_agent::harness::upgrade::Agent::Codex,
+                "0.157.1",
+                "0.158.0",
+            ),
+            (
+                aterm_agent::harness::upgrade::Agent::Claude,
+                "2.1.282",
+                "2.1.283",
+            ),
+        ] {
+            for place in ["in tab 1", "in window 2, tab 11"] {
+                all.push(agent_upgrade_waiting_in(
+                    &aterm_agent::harness::upgrade_drive::Row {
+                        tab: "s-09205e59a0bbd30464d4".into(),
+                        from: from.into(),
+                        to: to.into(),
+                        agent,
+                        phase: aterm_agent::harness::upgrade::Phase::Pending,
+                        behind_since: 1_790_572_868,
+                        ..Default::default()
+                    },
+                    place,
+                ));
+            }
+        }
         let upgrade = aterm_agent::harness::upgrade_drive::Row {
             tab: "s-b5cf2faabac5ce5127bd".into(),
             from: "2.1.281".into(),
@@ -4021,6 +5296,211 @@ mod tests {
                 .iter()
                 .all(|l| l.chars().count() <= aterm_messages::DETAIL_LINE_CAP)
         );
+    }
+
+    /// The folders a row names, as the fold keeps them.
+    fn named(dirs: &[&str]) -> crate::spawn_folder::Named {
+        crate::spawn_folder::Named {
+            dirs: dirs.iter().map(|dir| (*dir).to_owned()).collect(),
+            unnamed: 0,
+        }
+    }
+
+    /// AUDIT #7 FINDING 48 — a shell that started in the home folder because
+    /// its folder was gone is ONE warning row, keyed, in the failure grammar,
+    /// saying where the shell is instead and naming the folder; several
+    /// folders are counted in the title and named one per line, and past the
+    /// line cap the rest are counted. A folder that could not be entered has
+    /// its own row and words. On the glass by the attention rule: the shell is
+    /// not where the person asked.
+    #[test]
+    fn a_shell_in_the_home_folder_is_one_row_naming_every_folder_per_fault() {
+        use crate::spawn_folder::Fault;
+        let one = folder_row(Fault::Missing, &named(&["/Users/_an/src/old"]));
+        assert_eq!(one.title, "Couldn't find the folder");
+        assert_eq!(one.severity, Severity::Warn);
+        assert_eq!(
+            one.detail,
+            ["opened in your home folder instead of /Users/_an/src/old"]
+        );
+        assert_eq!(one.key.as_deref(), Some(KEY_FOLDER_NOT_FOUND));
+        assert_eq!(attention(&one), Ok(Attention::Failure));
+
+        let three = folder_row(Fault::Missing, &named(&["/a", "/b", "/c"]));
+        assert_eq!(three.title, "Couldn't find 3 folders");
+        assert_eq!(
+            three.detail,
+            ["opened in your home folder instead", "/a", "/b", "/c"]
+        );
+        assert_eq!(three.key, one.key, "one row, however many folders");
+        assert_eq!(attention(&three), Ok(Attention::Failure));
+
+        let many: Vec<String> = (0..40).map(|i| format!("/gone/{i}")).collect();
+        let dirs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let row = folder_row(Fault::Missing, &named(&dirs));
+        assert_eq!(row.title, "Couldn't find 40 folders");
+        assert_eq!(row.detail.len(), DETAIL_LINES_CAP);
+        assert_eq!(row.detail.last().map(String::as_str), Some("and 18 more"));
+
+        let shut = folder_row(Fault::Shut, &named(&["/srv/locked"]));
+        assert_eq!(shut.title, "Couldn't open the folder");
+        assert_eq!(
+            shut.detail,
+            ["opened in your home folder instead of /srv/locked"]
+        );
+        assert_eq!(shut.key.as_deref(), Some(KEY_FOLDER_NOT_OPENED));
+        assert_eq!(attention(&shut), Ok(Attention::Failure));
+        let two = folder_row(Fault::Shut, &named(&["/a", "/b"]));
+        assert_eq!(two.title, "Couldn't open 2 folders");
+    }
+
+    /// A ROW READS BACK AS THE FOLDERS IT NAMES — how a row carried across an
+    /// update keeps them when the next folder joins it: one folder, several,
+    /// past the line cap (the named ones and the count), a folder with a space
+    /// and one longer than a line. The negative control is a row of another
+    /// shape.
+    #[test]
+    fn a_folder_row_reads_back_as_the_folders_it_names() {
+        use crate::spawn_folder::{Fault, Named};
+        let long = format!("/deep/{}", "d".repeat(300));
+        let many: Vec<String> = (0..40).map(|i| format!("/gone/{i}")).collect();
+        let cases = [
+            named(&["/Users/_an/src/old"]),
+            named(&["/Users/_an/My Projects/old"]),
+            named(&["/a", "/b", "/c"]),
+            named(&[long.as_str()]),
+            Named {
+                dirs: many[..22].to_vec(),
+                unnamed: 18,
+            },
+        ];
+        for case in cases {
+            for fault in Fault::ALL {
+                assert_eq!(
+                    folder_row_named(&folder_row(fault, &case)),
+                    Some(case.clone())
+                );
+            }
+        }
+        let past_the_cap = named(&many.iter().map(String::as_str).collect::<Vec<_>>());
+        let back = folder_row_named(&folder_row(Fault::Missing, &past_the_cap)).expect("reads");
+        assert_eq!((back.dirs.len(), back.unnamed), (22, 18));
+        assert_eq!(folder_row_named(&restored_tab_failed("x")), None);
+    }
+
+    /// AUDIT #7 FINDING 48 — the reopened layout's restored line COUNTS the
+    /// panes that could not open their folder instead of claiming every tab
+    /// came back in its folder; the rest of the row is unchanged. The
+    /// negative control is the line with none. A pane a program held whose
+    /// folder is not here (audit #8) is not counted, and the line then claims
+    /// no folders: its shell started in the default folder.
+    #[test]
+    fn the_reopened_row_counts_the_panes_that_could_not_open_their_folder() {
+        use crate::crash_journal::DeathClass;
+        let row = |gone, unasked| {
+            journal_reopened_message(
+                &reopened_fixture(DeathClass::Killed),
+                None,
+                None,
+                None,
+                false,
+                PanesWithoutFolder { gone, unasked },
+            )
+        };
+        assert_eq!(
+            row(0, 0).detail[1],
+            "2 tabs in 1 window restored in their folders from its crash journal"
+        );
+        assert_eq!(
+            row(1, 0).detail[1],
+            "2 tabs in 1 window restored from its crash journal; 1 pane could not open its folder"
+        );
+        assert_eq!(
+            row(2, 0).detail[1],
+            "2 tabs in 1 window restored from its crash journal; 2 panes could not open their \
+             folders"
+        );
+        assert_eq!(
+            row(0, 1).detail[1],
+            "2 tabs in 1 window restored from its crash journal"
+        );
+        assert_eq!(
+            row(1, 1).detail[1],
+            "2 tabs in 1 window restored from its crash journal; 1 pane could not open its folder"
+        );
+        let (none, some) = (row(0, 0), row(1, 0));
+        assert_eq!(
+            (&none.title, none.severity, &none.detail[0], &none.key),
+            (&some.title, some.severity, &some.detail[0], &some.key)
+        );
+    }
+
+    /// AUDIT #8 — once a pane did not come back in its folder, the loss
+    /// sentence no longer says ONLY the scrollback was lost. Both shapes that said `only` — nothing ran, and
+    /// only a resumed agent ran — after a kill (the quiet record) and after
+    /// a crash (the row on glass). The negative control is each at 0.
+    #[test]
+    fn a_pane_without_its_folder_drops_only_from_the_loss_sentence() {
+        use crate::crash_journal::DeathClass;
+        for class in [DeathClass::Killed, DeathClass::Signal] {
+            let nothing = |gone, unasked| {
+                journal_reopened_message(
+                    &reopened_with_programs(class, &[]),
+                    None,
+                    None,
+                    None,
+                    false,
+                    PanesWithoutFolder { gone, unasked },
+                )
+            };
+            assert_eq!(nothing(0, 0).detail[0], JOURNAL_NOTHING_RAN, "{class:?}");
+            assert_eq!(
+                nothing(1, 0).detail[0],
+                "nothing was running in them: their scrollback did not survive",
+                "{class:?}"
+            );
+            assert_eq!(
+                nothing(0, 1).detail[0],
+                JOURNAL_NOTHING_RAN_FOLDERLESS,
+                "{class:?}: a held pane's folder that is not here"
+            );
+            assert_eq!(
+                nothing(1, 0).detail[1],
+                "2 tabs in 1 window restored from its crash journal; 1 pane could not open its \
+                 folder",
+                "{class:?}"
+            );
+            let resumed = |gone, unasked| {
+                journal_reopened_message(
+                    &reopened_with_agent(class, &[]),
+                    None,
+                    None,
+                    None,
+                    true,
+                    PanesWithoutFolder { gone, unasked },
+                )
+            };
+            assert_eq!(
+                resumed(0, 0).detail[0],
+                format!(
+                    "aterm starts Claude again on its conversation in tab 2; \
+                     {JOURNAL_ONLY_SCROLLBACK}"
+                ),
+                "{class:?}"
+            );
+            assert_eq!(
+                resumed(1, 0).detail[0],
+                "aterm starts Claude again on its conversation in tab 2; the scrollback did not \
+                 survive",
+                "{class:?}"
+            );
+            let (none, some) = (nothing(0, 0), nothing(1, 0));
+            assert_eq!(
+                (&none.title, none.severity, none.hold, &none.key),
+                (&some.title, some.severity, some.hold, &some.key),
+                "{class:?}: only the words move"
+            );
+        }
     }
 
     /// Every R14 row, from the sentences their sites really pass.
@@ -4345,6 +5825,7 @@ mod tests {
             manifest: crate::crash_journal::fixtures::layout(&[("/a", "zsh"), ("/b", "vim")]),
             class,
             sources: vec![crate::crash_journal::JournalId { pid: 9, nanos: 9 }],
+            writers: vec![9],
             programs: None,
             second_chance: false,
         }
@@ -4388,6 +5869,7 @@ mod tests {
             session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
             cwd: "/b".into(),
             version: None,
+            codex: None,
         };
         reopened
             .manifest
@@ -4416,7 +5898,8 @@ mod tests {
         use crate::crash_journal::DeathClass;
         use aterm_agent::harness::relaunch::Outcome;
         let crashed = reopened_with_agent(DeathClass::Signal, &[]);
-        let row = journal_reopened_message(&crashed, None, None, None, true);
+        let row =
+            journal_reopened_message(&crashed, None, None, None, true, PanesWithoutFolder::NONE);
         assert_eq!(row.severity, Severity::Error);
         assert_ne!(row.hold, Hold::LogOnly);
         assert_eq!(row.title, "Tabs restored after aterm crashed");
@@ -4425,13 +5908,15 @@ mod tests {
             "aterm starts Claude again on its conversation in tab 2; only the scrollback did not \
              survive"
         );
-        let off = journal_reopened_message(&crashed, None, None, None, false);
+        let off =
+            journal_reopened_message(&crashed, None, None, None, false, PanesWithoutFolder::NONE);
         assert_eq!(off.title, "Tabs restored, claude lost");
         let older = crate::crash_journal::Reopened {
             programs: None,
             ..crashed.clone()
         };
-        let row = journal_reopened_message(&older, None, None, None, true);
+        let row =
+            journal_reopened_message(&older, None, None, None, true, PanesWithoutFolder::NONE);
         // One sentence (ruling 314): the agent rides the loss line.
         assert_eq!(
             row.detail[0],
@@ -4576,6 +6061,7 @@ mod tests {
             None,
             None,
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(msg.title, "Tabs restored, programs lost");
         assert_eq!(msg.severity, Severity::Error);
@@ -4608,6 +6094,7 @@ mod tests {
             Some(&killed),
             None,
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(msg.severity, Severity::Warn);
         assert_eq!(msg.tag, tags::SESSION, "a kill is no crash");
@@ -4626,6 +6113,7 @@ mod tests {
             None,
             Some(std::path::Path::new(log)),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(
             msg.actions,
@@ -4652,6 +6140,7 @@ mod tests {
             None,
             Some(log),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(quiet.title, "Tabs restored after aterm stopped");
         assert_eq!(quiet.severity, Severity::Info);
@@ -4672,6 +6161,7 @@ mod tests {
             None,
             Some(log),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(lost.title, "Tabs restored, vim lost");
         assert_eq!(lost.severity, Severity::Warn);
@@ -4687,6 +6177,7 @@ mod tests {
             None,
             Some(log),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(both.title, "Tabs restored, programs lost");
         assert_eq!(
@@ -4701,6 +6192,7 @@ mod tests {
             None,
             Some(log),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(stray.hold, Hold::LogOnly);
 
@@ -4711,6 +6203,7 @@ mod tests {
             None,
             Some(log),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(crashed.title, "Tabs restored after aterm crashed");
         assert_eq!(crashed.severity, Severity::Error);
@@ -4723,6 +6216,7 @@ mod tests {
             None,
             Some(log),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(unnamed.title, "Tabs restored, a program lost");
 
@@ -4733,6 +6227,7 @@ mod tests {
             None,
             Some(log),
             false,
+            PanesWithoutFolder::NONE,
         );
         assert_eq!(older.title, "Tabs restored, programs lost");
         assert_eq!(older.severity, Severity::Warn);
@@ -5104,8 +6599,8 @@ mod tests {
     }
 
     /// THE COMMONEST CONFIG WARNING — one misspelled key: the title is terse
-    /// and the near-miss spelling is the excerpt (the head up to the
-    /// forward-compatibility aside), with the whole sentence behind Details.
+    /// and the near-miss spelling is the excerpt (the key and its suggestion,
+    /// without the no-effect aside), with the whole sentence behind Details.
     /// The sentence is the real one — `app_config::ignored_key_notices` over
     /// the text a live edit would save — so the fixture cannot drift from the
     /// validator's words.
@@ -5150,11 +6645,8 @@ mod tests {
 
         // The plain form is the bare key.
         assert_eq!(
-            unknown_key_excerpt(
-                "line 4: foo_bar is unknown to this aterm build; it will be preserved for \
-                 forward compatibility"
-            )
-            .as_deref(),
+            unknown_key_excerpt("line 4: foo_bar is unknown to this build and has no effect")
+                .as_deref(),
             Some("foo_bar")
         );
         assert_eq!(
@@ -5162,17 +6654,17 @@ mod tests {
             None,
             "neither shape: the head at a seam instead"
         );
-        // A plain form sheds its forward-compatibility clause at the
-        // semicolon; the head is the LONGEST that fits outside a parenthesis.
+        // A near miss sheds its no-effect aside; the head is the LONGEST that
+        // fits outside a parenthesis, so it keeps the dash and the suggestion.
         let key = "k".repeat(40);
-        let plain = format!(
-            "line 4: {key} is unknown to this aterm build; it will be preserved for forward \
-             compatibility"
-        );
+        let near = format!("line 4: {key} \u{2014} did you mean \"x\"? (no effect in this build)");
         assert_eq!(
-            excerpt_head(&plain, EXCERPT_CAP),
-            format!("line 4: {key} is unknown to this aterm build")
+            excerpt_head(&near, EXCERPT_CAP),
+            format!("line 4: {key} \u{2014} did you mean \"x\"?")
         );
+        // The plain form has no seam: it is its own head.
+        let plain = format!("line 4: {key} is unknown to this build and has no effect");
+        assert_eq!(excerpt_head(&plain, EXCERPT_CAP), plain);
         // A sentence with no seam inside the cap is its own excerpt.
         let wide = "x".repeat(EXCERPT_CAP + 1);
         let long = format!("{wide} (aside); tail");
@@ -5239,14 +6731,17 @@ mod tests {
             "{:?}",
             stalled.detail
         );
+        // It installs itself (ruling 380, the owner, 2026-09-28: "do I need
+        // to do something? It's not clear."): nothing to do.
         let waiting = agent_upgrade_waiting("Codex", &["0.157.1"]).expect("a record");
-        assert_eq!(waiting.title, "Codex 0.157.1 ready for 1 session");
+        assert_eq!(waiting.title, "Codex 0.157.1 installs itself");
+        assert!(waiting.detail[0].starts_with("nothing to do: "));
         // A mix names both products (review of 2026-09-26: "Newer agent
         // builds ready for 2 sessions" named neither), in the detail — the
-        // title keeps to eight words.
+        // title keeps to six words.
         let mixed = agent_upgrade_waiting("Claude Code and Codex", &["2.1.282", "0.157.1"])
             .expect("a record");
-        assert_eq!(mixed.title, "Newer agent builds ready for 2 sessions");
+        assert_eq!(mixed.title, "Newer agent builds install themselves");
         assert_eq!(
             mixed.detail.first().map(String::as_str),
             Some("Claude Code and Codex sessions")
@@ -6733,6 +8228,236 @@ mod tests {
         );
     }
 
+    /// ONE SESSION'S UPGRADE, WAITING, IS A RECORD WORDED BY WHAT HOLDS IT
+    /// (ruling 380; the owner, 2026-09-28: "What is this alert about 'Codex
+    /// upgrade waits in tab 1'??? that is confusing to me. do I need to do
+    /// something? It's not clear. I want upgrades to be applied
+    /// automatically." — and the review of that day: the record promised "the
+    /// first pause in your typing" of the incident's goal, which its daemon's
+    /// turns held). The incident's own row, ten minutes behind: titled by its
+    /// tab, `Info` in the log with no glass and no tab mark. Where only the
+    /// ladder's comfort holds it (its screen settling), its sentence is the
+    /// answer — nothing to do, when it starts, and from when a moment with the
+    /// agent idle and nobody typing is enough (the ladder's Land rung on the
+    /// person's clock, or `two hours behind` where the clock is not known);
+    /// where this tab's own goal holds it, that goal and when it moves; where
+    /// a turn aterm cannot place holds it, a turn that may be this tab's own
+    /// (a subagent of this conversation) or another Codex session's — never
+    /// presumed either, never a goal to pause here — said whole, unclipped. Then the tab and the move. Never `waits`,
+    /// never `next turn end`, never the pause in the person's typing. A place
+    /// that would break the title rule leaves the title (the move line keeps
+    /// it). NEGATIVE CONTROL: the same session six hours behind on a turn
+    /// still running is no longer healthy — a stall, and its row says it could
+    /// not be done yet; six hours on another session's turn, its row names
+    /// that and no goal to pause.
+    #[test]
+    fn one_waiting_upgrade_is_a_record_worded_by_what_holds_it() {
+        use aterm_agent::harness::upgrade::{Agent, Phase};
+        use aterm_agent::harness::upgrade_drive::Row;
+        const PENDING: u64 = 1_790_572_868;
+        let now = PENDING + 600;
+        let row = Row {
+            tab: "s-09205e59a0bbd30464d4".into(),
+            from: "0.157.1".into(),
+            to: "0.158.0".into(),
+            agent: Agent::Codex,
+            phase: Phase::Pending,
+            behind_since: PENDING,
+            wait: "settling".into(),
+            wait_since: PENDING,
+            ..Row::default()
+        };
+        assert_eq!(row.stall(now), None, "the ladder still has rungs to go");
+        assert_eq!(row.lands_by(), Some(PENDING + 7_200));
+        let msg = agent_upgrade_waiting_in(&row, "in tab 1");
+        assert_eq!(msg.title, "Codex 0.158.0 installs itself in tab 1");
+        assert_eq!(aterm_messages::text::glass_title_fault(&msg.title), None);
+        assert_eq!((msg.severity, msg.hold), (Severity::Info, Hold::LogOnly));
+        let from = crate::presence::local_offset_s().map_or_else(
+            || "two hours behind".to_string(),
+            |offset| aterm_messages::words::clock_words((PENDING + 7_200) * 1000, offset),
+        );
+        assert_eq!(
+            msg.detail,
+            vec![
+                format!(
+                    "nothing to do: it starts on its own at a quiet moment in the tab, and from \
+                     {from} as soon as it is idle and nobody has typed there for 20 seconds"
+                ),
+                "in tab 1 \u{00b7} Codex 0.157.1 \u{2192} 0.158.0".to_string(),
+            ]
+        );
+        // This tab's own goal (the kernel named its thread): what holds it,
+        // and when it moves.
+        let goal = agent_upgrade_waiting_in(
+            &Row {
+                wait: "goal".into(),
+                ..row.clone()
+            },
+            "in tab 1",
+        );
+        // The goal pause (the owner's decision of 2026-09-28): aterm pauses
+        // the goal for a moment at the Land rung and resumes it; nothing to
+        // do.
+        assert_eq!(
+            goal.detail[0],
+            format!(
+                "a goal is running in this tab's Codex; from {from} aterm pauses the goal for a \
+                 moment to install the new Codex, and resumes it right after: nothing to do"
+            )
+        );
+        // The goal paused for the move: said so, nothing to do.
+        let held = agent_upgrade_waiting_in(
+            &Row {
+                wait: "goal-held".into(),
+                goal_held_since: PENDING + 7_300,
+                ..row.clone()
+            },
+            "in tab 1",
+        );
+        assert_eq!(
+            held.detail[0],
+            "aterm paused its goal for a moment to install the new Codex, and resumes it right \
+             after: nothing to do"
+        );
+        // A turn aterm cannot place: this conversation's subagent or another
+        // session's, never presumed either, never a goal here.
+        let unplaced = agent_upgrade_waiting_in(
+            &Row {
+                wait: "daemon-busy".into(),
+                ..row.clone()
+            },
+            "in tab 1",
+        );
+        assert!(
+            unplaced.detail[0].starts_with(
+                "a turn is running on its Codex daemon that may be this tab's own (a subagent of \
+                 this conversation) or another Codex session's"
+            ),
+            "{:?}",
+            unplaced.detail
+        );
+        for msg in [&msg, &goal, &held, &unplaced] {
+            for line in std::iter::once(&msg.title).chain(&msg.detail) {
+                assert!(
+                    !line.contains("waits")
+                        && !line.contains("turn end")
+                        && !line.contains("pause in your typing"),
+                    "{line}"
+                );
+            }
+        }
+        assert!(!unplaced.detail[0].contains("goal") && !unplaced.detail[0].contains("pause"));
+        // A place that breaks the title rule leaves the title, not the record.
+        let far = agent_upgrade_waiting_in(
+            &Row {
+                agent: Agent::Claude,
+                from: "2.1.282".into(),
+                to: "2.1.283".into(),
+                ..row.clone()
+            },
+            "in window 2, tab 11",
+        );
+        assert_eq!(far.title, "Claude Code 2.1.283 installs itself");
+        assert!(far.detail[1].starts_with("in window 2, tab 11 \u{00b7} "));
+        // NEGATIVE CONTROL: six hours behind, the turn still running.
+        let late = PENDING + 6 * 3_600;
+        let overdue = Row {
+            wait: "not-idle:busy".into(),
+            ..row.clone()
+        };
+        assert_eq!(overdue.stall(late).as_deref(), Some("overdue"));
+        let stalled = agent_upgrade_stalled(&overdue, late, "in tab 1");
+        assert_eq!(stalled.title, "Couldn't upgrade Codex in tab 1 yet");
+        assert_eq!(
+            stalled.detail[0],
+            "behind for 6 h: its turn is still running"
+        );
+        // Six hours on a turn aterm cannot place: named so — a subagent of
+        // this conversation or another session's, neither presumed — no goal
+        // to pause.
+        let other = agent_upgrade_stalled(
+            &Row {
+                wait: "daemon-busy".into(),
+                ..row.clone()
+            },
+            late,
+            "in tab 1",
+        );
+        assert!(
+            other.detail[0].contains("a subagent of this conversation")
+                && other.detail[0].ends_with("or another Codex session's")
+                && !other.detail[0].contains("most often"),
+            "{:?}",
+            other.detail
+        );
+        for line in &other.detail {
+            assert!(!line.contains("goal") && !line.contains("pause"), "{line}");
+        }
+        // Six hours on its own goal (something kept the pause off): aterm
+        // pauses it once nothing else holds the tab, and pausing it here
+        // moves it now.
+        let own = agent_upgrade_stalled(
+            &Row {
+                wait: "goal".into(),
+                ..row.clone()
+            },
+            late,
+            "in tab 1",
+        );
+        assert!(
+            own.detail[1].starts_with(
+                "aterm pauses the goal for a moment to move it once nothing else holds the tab, \
+                 and resumes it after; pausing it in this tab moves it now"
+            ),
+            "{:?}",
+            own.detail
+        );
+        // A GOAL ATERM PAUSED AND HAS NOT RESUMED: a row of its own, worded as
+        // the wait it is, with the one hand step, and no word of the
+        // upgrade's offered. NEGATIVE CONTROL: the move done and nothing left
+        // paused — no row.
+        let left = Row {
+            phase: aterm_agent::harness::upgrade::Phase::Done,
+            goal_left_since: PENDING + 9_000,
+            ..row.clone()
+        };
+        assert_eq!(left.stall(late).as_deref(), Some("goal-paused"));
+        let msg = agent_upgrade_stalled(&left, late, "in tab 1");
+        assert_eq!(msg.title, "Codex goal still paused in tab 1");
+        assert_eq!((msg.severity, msg.hold), (Severity::Warn, Hold::Standing));
+        assert!(
+            msg.detail[0].contains("has not been able to resume it yet")
+                && msg.detail[1] == "type /goal resume in the tab to go on with the goal now",
+            "{:?}",
+            msg.detail
+        );
+        assert!(agent_upgrade_words(&left, late).is_empty());
+        assert!(agent_upgrade_capsules(&left, late).is_empty());
+        // LEFT PAUSED ON PURPOSE, its thread fallen into a sandbox: its own
+        // words, the relaunch its hand step, no word of the upgrade's.
+        let sandboxed = Row {
+            wait: "goal-sandboxed".into(),
+            ..left.clone()
+        };
+        assert_eq!(sandboxed.stall(late).as_deref(), Some("goal-sandboxed"));
+        let msg = agent_upgrade_stalled(&sandboxed, late, "in tab 1");
+        assert_eq!(msg.title, "Codex goal left paused in tab 1");
+        assert!(
+            msg.detail[0].contains("fell into a sandbox")
+                && msg.detail[1].contains("--dangerously-bypass-approvals-and-sandbox"),
+            "{:?}",
+            msg.detail
+        );
+        assert!(agent_upgrade_words(&sandboxed, late).is_empty());
+        assert!(agent_upgrade_capsules(&sandboxed, late).is_empty());
+        let done = Row {
+            phase: aterm_agent::harness::upgrade::Phase::Done,
+            ..row
+        };
+        assert_eq!(done.stall(late), None);
+    }
+
     /// A NOTICE WAITING BEHIND A FULL QUEUE IS TOLD HOW IT MOVES (review of
     /// 2026-09-27: the row said `Upgrade now` does not move it and that it
     /// "moves once that ends", of a limit over by every word, while nothing of
@@ -6741,8 +8466,8 @@ mod tests {
     /// run moves it — typing in its tab, or `Upgrade now`, which types the
     /// question once more — and promises no period of its own (ruling 307);
     /// `Upgrade now` is
-    /// offered, and the row says the upgrade waits (Remedy::Now), a row of
-    /// the person's, not a record. NEGATIVE CONTROL: waiting on the READY
+    /// offered (Remedy::Now), a row of the person's, not a record, titled as
+    /// one that could not be done yet (ruling 380). NEGATIVE CONTROL: waiting on the READY
     /// answer, `Upgrade now` is not offered and the remedy says it does not
     /// move it.
     #[test]
@@ -6764,7 +8489,9 @@ mod tests {
         assert_eq!(queued.remedy(NOW), Some(Remedy::Now));
         assert!(!queued.asks_on_its_own(NOW), "the person's to move: a row");
         let msg = agent_upgrade_stalled(&queued, NOW, "in tab 2");
-        assert_eq!(msg.title, "Claude upgrade waits in tab 2");
+        // Never `… upgrade waits in tab 2` (ruling 380, the owner's words of
+        // 2026-09-28): it could not be done yet.
+        assert_eq!(msg.title, "Couldn't upgrade Claude in tab 2 yet");
         assert_eq!(msg.hold, Hold::Standing);
         // A person's words, not the upgrade's own (ruling 307: `its notice
         // waits unread` read as a band row, and `30d` as a code).

@@ -6,7 +6,7 @@
 //! # Why this module exists
 //!
 //! Every number below is a real measurement of this checkout, taken by the very
-//! code the tests exercise (`cargo forge survey`, cross-checked against
+//! code the tests exercise (`targo --unverified forge survey`, cross-checked against
 //! `tools/forge-budget.tsv`). The cell rows are CEILINGS in `loc`'s tests: a
 //! graph that grows without anyone deciding it should is exactly the failure
 //! this crate was built to catch, and an assertion is the only thing that
@@ -25,7 +25,7 @@
 //! # These are not the ratchet
 //!
 //! `tools/forge-budget.tsv` is the ratchet: it enforces that the surface only
-//! ever decreases, and `cargo forge budget` is the gate on it — a manual one
+//! ever decreases, and `targo --unverified forge budget` is the gate on it — a manual one
 //! (`gate forge` is outside the `verify --fast` ladder). This module is the
 //! ceiling `cargo test -p aterm-forge` holds automatically, and the two are
 //! TIED by `ratchet_agreement` (below): every cell must have all five ratchet rows
@@ -37,9 +37,9 @@
 //! These rows were EQUALITY pins until 2026-09-24, catching motion in either
 //! direction; the downward half made every retirement a red suite until the
 //! rows were re-copied, so it was dropped. A retirement now leaves this file
-//! alone, `cargo forge budget --update` lowers the TSV, and everything stays
+//! alone, `targo --unverified forge budget --update` lowers the TSV, and everything stays
 //! green. The dominator anchors below are RECORDS of what was measured, not
-//! asserted by any test: re-measure one with `cargo forge blame`.
+//! asserted by any test: re-measure one with `targo --unverified forge blame`.
 //!
 //! # Re-measuring
 //!
@@ -141,7 +141,7 @@
 //! showing OUR path — a package count alone would have looked perfect.
 //!
 //! CORRECTION, from an adversarial review that reproduced the inert tree rather
-//! than reading this note: `cargo forge check` EXITS 1 on it, with six
+//! than reading this note: `targo --unverified forge check` EXITS 1 on it, with six
 //! `✗ FAIL` findings. This repository's own patch-liveness obligation [OB-12]
 //! already catches the case. An earlier draft here said "nothing warned", which
 //! was wrong and would have argued for building a gate that already exists. What
@@ -579,7 +579,7 @@ pub struct Baseline {
 //     eventually recorded is the NARROW one. `budget` only ever lowers a
 //     ceiling on its own, so the ten rows that grew were raised through
 //     `budget --update --allow-regress`, each carrying the reason in the
-//     file's fourth column where every run reprints it. Nine are the three
+//     file's fourth column, where it stays on record. Nine are the three
 //     shipped cells x (third_party_packages, third_party_loc, build_scripts),
 //     at +7 / +48,869 / +1 — not the +10 / +59,991 / +1 the prefix rule
 //     produced, because a ceiling raised to cover first-party code stays loose
@@ -987,7 +987,7 @@ pub const WASM_GPU: Baseline = Baseline {
 // Intel-Mac surface is the Apple-Silicon one. What the rows buy is the day that
 // STOPS being true — an `#[cfg(target_arch)]`-gated dependency, a vendored fork
 // with an arch-specific edge, an assembly crate pulled in on one arch only —
-// which under one ceiling per OS would have been invisible. `cargo forge survey
+// which under one ceiling per OS would have been invisible. `targo --unverified forge survey
 // --cell mac-x64 --cell linux-arm --cell win-arm` prints all three.
 // ---------------------------------------------------------------------------
 

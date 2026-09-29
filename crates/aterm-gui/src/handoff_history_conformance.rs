@@ -115,6 +115,11 @@ fn record() -> SessionRecord {
         history_dropped: 0,
         history_withheld: false,
         history_lost: 0,
+        hold: None,
+        supervisor: None,
+        claim_known: false,
+        attention_owners: Vec::new(),
+        viewport_from_bottom: None,
     }
 }
 
@@ -216,6 +221,7 @@ impl Real {
                     connections: Vec::new(),
                     next_turn_id: None,
                     outgoing_build: None,
+                    held: Vec::new(),
                 };
                 stamp_manifest(
                     &mut manifest,

@@ -12,6 +12,7 @@ mod reflow_map;
 use self::reflow_map::{
     ExtrasCopyCtx, ExtrasSource, chunk_cells_to_rows, copy_cells_to_row, source_coords_for_row,
 };
+use super::resize_undo::UndoRow;
 use super::row_u16;
 use super::scroll_convert::ScrolledRowExtras;
 use super::state::DetachedReaderAim;
@@ -74,7 +75,18 @@ impl From<bool> for ReflowMode {
 ///   to the cursor row, bottom-push the remainder into history) leaves the
 ///   identical viewport and cursor, and keeps the cut rows in history instead
 ///   of dropping them (below the demoted rows, out of reading order, as that
-///   corner always has);
+///   corner always has). A width change that leaves more rows than fit
+///   demotes by the same rule, counted on the rewrapped rows — re-measured
+///   2026-09-27 with pwsh, PSReadLine's `>>` on the row under the cursor:
+///   24x80→20x60 demoted all four rows, where the Native width shrink pushes
+///   only the three that bring the cursor on screen
+///   (`Grid::conpty_reflow_demote`). The rewrapped rows are counted with the
+///   cursor's row kept through the cursor's cell, as conhost's Reflow keeps it
+///   (`cursor_row_copy_len`): pwsh parks the cursor one column past the
+///   prompt's last glyph (offset 117 after its 116 columns), and at a width
+///   whose rows end right before that cell (58, 39 and 29) it is a row of its
+///   own — conhost demoted one row more there, with or without `>>` under the
+///   prompt;
 /// * widen 80→120: the viewport's own lines unwrap in place, row 0 stays row
 ///   0, the freed rows at the bottom are painted `CSI K` — no history is
 ///   pulled in to fill them; a wrap CONTINUATION sitting at row 0 (head in
@@ -82,6 +94,18 @@ impl From<bool> for ReflowMode {
 ///   rejoined with its head; narrowing it to 60 splits the fragment 60+10 and
 ///   scrolls the viewport to keep the cursor on screen (row 0 = the 10-char
 ///   tail), and widening back to 80 does NOT rejoin the 60+10 split.
+///   Re-measured 2026-09-27 with pwsh at 23x80 (`aterm ctl cast`, 40 lines
+///   of 102 columns, the 30th cut at the seam): the 80→120 repaint is
+///   `CSI H`, the 22-column tail `CSI K`, then every later line on one row —
+///   the tail is never rejoined, so the history keeps the 80-column head
+///   and the viewport keeps the tail conhost paints;
+/// * the rewrap trusts continuation flags that conhost's OUTPUT sets and
+///   breaks: a wrapped line that starts on the bottom row goes out as its
+///   first 80 columns, CR LF, then `CSI <rows-1>;80 H` re-writing the 80th
+///   character so the rest autowraps; pwsh's `cls` is `CSI K` down every
+///   row, which must break each row's link to the row below
+///   (`Grid::clear_wrap_into_next_row`) or a later line written there is
+///   rewrapped into the line above it on the next width change.
 ///
 /// So the seam-crossing moves the Native policy makes for the reader's
 /// benefit — revealing history into grown rows, lifting the boundary
@@ -117,10 +141,14 @@ pub enum ResizePolicy {
     /// its own buffer (the measurements above): a rows-grow appends fresh
     /// blank rows at the BOTTOM and reveals nothing; a width change rewraps
     /// the viewport in place and the off-screen history separately, with no
-    /// continuation lift and no deficit fill, and a continuation at row 0
-    /// becomes a line of its own. Rows-shrink keeps the Native shape (trim
-    /// trailing blanks, top-demote, bottom-push corner), which leaves the
-    /// viewport conhost paints. The grow's append and the shrink's trim move
+    /// continuation lift and no deficit fill, a continuation at row 0 becomes
+    /// a line of its own, and the cursor's row keeps every cell through the
+    /// cursor's, so the cursor keeps its offset in its line where Native
+    /// clamps it to the last glyph. A rows-only shrink keeps the Native shape
+    /// (trim trailing blanks, top-demote, bottom-push corner), which leaves
+    /// the viewport conhost paints; a shrink that rewraps demotes that same
+    /// count from the rewrapped rows, where Native pushes only what brings the
+    /// cursor on screen. The grow's append and the shrink's trim move
     /// `absolute_row_counter` with their rows, so no key moves (above).
     ConPty,
 }
@@ -150,6 +178,26 @@ struct ReflowResult {
 /// source row's line_size).
 fn is_mergeable_continuation(row: &Row) -> bool {
     row.is_wrapped() && row.line_size() == LineSize::SingleWidth
+}
+
+/// How many cells of the cursor's row a ConPTY rewrap copies: its content and
+/// every cell through the cursor's, blank or not. conhost's Reflow copies the
+/// cursor's row through `max(MeasureRight, cursor.x + 1)`, so a cursor parked
+/// past the row's last glyph keeps its offset in the logical line, and when the
+/// cells before it end on a row boundary the cursor's cell starts a row of its
+/// own; on a row with no text a cursor past the new width moves down with its
+/// cells. Measured 2026-09-27 (pwsh 7.6, `aterm ctl cast`): the 116-column
+/// prompt ends in `CSI 1 C`, so the cursor sits at offset 117; at 58 columns
+/// conhost repainted the prompt as two rows, a `CSI K` row under it, and put
+/// the cursor there (`CSI 19;2 H`), and likewise at 39 and 29 (117 = 3 x 39,
+/// 116 = 4 x 29). The Native rewrap clamps the cursor to the
+/// line's last glyph, which put it on the prompt's second row, counted one
+/// content row fewer than conhost demoted, and let conhost's row-0 repaint
+/// overwrite a line (`pad 16`, or `pad 13` with no `>>` under the prompt).
+fn cursor_row_copy_len(row: &Row, cursor_col: u16) -> usize {
+    usize::from(row.len())
+        .max(usize::from(cursor_col) + 1)
+        .min(row.as_slice().len())
 }
 
 /// Resize a DECDWL/DECDHL row in place (truncate or pad) without reflow.
@@ -279,6 +327,19 @@ impl Grid {
         let new_rows = new_rows.clamp(1, MAX_GRID_ROWS);
         let new_cols = new_cols.clamp(1, MAX_GRID_COLS);
         let old_cols = self.storage.cols;
+        // The alt-screen resize undo (`resize_undo`): keep the stash only if
+        // nothing touched the screen since the resize that sealed it, and open
+        // one for a rows-only shrink of a grid that keeps no history. Before
+        // anything below moves the cursor or resets the margins, because the
+        // stash compares and keeps exactly those.
+        self.admit_resize_undo(new_rows, new_cols, policy);
+        // This resize's row accounting starts empty: each arm of
+        // `adjust_row_count` stores its own count below, and nothing an earlier
+        // resize recorded may survive into this one's record (`ResizeShape`).
+        self.storage.last_resize_shape = crate::ResizeShape {
+            reflowed: new_cols != old_cols && reflow,
+            ..crate::ResizeShape::default()
+        };
 
         // Snap to the live view for the reflow/resize computation below — it operates
         // on the live grid + scrollback split and assumes display_offset 0 (#2184) —
@@ -387,7 +448,7 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
 
         if new_cols != old_cols && reflow {
-            self.reflow_columns(new_rows, new_cols, cursor_row, cursor_col);
+            self.reflow_columns(new_rows, new_cols, cursor_row, cursor_col, policy);
         } else if new_cols != old_cols {
             // No reflow - just resize each row
             let mut new_pages = PageStore::new();
@@ -605,6 +666,10 @@ impl Grid {
             self.storage.history_renumber_epoch =
                 self.storage.history_renumber_epoch.saturating_add(1);
         }
+        // Last, after this resize's own `content_gen` bump: the stash is valid
+        // for the next resize only while nothing moves the generation, the
+        // geometry or the cursor picture past what this one left.
+        self.seal_resize_undo();
     }
 
     /// ConPTY width change: make the viewport's top row a line of its own
@@ -746,6 +811,9 @@ impl Grid {
                 .saturating_sub(self.storage.visible_rows as usize);
             let from_front = excess.min(scrollback);
             let from_back = excess - from_front;
+            // Only the bottom drain changes the viewport; the front drain moves
+            // history rows between tiers (`ResizeShape::pushed`).
+            self.storage.last_resize_shape.pushed = row_u16(from_back);
             if from_front > 0 {
                 // Push front rows to lazy scrollback before draining (#7473).
                 // Only when tiered scrollback is attached, matching the
@@ -760,7 +828,7 @@ impl Grid {
                     || self.storage.scrollback_detached_for_reflow;
                 if has_scrollback {
                     let drained_rows: Vec<Row> = self.storage.rows.drain(..from_front).collect();
-                    for row in &drained_rows {
+                    for row in drained_rows {
                         // These are scrollback rows whose CellExtras were already
                         // extracted during normal scroll_up. Use u16::MAX as
                         // row_idx so HashMap-keyed lookups (hyperlinks, combining
@@ -768,15 +836,18 @@ impl Grid {
                         // scrollback rows (#7513). Ring-buffer lookups use the
                         // cell's internal index, unaffected by row_idx.
                         let extracted = Self::extract_row_extras(
-                            row,
+                            &row,
                             &self.storage.extras,
                             u16::MAX,
                             self.styles(),
                         );
-                        self.storage.lazy_buffer.push_row(row, extracted);
+                        self.storage.lazy_buffer.push_row(&row, extracted);
+                        // SAFETY: these rows came from storage.rows, and staging
+                        // copied their content before returning their allocations.
+                        unsafe { row.recycle(&mut self.storage.pages) };
                     }
                 } else {
-                    drop(self.storage.rows.drain(..from_front));
+                    self.storage.recycle_rows(0..from_front);
                 }
             }
             if from_back > 0 {
@@ -799,20 +870,22 @@ impl Grid {
                     // p - remaining_scrollback. (#7783)
                     let remaining_scrollback = scrollback.saturating_sub(from_front);
                     let drained_rows: Vec<Row> = self.storage.rows.drain(start..).collect();
-                    for (i, row) in drained_rows.iter().enumerate() {
+                    for (i, row) in drained_rows.into_iter().enumerate() {
                         let external_row = row_u16(start + i - remaining_scrollback);
                         let extracted = Self::extract_row_extras(
-                            row,
+                            &row,
                             &self.storage.extras,
                             external_row,
                             self.styles(),
                         );
-                        self.storage.lazy_buffer.push_row(row, extracted);
+                        self.storage.lazy_buffer.push_row(&row, extracted);
+                        // SAFETY: the removed row belongs to storage.pages;
+                        // the lazy buffer owns its content before this transfer.
+                        unsafe { row.recycle(&mut self.storage.pages) };
                     }
                 } else {
-                    for _ in 0..from_back {
-                        self.storage.rows.pop();
-                    }
+                    let end = self.storage.rows.len();
+                    self.storage.recycle_rows(end - from_back..end);
                 }
             }
         }
@@ -825,6 +898,7 @@ impl Grid {
         let revealed = target
             .saturating_sub(old_visible)
             .min(self.storage.rows.len().saturating_sub(old_visible));
+        self.storage.last_resize_shape.revealed = row_u16(revealed);
 
         if target > self.storage.rows.len() {
             let ring_head = self.storage.ring_head;
@@ -843,6 +917,7 @@ impl Grid {
                 }
             }
             self.storage.total_lines += rows_to_add;
+            self.storage.last_resize_shape.appended = row_u16(rows_to_add);
         }
         // The width path's revealed rows carry no ring_extras hand-off: their
         // extras (if any) already rode the take/restore scrollback round trip.
@@ -866,10 +941,10 @@ impl Grid {
     /// bought nothing: `scrollback_lines() == ring + lazy + tiered` counts a
     /// retained line identically in whichever tier it sits, so the migration
     /// was pure relocation of an unchanged logical buffer. It also STRANDED the
-    /// evacuated rows' page bytes — `PageStore` is bump-only with no free path
-    /// (`alloc_slice_impl`), and this path never rebuilds, so the 9,999 dropped
-    /// `Row`s' pages were unreclaimable for the process lifetime while the ring
-    /// re-allocated the same bytes as output refilled it.
+    /// evacuated rows' page bytes: the allocator formerly offered only bump
+    /// allocation, so output refilled the ring with newly allocated bodies.
+    /// Removed rows now return their unique cell slices to the SAME PageStore
+    /// for reuse, keeping allocation at the retained-row high-water mark.
     ///
     /// COST: O(|Δrows|), INDEPENDENT of ring depth. The only rows that leave
     /// the ring are the ones the shrunken retention cap can no longer hold — at
@@ -901,6 +976,18 @@ impl Grid {
     ///   a scrolled-back reader's anchor stays exact) and hands the revealed
     ///   rows' `ring_extras` back for re-injection instead of discarding
     ///   them.
+    ///
+    /// The identity holds through the ring only while retention can hold the
+    /// demoted rows (`max_scrollback >= demote`). The alternate screen is built
+    /// with `max_scrollback = 0`, so step 4's cap evicts every demoted row in
+    /// the same call and the grow finds no history to reveal. There the RESIZE
+    /// UNDO (`grid::resize_undo`) keeps the evicted rows instead, and a grow
+    /// with nothing drawn since hands them back (demoted rows through the
+    /// reveal below, pushed rows through the bottom append), so the net-zero
+    /// flap is an identity there too; once anything is drawn the undo is gone,
+    /// the grow appends blanks, and the flap shifts the screen UP by the
+    /// demote count. Each arm's count is recorded in [`crate::ResizeShape`] so
+    /// the host can see it.
     fn adjust_row_count_rows_only(
         &mut self,
         target: usize,
@@ -925,9 +1012,16 @@ impl Grid {
             // content — archiving them would manufacture blank history that a
             // later grow reveals ABOVE real content. Drop them outright.
             let trim = shrink.min(self.trailing_blank_rows_below_cursor());
+            self.storage.last_resize_shape.trimmed = row_u16(trim);
+            // A trimmed row is blank, so the undo keeps only its place: the
+            // grow that hands it back appends a blank row, as it always has.
+            if let Some(undo) = self.storage.resize_undo.as_mut() {
+                undo.entries
+                    .extend(std::iter::repeat_with(|| UndoRow::Trimmed).take(trim));
+            }
             if trim > 0 {
                 let keep = self.storage.total_lines - trim;
-                self.storage.rows.truncate(keep);
+                self.storage.recycle_rows(keep..self.storage.rows.len());
                 self.storage.total_lines = keep;
                 // Their extras keys land >= `target` after the demote shift
                 // below and are swept by the caller's `retain_rows_below`.
@@ -991,6 +1085,8 @@ impl Grid {
                 }
             }
             let bottom_push = remaining - demote;
+            self.storage.last_resize_shape.demoted = row_u16(demote);
+            self.storage.last_resize_shape.pushed = row_u16(bottom_push);
             // SELECTION CUSTODY — which of the two shapes above just ran decides
             // whether a selection can FOLLOW its content or must be destroyed.
             //
@@ -1050,8 +1146,8 @@ impl Grid {
             // evict the oldest past it — the same observable effect as
             // scroll_up's at-capacity eviction. Bounded by the height delta:
             // `total_lines <= visible + max_scrollback` on entry, so
-            // `excess <= visible - target`. (The dropped rows' page memory is
-            // reclaimed on the next rebuild, like the tiered trim path.)
+            // `excess <= visible - target`. Removed row bodies return to the
+            // arena after their content is preserved, for the next grow/scroll.
             let excess =
                 (self.storage.total_lines - target).saturating_sub(self.storage.max_scrollback);
             if excess > 0 {
@@ -1074,12 +1170,46 @@ impl Grid {
                         let storage = &mut self.storage;
                         storage.lazy_buffer.push_row_boxed(&storage.rows[i], extras);
                     }
+                } else if self.storage.resize_undo.is_some() && excess == demote + bottom_push {
+                    // THE RESIZE UNDO (`resize_undo`): a grid that keeps no
+                    // history had none before this shrink, so the evicted rows
+                    // are exactly this call's demoted rows, then its pushed
+                    // rows, in ring order. Keep them, with their extras boxes,
+                    // for a grow back that nothing drew in front of. Pushed rows
+                    // are kept bottom-first — the order a run of one-row
+                    // shrinks would push them — so the LIFO hand-back appends
+                    // them top-first.
+                    let storage = &mut self.storage;
+                    let mut taken: Vec<_> = (0..excess)
+                        .map(|i| {
+                            let extras = storage.ring_extras.pop_front().flatten();
+                            (storage.rows[i].snapshot(), extras)
+                        })
+                        .collect();
+                    let pushed = taken.split_off(demote);
+                    if let Some(undo) = storage.resize_undo.as_mut() {
+                        undo.entries.extend(
+                            taken
+                                .into_iter()
+                                .map(|(row, extras)| UndoRow::Demoted(row, extras)),
+                        );
+                        undo.entries.extend(
+                            pushed
+                                .into_iter()
+                                .rev()
+                                .map(|(row, extras)| UndoRow::Pushed(row, extras)),
+                        );
+                    }
+                    storage.last_resize_shape.stashed = row_u16(excess);
                 } else {
+                    // A stash that cannot hold this shrink's rows would hand
+                    // back the wrong ones: drop it.
+                    self.storage.resize_undo = None;
                     for _ in 0..excess {
                         self.storage.ring_extras.pop_front();
                     }
                 }
-                drop(self.storage.rows.drain(..excess));
+                self.storage.recycle_rows(0..excess);
                 self.storage.total_lines -= excess;
             }
         } else if target > visible {
@@ -1112,6 +1242,7 @@ impl Grid {
                     rows.push(unsafe { Row::new(new_cols, pages) });
                 }
                 self.storage.total_lines += rows_to_add;
+                self.storage.last_resize_shape.appended = row_u16(rows_to_add);
                 self.keep_keys_across_bottom_rows(BottomRows::Appended(rows_to_add));
                 return (0, Vec::new());
             }
@@ -1128,8 +1259,15 @@ impl Grid {
             // because injection must land AFTER the caller shifts the old
             // viewport's extras down by `revealed` — injected here, the
             // entries would ride that shift to the wrong rows.
+            // THE RESIZE UNDO (`resize_undo`): hand back, newest first, the rows
+            // the shrink(s) this grow undoes took off. Demoted rows go back
+            // ABOVE the viewport as history, for the reveal below to relabel
+            // exactly as it relabels retained history; the pushed rows and the
+            // trimmed blanks come back, top-first, for the bottom append.
+            let restored_bottom = self.take_undo_rows(target - visible, new_cols);
             let hist = self.storage.total_lines - visible;
             let revealed = (target - visible).min(hist);
+            self.storage.last_resize_shape.revealed = row_u16(revealed);
             let keep = hist - revealed;
             let mut reveal_extras: Vec<(u16, Box<ScrolledRowExtras>)> = Vec::new();
             // Deque tail = newest ring row = the BOTTOM revealed viewport row
@@ -1143,6 +1281,49 @@ impl Grid {
                 if let Some(bx) = self.storage.ring_extras.pop_back().flatten() {
                     reveal_extras.push((row_u16(j), bx));
                 }
+            }
+            // Pushed rows come back at the bottom, where the shrink took them
+            // from, with their extras at their final viewport rows (injected
+            // by the caller after its reveal shift, like the revealed rows').
+            // Trimmed blanks come back IN PLACE among them (top-first pop
+            // order), never after them: a trim stacked above a push must stay
+            // above it (`take_undo_rows`).
+            let mut blanks_restored = 0;
+            if !restored_bottom.is_empty() {
+                // Appended in order after the viewport, as the blank append
+                // below does: the ring must start at its physical row 0.
+                if self.storage.ring_head != 0 {
+                    self.storage.rows.rotate_left(self.storage.ring_head);
+                    self.storage.ring_head = 0;
+                }
+                let base = revealed + visible;
+                let n = restored_bottom.len();
+                let mut pushed = 0;
+                let rows = &mut self.storage.rows;
+                let pages = &mut self.storage.pages;
+                for (i, entry) in restored_bottom.into_iter().enumerate() {
+                    let Some((row, extras)) = entry else {
+                        // SAFETY: New rows are stored in the same `GridStorage`
+                        // that owns `pages`, and rows drop before the backing
+                        // pages.
+                        rows.push(unsafe { Row::new(new_cols, pages) });
+                        blanks_restored += 1;
+                        continue;
+                    };
+                    // SAFETY: the row is stored in the same `GridStorage` that
+                    // owns `pages`, and rows drop before the backing pages.
+                    rows.push(unsafe { Row::from_snapshot(&row, new_cols, pages) });
+                    pushed += 1;
+                    if let Some(bx) = extras {
+                        reveal_extras.push((row_u16(base + i), bx));
+                    }
+                }
+                self.storage.total_lines += n;
+                self.storage.last_resize_shape.restored_bottom = row_u16(pushed);
+                self.storage.last_resize_shape.appended = row_u16(blanks_restored);
+                // Added at the bottom, like the blank append below: the retained
+                // total grows under a fixed counter (`note_bottom_end_renumbered`).
+                self.note_bottom_end_renumbered();
             }
             // Any remaining growth needs fresh blank rows at the bottom.
             if target > self.storage.total_lines {
@@ -1159,6 +1340,7 @@ impl Grid {
                     rows.push(unsafe { Row::new(new_cols, pages) });
                 }
                 self.storage.total_lines += rows_to_add;
+                self.storage.last_resize_shape.appended = row_u16(blanks_restored + rows_to_add);
                 // RENUMBERING: the reveal above is a pure relabel that keeps
                 // absolute numbering, but these blank rows are ADDED at the
                 // bottom — the retained total grows while
@@ -1284,6 +1466,7 @@ impl Grid {
         new_cols: u16,
         cursor_row: usize,
         cursor_col: u16,
+        policy: ResizePolicy,
     ) {
         let old_extras = self
             .storage
@@ -1297,6 +1480,7 @@ impl Grid {
             cursor_row,
             cursor_col,
             old_extras_ref,
+            policy,
         );
     }
 
@@ -1309,38 +1493,57 @@ impl Grid {
     /// Drops old grid data before allocating padding rows so that peak memory
     /// during resize is reduced — the old page store is freed before new
     /// empty-row pages are allocated (#4074).
-    fn finalize_reflow(&mut self, target_rows: u16, mut result: ReflowResult, new_cols: u16) {
+    ///
+    /// Under [`ResizePolicy::ConPty`] the count pushed is the one conhost
+    /// demotes (see [`Self::conpty_reflow_demote`]), not the Native minimum
+    /// that only brings the cursor on screen.
+    fn finalize_reflow(
+        &mut self,
+        target_rows: u16,
+        mut result: ReflowResult,
+        new_cols: u16,
+        policy: ResizePolicy,
+    ) {
         let target_rows = usize::from(target_rows);
 
-        // If the cursor overflows the visible area, push excess top rows to
-        // scrollback instead of silently discarding them (#7410).
-        if result.rows.len() > target_rows && result.cursor_row >= target_rows {
+        // Push excess top rows to scrollback instead of silently discarding
+        // them (#7410). Native pushes only when the cursor overflows the
+        // visible area, and only the minimum that brings it back into view;
+        // ConPTY pushes what conhost demotes.
+        let push_count = if policy == ResizePolicy::ConPty {
+            Self::conpty_reflow_demote(&result, target_rows)
+        } else if result.rows.len() > target_rows && result.cursor_row >= target_rows {
             let rows_to_push = result.rows.len() - target_rows;
-            // Push the minimum needed to bring cursor into the visible window.
-            // This is the number of rows we need to remove from the top.
-            let push_count = rows_to_push.min(result.cursor_row + 1 - target_rows);
-            let push_count = push_count.min(result.rows.len().saturating_sub(target_rows));
-
+            rows_to_push.min(result.cursor_row + 1 - target_rows)
+        } else {
+            0
+        };
+        if push_count > 0 {
             // Collect drained rows so we can borrow result.extras
             // for extract_row_extras while iterating (#7448).
             let drained_rows: Vec<Row> = result.rows.drain(..push_count).collect();
-            for (i, row) in drained_rows.iter().enumerate() {
+            for (i, row) in drained_rows.into_iter().enumerate() {
                 let row_idx = u16::try_from(i).unwrap_or(u16::MAX);
                 let extracted =
-                    Self::extract_row_extras(row, &result.extras, row_idx, self.styles());
-                self.storage.lazy_buffer.push_row(row, extracted);
+                    Self::extract_row_extras(&row, &result.extras, row_idx, self.styles());
+                self.storage.lazy_buffer.push_row(&row, extracted);
+                // SAFETY: reflow built these rows in result.pages, not the old
+                // storage.pages. The lazy buffer now owns the preserved data.
+                unsafe { row.recycle(&mut result.pages) };
             }
 
             // Shift extras row indices to match the row removal.
-            if push_count > 0 {
-                if let Ok(n) = u16::try_from(push_count) {
-                    result.extras.shift_rows_up_by(0, n);
-                }
-                result.cursor_row -= push_count;
+            if let Ok(n) = u16::try_from(push_count) {
+                result.extras.shift_rows_up_by(0, n);
             }
+            result.cursor_row -= push_count;
         }
 
-        result.rows.truncate(target_rows);
+        let kept = target_rows.min(result.rows.len());
+        for row in result.rows.drain(kept..) {
+            // SAFETY: each removed reflow row belongs to the new result arena.
+            unsafe { row.recycle(&mut result.pages) };
+        }
 
         // Release old grid data before padding allocation to reduce peak
         // memory. After the reflow loop the old rows/pages are unreferenced.
@@ -1380,6 +1583,40 @@ impl Grid {
         self.storage.cursor.col = result.cursor_col.min(new_cols.saturating_sub(1));
     }
 
+    /// How many top rows of a rewrapped viewport conhost demotes to its
+    /// scrollback when a ConPTY width change leaves more rows than fit: the
+    /// rows that carry content (through the cursor's row and the last
+    /// non-blank row, so blank rows under the cursor are simply dropped)
+    /// minus the target height, at most the rows above the cursor — the
+    /// rows-only shrink's trim + top-demote, applied to the rewrapped rows.
+    ///
+    /// The Native count is only what brings the cursor on screen, and that
+    /// loses a line under conhost whenever a non-blank row sits below the
+    /// cursor. Measured 2026-09-27 (pwsh 7.6, aterm 0.95.0, `aterm ctl
+    /// cast`): the pad fill left PSReadLine's `>>` on row 23 of a 24x80 tab
+    /// with the cursor on row 22; after a resize to 20x60 conhost repainted
+    /// `pad 16` at row 0 and `>>` on the bottom row (`CSI 19;58 H`), i.e. it
+    /// demoted all four rows, `pad 12..=15`. The Native count pushed three,
+    /// left `pad 15` at row 0 for conhost to paint `pad 16` over, and cut
+    /// `>>`: `pad 15` was gone from history and screen alike. 20x50 lost
+    /// `pad 17` the same way.
+    ///
+    /// The count is only as good as `result.cursor_row`: it matches conhost's
+    /// because the ConPTY rewrap keeps the cursor's row through the cursor's
+    /// cell (`cursor_row_copy_len`). With the cursor clamped to the prompt's
+    /// last glyph, 20x58 still counted one row fewer than conhost demoted.
+    fn conpty_reflow_demote(result: &ReflowResult, target_rows: usize) -> usize {
+        let content_rows = result
+            .rows
+            .iter()
+            .rposition(|row| !row.is_empty() || row.is_wrapped())
+            .map_or(0, |last| last + 1)
+            .max(result.cursor_row + 1);
+        content_rows
+            .saturating_sub(target_rows)
+            .min(result.cursor_row)
+    }
+
     /// Rewrap the visible rows to a new column count, in EITHER direction.
     ///
     /// Soft-wrapped continuation runs are merged into their logical line first
@@ -1400,6 +1637,7 @@ impl Grid {
         cursor_row: usize,
         cursor_col: u16,
         old_extras: Option<&CellExtras>,
+        policy: ResizePolicy,
     ) {
         let mut new_pages = PageStore::new();
         let visible_count = usize::from(self.storage.visible_rows);
@@ -1408,6 +1646,7 @@ impl Grid {
         let mut merge_buf: Vec<super::Cell> = Vec::with_capacity(self.storage.cols as usize);
         let mut merge_coords: Vec<CellCoord> = Vec::new();
         let mut new_extras = CellExtras::new();
+        let keep_cursor_cell = policy == ResizePolicy::ConPty;
 
         let mut i = 0;
         while i < visible_count {
@@ -1421,8 +1660,16 @@ impl Grid {
                     continue;
                 }
             };
-            let content_len = row.len() as usize;
             let first_row_idx = i;
+            // The cells a line with no continuation contributes: its content,
+            // and under ConPTY for the cursor's row every cell through the
+            // cursor's (`cursor_row_copy_len`). The merge path applies the same
+            // rule to the line's last row.
+            let copy_len = if keep_cursor_cell && cursor_row == first_row_idx {
+                cursor_row_copy_len(row, cursor_col)
+            } else {
+                row.len() as usize
+            };
             let has_cont = i + 1 < visible_count
                 && self
                     .row(row_u16(i + 1))
@@ -1454,6 +1701,7 @@ impl Grid {
                     visible_count,
                     cursor_row,
                     cursor_col,
+                    keep_cursor_cell,
                     &mut merge_buf,
                     &mut merge_coords,
                     &mut i,
@@ -1464,7 +1712,7 @@ impl Grid {
                     old_extras,
                     &mut new_extras,
                 );
-            } else if content_len == 0 {
+            } else if copy_len == 0 {
                 // SAFETY: `new_row` is appended to `new_rows` and returned
                 // alongside `new_pages` in the same reflow result.
                 let mut new_row = unsafe { Row::new(new_cols, &mut new_pages) };
@@ -1479,7 +1727,7 @@ impl Grid {
             } else {
                 let was_wrapped = row.is_wrapped();
                 let first_idx = new_rows.len();
-                let cells = &row.as_slice()[..content_len];
+                let cells = &row.as_slice()[..copy_len];
                 let offset = (cursor_row == first_row_idx).then(|| usize::from(cursor_col));
                 let mut extras_ctx = ExtrasCopyCtx {
                     // Single source row `i` chunked across new rows → compute coords.
@@ -1523,6 +1771,7 @@ impl Grid {
                 cursor_col: cursor.1,
             },
             new_cols,
+            policy,
         );
     }
 
@@ -1536,6 +1785,7 @@ impl Grid {
         visible_count: usize,
         cursor_row: usize,
         cursor_col: u16,
+        keep_cursor_cell: bool,
         merge_buf: &mut Vec<super::Cell>,
         merge_coords: &mut Vec<CellCoord>,
         i: &mut usize,
@@ -1623,6 +1873,25 @@ impl Grid {
                 }
                 if cursor_row == *i {
                     cursor_offset = Some(off + usize::from(cursor_col));
+                }
+            }
+        }
+
+        // ConPTY: a cursor on the line's LAST row keeps every cell through its
+        // own (`cursor_row_copy_len`). On an earlier row the autowrap pad above
+        // already reaches past the cursor, so only the last row can need it.
+        if keep_cursor_cell
+            && cursor_row == row_idx
+            && let Some(row) = self.row(row_u16(row_idx))
+        {
+            let copied = merge_buf.len() - row_start;
+            let end = cursor_row_copy_len(row, cursor_col);
+            if end > copied {
+                merge_buf.extend_from_slice(&row.as_slice()[copied..end]);
+                if old_extras.is_some() {
+                    merge_coords.extend(
+                        (copied..end).map(|col| CellCoord::new(row_u16(row_idx), row_u16(col))),
+                    );
                 }
             }
         }
@@ -2176,5 +2445,384 @@ mod tests {
             conpty.history_renumber_epoch()
         );
         conpty.assert_invariants();
+    }
+
+    /// `rows` rows labelled `R0`, `R1`, … (every row non-blank), cursor parked on
+    /// `cursor_row`, ring retention `max_scrollback` — 0 is the alternate
+    /// screen's shape (`Grid::with_scrollback(rows, cols, 0)` in the DEC 47/1049
+    /// handlers).
+    fn labelled_screen(rows: u16, cursor_row: u16, max_scrollback: usize) -> Grid {
+        let mut grid = Grid::with_scrollback(rows, 10, max_scrollback);
+        for r in 0..rows {
+            grid.set_cursor(r, 0);
+            for c in format!("R{r}").chars() {
+                grid.write_char(c);
+            }
+        }
+        grid.set_cursor(cursor_row, 0);
+        grid
+    }
+
+    /// `ResizeShape` names each arm a resize ran, with its count: TRIM below the
+    /// cursor, TOP-DEMOTE, the BOTTOM-PUSH corner, the grow's REVEAL and blank
+    /// APPEND, and the width rewrap. The retention-0 rows are the alternate
+    /// screen's flap: the shrink's demote is evicted from the ring but kept by
+    /// the resize undo, so the grow hands it back (`restored_top`) and the flap
+    /// is an identity; with a write between the halves the undo is gone, the
+    /// grow can only append, and the screen stays shifted up by the demote count.
+    #[test]
+    fn last_resize_shape_in_the_trim_demote_and_bottom_push_regimes() {
+        use crate::ResizeShape;
+        let shape = |trimmed, demoted, pushed, revealed, appended| ResizeShape {
+            trimmed,
+            demoted,
+            pushed,
+            revealed,
+            appended,
+            ..ResizeShape::default()
+        };
+
+        // TRIM: two content rows, cursor on the second, four blank rows below.
+        let mut grid = labelled_screen(2, 1, 100);
+        grid.resize(6, 10);
+        assert_eq!(grid.take_last_resize_shape(), shape(0, 0, 0, 0, 4));
+        grid.resize(4, 10);
+        assert_eq!(grid.last_resize_shape(), shape(2, 0, 0, 0, 0), "peek");
+        assert_eq!(grid.take_last_resize_shape(), shape(2, 0, 0, 0, 0));
+        assert_eq!(grid.last_resize_shape(), ResizeShape::default(), "drained");
+        assert_eq!(grid.take_last_resize_row_shift(), 0, "a trim moves nothing");
+        assert_eq!(grid.row(0).unwrap().to_string(), "R0");
+
+        // TRIM, then DEMOTE for the rest: one blank row below the cursor.
+        let mut grid = labelled_screen(6, 5, 100);
+        grid.erase_line();
+        grid.set_cursor(4, 0);
+        grid.resize(3, 10);
+        assert_eq!(grid.take_last_resize_shape(), shape(1, 2, 0, 0, 0));
+        assert_eq!(grid.row(0).unwrap().to_string(), "R2");
+        assert_eq!(grid.cursor_row(), 2);
+
+        // DEMOTE on a retaining grid, and the grow REVEALS it back: identity.
+        let mut grid = labelled_screen(6, 4, 100);
+        grid.resize(4, 10);
+        assert_eq!(grid.take_last_resize_shape(), shape(0, 2, 0, 0, 0));
+        assert_eq!(
+            grid.take_last_resize_row_shift(),
+            2,
+            "the selection's input"
+        );
+        assert_eq!(grid.row(0).unwrap().to_string(), "R2");
+        grid.resize(6, 10);
+        assert_eq!(grid.take_last_resize_shape(), shape(0, 0, 0, 2, 0));
+        assert_eq!(grid.row(0).unwrap().to_string(), "R0");
+        assert_eq!(grid.row(5).unwrap().to_string(), "R5");
+        assert_eq!(grid.cursor_row(), 4);
+
+        // The same flap with NO retention: the demote is evicted from the ring
+        // but kept by the resize undo, and the grow hands it back.
+        let mut grid = labelled_screen(6, 4, 0);
+        grid.resize(4, 10);
+        assert_eq!(
+            grid.take_last_resize_shape(),
+            ResizeShape {
+                stashed: 2,
+                ..shape(0, 2, 0, 0, 0)
+            }
+        );
+        assert_eq!(grid.scrollback_lines(), 0, "retention 0 evicted the demote");
+        grid.resize(6, 10);
+        assert_eq!(
+            grid.take_last_resize_shape(),
+            ResizeShape {
+                restored_top: 2,
+                undone: true,
+                ..shape(0, 0, 0, 2, 0)
+            }
+        );
+        assert_eq!(grid.row(0).unwrap().to_string(), "R0");
+        assert_eq!(grid.row(5).unwrap().to_string(), "R5");
+        assert_eq!(grid.cursor_row(), 4);
+        assert_eq!(grid.scrollback_lines(), 0, "handed back, not retained");
+
+        // A write between the halves drops the undo: the grow appends, and
+        // every row stays two rows higher than it was painted.
+        let mut grid = labelled_screen(6, 4, 0);
+        grid.resize(4, 10);
+        grid.write_char('x');
+        grid.resize(6, 10);
+        assert_eq!(grid.take_last_resize_shape(), shape(0, 0, 0, 0, 2));
+        assert_eq!(grid.row(0).unwrap().to_string(), "R2");
+        assert_eq!(grid.row(3).unwrap().to_string(), "R5");
+        assert!(grid.row(4).unwrap().is_empty());
+        assert!(grid.row(5).unwrap().is_empty());
+        assert_eq!(grid.cursor_row(), 2);
+
+        // BOTTOM-PUSH corner: a full screen with the cursor on row 0.
+        let mut grid = labelled_screen(6, 0, 100);
+        grid.resize(4, 10);
+        assert_eq!(grid.take_last_resize_shape(), shape(0, 0, 2, 0, 0));
+        assert_eq!(grid.row(0).unwrap().to_string(), "R0", "the top stays put");
+
+        // Both: the cursor on row 1 caps the demote at 1, the corner pushes 1.
+        let mut grid = labelled_screen(6, 1, 100);
+        grid.resize(4, 10);
+        assert_eq!(grid.take_last_resize_shape(), shape(0, 1, 1, 0, 0));
+
+        // A same-size resize records an empty shape, not the previous one.
+        grid.resize(4, 10);
+        grid.resize(4, 10);
+        assert_eq!(grid.take_last_resize_shape(), ResizeShape::default());
+
+        // Width: the rewrap is flagged; the no-reflow path (the alt screen's)
+        // is not.
+        let mut grid = labelled_screen(6, 4, 100);
+        grid.resize(6, 12);
+        assert!(grid.take_last_resize_shape().reflowed);
+        grid.resize_no_reflow(6, 10);
+        assert!(!grid.take_last_resize_shape().reflowed);
+
+        // The ConPTY grow appends; the Native grow on the same grid reveals.
+        let mut conpty = ten_lines_in_four_rows();
+        conpty.resize_with_policy(8, 10, ResizePolicy::ConPty);
+        assert_eq!(conpty.take_last_resize_shape(), shape(0, 0, 0, 0, 4));
+        let mut native = ten_lines_in_four_rows();
+        native.resize(8, 10);
+        assert_eq!(native.take_last_resize_shape(), shape(0, 0, 0, 4, 0));
+        native.assert_invariants();
+        conpty.assert_invariants();
+    }
+
+    /// PSReadLine's shape from the 2026-09-27 capture, in small: `L0..=L5` in
+    /// history, `L6..=L9` on rows 0..4, a prompt `>` on row 4 with the cursor
+    /// after it, and a non-blank `>>` on row 5 BELOW the cursor.
+    fn prompt_above_a_non_blank_row() -> Grid {
+        let mut grid = Grid::with_scrollback(6, 10, 100);
+        for i in 0..10 {
+            grid.write_char('L');
+            grid.write_char(char::from(b'0' + i));
+            grid.line_feed();
+            grid.carriage_return();
+        }
+        grid.write_char('>');
+        grid.line_feed();
+        grid.carriage_return();
+        grid.write_char('>');
+        grid.write_char('>');
+        grid.move_cursor_to(4, 1);
+        assert_eq!(grid.scrollback_lines(), 6);
+        assert_eq!(grid.row(4).unwrap().to_string(), ">");
+        assert_eq!(grid.row(5).unwrap().to_string(), ">>");
+        grid
+    }
+
+    fn history_text(grid: &Grid) -> Vec<String> {
+        (0..grid.scrollback_lines())
+            .map(|i| grid.get_history_line(i).unwrap().to_string())
+            .collect()
+    }
+
+    fn screen_text(grid: &Grid) -> Vec<String> {
+        (0..grid.rows())
+            .map(|r| grid.row(r).unwrap().to_string())
+            .collect()
+    }
+
+    /// A ConPTY width change that leaves more rows than fit demotes the whole
+    /// excess from the top, as conhost does, and keeps the non-blank row under
+    /// the cursor; Native pushes only the one row that brings the cursor on
+    /// screen and cuts `>>` — the push conhost's row-0 repaint then overwrites.
+    #[test]
+    fn conpty_width_shrink_demotes_the_excess_above_a_non_blank_row() {
+        let lines = |r: std::ops::RangeInclusive<u8>| -> Vec<String> {
+            r.map(|i| format!("L{i}")).collect()
+        };
+        let mut conpty = prompt_above_a_non_blank_row();
+        conpty.resize_with_policy(4, 8, ResizePolicy::ConPty);
+        assert_eq!(
+            history_text(&conpty),
+            lines(0..=7),
+            "both excess rows demoted"
+        );
+        assert_eq!(screen_text(&conpty), ["L8", "L9", ">", ">>"]);
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (2, 1));
+        conpty.assert_invariants();
+
+        let mut native = prompt_above_a_non_blank_row();
+        native.resize(4, 8);
+        assert_eq!(
+            history_text(&native),
+            lines(0..=6),
+            "Native: the cursor's minimum"
+        );
+        assert_eq!(screen_text(&native), ["L7", "L8", "L9", ">"]);
+        assert_eq!(native.cursor_row(), 3);
+    }
+
+    /// The demote is capped at the rows above the cursor (the cursor's row is
+    /// never demoted), and a blank row under the cursor is dropped rather than
+    /// counted — both exactly the rows-only shrink's trim and demote.
+    #[test]
+    fn conpty_width_shrink_demotes_no_further_than_the_cursor_and_drops_blanks() {
+        // Cursor on row 1 with four non-blank rows below it: 6 content rows
+        // into 3 demotes only the one row above the cursor.
+        let mut high = prompt_above_a_non_blank_row();
+        high.move_cursor_to(1, 0);
+        high.resize_with_policy(3, 8, ResizePolicy::ConPty);
+        assert_eq!(high.scrollback_lines(), 7);
+        assert_eq!(high.row(0).unwrap().to_string(), "L7");
+        assert_eq!(high.cursor_row(), 0);
+        high.assert_invariants();
+
+        // The `>>` row erased: the blank row under the cursor goes first, so
+        // the policies agree again (one row demoted, the cursor on the bottom).
+        let mut conpty = prompt_above_a_non_blank_row();
+        let mut native = prompt_above_a_non_blank_row();
+        for grid in [&mut conpty, &mut native] {
+            grid.move_cursor_to(5, 0);
+            grid.erase_line();
+            grid.move_cursor_to(4, 1);
+        }
+        conpty.resize_with_policy(4, 8, ResizePolicy::ConPty);
+        native.resize(4, 8);
+        assert_eq!(history_text(&conpty), history_text(&native));
+        assert_eq!(screen_text(&conpty), ["L7", "L8", "L9", ">"]);
+        assert_eq!(conpty.cursor_row(), native.cursor_row());
+    }
+
+    /// pwsh's prompt from the 2026-09-27 capture, in small: `L0..=L5` in
+    /// history, `L6..=L9` on rows 0..=3, and a 15-cell prompt that autowrapped
+    /// at 10 columns (`P` x10 on row 4, `Q` x5 on row 5) with the cursor one
+    /// column past its last glyph, as pwsh's `CSI 1 C` leaves it: offset 16.
+    fn prompt_with_the_cursor_past_its_end() -> Grid {
+        let mut grid = Grid::with_scrollback(6, 10, 100);
+        for i in 0..10 {
+            grid.write_char('L');
+            grid.write_char(char::from(b'0' + i));
+            grid.line_feed();
+            grid.carriage_return();
+        }
+        for c in "PPPPPPPPPPQQQQQ".chars() {
+            grid.write_char_wrap(c);
+        }
+        grid.move_cursor_to(5, 6);
+        assert_eq!(grid.scrollback_lines(), 6);
+        assert_eq!(screen_text(&grid)[4..], ["PPPPPPPPPP", "QQQQQ"]);
+        assert!(grid.row(5).unwrap().is_wrapped());
+        grid
+    }
+
+    /// At a width that divides the prompt exactly (15 into 5) the cursor's
+    /// cell starts a row of its own under ConPTY, as conhost's Reflow puts it
+    /// (`cursor_row_copy_len`; measured with pwsh's 116-column prompt at 58),
+    /// and that row counts toward the demote: 8 content rows into 6 demotes
+    /// two. Native clamps the cursor to the last glyph, counts 7 rows and
+    /// pushes one — the row conhost's row-0 repaint then overwrites.
+    #[test]
+    fn conpty_rewrap_keeps_the_cursor_cell_past_the_prompt_as_a_row() {
+        let lines = |r: std::ops::RangeInclusive<u8>| -> Vec<String> {
+            r.map(|i| format!("L{i}")).collect()
+        };
+        let mut conpty = prompt_with_the_cursor_past_its_end();
+        conpty.resize_with_policy(6, 5, ResizePolicy::ConPty);
+        assert_eq!(history_text(&conpty), lines(0..=7), "two rows demoted");
+        assert_eq!(
+            screen_text(&conpty),
+            ["L8", "L9", "PPPPP", "PPPPP", "QQQQQ", ""]
+        );
+        assert!(
+            conpty.row(5).unwrap().is_wrapped(),
+            "the cursor's row continues the prompt"
+        );
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (5, 1));
+        conpty.assert_invariants();
+
+        // Widening back rejoins the cursor's row with the prompt: the cursor
+        // is back on its column, one past the last glyph.
+        conpty.resize_with_policy(6, 10, ResizePolicy::ConPty);
+        assert_eq!(history_text(&conpty), lines(0..=7));
+        assert_eq!(
+            screen_text(&conpty),
+            ["L8", "L9", "PPPPPPPPPP", "QQQQQ", "", ""]
+        );
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (3, 6));
+        conpty.assert_invariants();
+
+        let mut native = prompt_with_the_cursor_past_its_end();
+        native.resize(6, 5);
+        assert_eq!(history_text(&native), lines(0..=6), "Native pushes one");
+        assert_eq!(
+            screen_text(&native),
+            ["L7", "L8", "L9", "PPPPP", "PPPPP", "QQQQQ"]
+        );
+        assert_eq!((native.cursor_row(), native.cursor_col()), (5, 4));
+    }
+
+    /// The same rule on a line with no continuation: the cursor keeps its
+    /// offset under ConPTY instead of being clamped to the last glyph, so a
+    /// width that divides the cells through the cursor's gives the cursor a
+    /// row of its own, and one that does not moves only the cursor's column.
+    #[test]
+    fn conpty_rewrap_keeps_the_cursor_offset_on_an_unwrapped_line() {
+        let prompt = || {
+            let mut grid = Grid::new(3, 10);
+            for c in "PPPPPP".chars() {
+                grid.write_char(c);
+            }
+            grid.move_cursor_to(0, 8);
+            grid
+        };
+        // 6 glyphs, the cursor at 8: nine cells into 4 columns is three rows.
+        let mut conpty = prompt();
+        conpty.resize_with_policy(3, 4, ResizePolicy::ConPty);
+        assert_eq!(screen_text(&conpty), ["PPPP", "PP", ""]);
+        assert!(conpty.row(2).unwrap().is_wrapped());
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (2, 0));
+        conpty.assert_invariants();
+        let mut native = prompt();
+        native.resize(3, 4);
+        assert_eq!(screen_text(&native), ["PPPP", "PP", ""]);
+        assert!(!native.row(2).unwrap().is_wrapped());
+        assert_eq!((native.cursor_row(), native.cursor_col()), (1, 2));
+
+        // Into 5 columns nine cells is two rows either way; only the cursor's
+        // column differs.
+        let mut conpty = prompt();
+        conpty.resize_with_policy(3, 5, ResizePolicy::ConPty);
+        assert_eq!(screen_text(&conpty), ["PPPPP", "P", ""]);
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (1, 3));
+        conpty.assert_invariants();
+        let mut native = prompt();
+        native.resize(3, 5);
+        assert_eq!((native.cursor_row(), native.cursor_col()), (1, 1));
+    }
+
+    /// The rule holds on a row with no text at all. Measured 2026-09-27
+    /// (pwsh 7.6 in a debug aterm 0.95.0 of this tree, `aterm ctl cast`):
+    /// `cls`, the cursor parked at column 70 of row 5 by
+    /// `[Console]::SetCursorPosition` during a `Start-Sleep`; conhost's repaint
+    /// put it at `CSI 7;11 H` after 80→60, `CSI 7;31 H` after 60→40 and
+    /// `CSI 6;71 H` after 40→80. Native keeps it on its row, clamped.
+    #[test]
+    fn conpty_rewrap_carries_a_cursor_on_a_blank_row_past_the_width() {
+        let parked = || {
+            let mut grid = Grid::new(24, 80);
+            grid.move_cursor_to(5, 70);
+            grid
+        };
+        let mut conpty = parked();
+        conpty.resize_with_policy(24, 60, ResizePolicy::ConPty);
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (6, 10));
+        assert!(conpty.row(6).unwrap().is_wrapped());
+        conpty.resize_with_policy(24, 40, ResizePolicy::ConPty);
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (6, 30));
+        conpty.resize_with_policy(24, 80, ResizePolicy::ConPty);
+        assert_eq!((conpty.cursor_row(), conpty.cursor_col()), (5, 70));
+        assert!((0..24).all(|r| conpty.row(r).unwrap().is_empty()));
+        assert_eq!(conpty.scrollback_lines(), 0);
+        conpty.assert_invariants();
+
+        let mut native = parked();
+        native.resize(24, 60);
+        assert_eq!((native.cursor_row(), native.cursor_col()), (5, 59));
     }
 }

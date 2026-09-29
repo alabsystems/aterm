@@ -15,7 +15,7 @@
 //!
 //! `vendor/forge.toml` is the checked-in record of that: one `[[fork]]` block
 //! per vendored patch entry, plus a `[forge]` header pinning the measurement
-//! methods so a number in a report can be re-derived years later. `cargo forge
+//! methods so a number in a report can be re-derived years later. `targo --unverified forge
 //! check` holds the ledger to the tree (`[OB-17]`): it must parse, its header
 //! must name the cell matrix forge measures, and its fork blocks must be the
 //! vendored patches exactly — path, version and license as the tree has them,
@@ -110,7 +110,7 @@ pub struct Fork {
     /// The crates.io package this fork replaces (== the patch table key).
     pub name: String,
     /// The upstream version the fork keeps, so the existing `^` requirements
-    /// still resolve. Held to the vendored manifest by `cargo forge check`'s `[OB-17]`.
+    /// still resolve. Held to the vendored manifest by `targo --unverified forge check`'s `[OB-17]`.
     pub version: String,
     /// Repo-relative directory (`vendor/winit`).
     pub path: String,
@@ -118,9 +118,9 @@ pub struct Fork {
     pub license: String,
     /// `true` when this fork's license leaves no non-Apache option, so the
     /// Apache-2.0 §4(b) "carry prominent notices stating that You changed the
-    /// files" obligation binds every file aterm modified. `cargo forge attest`
+    /// files" obligation binds every file aterm modified. `targo --unverified forge attest`
     /// decides that from the license and checks the notices; `[OB-7]`'s verdict
-    /// is what this flag must agree with (`cargo forge check` `[OB-17]`).
+    /// is what this flag must agree with (`targo --unverified forge check` `[OB-17]`).
     pub apache_notice: bool,
     /// The lock-order census's classification.
     pub census_mode: CensusMode,
@@ -171,7 +171,7 @@ pub fn parse(text: &str) -> Result<Policy, String> {
         format!("{POLICY_PATH} is not valid TOML: {e} — fix the syntax; forge will not guess")
     })?;
 
-    // `[[carved]]` rows are the carve ledger, read by `cargo forge check`'s
+    // `[[carved]]` rows are the carve ledger, read by `targo --unverified forge check`'s
     // `[OB-13]`; this reader only admits the key.
     for (key, _) in doc.as_table().iter() {
         if key != "forge" && key != "fork" && key != "carved" {
@@ -229,7 +229,7 @@ fn header(item: &Item) -> Result<ForgeHeader, String> {
         return Err(format!(
             "{POLICY_PATH}: [forge] loc_method = \"{loc_method}\" but this build of forge \
              measures \"{LOC_METHOD}\" — the numbers in the ledger were produced by a method \
-             forge no longer implements. Re-measure with `cargo forge survey` and set \
+             forge no longer implements. Re-measure with `targo --unverified forge survey` and set \
              loc_method = \"{LOC_METHOD}\", or check out the forge that wrote this file"
         ));
     }
@@ -536,8 +536,8 @@ impl PatchEntry {
 /// Read `[patch.crates-io]` from `<root>/Cargo.toml` and measure each entry
 /// against the vendored manifest and `Cargo.lock`.
 ///
-/// Measurement, not judgement: drift is RECORDED here (so `cargo forge budget`
-/// can count live entries and `cargo forge check` can hold the fork ledger to
+/// Measurement, not judgement: drift is RECORDED here (so `targo --unverified forge budget`
+/// can count live entries and `targo --unverified forge check` can hold the fork ledger to
 /// them); `[OB-12]` is where a patch that does not take is refused.
 pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     let manifest = root.join("Cargo.toml");
@@ -900,7 +900,7 @@ census.mode = "build-dep-only"
     /// like every other member, and `patched_manifest` resolves it. The
     /// literal-only rule is a `vendor/` rule (inheritance reaches nothing out
     /// there), and applying it to a workspace member would have made
-    /// `patch_entries` — and with it the whole `cargo forge budget` ratchet —
+    /// `patch_entries` — and with it the whole `targo --unverified forge budget` ratchet —
     /// a hard could-not-run.
     #[test]
     fn a_first_party_patch_target_may_inherit_its_license_from_the_workspace() {
@@ -997,7 +997,7 @@ census.mode = "build-dep-only"
                     let id = crate::model::PkgId::new(name.clone(), v.clone());
                     assert!(
                         !graph.nodes.contains(&id),
-                        "cell `{}` ({}) resolves an UNPATCHED `{name} {v}` in its                          `--edges normal` graph, so the patch's replacement is absent                          from the copy that compiles. Find the edge with                          `cargo tree -p aterm -e normal --target {} -i {name}@{v}`.",
+                        "cell `{}` ({}) resolves an UNPATCHED `{name} {v}` in its                          `--edges normal` graph, so the patch's replacement is absent                          from the copy that compiles. Find the edge with                          `targo tree -p aterm -e normal --target {} -i {name}@{v}`.",
                         cell.name,
                         cell.triple,
                         cell.triple

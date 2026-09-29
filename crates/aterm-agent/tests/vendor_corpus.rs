@@ -20,9 +20,10 @@
 //! # What a green run here does and does not mean
 //!
 //! It means: every Bash command this vendor build was OBSERVED to ask a
-//! permission for is pressed at full power when drawn into its box; the
-//! vendor's own statusLine payloads read into one HUD line carrying their
-//! figures; and the painted `/usage` panel yields its windows. It does NOT
+//! permission for is pressed at full power when drawn into its box, and the
+//! painted `/usage` panel yields its windows. (The statusLine payloads and
+//! their HUD replay went 2026-09-27 with the reader they fed, which nothing
+//! live had fed since decision "B".) It does NOT
 //! mean the vendor will not send something else tomorrow — nothing can mean
 //! that. It means the day it does, re-capturing makes this suite say so.
 //!
@@ -44,7 +45,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aterm_agent::harness::usage::{self, AccountView, UsageView};
 use aterm_digest::Sha256;
 
 /// Where the corpus lives, relative to this crate.
@@ -55,11 +55,6 @@ const CORPUS: &str = "tests/testdata/vendor";
 /// non-vacuity test below refuses it.
 const DECIDE_EVENTS: &[&str] = &["PermissionRequest", "PreToolUse"];
 
-/// The statusLine's directory name. It is the EVENT name the vendor's
-/// bridge is invoked with (`bridge.sh statusline StatusLine usage-hud`),
-/// not the mode word — capitalised, like every other row of `HOOK_ROWS`.
-const STATUSLINE: &str = "StatusLine";
-
 // ---------------------------------------------------------------------------
 // Reading the corpus
 // ---------------------------------------------------------------------------
@@ -69,7 +64,7 @@ const STATUSLINE: &str = "StatusLine";
 struct Fixture {
     /// The corpus-relative path, e.g. `2.1.278/PermissionRequest/0.json`.
     rel: String,
-    /// `PermissionRequest`, `statusline`, `screen`, …
+    /// `PermissionRequest`, `PreToolUse`, `screen`, …
     kind: String,
     bytes: Vec<u8>,
 }
@@ -245,15 +240,13 @@ fn the_corpus_is_not_empty_and_covers_the_events_that_decide() {
                 cap.version,
                 f.rel
             );
-            if f.kind != STATUSLINE {
-                assert_eq!(
-                    parsed.get("hook_event_name").and_then(|v| v.as_str()),
-                    Some(f.kind.as_str()),
-                    "{}/{}: the payload names a different event than its directory",
-                    cap.version,
-                    f.rel
-                );
-            }
+            assert_eq!(
+                parsed.get("hook_event_name").and_then(|v| v.as_str()),
+                Some(f.kind.as_str()),
+                "{}/{}: the payload names a different event than its directory",
+                cap.version,
+                f.rel
+            );
         }
         let kinds: BTreeSet<&str> = cap.fixtures.iter().map(|f| f.kind.as_str()).collect();
         for want in DECIDE_EVENTS {
@@ -265,11 +258,6 @@ fn the_corpus_is_not_empty_and_covers_the_events_that_decide() {
                 cap.version
             );
         }
-        assert!(
-            kinds.contains(STATUSLINE),
-            "{}: no statusLine payload captured, so the HUD path is untested here. Kinds: {kinds:?}",
-            cap.version
-        );
     }
 }
 
@@ -419,73 +407,6 @@ fn every_captured_permission_request_is_pressed_at_full_power() {
         unproven > 0,
         "{asked} box(es) replayed and every one was proven, so nothing here shows full power \
          pressing what the safe rules hand over. Capture a turn that asks to write."
-    );
-}
-
-/// THE HUD LINE, over the vendor's own statusLine payloads.
-///
-/// Nothing installs a statusLine any more (decision "B"), but the payloads
-/// are still the vendor's own record of its windows, and `usage`'s reader is
-/// still how aterm reads one: exactly one line, never empty, never a panic,
-/// and the five-hour figure reaches it.
-#[test]
-fn every_captured_statusline_renders_one_footer_line() {
-    let mut rendered = 0usize;
-    let mut carried = 0usize;
-    for cap in captures() {
-        for f in cap.fixtures.iter().filter(|f| f.kind == STATUSLINE) {
-            let parsed = usage::parse_statusline(&f.text()).unwrap_or_else(|e| {
-                panic!(
-                    "{}/{}: the vendor's own statusLine did not parse ({e:?})",
-                    cap.version, f.rel
-                )
-            });
-            let mut view = UsageView::new(1_790_000_000);
-            let mut account = AccountView::new("account", true);
-            account.add_statusline(&parsed, 0);
-            view.accounts.push(account);
-            let line = usage::hud_line(&view, 0);
-            assert!(
-                !line.is_empty(),
-                "{}/{}: the HUD rendered nothing",
-                cap.version,
-                f.rel
-            );
-            assert!(
-                !line.contains('\n') && !line.contains('\r'),
-                "{}/{}: the HUD rendered more than one line: {line:?}",
-                cap.version,
-                f.rel
-            );
-            // THE DISCRIMINATING PART: a payload carrying
-            // `rate_limits.five_hour.used_percentage` must produce a line
-            // naming that percentage. A reader that dropped the payload, or
-            // read the wrong window, fails.
-            if let Some(pct) = parsed
-                .rate_limits
-                .as_ref()
-                .and_then(|r| r.five_hour())
-                .and_then(|w| w.used_pct)
-            {
-                let want = format!("{}%/5h", pct.round() as i64);
-                assert!(
-                    line.contains(&want),
-                    "{}/{}: the payload carries five_hour at {pct}% and the footer reads {line:?} \
-                     — the figure did not reach it",
-                    cap.version,
-                    f.rel
-                );
-                carried += 1;
-            }
-            rendered += 1;
-        }
-    }
-    assert!(rendered > 0, "no statusLine payload was replayed");
-    assert!(
-        carried > 0,
-        "{rendered} statusLine payload(s) replayed and NOT ONE carried a five-hour percentage, \
-         so nothing here checked that a figure reaches the footer. Capture a session that has \
-         done enough work to have a rate-limit block."
     );
 }
 

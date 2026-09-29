@@ -28,11 +28,26 @@
 //!   ([`daemon_clients_in`]).
 //! * **A DAEMON-MODE CLIENT** (the TUI) holds nothing: `/exit` exits 0,
 //!   restores the terminal, and prints `Disconnected from this task. Any
-//!   running work continues.` / `Reconnect: codex resume <uuid>`; the daemon
-//!   keeps the thread, and `codex resume <uuid>` reattaches. No wind-down and
-//!   no continuation are owed: the conversation never stopped, and nor does a
-//!   background terminal it left, which runs in the daemon (measured: a
-//!   `sleep` survived the client's `/exit`).
+//!   running work continues.` / `Reconnect: codex resume <uuid>` (measured on
+//!   0.157, with no turn running); the daemon keeps the thread, and `codex
+//!   resume <uuid>` reattaches. No wind-down and no continuation are owed: the
+//!   conversation never stopped, and nor does a background terminal it left,
+//!   which runs in the daemon (measured: a `sleep` survived the client's
+//!   `/exit`). OPEN MEASUREMENT (2026-09-28): Codex 0.158.0's binary holds a
+//!   second disconnect string beside that one, `Disconnected from this task.
+//!   The current turn was stopped.` — found in the binary, never seen printed;
+//!   which case prints it (an `/exit` while the client's own turn runs, a
+//!   goal's turn, another setting) is unmeasured. Until it is, an `/exit` is
+//!   never typed while the client's OWN conversation runs a turn in the
+//!   daemon ([`daemon_turn`], the gate's running-work floor): the one the
+//!   kernel names as its own ([`own_thread`]: every thread of the daemon one
+//!   root's spawn tree — that thread and the subagents it spawned,
+//!   [`Lineage`] — and this TUI its one client), or a running thread this
+//!   tab's screen has not placed in another session ([`still_through`]) —
+//!   which only a root is, only with another Codex attached to the daemon,
+//!   and never while this screen's footer shows a goal being pursued. A live
+//!   lane that measures it — an `/exit` typed mid-turn, mid-goal, and while a
+//!   subagent runs — is owed (`tools/test-codex-live-upgrade.sh` has none).
 //! * **AN EMBEDDED SESSION** (`--no-daemon`, or a launch Codex keeps out of
 //!   the daemon) holds `$CODEX_HOME/thread-writer-locks/<uuid>.lock` itself —
 //!   an exclusive flock, so the kernel proves which pid owns which thread —
@@ -47,6 +62,68 @@
 //!   and bracketed paste on), and `/exit` restores every mode (measured here:
 //!   `modes` reads `alt_screen=false kitty_keyboard=none mouse_mode=none`
 //!   after it). NOTHING IN THE CODEX LANE SENDS A SIGNAL.
+//!
+//! THE GOAL PAUSE (the owner's decision of 2026-09-28: "Pause the goal
+//! briefly — once the upgrade is due, aterm types `/goal pause` (or presses
+//! Esc the instant a new goal turn starts, before it has done anything),
+//! moves Codex onto the new build, then types `/goal resume`. The goal carries
+//! on where it was; no running tool call is ever cut off."). A goal-mode
+//! Codex starts its next turn within 14 ms of the last one's end (89 of 90 in
+//! the owner's rollout), so no turn end is ever a pause to move it in:
+//! [`goal_step`] makes one. WHY `/goal pause` IS TYPED, AND NOT AN ESC, read
+//! from the vendor's source at the tags of both store builds (openai/codex
+//! `rust-v0.157.1`, `rust-v0.158.0`; the source matched to the binaries by
+//! the tracing sites compiled into both, `ext/goal/src/runtime.rs:450` among
+//! them, and by their strings):
+//!
+//! * `/goal` is taken WHILE A TURN RUNS: `tui/src/slash_command.rs`
+//!   `available_during_task` lists `SlashCommand::Goal => true` (its test
+//!   `certain_commands_are_available_during_task` asserts it), so
+//!   `slash_command_blocked_by_active_task` never refuses it. Enter is the
+//!   composer's `submit` key (`keymap.rs`: `plain(KeyCode::Enter)`; Tab is
+//!   `queue`), which submits unqueued once the session is configured
+//!   (`queue_submissions` is set only until then) through
+//!   `try_dispatch_slash_command_with_args` — `/goal pause` is dispatched at
+//!   once, never queued behind the turn and never steered into it.
+//! * It STOPS THE NEXT TURN, NOT THE RUNNING ONE: `slash_dispatch.rs` sends
+//!   `"pause" => SetThreadGoalStatus(Paused)`, a `thread/goal/set` request
+//!   (`app/thread_goal_actions.rs`), and nothing that interrupts; the server
+//!   applies it by `apply_external_goal_set`, whose `Paused` arm only clears
+//!   the goal's active accounting (`ext/goal/src/runtime.rs`); the goal's
+//!   next turn is started by `on_thread_idle` → `continue_if_idle`, which
+//!   returns without a turn when the goal is not `Active`. So the turn
+//!   running when it is typed finishes whatever it does — its tool calls
+//!   included — and no turn follows it.
+//! * `/goal resume` is `SetThreadGoalStatus(Active)`: `continue_if_idle`
+//!   starts the goal's continuation at once on an idle thread, and after the
+//!   running turn otherwise.
+//! * A PAUSED goal taken back by `codex resume <thread>` with no prompt draws
+//!   a box first (`app/startup.rs`, `should_prompt_for_paused_goal_after_
+//!   startup_resume`; `chatwidget/goal_menu.rs` `show_resume_paused_goal_
+//!   prompt`): `Resume paused goal?`, `Resume goal` focused — which sends the
+//!   same `SetThreadGoalStatus(Active)` — over `Leave paused`. After the move
+//!   the relaunched Codex opens on it, and the upgrade answers it with the
+//!   resume (`aterm_phase::codex::resume_box`), or types `/goal resume` where
+//!   no box came.
+//! * Codex RECORDS each change in the rollout (MEASURED read-only in the
+//!   owner's rollout, 2026-09-28: `event_msg` `thread_goal_updated`,
+//!   `"status":"paused"` at the owner's Esc of 15:01:13Z, `"active"` at his
+//!   `codex resume` of 15:27:29Z), and draws it on the footer (`Goal paused
+//!   (/goal resume)`, `Pursuing goal (…)`), which is what the upgrade reads.
+//!
+//! The Esc is the FALLBACK, for a pause that never shows: pressed only at a
+//! goal turn's HEAD ([`TurnState::Head`]: its rollout holds nothing of the
+//! turn's own work yet), read again just before the key, the composer free
+//! and nobody typing — Esc interrupts the turn and pauses the goal in the
+//! same instant (the owner's rollout: `turn_aborted`, then `thread_goal_
+//! updated … paused`). What the Esc can still meet, stated: the model's first
+//! item arrives 4 to 10 s after a goal turn starts (measured), and the head
+//! is read within a second of the key, not at it.
+//!
+//! The goal is the upgrade's to resume ONCE: its hold is on the tab's one
+//! goal record ([`super::goal_hold`]), written before every key, shared with
+//! the supervisor's save-then-wait switch — which never holds the same goal
+//! at the same time, and an open switch keeps the pause off.
 //!
 //! Everything here is PURE over facts the driver
 //! (`upgrade_drive`'s `codex` module) measured: the package version, the flag
@@ -63,14 +140,18 @@
 //! host: both modes moved, an inline TUI at a two-row prompt, and the
 //! SIGTERM negative control.
 //!
-//! The screen grammar here (the composer, the exit hint) is the Codex lane's
-//! own until aterm-phase reads Codex's composer; the day it does, these
-//! readers give way to it.
+//! The composer is read by the one reader every lane reads Codex by
+//! (`aterm_phase::codex`: both of its input line's marks, `›` and 0.158.0's
+//! `»`); the exit hint is this lane's own, read off the TUI's own last rows.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
+use aterm_phase::codex::CodexGoal;
+
+use super::goal_hold::Hold;
 use super::upgrade::{ArgvRefusal, Facts, Gate, Phase, Request, Step, Version};
 
 // ---------------------------------------------------------------- the package
@@ -382,6 +463,78 @@ pub fn is_thread_id(s: &str) -> bool {
             .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The thread a TUI's argv RESUMES (`codex [flags] resume [flags] <id>`): the
+/// first positional after the `resume` subcommand, when it is a thread id
+/// ([`is_thread_id`]). `None` for a plain launch, `resume --last` or a
+/// picker (`resume` with no id), or a `fork` (a new thread).
+#[must_use]
+pub fn resumed_thread(argv: &[String]) -> Option<String> {
+    let mut i = 1;
+    let mut resuming = false;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        i += 1;
+        if tok == "--" {
+            break;
+        }
+        if !maybe_option(tok) {
+            if !resuming {
+                if tok != "resume" {
+                    return None;
+                }
+                resuming = true;
+                continue;
+            }
+            return is_thread_id(tok).then(|| tok.to_string());
+        }
+        let attached = tok.contains('=') || (!tok.starts_with("--") && tok.chars().count() > 2);
+        if !attached && matches!(flag(tok), Some((Arity::One | Arity::Many, _))) {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// When a thread was CREATED, in unix milliseconds, read off its id: Codex's
+/// thread ids are UUIDv7 (measured 0.157.1, 2026-09-27: `01a0e4bd-2b37-75a0-…`
+/// is 2026-09-27T21:19:57.751Z, the second after its TUI started), whose
+/// first 48 bits are the creation instant. `None` for an id that is no
+/// version-7 UUID — a changed id scheme reads as unknown, never a guess.
+#[must_use]
+pub fn thread_created_ms(thread: &str) -> Option<u64> {
+    if !is_thread_id(thread) || thread.as_bytes().get(14) != Some(&b'7') {
+        return None;
+    }
+    let hex: String = thread.split('-').take(2).collect();
+    u64::from_str_radix(&hex, 16).ok()
+}
+
+/// The working directory a rollout's conversation began in: its first line's
+/// `session_meta` (`payload.cwd`, measured 0.157.1). `None` for any other
+/// first line.
+#[must_use]
+pub fn rollout_cwd(first_line: &str) -> Option<String> {
+    let v: Value = aterm_json::from_str(first_line.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    v.get("payload")?.get("cwd")?.as_str().map(str::to_string)
+}
+
+/// Whether a Codex TUI's exit status, as its shell recorded it (the shell
+/// integration's command block, `exit`), was a CRASH — no one's decision:
+/// killed by a signal nobody sends to end a program on purpose (SIGKILL's
+/// 137, the one an OOM kill uses; a SIGSEGV, SIGABRT, SIGBUS), or a failure
+/// status. `0` is its own orderly exit (a person's `/exit` or double ctrl-c,
+/// an orchestrator's typed `/exit`: measured 0 on 0.157.1, the exit hint
+/// printed), and SIGHUP, SIGINT and SIGTERM (129, 130, 143) are someone's
+/// signal to end it — the parity of Claude Code, whose own handler removes
+/// its session record on those and never on SIGKILL.
+#[must_use]
+pub fn crashed_status(exit: i64) -> bool {
+    !matches!(exit, 0 | 129 | 130 | 143)
+}
+
 // ---------------------------------------------------------------- the exit
 
 /// What a Codex TUI printed as it left: the thread it held and how.
@@ -495,10 +648,102 @@ pub enum TurnState {
     Idle,
     /// The last turn event is `task_started`: a turn is running.
     Busy,
-    /// No turn event in the tail read: a turn that started past it, or a
-    /// shape this reader does not know — never read as idle.
+    /// THE TURN'S HEAD: the last turn event is `task_started`, and nothing of
+    /// the turn's OWN WORK follows it — only what the turn opened with
+    /// ([`head_part`]: its `turn_context`, the messages it began with, token
+    /// counts). Read by the head readers alone ([`rollout_turn_head`],
+    /// [`rollout_head_back`]); [`rollout_turn`] and [`rollout_turn_back`] read
+    /// such a turn [`TurnState::Busy`]. Measured 2026-09-28 read-only in the
+    /// owner's goal-mode rollout: a goal turn opens with `task_started`,
+    /// `turn_context` and the goal's `<codex_internal_context source="goal">`
+    /// user message within 10 ms, and its first work — a reasoning item, an
+    /// assistant message, a tool call — lands 4 to 10 s later. Only here may
+    /// an Esc stop a turn without cutting off anything it did (the upgrade's
+    /// goal pause, [`goal_step`]).
+    Head,
+    /// No turn event in what was read — a tail ([`rollout_turn`]), or the
+    /// rollout as far back as it is read ([`rollout_turn_back`]): a turn
+    /// that started before that, or a shape this reader does not know —
+    /// never read as idle.
     Unknown,
 }
+
+/// Whether one rollout line is PART OF A TURN'S HEAD — what a turn opens with,
+/// no work of its own ([`TurnState::Head`]): its `turn_context`, its
+/// `world_state`, a
+/// `response_item` `message` of role `user` or `developer` (the goal's
+/// continuation, the environment context, the instructions), an `event_msg`
+/// that is a `user_message`, a `token_count` or a `thread_goal_updated`, and
+/// a `token_usage_record`. Anything else — a reasoning item, an assistant
+/// message, any call or its output, an `item_completed`, a line that is not
+/// JSON or is of a shape this reader was not written for — is the turn's
+/// work: never a head.
+#[must_use]
+pub fn head_part(line: &str) -> bool {
+    let Ok(v) = aterm_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    let payload = |k: &str| {
+        v.get("payload")
+            .and_then(|p| p.get(k))
+            .and_then(Value::as_str)
+    };
+    match v.get("type").and_then(Value::as_str) {
+        // `world_state`: the environment's state a turn opens with, written
+        // between its opening messages and its `turn_context` (0.158.0,
+        // measured read-only in the owner's rollouts, 2026-09-28: 15:28:29.649Z
+        // between 15:28:29.648Z's message and 15:28:29.650Z's
+        // `turn_context`; and after a `compacted`).
+        Some("turn_context" | "token_usage_record" | "world_state") => true,
+        Some("response_item") => {
+            payload("type") == Some("message")
+                && matches!(payload("role"), Some("user" | "developer"))
+        }
+        Some("event_msg") => matches!(
+            payload("type"),
+            Some("user_message" | "token_count" | "thread_goal_updated")
+        ),
+        _ => false,
+    }
+}
+
+/// THE THREAD'S TURN, ITS HEAD TOLD APART, from a text of its rollout (a
+/// tail): [`rollout_turn`]'s answer, with a running turn that has done
+/// nothing yet read [`TurnState::Head`] ([`head_part`]). A blank line is
+/// passed by; a line that is neither a turn event nor part of a head is
+/// work, and a cut or half-written line is too — so a head is read only
+/// where every line after `task_started` was read whole.
+#[must_use]
+pub fn rollout_turn_head(tail: &str) -> TurnState {
+    let mut worked = false;
+    scan_head(tail, &mut worked).unwrap_or(TurnState::Unknown)
+}
+
+/// [`rollout_turn_head`]'s scan of `text`, newest line first, `worked`
+/// carried across the texts of one read (the chunks [`rollout_head_back`]
+/// reads back): the state of the last turn event, or `None` where `text`
+/// holds none.
+fn scan_head(text: &str, worked: &mut bool) -> Option<TurnState> {
+    for line in text.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(turn) = turn_event(line) {
+            return Some(match turn {
+                TurnState::Busy if !*worked => TurnState::Head,
+                other => other,
+            });
+        }
+        if !*worked && !head_part(line) {
+            *worked = true;
+        }
+    }
+    None
+}
+
+/// The payload types that start and end a turn — the words a rollout line
+/// must hold before it is parsed as one ([`turn_event`]).
+const TURN_EVENTS: [&str; 3] = ["task_started", "task_complete", "turn_aborted"];
 
 /// The payload of one rollout line, when it is an `event_msg`.
 fn event_payload(line: &str) -> Option<Value> {
@@ -512,26 +757,179 @@ fn event_payload(line: &str) -> Option<Value> {
     v.get("payload").cloned()
 }
 
-/// THE THREAD'S TURN STATE from its rollout's tail: the LAST of
-/// `task_started` (busy) and `task_complete` / `turn_aborted` (idle), the
-/// shapes 0.145 and 0.157 both write (measured: 0.157 `task_started …
-/// turn_aborted` after an Esc; 0.145 `task_started … task_complete`). A
-/// line that is not JSON (the tail's cut first line, a last line caught
-/// half-written) is skipped.
+/// THE THREAD'S TURN STATE from a text of its rollout (a tail — the file
+/// itself is read back from its end by [`rollout_turn_back`], which reads
+/// each chunk so): the LAST of `task_started` (busy) and `task_complete` /
+/// `turn_aborted` (idle), the shapes 0.145 and 0.157 both write (measured:
+/// 0.157 `task_started … turn_aborted` after an Esc; 0.145 `task_started …
+/// task_complete`). A line that is not JSON (the tail's cut first line, a
+/// last line caught half-written) is skipped.
 #[must_use]
 pub fn rollout_turn(tail: &str) -> TurnState {
-    let mut state = TurnState::Unknown;
-    for line in tail.lines() {
-        let Some(p) = event_payload(line) else {
-            continue;
-        };
-        match p.get("type").and_then(Value::as_str) {
-            Some("task_started") => state = TurnState::Busy,
-            Some("task_complete" | "turn_aborted") => state = TurnState::Idle,
-            _ => {}
-        }
+    tail.lines()
+        .rev()
+        .find_map(turn_event)
+        .unwrap_or(TurnState::Unknown)
+}
+
+/// The turn event one rollout line is, if it is one: an `event_msg` whose
+/// payload type starts a turn (busy) or ends one (idle). Parsed only when it
+/// holds one of those types' words ([`TURN_EVENTS`]), so a long line of
+/// anything else costs a byte search.
+fn turn_event(line: &str) -> Option<TurnState> {
+    if !TURN_EVENTS.iter().any(|w| line.contains(w)) {
+        return None;
     }
-    state
+    match event_payload(line)?.get("type").and_then(Value::as_str) {
+        Some("task_started") => Some(TurnState::Busy),
+        Some("task_complete" | "turn_aborted") => Some(TurnState::Idle),
+        _ => None,
+    }
+}
+
+/// A ROLLOUT'S LAST TURN EVENT, READ BACK FROM ITS END `chunk` bytes at a
+/// time, no further than `bound` bytes from it: [`rollout_turn`] over as
+/// much of the rollout (`len` bytes of `file`) as its caller bounds, where a
+/// tail alone can hold no turn event while the thread idles. Measured
+/// read-only on the owner's live 3 GB root rollout (Codex 0.158.0, the fourth
+/// review of 2026-09-28): a turn ended (`task_complete`,
+/// 2026-09-27T20:45:24Z), a command that finished after it wrote ONE
+/// 542,736-byte `item_completed` line, and nothing but settings rows
+/// followed until the next `task_started` six hours later — read by its
+/// 256 KiB tail alone the idle conversation was Unknown, counted running,
+/// and held its tab `wait:daemon-turn` all that time.
+///
+/// Each chunk read ENDS where the one read before it began, and the line a
+/// chunk's start cuts is carried into the next one read, whole
+/// ([`TurnBack`]): a turn event is read wherever the chunks cut it, and a
+/// line longer than a chunk is carried until its start is read. A line is
+/// parsed only when it holds a turn event's word ([`turn_event`]). A line
+/// the bound cuts is never read, and past the bound the state stays
+/// [`TurnState::Unknown`] — counted running — as it does where `file`
+/// cannot be read whole.
+#[must_use]
+pub fn rollout_turn_back<R: Read + Seek>(
+    file: &mut R,
+    len: u64,
+    chunk: u64,
+    bound: u64,
+) -> TurnState {
+    read_back(file, len, chunk, bound, TurnBack::default())
+}
+
+/// [`rollout_turn_back`] with the turn's HEAD told apart
+/// ([`rollout_turn_head`]): a running turn none of whose lines since its
+/// `task_started` is its own work reads [`TurnState::Head`] — the one point
+/// the upgrade's goal pause may press Esc at ([`goal_step`]). The same
+/// chunks, bound and carry; a line the bound cuts, or one not read whole, is
+/// no head.
+#[must_use]
+pub fn rollout_head_back<R: Read + Seek>(
+    file: &mut R,
+    len: u64,
+    chunk: u64,
+    bound: u64,
+) -> TurnState {
+    read_back(
+        file,
+        len,
+        chunk,
+        bound,
+        TurnBack {
+            head: Some(false),
+            ..TurnBack::default()
+        },
+    )
+}
+
+/// The read-back both readers share: `back` fed the chunks of `file` from its
+/// end, `chunk` bytes at a time, no further than `bound` from it.
+fn read_back<R: Read + Seek>(
+    file: &mut R,
+    len: u64,
+    chunk: u64,
+    bound: u64,
+    mut back: TurnBack,
+) -> TurnState {
+    let floor = len.saturating_sub(bound);
+    let mut end = len;
+    while end > floor {
+        let start = end.saturating_sub(chunk.max(1)).max(floor);
+        let Ok(n) = usize::try_from(end - start) else {
+            return TurnState::Unknown;
+        };
+        let mut bytes = vec![0; n];
+        if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut bytes).is_err() {
+            return TurnState::Unknown;
+        }
+        if let Some(turn) = back.feed(bytes, start == 0) {
+            return turn;
+        }
+        end = start;
+    }
+    TurnState::Unknown
+}
+
+/// [`rollout_turn_back`]'s carry between the chunks it reads: the one line
+/// not yet whole — its end, read, and its start still in a chunk to come —
+/// kept as the PIECES read of it, the newest read (the earliest in the file)
+/// last. A piece is moved in, never copied; the line is joined ONCE, when
+/// the chunk that holds its start arrives. So a line longer than a chunk
+/// costs its length, not its length squared over the chunk (the fourth
+/// review of 2026-09-28: the carry was re-copied, and re-scanned for its
+/// first newline, at every chunk — an 8 MiB line read 256 KiB at a time
+/// copied about 130 MiB).
+#[derive(Debug, Default)]
+struct TurnBack {
+    pieces: Vec<Vec<u8>>,
+    /// The head reader's memory ([`rollout_head_back`]): `Some(worked)` —
+    /// whether a line read so far (a later one in the file) was the turn's
+    /// own work; `None` for the turn reader, which tells no head apart.
+    head: Option<bool>,
+}
+
+impl TurnBack {
+    /// Feeds `chunk`, the bytes that end where the chunk fed before began
+    /// (the first: the file's end), `from_start` when it begins the file.
+    /// The state of the LAST turn event among the lines it completes, or
+    /// `None`: none there — read further back.
+    fn feed(&mut self, chunk: Vec<u8>, from_start: bool) -> Option<TurnState> {
+        // Where this chunk's whole lines begin: past the line its start
+        // cuts, unless it starts the file. A chunk with no newline is all
+        // one line's middle: carried on, nothing completed.
+        let whole = if from_start {
+            0
+        } else if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+            nl + 1
+        } else {
+            self.pieces.push(chunk);
+            return None;
+        };
+        // The lines completed: this chunk's from `whole`, then the carry in
+        // file order.
+        let carried: usize = self.pieces.iter().map(Vec::len).sum();
+        let mut lines = Vec::with_capacity(chunk.len() - whole + carried);
+        lines.extend_from_slice(&chunk[whole..]);
+        for piece in self.pieces.drain(..).rev() {
+            lines.extend_from_slice(&piece);
+        }
+        let text = String::from_utf8_lossy(&lines);
+        let turn = match &mut self.head {
+            Some(worked) => scan_head(&text, worked),
+            None => text.lines().rev().find_map(turn_event),
+        };
+        let mut cut = chunk;
+        cut.truncate(whole);
+        self.pieces.push(cut);
+        turn
+    }
+
+    /// The bytes carried: the line not yet whole (tests: the carry is moved
+    /// in, never grown by a copy).
+    #[cfg(test)]
+    fn carried(&self) -> usize {
+        self.pieces.iter().map(Vec::len).sum()
+    }
 }
 
 /// The text of a USER message on one rollout line: a `response_item`
@@ -611,89 +1009,30 @@ pub fn rollout_has_ready(tail: &str, marker: &str) -> bool {
 
 // ---------------------------------------------------------------- the screen
 
-/// Codex's composer caret (U+203A), in column 0 (measured 0.157.0/0.157.1:
-/// `› Ask Codex to do anything`, the placeholder DIM with the cursor at
-/// column 2; a typed draft `› my draft here` in plain attributes).
-pub const CARET: char = '›';
-
-/// Rows in column 0 that are the TRANSCRIPT's, not the composer's: an agent
-/// block, an error or interrupt, an approval echo, the session card's corners,
-/// a tool row's output.
-const BLOCK_GLYPHS: &[char] = &['•', '■', '✔', '╭', '╰', '│', '└'];
-
-/// `› 1. Trust and continue`: a choice box's option row, never the composer.
-fn is_option_row(row: &str) -> bool {
-    let t = row.trim_start().trim_start_matches(CARET).trim_start();
-    let digits = t.chars().take_while(char::is_ascii_digit).count();
-    (1..=2).contains(&digits) && t[digits..].starts_with(". ")
-}
-
-/// THE COMPOSER ROW: the LAST row with the caret in column 0 that is not a
-/// box's option row, with nothing of the transcript under it — only its own
-/// draft rows and the footer (model and directory, the key hints), each
-/// indented. `None` while a box replaces it, and on a screen Codex left.
-#[must_use]
-pub fn composer_row(rows: &[String]) -> Option<usize> {
-    let c = rows
-        .iter()
-        .rposition(|r| r.starts_with(CARET) && !is_option_row(r))?;
-    let clean = rows[c + 1..].iter().all(|r| {
-        let t = r.trim_start();
-        t.is_empty() || (!r.starts_with(BLOCK_GLYPHS) && !t.starts_with('└') && r.starts_with(' '))
-    });
-    clean.then_some(c)
-}
-
-/// The composer's text as `(caret row, lines)`: the caret row's text first
-/// (the caret stripped; the dim placeholder when nothing is typed — the text
-/// cannot tell them apart, the cursor and the cell can), then every row down
-/// to the footer (the last run of non-blank rows on the screen), less the
-/// blank row that separates the two.
-#[must_use]
-pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
-    let c = composer_row(rows)?;
-    let last = (c + 1..rows.len())
-        .rev()
-        .find(|&i| !rows[i].trim().is_empty());
-    let end = match last {
-        Some(last) => {
-            let mut top = last;
-            while top > c + 1 && !rows[top - 1].trim().is_empty() {
-                top -= 1;
-            }
-            if top > c + 1 && rows[top - 1].trim().is_empty() {
-                top - 1
-            } else if top == c + 1 {
-                // No blank row between the caret and the run: all of it is
-                // the draft's (a footer is always separated by one).
-                last + 1
-            } else {
-                top
-            }
-        }
-        None => c + 1,
-    };
-    let caret = rows[c].strip_prefix(CARET).unwrap_or(&rows[c]).trim();
-    let mut lines = vec![caret.to_string()];
-    lines.extend(rows[c + 1..end].iter().map(|r| r.trim().to_string()));
-    Some((c, lines))
-}
+// THE COMPOSER IS READ BY ONE READER, `aterm_phase::codex` (`composer`,
+// `composer_draft`, `caret_on`, the input line's marks `CARETS`): the screen
+// grammar every other lane reads Codex by. This lane kept a copy of its own
+// until 2026-09-28, which knew `›` alone; Codex 0.158.0 draws its input line
+// `»`, and the copy — like the reader it copied — found no composer there.
 
 /// Whether Codex's composer holds no TYPED text — the Claude lane's rule
-/// ([`super::upgrade::composer_is_empty`]) over Codex's caret: present, and
-/// blank, or the placeholder, which is text at column 2 of the caret row with
-/// the cursor there AND the cell there drawn DIM (`dim_at_caret`, read with
-/// the `cell` verb). Measured 0.157.1: the placeholder's first cell reads
-/// `dim`; a typed draft whose caret was moved home (Home) puts the cursor at
-/// column 2 too, and its cell reads `none`. A second draft row is typed text
-/// whatever the cursor says.
+/// ([`super::upgrade::composer_is_empty`]) over Codex's input line as the one
+/// reader reads it ([`aterm_phase::codex::composer_draft`], either mark):
+/// present, and blank, or the placeholder, which is text at column 2 of the
+/// caret row with the cursor there AND the cell there drawn DIM
+/// (`dim_at_caret`, read with the `cell` verb). Measured 0.157.1: the
+/// placeholder's first cell reads `dim`; a typed draft whose caret was moved
+/// home (Home) puts the cursor at column 2 too, and its cell reads `none`;
+/// measured 0.158.0 (2026-09-28): the `»` line's placeholder reads `dim` at
+/// column 2 the same. A second draft row is typed text whatever the cursor
+/// says.
 #[must_use]
 pub fn composer_is_empty(
     rows: &[String],
     cursor: Option<(usize, usize)>,
     dim_at_caret: bool,
 ) -> bool {
-    let Some((caret, lines)) = composer_draft(rows) else {
+    let Some((caret, lines)) = aterm_phase::codex::composer_draft(rows) else {
         return false;
     };
     if lines.iter().skip(1).any(|l| !l.is_empty()) {
@@ -732,6 +1071,759 @@ pub fn box_on_screen(rows: &[String]) -> bool {
 pub fn terminals_on_screen(rows: &[String]) -> bool {
     rows.iter()
         .any(|row| aterm_phase::codex::is_background_terminal_row(row))
+}
+
+/// Whether Codex's footer says a GOAL is being pursued (measured 0.158.0,
+/// 2026-09-28: `… · Main [default]   Pursuing goal (10d 3h 14m)` on the
+/// row under the input line): Codex's ONE goal reader,
+/// [`aterm_phase::codex::goal_state`] — the footer's status row
+/// ([`aterm_phase::codex::footer_status`]: the row at column 2 with a ` · `
+/// in the screen's last run of rows, the one under the input line), read
+/// through the anchor `codex.goal.pursuing` — naming
+/// [`aterm_phase::codex::CodexGoal::Pursuing`]; the supervisor's
+/// save-then-wait switch reads the same (`CodexReader::goal_active`). A
+/// transcript row that says so is never the footer, and a box up reads no
+/// goal. A paused, stalled or usage-limited goal is none being pursued: its
+/// next turn does not start by itself.
+#[must_use]
+pub fn goal_on_screen(rows: &[String]) -> bool {
+    aterm_phase::codex::goal_state(rows) == Some(aterm_phase::codex::CodexGoal::Pursuing)
+}
+
+// ---------------------------------------------------------------- the goal pause
+
+/// How long a pause is given to show on the footer (`Goal paused (/goal
+/// resume)`) before the next way of pausing is tried — the Esc at a goal
+/// turn's head ([`GoalStep::Esc`]). Codex writes the goal's new state and
+/// redraws its footer as it answers the `thread/goal/set` the command sends.
+pub const PAUSE_TAKE_S: u64 = 60;
+
+/// How long, from the first pause, a pause that never showed is tried before
+/// aterm gives it up ([`GoalStep::GiveUp`]: said once, the goal holding its
+/// tab as before the owner's decision, the ladder's floor).
+pub const PAUSE_GIVE_UP_S: u64 = 30 * 60;
+
+/// How long a goal aterm paused may stay paused without the move — its last
+/// turn still running, or another floor holding the tab (a draft, a box, a
+/// keystroke, the daemon's other work) — before aterm resumes it anyway
+/// ([`GoalStep::Resume`] `bound`): a pause is for a moment, and the goal
+/// never waits on the upgrade for long.
+pub const GOAL_HOLD_BOUND_S: u64 = 60 * 60;
+
+/// How long a resume is given to show on the footer before it is made again
+/// ([`GoalStep::Resume`] `again`).
+pub const RESUME_TAKE_S: u64 = 60;
+
+/// How many resumes one hold makes at most; past them the goal left paused
+/// is said, with the one hand step ([`GoalStep::Wait`] `goal-left-paused`).
+pub const MAX_RESUMES: u32 = 3;
+
+/// How long after a hold that ended WITHOUT its move — resumed at its bound
+/// or because the move was abandoned, released to a person's hand, or a
+/// pause that never took — no new pause is made: the round's rest
+/// ([`super::upgrade::RETRY_S`]), so a goal whose move keeps failing is not
+/// paused and resumed at every look.
+pub const GOAL_REST_S: u64 = super::upgrade::RETRY_S;
+
+/// ONE LOOK AT A CODEX GOAL, for the upgrade's pause ([`goal_step`]): what
+/// the visit read at an idle point of a Codex tab, or at the relaunched
+/// Codex's first moments.
+#[derive(Clone, Debug)]
+pub struct GoalLook<'a> {
+    /// The tab's goal hold ([`super::goal_hold`]), of either owner.
+    pub hold: Option<&'a Hold>,
+    /// The Codex on screen is still behind the build it is moved to: a pause
+    /// is made only for a move still owed (a current Codex's look only ever
+    /// resumes).
+    pub behind: bool,
+    /// The goal the footer names ([`aterm_phase::codex::goal_state`]).
+    pub goal: Option<CodexGoal>,
+    /// Whether a footer was read at all ([`aterm_phase::codex::footer_status`]):
+    /// no footer (a box stands where it was) says nothing of the goal.
+    pub footer: bool,
+    /// The ladder's Land rung is in force — two hours behind, or the owner's
+    /// `--now` ([`super::upgrade::rung_in_force`]): the pause is made there
+    /// and never at first sight.
+    pub land: bool,
+    /// What holds the move is the GOAL'S OWN TURN: a daemon-mode client's
+    /// ([`super::upgrade::DaemonTurn::Goal`]: its own conversation, named by
+    /// the kernel, runs a turn under the goal its footer shows), or an
+    /// embedded conversation's whose rollout runs a turn under that goal.
+    pub goal_holds: bool,
+    /// The gate with that turn waived ([`super::upgrade::gate_announce`]):
+    /// `Go` where the goal's turn is the ONLY thing holding the move — a
+    /// pause bought for anything else would buy nothing.
+    pub waived: Gate,
+    /// A save-then-wait switch is open on the tab (its ledger's open
+    /// wind-down): the session is the switch's, and no pause is made.
+    pub switch: bool,
+    /// The move is made: the Codex on screen is not the one the pause went
+    /// into, and runs the build the move was for.
+    pub moved: bool,
+    /// The move will not come now, and why: the round stopped (`failed`), the
+    /// owner's `--skip` or `--defer`, the Codex paused no longer behind or no
+    /// longer in the tab.
+    pub abandoned: Option<&'static str>,
+    /// The goal thread's rollout, its HEAD told apart
+    /// ([`rollout_head_back`]): `Some(true)` a turn at its head, `Some(false)`
+    /// anything else read, `None` not read (read only where an Esc is
+    /// weighed).
+    pub head: Option<bool>,
+    /// The composer takes a line: no box, no turn's status row, nothing
+    /// typed in it (the typing fence asks it again, fresh, before any key).
+    pub free: bool,
+    /// An Esc would reach the goal's turn and nothing else: no box, nothing
+    /// typed in the composer — the turn's own status row (`Working (… • esc
+    /// to interrupt)`) may stand, as it does for the whole of a turn's head
+    /// (the goal-pause review of 2026-09-28: the Esc was weighed on
+    /// [`GoalLook::free`], which that row makes false, so it could never be
+    /// pressed at a head). The rollout's head is the guard ([`GoalLook::head`]).
+    pub esc_free: bool,
+    /// The goal's thread FELL INTO A SANDBOX its launch bypassed
+    /// (`supervise::codex_usage::sandbox_fell`, read only where a resume
+    /// without the move is weighed): nothing resumes the goal there — it
+    /// would go on inside the sandbox, which cannot commit or push (the
+    /// owner: "not continue work in a sandbox"). A resume after the move is
+    /// made all the same: the relaunch carries the launch's own flags, which
+    /// bring the thread back out of it (measured in the owner's rollout,
+    /// 2026-09-28 15:27:29Z: `danger-full-access` again after a resume with
+    /// the bypass flag).
+    pub sandboxed: bool,
+    /// A person typed within [`super::upgrade::KEYS_GAP_S`]: the floor no
+    /// rung and no word waives.
+    pub typing: bool,
+    /// A person's hand since the hold's last edge — its pause, or its
+    /// resume ([`Hold::last_at`]); an unknown stamp counts as one.
+    pub person_since: bool,
+    /// The look's clock.
+    pub now: u64,
+}
+
+/// What the upgrade's goal pause does at one look ([`goal_step`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalStep {
+    /// Nothing of the goal's: the ordinary step decides.
+    Pass,
+    /// Wait on the goal's own step, by this word.
+    Wait(&'static str),
+    /// Type `/goal pause` (the goal claimed first, [`super::goal_hold::claim`]).
+    Pause,
+    /// Press the guarded Esc: the pause did not show, and the goal's turn is
+    /// at its HEAD.
+    Esc,
+    /// The pause shows on the footer: the goal is aterm's to resume, once.
+    Took,
+    /// Paused, the move not made: the ordinary step goes on (its wait on the
+    /// paused goal's last turn worded `goal-held`).
+    Hold,
+    /// Type `/goal resume` — or, at the relaunched Codex's first moments,
+    /// press its box's `Resume goal` — and why: `moved`, `abandoned:<why>`,
+    /// `bound` ([`GOAL_HOLD_BOUND_S`]), `again` (a resume that did not show).
+    Resume(&'static str),
+    /// The resume shows on the footer: nothing owed.
+    Resumed,
+    /// The goal is no longer aterm's to resume, and why: `by-hand` (a
+    /// person's hand on it since aterm's last edge, or the goal pursued
+    /// again with no resume of aterm's), `changed` (the footer shows it
+    /// neither paused nor pursued).
+    Release(&'static str),
+    /// The pause never showed within [`PAUSE_GIVE_UP_S`]: given up, said
+    /// once; the goal holds its tab as a running turn does.
+    GiveUp,
+}
+
+/// Why a goal is resumed without the move where the Codex paused is gone and
+/// the one in the tab now is no relaunch of aterm's: the person restarted it
+/// ([`GoalLook::abandoned`]) — a hand on the tab since then makes the goal
+/// theirs ([`goal_step`]).
+pub const BY_HAND: &str = "abandoned:by-hand";
+
+/// The note a hold carries once the relaunched Codex's paused-goal box was
+/// left to a person at the keys ([`Hold::say`]): their answer to it, since,
+/// is theirs ([`goal_step`]).
+pub const BOX_THEIRS: &str = "box-theirs";
+
+/// Whether a hold that ended keeps the next pause off ([`GOAL_REST_S`]): it
+/// ended without its move, within the rest.
+fn resting(h: &Hold, now: u64) -> bool {
+    goal_rest_until(h, now).is_some()
+}
+
+/// Until when a hold of the upgrade's that ended WITHOUT its move keeps the
+/// next pause off ([`GOAL_REST_S`] past its last edge); `None` for a hold
+/// still owed, one that ended with its move, or a rest run out.
+#[must_use]
+pub fn goal_rest_until(h: &Hold, now: u64) -> Option<u64> {
+    let until = h.last_at().saturating_add(GOAL_REST_S);
+    (h.owner == super::goal_hold::Owner::Upgrade && !h.owes() && h.why != "moved" && now < until)
+        .then_some(until)
+}
+
+/// Whether the goal the hold `h` paused has stayed paused past the hold's
+/// bound at `now` ([`GOAL_HOLD_BOUND_S`] from the later of the pause made
+/// and the pause seen): the resume is due without the move ([`goal_step`]'s
+/// `bound`). The one reading of that clock — the goal pause's model projects
+/// its `overdue` through it too (`upgrade_drive::goal_projection`).
+#[must_use]
+pub fn goal_hold_past_bound(h: &Hold, now: u64) -> bool {
+    now.saturating_sub(h.took_at.max(h.at)) >= GOAL_HOLD_BOUND_S
+}
+
+/// How long a goal the upgrade paused may owe its resume before it is said
+/// to a person as LEFT PAUSED, with the one hand step (`/goal resume` in the
+/// tab): the hold's bound ([`GOAL_HOLD_BOUND_S`], where the resume is due
+/// even with no move) and half an hour of idle points past it, none of which
+/// could take the resume — the Codex gone, a person's box, a screen that
+/// cannot be read.
+pub const GOAL_LEFT_AFTER_S: u64 = GOAL_HOLD_BOUND_S + 30 * 60;
+
+/// Since when the goal the upgrade's hold `h` paused counts as LEFT PAUSED
+/// at `now`: owed its resume past [`GOAL_LEFT_AFTER_S`] from its pause, or
+/// its resumes spent ([`MAX_RESUMES`]) and the last one not seen within
+/// [`RESUME_TAKE_S`]. `None` otherwise — a hold not the upgrade's, one no
+/// longer owed, one within its time.
+#[must_use]
+pub fn goal_left_since(h: &Hold, now: u64) -> Option<u64> {
+    if h.owner != super::goal_hold::Owner::Upgrade || !h.owes() {
+        return None;
+    }
+    let bound = h.at.saturating_add(GOAL_LEFT_AFTER_S);
+    let spent = (h.resumes >= MAX_RESUMES).then(|| h.resume_at.saturating_add(RESUME_TAKE_S));
+    [Some(bound), spent]
+        .into_iter()
+        .flatten()
+        .filter(|at| now >= *at)
+        .min()
+}
+
+/// THE UPGRADE'S GOAL PAUSE (the owner's decision of 2026-09-28: "Pause the
+/// goal briefly — once the upgrade is due, aterm types `/goal pause` (or
+/// presses Esc the instant a new goal turn starts, before it has done
+/// anything), moves Codex onto the new build, then types `/goal resume`. The
+/// goal carries on where it was; no running tool call is ever cut off.").
+/// Over one look ([`GoalLook`]):
+///
+/// * NO HOLD OF THE UPGRADE'S OWED: a goal the footer shows PURSUED, its own
+///   turn the only thing holding the move (`goal_holds`, `waived` open), at
+///   the Land rung (or `--now`), its Codex still behind and its move not
+///   held by the owner's `--skip` or `--defer`, no switch open, no hold of
+///   the switch's, no
+///   rest after a hold that ended without its move, the composer free and
+///   nobody typing — [`GoalStep::Pause`]: `/goal pause`, which Codex takes
+///   while a turn runs and which stops the goal's NEXT turn, never the
+///   running one (module header, "THE GOAL PAUSE"). Anything else passes.
+/// * PAUSING (made, not seen): the footer shows it paused — taken, unless a
+///   person's hand has been on the tab since (the pause may be theirs: it is
+///   released to them). Still pursued: a person's hand since releases it;
+///   within [`PAUSE_TAKE_S`] it waits; past [`PAUSE_GIVE_UP_S`] from the
+///   first pause it is given up; else, a typed pause that never showed, the
+///   goal's turn at its HEAD, no box, nothing typed and nobody typing (the
+///   turn's own status row may stand, [`GoalLook::esc_free`]) — the ONE Esc
+///   ([`GoalStep::Esc`]).
+/// * PAUSED (taken): pursued again with no resume of aterm's — released, the
+///   goal a person's again (or anyone's but aterm's). Still paused: once the
+///   move is made, or abandoned, or past [`GOAL_HOLD_BOUND_S`], the resume —
+///   with the composer free and nobody typing, else a wait — unless the
+///   relaunched Codex's box was left to a person at the keys, or the Codex
+///   in the tab is one the person restarted themselves ([`BY_HAND`]), and
+///   their hand has been on the tab since ([`BOX_THEIRS`]: `Leave paused` is
+///   theirs to choose), which releases it; a resume WITHOUT the move into a
+///   thread fallen into a sandbox is withheld ([`SANDBOXED`]: the goal stays
+///   paused, and is said); before that, the ordinary step
+///   ([`GoalStep::Hold`]).
+/// * RESUMING (made, not seen): pursued — resumed. Still paused: a person's
+///   hand since releases it (theirs to resume); within [`RESUME_TAKE_S`] it
+///   waits; past [`MAX_RESUMES`], `goal-left-paused` (said, with the hand
+///   step); else the resume once more (`again`).
+/// * A footer that names the goal neither paused nor pursued — stopped at a
+///   usage limit, stalled, achieved (its last turn may complete it) or unmet,
+///   or (a person's hand on the tab since the hold's last edge) no goal at
+///   all — while a hold is owed: released (`changed`).
+///   No footer read, or one that names no goal with nobody's hand since:
+///   nothing decided (a wait while owed; the ordinary step for a hold only
+///   paused) — a goal aterm paused leaves that state only by a key or a
+///   turn, and a look that read none never drops the resume it owes.
+/// * The SWITCH's hold: nothing of the upgrade's (the switch owns that goal);
+///   and while a switch is open, nothing is typed for the upgrade's own hold
+///   either — no Esc, no resume (`switch`): its records go on.
+#[must_use]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeGoalPause",
+        action = "GoalPause",
+        project = "aterm_agent::harness::upgrade_drive::goal_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeGoalPause",
+        action = "GoalEsc",
+        project = "aterm_agent::harness::upgrade_drive::goal_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeGoalPause",
+        action = "GoalResume",
+        project = "aterm_agent::harness::upgrade_drive::goal_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeGoalPause",
+        action = "Release",
+        project = "aterm_agent::harness::upgrade_drive::goal_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeGoalPause",
+        action = "Took",
+        project = "aterm_agent::harness::upgrade_drive::goal_projection"
+    )
+)]
+pub fn goal_step(g: &GoalLook) -> GoalStep {
+    use super::goal_hold::Owner;
+    let Some(h) = g.hold.filter(|h| h.owes()) else {
+        return goal_start(g);
+    };
+    if h.owner == Owner::Switch {
+        return GoalStep::Pass;
+    }
+    let step = owed_step(g, h);
+    // A SWITCH OPEN on the tab owns the session: nothing is typed into it
+    // for the upgrade's goal — no Esc, no resume (a goal resumed under the
+    // switch would run on the cheaper model); the record's own edges go on.
+    if g.switch && matches!(step, GoalStep::Esc | GoalStep::Resume(_)) {
+        return GoalStep::Wait("switch");
+    }
+    step
+}
+
+/// Why a resume WITHOUT the move is withheld: the goal's thread fell into a
+/// sandbox its launch bypassed ([`GoalLook::sandboxed`]) — the goal stays
+/// paused, and the tab's row says so with the fix (quit Codex and resume the
+/// thread with its launch flags).
+pub const SANDBOXED: &str = "goal-sandboxed";
+
+/// [`goal_step`] for a hold of the upgrade's that owes the goal its resume.
+fn owed_step(g: &GoalLook, h: &Hold) -> GoalStep {
+    use super::goal_hold::{How, Stage};
+    let now = g.now;
+    // A LOOK THAT READ NO GOAL decides nothing about it: no footer (a box
+    // stands where it was), or a footer that names no goal with nobody's
+    // hand on the tab since the hold's last edge — a goal aterm paused
+    // leaves its paused state only by a key (a person's `/goal clear`, a
+    // thread of their own) or by a turn, which names its end (`Goal
+    // achieved`, `Goal unmet`: [`CodexGoal::Achieved`], [`CodexGoal::Unmet`],
+    // released below), and a paused goal starts none. The
+    // goal-pause review of 2026-09-28 met the other reading: in a narrow pane
+    // the key-hint row was read as the status row, the goal as none, and the
+    // hold released `changed` with its resume still owed — no row, and the
+    // relaunched Codex's box escalated as a goal aterm did not pause.
+    if !g.footer || (g.goal.is_none() && !g.person_since) {
+        return match h.stage {
+            Stage::Pausing => GoalStep::Wait("goal-pausing"),
+            Stage::Resuming => GoalStep::Wait("goal-resuming"),
+            _ if g.moved || g.abandoned.is_some() => GoalStep::Wait("goal-resume"),
+            _ => GoalStep::Hold,
+        };
+    }
+    match (h.stage, g.goal) {
+        // The pause shows — but with a person's hand on the tab since it
+        // was typed, it may be theirs (their Esc into the last turn pauses
+        // the goal too, or their own `/goal pause`): never claimed, never
+        // resumed over them (the review of 2026-09-28).
+        (Stage::Pausing, Some(CodexGoal::Paused)) if g.person_since => GoalStep::Release("by-hand"),
+        (Stage::Pausing, Some(CodexGoal::Paused)) => GoalStep::Took,
+        (Stage::Pausing, Some(CodexGoal::Pursuing)) => {
+            if g.person_since {
+                GoalStep::Release("by-hand")
+            } else if now.saturating_sub(h.tried_at) < PAUSE_TAKE_S {
+                GoalStep::Wait("goal-pausing")
+            } else if now.saturating_sub(h.at) >= PAUSE_GIVE_UP_S {
+                GoalStep::GiveUp
+            } else if h.how == How::Typed && g.head == Some(true) && g.esc_free && !g.typing {
+                GoalStep::Esc
+            } else {
+                GoalStep::Wait("goal-pausing")
+            }
+        }
+        (Stage::Paused, Some(CodexGoal::Pursuing)) => GoalStep::Release("by-hand"),
+        (Stage::Paused, Some(CodexGoal::Paused)) => {
+            let due = if g.moved {
+                Some("moved")
+            } else if let Some(why) = g.abandoned {
+                Some(why)
+            } else if goal_hold_past_bound(h, now) {
+                Some("bound")
+            } else {
+                None
+            };
+            match due {
+                // The relaunched Codex's box was left to a person at the keys
+                // (`upgrade_codex_drive::resume_on_relaunch`), and their hand
+                // has been on it since: its answer was theirs — `Leave
+                // paused` among them — and aterm resumes nothing over it.
+                // So is a Codex the person restarted themselves, in place of
+                // the one paused (`abandoned:by-hand`).
+                Some(why) if (h.said(BOX_THEIRS) || why == BY_HAND) && g.person_since => {
+                    GoalStep::Release("by-hand")
+                }
+                // Resumed without the move, the goal would go on inside the
+                // sandbox its thread fell into: left paused, and said.
+                Some(why) if why != "moved" && g.sandboxed => GoalStep::Wait(SANDBOXED),
+                Some(why) if g.free && !g.typing => GoalStep::Resume(why),
+                Some(_) => GoalStep::Wait("goal-resume"),
+                None => GoalStep::Hold,
+            }
+        }
+        (Stage::Resuming, Some(CodexGoal::Pursuing)) => GoalStep::Resumed,
+        (Stage::Resuming, Some(CodexGoal::Paused)) => {
+            if g.person_since {
+                GoalStep::Release("by-hand")
+            } else if now.saturating_sub(h.resume_at) < RESUME_TAKE_S {
+                GoalStep::Wait("goal-resuming")
+            } else if h.resumes >= MAX_RESUMES {
+                GoalStep::Wait("goal-left-paused")
+            } else if h.why != "moved" && g.sandboxed {
+                GoalStep::Wait(SANDBOXED)
+            } else if g.free && !g.typing {
+                GoalStep::Resume("again")
+            } else {
+                GoalStep::Wait("goal-resuming")
+            }
+        }
+        _ => GoalStep::Release("changed"),
+    }
+}
+
+/// [`goal_step`] with no hold of the upgrade's owed: the pause, or nothing.
+fn goal_start(g: &GoalLook) -> GoalStep {
+    use super::goal_hold::Owner;
+    let pursued = g.behind && g.goal == Some(CodexGoal::Pursuing) && g.goal_holds;
+    let switch_holds = g.hold.is_some_and(|h| h.owner == Owner::Switch && h.owes());
+    let rest = g.hold.is_some_and(|h| resting(h, g.now));
+    if pursued
+        && g.land
+        && g.abandoned.is_none()
+        && !g.switch
+        && !switch_holds
+        && !rest
+        && g.waived == Gate::Go
+        && g.free
+        && !g.typing
+    {
+        GoalStep::Pause
+    } else {
+        GoalStep::Pass
+    }
+}
+
+/// Whether the tab whose goal hold is `hold` must still be LOOKED AT for it —
+/// the upgrade's hold owes the goal its resume — whatever else its upgrade
+/// says: the host's `due` ([`super::upgrade_drive::due`]) keeps a tab due
+/// while this holds, so the host never lets a tab go with its goal left
+/// paused by aterm (a move made, the Codex current, and nothing else owed).
+#[must_use]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeGoalPause",
+        action = "LetGo",
+        project = "aterm_agent::harness::upgrade_drive::goal_projection"
+    )
+)]
+pub fn goal_owed(hold: Option<&Hold>) -> bool {
+    hold.is_some_and(|h| h.owner == super::goal_hold::Owner::Upgrade && h.owes())
+}
+
+// ---------------------------------------------------------------- the spawn trees
+
+/// WHERE A THREAD THE DAEMON HOLDS SITS IN ITS CONVERSATION'S SPAWN TREE, by
+/// the first line of its rollout, `session_meta` ([`session_lineage`]).
+/// Measured 2026-09-28, read-only, on the owner's live Codex 0.158.0 daemon:
+/// its four writer locks were ONE conversation — the `cli` thread the one TUI
+/// attached to it had resumed (`"source":"cli"`) and three subagents that
+/// thread spawned, each `"source":{"subagent":{"thread_spawn":
+/// {"parent_thread_id":"<that thread>","depth":1,…}}}`, their turns running
+/// on their own after the spawn and never drawn on the TUI's main screen.
+/// Across that home's 788 rollouts every one of the 785 subagents has that
+/// shape (depth 1 to 3); its direct parent is named there. So a lock is not
+/// a conversation: counting locks, the lane named none of the owner's, and
+/// took a running subagent of the tab's own conversation for another
+/// session's (the third review of 2026-09-28).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lineage {
+    /// A conversation's own thread: `source` a plain word (`"cli"`, measured;
+    /// Codex's other launch sources are words too).
+    Root,
+    /// A subagent spawned by the thread `parent` (`source.subagent.
+    /// thread_spawn.parent_thread_id`, a thread id).
+    Spawned(String),
+    /// A subagent whose parent is not named (`source.subagent` of any other
+    /// shape — a review's, a compaction's, a spawn written differently): a
+    /// thread of SOME conversation, never a root.
+    Subagent,
+    /// No `session_meta` read: no rollout yet (a thread with no message), a
+    /// first line past the bound or not JSON, or a shape this reader was not
+    /// written for. Neither a root nor anyone's subagent, proven.
+    Unread,
+}
+
+/// A THREAD'S LINEAGE from its rollout's FIRST line (`session_meta`, module
+/// header of [`Lineage`]). A line that is not a `session_meta`, not JSON, or
+/// a `source` of a shape not written for is [`Lineage::Unread`] — never a
+/// guess.
+#[must_use]
+pub fn session_lineage(first_line: &str) -> Lineage {
+    let Ok(v) = aterm_json::from_str::<Value>(first_line.trim()) else {
+        return Lineage::Unread;
+    };
+    if v.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Lineage::Unread;
+    }
+    let Some(source) = v.get("payload").and_then(|p| p.get("source")) else {
+        return Lineage::Unread;
+    };
+    if source.as_str().is_some() {
+        return Lineage::Root;
+    }
+    let Some(sub) = source.get("subagent") else {
+        return Lineage::Unread;
+    };
+    match sub
+        .get("thread_spawn")
+        .and_then(|spawn| spawn.get("parent_thread_id"))
+        .and_then(Value::as_str)
+    {
+        Some(parent) if is_thread_id(parent) => Lineage::Spawned(parent.to_string()),
+        _ => Lineage::Subagent,
+    }
+}
+
+/// One thread the daemon holds (its writer lock), as one read of it found
+/// it: its id, its turn state by its rollout's last turn event (read back
+/// from its end, [`rollout_turn_back`]; a state not read,
+/// [`TurnState::Unknown`], counts as running) and its place in its
+/// conversation's spawn tree ([`Lineage`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loaded {
+    /// The thread.
+    pub thread: String,
+    /// Its turn.
+    pub turn: TurnState,
+    /// Its spawn tree.
+    pub lineage: Lineage,
+}
+
+impl Loaded {
+    /// Whether a turn runs in it, or might ([`TurnState::Unknown`]).
+    #[must_use]
+    pub fn running(&self) -> bool {
+        self.turn != TurnState::Idle
+    }
+}
+
+/// THE ROOT OF `thread`'S SPAWN TREE among the threads the daemon holds
+/// (`threads`): its parent chain followed through loaded threads to a
+/// [`Lineage::Root`]. `None` where the chain leaves the daemon (a parent it
+/// does not hold), meets a subagent that names no parent or a thread whose
+/// lineage was not read, or loops — a tree this read cannot hang from a
+/// conversation.
+#[must_use]
+pub fn tree_root<'a>(thread: &str, threads: &'a [Loaded]) -> Option<&'a str> {
+    let mut at = threads.iter().find(|l| l.thread == thread)?;
+    for _ in 0..=threads.len() {
+        match &at.lineage {
+            Lineage::Root => return Some(at.thread.as_str()),
+            Lineage::Spawned(parent) => at = threads.iter().find(|l| l.thread == *parent)?,
+            Lineage::Subagent | Lineage::Unread => return None,
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------- the daemon's turns
+
+/// THE CLIENT'S OWN CONVERSATION, where the kernel names it: every thread
+/// the daemon holds (its writer locks, `threads`) hangs from ONE root
+/// ([`tree_root`]: that conversation and the subagents it spawned) and
+/// `client` is the only Codex attached to it (`clients`,
+/// [`daemon_clients_in`]) — the ROOT, the thread `codex resume` takes back.
+/// The daemon holds the writer lock of every thread it has loaded, a
+/// client's from the moment it attaches (a thread with no message yet
+/// included), so one conversation and one client is that client's. One
+/// thread alone is named whatever its lineage reads, unless it is a
+/// subagent (which no client's conversation is): a first line this reader
+/// could not read is no second conversation. `None` wherever that does not
+/// hold: two roots (another session's, one run in the background with no
+/// tab, this client's own earlier one), a thread no loaded root claims, more
+/// clients, or clients the kernel would not list. Never a guess: a TUI's
+/// `codex resume <id>` argv names the thread it STARTED on, and `/new` or
+/// `/resume` inside it moves it to another. Until the third review of
+/// 2026-09-28 this counted LOCKS, and a conversation with subagents was
+/// never named — the owner's, with three.
+#[must_use]
+pub fn own_thread<'a>(
+    client: u32,
+    threads: &'a [Loaded],
+    clients: Option<&[u32]>,
+) -> Option<&'a str> {
+    if !matches!(clients, Some([pid]) if *pid == client) {
+        return None;
+    }
+    match threads {
+        [] => None,
+        [only] => {
+            matches!(only.lineage, Lineage::Root | Lineage::Unread).then_some(only.thread.as_str())
+        }
+        [first, ..] => {
+            let root = tree_root(&first.thread, threads)?;
+            threads
+                .iter()
+                .all(|l| tree_root(&l.thread, threads) == Some(root))
+                .then_some(root)
+        }
+    }
+}
+
+/// WHERE A TURN RUNS THAT A DAEMON-MODE CLIENT'S `/exit` MUST WAIT FOR
+/// ([`super::upgrade::DaemonTurn`], the gate's running-work floor) — over the
+/// daemon's threads ([`Loaded`]: each one's turn and spawn tree), the Codex
+/// attached to it (`clients`), the threads PLACED ELSEWHERE by this tab's
+/// screen (`elsewhere`: each ran a turn through [`super::upgrade::QUIET_S`]
+/// of its still run, [`still_through`]) and whether its footer shows a goal
+/// being pursued (`goal`, [`goal_on_screen`]):
+///
+/// * the client's own conversation named by the kernel ([`own_thread`]: one
+///   root, one client): a turn anywhere in it holds it — the root's, or a
+///   subagent's it spawned — `Goal` where the footer shows one, else `Own`;
+/// * not named: a running thread holds it as `Unplaced` — it may be this
+///   client's own, so nothing is typed — unless it is placed elsewhere, which
+///   only a ROOT is, only where the kernel lists ANOTHER Codex attached to
+///   the daemon, and never under a goal on this screen:
+///   * A SUBAGENT IS NEVER PLACED (the third review of 2026-09-28): its
+///     turns never draw on any client's main screen — its own
+///     conversation's included — so a still run of this screen says nothing
+///     of whose it is. The owner's daemon held three subagents of the tab's
+///     own conversation, running on their own after their spawn, and the
+///     rule that placed them typed `/exit` over them.
+///   * WITH THIS CLIENT THE DAEMON'S ONLY ONE, nothing is placed: a second
+///     root is then a thread no tab shows, or this client's own conversation
+///     while its screen shows another thread (a subagent, a `/side` fork),
+///     whose turns it does not draw — not provably another session's.
+///   * UNDER A GOAL ON THIS SCREEN nothing is placed: a pursued goal's next
+///     turn streams under the last turn's end row with no status row, and
+///     the screen reads that ENDED turn at the same last words (measured
+///     2026-09-28, `aterm_phase::codex::fixtures::GOAL_NEXT_TURN_0_158`) —
+///     its own thread runs through a still run of this screen exactly as
+///     another session's would. The second review of 2026-09-28 drove the
+///     incident's goal looks with one more thread on the daemon through the
+///     rule that placed anyway, and it typed `/exit` at 06:12:42Z, mid-goal
+///     (`upgrade_ladder_tests`, the second-thread replay).
+///
+/// What stays assumed where a root IS placed — another Codex attached, no
+/// goal on this screen — is that this client's screen draws its own root's
+/// turn: not where it shows a subagent's or a `/side` fork's thread instead
+/// (how Codex 0.158.0 marks that view is unmeasured), nor a goal it pursues
+/// with no status line configured (the footer draws the goal only through
+/// one). The ladder's model states it (`HarnessUpgradeLadder`, `work`).
+#[must_use]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeLadder",
+        action = "Move",
+        project = "aterm_agent::harness::upgrade_drive::ladder_projection"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeGoalPause",
+        action = "LadderMove",
+        project = "aterm_agent::harness::upgrade_drive::goal_projection"
+    )
+)]
+pub fn daemon_turn(
+    client: u32,
+    threads: &[Loaded],
+    clients: Option<&[u32]>,
+    elsewhere: &[String],
+    goal: bool,
+) -> super::upgrade::DaemonTurn {
+    use super::upgrade::DaemonTurn;
+    if own_thread(client, threads, clients).is_some() {
+        return match (threads.iter().any(Loaded::running), goal) {
+            (false, _) => DaemonTurn::None,
+            (true, true) => DaemonTurn::Goal,
+            (true, false) => DaemonTurn::Own,
+        };
+    }
+    let another = clients.is_some_and(|c| c.iter().any(|pid| *pid != client));
+    let placed = |l: &Loaded| {
+        !goal && another && l.lineage == Lineage::Root && elsewhere.contains(&l.thread)
+    };
+    if threads.iter().any(|l| l.running() && !placed(l)) {
+        DaemonTurn::Unplaced
+    } else {
+        DaemonTurn::None
+    }
+}
+
+/// THE THREADS THIS TAB'S SCREEN PLACES IN ANOTHER SESSION, and the record
+/// it keeps for that: each thread of the daemon running a turn at a look of
+/// this screen's STILL RUN (looks that read it authoritatively idle with the
+/// same last words, `upgrade_drive::St::still`), with the first look of the
+/// run that found it running (`record`, as the last look left it). At this
+/// look (`now`), with the threads running now (`running`) and whether the
+/// look continues that run (`in_run`: an idle reading at the same words — a
+/// look that begins a run, or reads no idle screen, keeps nothing from
+/// before): the new record — every thread running now, from when the run
+/// first found it — and those PLACED: found running at a look of the run
+/// [`super::upgrade::QUIET_S`] (20 s) or more ago, and running now. A turn
+/// of the client's own ROOT draws on its screen — its status row, its
+/// streaming words, the rows a finished turn leaves — so a root running at
+/// two looks 20 s apart of one still run is another session's (a goal's
+/// thread that ended and began again between them too: its turns never drew
+/// here). That is the placement's ASSUMPTION, and [`daemon_turn`] takes a
+/// thread this returns as placed only where it holds as far as the lane can
+/// tell: a ROOT (a subagent's turns draw on no main screen, its own
+/// conversation's included), with another Codex attached to the daemon, and
+/// no goal on this screen — a pursued GOAL's next turn draws no status row
+/// and leaves the last words standing (measured 2026-09-28,
+/// `GOAL_NEXT_TURN_0_158`), so under one the visit keeps no record at all.
+/// One found running only now is not placed: a turn streams nothing for its
+/// first moments, and a look can catch this client's own there.
+#[must_use]
+pub fn still_through(
+    record: &[(String, u64)],
+    running: &[String],
+    in_run: bool,
+    now: u64,
+) -> (Vec<(String, u64)>, Vec<String>) {
+    let kept: Vec<(String, u64)> = running
+        .iter()
+        .map(|thread| {
+            let since = record
+                .iter()
+                .find(|(seen, _)| in_run && seen == thread)
+                .map_or(now, |(_, since)| (*since).min(now));
+            (thread.clone(), since)
+        })
+        .collect();
+    let placed = kept
+        .iter()
+        .filter(|(_, since)| now.saturating_sub(*since) >= super::upgrade::QUIET_S)
+        .map(|(thread, _)| thread.clone())
+        .collect();
+    (kept, placed)
 }
 
 // ---------------------------------------------------------------- the words
@@ -816,9 +1908,13 @@ impl Mode {
 /// THE CLIENT'S NEXT STEP: [`super::upgrade::next_step`] for an embedded
 /// session with a conversation (the notice, the READY answer, the re-asks
 /// and the give-up, word for word the Claude lane's), and for every other
-/// client the gate alone — idle, settled, the composer empty, no box, no
-/// busy row, no hold, nobody at the tab — then [`Step::Terminate`], which the
-/// Codex driver carries out as a typed `/exit`, never a signal. A stopped
+/// client the gate alone — idle, settled by the ladder's rung, the composer
+/// empty, no box, no busy row, no hold, nobody at the tab, and for a
+/// daemon-mode client no turn of its own running in its daemon, nor one there
+/// it cannot place in another session ([`Facts::daemon_turn`]: its `/exit`
+/// might stop its own) — then
+/// [`Step::Terminate`], which the Codex driver carries out as a typed
+/// `/exit`, never a signal. A stopped
 /// round of either kind starts a new one once it has rested
 /// [`super::upgrade::RETRY_S`] ([`Step::Rearm`]): no stop is for good. A daemon-mode
 /// client also waits for its daemon to be on the build it moves to
@@ -864,8 +1960,10 @@ pub fn next_step(
 
 /// [`next_step`] under the owner's word — [`super::upgrade::requested_step`]'s
 /// rule: a skip of THIS target or a deferral not run out holds it, and a
-/// stopped round's new one ([`super::upgrade::rearm_held`]); `--now`
-/// waives the settling window and the attended-tab guard and nothing else.
+/// stopped round's new one ([`super::upgrade::rearm_held`]); `--now` stands
+/// it at the ladder's last rung ([`super::upgrade::Rung::Land`]: no settling
+/// window, a keystroke within [`super::upgrade::KEYS_GAP_S`] still holding
+/// it, every floor kept) and nothing else.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn requested_step(
@@ -886,12 +1984,11 @@ pub fn requested_step(
         });
     }
     let step = if *request == Request::Now {
-        let waived = Facts {
+        let now = Facts {
             owner_now: true,
-            attended: false,
             ..f.clone()
         };
-        next_step(mode, phase, &waived, ready, daemon_behind, now_s)
+        next_step(mode, phase, &now, ready, daemon_behind, now_s)
     } else {
         next_step(mode, phase, f, ready, daemon_behind, now_s)
     };
@@ -926,9 +2023,10 @@ pub struct DaemonFacts {
     pub terminals: usize,
     /// Idle threads written within [`super::upgrade::QUIET_S`].
     pub settling_threads: usize,
-    /// A person gave input within [`super::upgrade::ATTENDED_IDLE`] to a
-    /// Codex tab on this home — a tab whose owner said `--now` excepted: that
-    /// is the person asking.
+    /// A person gave input to a Codex tab on this home within the grace that
+    /// tab's rung of the ladder keeps ([`super::upgrade::person_grace`]:
+    /// `[harness] human_grace_s`, then [`super::upgrade::KEYS_GAP_S`] from
+    /// [`super::upgrade::Rung::KeysOnly`] on and under the owner's `--now`).
     pub attended: bool,
     /// A hold on a Codex tab on this home.
     pub held: bool,
@@ -969,6 +2067,14 @@ pub enum DaemonStep {
 /// restarts the daemon ("may interrupt running work", its own help), so
 /// running work is waited for, with no deadline, and nothing is ever killed.
 #[must_use]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeLadder",
+        action = "Pin",
+        project = "aterm_agent::harness::upgrade_drive::ladder_projection"
+    )
+)]
 pub fn daemon_step(f: &DaemonFacts) -> DaemonStep {
     let Some(running) = &f.running else {
         return DaemonStep::Wait("daemon-version");
@@ -1140,6 +2246,30 @@ pub fn daemon_clients_in(lsof_f: &str, daemon: u32) -> Option<Vec<u32>> {
             .map(|(p, _)| *p)
             .collect(),
     )
+}
+
+/// `session_meta` FIRST LINES in the shapes measured 2026-09-28 on the
+/// owner's Codex daemon (read-only), every value but the ones [`Lineage`]
+/// reads a stand-in and the base instructions cut short: a conversation's
+/// root as 0.149.1 wrote it (`"source":"cli"`), and a subagent as 0.158.0
+/// spawns one (`multi_agent_version` 2: the parent named in `source` and
+/// again at the top, the tree's root as its `session_id`).
+#[cfg(test)]
+pub(crate) mod fixtures {
+    /// The root `thread`'s first line.
+    pub(crate) fn root_meta(thread: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-08-26T05:23:33.621Z","ordinal":0,"type":"session_meta","payload":{{"session_id":"{thread}","id":"{thread}","timestamp":"2026-08-26T05:21:24.804Z","cwd":"/stand-in/project","originator":"codex-tui","cli_version":"0.149.1","source":"cli","thread_source":"user","model_provider":"openai","base_instructions":{{"text":"You are Codex (stand-in)","provenance":{{"type":"model","model":"stand-in"}}}},"history_mode":"paginated","context_window":{{"window_id":"{thread}"}}}}}}"#
+        )
+    }
+
+    /// The first line of `thread`, a subagent `parent` spawned at `depth` in
+    /// the tree of `root`.
+    pub(crate) fn spawned_meta(thread: &str, parent: &str, root: &str, depth: u32) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-28T15:28:00.257Z","ordinal":0,"type":"session_meta","payload":{{"creator_user_id":"user-stand-in","session_id":"{root}","id":"{thread}","parent_thread_id":"{parent}","timestamp":"2026-09-28T15:28:00.201Z","cwd":"/stand-in/project","originator":"codex-tui","cli_version":"0.158.0","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}","depth":{depth},"agent_path":"/root/stand_in","agent_nickname":"Stand-in","agent_role":null}}}}}},"thread_source":"subagent","agent_nickname":"Stand-in","agent_path":"/root/stand_in","model_provider":"openai","base_instructions":{{"text":"You are Codex (stand-in)","provenance":{{"type":"model","model":"stand-in"}}}},"history_mode":"paginated","multi_agent_version":"v2","context_window":{{"window_id":"{thread}"}}}}}}"#
+        )
+    }
 }
 
 #[cfg(test)]

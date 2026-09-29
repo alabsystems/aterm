@@ -94,8 +94,16 @@ impl Row {
     /// `pages` must outlive the returned row. If the row is stored inside
     /// another owner, that owner must not outlive the backing page store.
     #[must_use]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "ResizeRowReuse",
+            action = "Grow",
+            project = "grid::tests::resize_row_reuse::resize_row_reuse_conforms"
+        )
+    )]
     pub unsafe fn new(cols: u16, pages: &mut PageStore) -> Self {
-        let mut cells = pages.alloc_slice::<Cell>(cols);
+        let mut cells = pages.alloc_cells(cols);
         for cell in cells.iter_mut() {
             *cell = Cell::EMPTY;
         }
@@ -104,6 +112,26 @@ impl Row {
             len: 0,
             flags: RowFlags::DIRTY,
         }
+    }
+
+    /// Return this removed row's cell storage for another row of the same width.
+    /// Snapshots/extras must already own any content that survives the removal.
+    ///
+    /// # Safety
+    ///
+    /// `pages` must be the live PageStore that allocated this row's cells.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "ResizeRowReuse",
+            action = "Shrink",
+            project = "grid::tests::resize_row_reuse::resize_row_reuse_conforms"
+        )
+    )]
+    pub(crate) unsafe fn recycle(self, pages: &mut PageStore) {
+        // SAFETY: the caller supplies the originating arena; consuming the Row
+        // transfers its non-Clone PageSlice and leaves no row owning the range.
+        unsafe { pages.recycle_cells(self.cells) };
     }
 
     /// Get the column count.
@@ -514,6 +542,53 @@ impl Row {
         self.cells[..copy_len].copy_from_slice(&other.cells[..copy_len]);
         self.len = other.len.min(self.cols());
         self.flags = other.flags | RowFlags::DIRTY;
+    }
+
+    /// An owned copy of this row that no [`PageStore`] backs, for a holder that
+    /// must outlive the grid's pages (`Grid`'s alt-screen resize undo: the
+    /// grid replaces its store wholesale on a width change, an ED 3 and a ring
+    /// eviction, and a `Row` kept across one of those would dangle).
+    pub(crate) fn snapshot(&self) -> RowSnapshot {
+        RowSnapshot {
+            cells: self.cells.to_vec().into_boxed_slice(),
+            len: self.len,
+            flags: self.flags,
+        }
+    }
+
+    /// Rebuild a row from a [`RowSnapshot`], `cols` wide (the snapshot is
+    /// clamped or padded with empty cells when the widths differ).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Row::new`]: `pages` must outlive the returned row.
+    pub(crate) unsafe fn from_snapshot(
+        snapshot: &RowSnapshot,
+        cols: u16,
+        pages: &mut PageStore,
+    ) -> Self {
+        // SAFETY: forwarded from this function's contract.
+        let mut row = unsafe { Self::new(cols, pages) };
+        let copy_len = row.cells.len().min(snapshot.cells.len());
+        row.cells[..copy_len].copy_from_slice(&snapshot.cells[..copy_len]);
+        row.len = snapshot.len.min(row.cols());
+        row.flags = snapshot.flags | RowFlags::DIRTY;
+        row
+    }
+}
+
+/// A row's cells, length and flags held outside any [`PageStore`]
+/// ([`Row::snapshot`]).
+#[derive(Debug, Clone)]
+pub(crate) struct RowSnapshot {
+    cells: Box<[Cell]>,
+    len: u16,
+    flags: RowFlags,
+}
+
+impl RowSnapshot {
+    pub(crate) fn heap_memory_used(&self) -> usize {
+        self.cells.len() * std::mem::size_of::<Cell>()
     }
 }
 

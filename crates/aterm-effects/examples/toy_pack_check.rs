@@ -10,7 +10,9 @@ use aterm_effects::spec::{compile_toy_pack_toml, read_toy_pack_file};
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: cargo run -p aterm-effects --example toy_pack_check -- <pack.toml>");
+        eprintln!(
+            "usage: targo --unverified run -p aterm-effects --example toy_pack_check -- <pack.toml>"
+        );
         return ExitCode::from(2);
     };
     let source = match read_toy_pack_file(&path) {

@@ -532,6 +532,60 @@ fn a_password_never_reaches_a_debug_line() {
     assert!(rendered.contains("redacted"), "{rendered}");
 }
 
+// --- the refusal names the file to fix, or the profile to pass ----------------
+
+/// A fresh machine with only `~/.aterm/machine.key` — no `--release-credentials` — must be
+/// told to pass the profile `ship provision` writes, never to edit a profile it was not
+/// given; a real profile lacking `notary_profile` is named by its path. FAILS WITHOUT THE
+/// FIX: the machine-key case was refused with "add `notary_profile` to the profile".
+#[test]
+fn a_cut_without_a_profile_is_told_to_pass_one_and_a_profile_without_notary_is_named() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("aterm-apple-refusal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (home, repo) = (root.join("home"), root.join("repo"));
+    std::fs::create_dir_all(home.join(".aterm")).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    let pkcs8 =
+        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let key = home.join(".aterm/machine.key");
+    std::fs::write(&key, pkcs8.as_ref()).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let machine = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
+        .expect("machine.key resolves")
+        .expect("machine.key yields credentials");
+    assert!(machine.profile().is_none(), "machine.key is no profile");
+    for credentials in [Some(&machine), None] {
+        let err = sign::resolve_apple_tier(FAKE_TEAM, credentials)
+            .expect_err("no profile, no notary credential");
+        assert!(
+            err.contains("no --release-credentials profile was given")
+                && err.contains("--release-credentials ~/.aterm/release-credentials.toml")
+                && err.contains("ship provision --id <machine-id>"),
+            "{err}"
+        );
+        assert!(!err.contains("notary_profile"), "nothing to edit: {err}");
+    }
+
+    let encoded = aterm_codec::base64::encode(pkcs8.as_ref()).expect("pkcs8");
+    let path = root.join("profile.toml");
+    std::fs::write(&path, format!("signing_key = \"{encoded}\"\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let profile = sign::ReleaseCredentials::load(&path).expect("the profile loads");
+    assert_eq!(profile.profile(), Some(path.as_path()));
+    let err = sign::resolve_apple_tier(FAKE_TEAM, Some(&profile))
+        .expect_err("a profile without notary_profile cannot notarize");
+    assert!(
+        err.contains(&format!(
+            "{} names no notarytool credential",
+            path.display()
+        )) && err.contains("notary_profile"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // --- the profile's Apple stanza ---------------------------------------------
 
 #[test]

@@ -844,17 +844,17 @@ pub fn chrome_face_gate_model() -> Model {
     }
 }
 
-/// MOTION POLICY (W11) — reduced-motion totality: the abstract twin of
-/// aterm-gui's pure `motion::MotionPolicy::resolve` + `amplitude` (the Tier-1
-/// binding is aterm-gui's `reduced_motion_totality` test, which enumerates the
-/// SAME 3×2×2 input domain × the full governed-effect set over the shipping
-/// resolver — a complete proof, since the domain is finite).
+/// MOTION POLICY (W11) — reduced-motion totality: the abstract twin of the
+/// pure `aterm_effects::motion::MotionPolicy::resolve` + `amplitude` (the
+/// Tier-1 binding is that module's `reduced_motion_totality` test, which
+/// enumerates the SAME 3×2×2 input domain × the full governed-effect set over
+/// the shipping resolver — a complete proof, since the domain is finite).
 ///
 /// The model abstracts the amplitude as ONE scalar over the whole governed set
 /// (the per-effect arm is a constant 0 under Reduced), so a NEW governed effect
-/// joins the proof through aterm-gui's `MotionEffect::ALL` + the exhaustive
-/// `amplitude` match, not through an edit here — and a RETIRED one leaves the
-/// same way (`MotionEffect::PkgProgressCard`, the floating progress card's
+/// joins the proof through `MotionEffect::ALL` + the exhaustive `amplitude`
+/// match, not through an edit here — and a RETIRED one leaves the same way
+/// (`MotionEffect::PkgProgressCard`, the floating progress card's
 /// rainbow/sparkle/cat trim, went with the card on 2026-08-26; the status bars
 /// that replaced it carry no time-driven decoration to govern).
 ///
@@ -1300,27 +1300,43 @@ pub fn emacs_search_navigation_model() -> Model {
 /// sampling + `App::settle_scroll_motion_at_target` reducer. The real-code
 /// binding includes `glide_disarms_in_bounded_wakes`,
 /// `glide_converges_monotonically_and_exactly`, and
-/// `reduced_motion_settle_conforms_to_scroll_glide_model`.
+/// `reduced_motion_settle_conforms_to_scroll_glide_model`, and
+/// `output_mid_glide_conforms_to_scroll_glide_model` for `Output`.
 ///
-/// Scalar projection `<<pos, target, armed, wakes, reduced>>` over a 0..N
-/// position lane (N = 3): `Arm` starts a Full-policy glide at a nondeterministic
-/// target (wake counter reset), `Retarget` redirects it mid-flight (a chained
-/// wheel notch — the clock restarts, so the counter resets too), and `Wake` is
-/// one Full-policy deadline firing: the position steps one unit toward the
-/// target and the glide disarms iff it arrived. `SetReduced` is the accessibility
-/// edge: position becomes target and armed becomes 0 in the same transition;
-/// `SetFull` re-enables future arms. `wakes` saturates at N+1 so the state space
-/// stays finite.
+/// Scalar projection `<<pos, target, armed, wakes, reduced, aim, drift>>` over a
+/// 0..N position lane (N = 3; `pos`/`target` are rows into history, 0 = live):
+/// `Arm` starts a Full-policy glide at a nondeterministic target (wake counter
+/// reset), `Retarget` redirects it mid-flight (a chained wheel notch — the clock
+/// restarts, so the counter resets too), and `Wake` is one Full-policy deadline
+/// firing: the position steps one unit toward the target and the glide disarms
+/// iff it arrived. `SetReduced` is the accessibility edge: position becomes
+/// target and armed becomes 0 in the same transition; `SetFull` re-enables
+/// future arms. `wakes` saturates at N+1 so the state space stays finite.
 ///
-/// `Buggy` gates the policy-edge defect found by the settings audit: with
-/// `Buggy = 0` (committed), every Full wake advances, at most N wakes elapse
-/// before disarm (`BoundedWakes`), every disarmed glide sits at its target
-/// (`DisarmedAtTarget`), and Reduced is both disarmed and landed
-/// (`ReducedSettled`). With `Buggy = 1`, `SetReduced` retains the intermediate
-/// position and armed deadline — the old whole-row sampling behavior — so
-/// `ReducedSettled` yields a counterexample. Thus `ty` proves both ordinary
-/// convergence and immediate Reduced settlement, and catches the actual stale-
-/// deadline mutant.
+/// `Output` is the MACHINE moving the frame under a glide bound into history
+/// (SCR-1's re-pin: a line of output while the reader is off live renumbers
+/// every history row by one, `display_offset += lines_added`): the viewport and
+/// the glide's target move together (`Glide::shift`, discovered through
+/// `ScrollGlideState::engine_row`), so the reader keeps the content they were
+/// looking at and the landing is the SAME content they aimed at. `aim` is the
+/// target as last set by a person (Arm/Retarget) and `drift` the machine's rows
+/// since; `TargetIsAnchored` is the law (`target == aim + drift` while armed). A
+/// glide bound for LIVE (target 0) is a destination, not content — it lands on
+/// live whatever streams (`a_glide_bound_for_live_lands_on_live_while_output_streams`
+/// binds that half), so `Output` is modelled for history targets only.
+///
+/// `Buggy` gates the two defects found: with `Buggy = 0` (committed), every Full
+/// wake advances, at most N wakes elapse before disarm (`BoundedWakes`), every
+/// disarmed glide sits at its target (`DisarmedAtTarget`), Reduced is both
+/// disarmed and landed (`ReducedSettled`), and output keeps the target on its
+/// content (`TargetIsAnchored`). With `Buggy = 1`, `SetReduced` retains the
+/// intermediate position and armed deadline — the old whole-row sampling
+/// behavior — so `ReducedSettled` yields a counterexample; and `Output` re-pins
+/// the viewport but leaves the target where it was — the pre-2026-09-22 tick that
+/// scrolled the reader back toward live by `lines_added` on every wake — so
+/// `TargetIsAnchored` yields one. Thus `ty` proves ordinary convergence,
+/// immediate Reduced settlement and anchoring under output, and catches both
+/// mutants.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
 // models above) — the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1362,12 +1378,21 @@ pub fn scroll_glide_model() -> Model {
                 name: "reduced",
                 init: 0,
             },
+            StateVar {
+                name: "aim",
+                init: 0,
+            },
+            StateVar {
+                name: "drift",
+                init: 0,
+            },
         ],
         fn_vars: vec![],
         actions: vec![
             Action {
                 // A wheel notch arrives on an idle viewport: aim anywhere in
-                // the 0..N lane and arm the glide (wake counter restarts).
+                // the 0..N lane and arm the glide (wake counter restarts). No
+                // machine drift yet, so `target` IS the person's aim.
                 name: "Arm",
                 guard: Some(and_(le(var("armed"), int(0)), le(var("reduced"), int(0)))),
                 updates: vec![
@@ -1383,11 +1408,20 @@ pub fn scroll_glide_model() -> Model {
                         var: "wakes",
                         expr: int(0),
                     },
+                    Update {
+                        var: "aim",
+                        expr: int(0),
+                    },
+                    Update {
+                        var: "drift",
+                        expr: int(0),
+                    },
                 ],
             },
             Action {
                 // A chained wheel notch mid-glide: redirect the target; the
-                // ease clock restarts, so the per-arm wake budget does too.
+                // ease clock restarts, so the per-arm wake budget does too. A new
+                // aim: the machine's drift so far belongs to the old one.
                 name: "Retarget",
                 guard: Some(and_(gt(var("armed"), int(0)), le(var("reduced"), int(0)))),
                 updates: vec![
@@ -1398,6 +1432,55 @@ pub fn scroll_glide_model() -> Model {
                     Update {
                         var: "wakes",
                         expr: int(0),
+                    },
+                    Update {
+                        var: "aim",
+                        expr: int(0),
+                    },
+                    Update {
+                        var: "drift",
+                        expr: int(0),
+                    },
+                ],
+            },
+            Action {
+                // The MACHINE moves the frame under a glide bound into history:
+                // one line of output while the reader is off live (SCR-1's
+                // re-pin, `display_offset += 1`). The glide shifts with it —
+                // start and target together, the ease clock untouched
+                // (`Glide::shift`) — so the remaining distance and the wake
+                // budget are unchanged. `aim` captures the person's target the
+                // first time the machine moves it (until then it IS `target`).
+                // Buggy re-pins the viewport but leaves the target behind: the
+                // pre-2026-09-22 tick that scrolled the reader back toward live.
+                name: "Output",
+                guard: Some(and_(
+                    and_(gt(var("armed"), int(0)), le(var("reduced"), int(0))),
+                    and_(
+                        and_(gt(var("pos"), int(0)), le(var("pos"), int(2))),
+                        and_(gt(var("target"), int(0)), le(var("target"), int(2))),
+                    ),
+                )),
+                updates: vec![
+                    Update {
+                        var: "pos",
+                        expr: add(var("pos"), int(1)),
+                    },
+                    Update {
+                        var: "target",
+                        expr: if_(
+                            gt(cst("Buggy"), int(0)),
+                            var("target"),
+                            add(var("target"), int(1)),
+                        ),
+                    },
+                    Update {
+                        var: "aim",
+                        expr: if_(eq(var("drift"), int(0)), var("target"), var("aim")),
+                    },
+                    Update {
+                        var: "drift",
+                        expr: add(var("drift"), int(1)),
                     },
                 ],
             },
@@ -1478,6 +1561,16 @@ pub fn scroll_glide_model() -> Model {
                 expr: or_(
                     le(var("reduced"), int(0)),
                     and_(le(var("armed"), int(0)), eq(var("pos"), var("target"))),
+                ),
+            },
+            Invariant {
+                // Output never takes the reader's aim away: while armed, the
+                // target is the person's aim plus every row the machine moved
+                // the frame by since — the SAME content (selection-custody §1d).
+                name: "TargetIsAnchored",
+                expr: or_(
+                    or_(le(var("armed"), int(0)), le(var("drift"), int(0))),
+                    eq(var("target"), add(var("aim"), var("drift"))),
                 ),
             },
         ],

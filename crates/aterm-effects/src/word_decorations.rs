@@ -17,7 +17,7 @@
 //!   descends — a one-shot per occurrence. When the cat cannot draw (style,
 //!   cell floors, narrow words, top row, `MAX_CATS` overflow) no graphic is
 //!   shown at all; the word's own animated ink still plays.
-//! * **Animated ink** (v2 — emphasis / profanity / feline; orca untouched) → the
+//! * **Animated ink** (v2 — emphasis / profanity / feline) → the
 //!   matched glyphs themselves are recolored through [`InkCell`] fg overrides: a
 //!   two-tone gradient with one traveling specular sweep, settling to constant
 //!   bytes forever (a stable fixed point, not a decay to default fg).
@@ -176,7 +176,7 @@ const DONE_MARKS_CAP: usize = 65_536;
 /// representable index while every possible `u64` done-mark key remains legal.
 const DONE_MARK_NONE: u32 = u32::MAX;
 /// v3 §1.2 graphics-decay rule: sparkle + nova ember residuals fade out
-/// within this window after their animation window (orca residual exempt).
+/// within this window after their animation window.
 const RESIDUAL_FADE_MS: u64 = 2000;
 /// v3 dwell genome derivation salts. DEVIATION (documented): the design
 /// derives dwell from dedicated genome bits, but no such fields exist
@@ -203,11 +203,6 @@ const GLOW_BURST_MS: u64 = 1400;
 /// It fits entirely inside the already-animated rainbow drift, so it adds no
 /// deadline or idle wake of its own.
 const RAINBOW_SPARKLE_MS: u64 = 1000;
-
-/// The orca "splash" glyph cycle — water droplets + a cross of spray.
-const ORCA_GLYPHS: [DecoGlyph; 3] = [DecoGlyph::Droplet, DecoGlyph::Dot, DecoGlyph::Plus];
-/// Ocean splash palette (`0x00RRGGBB`): deep blue, azure, bright cyan, foam white.
-const ORCA_PALETTE: [u32; 4] = [0x0020_6CC8, 0x0029_A0E0, 0x0055_D6F0, 0x00E8_FBFF];
 
 /// App-cached resolved sparkle state: the resolved [`DecoConfig`] plus the
 /// compiled lexicon. Rebuilt only on config reload / toggle (NOT per frame), so
@@ -648,8 +643,6 @@ pub struct DecoConfig {
     /// Canine family → the typed-word DOG cameo (the input path). The screen
     /// scanner's ambient class default is inert, so this gates only the cameo.
     pub canine: bool,
-    /// Orca / cetacean family → the randomized water-droplet "splash".
-    pub orca: bool,
     /// Emphasis / hype words (user `extra_words` only; the builtin lexicon
     /// ships no emphasis forms) — the ink-only class. This gates only the
     /// class-default path. A custom override is resolved before class gates
@@ -657,7 +650,7 @@ pub struct DecoConfig {
     /// indexed under the emphasis class.
     pub emphasis: bool,
     /// Animated glyph-ink shimmer over ink-bearing classes (emphasis + profanity
-    /// + feline; orca untouched in v2). `false` ⇒ zero [`InkCell`]s emitted.
+    /// + feline). `false` ⇒ zero [`InkCell`]s emitted.
     pub ink_enabled: bool,
     /// Ink tint vs the captured original fg, `0.0..=1.0` (§4.2 `strength`).
     pub ink_strength: f32,
@@ -738,7 +731,6 @@ impl DecoConfig {
 /// the existing classes expressed as spec consumers (no behavior change
 /// except as specced): Profanity = Rainbow + SuperNova@chance (or the
 /// selectable classic Nova / v1 Sparkle), Feline = Cats + SelfGlow,
-/// Orca = the suspended splash (dispatched by class until the orca redo),
 /// Emphasis = TwoTone. TwoTone class defaults carry the CLASS BASE pair and
 /// are genome-hue-nudged at emission (custom TwoTone specs use their colors
 /// raw — see `Occurrence::custom`).
@@ -788,10 +780,6 @@ fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
             }),
             burst: None,
         },
-        // §4: the suspended splash keeps its class-keyed dispatch (and its v2
-        // steady residual, the §1.2 exception) until the orca redo rides the
-        // framework as an `Orcas` collection.
-        Class::Orca => WordEffectSpec::default(),
         // The canine family works BOTH ways: the typed-word summon pops the
         // dog cameo (the input path), and an on-screen canine word peeks the
         // animal roster's dog head — the Animal class default with the species
@@ -862,7 +850,6 @@ impl Default for DecoConfig {
             profanity: true,
             feline: true,
             canine: true,
-            orca: true,
             emphasis: true,
             ink_enabled: true,
             ink_strength: 0.75,
@@ -1519,15 +1506,14 @@ struct Occurrence {
     /// surface) — the v1 paw + ink take over.
     dec_line: bool,
     /// v3 §1.1: copied from the episode's born-done/born-settled flags at
-    /// rescan — the inert emission gate (settled ink bytes only; orca keeps
-    /// its exempt v2 residual).
+    /// rescan — the inert emission gate (settled ink bytes only).
     inert: bool,
     /// v3 §6: the resolved effect spec (per-word override, else the class
     /// default) — the tick dispatches on its axes, not on `class`.
     spec: WordEffectSpec,
     /// v3 §6: `spec` came from a `[[sparkle_words.custom]]` override — the
     /// class-gate bypass marker; custom TwoTone colors apply RAW (no genome
-    /// hue nudge), and the orca class carve-out yields to the spec.
+    /// hue nudge).
     custom: bool,
     /// For a [`Class::Animal`] occurrence: the authored species head, resolved
     /// at rescan from the match's lexicon `species` tag
@@ -6013,7 +5999,6 @@ impl WordDecorations {
                     Class::Profanity if !cfg.profanity => continue,
                     Class::Feline if !cfg.feline => continue,
                     Class::Canine if !cfg.canine => continue,
-                    Class::Orca if !cfg.orca => continue,
                     // Emphasis is the ink-only class (P1): the resolver folds
                     // `ink_enabled || has_custom_specs` into `cfg.emphasis`,
                     // so a gated-off emphasis match never consumes a slot.
@@ -6136,8 +6121,7 @@ impl WordDecorations {
             // visual span, plus the first lead cell's bg for the legibility
             // guard. Continuation halves of wide glyphs carry no glyph and
             // are skipped (the lead cell's InkCell governs the whole glyph).
-            // v3 §6: ink-bearing = the resolved spec carries an ink axis
-            // (orca's default spec carries none — the v2 exemption intact).
+            // v3 §6: ink-bearing = the resolved spec carries an ink axis.
             let ink_bearing = cfg.ink_enabled && spec.ink.is_some();
             let mut ink_base = 0usize;
             let mut ink_cells = 0u16;
@@ -7180,22 +7164,6 @@ impl WordDecorations {
                 emit_rainbow_sparkles(occ, cfg, now, frame, geom, out, &mut fp, &mut active_until);
             }
             if out.len() >= MAX_DECORATIONS {
-                continue;
-            }
-            // §4 orca carve-out: the suspended splash keeps its class-keyed
-            // dispatch (and its exempt v2 residual) until the orca redo rides
-            // the framework; a custom-overridden word takes the spec axes.
-            if occ.class == Class::Orca && !occ.custom {
-                emit_orca_splash(
-                    occ,
-                    cfg,
-                    now,
-                    self.frame,
-                    anim,
-                    out,
-                    &mut fp,
-                    &mut active_until,
-                );
                 continue;
             }
             // v3 §6 GRAPHIC axis (`Collection::Cats`: the peeking cat, with
@@ -8410,8 +8378,8 @@ impl WordDecorations {
         until
     }
 
-    /// Whether any occurrence is still inside its animation window (profanity /
-    /// orca sparkle, a live ink sweep, or a granted — possibly still queued —
+    /// Whether any occurrence is still inside its animation window (profanity
+    /// sparkle, a live ink sweep, or a granted — possibly still queued —
     /// nova window) — the scheduler keeps presenting frames while true, then
     /// drops to a pure wait. Cheap (no config / no scan): reads the deadline
     /// last computed by `tick`.
@@ -8833,77 +8801,6 @@ fn emit_super_axis(
                 out.push(d);
             }
         }
-    }
-}
-
-/// The suspended §4 orca "splash": same randomized, self-terminating motion
-/// as the profanity sparkle, but water DROPLETS in an ocean palette that
-/// spray UPWARD. v3 §1.2 EXCEPTION: keeps its v2 steady-droplet residual
-/// untouched (design §4 promises orca code intact; unreachable while
-/// suspended, and the orca redo replaces it). Born-inert episodes skip
-/// straight to the settled residual.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "pure per-occurrence emission over tick-local accumulators, the emit_ink idiom"
-)]
-fn emit_orca_splash(
-    occ: &Occurrence,
-    cfg: &DecoConfig,
-    now: Instant,
-    frame: u64,
-    anim: Duration,
-    out: &mut Vec<WordDecoration>,
-    fp: &mut u64,
-    active_until: &mut Option<Instant>,
-) {
-    let animating =
-        !occ.inert && !cfg.reduced_motion && now.saturating_duration_since(occ.appeared) < anim;
-    let width = u64::from(occ.end_col.saturating_sub(occ.start_col) + 1).max(1);
-    if animating {
-        let until = occ.appeared + anim;
-        arm_until(active_until, until);
-        let density = cfg.density.clamp(1, 12);
-        for k in 0..density {
-            if out.len() >= MAX_DECORATIONS {
-                break;
-            }
-            let s = mix(occ.seed
-                ^ u64::from(k).wrapping_mul(0xA24B_AED4_963E_E407)
-                ^ frame.rotate_left(17));
-            let col = occ.start_col + (s % width) as u16;
-            let glyph = ORCA_GLYPHS[(s >> 11) as usize % ORCA_GLYPHS.len()];
-            let color = ORCA_PALETTE[(s >> 23) as usize % ORCA_PALETTE.len()];
-            let env = twinkle(s, now.saturating_duration_since(occ.appeared).as_secs_f32());
-            let alpha = scale_u8(cfg.intensity * env);
-            // Upward splash: jitter MINUS a 1..=4 px rise.
-            let splash_up = 1 + (s >> 5 & 0x3) as i8;
-            let d = WordDecoration {
-                row: occ.row,
-                col,
-                dx: jitter(cfg.jitter, s),
-                dy: jitter(cfg.jitter, s >> 7).saturating_sub(splash_up),
-                glyph,
-                blend: DecoBlend::Add,
-                color,
-                alpha,
-            };
-            *fp = fold_deco(*fp, &d) ^ frame.wrapping_mul(0x9E37_79B1);
-            out.push(d);
-        }
-    } else {
-        // Steady residual: one dim droplet.
-        let d = WordDecoration {
-            row: occ.row,
-            col: occ.start_col,
-            dx: 0,
-            dy: 0,
-            glyph: DecoGlyph::Droplet,
-            blend: DecoBlend::Add,
-            color: ORCA_PALETTE[0],
-            alpha: scale_u8(cfg.intensity * 0.30),
-        };
-        *fp = fold_deco(*fp, &d);
-        out.push(d);
     }
 }
 
@@ -10224,7 +10121,7 @@ fn emit_animal(
 }
 
 /// The class base ink pair `(c0, c1)` (§4.2/§4.6), `0x00RRGGBB`. `None` = the
-/// class carries no ink (orca is untouched in v2).
+/// class carries no ink.
 fn ink_pair(class: Class) -> Option<(u32, u32)> {
     match class {
         Class::Emphasis => Some((0x007C_C8FF, 0x00C8_9AFF)),
@@ -10234,7 +10131,6 @@ fn ink_pair(class: Class) -> Option<(u32, u32)> {
         // (the class default rides the feline's SelfGlow), kept so the anchor
         // exists the day a user recolors an animal word.
         Class::Animal => Some((0x00FF_C98A, 0x00B9_E8A3)),
-        Class::Orca => None,
         Class::Canine => None,
     }
 }
@@ -10298,8 +10194,7 @@ fn emit_ink(
     if occ.ink_cells == 0 || !cfg.ink_enabled {
         return;
     }
-    // v3 §6: the ink axis dispatches on the resolved spec colorway (orca's
-    // default spec carries no ink axis — the v2 exemption intact).
+    // v3 §6: the ink axis dispatches on the resolved spec colorway.
     let Some(ink_spec) = occ.spec.ink else {
         return;
     };
@@ -11045,7 +10940,8 @@ fn class_tag(c: Class) -> u64 {
     match c {
         Class::Profanity => 1,
         Class::Feline => 2,
-        Class::Orca => 3,
+        // 3 was the deleted orca class's tag: left unused, so no other
+        // class's seed moves.
         Class::Emphasis => 4,
         Class::Canine => 5,
         // 5 is spoken for: the dog-summon branch's Canine tag (branch
@@ -11061,7 +10957,7 @@ fn glyph_id(g: DecoGlyph) -> u64 {
         DecoGlyph::Dot => 2,
         DecoGlyph::Plus => 3,
         DecoGlyph::Paw => 4,
-        DecoGlyph::Droplet => 5,
+        // 5 was the deleted droplet sprite's id: left unused.
         DecoGlyph::RingArc => 6,
         DecoGlyph::Shade => 7,
     }
@@ -11476,7 +11372,6 @@ mod tests {
             profanity: true,
             feline: true,
             canine: true,
-            orca: true,
             emphasis: true,
             ink_enabled: true,
             ink_strength: 0.75,
@@ -12329,41 +12224,6 @@ mod tests {
             !ink.is_empty(),
             "the rainbow may continue after the stars settle"
         );
-    }
-
-    #[test]
-    fn orca_word_makes_a_splash() {
-        let mut term = Terminal::new(2, 48);
-        term.process(b"the orca leaps");
-        let mut wd = WordDecorations::default();
-        let lex = Lexicon::with_languages(&["en"]);
-        let mut c = cfg();
-        c.orca = true;
-        let epoch = term.damage_epoch();
-        let now = Instant::now();
-        wd.rescan(&term, 2, 48, &lex, &c, epoch, now);
-        let mut out = Vec::new();
-        tick_deco(&mut wd, now, &c, &mut out);
-        // "orca" → an additive, randomized SPLASH during the animation window.
-        assert!(
-            out.iter().any(|d| matches!(d.blend, DecoBlend::Add)),
-            "expected an orca splash, got {out:?}"
-        );
-        // After the window the steady residual is a single dim water Droplet.
-        let later = now + Duration::from_millis(c.anim_ms + 10);
-        out.clear();
-        tick_deco(&mut wd, later, &c, &mut out);
-        assert!(
-            out.iter().any(|d| matches!(d.glyph, DecoGlyph::Droplet)),
-            "steady orca residual must be a droplet, got {out:?}"
-        );
-        // Disabling the orca category removes the splash entirely.
-        c.orca = false;
-        wd.reset();
-        wd.rescan(&term, 2, 48, &lex, &c, epoch, now);
-        out.clear();
-        tick_deco(&mut wd, now, &c, &mut out);
-        assert!(out.is_empty(), "orca off → no splash, got {out:?}");
     }
 
     #[test]

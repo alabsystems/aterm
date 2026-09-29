@@ -196,7 +196,8 @@ fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
         rows: 1,
         z_index: -1,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: aterm_core::grid::extra::ImageScaling::Fit,
+        source_rect: None,
     });
 
     let make_input = |text: &str, with_image: bool| {
@@ -213,6 +214,7 @@ fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
                     image: image.clone(),
                     cell_row: 0,
                     cell_col: 0,
+                    kitty: None,
                 },
             ));
         } else {
@@ -357,7 +359,8 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
         rows: 1,
         z_index: -1,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: aterm_core::grid::extra::ImageScaling::Fit,
+        source_rect: None,
     });
 
     let make_input = |bg: [u8; 3], with_image: bool| {
@@ -386,6 +389,7 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
                     image: image.clone(),
                     cell_row: 0,
                     cell_col: 0,
+                    kitty: None,
                 },
             ));
         }
@@ -467,6 +471,8 @@ fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
         eprintln!("SKIP: no system monospace font");
         return;
     };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (2usize, 4usize);
     let frame_default_bg = [1, 2, 3];
@@ -500,7 +506,8 @@ fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
             rows: 1,
             z_index,
             band_lift_px: 0,
-            pixel_exact: false,
+            scaling: aterm_core::grid::extra::ImageScaling::Fit,
+            source_rect: None,
         });
         for col in 0..=1 {
             input.images[0].push((
@@ -509,6 +516,7 @@ fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
                     image: Arc::clone(&image),
                     cell_row: 0,
                     cell_col: 0,
+                    kitty: None,
                 },
             ));
         }
@@ -750,7 +758,7 @@ fn image_scissored_present_byte_identical_to_full() {
 
     // A fresh full-render oracle for an input (separate renderer, no prior frame).
     let fresh = |input: &aterm_render::RenderInput| -> Vec<u32> {
-        let mut g = aterm_gpu::GpuRenderer::new(px, theme).expect("GPU available a moment ago");
+        let mut g = common::independent_gpu(px, theme);
         let mut w = aterm_gpu::WindowGpu::new();
         g.render_input(&mut w, input, None).pixels
     };
@@ -867,4 +875,124 @@ fn kitty_rgba_image_rasterizes_to_pixels_cpu() {
         "the Kitty RGBA image must rasterize to red pixels (got none) — \
          confirms kitty graphics actually render via the shared compositor"
     );
+}
+
+/// iTerm2 `preserveAspectRatio=0` STRETCHES a square picture over a 4x1-cell
+/// box on BOTH backends — the stretch lives in the one shared decode, so the
+/// GPU samples the same filled footprint the CPU blits. The default (FIT) is
+/// the control: the square is centred and the box's last column stays bare.
+#[test]
+fn stretched_image_fills_its_footprint_on_cpu_and_gpu() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (3usize, 8usize);
+    let png = solid_png(ch as u32, ch as u32, [220, 20, 20]);
+    for (args, fills) in [
+        ("inline=1;width=4;height=1;preserveAspectRatio=0", true),
+        ("inline=1;width=4;height=1", false),
+    ] {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.set_cell_pixel_size(cw as u16, ch as u16);
+        term.process(&osc_1337_file(args, &png));
+        let input = term.cell_frame(rows, cols);
+        let cpu_frame = cpu.render_input(&input);
+        let mut win = aterm_gpu::WindowGpu::new();
+        let gpu_frame = gpu.render_input(&mut win, &input, None);
+        let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+        assert!(delta <= 8, "{args}: CPU/GPU diverge by {delta} > 8");
+        // The rightmost pixel column of the box: inside the stretch, outside
+        // the centred fit.
+        let edge_red = |f: &Frame| {
+            (0..ch)
+                .filter(|&y| {
+                    let p = f.pixels[y * f.width + 4 * cw - 1];
+                    rr(p) > 150 && gg(p) < 80 && bb(p) < 80
+                })
+                .count()
+        };
+        for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+            if fills {
+                assert_eq!(
+                    edge_red(frame),
+                    ch,
+                    "{name}: the stretch reaches the box edge"
+                );
+            } else {
+                assert_eq!(
+                    edge_red(frame),
+                    0,
+                    "{name}: control: the fit leaves the edge bare"
+                );
+            }
+        }
+    }
+}
+
+/// A Kitty put with a source rectangle (`x=`/`y=`/`w=`/`h=`) shows only that
+/// part of the image, identically on both backends: the crop, like the
+/// scaling, happens in the one shared decode. The uncropped put is the
+/// control.
+#[test]
+fn kitty_cropped_put_matches_cpu_and_gpu() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (4usize, 8usize);
+    // Two cells wide: the left cell's worth red, the right cell's worth blue.
+    let mut raw = Vec::with_capacity(2 * cw * ch * 4);
+    for _y in 0..ch {
+        for x in 0..2 * cw {
+            raw.extend_from_slice(if x < cw {
+                &[230, 20, 20, 255]
+            } else {
+                &[20, 20, 230, 255]
+            });
+        }
+    }
+    let b64 = aterm_codec::base64::encode(&raw).expect("encode");
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.set_cell_pixel_size(cw as u16, ch as u16);
+    term.process(format!("\x1b_Ga=t,f=32,s={},v={ch},i=1,q=2;{b64}\x1b\\", 2 * cw).as_bytes());
+    // Row 0: the right half only. Row 2: the whole image (control).
+    term.process(format!("\x1b[1;1H\x1b_Ga=p,i=1,x={cw},y=0,w={cw},h={ch},q=2\x1b\\").as_bytes());
+    term.process(b"\x1b[3;1H\x1b_Ga=p,i=1,q=2\x1b\\");
+    let input = term.cell_frame(rows, cols);
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(delta <= 8, "cropped put: CPU/GPU diverge by {delta} > 8");
+
+    let count = |f: &Frame, row: usize, red: bool| {
+        cell_pixels(f, cw, ch, row, 0)
+            .iter()
+            .filter(|&&p| {
+                if red {
+                    rr(p) > 150 && bb(p) < 80
+                } else {
+                    bb(p) > 150 && rr(p) < 80
+                }
+            })
+            .count()
+    };
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        assert_eq!(
+            count(frame, 0, true),
+            0,
+            "{name}: the crop dropped the red half"
+        );
+        assert!(
+            count(frame, 0, false) > 0,
+            "{name}: the crop shows the blue half"
+        );
+        assert!(
+            count(frame, 2, true) > 0,
+            "{name}: control: the uncropped put starts red"
+        );
+    }
 }

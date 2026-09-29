@@ -1479,6 +1479,285 @@ pub(crate) fn mark_backend_worker_done() {
     let _ = BACKEND_WORKER_DONE.set(Instant::now());
 }
 
+// ---------------------------------------------------------------------------
+// THE SUCCESSOR'S CLAIM TIMELINE (warm successor P0,
+// docs/DESIGN-warm-successor-2026-09-29.md "Where the milliseconds go").
+//
+// Under the late park the outgoing terminal is frozen from just before this
+// successor's rendezvous claim until Commit, and `claim->proof` is the part of
+// that freeze this process pays. That one number used to be all the log said;
+// every segment inside it was inferred from unrelated lines. These stamps make
+// each boundary a measurement, relative to the claim instant.
+//
+// OBSERVATION ONLY. Every stamp is a first-write-wins `OnceLock` set that
+// nothing reads back to decide anything, and every one is a no-op until a claim
+// is recorded — so an ordinary launch, and every launch off macOS, records
+// nothing here. The boundaries the startup ledger already stamps (`run_app`,
+// the first `resumed`, the seven attach points, the backend worker's spawn and
+// done, the first reveal) are READ from that ledger, never stamped twice.
+
+/// The boundaries only a handoff boot stamps for itself: the ones the startup
+/// ledger above has no stamp for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))] // `Proof` is stamped on the unix lane only
+pub(crate) enum ClaimStamp {
+    /// `seamless::take_incoming` returned: the intake's authentication is done.
+    Intake,
+    /// Session 0 (the first adopted shell) was bound by `spawn_session`.
+    Adopt0,
+    /// The winit `EventLoop` was built.
+    EventLoopBuilt,
+    /// The first successful present of any window (`first_present_done`).
+    FirstPresent,
+    /// The deferred restore (windows 2..N, the other adopted shells) began.
+    RestoreStart,
+    /// The deferred restore returned: every carried shell is placed.
+    RestoreDrained,
+    /// The adoption proof is about to be written to the parent.
+    Proof,
+}
+
+impl ClaimStamp {
+    const COUNT: usize = 7;
+}
+
+/// The earliest in-process instant this process stamped: the shipped binary's
+/// Rust `main` ([`mark_rust_main_start`]), else the GUI entry (the thin dev
+/// binary). The loader's work before it is outside every stamp here.
+#[must_use]
+pub(crate) fn process_main_start() -> Option<Instant> {
+    RUST_MAIN_START
+        .get()
+        .or_else(|| PROCESS_START.get())
+        .copied()
+}
+
+/// When the claim was granted. `None` on every launch that did not claim.
+static CLAIM_AT: OnceLock<Instant> = OnceLock::new();
+/// When this successor dialled the rendezvous (before the grant hold).
+static CLAIM_DIALLED_AT: OnceLock<Instant> = OnceLock::new();
+/// How long this successor spent warming BEFORE its dial. Recorded beside the
+/// claim; zero until a warm stage exists (the design's P2).
+static CLAIM_WARM_PRE_DIAL: OnceLock<std::time::Duration> = OnceLock::new();
+static CLAIM_STAMPS: [OnceLock<Instant>; ClaimStamp::COUNT] =
+    [const { OnceLock::new() }; ClaimStamp::COUNT];
+
+/// Record the rendezvous claim: the zero point of every [`ClaimStamp`]. First
+/// write wins, as for every startup stamp.
+#[cfg(target_os = "macos")]
+pub(crate) fn mark_handoff_claimed(
+    dialled_at: Instant,
+    claimed_at: Instant,
+    warm_pre_dial: std::time::Duration,
+) {
+    let _ = CLAIM_DIALLED_AT.set(dialled_at);
+    let _ = CLAIM_WARM_PRE_DIAL.set(warm_pre_dial);
+    let _ = CLAIM_AT.set(claimed_at);
+}
+
+/// Offer one claim-relative boundary. A no-op on a launch that claimed nothing,
+/// and after the first write.
+pub(crate) fn stamp_claim(stamp: ClaimStamp) {
+    if CLAIM_AT.get().is_some() {
+        let _ = CLAIM_STAMPS[stamp as usize].set(Instant::now());
+    }
+}
+
+/// Everything the claim timeline is derived from, gathered so the derivation is
+/// a pure function a test can drive with invented instants.
+#[derive(Clone, Copy, Debug)]
+struct ClaimTimelineInputs {
+    claim: Instant,
+    /// [`process_main_start`].
+    exec: Option<Instant>,
+    dial: Option<Instant>,
+    own: [Option<Instant>; ClaimStamp::COUNT],
+    worker_spawn: Option<Instant>,
+    worker_done: Option<Instant>,
+    run_app: Option<Instant>,
+    resumed: Option<Instant>,
+    attach: Option<StartupAttachMilestones>,
+    surface_ready: Option<Instant>,
+    visible: Option<Instant>,
+}
+
+/// One labelled boundary, in signed microseconds after the claim (the Rust
+/// main and the dial precede it, so they read negative).
+type ClaimPoint = (&'static str, i64);
+
+fn signed_us(zero: Instant, at: Instant) -> i64 {
+    match at.checked_duration_since(zero) {
+        Some(after) => i64::try_from(after.as_micros()).unwrap_or(i64::MAX),
+        None => {
+            i64::try_from(zero.duration_since(at).as_micros()).map_or(i64::MIN, std::ops::Neg::neg)
+        }
+    }
+}
+
+/// The claim timeline in its NOMINAL boot order (the order the code runs them;
+/// the values say what really happened). A boundary not reached is left out, so
+/// every point printed is a measurement.
+fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
+    let own = |stamp: ClaimStamp| inputs.own[stamp as usize];
+    let attach = inputs.attach.map(|milestones| milestones.points);
+    let attach_point = |index: usize| attach.map(|points| points[index]);
+    let ordered: [(&'static str, Option<Instant>); 22] = [
+        ("main", inputs.exec),
+        ("dial", inputs.dial),
+        ("intake", own(ClaimStamp::Intake)),
+        ("worker_spawn", inputs.worker_spawn),
+        ("event_loop", own(ClaimStamp::EventLoopBuilt)),
+        ("adopt0", own(ClaimStamp::Adopt0)),
+        ("run_app", inputs.run_app),
+        ("resumed", inputs.resumed),
+        ("attach", attach_point(0)),
+        ("window_create", attach_point(1)),
+        ("window_created", attach_point(2)),
+        ("join", attach_point(3)),
+        ("worker_done", inputs.worker_done),
+        ("joined", attach_point(4)),
+        ("surface_create", attach_point(5)),
+        // The seventh attach point: without it the surface's own creation and
+        // the finish after it read as one slice.
+        ("surface_created", attach_point(6)),
+        ("surface_ready", inputs.surface_ready),
+        ("first_present", own(ClaimStamp::FirstPresent)),
+        ("visible", inputs.visible),
+        ("restore", own(ClaimStamp::RestoreStart)),
+        ("drained", own(ClaimStamp::RestoreDrained)),
+        ("proof", own(ClaimStamp::Proof)),
+    ];
+    ordered
+        .into_iter()
+        .filter_map(|(label, at)| Some((label, signed_us(inputs.claim, at?))))
+        .collect()
+}
+
+/// The backend worker against the join that waits for it: how long the join
+/// blocked, and how far the worker's `done` sat before (positive) or after
+/// (negative) the join's entry. `None` until both halves exist.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn claim_worker_vs_join(inputs: &ClaimTimelineInputs) -> Option<(i64, i64)> {
+    let (join_entry, join_exit) = inputs.attach?.backend_finalize_bounds();
+    let done = inputs.worker_done?;
+    Some((
+        signed_us(join_entry, join_exit),
+        signed_us(done, join_entry),
+    ))
+}
+
+fn claim_timeline_inputs() -> Option<ClaimTimelineInputs> {
+    let claim = CLAIM_AT.get().copied()?;
+    let mut own = [None; ClaimStamp::COUNT];
+    for (slot, stamp) in own.iter_mut().zip(CLAIM_STAMPS.iter()) {
+        *slot = stamp.get().copied();
+    }
+    Some(ClaimTimelineInputs {
+        claim,
+        exec: process_main_start(),
+        dial: CLAIM_DIALLED_AT.get().copied(),
+        own,
+        worker_spawn: BACKEND_WORKER_SPAWN.get().copied(),
+        worker_done: BACKEND_WORKER_DONE.get().copied(),
+        run_app: GUI_READY_FOR_WINIT.get().copied(),
+        resumed: FIRST_WINIT_RESUMED.get().copied(),
+        attach: INITIAL_ATTACH_MILESTONES.get().copied(),
+        surface_ready: INITIAL_SURFACE_READY.get().copied(),
+        visible: FIRST_WINDOW_VISIBLE.get().copied(),
+    })
+}
+
+/// Signed microseconds as milliseconds with `decimals` places (`-3.1`, `12.40`).
+fn signed_ms(us: i64, decimals: usize) -> String {
+    let sign = if us < 0 { "-" } else { "" };
+    let ms = us.unsigned_abs() as f64 / 1000.0;
+    format!("{sign}{ms:.decimals$}")
+}
+
+/// The log's rendering of the whole timeline, or `None` on a launch that did not
+/// claim: `intake +12.3, adopt0 +80.1, … ; the backend join waited 0.4 ms, the
+/// worker done 3.2 ms before it`.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[must_use]
+pub(crate) fn claim_timeline_log_text() -> Option<String> {
+    let inputs = claim_timeline_inputs()?;
+    Some(render_claim_timeline_log(&inputs))
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn render_claim_timeline_log(inputs: &ClaimTimelineInputs) -> String {
+    let points = claim_timeline_points(inputs)
+        .into_iter()
+        .map(|(label, us)| {
+            let sign = if us < 0 { "" } else { "+" };
+            format!("{label} {sign}{}", signed_ms(us, 1))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match claim_worker_vs_join(inputs) {
+        Some((waited, slack)) => format!(
+            "{points}; the backend join waited {} ms, the worker done {} ms {} it",
+            signed_ms(waited, 1),
+            signed_ms(slack.saturating_abs(), 1),
+            if slack < 0 { "after" } else { "before" },
+        ),
+        None => points,
+    }
+}
+
+/// The warm stage's cost before the dial, as the log and `metrics` say it.
+#[must_use]
+pub(crate) fn claim_warm_pre_dial() -> Option<std::time::Duration> {
+    CLAIM_AT.get()?;
+    CLAIM_WARM_PRE_DIAL.get().copied()
+}
+
+/// The `metrics` summary's claim fragment: ` handoff_claim_stamps=<label:ms,…|none>
+/// handoff_warm_pre_dial_ms=<ms|none>`. Self-labelling pairs, like
+/// `startup_gpu_cell_pipeline_ms`, so a new boundary never shifts a column.
+#[must_use]
+pub(crate) fn handoff_claim_fields_text() -> String {
+    let inputs = claim_timeline_inputs();
+    let stamps = inputs.as_ref().map_or_else(
+        || "none".to_string(),
+        |inputs| {
+            claim_timeline_points(inputs)
+                .into_iter()
+                .map(|(label, us)| format!("{label}:{}", signed_ms(us, 2)))
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    let warm = claim_warm_pre_dial().map_or_else(
+        || "none".to_string(),
+        |warm| format!("{:.2}", warm.as_secs_f64() * 1000.0),
+    );
+    format!(" handoff_claim_stamps={stamps} handoff_warm_pre_dial_ms={warm}")
+}
+
+/// Field-for-field JSON twin of [`handoff_claim_fields_text`], with a leading
+/// comma: an object of `label: ms` (or `null`), and a number (or `null`).
+#[must_use]
+pub(crate) fn handoff_claim_fields_json() -> String {
+    let inputs = claim_timeline_inputs();
+    let stamps = inputs.as_ref().map_or_else(
+        || "null".to_string(),
+        |inputs| {
+            let pairs = claim_timeline_points(inputs)
+                .into_iter()
+                .map(|(label, us)| format!("\"{label}\":{}", signed_ms(us, 2)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{pairs}}}")
+        },
+    );
+    let warm = claim_warm_pre_dial().map_or_else(
+        || "null".to_string(),
+        |warm| format!("{:.2}", warm.as_secs_f64() * 1000.0),
+    );
+    format!(",\"handoff_claim_stamps\":{stamps},\"handoff_warm_pre_dial_ms\":{warm}")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StartupWorkerSample {
     valid: bool,
@@ -4639,6 +4918,132 @@ pub(crate) fn snapshot() -> Snapshot {
 /// `startup_phase_tests` (reset) and `histogram_tests` (record_deadline).
 #[cfg(test)]
 static SCHEDULER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod claim_timeline_tests {
+    use super::{
+        ClaimStamp, ClaimTimelineInputs, StartupAttachMilestones, claim_timeline_points,
+        claim_worker_vs_join, render_claim_timeline_log,
+    };
+    use std::time::{Duration, Instant};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// The shape of a real handoff boot (the 24802 run's segments), with the
+    /// worker finishing before the join.
+    fn a_boot() -> ClaimTimelineInputs {
+        let exec = Instant::now();
+        let dial = exec + ms(31);
+        let claim = dial + ms(5);
+        let mut own = [None; ClaimStamp::COUNT];
+        own[ClaimStamp::Intake as usize] = Some(claim + ms(12));
+        own[ClaimStamp::Adopt0 as usize] = Some(claim + ms(99));
+        own[ClaimStamp::EventLoopBuilt as usize] = Some(claim + ms(60));
+        own[ClaimStamp::FirstPresent as usize] = Some(claim + ms(203));
+        own[ClaimStamp::RestoreStart as usize] = Some(claim + ms(204));
+        own[ClaimStamp::RestoreDrained as usize] = Some(claim + ms(219));
+        own[ClaimStamp::Proof as usize] = Some(claim + ms(223));
+        let attach = [110, 115, 135, 140, 141, 160, 170].map(|n| claim + ms(n));
+        ClaimTimelineInputs {
+            claim,
+            exec: Some(exec),
+            dial: Some(dial),
+            own,
+            worker_spawn: Some(claim + ms(32)),
+            worker_done: Some(claim + ms(90)),
+            run_app: Some(claim + ms(106)),
+            resumed: Some(claim + ms(108)),
+            attach: Some(StartupAttachMilestones::new(attach)),
+            surface_ready: Some(claim + ms(172)),
+            visible: Some(claim + ms(205)),
+        }
+    }
+
+    #[test]
+    fn every_boundary_is_signed_ms_after_the_claim_in_boot_order() {
+        let points = claim_timeline_points(&a_boot());
+        let labels: Vec<_> = points.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            [
+                "main",
+                "dial",
+                "intake",
+                "worker_spawn",
+                "event_loop",
+                "adopt0",
+                "run_app",
+                "resumed",
+                "attach",
+                "window_create",
+                "window_created",
+                "join",
+                "worker_done",
+                "joined",
+                "surface_create",
+                "surface_created",
+                "surface_ready",
+                "first_present",
+                "visible",
+                "restore",
+                "drained",
+                "proof",
+            ]
+        );
+        let at = |label: &str| points.iter().find(|(l, _)| *l == label).unwrap().1;
+        // The Rust main and the dial PRECEDE the claim, so they read negative.
+        assert_eq!(at("main"), -36_000);
+        assert_eq!(at("dial"), -5_000);
+        assert_eq!(at("intake"), 12_000);
+        // Every one of the seven attach points is printed, the last included.
+        assert_eq!(at("surface_create"), 160_000);
+        assert_eq!(at("surface_created"), 170_000);
+        assert_eq!(at("proof"), 223_000);
+    }
+
+    #[test]
+    fn a_boundary_never_reached_is_left_out_not_printed_as_zero() {
+        let mut boot = a_boot();
+        boot.own[ClaimStamp::RestoreStart as usize] = None;
+        boot.own[ClaimStamp::RestoreDrained as usize] = None;
+        boot.attach = None;
+        let points = claim_timeline_points(&boot);
+        for gone in [
+            "restore",
+            "drained",
+            "attach",
+            "join",
+            "joined",
+            "surface_created",
+        ] {
+            assert!(points.iter().all(|(l, _)| *l != gone), "{gone}");
+        }
+        assert!(claim_worker_vs_join(&boot).is_none());
+    }
+
+    #[test]
+    fn the_worker_is_judged_against_the_join_on_both_sides() {
+        let boot = a_boot();
+        // Done at +90, join entered at +140 and left at +141.
+        assert_eq!(claim_worker_vs_join(&boot), Some((1_000, 50_000)));
+        let line = render_claim_timeline_log(&boot);
+        assert!(
+            line.starts_with("main -36.0, dial -5.0, intake +12.0,"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("the backend join waited 1.0 ms, the worker done 50.0 ms before it"),
+            "{line}"
+        );
+        // A worker still running at the join is AFTER it (the negative control).
+        let mut late = boot;
+        late.worker_done = Some(boot.claim + ms(141));
+        let line = render_claim_timeline_log(&late);
+        assert!(line.ends_with("the worker done 1.0 ms after it"), "{line}");
+    }
+}
 
 #[cfg(test)]
 mod startup_worker_tests {

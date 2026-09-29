@@ -587,7 +587,7 @@ fn capped_detail(joined: &str) -> Vec<String> {
 /// Lines joined by US. A US INSIDE a line would read back as a line break,
 /// so it is dropped here — every stored line is control-stripped already,
 /// so the codec is total without a second escape level.
-fn join_us(lines: &[String]) -> String {
+pub(crate) fn join_us(lines: &[String]) -> String {
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
@@ -598,7 +598,9 @@ fn join_us(lines: &[String]) -> String {
     out
 }
 
-fn split_us(s: &str) -> Vec<String> {
+/// The inverse of [`join_us`]: a value's lines, split at US (none for an
+/// empty value).
+pub(crate) fn split_us(s: &str) -> Vec<String> {
     if s.is_empty() {
         return Vec::new();
     }
@@ -606,7 +608,7 @@ fn split_us(s: &str) -> Vec<String> {
 }
 
 /// `\`→`\\`, TAB→`\t`, LF→`\n`, CR→`\r`, US→`\u`.
-fn escape_into(out: &mut String, v: &str) {
+pub(crate) fn escape_into(out: &mut String, v: &str) {
     for c in v.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
@@ -620,7 +622,7 @@ fn escape_into(out: &mut String, v: &str) {
 }
 
 /// The inverse of [`escape_into`]; an unknown escape keeps both characters.
-fn unescape(v: &str) -> String {
+pub(crate) fn unescape(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     let mut chars = v.chars();
     while let Some(c) = chars.next() {

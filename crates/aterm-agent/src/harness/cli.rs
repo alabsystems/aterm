@@ -19,8 +19,12 @@
 //! `liveness`, `recover`, `nudge`, `switch`, `watch` and `config` went with it;
 //! each is refused by name ([`DELETED`]) with where the capability went.
 //!
-//! * `usage` folds the vendor's transcript for this working directory — a
-//!   filesystem fact no hook is needed for.
+//! * `usage` folds THIS session's transcripts — the one Claude Code names in
+//!   the environment it gives its tools (`CLAUDE_CODE_SESSION_ID`, else
+//!   `CLAUDE_PID`'s sessions file), else the newest in this working
+//!   directory, said so — and its subagents', through the same incremental
+//!   fold the window's footer reads ([`super::session_usage`]). A filesystem
+//!   fact no hook is needed for.
 //! * `limits` reads the session's SCREEN over the control socket (the one
 //!   interface) through the engine's own readers: the wall the last turn
 //!   ended on ([`aterm_phase::wall`], the one wall classifier — the engine's
@@ -28,8 +32,12 @@
 //!   painted on its `/usage` panel ([`usage::usage_panel_windows`]), each
 //!   reset placed by the supervisor's own clock ([`limit::parse_reset`]).
 //! * `disk` measures, and removes only a named safelist class under
-//!   `disk.apply = true`; every measurement, removal and refusal is appended
-//!   to `<state>/disk.jsonl`, cut back to its newest rows past
+//!   `disk.apply = true` — for build directories, an idle cargo profile's
+//!   `incremental/` under cargo's own locks ([`disk::target`]), and below the
+//!   automatic floor recent ones too, least recently used first, until free
+//!   space is back (measured, or covered by the bytes released); every
+//!   measurement, removal intent, removal and refusal is appended to
+//!   `<state>/disk.jsonl` as it happens, cut back to its newest rows past
 //!   [`DISK_LEDGER_MAX_BYTES`] ([`bound_ledger`]).
 //! * `ledger` reads the engine's approval ledger
 //!   ([`crate::supervise::approvals`], `<aterm state>/drive/<sid>.jsonl`) — or
@@ -80,6 +88,8 @@ use std::process::ExitCode;
 use aterm_json::{Map, Value};
 
 use super::disk;
+use super::footer;
+use super::session_usage::{self, SessionUsage};
 use super::source::Source;
 use super::usage::{self, AccountView, UsageView, rfc3339_utc};
 use crate::supervise::journal::Journal;
@@ -284,7 +294,7 @@ default, for every Claude Code and Codex session (`aterm drive watch|supervise`
 runs the same engine from a terminal).
 
 USAGE:
-    aterm harness usage [--json]                 this directory's transcript spend (design 5.2)
+    aterm harness usage [--json]                 this session's tokens per model (design 5.2)
     aterm harness limits [@<sid>] [--json]       the wall and the painted /usage windows on the session's screen
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
     aterm harness ledger [@<sid>] [<n>] [--json] the supervisor's approval ledger
@@ -320,21 +330,29 @@ OPTIONS:
     --config <path>     where the [disk] knobs are read from
                         (default: $XDG_CONFIG_HOME/aterm/aterm.toml, else $HOME/.config/...)
     --sock <path>       limits: the control socket (default: the resolved one)
-    --utc-offset <s>    seconds east of UTC for the times usage prints (default: 0, i.e. UTC)
     --apply <class>     disk: the ONE safelist class to act on. atpkg-gc and
                         claude-purge are surfaced and never removed from here;
                         they name the command that owns them
     --dry-run           upgrade: print each session's next step, type and signal nothing
     --status            upgrade: print each recorded upgrade, sweep nothing
-    --now               upgrade <sid>: restart it at its next turn end (the quiet waits waived)
+    --now               upgrade <sid>: move it at its first pause (the ladder's last rung)
     --defer <dur>       upgrade <sid>: not for <dur> (90s, 30m, 6h, 2d; at most 30d)
     --skip              upgrade <sid>: stay on the running build until a newer target comes
     --json              the JSON form
     -h, --help          this text
 
-`usage` folds the NEWEST transcript in this working directory's project directory
-(~/.claude/projects/<dir>/*.jsonl) and says so: two Claude Code sessions in one directory
-share it, so the newest file may be the other one's. It carries spend, never a window.
+`usage` folds THIS session's transcripts — its transcript and its subagents'
+(<session>/subagents/**/agent-*.jsonl) — per model. Run from a Claude Code session's own
+tools (they inherit CLAUDE_CODE_SESSION_ID, or CLAUDE_PID), it folds that session's own
+file, named by the vendor; a named session with no transcript yet folds nothing. Anywhere
+else — aterm's shells carry no CLAUDE_* — it folds the NEWEST transcript in this working
+directory's project directory (<claude dir>/projects/<dir>/*.jsonl, the claude dir being
+CLAUDE_CONFIG_DIR, else ~/.claude) and says so: two sessions in one directory share it,
+so the newest may be the other one's; a relative CLAUDE_CONFIG_DIR folds nothing, said.
+A streamed subagent message counts once, at its final figures. It reads up to a 4 GiB
+cap and says PREFIX only when it hits it; a subagent transcript it could not count is
+said (`complete` is false in --json). It carries spend, never a window; the window's
+Claude Code footer shows the same tokens live, and a limit the session hit.
 
 `limits` reads the session's screen once over the control socket (`text --json tail=40`)
 and prints the wall the last turn ended on (the kind the supervisor acts on, its words and
@@ -343,16 +361,47 @@ reads the session it runs in ($ATERM_PARENT_SESSION_ID); with neither it refuses
 rather than read whichever session the socket defaults to. No session answering is exit 1.
 
 `disk` REPORTS AND REMOVES NOTHING by default. Every row carries the witness that would
-make it safe to remove — a build tool's own marker plus two clocks past
-`disk.target_stale_days`, or a version directory the live symlink does not point at, or
-a package build the live one supersedes. Removal needs BOTH `disk.apply = true` in
-aterm.toml AND an explicit `--apply <class>`; a refusal is written to the disk journal as
-a denial row rather than dropped. Nothing under the transcripts root is removable under
-any flag. Build directories are the ones you NAME on the line. The journal is cut back to
-its newest 1024 rows once it passes 1 MiB. One removal needs no verb: every 6 h the window
-looks at free space, and below `disk.auto_free_gib` (10 GiB; 0 or a negative value turns
-it off) it removes the stale build directories in its agents' working directories on that
-volume by itself — that class only, each with its witness journalled here.
+make it safe to remove — for a build directory, a build tool's own marker and a cargo
+profile idle past `disk.target_stale_days` (default 1 day: nothing a compile writes
+touched that long) with a non-empty `incremental/` and locks no build holds — below the
+floor, a recent profile's own row, oldest first (see below); or a version directory the
+live symlink does not point at, or a package build the live one supersedes. Removal
+needs BOTH `disk.apply = true` in aterm.toml AND an explicit `--apply <class>`; a
+refusal is written to the disk journal as a denial row rather than dropped. Nothing under the transcripts root is removable under any flag.
+Build directories are the ones you NAME on the line, and `cargo-targets` takes from each
+ONLY its idle profiles' `incremental/` (the next build of each crate is a full compile
+of it) — below the floor, recent profiles' too, as the tick does — deleted while holding every one of cargo's build locks of that profile — a
+profile a build holds is skipped, and nothing is reached through a symlink or on another
+device. Never the directory itself, `deps/`, `build/`, `.fingerprint/`, an uplifted
+binary, `examples/`, `doc/` or a benchmark's data: those deeper caches are left for a
+later tier, since cargo runs tests without its locks. Each removal is journalled before
+it starts and again after, with the bytes it released and every error; a removal whose
+intent cannot be journalled (a full disk, no state directory) does not start. The bytes
+it says it freed are COUNTED, not measured: the blocks of each deleted file that was
+that file's last name. A hard-linked file frees nothing and is not counted; an
+APFS clone's shared blocks are counted although the clone keeps them; a file it cannot
+open to measure is deleted uncounted. The journal is cut back to its newest 1024 rows
+once it passes 1 MiB. One removal needs no verb: every 6 h the window looks at free
+space, and below `disk.auto_free_gib` (10 GiB; 0 or a negative value turns it off) it
+reclaims the same caches in the build directories of its agents' working directories
+on that volume by itself — that class only, each with its witness journalled here —
+LEAST RECENTLY USED FIRST: every idle profile's cache, then, one profile at a time and
+oldest first, the caches of profiles a compile wrote into within `disk.target_stale_days`
+(1 day), measuring free space again before each and stopping once it is back at the
+floor plus 1 GiB, or once the bytes those removals released cover what free space was
+short when they began (a local snapshot can keep the figure from rising), or when it
+cannot be measured (a stop row in the journal says which, and where). Even then a
+profile a build holds locked is never taken, nor one on another volume. No reclaim, the
+tick's or this verb's, takes a profile written into within the last 10 min (a build that
+just finished is usually followed by another, which would write the cache straight back)
+— not even at `target_stale_days = 0`, which otherwise makes every profile idle. Below
+the floor this verb lists those profiles too, in the order they would go
+(`under_pressure_up_to=` is what every one of them would free, an upper bound;
+`reclaimable=` is what goes whole), and `--apply cargo-targets` takes them under the
+same stop; at or above it, a profile inside the window is kept. So `disk.target_stale_days` says
+what is IDLE — what `--apply cargo-targets` takes at any free figure, and what the tick
+takes whole before any recent profile — and, since 2026-09-28, no longer keeps a
+recently built checkout's cache once the volume is under the floor.
 
 `ledger` prints the newest rows of the approval ledger the supervisor keeps for one
 session (<aterm state>/drive/<sid>.jsonl: every box its approval policy decided —
@@ -365,7 +414,7 @@ twin, or — for a session that runs Claude's own native install, the one whose
 footer shows Claude Code's own `Update installed` notice — that install's
 current version; never an older one. Each sweep moves each session one step: when the
 agent is idle, its composer empty, no approval box up and nobody typing into the tab
-(`[harness] human_grace_s`), it TYPES a notice
+(`[harness] human_grace_s`; the LADDER below narrows it), it TYPES a notice
 asking the agent to reach a stopping point — let its background tasks finish
 while they make progress, never cancel them, but stop any wait of its own that
 can never end — naming the shells still running under the agent (up to five, by
@@ -410,6 +459,21 @@ once it is gone, the upgrade is pending again in a new round, with nothing
 owed to the gone one (`reopened:notice-process-gone`), and the process that
 holds the conversation now is asked afresh, under every gate a first notice
 is, only while it is still behind.
+THE LADDER — ACTIVITY DELAYS; IT NEVER DISABLES (the owner's decision of
+2026-09-28): the longer a session has been behind, the less the upgrade waits
+for a comfortable moment. Behind less than 20 minutes it asks for the natural
+idle point: the screen still 20 s and nobody who gave the tab input within
+`[harness] human_grace_s`. From 20 minutes a pause that only LOOKS quiet counts:
+two looks 20 s apart that read the screen idle with the same last words,
+however it repainted between them (a footer's clock, a goal's counter). From
+an hour a person holds it only by a keystroke in the last 20 s. From two
+hours it moves at the first such pause, its settle waived. No rung ever moves
+it over a draft, a box, a keystroke in the last 20 s, a hold, a usage limit or
+the login wall, or running work — the agent's turn or status, the shells under
+it, a turn of a Codex client's own in its daemon (`wait:daemon-turn`,
+`wait:goal`, `wait:daemon-busy` for one it cannot yet place in another
+session) — and the READY answer and an empty process tree still come before
+the restart. `--now` is the last rung at once, with the same floors.
 A SESSION IS MOVED ONLY WHILE THE
 AGENT IS ITS SHELL'S FOREGROUND JOB ON A TERMINAL AN ATERM TAB OWNS: an agent
 in a multiplexer pane (tmux, screen, zellij) or on any other pty the tab does
@@ -490,20 +554,25 @@ points (Codex 0.157 runs TWO processes: a shared app-server DAEMON per
 $CODEX_HOME that holds every conversation, and the TUI in the tab, a client of
 it). THE DAEMON FIRST: for ~/.codex (a hand-run sweep) and every home a live
 Codex TUI runs with, a daemon on an older
-build than the managed Codex — or on the same build with the vendor's own
-updater armed (`packages/app-server-daemon/auto-update-version`, which re-runs
-chatgpt.com's installer outside atpkg) — is moved by the vendor's verb,
+build than the managed Codex is moved by the vendor's verb,
 `<managed codex> app-server daemon update --from-cli --yes`, run with the
 environment the daemon itself was started with: the managed build is copied
 in and PINNED, the updater goes, the daemon restarts, and every attached TUI
-reconnects (`• Reconnected. No input was resent.`). Only while NOTHING RUNS
+reconnects (`• Reconnected. No input was resent.`). A daemon ON the managed
+build whose vendor updater is still armed (`packages/app-server-daemon/
+auto-update-version`, which re-runs chatgpt.com's installer outside atpkg,
+and restarted the owner's daemon mid-turn on 2026-09-28) is PINNED the same
+way — it keeps its tab due for the pin alone, looked at for it at most once
+an hour (`wait:pin:<why>`, which owns no turn end and shows no row or tab
+mark). Only while NOTHING RUNS
 in it — every thread it holds idle and settled, attached to a tab or not (its
 locks reveal them), and no BACKGROUND TERMINAL a finished turn left running
 under it (a unified-exec command leads a session of its own under the
 daemon; the restart would end it) — no person is at a Codex tab on that home,
 none is held, the OWNER'S WORD on none keeps it (a `--skip` of this build or
 a `--defer` on a Codex tab holds the daemon that runs its conversation too;
-that tab's `--now` waives its own attended guard here as well), and every
+that tab's `--now` narrows its own attended guard to a keystroke in the last
+20 s here as well, as the ladder's last rung does), and every
 Codex attached to the daemon is one the pass sees — the window's step asks
 every Codex tab of its window, whichever tab's step reaches the daemon first
 (a TUI in another window or a pane was asked none of this): `wait:busy-thread`,
@@ -511,16 +580,66 @@ every Codex tab of its window, whichever tab's step reaches the daemon first
 `settling`. A daemon ahead of the managed Codex is never moved back
 (`wait:vendor-ahead`). THEN EACH TUI that is a tab's foreground job on an
 older build: a DAEMON-MODE client at an idle point (no turn running on
-screen, its composer's dim placeholder, no box, quiet 20 s, nobody at the tab
-— the same gates, the same `--now`) is ended by a TYPED `/exit` — fenced on
-the screen it was judged by, its Enter guarded on the composer's row — and
+screen, its input line's dim placeholder — `›` or 0.158.0's `»` — no box,
+quiet as its rung asks, nobody at the tab — the same gates, the same `--now`
+— and NO TURN OF ITS OWN RUNNING IN ITS DAEMON, since an `/exit` might stop
+it: Codex 0.157 was measured printing `Disconnected from this task. Any
+running work continues.`, and 0.158.0's binary also holds `… The current turn
+was stopped.` — which case prints it is not measured) is ended by a TYPED
+`/exit`. Its own conversation is the one the kernel names — every thread of
+its daemon hangs from that conversation's root (read from each thread's
+rollout: the subagents it spawned name it as their parent) and it is the
+daemon's only client — and a turn anywhere in it, a subagent's included,
+waits `wait:goal` while its footer says `Pursuing goal`, else
+`wait:daemon-turn`. A GOAL IS PAUSED FOR THE MOVE (the owner's decision of
+2026-09-28): a goal starts its next turn within milliseconds of the last one's
+end, so from the Land rung (or `--now`), where its own turn is all that holds
+the move and no save-then-wait switch is open, aterm types `/goal pause` —
+Codex takes it while a turn runs, and it stops the NEXT turn, never the running
+one — waits for that last turn to end (`wait:goal-held`), moves the tab, and
+resumes the goal once: the box the relaunched Codex opens with, asking
+whether to resume its paused goal, answered with its first option, or `/goal
+resume` typed (an embedded session gets no carry-on then: the goal is it). A
+pause that never shows is followed, at a goal turn's head only (its rollout
+holds nothing of its own work), by one Esc. The record of it (`<aterm
+state>/drive/<tab>.goal-hold.json`, written before every key) resumes it once
+after a restart, never twice; a person resuming or changing the goal, or
+their hand on a pause not yet seen, takes it from aterm; every wait at a goal
+held paused is `wait:goal-held`, which keeps the supervisor's carry-on out; a
+move that does not come within an hour is given up and the goal resumed, said
+once — never into a thread fallen into a sandbox, where it stays paused
+(`wait:goal-sandboxed`, a row naming the relaunch); the relaunched Codex's box
+is the one the approval policy answers for it; a switch that opens over the
+pause resumes the goal at its reset; a resume not made in an hour and a half
+is a row with the one hand step (`/goal resume` in the tab), never while a
+switch holds the session or the paused goal's last turn runs. Another
+session's turn on the same
+daemon holds it only until its screen places it there — a ROOT running at
+two looks 20 s apart, while this screen's words stood still, which a turn of
+its own would have changed, with another Codex attached to the daemon —
+never while its footer says `Pursuing goal` (a goal's next turn runs under a
+screen whose words stand still); a subagent's turn, or a second root's with
+this TUI the daemon's only client, is never placed. Until then it waits
+`wait:daemon-busy`, never said as a goal to pause in this tab, nor presumed
+another session's. The `/exit`
+is fenced on the screen it was judged by, its Enter guarded on the
+composer's row, its
+daemon read once more first (a turn begun since the sweep's read waits
+`wait:changed`) — and
 relaunched at the returned prompt as `<managed codex> resume <the same flags>
 <thread>`, the thread read from the TUI's own exit hint (`Reconnect: codex
 resume <id>`: its command block's output, else the rows directly above the
-new prompt's FIRST row, so a prompt of two rows is no obstacle — which is why
-the `/exit` waits for the shell integration's marks, `wait:no-shell-integration`);
-its work never stops, in the daemon, so nothing is announced and nothing
-continued. It waits for its daemon to be on the build it moves to, and says
+new prompt's FIRST row, so a prompt of two rows is no obstacle). Where the
+shell integration's marks do not reach aterm (`status integration=degraded`,
+as after an aterm update) the thread is the one the KERNEL names — the root
+of the daemon's one conversation, this TUI its one client — recorded before
+the `/exit`
+(a hint naming another stops the relaunch); where the kernel cannot name it
+either, the `/exit` waits `wait:no-shell-integration`, which after 30 minutes
+is a row saying so (`blocked:no-shell-integration`: quit Codex in its tab and
+resume it with the line it prints); the relaunch line also heals the shell's
+integration. Its work never stops, in the daemon, so nothing is announced and
+nothing continued. It waits for its daemon to be on the build it moves to, and says
 what the daemon waits on (`wait:daemon-first:<why>`). An EMBEDDED session
 (`--no-daemon`, or a launch Codex keeps out of the daemon; the kernel proves
 it by the `thread-writer-locks/<id>.lock` it holds) gets Claude's protocol —
@@ -552,7 +671,10 @@ and to, the phase, `pending_for=`,
 `wait=` (what the last step waited on: `settling`, `awaiting-ready`,
 `background`, `draft`, `attended`, `held`, `terminal:<owner>`, `not-idle:busy`
 for a turn a hand-run sweep found in progress, `status-stale:<status>` for a status
-the idle screen does not bear out — the restart's until Claude says `idle` …) with
+the idle screen does not bear out — the restart's until Claude says `idle` …,
+`release:<gate>` while that gate holds the line an abandoned notice owes the
+agent; where no look has recorded one, a Claude Code row reads Claude's own live
+status, `not-idle:waiting` for a box, never over a recorded word) with
 `wait_for=`, the owner's `request=`, `next_round=` (for a round that stopped: how
 long until the new round it starts by itself, `due` once it has rested, `-` for
 any other, one the owner's `--skip` holds, or one that gave up and acts on a
@@ -562,17 +684,38 @@ while the upgrade will move on its own, else why it will not: `refused:<why>`
 something changed), `failed:<why>`, `held-back:<owner>` (a multiplexer pane),
 `stuck:<exiting|exited|relaunched>` (a restart under way that has not moved for
 5 minutes — the agent still ending, its prompt not free to type at, the new one
-never idle: nothing is forced, and no word moves it), or `overdue` (6 hours
-behind, whatever it waits on, unless the owner's `--now` came in the last 30
-minutes) — and `held_by=` (what ran under the agent at the last look that
+never idle: nothing is forced, and no word moves it; a sweep says it once on the
+ledger, `stuck:<what>`), `blocked:<wait>` (a wait
+no rung passes, blocking the move 30 minutes whatever other wait came between:
+`no-shell-integration`, `screen-unreadable` — quit it in its tab and resume it
+there), or `overdue` (6 hours behind — four
+past the ladder's last rung — whatever it waits on, unless the owner's `--now`
+came in the last 30 minutes) — and `held_by=` (what ran under the agent at the last look that
 waited, by pid, name and age — `63492(zsh:5d4h),…`, `-` for nothing; never a
-command). A round that GAVE UP is no stall: it rests until its `next_round=`,
+command), `release=` (the release still owed to an agent the upgrade asked
+to wind down and did not restart — why it abandoned that notice: `gave-up`,
+`void`, `skipped`, `deferred`, `retargeted`, a stop's reason; `-` for none),
+`rung=` (the ladder's rung while the move is owed: `prefer`, `settled`,
+`keys-only`, `land` — `land` under the owner's `--now` — and `-` once it is
+under way, done or stopped), and the watch's fields last: `looked=` (how long
+ago a look off a point read the record) and `by=` (the aterm build that
+looked), `point=` (how long ago the session's loop last offered an idle point
+or a settled break) and `guard=` (the loop's guard that withheld the latest
+point: `wall`, `settle`, `no-background-wait`, `act-untaken`, `not-idle`, …),
+each `-` for none recorded, and `watch_at=` (when the record is due to be
+watched: the step's deadline, or 24 hours behind, whichever is first; `due`
+once past, `-` for a record nothing more is owed on); and, only while aterm's
+own fence refuses the notice due, `refused=<n>/<span>` at the very end (how
+many looks in a row it could not type it, and since how long).
+A round that GAVE UP is no stall: it rests until its `next_round=`,
 and its column reads `pending/<to>/next-round:<span>/<age>` —
 `pending/<to>/ready/<age>` while it acts on a late READY instead.
 The window shows the same per tab as `upgrade=`
-in `aterm ctl status`/`sessions`, records it in Settings ▸ Messages, and marks
-a STALLED tab (`meta attention owner=upgrade`) — never a tab that is merely
-waiting for its turn end.
+in `aterm ctl status`/`sessions`, records it in Settings ▸ Messages — one
+record, `<agent> <build> installs itself in tab N`, saying there is nothing to
+do and from what time the first pause is enough — and marks a STALLED tab
+(`meta attention owner=upgrade`) — never a tab that is merely waiting for its
+moment.
 
 THE OWNER'S WORD on one tab's upgrade — `upgrade <sid> --now|--defer
 <dur>|--skip` — is written into that upgrade's state under the sweep's own
@@ -580,12 +723,13 @@ lock (waiting up to 10 s for a step in progress; past that it exits 75 and
 writes nothing) and put on the ledger as `requested:<word>`, and it wakes the
 window's worker for that tab, which takes it at the session's next idle
 point. The word is on the TAB named: the same conversation resumed in another
-tab is asked afresh. `--now` waives the two waits that keep a person from
-being typed over — the quiet window, and the hold on a tab a person gave input
-to within `[harness] human_grace_s` (its `status human_ms=`) — the word IS
-that person — and nothing else (an idle status, an empty composer, no box, no
-hold, the READY answer and nothing running under the agent are still
-required, and what is typed is still fenced on the screen it was judged by).
+tab is asked afresh. `--now` stands the upgrade at the LADDER'S LAST RUNG at
+once: no quiet window, and a person at the tab holds it only by a keystroke
+in the last 20 s (its `status human_ms=`) — never waived, the word included —
+and nothing else (an idle status, an empty composer, no box, no hold, no turn
+in a Codex daemon, the READY answer and nothing running under the agent are
+still required, and what is typed is still fenced on the screen it was judged
+by).
 Every word arms a NEW ROUND of the upgrade: a notice after it asks for a READY
 marker no earlier answer carries. An upgrade the owner holds (`--defer`,
 `--skip`) owns none of its session's turn ends: the tab's supervisor goes on
@@ -607,7 +751,9 @@ already under way is neither held nor hurried (exit 1).
 
 The window writes the same words, on the same path, with no shell: a
 stalled upgrade's band row offers two of them (Upgrade now where `--now`
-moves it, Not today — a one-day `--defer` — and Skip version), Settings ▸
+moves it, Not today — a one-day `--defer` — and Skip version; one row for
+several tabs of the same agent writes the word for each tab it lists that
+takes it), Settings ▸
 Messages offers them on the waiting record while exactly one session waits,
 and the tab's context menu offers every word that does something for the
 upgrade of the pane it was opened on. Each is for the session and the build
@@ -632,12 +778,28 @@ pub struct Env {
     pub cwd: PathBuf,
     /// The owner's home, when known.
     pub home: Option<PathBuf>,
+    /// The Claude Code directory: `CLAUDE_CONFIG_DIR` when set, else
+    /// `$HOME/.claude` ([`footer::claude_dir_of`]); `None` falls back to
+    /// `home` ([`Env::claude_dir`]).
+    pub claude_dir: Option<PathBuf>,
+    /// `CLAUDE_CONFIG_DIR` when it is set but names no directory this
+    /// command can find — a relative path, which the vendor resolves against
+    /// ITS working directory, not this command's. Then no Claude Code
+    /// directory is known ([`Env::claude_dir`]): `~/.claude` is not the one
+    /// the session writes.
+    pub claude_config_unusable: Option<String>,
+    /// The Claude Code session this command runs under, when the vendor
+    /// named it: `CLAUDE_CODE_SESSION_ID`, which Claude Code 2.1.283 sets for
+    /// every tool it runs (MEASURED). aterm strips `CLAUDE_*` from the
+    /// shells it spawns, so only Claude Code's own tools carry it.
+    pub claude_session: Option<String>,
+    /// The Claude Code process this command runs under (`CLAUDE_PID`, set
+    /// beside the session id), for a build that names only the process.
+    pub claude_pid: Option<u32>,
     /// Unix seconds. Read once, at the top of [`main_entry`].
     pub now: i64,
     /// The aterm session id (`$ATERM_PARENT_SESSION_ID`), or empty.
     pub sid: String,
-    /// Seconds east of UTC for printed wall-clock times.
-    pub utc_offset_s: i64,
     /// `--sock` — the control socket `limits` reads through. `None` resolves
     /// it the way every other aterm client does.
     pub sock: Option<String>,
@@ -673,27 +835,54 @@ impl Env {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0);
+        let config_dir = std::env::var("CLAUDE_CONFIG_DIR")
+            .ok()
+            .filter(|d| !d.is_empty());
+        let claude_dir =
+            footer::claude_dir_of(config_dir.as_deref(), std::env::var("HOME").ok().as_deref());
+        let claude_config_unusable = config_dir.filter(|_| claude_dir.is_none());
+        let claude_session = std::env::var("CLAUDE_CODE_SESSION_ID")
+            .ok()
+            .filter(|id| footer::is_session_id(id));
+        let claude_pid = std::env::var("CLAUDE_PID")
+            .ok()
+            .and_then(|p| p.parse::<u32>().ok())
+            .filter(|&p| p > 0);
         Ok(Env {
             state,
             aterm_state,
             cwd,
             home,
+            claude_dir,
+            claude_config_unusable,
+            claude_session,
+            claude_pid,
             now,
             sid: std::env::var("ATERM_PARENT_SESSION_ID").unwrap_or_default(),
-            utc_offset_s: 0,
             sock: None,
             config: default_config_path(),
         })
     }
 
-    /// Where the vendor keeps its transcripts: `~/.claude/projects`. A
+    /// The Claude Code directory: [`Env::claude_dir`], else `$HOME/.claude`
+    /// — but none when `CLAUDE_CONFIG_DIR` is set and unusable
+    /// ([`Env::claude_config_unusable`]).
+    #[must_use]
+    pub fn claude_dir(&self) -> Option<PathBuf> {
+        if self.claude_config_unusable.is_some() {
+            return None;
+        }
+        self.claude_dir
+            .clone()
+            .or_else(|| self.home.as_ref().map(|h| h.join(".claude")))
+    }
+
+    /// Where the vendor keeps its transcripts: `<claude dir>/projects`. A
     /// FILESYSTEM fact, not a hook — `--bare` removes hooks, plugins and the
     /// statusLine in one flag and does not touch this.
     #[must_use]
     pub fn transcripts_root(&self) -> Option<PathBuf> {
-        self.home
-            .as_ref()
-            .map(|h| h.join(".claude").join("projects"))
+        self.claude_dir().map(|d| d.join("projects"))
     }
 
     /// The disk journal.
@@ -816,8 +1005,6 @@ pub enum Cmd {
 pub struct Overrides {
     /// `--state`.
     pub state: Option<PathBuf>,
-    /// `--utc-offset`.
-    pub utc_offset_s: Option<i64>,
     /// `--config`.
     pub config: Option<PathBuf>,
     /// `--sock`.
@@ -868,14 +1055,6 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             }
             "--sock" => {
                 over.sock = Some(value(i, "--sock")?);
-                i += 1;
-            }
-            "--utc-offset" => {
-                let v = value(i, "--utc-offset")?;
-                over.utc_offset_s =
-                    Some(v.parse::<i64>().map_err(|_| {
-                        format!("--utc-offset wants a number of seconds, not {v:?}")
-                    })?);
                 i += 1;
             }
             "--apply" => {
@@ -1087,31 +1266,75 @@ pub fn project_dir_name(cwd: &Path) -> String {
 /// directory that holds something else entirely.
 pub const MAX_TRANSCRIPT_ENTRIES: usize = 4096;
 
-/// The byte cap on the transcript this command folds. `fold_reader` streams,
-/// so the cost is one pass and no line is ever held; rows past the cap are
-/// not folded, and the fold's own counters say how much was read.
-pub const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
+/// The byte cap on what this command folds, over all of the session's files
+/// — its OWN cap: it runs once, so the window's per-read budget
+/// (`footer::FOLD_BUDGET`) does not apply. The fold streams, so the cost is
+/// one pass and no line is ever held; bytes past the cap are not folded, and
+/// only then does the output say the totals are a PREFIX.
+pub const MAX_TRANSCRIPT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Fold the NEWEST transcript in this working directory's project directory,
-/// with the path it read. `None` when there is no home, no project directory
-/// or no `.jsonl` in it.
-///
-/// Newest-by-mtime is the only rung left. The two that outranked it — the
-/// session a statusLine payload or a hook row NAMED — arrived on the hook
-/// bridge decision "B" retired, so the answer is labelled
-/// [`Source::TranscriptNewest`] and the text says what that costs.
-fn fold_newest_transcript(env: &Env) -> Option<(PathBuf, usage::TranscriptUsage)> {
-    let dir = env.transcripts_root()?.join(project_dir_name(&env.cwd));
-    let path = newest_transcript(&dir)?;
-    let file = std::fs::File::open(&path).ok()?;
-    let mut fold = usage::TranscriptUsage::new();
-    // A read error mid-file keeps what was folded before it: a partial spend
-    // is a measurement of part of the session, labelled by the row counters.
-    let _ = fold.fold_reader(std::io::BufReader::new(std::io::Read::take(
-        file,
-        MAX_TRANSCRIPT_BYTES,
-    )));
-    Some((path, fold))
+/// Which transcript `usage` folds, and how it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// The session Claude Code NAMED in this command's environment
+    /// (`CLAUDE_CODE_SESSION_ID`, or `CLAUDE_PID`'s `sessions/<pid>.json`):
+    /// this session's own file. `how` is the JSON's `transcript_pick`.
+    Named {
+        /// The transcript.
+        path: PathBuf,
+        /// `session-id` or `claude-pid`.
+        how: &'static str,
+    },
+    /// The session was named but has written no transcript yet: nothing is
+    /// folded — another session's file is not this one's.
+    NamedButAbsent {
+        /// The session id.
+        session: String,
+    },
+    /// Nothing named a session: the NEWEST `.jsonl` in this working
+    /// directory's project directory, which may be another session's.
+    Newest(PathBuf),
+    /// Nothing to fold.
+    None,
+}
+
+/// Choose the transcript `usage` folds: the session Claude Code named
+/// ([`Env::claude_session`], then [`Env::claude_pid`]'s sessions file), else
+/// the newest in this working directory's project directory — the one rung
+/// left when nothing names the session (aterm's own shells carry no
+/// `CLAUDE_*`), labelled [`Source::TranscriptNewest`] and said so.
+#[must_use]
+pub fn pick_transcript(env: &Env) -> Pick {
+    let Some(claude_dir) = env.claude_dir() else {
+        return Pick::None;
+    };
+    let named = |entry: footer::SessionEntry, how: &'static str| match footer::transcript_path(
+        &claude_dir,
+        &entry,
+    ) {
+        Some(path) => Pick::Named { path, how },
+        None => Pick::NamedButAbsent {
+            session: entry.session_id,
+        },
+    };
+    if let Some(id) = &env.claude_session {
+        let entry = footer::SessionEntry {
+            session_id: id.clone(),
+            cwd: env.cwd.clone(),
+            version: None,
+            proc_start: None,
+            started_at: None,
+        };
+        return named(entry, "session-id");
+    }
+    if let Some(entry) = env
+        .claude_pid
+        .and_then(|pid| footer::session_of_pid(&claude_dir, pid, None))
+    {
+        return named(entry, "claude-pid");
+    }
+    let dir = claude_dir.join("projects").join(project_dir_name(&env.cwd));
+    newest_transcript(&dir).map_or(Pick::None, Pick::Newest)
 }
 
 /// The newest `.jsonl` in `dir` by modification time.
@@ -1161,24 +1384,55 @@ fn sourced_json(
 
 /// `aterm harness usage`.
 fn run_usage(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
-    let mut view = UsageView::new(env.now);
-    let folded = fold_newest_transcript(env);
-    let source = if let Some((_, fold)) = &folded {
-        let mut account = AccountView::new("account", true);
-        account.add_transcript(fold, &usage::PriceTable::new());
-        view.accounts.push(account);
-        Source::TranscriptNewest
-    } else {
-        Source::None
+    let pick = pick_transcript(env);
+    let (path, source, pick_word) = match &pick {
+        Pick::Named { path, how } => (Some(path.clone()), Source::Transcript, *how),
+        Pick::Newest(path) => (Some(path.clone()), Source::TranscriptNewest, "newest-mtime"),
+        Pick::NamedButAbsent { .. } | Pick::None => (None, Source::None, "none"),
     };
+    // The window's footer folds through the same `SessionUsage`; one refresh
+    // here is the whole pass, up to this command's own cap. ONE sum,
+    // `total_fold`, feeds the view, the JSON and the text alike.
+    let folded = path.map(|path| {
+        let mut session = SessionUsage::new(path);
+        let refresh = session.refresh(MAX_TRANSCRIPT_BYTES);
+        let total = session.total_fold();
+        (session, refresh, total)
+    });
+    let mut view = UsageView::new(env.now);
+    if let Some((_, _, total)) = &folded {
+        let mut account = AccountView::new("account", true);
+        account.add_transcript(total, &usage::PriceTable::new());
+        view.accounts.push(account);
+    }
     if json {
-        let extra = match &folded {
-            Some((path, _)) => vec![
-                ("transcript", Value::from(path.display().to_string())),
-                ("transcript_pick", Value::from("newest-mtime".to_owned())),
-            ],
-            None => Vec::new(),
-        };
+        // Schema 1, keys ADDED only: `transcript_pick` gains `session-id`,
+        // `claude-pid` and `none`; `complete` and the subagent counts are new.
+        let mut extra = Vec::new();
+        if let Some((session, _, _)) = &folded {
+            extra.push((
+                "transcript",
+                Value::from(session.transcript().display().to_string()),
+            ));
+        }
+        extra.push(("transcript_pick", Value::from(pick_word.to_owned())));
+        if let Some((session, refresh, _)) = &folded {
+            extra.push((
+                "subagent_transcripts",
+                Value::from(session.subagent_files() as u64),
+            ));
+            extra.push((
+                "subagent_transcripts_unread",
+                Value::from(refresh.unread as u64),
+            ));
+            extra.push(("complete", Value::from(refresh.complete())));
+        }
+        if let Pick::NamedButAbsent { session } = &pick {
+            extra.push(("session", Value::from(session.clone())));
+        }
+        if let Some(dir) = &env.claude_config_unusable {
+            extra.push(("claude_config_dir_unusable", Value::from(dir.clone())));
+        }
         let _ = writeln!(
             out,
             "{}",
@@ -1186,25 +1440,85 @@ fn run_usage(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    let line = usage::hud_line(&view, env.utc_offset_s);
+    let line = usage::hud_line(&view);
     let _ = writeln!(out, "{line}  [source={}]", source.as_str());
-    match &folded {
-        Some((path, fold)) => {
-            let _ = writeln!(
-                out,
-                "spend from {} ({} assistant rows), the newest transcript for this directory; \
-                 if two Claude Code sessions share the directory, it may be the other one's",
-                path.display(),
-                fold.assistant_rows,
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "no transcript for this directory under ~/.claude/projects — nothing to fold"
-            );
-        }
+    let Some((session, refresh, total)) = &folded else {
+        let why = match &pick {
+            Pick::NamedButAbsent { session } => format!(
+                "session {session} has written no transcript yet — nothing to fold (another \
+                 session's file is not this one's)"
+            ),
+            _ if env.claude_config_unusable.is_some() => format!(
+                "CLAUDE_CONFIG_DIR is {:?}, not an absolute path: the Claude Code directory it \
+                 names cannot be found from here, and ~/.claude is not it — nothing to fold",
+                env.claude_config_unusable.as_deref().unwrap_or_default()
+            ),
+            _ => "no transcript for this directory under the Claude Code projects directory — \
+                  nothing to fold"
+                .to_owned(),
+        };
+        let _ = writeln!(out, "{why}");
+        return ExitCode::SUCCESS;
+    };
+    let facts = session_usage::UsageFacts::of(
+        session_usage::model_tokens(total.per_model()),
+        None,
+        Some(refresh),
+    );
+    let tokens = match facts.as_ref().and_then(session_usage::usage_text) {
+        Some(text) if facts.as_ref().is_some_and(|f| !f.models.is_empty()) => text,
+        Some(text) => format!("no tokens \u{00B7} {text}"),
+        None => "no tokens".to_owned(),
+    };
+    let _ = writeln!(out, "{} {tokens}", footer::USAGE_MARK);
+    for (model, s) in total.per_model() {
+        let _ = writeln!(
+            out,
+            "  {model}: in {} (cache write {}, cache read {}), out {}",
+            s.input, s.cache_write, s.cache_read, s.output
+        );
     }
+    let whose = match &pick {
+        Pick::Named {
+            how: "claude-pid", ..
+        } => "this session's own transcript, named by CLAUDE_PID's sessions file",
+        Pick::Named { .. } => "this session's own transcript, named by CLAUDE_CODE_SESSION_ID",
+        _ => {
+            "the NEWEST transcript in this project directory: if two Claude Code sessions \
+             share this working directory it may be the other one's"
+        }
+    };
+    let mut short = String::new();
+    if refresh.spent >= MAX_TRANSCRIPT_BYTES {
+        short.push_str(&format!(
+            " The fold stopped at its {} GiB cap before the end: these totals are a PREFIX.",
+            MAX_TRANSCRIPT_BYTES >> 30
+        ));
+    } else if !refresh.caught_up {
+        short.push_str(" The transcript could not be read to its end: these totals are partial.");
+    }
+    if refresh.unread > 0 {
+        short.push_str(&format!(
+            " {} subagent transcripts are NOT in these totals (unreadable now, or past the {} \
+             files one session's fold follows).",
+            refresh.unread,
+            session_usage::MAX_SUBAGENT_FILES,
+        ));
+    }
+    if refresh.walk_cut {
+        short.push_str(
+            " The subagent walk stopped at its entry bound: more subagent transcripts may exist \
+             and are NOT in these totals.",
+        );
+    }
+    let _ = writeln!(
+        out,
+        "SPEND folded from {} (+{} subagent transcripts; {} assistant rows), {whose}.{short} \
+         A transcript carries no rate-limit window.",
+        session.transcript().display(),
+        session.subagent_files(),
+        total.assistant_rows,
+    );
     ExitCode::SUCCESS
 }
 
@@ -1495,16 +1809,27 @@ pub struct DiskLook<'a> {
 /// ONE TICK of the window's disk watch (design §5.5's 6 h timer, hosted by
 /// `aterm-gui`'s harness host): below the automatic floor
 /// ([`disk::Config::below_auto_floor`], `[disk] auto_free_gib`), survey the
-/// look's targets, journal the report into `<state>/disk.jsonl`, and remove
-/// what [`disk::auto_plan`] grants, a removal row (with its witness) or a
-/// denial row for each. At or above the floor it reads nothing but the config.
-/// A target on ANOTHER volume than the one measured is not looked at: removing
-/// it would free nothing where space ran short ([`on_volume`]).
+/// look's targets, journal the report into `<state>/disk.jsonl`, and reclaim
+/// what [`disk::auto_plan`] grants through `remove` ([`disk::remover`] is the
+/// real one: a profile's `incremental/`, under cargo's locks — every idle
+/// one, then recent ones least recently used first, `measure` read again
+/// before each of those and the pass stopped once free space is back at
+/// [`disk::Config::pressure_target_bytes`]) —
+/// journalling an intent row BEFORE each removal and its outcome (bytes
+/// actually released, what went, what was skipped, every delete error) or a
+/// denial row after, each as it happens. A removal whose intent row could not
+/// be written (no state directory, a failed append) does not start: it is a
+/// denial ([`disk::Refusal::Unjournalled`]), and nothing is removed without a
+/// record. At or above the floor it reads
+/// nothing but the config. A target on ANOTHER volume than the one measured
+/// is not looked at: removing it would free nothing where space ran short
+/// ([`on_volume`]).
 #[must_use]
 pub fn disk_tick(
     look: &DiskLook<'_>,
     config: disk::Config,
-    remove: &mut dyn FnMut(&Path) -> io::Result<()>,
+    remove: &mut disk::Remove<'_>,
+    measure: &mut disk::Measure<'_>,
 ) -> DiskTick {
     let DiskLook {
         state,
@@ -1525,21 +1850,23 @@ pub fn disk_tick(
     };
     let survey = disk::scan(&roots, now, disk::Trigger::Tick, config, free);
     let rep = disk::report(&survey, config);
-    let done =
-        disk::apply_auto(&rep, survey.transcripts_root.as_deref(), remove).unwrap_or_default();
     let path = state.join(DISK_LEDGER);
     let mut sink = io::sink();
-    if std::fs::create_dir_all(state).is_ok() {
+    let mut journal = if std::fs::create_dir_all(state).is_ok() {
         let _ = bound_ledger(&path, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS);
-        let mut journal = Journal::open(Some(&path), None, &mut sink);
-        journal.append_raw(&disk::report_row(now, "", &rep), &mut sink);
-        for row in &done.removed {
-            journal.append_raw(&disk::removal_row(now, "", row), &mut sink);
-        }
-        for refusal in &done.denials {
-            journal.append_raw(&disk::denial_row(now, "", refusal), &mut sink);
-        }
-    }
+        Journal::open(Some(&path), None, &mut sink)
+    } else {
+        Journal::off()
+    };
+    journal.append_raw(&disk::report_row(now, "", &rep), &mut sink);
+    let done = disk::apply_auto(
+        &rep,
+        survey.transcripts_root.as_deref(),
+        remove,
+        measure,
+        &mut |step| journal.append_raw(&disk::step_row(now, "", step), &mut io::sink()),
+    )
+    .unwrap_or_default();
     DiskTick::Reclaimed(done)
 }
 
@@ -1610,22 +1937,26 @@ fn run_disk(
     let mut journal = Journal::open(Some(&path), sid, err);
     journal.append_raw(&disk::report_row(env.now, &env.sid, &rep), err);
 
+    // The hand-run verb reclaims the idle profiles of the build directories
+    // it was NAMED, on whatever volume they are: `device` is not fenced. A
+    // pressure row carries the device it was measured on, and free space is
+    // measured again (`df`) before each.
+    let judge = disk::Judge {
+        now: env.now,
+        threshold_days: config.target_stale_days,
+        device: None,
+    };
+    let volume = roots.volume.clone();
     let done = class.map(|_| {
         disk::apply(
             &rep,
             survey.transcripts_root.as_deref(),
             class,
-            &mut disk::remove_tree,
+            &mut disk::remover(judge),
+            &mut || volume.as_deref().and_then(disk::free_bytes),
+            &mut |step| journal.append_raw(&disk::step_row(env.now, &env.sid, step), err),
         )
     });
-    if let Some(done) = &done {
-        for row in &done.removed {
-            journal.append_raw(&disk::removal_row(env.now, &env.sid, row), err);
-        }
-        for refusal in &done.denials {
-            journal.append_raw(&disk::denial_row(env.now, &env.sid, refusal), err);
-        }
-    }
 
     if json {
         let _ = writeln!(out, "{}", rep.to_json());
@@ -1638,6 +1969,50 @@ fn run_disk(
                 Value::from(u64::try_from(done.removed.len()).unwrap_or(u64::MAX)),
             );
             o.insert("freed_bytes".to_owned(), Value::from(done.freed_bytes));
+            // What each row's removal did, as the text form prints it: what
+            // went, what was kept and why, every delete error — so a partial
+            // reclaim reads as partial here too.
+            let texts = |items: Vec<String>| {
+                Value::Array(items.into_iter().map(Value::from).collect::<Vec<_>>())
+            };
+            o.insert(
+                "rows".to_owned(),
+                Value::Array(
+                    done.removed
+                        .iter()
+                        .map(|(row, removed)| {
+                            let mut r = Map::new();
+                            r.insert(
+                                "path".to_owned(),
+                                Value::from(row.path.display().to_string()),
+                            );
+                            r.insert("freed_bytes".to_owned(), Value::from(removed.bytes));
+                            r.insert(
+                                "units".to_owned(),
+                                texts(
+                                    removed
+                                        .units
+                                        .iter()
+                                        .map(|p| p.display().to_string())
+                                        .collect(),
+                                ),
+                            );
+                            r.insert(
+                                "skipped".to_owned(),
+                                texts(
+                                    removed
+                                        .skipped
+                                        .iter()
+                                        .map(|(p, why)| format!("{}: {why}", p.display()))
+                                        .collect(),
+                                ),
+                            );
+                            r.insert("trouble".to_owned(), texts(removed.trouble.clone()));
+                            Value::Object(r)
+                        })
+                        .collect(),
+                ),
+            );
             o.insert(
                 "denials".to_owned(),
                 Value::Array(
@@ -1646,6 +2021,12 @@ fn run_disk(
                         .map(|d| Value::from(d.describe()))
                         .collect(),
                 ),
+            );
+            o.insert(
+                "stopped".to_owned(),
+                done.stopped
+                    .as_ref()
+                    .map_or(Value::Null, |s| Value::from(s.describe())),
             );
             let _ = writeln!(
                 out,
@@ -1659,6 +2040,17 @@ fn run_disk(
     let _ = writeln!(out, "{}", rep.headline());
     for row in &rep.rows {
         let _ = writeln!(out, "  {}", row.line());
+    }
+    if rep
+        .rows
+        .iter()
+        .any(|r| matches!(r.witness, disk::Witness::LeastRecentlyUsed { .. }))
+    {
+        let _ = writeln!(
+            out,
+            "  under pressure: the least-recently-used rows above go in that order, free space measured again before each, until {} is free or the bytes released cover what was short — under_pressure_up_to is what every one of them would free, an upper bound",
+            disk::human_bytes(config.pressure_target_bytes())
+        );
     }
     for note in &rep.notes {
         let _ = writeln!(out, "  note: {note}");
@@ -1674,16 +2066,29 @@ fn run_disk(
         }
         Some(done) => {
             let _ = writeln!(out, "{}", done.headline());
-            for row in &done.removed {
+            for (row, removed) in &done.removed {
                 let _ = writeln!(
                     out,
-                    "  removed {} — {}",
+                    "  removed {} — {}; freed about {}",
                     row.path.display(),
-                    row.witness.describe()
+                    row.witness.describe(),
+                    disk::human_bytes(removed.bytes)
                 );
+                for unit in &removed.units {
+                    let _ = writeln!(out, "    went: {}", unit.display());
+                }
+                for (unit, why) in &removed.skipped {
+                    let _ = writeln!(out, "    kept: {} — {why}", unit.display());
+                }
+                for trouble in &removed.trouble {
+                    let _ = writeln!(out, "    trouble: {trouble}");
+                }
             }
             for refusal in &done.denials {
                 let _ = writeln!(out, "  denied: {}", refusal.describe());
+            }
+            if let Some(stop) = &done.stopped {
+                let _ = writeln!(out, "  stopped: {}", stop.describe());
             }
         }
     }
@@ -1813,6 +2218,23 @@ fn approval_line(row: &str) -> String {
     }
 }
 
+/// How much of a give-up's upgrade ledger row [`upgrade_ledger_line`] shows,
+/// in bytes (every other row's detail is cut at 200): its list of what held
+/// the move, whole.
+const GAVE_UP_DETAIL_BYTES: usize = 8 * 1024;
+
+// THE LIST FITS, checked here rather than trusted: it is bounded where it is
+// written (`upgrade::held_list`) — at most `upgrade::HELD_NAMED` processes
+// named, each by a name of at most 32 characters, a command of at most
+// `upgrade::HELD_COMMAND_CHARS` and at most 32 characters of pid, age and
+// punctuation, any character at most 4 bytes — after the give-up's own words
+// (under 512 bytes, `upgrade_drive::gave_up_words`) and a count of the rest.
+// A bound raised past the cut fails the build here, not in a ledger view.
+const _: () = assert!(
+    512 + super::upgrade::HELD_NAMED * 4 * (32 + super::upgrade::HELD_COMMAND_CHARS + 32) + 32
+        <= GAVE_UP_DETAIL_BYTES
+);
+
 /// One upgrade ledger row as a line a person reads: time, step, tab and
 /// conversation, from and to, then the detail (the marker, the relaunch line,
 /// the outcome, the reason).
@@ -1827,11 +2249,9 @@ fn upgrade_ledger_line(row: &str) -> String {
         .map_or_else(|| "-".to_string(), rfc3339_utc);
     // A give-up's row is its list of what held the move, after words that
     // alone run past the cut (the review of 2026-09-27: the view showed none
-    // of the list). That list is bounded where it is written — at most
-    // `upgrade::HELD_NAMED` processes named, each command in
-    // `upgrade::HELD_COMMAND_CHARS` — and 8 KiB holds it whole.
+    // of the list): [`GAVE_UP_DETAIL_BYTES`] holds it whole.
     let cap = if s("step") == "gave-up" {
-        8 * 1024
+        GAVE_UP_DETAIL_BYTES
     } else {
         200
     };
@@ -2422,9 +2842,6 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     };
     if let Some(state) = over.state {
         env.state = state;
-    }
-    if let Some(offset) = over.utc_offset_s {
-        env.utc_offset_s = offset;
     }
     if let Some(config) = over.config {
         env.config = Some(config);

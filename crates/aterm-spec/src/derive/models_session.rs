@@ -2081,9 +2081,12 @@ pub fn no_transitive_authority_model() -> Model {
 ///   entry gate exists beside the lock rather than instead of it.
 ///
 /// * `Unmarked` — the HANDOFF WINDOW (closed 2026-09-25). A handoff is not one
-///   step: the predecessor EXITS (its lock dies), and only then does the
-///   successor bind and PUBLISH its own entry. Between the two, neither gate
-///   answered. The predecessor now names its successor at Commit
+///   step: on a FIXED-PATH socket the predecessor EXITS (its lock dies), and only
+///   then does the successor bind and PUBLISH its own entry. Between the two,
+///   neither gate answered. (A per-process socket's successor publishes BEFORE
+///   the Commit instead — the other order, where the entry already holds the id
+///   against a launch and the question is who ANSWERS it:
+///   [`handoff_address_owner_model`].) The predecessor now names its successor at Commit
 ///   (`claims/<sid>.successor`, a third gate a launch consults), and the
 ///   successor retires that marker once its entry is published. `Unmarked = 1`
 ///   is the pre-fix exit with no marker, and a launch in the window duplicates.
@@ -2167,6 +2170,116 @@ pub fn session_id_claim_model() -> Model {
             // THE SAFETY PROPERTY. An address that resolves at all resolves to
             // exactly one place.
             invariant AtMostOneHolder: holders <= 1;
+        }
+    }
+}
+
+/// WHO ANSWERS AN ADOPTED `@<sid>` WHILE A SEAMLESS UPDATE DECIDES (aterm-gui
+/// `control::ambiguous_sid_refusal` over `identity_claim::live_holder`; the
+/// 2026-09-28 update 0.95 → 0.97).
+///
+/// The dispatch refuses an id this process hosts when `graph/<sid>` names ANOTHER
+/// live process: two holders of one address, so a keystroke could land in a
+/// stranger's window. A successor on a per-process socket publishes the carried
+/// ids as soon as it has booted — before the predecessor's Commit (measured on
+/// every update since the in-GUI supervisor host shipped: 191–272 ms early) —
+/// while the predecessor still owns the sessions, decides the Commit and rolls
+/// back on a rejection. Read as a second holder, the entry refused the
+/// predecessor's own supervisor (`ERR ambiguous session id … also served by pid
+/// <successor>`: a supervisor restart, and on rejected attempts a restart budget
+/// spent). The fix exempts the ONE pid this process's handoff lane registered —
+/// the kernel's answer for its own candidate — for as long as the attempt decides.
+///
+/// `cand`: this process's candidate, 0 none yet, 1 alive, 2 proven dead (a
+/// rejection reaps before the lane lets go of it); `registered`: the lane's
+/// registration names it (`Launch` is the candidate's creation, registered before
+/// any descriptor reaches it; `Reject` is the reap and then the registration's
+/// drop); `entry`: whom `graph/<sid>` names, 0 this process, 1 the candidate, 2 a
+/// live stranger (an unrelated instance holding the same id: the duplicate the
+/// refusal exists for); `pred`: this process still owns the session (0 after the
+/// Commit's `_exit`); `asked`: the last request this process answered, 0 none, else
+/// 1 + the entry it met; `refused`: whether it was refused.
+///
+/// Two dials, one per half of the one invariant `RefusesExactlyAStranger`:
+///
+/// * `Buggy = 1` — the rule before 2026-09-28: refuse ANY live foreign entry,
+///   the candidate's included. Caught at `SuccessorPublishes` → `Request`: the
+///   predecessor refuses its own session while it still owns it.
+/// * `Blanket = 1` — an exemption keyed on "an attempt is deciding" rather than on
+///   WHICH pid: a stranger publishing the same id during an update is then
+///   served. Caught at `StrangerPublishes` → `Request`.
+///
+/// A request after a `Reject` meets a dead candidate's entry, which no rule
+/// refuses (a dead pid is no holder); one after the Commit never reaches this
+/// process. In the FORK lane the registration follows `spawn` by microseconds, and a
+/// child that published inside them would meet the pre-fix refusal — never a
+/// misdelivery; the model takes the launched lane's order, where the registration
+/// comes at the dial, before the grant gives the successor any id to publish.
+///
+/// Tier-1: aterm-gui's
+/// `control::tests::an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit`
+/// drives the real `ambiguous_sid_refusal` and `resolve_explicit` through every
+/// entry and registration state, and `identity_claim::tests::
+/// a_handoff_candidate_registration_is_exactly_its_own` the registration's life.
+#[must_use]
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
+// returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn handoff_address_owner_model() -> Model {
+    crate::ty_model! {
+        HandoffAddressOwner {
+            const Buggy = 0;      // 1 = refuse every live foreign entry, the candidate's too
+            const Blanket = 0;    // 1 = exempt every entry while an attempt decides
+            var cand = 0;         // 0 none, 1 alive, 2 proven dead
+            var registered = 0;   // the lane's registration names the candidate
+            var entry = 0;        // graph/<sid> names: 0 us, 1 the candidate, 2 a stranger
+            var pred = 1;         // this process still owns the session
+            var asked = 0;        // the last request: 0 none, else 1 + the entry it met
+            var refused = 0;      // and whether it was refused
+            var steps = 0;        // run bound
+
+            // The lane makes its candidate and registers it, before the grant.
+            action Launch when (pred == 1 && cand == 0) {
+                cand = 1;
+                registered = 1;
+            }
+
+            // The candidate, booted with the carried ids, publishes their entries
+            // before the Commit (a per-process socket does not wait for it).
+            action SuccessorPublishes when (cand == 1 && entry == 0) {
+                entry = 1;
+            }
+
+            // An unrelated live instance publishes the same id.
+            action StrangerPublishes when (entry <= 1) {
+                entry = 2;
+            }
+
+            // This process's own supervisor asks for its session.
+            action Request when (pred == 1 && steps <= 3) {
+                steps = steps + 1;
+                asked = entry + 1;
+                refused = if entry == 2 {
+                    if Blanket == 1 && registered == 1 { 0 } else { 1 }
+                } else {
+                    if entry == 1 && cand == 1 && (Buggy == 1 || registered == 0) { 1 } else { 0 }
+                };
+            }
+
+            // The Commit: this process `_exit`s, its registration with it.
+            action Commit when (pred == 1 && cand == 1) {
+                pred = 0;
+            }
+
+            // A rejection: the candidate is reaped, then the lane lets go.
+            action Reject when (pred == 1 && cand == 1) {
+                cand = 2;
+                registered = 0;
+            }
+
+            // THE PROPERTY: refuse exactly the entries a stranger holds — never the
+            // transfer this process is deciding, always a real duplicate.
+            invariant RefusesExactlyAStranger: if asked == 3 { refused == 1 } else { refused == 0 };
         }
     }
 }

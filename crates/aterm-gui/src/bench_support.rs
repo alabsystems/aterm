@@ -313,17 +313,17 @@ impl BenchApp {
     // ------------------------------------------------------------ cadence --
 
     /// Pulse the typing-cadence tracker with an INJECTED clock — the exact
-    /// call the human key path makes (`ws.typing_cadence.on_keystroke`), used
+    /// call the human key path makes (`ws.cursor_fx.cadence.on_keystroke`), used
     /// by arms that must stay on the bench's injected clock (App::input
     /// samples the wall internally, which would break reproducibility).
     pub fn pulse_typing(&mut self, now: Instant) {
-        self.ws_mut().typing_cadence.on_keystroke(now);
+        self.ws_mut().cursor_fx.cadence.on_keystroke(now);
     }
 
     /// The cadence intensity at `now` — the guards' hot/cold proof.
     #[must_use]
     pub fn cadence_intensity(&self, now: Instant) -> f32 {
-        self.ws().typing_cadence.intensity(now)
+        self.ws().cursor_fx.cadence.intensity(now)
     }
 
     /// THE PRE-FIX DRIVER SHAPE, verbatim (CF-6): `intensity` (the
@@ -335,9 +335,9 @@ impl BenchApp {
     pub fn cadence_triple(&self, now: Instant) -> (f32, f32, f32) {
         let ws = self.ws();
         (
-            ws.typing_cadence.intensity(now),
-            ws.typing_cadence.intensity(now),
-            ws.typing_cadence.warmth(now),
+            ws.cursor_fx.cadence.intensity(now),
+            ws.cursor_fx.cadence.intensity(now),
+            ws.cursor_fx.cadence.warmth(now),
         )
     }
 
@@ -345,7 +345,7 @@ impl BenchApp {
     /// aterm-effects): both channels off ONE decay — what the driver adopts.
     #[must_use]
     pub fn cadence_sample(&self, now: Instant) -> (f32, f32) {
-        self.ws().typing_cadence.sample(now)
+        self.ws().cursor_fx.cadence.sample(now)
     }
 
     // -------------------------------------------------------------- frame --

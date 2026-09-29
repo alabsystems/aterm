@@ -163,6 +163,14 @@ pub trait ScreenReader: Sync {
     /// The glyph the composer's caret row starts with (`❯` Claude Code, `›`
     /// Codex): what a guard on typed text anchors to. `None`: no composer.
     fn caret(&self) -> Option<char>;
+    /// The glyph the composer's caret row starts with ON `rows` — what a guard
+    /// on text typed into THAT screen anchors to. [`Self::caret`] by default;
+    /// Codex draws its input line with one of two marks (`›`, and `»` on
+    /// 0.158.0: [`crate::codex::CARETS`]), so its reader reads the one drawn,
+    /// and a guard spelled with the other is never pressed under.
+    fn caret_on(&self, _rows: &[String]) -> Option<char> {
+        self.caret()
+    }
     /// An Enter that arrives within a burst of typed text is taken as a
     /// NEWLINE, not a submit (Codex's paste guard, measured): typed text is
     /// submitted by a `turn` that settles first, never by an Enter right
@@ -388,8 +396,10 @@ impl ScreenReader for CodexReader {
     fn suggestion(&self, _: &[String], _: usize) -> Option<String> {
         None
     }
-    fn goal_active(&self, _: &[String]) -> bool {
-        false
+    /// The footer's `Pursuing goal (…)` ([`codex::goal_state`]): Codex runs
+    /// its goal's next turn itself.
+    fn goal_active(&self, rows: &[String]) -> bool {
+        codex::goal_state(rows) == Some(codex::CodexGoal::Pursuing)
     }
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         codex::said_tail(rows)
@@ -405,6 +415,11 @@ impl ScreenReader for CodexReader {
     }
     fn caret(&self) -> Option<char> {
         Some('›')
+    }
+    /// The mark the input line is drawn with now (`»` on 0.158.0), or `›`
+    /// with no composer on the screen.
+    fn caret_on(&self, rows: &[String]) -> Option<char> {
+        codex::caret_on(rows).or_else(|| self.caret())
     }
     /// Measured on 0.156.1 ([`crate::codex`], "TYPING INTO THE COMPOSER").
     fn paste_guard(&self) -> bool {
@@ -536,19 +551,6 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
     }
 }
 
-/// How a program that was restarted resumes the conversation it lost — the
-/// words Claude Code's own critical-memory banner ends on (`… restart and
-/// resume with claude --continue`), for a supervisor's escalation and the
-/// server's own attention to repeat. `None` for a program with no such
-/// command this crate knows. The words are a command, not a screen anchor.
-#[must_use]
-pub fn resume_hint(program: Program) -> Option<&'static str> {
-    match program {
-        Program::Claude => Some("claude --continue"),
-        Program::Codex | Program::Generic => None,
-    }
-}
-
 /// [`identify`], then that reader's [`ScreenReader::read`].
 #[must_use]
 pub fn read(program: Option<&str>, rows: &[String], cursor_col: Option<usize>) -> Reading {
@@ -588,15 +590,46 @@ pub fn read_at(
 /// evidence (measured on 2.1.283, 2026-09-26: a 50-row pane, the REPL on
 /// rows 8-11 — `agent=` stayed `unknown` and `await agent idle` timed out).
 /// A screen drawn to its last row (the fullscreen renderer's footer, a
-/// Codex composer) has the zone the grid's last `n` rows always gave.
+/// Codex composer) has the zone the grid's last `n` rows always gave — and so
+/// does one whose blank rows are ordinary separators; only a GAP of
+/// [`BLANK_GAP`] blank rows or more counts as one row, so the last thing said
+/// above a tall pane's blank middle stays in the zone.
 #[must_use]
 pub fn live_zone_start(rows: &[String], n: usize) -> usize {
     let drawn = rows
         .iter()
         .rposition(|r| !r.trim().is_empty())
         .map_or(0, |last| last + 1);
-    drawn.saturating_sub(n)
+    let blank = |i: usize| rows[i].trim().is_empty();
+    let (mut start, mut budget) = (drawn, n);
+    while start > 0 && budget > 0 {
+        start -= 1;
+        // A long blank GAP counts as one row against `n`, however tall: the
+        // whole run stays in the zone, and what was said above it is not cut
+        // by it. Claude Code's fullscreen renderer pins the composer to the
+        // pane's foot, so a short transcript in a tall pane leaves the last
+        // thing said (`⏺ API Error: …`) far above it — measured on 2.1.284,
+        // 2026-09-28, 144x50: the error on row 8, the composer on rows 45-47,
+        // `agent=idle` with no wall because row 8 was 41 rows above the last
+        // drawn row. A run of fewer than [`BLANK_GAP`] rows is an ordinary
+        // separator and counts row by row, as it always did.
+        if blank(start) {
+            let mut top = start;
+            while top > 0 && blank(top - 1) {
+                top -= 1;
+            }
+            if start - top + 1 >= BLANK_GAP {
+                start = top;
+            }
+        }
+        budget -= 1;
+    }
+    start
 }
+
+/// How many blank rows in a row make a GAP rather than a separator
+/// ([`live_zone_start`]).
+const BLANK_GAP: usize = 4;
 
 /// The program word of a `program=` / `detail=` value: the basename of its
 /// first word, lowercased, a login shell's `-` dropped.
@@ -638,7 +671,9 @@ fn program_word(program: &str) -> String {
 mod tests {
     use super::*;
     use crate::prompt::fixtures::{
-        API_ERROR_ENOTFOUND, BOX_BASH_TOUCH, CODEX_TRUST, END_529, GOAL_ACTIVE_SUGGESTION,
+        API_ERROR_ENOTFOUND, API_RETRYING_DRAFT_MEASURED, API_RETRYING_MEASURED,
+        API_RETRYING_QUEUED_80_MEASURED, API_RETRYING_QUEUED_DRAFT_MEASURED,
+        API_RETRYING_QUEUED_MEASURED, BOX_BASH_TOUCH, CODEX_TRUST, END_529, GOAL_ACTIVE_SUGGESTION,
         MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE, TRUST, bash_one_row, composer, rows, screen,
     };
     use crate::prompt::{CancelEffect, PromptKind, Role, Select};
@@ -922,6 +957,24 @@ mod tests {
         let busy = read(Some("claude"), &retrying, None);
         assert_eq!(busy.phase, Phase::Busy);
         assert_eq!(busy.wall, None);
+        // The retry MEASURED (2026-09-27): the spinner row carries the whole
+        // formatted error (`✻ Can't reach the API server — check your
+        // internet or DNS (ENOTFOUND) · Retrying in 1s · attempt 5/10`), no
+        // `…` and no `(esc to interrupt)` of its own; `esc to interrupt` is
+        // on the mode row. Busy, no wall — with a message queued too, and at
+        // 80 columns, where the error is cut to fit.
+        for (name, text) in [
+            ("retrying", API_RETRYING_MEASURED),
+            ("queued", API_RETRYING_QUEUED_MEASURED),
+            ("queued 80", API_RETRYING_QUEUED_80_MEASURED),
+            // A draft typed drops `esc to interrupt` from the mode row: the
+            // retry row alone says the vendor is still working.
+            ("draft", API_RETRYING_DRAFT_MEASURED),
+            ("queued draft", API_RETRYING_QUEUED_DRAFT_MEASURED),
+        ] {
+            let r = read(Some("claude"), &screen(text), None);
+            assert_eq!((r.phase, r.wall), (Phase::Busy, None), "{name}");
+        }
     }
 
     /// The 2026-09-24 incident's screen: the spinner still running, so the
@@ -1065,6 +1118,70 @@ mod tests {
     /// bottom rule begun, `──`) no evidence. A screen drawn to its last row
     /// has the zone the grid's last 40 rows always gave (the fullscreen
     /// REPL's control).
+    /// THE TALL PANE (a real render, 2026-09-28): a short transcript with the
+    /// composer pinned at the foot leaves 36 blank rows between the last thing
+    /// said and the composer, and the error on row 8 lay 41 rows above the
+    /// last drawn row — cut by the zone, so `agent=idle` with no wall while
+    /// the library read the wall on the whole screen. A gap of blank rows
+    /// counts as one row. CONTROLS: a screen with only one-row separators
+    /// cuts exactly as before, and a gap of three rows is a separator.
+    #[test]
+    fn a_long_blank_gap_does_not_cut_the_last_thing_said_out_of_the_zone() {
+        use crate::prompt::fixtures::API_ERROR_TALL_PANE_MEASURED;
+        let rows = screen(API_ERROR_TALL_PANE_MEASURED);
+        let error = rows
+            .iter()
+            .position(|r| r.starts_with("⏺ API Error"))
+            .expect("the error row");
+        let cursor = rows
+            .iter()
+            .rposition(|r| r.starts_with('❯'))
+            .expect("caret");
+        assert!(error < 10 && cursor > 44, "{error} {cursor}");
+        // RED: the grid's last 40 rows, and the zone as it was counted.
+        assert!(rows.len() - 40 > error, "the old cut lies below the error");
+        // GREEN: the zone reaches the error and the reader finds the wall.
+        let start = live_zone_start(&rows, 40);
+        assert!(start <= error, "{start} > {error}");
+        let zone = &rows[start..];
+        let r = read_at(Some("claude"), zone, Some(cursor - start), None);
+        assert!(r.phase_authoritative, "{r:?}");
+        assert_eq!(
+            r.wall.as_ref().map(|w| (w.kind, w.placement)),
+            Some((
+                crate::wall::WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: crate::wall::ApiCause::Unreachable
+                },
+                crate::wall::Placement::ErrorRow
+            ))
+        );
+        // CONTROL: no gap — every row drawn, blanks single — is the last
+        // `n` rows, as before; three blank rows are a separator too.
+        let full: Vec<String> = (0..62)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("row {i}")
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        // Content on the even rows: the last drawn row is 60, one row-count each.
+        assert_eq!(live_zone_start(&full, 40), 61 - 40);
+        let mut sep: Vec<String> = (0..62).map(|i| format!("row {i}")).collect();
+        for i in [30, 31, 32] {
+            sep[i] = String::new();
+        }
+        assert_eq!(live_zone_start(&sep, 40), 62 - 40);
+        // A gap of four counts as one: the zone reaches three rows further.
+        sep[33] = String::new();
+        assert_eq!(live_zone_start(&sep, 40), 62 - 40 - 3);
+        // All blank: read whole.
+        assert_eq!(live_zone_start(&vec![String::new(); 62], 40), 0);
+    }
+
     #[test]
     fn an_inline_repl_above_the_last_40_rows_is_read_in_the_live_zone() {
         use crate::prompt::fixtures::{
@@ -1108,11 +1225,19 @@ mod tests {
             (Phase::Idle, false, None),
             "the REPL half drawn is no evidence"
         );
-        // The control: the fullscreen REPL is drawn to its last row, and its
-        // zone is the grid's last 40 rows, as it always was.
+        // The fullscreen REPL at launch: the banner at the top, the composer
+        // pinned at its foot, a blank gap between. The gap counts as one
+        // row, so the zone holds the banner too — the reader sees the launch
+        // card (`fresh`) as the inline REPL's zone always did.
         let full = screen(LAUNCH_REPL_READY);
         assert_eq!(full.len(), 50);
-        assert_eq!(zone(&full), tail(&full));
+        assert_eq!(live_zone_start(&full, 40), 0, "the banner is in the zone");
+        let launch = read(Some("claude"), &zone(&full), Some(45));
+        assert!(launch.fresh, "{launch:?}");
+        // The control: a fullscreen screen drawn to its last row, no gap, is
+        // the grid's last 40 rows, as it always was.
+        let drawn: Vec<String> = (0..50).map(|i| format!("row {i}")).collect();
+        assert_eq!(zone(&drawn), tail(&drawn));
     }
 
     /// [`live_zone_start`]'s arithmetic: the last `n` rows counted up from
@@ -1411,17 +1536,21 @@ mod tests {
         );
     }
 
+    /// The banner's remedy tail is the VENDOR's (`— restart and resume with
+    /// claude --continue`), and [`crate::wall::memory_banner_head`] leaves it
+    /// out of anything aterm repeats (2026-09-26: `--continue` resumes the
+    /// directory's newest conversation — a sibling tab's where two share
+    /// it). NEGATIVE CONTROL: the whole message still carries it, so the cut
+    /// is what removes it.
     #[test]
-    fn only_claude_code_has_a_resume_hint() {
-        assert_eq!(resume_hint(Program::Claude), Some("claude --continue"));
-        assert_eq!(resume_hint(Program::Codex), None);
-        assert_eq!(resume_hint(Program::Generic), None);
-        // The banner's own last words are the hint.
+    fn the_memory_banner_head_leaves_the_vendors_continue_out() {
         let banner = memory_wall(&screen(MEMORY_BANNER_BUSY)).expect("the banner");
-        assert!(
-            banner
-                .message
-                .ends_with(resume_hint(Program::Claude).unwrap())
+        assert!(banner.message.contains("--continue"), "{}", banner.message);
+        let head = crate::wall::memory_banner_head(&banner.message);
+        assert_eq!(
+            head,
+            format!("{} (140.4GB)", crate::anchors::anchor_text("wall.memory"))
         );
+        assert!(!head.contains("--continue"), "{head}");
     }
 }

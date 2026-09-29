@@ -32,14 +32,9 @@ use crate::trail_audio::HostState;
 #[path = "sound_seam_conformance.rs"]
 mod conformance;
 
-/// Whether the person asked for any aurora at all: the RESOLVED brightness
-/// knob (`cursor_trail_intensity`, or a style pack that resolves to zero),
-/// read BEFORE any policy fold. Zero is their explicit off (binding decision
-/// C) — it silences the key seam, and it is what the verb must call
-/// `trail-off` rather than `engine-silent`.
-pub(crate) fn user_lit(resolved: &aterm_effects::cursor_glow::GlowConfig) -> bool {
-    resolved.intensity > 0.0
-}
+// The light/audio fold and its `user_lit` read are the engine's
+// (`aterm_effects::sound_policy`), shared by every host; this oracle reads them.
+pub(crate) use aterm_effects::sound_policy::{fold_window_audibility, user_lit};
 
 /// `SeamInputs::trail_on` for a resolved (pre-fold) config: the master knob
 /// and serious mode (`enabled`) AND a nonzero brightness knob.
@@ -51,31 +46,6 @@ pub(crate) fn user_lit(resolved: &aterm_effects::cursor_glow::GlowConfig) -> boo
 /// `EngineSilentIsUnreachable` and its conformance are what found it.
 pub(crate) fn trail_on(resolved: &aterm_effects::cursor_glow::GlowConfig) -> bool {
     resolved.enabled && user_lit(resolved)
-}
-
-/// THE HOST'S SPLIT of one resolved config into its light half and its audio
-/// half, for one window's tick — the ONE place `tick_cursor_fx` decides both.
-///
-/// The light takes both motion policies (the accessibility stage's amplitude
-/// and the load-shed envelope); the key seam takes NEITHER: `audible` is
-/// whose window the key landed in and whether the person asked for any
-/// aurora at all. Before 2026-09-22 a shed frame or a `Reduce Motion`
-/// session zeroed `intensity`, the engine read that as "dark ⇒ silent", and
-/// every keystroke went quiet while `aterm ctl tone` still said `audio=live`.
-///
-/// A function rather than three inline lines so the `TrailSoundSeam`
-/// conformance drives THIS fold instead of a transcription of it.
-pub(crate) fn fold_window_audibility(
-    cfg: &mut aterm_effects::cursor_glow::GlowConfig,
-    motion_amplitude: f32,
-    shed_env: f32,
-    win_focused: bool,
-) {
-    // Read BEFORE the fold below: the one point at which the three meanings
-    // of a zero `intensity` are still separable.
-    let lit = user_lit(cfg);
-    cfg.intensity *= motion_amplitude * shed_env;
-    cfg.audible = win_focused && lit;
 }
 
 /// Everything that decides whether a keypress sounds, gathered once so the

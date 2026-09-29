@@ -9,13 +9,6 @@ license.workspace = true
 repository.workspace = true
 description = "aterm — artifact-agnostic, portable POSIX update primitives (source resolution, advisory file lock, curl plumbing, private-dir hardening, sha256) shared by aterm-update and atpkg."
 
-[lib]
-# The pinned custom `trust` toolchain (rust-toolchain.toml) ships no rustdoc, and a
-# linked custom toolchain cannot `rustup component add` one — so `cargo test`'s
-# doc-test phase aborts the whole run on this tree even with every real test green.
-# Same constraint (and comment) as crates/atpkg: bare `cargo test` must be able to pass.
-doctest = false
-
 [features]
 # Development seams in an optimized build (`aterm_types::dev_seam!`: ATERM_UPDATE_ROOT;
 # `source::REPOINT_IS_A_DEV_SEAM`: the `[update]` owner/repo repoint). Debug builds

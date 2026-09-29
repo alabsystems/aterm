@@ -96,6 +96,22 @@
 //! agent prompt, question or usage limit, or into typed `attention`). Both use
 //! this same bounded queue and focus suppression, and both rate-limit
 //! themselves before the queue. The herald never runs in a headless instance.
+//! The embedded operator's notices (`operator_host`, "aterm operator") ride the
+//! same queue, and the update-health banner calls [`deliver`] directly.
+//!
+//! **`desktop_alerts` turns aterm's own notices off** (config key, default OFF
+//! since 2026-09-28 — the owner: "I don't know what these OSX alerts are from
+//! aterm but they are annoying, disable them"; on macOS without
+//! `terminal-notifier` they arrive as Script Editor banners). Each such notice is
+//! built with [`NotifyMsg::own`], and the delivery thread drops an OWN message
+//! while the live switch ([`spawn_delivery`]'s `own_alerts`) reads `false` — one
+//! gate every producer on the queue passes, however it was written. The App's
+//! producers also check the key themselves (the herald so its `aterm.log` line can
+//! say the setting held the notice back; the update-health banner, which does not
+//! ride the queue). Nothing else changes: the band, the menu bar, the tab marks
+//! and `messages.log` carry every one of these notices as before. Program
+//! notifications (OSC 9/99/777) are [`NotifyMsg::program`] and answer to
+//! `allow_notifications` alone.
 
 // Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
 // channel-draining stub (`spawn_delivery`), and the real-notification helpers
@@ -122,22 +138,54 @@ pub(crate) struct NotifyMsg {
     pub title: Option<String>,
     /// Notification body.
     pub body: String,
+    /// `true` for a notice aterm wrote itself ([`Self::own`]), which the
+    /// `desktop_alerts` switch governs; `false` for a program's (OSC 9/99/777,
+    /// [`Self::program`]), which `allow_notifications` already admitted.
+    #[cfg(any(target_os = "macos", windows, test))]
+    pub own: bool,
 }
 
 impl NotifyMsg {
-    /// One notification. Off a delivery host (`spawn_delivery` there only drains
-    /// the channel) the session and title have no reader, and are dropped here.
-    pub(crate) fn new(session: u64, title: Option<String>, body: String) -> Self {
+    /// One PROGRAM notification (OSC 9/99/777), already admitted by the
+    /// `allow_notifications` opt-in. Off a delivery host (`spawn_delivery` there
+    /// only drains the channel) the session and title have no reader, and are
+    /// dropped here.
+    pub(crate) fn program(session: u64, title: Option<String>, body: String) -> Self {
+        Self::with_origin(session, title, body, false)
+    }
+
+    /// One notice aterm wrote ITSELF (the herald, the consent attention path,
+    /// the embedded operator): the delivery thread drops it while
+    /// `desktop_alerts` is off (the module doc's *`desktop_alerts`* paragraph).
+    pub(crate) fn own(session: u64, title: Option<String>, body: String) -> Self {
+        Self::with_origin(session, title, body, true)
+    }
+
+    fn with_origin(session: u64, title: Option<String>, body: String, own: bool) -> Self {
         #[cfg(not(any(target_os = "macos", windows, test)))]
-        let _ = (session, title);
+        let _ = (session, title, own);
         Self {
             #[cfg(any(target_os = "macos", windows, test))]
             session,
             #[cfg(any(target_os = "macos", windows, test))]
             title,
             body,
+            #[cfg(any(target_os = "macos", windows, test))]
+            own,
         }
     }
+}
+
+/// The delivery thread's one decision for a dequeued message: an OWN notice
+/// while `desktop_alerts` is off (`own_alerts == false`) is dropped, and so is
+/// any notice whose session the person is already looking at (`suppressed`, the
+/// focus set). Pure, so the gate is tested without running a notifier.
+#[cfg(any(target_os = "macos", windows, test))]
+fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, own_alerts: bool) -> bool {
+    if msg.own && !own_alerts {
+        return false;
+    }
+    !suppressed.contains(&msg.session)
 }
 
 /// Bound on the notification delivery queue, mirroring the OSC 52 clipboard
@@ -165,24 +213,29 @@ pub(crate) const fn delivery_available() -> bool {
 /// `recv()` (0% idle when no notifications arrive) and exits when every sender
 /// is dropped. `suppress` is the live suppression set the UI thread keeps current
 /// (the active-tab focused-pane id of every focused window); the thread reads it
-/// to apply focus-aware suppression.
+/// to apply focus-aware suppression. `own_alerts` is the live `desktop_alerts`
+/// switch the UI thread keeps current: while it reads `false`, every
+/// [`NotifyMsg::own`] notice is dropped here ([`delivers`]).
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) fn spawn_delivery(
     suppress: Arc<Mutex<HashSet<u64>>>,
     silent: Arc<AtomicBool>,
+    own_alerts: Arc<AtomicBool>,
 ) -> SyncSender<NotifyMsg> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
     std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
-            // Suppress ONLY when the firing session is the active tab of SOME
+            // Suppress when the firing session is the active tab of SOME
             // focused window — the user is already looking at it. App unfocused
             // (empty set) OR a background tab fired it → deliver (a background
-            // tab's activity still surfaces, mirroring `App::on_bell`).
-            if suppress
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&msg.session)
-            {
+            // tab's activity still surfaces, mirroring `App::on_bell`) — unless
+            // it is aterm's own notice and `desktop_alerts` is off.
+            let admitted = delivers(
+                &msg,
+                &suppress.lock().unwrap_or_else(|p| p.into_inner()),
+                own_alerts.load(Ordering::Acquire),
+            );
+            if !admitted {
                 continue;
             }
             deliver(
@@ -202,6 +255,7 @@ pub(crate) fn spawn_delivery(
 pub(crate) fn spawn_delivery(
     _suppress: Arc<Mutex<HashSet<u64>>>,
     _silent: Arc<AtomicBool>,
+    _own_alerts: Arc<AtomicBool>,
 ) -> SyncSender<NotifyMsg> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
     std::thread::spawn(move || while rx.recv().is_ok() {});
@@ -217,8 +271,10 @@ pub(crate) fn spawn_delivery(
 /// `allow_notifications` gate (the module doc's *Identity and consent* paragraph
 /// says what each subprocess asks the system for under aterm's name, and that
 /// the measured answer is: nothing that prompts). aterm's OWN notices — the
-/// consent attention path and the escalation herald — are not program output
-/// and do not pass that gate; see *aterm's own notices* in the module doc.
+/// consent attention path, the escalation herald, the embedded operator and the
+/// update-health banner — are not program output and do not pass that gate;
+/// they pass `desktop_alerts` instead (default off). See *aterm's own notices*
+/// in the module doc.
 #[cfg(target_os = "macos")]
 pub(crate) fn deliver(title: Option<&str>, body: &str, _silent: bool) {
     use std::process::{Command, Stdio};
@@ -647,16 +703,50 @@ fn fold_to_utf16(s: &str, out: &mut [u16]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        NOTIFY_QUEUE_CAP, NotifyMsg, applescript_escape, fold_to_utf16, windows_info_flags,
+        NOTIFY_QUEUE_CAP, NotifyMsg, applescript_escape, delivers, fold_to_utf16,
+        windows_info_flags,
     };
+    use std::collections::HashSet;
     use std::sync::mpsc::TrySendError;
 
     fn msg(session: u64) -> NotifyMsg {
-        NotifyMsg {
-            session,
-            title: None,
-            body: "flood".to_string(),
-        }
+        NotifyMsg::program(session, None, "flood".to_string())
+    }
+
+    /// `desktop_alerts = false` (the delivery thread's `own_alerts`) drops
+    /// every notice aterm wrote itself — the herald's, the operator's, the
+    /// consent path's — and nothing else: a program notification, which
+    /// `allow_notifications` already admitted, is still delivered, and the
+    /// focus suppression still holds for both origins. Negative control: the
+    /// same own notice IS delivered with the switch on, so the drop is the
+    /// switch's and not an accident of the notice.
+    #[test]
+    fn desktop_alerts_off_drops_only_aterms_own_notices() {
+        let none = HashSet::new();
+        let own = NotifyMsg::own(7, Some("aterm operator".into()), "waiting".into());
+        let program = NotifyMsg::program(7, None, "build done".into());
+        assert!(own.own && !program.own, "the constructors carry the origin");
+        assert!(
+            !delivers(&own, &none, false),
+            "switch off: aterm's own is dropped"
+        );
+        assert!(
+            delivers(&own, &none, true),
+            "switch on: it is delivered (control)"
+        );
+        assert!(
+            delivers(&program, &none, false),
+            "a program's notification is not the switch's to drop"
+        );
+        let looking = HashSet::from([7]);
+        assert!(
+            !delivers(&program, &looking, false),
+            "focus suppression holds"
+        );
+        assert!(
+            !delivers(&own, &looking, true),
+            "for aterm's own notices too"
+        );
     }
 
     /// The bounded delivery channel caps queue memory: with no receiver draining,

@@ -264,7 +264,7 @@ pub const REVIEWED_VENDORED_CRATES: &[VendoredCrate] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchTargetKind {
     /// Under `vendor/`: third-party source, owes a [`REVIEWED_VENDORED_CRATES`]
-    /// row and the whole provenance family (`cargo forge attest`).
+    /// row and the whole provenance family (`targo --unverified forge attest`).
     Vendored,
     /// Under `crates/` AND carrying none of the marks of a redistribution:
     /// a workspace member, code aterm wrote. Owes NO review row, NO NOTICE
@@ -281,7 +281,7 @@ pub enum PatchTargetKind {
 /// because either one alone is enough to create the obligation:
 ///
 /// * a RETAINED UPSTREAM LICENSE file in the crate root — the same signal
-///   `cargo forge attest` `[OB-5]` already uses to decide a vendored fork has
+///   `targo --unverified forge attest` `[OB-5]` already uses to decide a vendored fork has
 ///   kept its terms; and
 /// * a naming of the path in the top-level `NOTICE`, which is this repo's
 ///   authoritative record of what it redistributes and under whose terms.
@@ -1514,6 +1514,12 @@ pub(crate) mod test_fixtures {
         // across threads — so it can participate in no lock order; the census
         // walks it because it runs on whatever thread parses the reply.
         "crates/aterm-json/src",
+        // Entered the closure 2026-09-28 with the PTY keeper's P3: the window's
+        // `keeper_link` drives the keeper client (`aterm_keeper::client`) on a
+        // worker thread of this process. A normal (unix) [dependencies] edge,
+        // so the crate is GUI process code; its server half runs only in the
+        // keeper job, but it is one crate and is walked whole.
+        "crates/aterm-keeper/src",
         "crates/aterm-lexicon/src",
         "crates/aterm-log/src",
         "crates/aterm-lz4/src",

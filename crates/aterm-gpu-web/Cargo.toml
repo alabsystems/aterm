@@ -23,6 +23,11 @@ aterm-effects = { path = "../aterm-effects" }
 # native app runs — extracted from aterm-gui). Pure + clock-injected; the
 # predict_api module samples the real monotonic clock for it (aterm-time below).
 aterm-predict = { workspace = true }
+# The unified message engine (the message band: `notice`, `messages`, the
+# rows the frame reserves above the grid — src/messages_api.rs, the CPU
+# twin's file line for line). Its only dependency is aterm-time: clockless,
+# thread-free, wasm-clean. The renderer's `band` module composes its rows.
+aterm-messages = { workspace = true }
 # Real monotonic clock for the predict_api host seam: std Instant on native,
 # performance.now() on wasm32 — the predictor's echo reconciliation runs on
 # REAL time (the glitch-expiry self-heal), unlike the deterministic effects clock.
@@ -93,3 +98,6 @@ web-sys = { version = "0.3", features = ["HtmlCanvasElement", "OffscreenCanvas"]
 # NOTE: no per-crate [profile.release] — profiles only take effect from the
 # workspace root, which already sets lto/codegen-units=1/strip for release. A wasm
 # size build (opt-level="z") is driven by the build tool's --profile, not here.
+
+[lints]
+workspace = true

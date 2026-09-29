@@ -74,6 +74,7 @@ const VERBS: &[&str] = &[
     "noindex",
     "machine",
     "lease",
+    "lane",
 ];
 
 /// One usage line per verb — what `atpkg <verb> --help` prints.
@@ -172,6 +173,14 @@ const VERB_USAGE: &[(&str, &str)] = &[
         "atpkg lease <toolchain-dir> [--who <words>] -- <command> [args…]  — hold the \
          store build <toolchain-dir> belongs to while <command> runs: gc keeps it, the \
          seam does not re-lay it, an unattended trust update waits for it",
+    ),
+    (
+        "lane",
+        "atpkg lane [--cwd <dir>] (-- <command…> | - | --json <field.path>)  — read ONE shell \
+         command line (argv, stdin, or a string field of a JSON object on stdin): exit 2 with \
+         the Trust spelling when it runs stock Rust (cargo, rustc, rustfmt, clippy, rustdoc) at \
+         command position, 0 when it does not or ATERM_STOCK_REASON='<why>' stands in front, \
+         1 when the input cannot be read",
     ),
 ];
 
@@ -277,6 +286,7 @@ const VERB_TIERS: &[(&str, &[&str])] = &[
             "verify-pkg",
             "relocate",
             "lease",
+            "lane",
         ],
     ),
 ];
@@ -352,6 +362,15 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// `atpkg` argv0 alias) and by the thin standalone bin. Everything below is
 /// unchanged from the binary era.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
+    // THE HIDDEN WARM VERB, ON THE RAW ARGV ([`crate::warm`]): what a pass that landed an
+    // agent build starts, detached, to run that build once headless. Its operands carry the
+    // store prefix, which must reach it byte for byte (the lossy conversion below would
+    // name a store that does not exist), so it is answered here — before the store lock,
+    // which the pass that started it may still hold; it never mutates the store, and says
+    // nothing.
+    if argv.first().and_then(|v| v.to_str()) == Some(crate::warm::HIDDEN_VERB) {
+        return crate::warm::run_hidden(&argv[1..]);
+    }
     let mut args: Vec<String> = argv
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -701,6 +720,9 @@ fn run_verb(verb: Option<&str>, args: &[String]) -> ExitCode {
         // beside the store, never in it, and a holder must be able to lease the toolchain
         // while a pass holds the lock.
         Some("lease") => return cmd_lease(&args[1..]),
+        // Read-only and store-free: the Rust-lane reader over one command line
+        // ([`crate::lane`]) — no lock, no layout, nothing written.
+        Some("lane") => return cmd_lane(&args[1..]),
         Some(other) => {
             // The head `atpkg: unknown verb '<x>'` is byte-stable for scripts; the
             // suggestion rides after an em dash so a typo's fix is the FIRST thing on
@@ -1435,8 +1457,10 @@ fn pass_ended_while_we_waited(
 /// pass's ending, as that pass would have said it to the window. Its caller exits as that
 /// pass did — `ok` a quiet 0 on stdout, `offline` the offline code (retried soon, nothing
 /// shown), `failed` 1 on stderr with that pass's own sentence (`said`), so the window's
-/// failure ladder retries it rather than this child repeating it back to back. No marker,
-/// and nothing recorded: the record is the holder's. Pure.
+/// failure ladder retries it rather than this child repeating it back to back — except a
+/// pass that failed only for its cached index, which said nothing on stderr and so is
+/// said on stdout ([`stand_down_exit`] decides the stream and code, 2026-09-26). No
+/// marker, and nothing recorded: the record is the holder's. Pure.
 fn stood_down_after_wait(
     outcome: aterm_update_core::pkg_check::PassOutcome,
     ago: u64,
@@ -1456,6 +1480,56 @@ fn stood_down_after_wait(
                 said.trim()
             }
         ),
+    }
+}
+
+/// How a full pass that stood down behind the one that ended while it waited EXITS
+/// ([`stand_down_exit`]): its line, which stream carries it, and the exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandDown {
+    /// The one line ([`stood_down_after_wait`]).
+    pub line: String,
+    /// Whether it goes to stderr — the stream the window reads as a failure's words.
+    pub on_stderr: bool,
+    /// The exit code.
+    pub code: u8,
+}
+
+/// THE STAND-DOWN EXITS AS THE PASS IT STOOD BEHIND DID ([`stood_down_after_wait`]'s
+/// contract): `ok` 0 on stdout; `offline` the offline code on stdout; `failed` 1 — on
+/// stderr with that pass's sentence, EXCEPT when that pass failed only because its index
+/// came from the cache (`stale_index_only`, [`crate::status::stale_index_only_end`]): that
+/// pass exited 1 with NOTHING on stderr, so this one says its line on stdout and exits 1
+/// the same way.
+///
+/// THE GAP (review of 4329ea590, 2026-09-26): that commit taught the window to read a
+/// markerless exit 1 with empty stderr, whose own pass end recorded the cached-index
+/// clause, as a stale index — said at INFO, never "Package update failed". A window pass
+/// that QUEUED behind a sibling's cached-index pass (another window, the session lane, a
+/// person's `aterm pkg update`) stood down with that pass's outcome on stderr, and the
+/// window's rule, gated on empty stderr, posted the failure anyway — at exactly the moment
+/// a rate limit hits every lane at once. The stand-down was not exiting as that pass would
+/// have said it to the window. It now does, and a holder that ALSO failed a member
+/// (`stale_index_only` false) still stands down on stderr, a failure. Pure; `pub` so the
+/// window's verdict test drives this very decision.
+#[must_use]
+pub fn stand_down_exit(
+    outcome: aterm_update_core::pkg_check::PassOutcome,
+    ago: u64,
+    said: &str,
+    stale_index_only: bool,
+) -> StandDown {
+    use aterm_update_core::pkg_check::PassOutcome;
+    let line = stood_down_after_wait(outcome, ago, said);
+    let (on_stderr, code) = match outcome {
+        PassOutcome::Ok => (false, 0),
+        PassOutcome::Offline => (false, aterm_update_core::pkg_check::PASS_OFFLINE_EXIT),
+        PassOutcome::Failed => (!stale_index_only, 1),
+    };
+    StandDown {
+        line,
+        on_stderr,
+        code,
     }
 }
 
@@ -2074,10 +2148,7 @@ fn selfupdate_check(
     let _ = std::io::stderr().flush();
     let status = std::process::Command::new(atpkg)
         .args(crate::selfupdate::child_argv(atpkg, row.program, bound))
-        .env(
-            SPAWNER_PID_ENV,
-            crate::dec_u64(u64::from(std::process::id())),
-        )
+        .env(SPAWNER_PID_ENV, std::process::id().to_string())
         .spawn()
         .and_then(|mut child| child.wait());
     let status = match status {
@@ -4238,6 +4309,61 @@ fn lease_hold_line(hold: Option<&crate::lease::Hold>, dir: &std::path::Path, run
             "atpkg lease: warn \u{2014} no package prefix resolves, so nothing was leased; \
              {run} runs unprotected"
         ),
+    }
+}
+
+/// `atpkg lane` ([`crate::lane`]): the Rust-lane reader over one shell command line.
+/// Exit 0 when no stock Rust tool stands at command position (one stderr line when an
+/// `ATERM_STOCK_REASON` cleared one), [`crate::reroute::REFUSAL_EXIT`] with the refusal
+/// when one does, 1 when the input cannot be read, 2 on a usage error.
+fn cmd_lane(rest: &[String]) -> ExitCode {
+    use std::io::Read as _;
+    let args = match crate::lane::parse_args(rest) {
+        Ok(args) => args,
+        Err(why) => {
+            eprintln!("atpkg lane: {why}");
+            if let Some(usage) = verb_usage("lane") {
+                eprintln!("usage: {usage}");
+            }
+            return ExitCode::from(2);
+        }
+    };
+    let mut input = Vec::new();
+    if !matches!(args.source, crate::lane::Source::Words(_))
+        && let Err(e) = std::io::stdin()
+            .take(crate::lane::MAX_INPUT_BYTES)
+            .read_to_end(&mut input)
+    {
+        eprintln!("atpkg lane: could not read stdin: {e} — nothing is claimed");
+        return ExitCode::from(1);
+    }
+    let command = match crate::lane::command_line(&args.source, &input) {
+        Ok(Some(command)) => command,
+        // No command line at that field: nothing to read, nothing to refuse.
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(why) => {
+            eprintln!("atpkg lane: {why} — nothing is claimed");
+            return ExitCode::from(1);
+        }
+    };
+    let cwd = args.cwd.or_else(|| std::env::current_dir().ok());
+    let home = aterm_types::dirs::home_dir();
+    let env_toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
+    match crate::lane::answer(
+        &command,
+        cwd.as_deref(),
+        home.as_deref(),
+        env_toolchain.as_deref(),
+    ) {
+        crate::lane::Answer::Clean => ExitCode::SUCCESS,
+        crate::lane::Answer::Escaped(line) => {
+            eprintln!("{line}");
+            ExitCode::SUCCESS
+        }
+        crate::lane::Answer::Refused(text) => {
+            eprintln!("{text}");
+            ExitCode::from(crate::reroute::REFUSAL_EXIT)
+        }
     }
 }
 
@@ -7051,6 +7177,11 @@ fn record_pass_end(layout: &crate::store::Layout, now: i64, reached: bool) {
 /// when nothing answered (`offline`), else 1 — so the window never reads a pass on the §14
 /// cache as a check that ran (the special case it kept for exit 0 on the cache,
 /// `update_pass_served_from_cache`, is gone with the stamp that needed it).
+///
+/// The one ending that fails ONLY for its index — not reached, not offline, and `code` 0
+/// (no member failed, so nothing went to stderr) — is noted in
+/// [`PASS_FAILED_ONLY_FOR_ITS_INDEX`], which [`run_recorded_update_pass`] records with the
+/// pass's end ([`crate::status::Status::stale_index_only_pass_seq`], 2026-09-26).
 fn finish_update_pass(
     layout: &crate::store::Layout,
     now: i64,
@@ -7062,8 +7193,21 @@ fn finish_update_pass(
     match (reached, offline) {
         (true, _) => code,
         (false, true) => aterm_update_core::pkg_check::PASS_OFFLINE_EXIT,
-        (false, false) => 1,
+        (false, false) => {
+            PASS_FAILED_ONLY_FOR_ITS_INDEX.with(|only| only.set(code == 0));
+            1
+        }
     }
+}
+
+thread_local! {
+    /// Whether this thread's last full pass ended in [`finish_update_pass`]'s "failed only
+    /// for its index" arm: the index came from the cache, some host answered, and no member
+    /// failed — exit 1 with nothing on stderr. Reset and read by
+    /// [`run_recorded_update_pass`], which records it with the pass's end. The doc sits
+    /// inside the macro: on the invocation it would be `unused_doc_comments`.
+    static PASS_FAILED_ONLY_FOR_ITS_INDEX: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Stamp the index build this pass resolved (the publisher's pulse `doctor` reads), and —
@@ -7089,7 +7233,11 @@ fn record_index_freshness(layout: &crate::store::Layout, now: i64, index_build: 
         };
         if !status.outcome.contains("index from cache") {
             note_outcome_written();
-            status.outcome = format!("{} (index from cache — {why})", status.outcome);
+            status.outcome = format!(
+                "{} {}{why})",
+                status.outcome,
+                crate::status::INDEX_FROM_CACHE_CLAUSE
+            );
             let _ = crate::status::write(layout, &status);
         }
     }
@@ -7931,7 +8079,7 @@ fn write_removed(
     // crash between the truncate and the last line left a shorter list — every program
     // past the cut silently un-removed, and back on the next unattended pass.
     let mut tmp_name = String::from("removed.tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    tmp_name.push_str(&std::process::id().to_string());
     let tmp = path.with_file_name(tmp_name);
     let _ = std::fs::remove_file(&tmp);
     let wrote = crate::platform::open_create_write(&tmp, 0o600).and_then(|mut f| {
@@ -8936,7 +9084,8 @@ fn pass_path_tail(foreign: &std::path::Path) -> String {
 /// foreign copy): SOURCE THE HOOK WHERE IT STANDS — `. ~/.aterm/shell.d/00-atpkg.zsh`
 /// (`. …bash`; `source …fish` for fish; the dot-source `. …ps1` for pwsh) — whenever
 /// that hook file exists for the INVOKING shell's family ([`crate::hooks::hook_file`]);
-/// the same sentence the window's status row says for a tab from before the update. Only
+/// the same sentence the window records for a tab from before the update (a ledger
+/// entry `aterm ctl appstatus` reads since 2026-09-22, never a row on the glass). Only
 /// where no hook file exists (a shell atpkg writes no hook for, an install whose hook
 /// write failed, no shell/`HOME` known at all) is a `PATH` line printed instead — in the
 /// shell's own dialect (`export PATH="<agents>:$PATH"`, fish's `set -gx PATH …`, pwsh's
@@ -9400,6 +9549,26 @@ fn emit_marker_line(line: &str) {
         println!("{line}");
     }
     announcement::note(line);
+    #[cfg(test)]
+    MARKERS_SAID.with(|said| said.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TESTS ONLY: every marker line [`emit_marker_line`] printed on THIS thread, so a
+    /// test can read which terminal a pass chose (the announcement ledger is
+    /// process-wide and says only open/answered, and parallel tests share it). Drained
+    /// by [`take_markers_said`]. Added 2026-09-26 to pin the vendor lane's fresh-landing
+    /// terminal. The doc sits inside the macro: on the invocation it would be
+    /// `unused_doc_comments`.
+    static MARKERS_SAID: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// TESTS ONLY: drain the marker lines this thread printed ([`MARKERS_SAID`]).
+#[cfg(test)]
+fn take_markers_said() -> Vec<String> {
+    MARKERS_SAID.with(|said| std::mem::take(&mut *said.borrow_mut()))
 }
 
 /// [`emit_marker_line`] for the `--wait-lock` waiter's lines at the lock edge
@@ -9497,6 +9666,9 @@ fn human_marker(line: &str) -> Option<String> {
     if let Some(body) = marked(SEED_DONE_MARKER) {
         return Some(match count(body) {
             Some(n) => format!("Done \u{2014} {n} ALab {} installed.", programs(n)),
+            // The vendor lane's all-deferred ending names what waits: say it whole, not a
+            // bare "Done." after a line that said the landing did not happen.
+            None if body.contains(SIGNATURE_WAIT_CLAUSE) => sentence(body),
             None => "Done.".to_string(),
         });
     }
@@ -9902,6 +10074,8 @@ fn install_vendor_door(
             | crate::vendor_direct::lane::Verdict::Tombstoned { .. }
     );
     record_vendor_status(layout, &outcome, now);
+    note_landed(&mut pass, &outcome);
+    warm_landed(layout, &mut pass, seams);
     let _ = settle_vendor_pass(layout, &pass, seams);
     outcome.into_install(layout)
 }
@@ -10871,21 +11045,36 @@ fn cmd_update_all_code() -> u8 {
     // end recorded since it started waiting does not repeat it back to back (2026-09-18;
     // behind any ending, 2026-09-24).
     if let Some((outcome, ago)) = pass_ended_while_we_waited(&layout) {
-        let said = crate::status::read(&layout)
-            .map(|s| s.outcome)
+        let record = crate::status::read(&layout);
+        let said = record
+            .as_ref()
+            .map(|s| s.outcome.clone())
             .unwrap_or_default();
-        let line = stood_down_after_wait(outcome, ago, &said);
+        let stale_index_only = record
+            .as_ref()
+            .is_some_and(crate::status::stale_index_only_end);
+        let stand_down = stand_down_exit(outcome, ago, &said, stale_index_only);
+        if stand_down.on_stderr {
+            eprintln!("{}", stand_down.line);
+        } else {
+            println!("{}", stand_down.line);
+        }
+        // Literal returns, one per ending: `lock`'s exit-code census reads this body's
+        // `return <literal>` lines to prove the contention code is shared by nothing.
         match outcome {
             aterm_update_core::pkg_check::PassOutcome::Ok => {
-                println!("{line}");
+                debug_assert_eq!(stand_down.code, 0);
                 return 0;
             }
             aterm_update_core::pkg_check::PassOutcome::Offline => {
-                println!("{line}");
+                debug_assert_eq!(
+                    stand_down.code,
+                    aterm_update_core::pkg_check::PASS_OFFLINE_EXIT
+                );
                 return aterm_update_core::pkg_check::PASS_OFFLINE_EXIT;
             }
             aterm_update_core::pkg_check::PassOutcome::Failed => {
-                eprintln!("{line}");
+                debug_assert_eq!(stand_down.code, 1);
                 return 1;
             }
         }
@@ -11091,6 +11280,7 @@ fn run_recorded_update_pass(
     let stamped_before = successes_stamped();
     PASS_INDEX_RESOLVE_ATTEMPTED.with(|seen| seen.set(false));
     RESOLVED_PASS_INDEX_BUILD.with(|seen| seen.set(0));
+    PASS_FAILED_ONLY_FOR_ITS_INDEX.with(|only| only.set(false));
     let code = run_update_pass(layout, cfg, fetcher, installed, complete_the_set, seams);
     let outcome = aterm_update_core::pkg_check::PassOutcome::of_pass(
         successes_stamped() != stamped_before,
@@ -11099,11 +11289,15 @@ fn run_recorded_update_pass(
     let requested = PUBLISHED_INDEX_HINT.with(std::cell::Cell::get).unwrap_or(0);
     let resolved = RESOLVED_PASS_INDEX_BUILD.with(std::cell::Cell::get);
     let attempted = PASS_INDEX_RESOLVE_ATTEMPTED.with(std::cell::Cell::get);
-    let _ = crate::status::stamp_pass_end_with_index(
+    // Only the exit this pass actually took counts: code 1 from the "failed only for its
+    // index" arm, never a code the flag outlived.
+    let stale_index_only = code == 1 && PASS_FAILED_ONLY_FOR_ITS_INDEX.with(std::cell::Cell::get);
+    let _ = crate::status::stamp_pass_end_recorded(
         layout,
         &rfc3339_at((seams.now)()),
         outcome,
         attempted_pass_index_build(requested, resolved, attempted),
+        stale_index_only,
     );
     code
 }
@@ -11136,6 +11330,9 @@ struct PassSeams<'a> {
     progress: Option<&'a std::path::Path>,
     /// The `PATH` the pass judges shadowing and system installs against, read once.
     path: Option<std::ffi::OsString>,
+    /// The warm of the agent builds a vendor lane landed ([`crate::warm`]): each run once
+    /// by a detached process that never writes the store.
+    warm_agents: fn(&crate::store::Layout, &std::collections::BTreeSet<String>),
     /// Whether this process runs under Rosetta translation ([`running_translated`]).
     translated: fn() -> bool,
     /// Whether the toolchain's flip may wait for quiet ([`flip_policy`], the edge's
@@ -11155,6 +11352,7 @@ impl PassSeams<'static> {
             shell_hooks: refresh_shell_hooks,
             progress: pass_progress_path(),
             path: std::env::var_os("PATH"),
+            warm_agents: crate::warm::spawn_landed,
             translated: running_translated,
             flip_policy,
             running: &crate::gc::process_table,
@@ -14015,11 +14213,15 @@ fn update_vendor(
     let outcome = crate::vendor_direct::lane::install_one(&lane, spec, held);
     let mut pass = VendorPass::default();
     report_vendor(layout, &outcome, &mut pass, person, now);
+    warm_landed(layout, &mut pass, seams);
     let _ = settle_vendor_pass(layout, &pass, seams);
     print_managed_current(layout, &pass.unchecked, now);
+    // A deferred signature check is no failure for the window's door, but a person who
+    // asked for the move did not get it (2026-09-26), exactly as for an unreached vendor.
     let unchecked = matches!(
         outcome.verdict,
         crate::vendor_direct::lane::Verdict::Unreachable { .. }
+            | crate::vendor_direct::lane::Verdict::Deferred { .. }
     );
     !(outcome.is_failure() || (unchecked && person))
 }
@@ -14029,7 +14231,8 @@ fn update_vendor(
 /// gc spares their `.part`), the programs it ran (all a vendor door's gc may touch),
 /// whether any build moved, the programs whose vendor it could not reach (the
 /// `managed-current:` marker leaves them out), and whether any vendor's channel ANSWERED
-/// (a pass that reached nothing is offline, not a success — [`pass_reached_nothing`]).
+/// (a pass that reached nothing is offline, not a success — [`pass_reached_nothing`]),
+/// and the programs it LANDED a new build of, not yet warmed ([`warm_landed`]).
 #[derive(Default)]
 struct VendorPass {
     failures: u32,
@@ -14039,6 +14242,27 @@ struct VendorPass {
     changed: bool,
     unchecked: std::collections::BTreeSet<String>,
     reached: bool,
+    landed: std::collections::BTreeSet<String>,
+}
+
+/// Note `outcome`'s program as landed when the lane installed a new build of it — never a
+/// rollback onto a build that already ran here, a tombstone or anything that kept one.
+fn note_landed(pass: &mut VendorPass, outcome: &crate::vendor_direct::lane::Outcome) {
+    if matches!(
+        outcome.verdict,
+        crate::vendor_direct::lane::Verdict::Installed { .. }
+    ) {
+        pass.landed.insert(outcome.spec.program.to_string());
+    }
+}
+
+/// Warm the builds `pass` landed since it last warmed ([`crate::warm`], through `seams`)
+/// and forget them, so no later exit of the same lane warms them again.
+fn warm_landed(layout: &crate::store::Layout, pass: &mut VendorPass, seams: &PassSeams<'_>) {
+    let landed = std::mem::take(&mut pass.landed);
+    if !landed.is_empty() {
+        (seams.warm_agents)(layout, &landed);
+    }
 }
 
 /// After a vendor lane moved a build with no index lane to follow it (a vendor door, or a
@@ -14197,6 +14421,7 @@ fn vendor_pass(
         }
     }
     if fresh.is_empty() {
+        warm_landed(layout, &mut pass, seams);
         return pass;
     }
     // The fresh landings are a "net" progress pass of their own when the window asked for
@@ -14223,37 +14448,96 @@ fn vendor_pass(
         emit_marker_line(&line);
     }
     let mut arrived: Vec<&str> = Vec::new();
+    let mut deferred: Vec<&str> = Vec::new();
     for pending in &fresh {
         let outcome = lane::land_one(&lane, pending);
-        if matches!(outcome.verdict, Verdict::Installed { .. }) {
-            arrived.push(pending.program());
-            note_finished(pending.program(), crate::progress::Phase::Done, None);
-        } else {
-            note_finished(
+        match outcome.verdict {
+            Verdict::Installed { .. } => {
+                arrived.push(pending.program());
+                note_finished(pending.program(), crate::progress::Phase::Done, None);
+            }
+            // A FIRST LANDING WHOSE SIGNATURE CHECK DID NOT FINISH IS A WAIT, NOT A FAILURE
+            // (review of 4329ea590, 2026-09-26). The update lane already read
+            // `Verdict::Deferred` that way for an installed program, but this fresh path
+            // put every non-Installed verdict on the Failed row and, with nothing
+            // arrived, printed `net-failed:` — which the window reads as
+            // `PkgSeedFailed`, the "Package update failed" card and badge. That is
+            // exactly the moment a codesign timeout is likeliest: a machine laying
+            // codex's 238 MB binary for the first time, disk busiest, codesign clamped
+            // to the Background role (453 s measured at load ~90 against a 2 s
+            // unclamped run). The row is Skipped with no error; the deferral's own
+            // line went to stdout through `report_vendor`; the archive is kept and the
+            // next pass lands it without a download.
+            Verdict::Deferred { .. } => {
+                deferred.push(pending.program());
+                note_finished(pending.program(), crate::progress::Phase::Skipped, None);
+            }
+            _ => note_finished(
                 pending.program(),
                 crate::progress::Phase::Failed,
                 Some(outcome.line()),
-            );
+            ),
         }
         report_vendor(layout, &outcome, &mut pass, false, now);
     }
     if owned_pass {
         crate::progress::end_pass();
     }
-    if arrived.is_empty() {
-        emit_marker_line(&format!(
-            "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing — see the lines \
-             above for each program's reason"
-        ));
-    } else {
-        emit_marker_line(&format!(
+    if let Some(line) = fresh_landing_terminal(&arrived, &deferred, fresh.len()) {
+        emit_marker_line(&line);
+    }
+    if !arrived.is_empty() {
+        println!("{SEED_FOLLOW_ON}");
+    }
+    warm_landed(layout, &mut pass, seams);
+    pass
+}
+
+/// The terminal marker that answers the vendor lane's `net-starting:` announcement for its
+/// `planned` fresh landings, of which `arrived` installed and `deferred` waited on a
+/// signature check that did not finish ([`crate::vendor_direct::lane::Verdict::Deferred`]).
+///
+/// * something arrived → `net-installed:` naming it (a deferral beside it was said on its
+///   own stdout line);
+/// * nothing arrived and some landing FAILED (neither installed nor deferred) →
+///   `net-failed:`, the failure the window shows;
+/// * nothing arrived and every landing deferred → `seed-done:`, the positive terminal
+///   ([`SEED_DONE_MARKER`]: "an announced pass that ran to its end and has no richer
+///   marker of its own"), naming what waits. Never `net-failed:` (2026-09-26: a first
+///   landing of codex whose codesign ran past its deadline under load posted "Package
+///   update failed" for a pass in which nothing failed), and never silence, which the
+///   window cannot tell from a child that died after announcing.
+fn fresh_landing_terminal(arrived: &[&str], deferred: &[&str], planned: usize) -> Option<String> {
+    if planned == 0 {
+        return None;
+    }
+    if !arrived.is_empty() {
+        return Some(format!(
             "atpkg: {NET_INSTALLED_MARKER}{}",
             arrived.join(", ")
         ));
-        println!("{SEED_FOLLOW_ON}");
     }
-    pass
+    if deferred.len() < planned {
+        return Some(format!(
+            "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing — see the lines \
+             above for each program's reason"
+        ));
+    }
+    let one = deferred.len() == 1;
+    Some(format!(
+        "atpkg: {SEED_DONE_MARKER}the pass finished; {} {} for {} {SIGNATURE_WAIT_CLAUSE} — the \
+         next pass installs {}",
+        deferred.join(", "),
+        if one { "waits" } else { "wait" },
+        if one { "its" } else { "their" },
+        if one { "it" } else { "them" },
+    ))
 }
+
+/// The clause a `seed-done:` line carries when every fresh vendor landing waited on a
+/// signature check that did not finish ([`fresh_landing_terminal`]), and what
+/// [`human_marker`] reads to say that line whole to a person (2026-09-26).
+const SIGNATURE_WAIT_CLAUSE: &str = "signature check to finish";
 
 /// Say one vendor-lane outcome (a fault on stderr, and an unreachable vendor too when
 /// `unchecked_fails`: the verb a person typed did not check), count it, and record its row
@@ -14268,6 +14552,9 @@ fn report_vendor(
     use crate::vendor_direct::lane::Verdict;
     let line = outcome.line();
     let unchecked = matches!(outcome.verdict, Verdict::Unreachable { .. });
+    // A deferred signature check (2026-09-26) is said on stdout like any wait — a warning
+    // only to a person whose typed verb it left undone.
+    let deferred = matches!(outcome.verdict, Verdict::Deferred { .. });
     pass.ran.insert(outcome.spec.program.to_string());
     if outcome.is_failure() {
         pass.failures += 1;
@@ -14276,7 +14563,7 @@ fn report_vendor(
             line.strip_prefix("atpkg: ").unwrap_or(&line).to_string(),
         ));
     }
-    if outcome.is_failure() || (unchecked && unchecked_fails) {
+    if outcome.is_failure() || ((unchecked || deferred) && unchecked_fails) {
         eprintln!("{line}");
     } else {
         println!("{line}");
@@ -14293,6 +14580,7 @@ fn report_vendor(
             | Verdict::Current(_)
             | Verdict::Refused { .. }
             | Verdict::Failed { .. }
+            | Verdict::Deferred { .. }
             | Verdict::Kept { head: Some(_), .. }
             | Verdict::Unreachable { why: Some(_), .. }
     );
@@ -14306,6 +14594,7 @@ fn report_vendor(
     ) {
         pass.changed = true;
     }
+    note_landed(pass, outcome);
     record_vendor_status(layout, outcome, now);
 }
 
@@ -14358,7 +14647,7 @@ fn record_vendor_status(
     let (row, moved) = match &outcome.verdict {
         Verdict::Installed { .. } => (managed(&|v| crate::state::vendor_managed(v, vendor)), true),
         Verdict::Current(_) => (managed(&|v| crate::state::vendor_managed(v, vendor)), false),
-        Verdict::RolledBack { .. } | Verdict::Kept { .. } => {
+        Verdict::RolledBack { .. } | Verdict::Kept { .. } | Verdict::Deferred { .. } => {
             let why = outcome.kept_clause().unwrap_or_default();
             (
                 managed(&|v| crate::state::vendor_kept(v, &why)),
@@ -22677,6 +22966,8 @@ mod tests {
             // runs — beside the store, never in it — and must lease a toolchain while a
             // pass holds the store lock.
             "lease",
+            // `lane` reads one command line and writes nothing anywhere.
+            "lane",
             "help",
             "-h",
             "--help",
@@ -22693,6 +22984,37 @@ mod tests {
             "every advertised verb must be classified as a store mutator or read-only here \
              (a new verb defaults to lock-free, which is the dangerous direction): \
              {unclassified:?}"
+        );
+    }
+
+    /// `lane` at the dispatch edge: a stock command line is refused (exit 2), a Trust
+    /// one is not (0), and a `--help` AFTER `--` belongs to the command — the edge that
+    /// answers `<verb> --help` stops at `--`, so `lane -- cargo --help` is read, not
+    /// answered with lane's own usage.
+    #[test]
+    fn lane_refuses_stock_rust_and_reads_the_command_after_the_separator() {
+        let run = |argv: &[&str]| main_entry(argv.iter().map(std::ffi::OsString::from).collect());
+        assert_eq!(
+            run(&["lane", "--", "cargo", "+1.97.1", "test", "-p", "x"]),
+            ExitCode::from(crate::reroute::REFUSAL_EXIT)
+        );
+        assert_eq!(
+            run(&["lane", "--", "cargo", "--help"]),
+            ExitCode::from(crate::reroute::REFUSAL_EXIT)
+        );
+        assert_eq!(
+            run(&["lane", "--", "targo", "--unverified", "test", "-p", "x"]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(&["lane", "--", "ATERM_STOCK_REASON=wasm", "cargo", "build"]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(run(&["lane", "--help"]), ExitCode::SUCCESS);
+        assert_eq!(
+            run(&["lane"]),
+            ExitCode::from(2),
+            "no command line is a usage error"
         );
     }
 
@@ -24332,6 +24654,7 @@ mod tests {
             shell_hooks: no_shell_hooks,
             progress: None,
             path: Some(std::ffi::OsString::new()),
+            warm_agents: record_warm,
             translated: || false,
             flip_policy: || crate::quiet::FlipPolicy::Now,
             running: &no_processes,
@@ -24401,6 +24724,7 @@ mod tests {
             shell_hooks: no_shell_hooks,
             progress: None,
             path: Some(std::ffi::OsString::new()),
+            warm_agents: record_warm,
             translated: || false,
             flip_policy: || crate::quiet::FlipPolicy::Now,
             running: &no_processes,
@@ -24480,6 +24804,7 @@ mod tests {
             shell_hooks: no_shell_hooks,
             progress: None,
             path: Some(std::ffi::OsString::new()),
+            warm_agents: record_warm,
             translated: || true,
             flip_policy: || crate::quiet::FlipPolicy::Now,
             running: &no_processes,
@@ -27188,18 +27513,33 @@ mod tests {
 
     fn no_shell_hooks(_: &crate::store::Layout) {}
 
+    thread_local! {
+        /// Every program a pass on this thread asked to warm, in order ([`record_warm`]).
+        static WARMED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The world's warm: recorded on this thread (tests run one per thread), never run.
+    fn record_warm(_: &crate::store::Layout, programs: &std::collections::BTreeSet<String>) {
+        WARMED.with(|w| w.borrow_mut().extend(programs.iter().cloned()));
+    }
+
+    /// What this thread's passes asked to warm since the last call.
+    fn take_warmed() -> Vec<String> {
+        WARMED.with(|w| std::mem::take(&mut *w.borrow_mut()))
+    }
+
     fn world_anchor(_: &crate::store::Layout) -> crate::Anchor {
         crate::sig::testkit::anchor()
     }
 
-    /// What a pass runs under here: the test anchor and key, the world's clock, no shell
-    /// hooks (they write the real home) and no progress file.
     /// A process table with nothing in it: the pass tests' flip gate is `Now`, which never
     /// reads one, and a test that asks for quiet says so with its own.
     fn no_processes() -> Option<Vec<std::path::PathBuf>> {
         Some(Vec::new())
     }
 
+    /// What a pass runs under here: the test anchor and key, the world's clock, no shell
+    /// hooks (they write the real home), no progress file, and a warm that only records.
     fn world_seams(trust: &crate::vendor_direct::lane::Trust) -> PassSeams<'_> {
         PassSeams {
             anchor: world_anchor,
@@ -27208,6 +27548,7 @@ mod tests {
             shell_hooks: no_shell_hooks,
             progress: None,
             path: None,
+            warm_agents: record_warm,
             translated: || false,
             flip_policy: || crate::quiet::FlipPolicy::Now,
             running: &no_processes,
@@ -27472,6 +27813,246 @@ mod tests {
                 "a person's door forgets it"
             );
             assert_eq!(active(), build("2.1.282"));
+            // A signature check that did not finish (2026-09-26): quiet for the window —
+            // no failure, no "Package update failed" — and nothing moved; a person's door
+            // says it did not happen; the next window pass whose check finishes lands it.
+            f.publish_claude("2.1.284", &native_exe("claude 2.1.284"));
+            let slow = world::trust_timing_out();
+            assert!(run(VendorDoor::Window, &slow), "a deferral is quiet");
+            assert_eq!(active(), build("2.1.282"));
+            assert!(
+                !run(VendorDoor::Person, &slow),
+                "a person's move did not happen"
+            );
+            assert!(run(VendorDoor::Window, &trust));
+            assert_eq!(
+                active(),
+                build("2.1.284"),
+                "the next finished check lands it"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// THE WARM OF A LANDED BUILD ([`crate::warm`], 2026-09-23): every lane that LANDS a
+    /// new claude asks for it to be warmed exactly once — a pass's vendor lane at either of
+    /// its exits (a fresh install, then an upgrade), the head watch's and a person's
+    /// `update claude`, and `install claude` — and a lane that lands nothing (current,
+    /// unreached, refused) asks for nothing.
+    #[test]
+    fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
+        use crate::vendor_direct::lane::world::{self, Fake, native_exe};
+        let layout = world::layout("warm-lanes");
+        let f = Fake::default();
+        *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
+        let cfg = crate::config::PackagesConfig {
+            exclude: Some(vec!["codex".into()]),
+            ..Default::default()
+        };
+        let trust = world::trust();
+        let seams = world_seams(&trust);
+        let claude = crate::vendor_direct::spec("claude").unwrap();
+        let active = || crate::active_builds(&layout).get("claude").copied();
+        let build = |v: &str| Some(vendor_version(v).build_id());
+        let _ = take_warmed();
+        // The pass's vendor lane, completing the set: the fresh-landing exit.
+        f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+        let pass = vendor_pass(
+            &layout,
+            &f,
+            &cfg,
+            &std::collections::BTreeMap::new(),
+            VendorLanes {
+                update_installed: true,
+                complete_the_set: true,
+            },
+            Consent::Explicit,
+            None,
+            &seams,
+        );
+        assert_eq!(active(), build("2.1.281"));
+        // A fresh install asks too: whether the account ever ran claude — a default-set
+        // install nobody launched has nothing to refresh — is the warm's own question
+        // (`warm::declined`), answered where the user's config home is known.
+        assert_eq!(take_warmed(), ["claude"], "a fresh install");
+        assert!(pass.landed.is_empty(), "warmed, then forgotten");
+        // The full update pass: an upgrade, at the vendor lane's early exit.
+        f.publish_claude("2.1.282", &native_exe("claude 2.1.282"));
+        let installed = crate::active_builds(&layout);
+        run_update_pass(&layout, &cfg, &f, &installed, false, &seams);
+        assert_eq!(active(), build("2.1.282"));
+        assert_eq!(take_warmed(), ["claude"], "an upgrade");
+        let installed = crate::active_builds(&layout);
+        run_update_pass(&layout, &cfg, &f, &installed, false, &seams);
+        assert!(take_warmed().is_empty(), "current: nothing landed");
+        f.offline.set(true);
+        run_update_pass(&layout, &cfg, &f, &installed, false, &seams);
+        assert!(take_warmed().is_empty(), "unreached: nothing landed");
+        f.offline.set(false);
+        // The head watch's door, then a person's.
+        f.publish_claude("2.1.283", &native_exe("claude 2.1.283"));
+        assert!(update_vendor(
+            &layout,
+            &f,
+            claude,
+            VendorDoor::Window,
+            &seams
+        ));
+        assert_eq!(active(), build("2.1.283"));
+        assert_eq!(take_warmed(), ["claude"], "the head watch's landing");
+        assert!(update_vendor(
+            &layout,
+            &f,
+            claude,
+            VendorDoor::Window,
+            &seams
+        ));
+        assert!(update_vendor(
+            &layout,
+            &f,
+            claude,
+            VendorDoor::Person,
+            &seams
+        ));
+        assert!(take_warmed().is_empty(), "current, at either door");
+        f.publish_claude("2.1.284", &native_exe("claude 2.1.284"));
+        assert!(update_vendor(
+            &layout,
+            &f,
+            claude,
+            VendorDoor::Person,
+            &seams
+        ));
+        assert_eq!(take_warmed(), ["claude"], "a person's landing");
+        // A refusal lands nothing (the Apple anchor exists on macOS only).
+        if cfg!(target_os = "macos") {
+            f.publish_claude("2.1.285", &native_exe("claude 2.1.285"));
+            let refusing = world::trust_refusing_signers();
+            let refused = PassSeams {
+                trust: &refusing,
+                ..world_seams(&trust)
+            };
+            assert!(!update_vendor(
+                &layout,
+                &f,
+                claude,
+                VendorDoor::Window,
+                &refused
+            ));
+            assert_eq!(active(), build("2.1.284"));
+            assert!(take_warmed().is_empty(), "refused: nothing landed");
+        }
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        // `install claude`.
+        let layout = world::layout("warm-install-door");
+        install_vendor_door(&layout, &f, "stable", claude, &seams).expect("installs");
+        assert!(crate::active_builds(&layout).contains_key("claude"));
+        assert_eq!(take_warmed(), ["claude"], "the install door's landing");
+        install_vendor_door(&layout, &f, "stable", claude, &seams).expect("current");
+        assert!(take_warmed().is_empty(), "current: nothing landed");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The warm verb is machinery, not vocabulary: no roster row, no usage, no lock.
+    #[test]
+    fn the_warm_verb_is_unlisted_and_takes_no_lock() {
+        assert!(!dispatch_roster().contains(&crate::warm::HIDDEN_VERB));
+        assert!(!verb_mutates_store(crate::warm::HIDDEN_VERB));
+        assert_eq!(verb_usage(crate::warm::HIDDEN_VERB), None);
+    }
+
+    /// ONLY AN INSTALL IS A LANDING: a rollback re-activates a build that already ran here,
+    /// a tombstone runs nothing, and every other verdict moved nothing — none is warmed.
+    #[test]
+    fn only_an_installed_verdict_is_a_landing() {
+        use crate::vendor_direct::decide::{InstallReason, Installed, KeepReason};
+        use crate::vendor_direct::lane::{Outcome, Verdict};
+        let layout = crate::vendor_direct::lane::world::layout("warm-verdicts");
+        let claude = crate::vendor_direct::spec("claude").unwrap();
+        let v = vendor_version("2.1.280");
+        let verdicts = [
+            (
+                "installed",
+                Verdict::Installed {
+                    from: Installed::Nothing,
+                    to: v,
+                    reason: InstallReason::Fresh,
+                    shimmed: vec!["claude".into()],
+                    refused_shims: Vec::new(),
+                    tree_root: "b".repeat(64),
+                },
+                true,
+            ),
+            ("current", Verdict::Current(v), false),
+            (
+                "kept",
+                Verdict::Kept {
+                    reason: KeepReason::Held,
+                    head: Some(v),
+                    keeping: Installed::Nothing,
+                },
+                false,
+            ),
+            (
+                "unreachable",
+                Verdict::Unreachable {
+                    keeping: Installed::Nothing,
+                    why: None,
+                },
+                false,
+            ),
+            (
+                "refused",
+                Verdict::Refused {
+                    version: Some(v),
+                    why: "digest mismatch".into(),
+                    keeping: Installed::Nothing,
+                },
+                false,
+            ),
+            (
+                "rolled back",
+                Verdict::RolledBack {
+                    from: Installed::Nothing,
+                    to: v,
+                },
+                false,
+            ),
+            (
+                "tombstoned",
+                Verdict::Tombstoned {
+                    from: Installed::Nothing,
+                },
+                false,
+            ),
+            (
+                "failed",
+                Verdict::Failed {
+                    version: v,
+                    error: "disk full".into(),
+                    keeping: Installed::Nothing,
+                },
+                false,
+            ),
+            ("linked", Verdict::Linked, false),
+        ];
+        for (label, verdict, lands) in verdicts {
+            let outcome = Outcome {
+                spec: claude,
+                verdict,
+                asset: None,
+            };
+            let mut pass = VendorPass::default();
+            report_vendor(&layout, &outcome, &mut pass, false, world_now());
+            assert_eq!(pass.landed.contains("claude"), lands, "{label}: a pass");
+            let mut door = VendorPass::default();
+            note_landed(&mut door, &outcome);
+            assert_eq!(door.landed.contains("claude"), lands, "{label}: a door");
+            let trust = crate::vendor_direct::lane::world::trust();
+            let _ = take_warmed();
+            warm_landed(&layout, &mut pass, &world_seams(&trust));
+            assert_eq!(!take_warmed().is_empty(), lands, "{label}: warmed");
+            assert!(pass.landed.is_empty());
         }
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
@@ -28472,6 +29053,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
+    /// A PASS THAT FAILED ONLY FOR ITS CACHED INDEX IS RECORDED AS THAT, AND A CHILD THAT
+    /// STANDS DOWN BEHIND IT EXITS AS IT DID (review of 4329ea590, 2026-09-26). The index
+    /// listing refused (a rate limit) while no member failed: exit 1, nothing on stderr, and
+    /// the record says so for THAT pass end ([`crate::status::stale_index_only_end`]) — so a
+    /// `--wait-lock` child that stood down behind it says its line on stdout and exits 1
+    /// ([`stand_down_exit`]), which the window reads as a stale index, not "Package update
+    /// failed". Controls: a clean pass and an offline one are not that; a pass on the
+    /// cached index that ALSO failed a member (a signer refusal) is not that either, and
+    /// its stand-down still goes to stderr.
+    #[test]
+    fn a_pass_that_failed_only_for_its_cached_index_is_recorded_and_stood_down_as_that() {
+        use crate::vendor_direct::lane::world::{self, Fake, native_exe};
+        use aterm_update_core::pkg_check::PassOutcome;
+        let layout = world::layout("stale-index-only");
+        let f = Fake::default();
+        *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
+        f.publish_claude("2.1.281", &native_exe("a"));
+        let cfg = crate::config::PackagesConfig::default();
+        let trust = world::trust();
+        let seams = world_seams(&trust);
+        vendor_pass(
+            &layout,
+            &f,
+            &cfg,
+            &std::collections::BTreeMap::new(),
+            VendorLanes {
+                update_installed: true,
+                complete_the_set: true,
+            },
+            Consent::Explicit,
+            None,
+            &seams,
+        );
+        let installed = crate::active_builds(&layout);
+        let record = || crate::status::read(&layout).expect("a record");
+        let stand_down = |r: &crate::status::Status| {
+            stand_down_exit(
+                PassOutcome::Failed,
+                3,
+                &r.outcome,
+                crate::status::stale_index_only_end(r),
+            )
+        };
+        assert_eq!(
+            run_recorded_update_pass(&layout, &cfg, &f, &installed, false, &seams),
+            0
+        );
+        assert!(
+            !crate::status::stale_index_only_end(&record()),
+            "a clean pass"
+        );
+        // The listing refuses (HTTP 403): the pass runs on the cache, no member fails.
+        *f.index.borrow_mut() = None;
+        f.index_refused.set(true);
+        assert_eq!(
+            run_recorded_update_pass(&layout, &cfg, &f, &installed, false, &seams),
+            1
+        );
+        let stale = record();
+        assert!(
+            stale
+                .outcome
+                .contains(crate::status::INDEX_FROM_CACHE_CLAUSE),
+            "{}",
+            stale.outcome
+        );
+        assert!(
+            crate::status::stale_index_only_end(&stale),
+            "the record names this pass end as failed only for its index: {stale:?}"
+        );
+        let said = stand_down(&stale);
+        assert_eq!(said.code, 1);
+        assert!(
+            !said.on_stderr,
+            "the stand-down exits as that pass did: nothing on stderr ({})",
+            said.line
+        );
+        // Offline: not that.
+        f.index_refused.set(false);
+        f.offline.set(true);
+        assert_eq!(
+            run_recorded_update_pass(&layout, &cfg, &f, &installed, false, &seams),
+            aterm_update_core::pkg_check::PASS_OFFLINE_EXIT
+        );
+        assert!(!crate::status::stale_index_only_end(&record()), "offline");
+        f.offline.set(false);
+        // CONTROL (the Apple anchor exists on macOS only): the cached index AND a member
+        // refused — a failure the stand-down still says on stderr.
+        if cfg!(target_os = "macos") {
+            f.index_refused.set(true);
+            f.publish_claude("2.1.282", &native_exe("b"));
+            let refusing = world::trust_refusing_signers();
+            let seams = world_seams(&refusing);
+            assert_eq!(
+                run_recorded_update_pass(&layout, &cfg, &f, &installed, false, &seams),
+                1
+            );
+            let both = record();
+            assert!(
+                both.outcome
+                    .contains(crate::status::INDEX_FROM_CACHE_CLAUSE),
+                "{}",
+                both.outcome
+            );
+            assert!(
+                !crate::status::stale_index_only_end(&both),
+                "a member failed too: {both:?}"
+            );
+            assert!(stand_down(&both).on_stderr, "a failure, said as one");
+        }
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The stand-down's exit per holder ending ([`stand_down_exit`]): `ok` 0 and `offline`
+    /// the offline code on stdout; `failed` 1 on stderr — on stdout only for a holder that
+    /// failed for its cached index alone. The flag never quiets an ok or offline ending's
+    /// code, nor moves them to stderr.
+    #[test]
+    fn a_stand_down_exits_as_the_pass_it_stood_behind() {
+        use aterm_update_core::pkg_check::{PASS_OFFLINE_EXIT, PassOutcome};
+        for only in [false, true] {
+            let ok = stand_down_exit(PassOutcome::Ok, 2, "up to date", only);
+            assert_eq!((ok.on_stderr, ok.code), (false, 0));
+            let off = stand_down_exit(PassOutcome::Offline, 2, "", only);
+            assert_eq!((off.on_stderr, off.code), (false, PASS_OFFLINE_EXIT));
+        }
+        let failed = stand_down_exit(PassOutcome::Failed, 2, "1 program(s) failed", false);
+        assert_eq!((failed.on_stderr, failed.code), (true, 1));
+        let stale = stand_down_exit(
+            PassOutcome::Failed,
+            2,
+            "up to date (index build 46) (index from cache \u{2014} GitHub rate limit hit \
+             (HTTP 403))",
+            true,
+        );
+        assert_eq!((stale.on_stderr, stale.code), (false, 1));
+        assert!(stale.line.contains("index from cache"), "{}", stale.line);
+    }
+
     /// EVERY FULL PASS RECORDS HOW IT ENDED ([`run_recorded_update_pass`]) — what the
     /// schedulers read instead of `updated_at`. A clean pass is `ok`; a listing refused (the
     /// cache stood in) stamps no success and is `failed`, exit 1 — it reached nothing; a pass
@@ -29319,6 +30039,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
+    /// A FIRST LANDING WHOSE SIGNATURE CHECK DID NOT FINISH IS NO FAILURE (review of
+    /// 4329ea590, 2026-09-26). That commit made a codesign timeout `Verdict::Deferred` and
+    /// quiet on the update lane, for an INSTALLED program; the set-completion lane's fresh
+    /// path (`update` with `complete_the_set`, `install --default-set`) still put every
+    /// non-Installed verdict on a Failed progress row and, with nothing arrived, printed
+    /// `net-failed:` — the window's `PkgSeedFailed`, "Package update failed" — on exactly
+    /// the pass most likely to time out: codex's 238 MB binary laid for the first time.
+    /// Now: a Skipped row with no error, no failure counted, no `net-failed:`, the
+    /// positive `seed-done:` terminal naming what waits, and the next pass lands the kept
+    /// archive without a download. Control: a real signer refusal on the same fresh path
+    /// still fails its row and still says `net-failed:`.
+    #[test]
+    fn a_fresh_landing_whose_signature_check_did_not_finish_is_no_failure() {
+        use crate::vendor_direct::lane::world::{self, Fake, native_exe};
+        // The Apple anchor exists on macOS only: off it no codesign check runs at all.
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let _gate = crate::progress::PASS_TEST_GATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = crate::config::PackagesConfig::default();
+        let lanes = VendorLanes {
+            update_installed: true,
+            complete_the_set: true,
+        };
+        let pass_over =
+            |layout: &crate::store::Layout, f: &Fake, trust: &crate::vendor_direct::lane::Trust| {
+                let progress = layout.progress_file();
+                let seams = PassSeams {
+                    progress: Some(&progress),
+                    ..world_seams(trust)
+                };
+                let _ = take_markers_said();
+                let pass = vendor_pass(
+                    layout,
+                    f,
+                    &cfg,
+                    &crate::active_builds(layout),
+                    lanes,
+                    Consent::Explicit,
+                    None,
+                    &seams,
+                );
+                let file = crate::progress::read_progress(layout).expect("a progress file");
+                (pass, take_markers_said(), file)
+            };
+        let is = |said: &[String], marker: &str| {
+            said.iter()
+                .any(|l| l.starts_with(&format!("atpkg: {marker}")))
+        };
+        let layout = world::layout("fresh-deferred");
+        let f = Fake::default();
+        f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+        let (pass, said, file) = pass_over(&layout, &f, &world::trust_timing_out());
+        assert_eq!(pass.failures, 0, "a wait is no failure: {said:?}");
+        assert!(pass.failed.is_empty());
+        assert!(
+            !is(&said, NET_FAILED_MARKER),
+            "no \"Package update failed\" for a check that did not finish: {said:?}"
+        );
+        assert!(
+            said.iter().any(|l| l
+                == &format!(
+                    "atpkg: {SEED_DONE_MARKER}the pass finished; claude waits for its \
+                     signature check to finish — the next pass installs it"
+                )),
+            "the announcement is answered, and says what waits: {said:?}"
+        );
+        let row = &file.programs["claude"];
+        assert_eq!(row.phase, crate::progress::Phase::Skipped, "{row:?}");
+        assert_eq!(row.error, None);
+        assert!(!crate::active_builds(&layout).contains_key("claude"));
+        // The next pass, whose check finishes, lands the kept archive: no download.
+        let downloads = f.downloads.borrow().len();
+        let (pass, said, file) = pass_over(&layout, &f, &world::trust());
+        assert_eq!(pass.failures, 0);
+        assert!(is(&said, NET_INSTALLED_MARKER), "{said:?}");
+        assert_eq!(file.programs["claude"].phase, crate::progress::Phase::Done);
+        assert_eq!(
+            crate::active_builds(&layout).get("claude").copied(),
+            Some(vendor_version("2.1.281").build_id())
+        );
+        assert_eq!(
+            f.downloads.borrow().len(),
+            downloads,
+            "the verified archive was kept for the retry"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        // CONTROL: a real refusal on the same fresh path is still a failure, said.
+        let layout = world::layout("fresh-refused");
+        let f = Fake::default();
+        f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+        let (pass, said, file) = pass_over(&layout, &f, &world::trust_refusing_signers());
+        assert_eq!(pass.failures, 1, "{said:?}");
+        assert!(is(&said, NET_FAILED_MARKER), "{said:?}");
+        assert!(!is(&said, SEED_DONE_MARKER), "{said:?}");
+        assert_eq!(
+            file.programs["claude"].phase,
+            crate::progress::Phase::Failed
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The fresh-landing terminal, case by case: something arrived → `net-installed:`
+    /// (a deferral beside it said on its own line); nothing arrived and one landing
+    /// failed → `net-failed:`, even beside a deferral; every landing deferred →
+    /// `seed-done:`, with the words a person reads whole; nothing planned → nothing.
+    #[test]
+    fn the_fresh_landing_terminal_fails_only_on_a_failure() {
+        assert_eq!(fresh_landing_terminal(&[], &[], 0), None);
+        assert_eq!(
+            fresh_landing_terminal(&["claude"], &["codex"], 2).as_deref(),
+            Some("atpkg: net-installed: claude")
+        );
+        assert!(
+            fresh_landing_terminal(&[], &["codex"], 2)
+                .is_some_and(|l| l.starts_with(&format!("atpkg: {NET_FAILED_MARKER}"))),
+            "one deferred, one failed: the failure is said"
+        );
+        let both = fresh_landing_terminal(&[], &["claude", "codex"], 2).unwrap();
+        assert_eq!(
+            both,
+            format!(
+                "atpkg: {SEED_DONE_MARKER}the pass finished; claude, codex wait for their \
+                 signature check to finish — the next pass installs them"
+            )
+        );
+        assert_eq!(
+            human_marker(&both).as_deref(),
+            Some(
+                "The pass finished; claude, codex wait for their signature check to finish — \
+                 the next pass installs them."
+            ),
+            "a person reads what waits, not a bare \"Done.\""
+        );
+    }
+
     /// THE DEFAULT SET NAMES A MISSING C TOOLCHAIN, over the `PATH` it ran with: a stubbed
     /// PATH with no `cc` adds `doctor`'s own sentence and its one act; one whose `cc`
     /// answers adds nothing; one whose `cc` refuses names what it said. (Before, the set
@@ -29358,7 +30216,11 @@ mod tests {
                 .unwrap();
             dir
         };
-        let good = stub("good", "echo cc 1");
+        // A `cc` that answers AND builds the probe program (`-o <out> <src>`).
+        let good = stub(
+            "good",
+            "case \"$1\" in -o) printf x > \"$2\";; *) echo cc 1;; esac",
+        );
         assert_eq!(default_set_prereq_line(Some(good.as_os_str()), &host), None);
         let bad = stub("bad", "echo 'cc: cannot find crt1.o' >&2; exit 1");
         let line =

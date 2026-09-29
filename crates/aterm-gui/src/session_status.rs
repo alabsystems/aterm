@@ -261,6 +261,16 @@ impl Outcome {
             Self::Signal { .. } => "signal",
         }
     }
+
+    /// The `exit_code=`/`signal=` values beside [`Self::as_str`], `-` when
+    /// unset — shared by the `status` record and its timeline event.
+    fn wire_fields(self) -> (String, String) {
+        match self {
+            Self::Failure { exit_code } => (exit_code.to_string(), "-".to_string()),
+            Self::Signal { signal } => ("-".to_string(), signal.to_string()),
+            Self::None | Self::Success => ("-".to_string(), "-".to_string()),
+        }
+    }
 }
 
 /// Ordinal, NOT a probability. This is the contract a later interpretation tier
@@ -289,7 +299,6 @@ impl Confidence {
 /// consumer can tell an observed fact from an inference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
-    Pin,
     ShellBlock,
     LifecycleExit,
     ForegroundJob,
@@ -309,7 +318,6 @@ impl Reason {
     /// The normative wire spellings (RFC §3).
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Pin => "pin",
             Self::ShellBlock => "shell_block",
             Self::LifecycleExit => "lifecycle_exit",
             Self::ForegroundJob => "fg_job",
@@ -330,6 +338,25 @@ pub(crate) enum ShellEvidence {
     Entering,
     Executing,
     Complete { exit_code: Option<i32> },
+}
+
+/// A shell-integration block that COMPLETED (OSC 133;D) —
+/// [`Evidence::completed_block`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedBlock {
+    pub(crate) id: u64,
+    /// `None` when the shell reported no code; read as unknown, never success.
+    pub(crate) exit_code: Option<i32>,
+}
+
+/// The outcome a command's exit code reports: a missing code is unknown,
+/// never success.
+const fn exit_outcome(exit_code: Option<i32>) -> Outcome {
+    match exit_code {
+        None => Outcome::None,
+        Some(0) => Outcome::Success,
+        Some(code) => Outcome::Failure { exit_code: code },
+    }
 }
 
 /// How the session's PTY ended, when that is actually known.
@@ -369,12 +396,16 @@ pub(crate) struct ActivitySample {
 /// caller's job (and the only part that touches a lock).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Evidence {
-    /// A phase pinned explicitly by the user. Outranks everything. No surface
-    /// writes one yet (session metadata carries title/description/icon/role/
-    /// attention — none of them a phase pin), so the branch is live but
-    /// unfed — see RFC §9's remaining work.
-    pub(crate) pin: Option<Phase>,
     pub(crate) shell: Option<ShellEvidence>,
+    /// The shell-integration block whose result the shell is reporting
+    /// ([`completed_block`]): the current block once it COMPLETED, or — the
+    /// form a sweep actually sees — the block the current prompt closed, when
+    /// that one completed. Its exit code is the outcome a prompt reports, and
+    /// its id is what tells two failing commands apart when no work was
+    /// observed between them, so a second failure re-arms a mark the user has
+    /// already seen ([`FailureMark`]). `None` while a command runs, and at a
+    /// prompt that closed no completed block.
+    pub(crate) completed_block: Option<CompletedBlock>,
     pub(crate) lifecycle: Option<Lifecycle>,
     /// `tcgetpgrp`-derived: is a foreground job distinct from the shell running?
     /// The process NAME is not available and is deliberately not modelled.
@@ -540,22 +571,6 @@ impl StatusFsm {
             return Some(*first_seen + self.policy.dwell);
         }
         if self.published.phase == Phase::Running {
-            // A PINNED verdict is immovable, so it owes no wake. `classify`
-            // answers a user pin with `Confidence::Exact` BEFORE either
-            // activity clock is consulted, so the arithmetic below would return
-            // `max(movement, output) + quiet_after` — an instant that recedes
-            // further into the past on every turn while nothing can ever change
-            // the answer. That is a permanent wake plus a pool sweep, a
-            // `try_lock` and a `tcgetpgrp` per session, forever, for a status
-            // that is by definition immovable. The clamp would bound it to the
-            // observation rate; arming only where the verdict can actually
-            // change is the law this whole accessor exists to obey.
-            //
-            // Removing the pin is an EDGE (a control command), which drives its
-            // own observation — nothing here is needed to notice it.
-            if self.published.reasons.contains(&Reason::Pin) {
-                return None;
-            }
             return match (self.last_movement, self.last_output) {
                 (Some(movement), Some(output)) => {
                     Some(movement.max(output) + self.policy.quiet_after)
@@ -669,20 +684,9 @@ impl StatusFsm {
             };
         }
 
-        // 2. An explicit user pin outranks every inferred signal.
-        if let Some(phase) = evidence.pin {
-            return Candidate {
-                phase,
-                confidence: Confidence::Exact,
-                reasons: vec![Reason::Pin],
-                conflict: false,
-                outcome: None,
-            };
-        }
-
         let moved = self.moved_recently(now) || self.output_recently(&evidence.activity, now);
 
-        // 3. Shell integration: the strongest routine evidence. It OUTRANKS raw
+        // 2. Shell integration: the strongest routine evidence. It OUTRANKS raw
         //    screen movement, so a background job printing at a prompt stays
         //    Idle rather than masquerading as the foreground task.
         if let Some(shell) = evidence.shell {
@@ -717,13 +721,22 @@ impl StatusFsm {
                 // to plain `Idle` with no new bytes at all (see `owed_wake`).
                 // `Prompt` never carries the marker — its movement is the
                 // `tail -f &` case, not a keystroke.
+                //
+                // A PROMPT REPORTS THE BLOCK IT CLOSED. The precmd's 133;D and
+                // the next prompt's 133;A arrive back to back, so the sweep
+                // meets the finished command as the block behind the prompt,
+                // never as a current `Complete` one ([`completed_block`]); both
+                // prompt arms carry its result, the typing one included (the
+                // user who typed `false` is still inside the keystroke window
+                // when its prompt comes back). A prompt that closed nothing
+                // completed reports nothing, and the published outcome stands.
                 ShellEvidence::Entering if self.typed_recently(&evidence.activity, now) => {
                     Candidate {
                         phase: Phase::Idle,
                         confidence: Confidence::Strong,
                         reasons: vec![Reason::ShellBlock, Reason::ContentActivity],
                         conflict: false,
-                        outcome: None,
+                        outcome: evidence.completed_block.map(|b| exit_outcome(b.exit_code)),
                     }
                 }
                 ShellEvidence::Prompt | ShellEvidence::Entering => Candidate {
@@ -731,23 +744,19 @@ impl StatusFsm {
                     confidence: Confidence::Strong,
                     reasons: vec![Reason::ShellBlock],
                     conflict: false,
-                    outcome: None,
+                    outcome: evidence.completed_block.map(|b| exit_outcome(b.exit_code)),
                 },
                 ShellEvidence::Complete { exit_code } => Candidate {
                     phase: Phase::Idle,
                     confidence: Confidence::Strong,
                     reasons: vec![Reason::ShellBlock],
                     conflict: false,
-                    outcome: Some(match exit_code {
-                        None => Outcome::None,
-                        Some(0) => Outcome::Success,
-                        Some(code) => Outcome::Failure { exit_code: code },
-                    }),
+                    outcome: Some(exit_outcome(exit_code)),
                 },
             };
         }
 
-        // 4. No shell integration. A foreground-job Boolean still separates
+        // 3. No shell integration. A foreground-job Boolean still separates
         //    "shell is waiting for me" from "something is running".
         match evidence.foreground_job {
             Some(true) if moved => Candidate {
@@ -771,7 +780,7 @@ impl StatusFsm {
                 conflict: false,
                 outcome: None,
             },
-            // 5. Nothing but the screen. Movement is weak evidence of work;
+            // 4. Nothing but the screen. Movement is weak evidence of work;
             //    silence tells us nothing at all, so say so.
             None if moved => Candidate {
                 phase: Phase::Running,
@@ -791,7 +800,7 @@ impl StatusFsm {
     }
 
     /// Publish a candidate once it has held for the dwell interval. An
-    /// exact-confidence candidate (pin, lifecycle exit) is published at once —
+    /// exact-confidence candidate (a lifecycle exit) is published at once —
     /// a session that has exited must not be reported as running for another
     /// three-quarters of a second.
     fn apply(&mut self, candidate: Candidate, now: Instant) -> bool {
@@ -867,6 +876,42 @@ pub(crate) fn shell_evidence(term: &aterm_core::terminal::Terminal) -> Option<Sh
             exit_code: block.exit_code,
         },
         _ => return None,
+    })
+}
+
+/// The block whose result the shell is reporting — [`Evidence::completed_block`]:
+/// the current block once it has COMPLETED (133;D read, the next 133;A not
+/// yet), or, at a prompt, the block that prompt CLOSED when that one completed.
+///
+/// The second form is the one a sweep meets. Every aterm integration writes the
+/// finished command's `133;D` and the next prompt's `133;A` back to back from
+/// one hook (the zsh and bash precmd, fish's prompt event, the pwsh prompt
+/// function), so the reader processes both in one batch, and the A archives
+/// the completed block (`shell_prompt_start`) before any sweep can read it as
+/// current. Reading the current block alone therefore never saw a
+/// result: a failed command published `outcome=none` while `subscribe … events`
+/// pushed its `block-complete … exit=1` (review finding, 2026-09-27).
+///
+/// Only the block the prompt closed, never an older one: a prompt that closed a
+/// block with no 133;D (an empty Enter, an interrupted or `exec`-replaced
+/// shell) reports nothing, so an older command's result cannot come back over
+/// work that never reported one.
+pub(crate) fn completed_block(term: &aterm_core::terminal::Terminal) -> Option<CompletedBlock> {
+    use aterm_types::BlockState;
+
+    let block = match term.current_block().map(|current| current.state) {
+        Some(BlockState::Complete) => term.current_block()?,
+        // At a prompt (or with no current block, where `shell_evidence` reads
+        // this same archived block): the newest archived block.
+        Some(BlockState::PromptOnly | BlockState::EnteringCommand) | None => term
+            .last_completed_block()
+            .filter(|archived| archived.is_complete())?,
+        // A command is running: it reports when it completes.
+        Some(_) => return None,
+    };
+    Some(CompletedBlock {
+        id: block.id,
+        exit_code: block.exit_code,
     })
 }
 
@@ -1090,6 +1135,24 @@ fn word_end(segment: &str, start: usize, escape_in_single: bool) -> usize {
         if c == '\\' && (escape_in_single || quote != Some('\'')) {
             chars.next();
         }
+        // PowerShell's escape is the BACKTICK, and tab completion is not the
+        // only way a path with a space reaches pwsh: `& C:\Program` Files\Git\
+        // usr\bin\less.exe C:\Windows\win.ini` ran less and read
+        // `detail=Program` (measured 2026-09-27, 0.95.0). The line does not say
+        // which shell typed it, so the escape is honoured only where it cannot
+        // be a POSIX shell's command substitution: unquoted, directly before
+        // whitespace, inside a word that is already a WINDOWS path
+        // ([`windows_path_so_far`]). A POSIX line never reads that way — its
+        // `\` is an escape, not a separator — so a stray backtick after a bare
+        // name (`claude` /secret/tok`) still ends the word at the space, and
+        // the argument behind it stays off the wire.
+        if c == '`'
+            && quote.is_none()
+            && chars.clone().next().is_some_and(|(_, n)| n.is_whitespace())
+            && windows_path_so_far(&segment[start..at])
+        {
+            chars.next();
+        }
     }
     if quote.is_none() {
         return segment.len();
@@ -1102,6 +1165,19 @@ fn word_end(segment: &str, start: usize, escape_in_single: bool) -> usize {
     segment[start..]
         .find(char::is_whitespace)
         .map_or(segment.len(), |offset| start + offset)
+}
+
+/// Whether the start of a word, `head`, is already a Windows path: a drive
+/// (`C:`) or a `\` in it. Only then is a backtick before a space PowerShell's
+/// escape ([`word_end`]); pwsh spells a path with either, and neither opens a
+/// program word in a POSIX shell, where `\` escapes and `C:` names nothing.
+fn windows_path_so_far(head: &str) -> bool {
+    let mut chars = head.chars();
+    let drive = matches!(
+        (chars.next(), chars.next()),
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic()
+    );
+    drive || head.contains('\\')
 }
 
 /// The most a `detail=` may say about a command line: the program's basename,
@@ -1732,6 +1808,23 @@ pub(crate) fn status_indicators(status: &Status) -> crate::tab_model::TabIndicat
     }
 }
 
+/// The timeline kind of a published status transition, pushed on `subscribe …
+/// events` as `EVENT <local> status …` (`subscribe::timeline_wire_kind`).
+pub(crate) const STATUS_CHANGE: &str = "status-change";
+
+/// A `status-change` event's payload: the `status` record's own spellings of
+/// the fields that moved it — `phase=<p> outcome=<o> exit_code=<n|-> signal=<n|->
+/// confidence=<c>`.
+pub(crate) fn status_event_payload(status: &Status) -> String {
+    let (exit_code, signal) = status.last_outcome.wire_fields();
+    format!(
+        "phase={} outcome={} exit_code={exit_code} signal={signal} confidence={}",
+        status.phase.as_str(),
+        status.last_outcome.as_str(),
+        status.confidence.as_str(),
+    )
+}
+
 /// Owns one [`StatusFsm`] per live session and enforces the observation budget:
 /// at most one classification per session per `min_interval`, so an output flood
 /// cannot turn into a classification flood.
@@ -1816,6 +1909,84 @@ struct SessionSlot {
     /// claiming to be a shell at a prompt is the one lie this field exists to
     /// prevent.
     lifecycle: Option<Lifecycle>,
+    /// Whether the user has SEEN the failure this session's tab is marked for.
+    failure: FailureMark,
+    /// The `(phase, outcome)` the last `status-change` timeline event carried
+    /// ([`StatusObserver::take_status_event`]); `None` before the first.
+    evented: Option<(Phase, Outcome)>,
+}
+
+impl SessionSlot {
+    fn new(policy: StatusPolicy, now: Instant) -> Self {
+        Self {
+            fsm: StatusFsm::new(policy, now),
+            next_due: now,
+            revision: 1,
+            lifecycle: None,
+            failure: FailureMark::default(),
+            evented: None,
+        }
+    }
+}
+
+/// THE "SEEN" ACKNOWLEDGEMENT of a failure mark (RFC-session-understanding
+/// §17, built 2026-09-27). A failed command marks its tab so a pane the user is
+/// not looking at can say so ([`status_indicators`]); once the user HAS looked —
+/// the session is the focused view of a focused window — the mark has done its
+/// job and goes quiet, while the failure itself stays on the record
+/// (`status outcome=`, the tooltip) until the next unit of work.
+///
+/// A REVISION COMPARE, not a boolean: [`Self::generation`] moves with every NEW
+/// failure and [`Self::seen`] remembers the generation the user looked at, so a
+/// later failure re-arms the mark. A new failure is (a) the published outcome
+/// becoming a failure from anything else — the one edge a session without shell
+/// integration has (a lifecycle exit), its defined fallback — or (b) the shell
+/// completing a DIFFERENT command block while the outcome stays a failure: two
+/// failing commands with no work observed between them (a `false` that ran
+/// inside one observation interval) publish no status change at all, and only
+/// the completed-command sequence ([`Evidence::completed_block`]) tells them
+/// apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FailureMark {
+    /// The published outcome is a failure.
+    failing: bool,
+    /// Bumped per NEW failure (see the type).
+    generation: u64,
+    /// The completed block the current failure was read from, when shell
+    /// integration named one.
+    block: Option<u64>,
+    /// The generation the user has seen.
+    seen: u64,
+}
+
+impl FailureMark {
+    /// Fold the published outcome in after an observation.
+    fn note(&mut self, failing: bool, completed_block: Option<u64>) {
+        if failing {
+            let another_block = completed_block.is_some() && completed_block != self.block;
+            if !self.failing || another_block {
+                self.generation = self.generation.saturating_add(1);
+            }
+            if completed_block.is_some() {
+                self.block = completed_block;
+            }
+        } else {
+            self.block = None;
+        }
+        self.failing = failing;
+    }
+
+    /// A failure the user has not seen yet: what marks the tab.
+    const fn unseen(&self) -> bool {
+        self.failing && self.generation > self.seen
+    }
+
+    /// The user looked. Returns whether that quieted a mark.
+    fn see(&mut self) -> bool {
+        let quieted = self.unseen();
+        self.seen = self.generation;
+        quieted
+    }
 }
 
 impl StatusObserver {
@@ -2058,12 +2229,10 @@ impl StatusObserver {
     /// un-end it.
     pub(crate) fn observe(&mut self, session: u64, evidence: &Evidence, now: Instant) -> bool {
         let policy = self.policy;
-        let slot = self.sessions.entry(session).or_insert_with(|| SessionSlot {
-            fsm: StatusFsm::new(policy, now),
-            next_due: now,
-            revision: 1,
-            lifecycle: None,
-        });
+        let slot = self
+            .sessions
+            .entry(session)
+            .or_insert_with(|| SessionSlot::new(policy, now));
         slot.next_due = now + self.min_interval;
         let changed = match slot.lifecycle {
             Some(lifecycle) => {
@@ -2076,6 +2245,10 @@ impl StatusObserver {
         if changed {
             slot.revision = slot.revision.saturating_add(1);
         }
+        slot.failure.note(
+            slot.fsm.status().last_outcome.is_failure(),
+            evidence.completed_block.map(|b| b.id),
+        );
         // FOLD, never recompute. Keeping `next_due_any` a LOWER bound on the
         // true minimum is what makes the O(1) gate safe without an O(slots)
         // pass per observation; `note_swept` restores exactness once per sweep.
@@ -2103,12 +2276,7 @@ impl StatusObserver {
         let policy = self.policy;
         self.sessions
             .entry(session)
-            .or_insert_with(|| SessionSlot {
-                fsm: StatusFsm::new(policy, now),
-                next_due: now,
-                revision: 1,
-                lifecycle: None,
-            })
+            .or_insert_with(|| SessionSlot::new(policy, now))
             .lifecycle = Some(lifecycle);
         // Exit is `Confidence::Exact`, so it bypasses dwell and publishes on
         // this very call — a session that has ended must not be reported as
@@ -2205,6 +2373,42 @@ impl StatusObserver {
 
     pub(crate) fn status(&self, session: u64) -> Option<&Status> {
         self.sessions.get(&session).map(|slot| slot.fsm.status())
+    }
+
+    /// This session's contribution to its tab's indicator bits
+    /// ([`status_indicators`]), with a failure the user has already SEEN kept
+    /// off the tab ([`FailureMark`]). `None` before the first publication.
+    pub(crate) fn indicators(&self, session: u64) -> Option<crate::tab_model::TabIndicators> {
+        let slot = self.sessions.get(&session)?;
+        let mut bits = status_indicators(slot.fsm.status());
+        bits.status_attention &= slot.failure.unseen();
+        Some(bits)
+    }
+
+    /// The user is looking at `session` (the focused view of a focused
+    /// window): its current failure, if any, is SEEN. Returns whether that
+    /// quieted a tab mark — the caller's signal to refold the chrome.
+    pub(crate) fn note_seen(&mut self, session: u64) -> bool {
+        self.sessions
+            .get_mut(&session)
+            .is_some_and(|slot| slot.failure.see())
+    }
+
+    /// The payload of a `status-change` timeline event, when the published
+    /// PHASE or OUTCOME moved since the last one (RFC §7: one timeline event per
+    /// transition that survived dwell). Reason, confidence and detail moves are
+    /// not events: they change without dwell (`content_activity` ↔
+    /// `output_activity` under one `Running`), and carrying them would flood the
+    /// bounded timeline the dwell exists to protect. Consumes the change.
+    pub(crate) fn take_status_event(&mut self, session: u64) -> Option<String> {
+        let slot = self.sessions.get_mut(&session)?;
+        let status = slot.fsm.status();
+        let key = (status.phase, status.last_outcome);
+        if slot.evented == Some(key) {
+            return None;
+        }
+        slot.evented = Some(key);
+        Some(status_event_payload(status))
     }
 
     /// The published agent reading presence folds: its sequence number and
@@ -2558,6 +2762,8 @@ impl StatusObserver {
         self.agents.remove(&session);
         let _ = self.inputs.forget(session);
         self.programs.retire(session);
+        // The footer resolver's state for it too — its watch and its usage
+        // fold above all.
         crate::claude_footer::stop_session(session);
         self.footer_asked.remove(&session);
         if self.sessions.remove(&session).is_some() {
@@ -2727,9 +2933,12 @@ impl crate::App {
             // a contended engine is skipped above, so reaching here means the
             // read is non-blocking.
             let shell = shell_evidence(&guard);
+            let completed_block = completed_block(&guard);
             let alt_screen = guard.is_alternate_screen();
             let content_seq = guard.content_seq();
             let generation = crate::control::screen_gen(&guard);
+            // THE RESIZE LEDGER's probe: four integer loads under this guard.
+            let resize_probe = crate::resize_ledger::EngineProbe::sample(&guard);
             let detail = executing_detail(&guard);
             // THE AGENT VERDICT's one read of the screen, under this SAME
             // guard: the live zone's rows, only when the content moved since
@@ -2819,8 +3028,8 @@ impl crate::App {
                 )
             });
             let evidence = Evidence {
-                pin: None,
                 shell,
+                completed_block,
                 // The exit fact arrives as an EVENT (`note_session_exit`) and is
                 // held sticky on the slot, so the sweep never has to discover it.
                 lifecycle: None,
@@ -2839,6 +3048,26 @@ impl crate::App {
             // (`running targo test` -> `running claude`) still repaints.
             let status_changed = self.session_status.observe(id, &evidence, now);
             let detail_changed = self.session_status.set_detail(id, detail);
+            // A failure published while the user is LOOKING at this session —
+            // the focused view of a focused window — is seen as it happens, so
+            // it never marks the tab (`FailureMark`).
+            let seen = self.windows.iter().any(|(wid, ws)| {
+                crate::os_window_focused(ws) && self.focused_session_id(*wid) == Some(id)
+            }) && self.session_status.note_seen(id);
+            // ONE TIMELINE EVENT PER PUBLISHED TRANSITION (RFC §7): the phase or
+            // outcome moved, which dwell already bounds, so the bounded ring
+            // is not flooded by a spinner.
+            let status_event = status_changed
+                .then(|| self.session_status.take_status_event(id))
+                .flatten();
+            if let Some(payload) = status_event.as_ref() {
+                session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record(STATUS_CHANGE, payload.clone());
+            }
             // PROGRAM IDENTITY + AGENT VERDICT. The foreground group is one
             // `tcgetpgrp` (the job probe above asked the same question); only
             // a CHANGED group costs a resolution, and that runs off this
@@ -2945,13 +3174,51 @@ impl crate::App {
                 }
                 _ => false,
             };
-            if moved && self.subscribers.any() {
+            // THE RESIZE LEDGER, evaluated on this sweep so a `render` verdict
+            // transition lands on the timeline (and wakes the digest) without
+            // waiting for a reader. The SELF-AUDIT: an engine past the ledger
+            // (or another engine) took a resize no path booked, so its journal
+            // is copied under a second `try_lock` taken after the timeline is
+            // released (never nested, never waited on) and backfilled as
+            // `site=-`.
+            let now_ms = crate::turn_ledger::now_ms();
+            let (render_moved, behind) = {
+                let mut timeline = session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                (
+                    timeline.evaluate_resizes(resize_probe, now_ms),
+                    timeline.resizes().behind(&resize_probe),
+                )
+            };
+            let journal = if behind {
+                session
+                    .term
+                    .try_lock()
+                    .ok()
+                    .map(|t| crate::resize_ledger::JournalCopy::take(&t))
+            } else {
+                None
+            };
+            let backfilled = journal.is_some_and(|copy| {
+                session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .ingest_resizes(&copy, None, now_ms)
+            });
+            if (moved || render_moved || backfilled || status_event.is_some())
+                && self.subscribers.any()
+            {
                 self.subscribers
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .notify(id);
             }
-            if status_changed || detail_changed || step.reading_changed {
+            if status_changed || detail_changed || seen || step.reading_changed {
                 changed.push(id);
             }
         }
@@ -2988,34 +3255,36 @@ impl crate::App {
     /// Called at the TOP of the `Wake::Exit` arm, before anything closes: the
     /// child is still an unreaped zombie at that instant, which is the only
     /// window in which its status can be collected (`aterm_pty` reaps on the
-    /// teardown thread and throws the status away). `None` from the collector is
-    /// carried through as `Outcome::None` — an adopted session, a master that
-    /// went unreadable without the child exiting, and an already-reaped child
-    /// are all genuinely unknown, and a fabricated success would be worse than a
-    /// blank.
+    /// teardown thread and throws the status away). This is the exit path's
+    /// first look ([`crate::app_tabs::ExitLook::First`]), so the exit ledger
+    /// and a failed-start pane's line read the status it takes. `None` from the
+    /// collector is carried through as `Outcome::None` — an adopted session, a
+    /// master that went unreadable without the child exiting, and an
+    /// already-reaped child are all genuinely unknown, and a fabricated success
+    /// would be worse than a blank.
     ///
-    /// Whether anyone SEES this depends on `--hold`: without it the tab closes
-    /// and the slot is retired moments later. With it the pane survives its
-    /// shell, and this is what stops the next sweep — which finds `tcgetpgrp`
-    /// failing and reads that as "no foreground job" — from publishing `Idle`
-    /// and rendering a dead pane as "ready".
+    /// Whether anyone SEES this depends on `--hold`, or on a shell that failed
+    /// at start (it keeps its pane): otherwise the tab closes and the slot is
+    /// retired moments later. With `--hold` the pane survives its shell, and
+    /// this is what stops the next sweep — which finds `tcgetpgrp` failing and
+    /// reads that as "no foreground job" — from publishing `Idle` and rendering
+    /// a dead pane as "ready".
     pub(crate) fn note_session_exit(&mut self, session: u64) {
         if !self.config.tab_status_or_default() {
             return;
         }
-        let Some(pooled) = self.pool.get(session) else {
+        let Some(timeline) = self
+            .pool
+            .get(session)
+            .map(|pooled| pooled.ctx.timeline.clone())
+        else {
             return;
         };
-        // `collect_exit_status` REAPS the zombie, which frees the pid. Latch that
+        // `exit_status` REAPS the zombie, which frees the pid, and latches that
         // on the session so teardown cannot later `killpg` a number the kernel
         // has since reissued — under `--hold` the session outlives this by
         // minutes.
-        let collected = aterm_pty::collect_exit_status(pooled.pid);
-        if collected.is_some() {
-            pooled
-                .child_reaped
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
+        let collected = self.exit_status(session, crate::app_tabs::ExitLook::First);
         let lifecycle = match collected {
             Some(aterm_pty::ChildExit::Code(code)) => Lifecycle::Exited {
                 exit_code: Some(code),
@@ -3027,8 +3296,8 @@ impl crate::App {
         // classification — so this deliberately takes NO terminal lock on the
         // exit path, where the reader thread has just finished with it.
         let evidence = Evidence {
-            pin: None,
             shell: None,
+            completed_block: None,
             lifecycle: Some(lifecycle),
             foreground_job: None,
             activity: ActivitySample {
@@ -3042,6 +3311,32 @@ impl crate::App {
             .session_status
             .note_exit(session, lifecycle, &evidence, std::time::Instant::now())
         {
+            if let Some(payload) = self.session_status.take_status_event(session) {
+                timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record(STATUS_CHANGE, payload);
+                if self.subscribers.any() {
+                    self.subscribers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .notify(session);
+                }
+            }
+            self.refresh_session_status_chrome(session);
+        }
+    }
+
+    /// The user is looking at `session` in `wid`: when it is that window's
+    /// focused view and the window has keyboard focus, its failure mark is
+    /// SEEN and the tab goes quiet ([`FailureMark`]). Called where the focused
+    /// view can change — a tab or pane switch (`sync_active_session`) and a
+    /// window gaining focus (`on_focus`); the status sweep sees a failure that
+    /// publishes while the session is already in front.
+    pub(crate) fn note_session_seen(&mut self, wid: crate::WindowId, session: u64) {
+        let looking = self.windows.get(&wid).is_some_and(crate::os_window_focused)
+            && self.focused_session_id(wid) == Some(session);
+        if looking && self.session_status.note_seen(session) {
             self.refresh_session_status_chrome(session);
         }
     }
@@ -3145,9 +3440,7 @@ impl crate::App {
         if !self.config.tab_status_badge_or_default() {
             return crate::tab_model::TabIndicators::default();
         }
-        self.session_status
-            .status(session)
-            .map_or_else(Default::default, status_indicators)
+        self.session_status.indicators(session).unwrap_or_default()
     }
 
     /// Fan ONE session's published status change out to the chrome that shows
@@ -3174,11 +3467,13 @@ impl crate::App {
         // decayed the typing subject WHILE the user was typing and it never
         // showed at all. `Status::settled_idle` keeps the verdict false while
         // the keystroke echo is fresh and flips it once the echo has aged out.
-        let idle = self
-            .session_status
-            .status(session)
-            .is_some_and(Status::settled_idle);
-        let _ = self.title_summaries.note_phase_settled(session, idle);
+        //
+        // AND THE BLOCK IS RE-OBSERVED with it: a publish is the block
+        // transition itself (a job starting or ending), and for a BACKGROUND
+        // tab it is one of the only two edges that reach the title at all —
+        // its output wakes skip the observation (see
+        // `App::observe_title_subject`). The refresh below carries the result.
+        let _ = self.observe_title_subject(session);
         let mut windows = self.windows_with_focused_session(session);
         for (wid, tab_id) in self.tabs_viewing_session(session) {
             if self.refresh_tab_status_indicators(wid, tab_id) && !windows.contains(&wid) {
@@ -3392,6 +3687,11 @@ impl crate::App {
         // whose terminal could not be locked answers `-`/`-`: the poll never
         // waits on the guard for a field it can say it does not have.
         let stamp = term.as_deref().map(crate::control::screen_stamp);
+        // THE RESIZE LEDGER's probe (`render=`), from the same guard: four
+        // integer loads. `None` when the lock was contended, and `render=-`.
+        let resize_probe = term
+            .as_deref()
+            .map(crate::resize_ledger::EngineProbe::sample);
         let (seq, hash) = stamp.map_or_else(
             || ("-".to_string(), "-".to_string()),
             |(seq, hash)| (seq.to_string(), format!("{hash:016x}")),
@@ -3447,13 +3747,23 @@ impl crate::App {
         // agent_rev= agent_since_ms=`): the sweep's publication, read from the
         // session timeline — the same store the `sessions` row, `await agent`
         // and `EVENT agent` read, so no two surfaces disagree.
-        let agent = pooled
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent()
-            .wire_fields();
+        //
+        // `render=<ok|displaced|desync-risk|unverified|-> resizes=<n> flaps=<n>`
+        // (2026-09-28), evaluated in the same leaf lock and printed just before
+        // the `gen=`/`seq=`/`hash=` stamp: whether the app has drawn over
+        // content a resize displaced ([`crate::resize_ledger`]), how many
+        // resizes the session took, and how many net-zero flaps.
+        let (agent, resize) = {
+            let mut timeline = pooled
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (
+                timeline.agent().wire_fields(),
+                timeline.resize_status_fields(resize_probe, crate::turn_ledger::now_ms()),
+            )
+        };
         // `human_ms=<ms|->`, just after `supervisor=`: how long ago a PERSON
         // last had a hand on this session through a window
         // ([`crate::human_input`]; control verbs never stamp it), `-` for
@@ -3461,6 +3771,10 @@ impl crate::App {
         // human_grace_s`, and waits on before it keys a dialog a person may
         // be navigating. One atomic load.
         let human_ms = pooled.ctx.human_input.wire(crate::metrics::now_us());
+        // `human_seq=<n>` beside it: how many person gestures have reached the
+        // session — the value a write fenced `if-human=<n>` holds a person's
+        // keystroke since this read to ([`crate::human_input`]).
+        let human_seq = pooled.ctx.human_input.seq();
         // THE TWO ADDITIVE FIELDS (design §5.2). Additive: `schema=1` does not
         // move. Computed after the terminal guard is released, from the cwd
         // that guard already produced.
@@ -3532,8 +3846,8 @@ impl crate::App {
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
                  identity={identity} {presence} path={path} {agent} integration={integration} \
-                 {input} supervisor={supervisor} human_ms={human_ms} {owner} \
-                 history_lost={history_lost} integration_rev={integration_rev} gen={generation} seq={seq} hash={hash}",
+                 {input} supervisor={supervisor} human_ms={human_ms} human_seq={human_seq} {owner} \
+                 history_lost={history_lost} integration_rev={integration_rev} {resize} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -3545,11 +3859,7 @@ impl crate::App {
         let since_ms = std::time::Instant::now()
             .saturating_duration_since(status.since)
             .as_millis();
-        let (exit_code, signal) = match status.last_outcome {
-            Outcome::Failure { exit_code } => (exit_code.to_string(), "-".to_string()),
-            Outcome::Signal { signal } => ("-".to_string(), signal.to_string()),
-            Outcome::None | Outcome::Success => ("-".to_string(), "-".to_string()),
-        };
+        let (exit_code, signal) = status.last_outcome.wire_fields();
         // `consent_at_risk` rides the reasons list rather than the classifier:
         // the FSM is a pure function of terminal evidence and has no consent
         // input, and this token is a join of two facts it never sees.
@@ -3572,8 +3882,8 @@ impl crate::App {
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
              identity={identity} {presence} path={path} {agent} integration={integration} \
-             {input} supervisor={supervisor} human_ms={human_ms} {owner} \
-             history_lost={history_lost} integration_rev={integration_rev} gen={generation} seq={seq} hash={hash}",
+             {input} supervisor={supervisor} human_ms={human_ms} human_seq={human_seq} {owner} \
+             history_lost={history_lost} integration_rev={integration_rev} {resize} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -3777,10 +4087,18 @@ mod tests {
         }
     }
 
+    /// The block that completed with `exit_code`, as [`completed_block`] reads it.
+    fn done(id: u64, exit_code: i32) -> Option<CompletedBlock> {
+        Some(CompletedBlock {
+            id,
+            exit_code: Some(exit_code),
+        })
+    }
+
     fn evidence(activity: ActivitySample) -> Evidence {
         Evidence {
-            pin: None,
             shell: None,
+            completed_block: None,
             lifecycle: None,
             foreground_job: None,
             activity,
@@ -4368,6 +4686,297 @@ mod tests {
         later
     }
 
+    /// THE SWEEP RECORDS ITS TRANSITIONS on the session's timeline (RFC §7,
+    /// built 2026-09-27): a command that fails through the real terminal leaves
+    /// one `status-change` event carrying the failure, which the `events` digest
+    /// pushes as `EVENT <local> status …`. Before, the record was polled only
+    /// and the timeline carried no status transition at all.
+    ///
+    /// Fed the bytes a real integration writes: the precmd's `133;D` is followed
+    /// AT ONCE by the next prompt's `133;A` (and its `133;B`), which
+    /// archives the finished block before the sweep can read it as current.
+    /// Read from the current block only, this published `outcome=none` for
+    /// every command (review finding, 2026-09-27; the test then fed no
+    /// trailing A, a sequence no real shell leaves).
+    #[test]
+    fn the_status_sweep_records_one_status_change_per_published_transition() {
+        let mut app = crate::App::headless_for_test();
+        let front = app
+            .front_terminal(crate::WindowId(0))
+            .expect("front terminal");
+        let (session, term) = (front.session, front.term.clone());
+        let timeline = app.pool.get(session).expect("pooled").ctx.timeline.clone();
+        let status_events = |timeline: &std::sync::Arc<
+            std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+        >| {
+            timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .filter(|e| e.kind == STATUS_CHANGE)
+                .map(|e| e.payload.clone())
+                .collect::<Vec<_>>()
+        };
+        // A command ran and failed: OSC 133 A, B, C, then the precmd's D with
+        // exit 7 and the next prompt's A and B, in one batch.
+        const NEXT_PROMPT: &[u8] = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
+        let run = |exit: &str| {
+            let mut bytes = format!("\x1b]133;C\x1b\\\x1b]133;D;{exit}\x1b\\").into_bytes();
+            bytes.extend_from_slice(NEXT_PROMPT);
+            term.lock().unwrap().process(&bytes);
+        };
+        term.lock().unwrap().process(NEXT_PROMPT);
+        run("7");
+        let t0 = Instant::now();
+        let _ = app.observe_session_statuses(t0);
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(1));
+        let events = status_events(&timeline);
+        assert_eq!(
+            events,
+            vec!["phase=idle outcome=failure exit_code=7 signal=- confidence=strong".to_string()],
+            "one event for the one published transition"
+        );
+        // Nothing moved: another sweep records nothing.
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(2));
+        assert_eq!(
+            status_events(&timeline).len(),
+            1,
+            "no event without a transition"
+        );
+        assert_eq!(
+            crate::subscribe::timeline_wire_kind(STATUS_CHANGE),
+            Some("status"),
+            "the events digest pushes it"
+        );
+
+        // The failure marks the tab until it is seen; a SECOND failing command
+        // that ran inside one sweep interval (no work observed between) is no
+        // status change, and only its block tells it apart — through the same
+        // trailing prompt, which is what re-arms the mark in the product.
+        let attention = |app: &crate::App| {
+            app.session_status
+                .indicators(session)
+                .expect("published")
+                .status_attention
+        };
+        assert!(attention(&app), "an unseen failure marks the tab");
+        assert!(app.session_status.note_seen(session), "looking quiets it");
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(3));
+        assert!(!attention(&app), "the same failure stays seen");
+        run("7");
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(4));
+        assert!(attention(&app), "a new failing block re-arms the mark");
+        assert_eq!(
+            status_events(&timeline).len(),
+            1,
+            "the second failure is not a status change"
+        );
+
+        // A command that succeeds reports that, through the same prompt.
+        run("0");
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(5));
+        assert_eq!(
+            status_events(&timeline).last().map(String::as_str),
+            Some("phase=idle outcome=success exit_code=- signal=- confidence=strong"),
+        );
+        assert!(!attention(&app), "a success carries no mark");
+    }
+
+    /// A PROMPT REPORTS ONLY THE BLOCK IT CLOSED ([`completed_block`]): the
+    /// finished command behind a prompt, the current block while it is
+    /// `Complete`, nothing while a command runs, and nothing when the prompt
+    /// closed a block that never completed — an empty Enter, or a command whose
+    /// shell was replaced — so an older command's result never comes back.
+    #[test]
+    fn a_prompt_reports_the_block_it_closed_and_no_older_one() {
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
+        term.process(prompt);
+        assert_eq!(
+            completed_block(&term),
+            None,
+            "a first prompt closed nothing"
+        );
+
+        term.process(b"\x1b]133;C\x1b\\");
+        assert_eq!(
+            completed_block(&term),
+            None,
+            "a running command reports nothing"
+        );
+        term.process(b"\x1b]133;D;3\x1b\\");
+        let failed = completed_block(&term).expect("the current block completed");
+        assert_eq!(failed.exit_code, Some(3));
+        term.process(prompt);
+        assert_eq!(
+            completed_block(&term),
+            Some(failed),
+            "the prompt reports the block it closed"
+        );
+        assert_eq!(shell_evidence(&term), Some(ShellEvidence::Entering));
+
+        // An empty Enter: A with no C or D closes a block that ran nothing.
+        term.process(prompt);
+        assert_eq!(
+            completed_block(&term),
+            None,
+            "a prompt that closed an empty block reports no older result"
+        );
+
+        // A command whose shell never reported its end (`exec zsh`): the next
+        // prompt closes an Executing block.
+        term.process(b"\x1b]133;C\x1b\\");
+        term.process(prompt);
+        assert_eq!(completed_block(&term), None);
+    }
+
+    /// THE "SEEN" ACKNOWLEDGEMENT (RFC §17, 2026-09-27). A failure marks its
+    /// tab until the user looks at the session; looking quiets the mark while the
+    /// record keeps the failure; a NEW failure re-arms it — including a second
+    /// failing command the sweep saw no work between (only its completed block
+    /// differs), which publishes no status change at all.
+    #[test]
+    fn a_seen_failure_quiets_its_tab_and_a_new_failure_re_arms_it() {
+        let t0 = Instant::now();
+        let mut observer = StatusObserver::new(policy(), Duration::from_millis(250));
+        let attention = |o: &StatusObserver| o.indicators(1).expect("published").status_attention;
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
+        ev.completed_block = done(10, 1);
+        let t1 = settle_observer(&mut observer, 1, &ev, t0);
+        assert!(attention(&observer), "an unseen failure marks the tab");
+
+        assert!(observer.note_seen(1), "looking quiets a live mark");
+        assert!(
+            !attention(&observer),
+            "a seen failure no longer marks the tab"
+        );
+        assert!(
+            observer
+                .status(1)
+                .expect("published")
+                .last_outcome
+                .is_failure(),
+            "the RECORD keeps the failure; only the mark went quiet"
+        );
+        assert!(!observer.note_seen(1), "looking again quiets nothing");
+
+        // A second failing command with NO work observed between: the same
+        // phase and outcome, so the classifier publishes nothing — only the
+        // completed block moved.
+        ev.completed_block = done(11, 1);
+        assert!(
+            !observer.observe(1, &ev, t1 + Duration::from_millis(300)),
+            "the second failure is not a status change"
+        );
+        assert!(attention(&observer), "a new failure re-arms the mark");
+
+        // The same block observed again is the SAME failure.
+        observer.note_seen(1);
+        observer.observe(1, &ev, t1 + Duration::from_millis(600));
+        assert!(
+            !attention(&observer),
+            "re-reading one failure does not re-arm"
+        );
+
+        // Work, then another failure: the ordinary edge.
+        ev.shell = Some(ShellEvidence::Executing);
+        ev.completed_block = None;
+        ev.activity.content_seq = 2;
+        ev.activity.last_output = Some(t1 + Duration::from_millis(900));
+        let t2 = settle_observer(&mut observer, 1, &ev, t1 + Duration::from_millis(900));
+        assert!(
+            !attention(&observer),
+            "a running session carries no failure"
+        );
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(2) });
+        ev.completed_block = done(12, 2);
+        settle_observer(&mut observer, 1, &ev, t2 + Duration::from_millis(10));
+        assert!(attention(&observer), "the next failure marks the tab again");
+    }
+
+    /// A session WITHOUT shell integration has one failure edge, its lifecycle
+    /// exit, and no block to tell failures apart: the published edge is the
+    /// defined fallback, so the mark arms once and a look quiets it.
+    #[test]
+    fn a_session_without_shell_integration_arms_its_mark_on_the_published_edge() {
+        let t0 = Instant::now();
+        let mut observer = StatusObserver::new(policy(), Duration::from_millis(250));
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(true);
+        observer.observe(1, &ev, t0);
+        let exit = Lifecycle::Exited { exit_code: Some(3) };
+        observer.note_exit(1, exit, &ev, t0 + Duration::from_millis(10));
+        assert!(observer.indicators(1).expect("published").status_attention);
+        assert!(observer.note_seen(1));
+        observer.observe(1, &ev, t0 + Duration::from_millis(400));
+        assert!(
+            !observer.indicators(1).expect("published").status_attention,
+            "the held exit is one failure, seen once"
+        );
+    }
+
+    /// THE FLAPPING POLICY (RFC §15). Rapid heuristic transitions must not flood
+    /// the bounded timeline: a `status-change` event is taken only when the
+    /// published phase or outcome moved, and dwell bounds how often that can
+    /// happen — here a pane that alternates output and silence faster than
+    /// dwell for ten seconds yields at most one event per dwell interval.
+    #[test]
+    fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
+        let fast = StatusPolicy {
+            quiet_after: Duration::from_millis(100),
+            dwell: DWELL,
+        };
+        let t0 = Instant::now();
+        let mut observer = StatusObserver::new(fast, Duration::from_millis(0));
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(true);
+        let mut events = Vec::new();
+        let span = Duration::from_secs(10);
+        let step = Duration::from_millis(50);
+        let mut at = t0;
+        let mut seq = 1;
+        while at < t0 + span {
+            // Output for 150 ms, then 150 ms of silence: Running and Quiet
+            // candidates alternate every few samples.
+            if (at - t0).as_millis() % 300 < 150 {
+                seq += 1;
+                ev.activity.content_seq = seq;
+                ev.activity.last_output = Some(at);
+            }
+            if observer.observe(1, &ev, at)
+                && let Some(payload) = observer.take_status_event(1)
+            {
+                events.push(payload);
+            }
+            at += step;
+        }
+        let bound = (span.as_millis() / DWELL.as_millis()) as usize + 1;
+        assert!(
+            events.len() <= bound,
+            "{} status events in {span:?} (bound {bound}): {events:?}",
+            events.len()
+        );
+        // Not vacuous: a transition that survives dwell IS an event.
+        let mut steady = evidence(blank(1));
+        steady.foreground_job = Some(true);
+        steady.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
+        steady.completed_block = done(4, 1);
+        settle_observer(&mut observer, 1, &steady, at);
+        let payload = observer
+            .take_status_event(1)
+            .expect("a surviving transition");
+        assert_eq!(
+            payload,
+            "phase=idle outcome=failure exit_code=1 signal=- confidence=strong"
+        );
+        assert_eq!(
+            observer.take_status_event(1),
+            None,
+            "one event per transition"
+        );
+    }
+
     /// A PTY exit publishes `Exited` immediately and STAYS there. Under `--hold`
     /// the pane outlives its shell and keeps being swept; with the child gone
     /// `tcgetpgrp` fails, which reads as "no foreground job" — and would have
@@ -4635,14 +5244,17 @@ mod tests {
             record.contains(" hand=- level=quiet story=0 why=- path=live program="),
             "{record}"
         );
-        // The person's stamp (2026-09-25): no person has keyed session 0,
-        // and the field rides after `supervisor=`; the owner's columns
+        // The person's stamp (2026-09-25) and its count (2026-09-27): no
+        // person has keyed session 0, and the fields ride after
+        // `supervisor=`; the owner's columns
         // follow it, then the history this session's handoffs lost (none:
         // it never crossed one, 2026-09-26), the integration its shell runs
-        // (none signed: `-`, 2026-09-26), then the screen's stamp.
+        // (none signed: `-`, 2026-09-26), the resize ledger's verdict and
+        // counts (never resized: `ok`, 2026-09-28), then the screen's stamp.
         assert!(
             record.contains(
-                " supervisor=- human_ms=- path_evidence=- copy=- upgrade=- history_lost=0 integration_rev=- gen="
+                " supervisor=- human_ms=- human_seq=0 path_evidence=- copy=- upgrade=- history_lost=0 \
+                 integration_rev=- render=ok resizes=0 flaps=0 gen="
             ),
             "{record}"
         );
@@ -4765,23 +5377,32 @@ mod tests {
         }
         let (held_tx, held_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        // The writer keeps the lock until the test says the batch is back, so
+        // "the batch did not wait for the writer" is an ORDER: `true` from the
+        // join means the batch returned while the writer still held the lock.
+        // The minute is only a hang detector for the old blocking read, which
+        // parks behind this guard until the writer gives up (`false`). What the
+        // order does NOT see is how long the batch took: a read that stalled a
+        // bounded while (under the minute) and then deferred would pass. That it
+        // does not stall at all is the code's shape — one `try_lock`, no timed
+        // wait — and no clock here judges it. (The order replaces a 200 ms bound
+        // on the batch, which measured the scheduler as much as the lock
+        // discipline, and failed on a correct tree under load.)
         let worker = std::thread::spawn(move || {
             let _guard = timeline.lock().unwrap();
             held_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_millis(750));
+            release_rx.recv_timeout(Duration::from_secs(60)).is_ok()
         });
-        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        held_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the writer took the timeline lock");
 
-        let start = Instant::now();
         let batch = app.session_statuses_record();
-        let elapsed = start.elapsed();
-        // On the old blocking path the writer's timeout releases the lock
-        // first; still report the elapsed-time failure rather than a send error.
         let _ = release_tx.send(());
-        worker.join().unwrap();
         assert!(
-            elapsed < Duration::from_millis(200),
-            "a Fabric roster read held the main thread for {elapsed:?}"
+            worker.join().unwrap(),
+            "a Fabric roster read waited on the main thread for the background \
+             timeline writer to let go"
         );
         assert!(batch.contains("agent_deferred=1"), "{batch}");
         assert!(
@@ -5234,10 +5855,13 @@ mod tests {
     fn the_typing_subject_shows_while_typing_and_decays_once_settled() {
         let mut app = crate::App::headless_for_test();
         let term = app.pool.get(0).expect("session 0").term.clone();
-        // OSC 133 A + B: the block is EnteringCommand — prompt entry is open.
+        // OSC 133 A + B: the block is EnteringCommand — prompt entry is open —
+        // and the echo of what the user typed has moved the cursor off the
+        // command-start mark (an untouched prompt reads as `Ready`, not
+        // typing: `title_summary::block_activity`).
         term.lock()
             .unwrap()
-            .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+            .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\ls");
 
         // Classifier: Entering with the echo moving the grid between samples.
         let t0 = Instant::now();
@@ -5381,46 +6005,6 @@ mod tests {
         // The clamped wake still publishes: dwell was served well before it.
         assert!(observer.observe(1, &ev, owed), "the transition lands");
         assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Idle));
-    }
-
-    /// An IMMOVABLE verdict owes no wake. A user pin of `Running` bypasses both
-    /// activity clocks, so arming off them produced an instant that receded
-    /// further into the past on every turn while nothing could change the
-    /// answer — a permanent wake, a pool sweep, a `try_lock` and a `tcgetpgrp`
-    /// per session, forever.
-    #[test]
-    fn a_pinned_running_session_owes_no_time_driven_wake() {
-        let t0 = Instant::now();
-        let mut fsm = StatusFsm::new(policy(), t0);
-
-        // First, the UNPINNED shape, so the assertion below cannot pass just
-        // because this fixture never reaches Running.
-        let mut ev = evidence(blank(1));
-        ev.foreground_job = Some(true);
-        fsm.observe(&ev, t0);
-        ev.activity.content_seq = 2;
-        settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
-        assert_eq!(fsm.status().phase, Phase::Running);
-        assert!(
-            fsm.owed_wake().is_some(),
-            "an inferred Running owes its retirement"
-        );
-
-        // Now pin it. The verdict is `Exact` and clock-free, so no instant
-        // exists at which it could change on its own.
-        ev.pin = Some(Phase::Running);
-        let pinned = t0 + QUIET + Duration::from_secs(30);
-        fsm.observe(&ev, pinned);
-        assert_eq!(fsm.status().phase, Phase::Running);
-        assert!(
-            fsm.status().reasons.contains(&Reason::Pin),
-            "the record carries the pin"
-        );
-        assert_eq!(
-            fsm.owed_wake(),
-            None,
-            "a pin sustains Running with no clock, so it arms nothing"
-        );
     }
 
     /// The clamp's floor must ADVANCE on the sweep's other refusal. The sweep
@@ -5745,6 +6329,49 @@ mod tests {
             Some("claude"),
             "explicit"
         );
+    }
+
+    /// PowerShell escapes a space with a BACKTICK: `& C:\Program` Files\Git\
+    /// usr\bin\less.exe C:\Windows\win.ini` ran less and read `detail=Program`
+    /// on 0.95.0 (measured 2026-09-27). Inside a Windows path — a drive or a
+    /// `\` before the backtick — the escaped space is part of the word, so the
+    /// detail is the program's name. CONTROL: a backtick after a bare name, the
+    /// one place a POSIX shell's command substitution could put it, still ends
+    /// the word at the space, so an argument behind it never becomes the
+    /// detail; a POSIX command substitution reads as before.
+    #[test]
+    fn a_pwsh_backtick_escaped_space_is_part_of_the_program_path() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r"& C:\Program` Files\Git\usr\bin\less.exe C:\Windows\win.ini",
+                "less",
+            ),
+            (
+                r"C:\Program` Files\Git\usr\bin\less C:\Windows\win.ini",
+                "less",
+            ),
+            (r"& .\my` tools\build.cmd --target x", "build"),
+            (r"& C:/Program` Files/Git/usr/bin/vim.exe notes.txt", "vim"),
+            // The escaped space in the LAST component: the name ends at it.
+            (r"& C:\tools\my` app.exe --token SECRET", "my"),
+            // CONTROL: no Windows path in front of the backtick.
+            ("claude` /secret/tok --resume x", "claude"),
+            ("claude `echo /secret/tok`", "claude"),
+            ("`which less` README.md", "which"),
+            // CONTROL: the same program quoted, as tab completion writes it.
+            (
+                r"& 'C:\Program Files\Git\usr\bin\less.exe' C:\Windows\win.ini",
+                "less",
+            ),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(command_detail(cmd).as_deref(), Some(*want), "{cmd:?}");
+        }
+        assert!(windows_path_so_far(r"C:\Program"));
+        assert!(windows_path_so_far("d:/tools/my"));
+        assert!(windows_path_so_far(r".\my"));
+        assert!(!windows_path_so_far("claude"));
+        assert!(!windows_path_so_far("/usr/local/bin/my"));
     }
 
     /// The quote that lets a spaced path be ONE word (D3, above) must never
@@ -6157,11 +6784,25 @@ mod agent_verdict_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        PROGRAM_NAME_CONFIRM, PROGRAM_NAMED_RECHECK_FLOOR, PROGRAM_RECHECK, SessionSlot, StatusFsm,
+        PROGRAM_NAME_CONFIRM, PROGRAM_NAMED_RECHECK_FLOOR, PROGRAM_RECHECK, SessionSlot,
         StatusObserver, StatusPolicy,
     };
     use crate::presence::Cursor;
     use crate::{App, WindowId};
+
+    /// A session's retirement reaches the Claude footer's resolver, which
+    /// holds its usage fold: a closed tab's fold goes with it, not at the end
+    /// of its watch.
+    #[test]
+    fn retiring_a_session_retires_its_footer_state() {
+        let mut observer = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(0));
+        crate::claude_footer::STOPPED_SESSIONS.with(|r| r.borrow_mut().clear());
+        observer.retire(4_321);
+        assert_eq!(
+            crate::claude_footer::STOPPED_SESSIONS.with(|r| r.borrow().clone()),
+            vec![4_321]
+        );
+    }
 
     /// The background resolver can answer after the usual one-interval
     /// follow-up has already gone quiet. Its completion wake restores one
@@ -6178,10 +6819,8 @@ mod agent_verdict_tests {
         observer.sessions.insert(
             id,
             SessionSlot {
-                fsm: StatusFsm::new(policy, t0),
                 next_due: t0 + floor,
-                revision: 1,
-                lifecycle: None,
+                ..SessionSlot::new(policy, t0)
             },
         );
         observer.agent_observe(
@@ -6687,8 +7326,8 @@ mod agent_verdict_tests {
         let mut obs =
             super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
         let evidence = super::Evidence {
-            pin: None,
             shell: None,
+            completed_block: None,
             lifecycle: None,
             foreground_job: None,
             activity: super::ActivitySample {
@@ -6779,8 +7418,8 @@ mod agent_verdict_tests {
         let interval = Duration::from_millis(250);
         let mut obs = super::StatusObserver::new(super::StatusPolicy::default(), interval);
         let ev = super::Evidence {
-            pin: None,
             shell: None,
+            completed_block: None,
             lifecycle: None,
             foreground_job: None,
             activity: super::ActivitySample {
@@ -6856,8 +7495,8 @@ mod agent_verdict_tests {
         let gap = Duration::from_millis(167);
         let mut obs = super::StatusObserver::new(super::StatusPolicy::default(), interval);
         let ev = super::Evidence {
-            pin: None,
             shell: None,
+            completed_block: None,
             lifecycle: None,
             foreground_job: None,
             activity: super::ActivitySample {
@@ -7301,7 +7940,7 @@ mod agent_verdict_tests {
         let (mut app, sid) = app_with_stub();
         let record = app.session_status_record(sid).expect("live");
         assert!(
-            record.contains(" history_lost=0 integration_rev=- gen="),
+            record.contains(" history_lost=0 integration_rev=- render=ok resizes=0 flaps=0 gen="),
             "{record}"
         );
         let whole = [ImportReport {
@@ -7336,7 +7975,8 @@ mod agent_verdict_tests {
         app.settle_handoff_history(&failed);
         let record = app.session_status_record(sid).expect("live");
         assert!(
-            record.contains(" history_lost=1234 integration_rev=- gen="),
+            record
+                .contains(" history_lost=1234 integration_rev=- render=ok resizes=0 flaps=0 gen="),
             "{record}"
         );
         assert!(app.has_live_message("Couldn't carry all scrollback"));
@@ -7430,10 +8070,8 @@ mod agent_verdict_tests {
         observer.sessions.insert(
             id,
             SessionSlot {
-                fsm: StatusFsm::new(policy, t0),
                 next_due: t0 + floor,
-                revision: 1,
-                lifecycle: None,
+                ..SessionSlot::new(policy, t0)
             },
         );
 
@@ -7672,10 +8310,8 @@ mod agent_verdict_tests {
         observer.sessions.insert(
             id,
             SessionSlot {
-                fsm: StatusFsm::new(policy, t0),
                 next_due: t0 + floor,
-                revision: 1,
-                lifecycle: None,
+                ..SessionSlot::new(policy, t0)
             },
         );
 
@@ -7993,6 +8629,8 @@ mod agent_verdict_tests {
     fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
         let (mut app, sid) = app_with_stub();
         app.headless = false;
+        // The desktop notice is what these count (`desktop_alerts` is opt-in).
+        app.config.desktop_alerts = Some(true);
         let fixture = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::TRUST);
         let dialog = &fixture[8..=23];
         assert!(dialog[1].contains("Accessing workspace"), "{dialog:?}");
@@ -8022,8 +8660,8 @@ mod agent_verdict_tests {
             let store = app.store.read().unwrap();
             let handle = store.by_local(sid).expect("the session");
             (
-                App::status_session_row(handle, true),
-                App::status_session_row(handle, false),
+                App::status_session_row(handle, true, &Default::default()),
+                App::status_session_row(handle, false, &Default::default()),
             )
         };
         assert!(hosted.supervised, "{hosted:?}");
@@ -8044,6 +8682,8 @@ mod agent_verdict_tests {
     fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
         let (mut app, sid) = app_with_stub();
         app.headless = false;
+        // The desktop notice is what these count (`desktop_alerts` is opt-in).
+        app.config.desktop_alerts = Some(true);
         {
             use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
             let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
@@ -8150,6 +8790,8 @@ mod agent_verdict_tests {
     fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         let (mut app, sid) = app_with_stub();
         app.headless = false;
+        // The desktop notice is what these count (`desktop_alerts` is opt-in).
+        app.config.desktop_alerts = Some(true);
         let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
         let _ = take_posts();
         looking_at(&app, &[]);

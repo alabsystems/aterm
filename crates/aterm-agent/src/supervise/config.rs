@@ -50,9 +50,12 @@ pub const KEYS: &[&str] = &[
     "retry_api_errors",
     "probe_api",
     "resume_limits",
+    "limit_wait",
     "model_fallback",
+    "rate_nudge",
     "compact_on_context_wall",
     "relaunch",
+    "stall_term_after_s",
     "upgrade",
     "human_grace_s",
 ];
@@ -155,17 +158,44 @@ pub struct SupervisorConfig {
     pub probe_api: bool,
     /// Continue once a session or weekly usage limit has reset.
     pub resume_limits: bool,
-    /// The model the agent is RELAUNCHED on at a model-bucket limit
-    /// (`--model`, session-only — never Claude's `/model`, which saves the
-    /// person's default), and back from at its reset. `None`: wait for the
-    /// reset instead.
+    /// At Claude Code's usage-limit dialog (`What do you want to do?`),
+    /// choose `Wait here, then continue automatically …` — by its label,
+    /// never a spending row, never `Stop` — so the vendor's own continue is
+    /// armed for the reset (`limit-wait@v1`; the owner, 2026-09-24: "you
+    /// should not depend on the user to choose"). Off: the dialog is a
+    /// person's.
+    pub limit_wait: bool,
+    /// CLAUDE CODE'S model fallback: the model the agent is RELAUNCHED on at
+    /// a model-bucket limit (`--model`, session-only — never Claude's
+    /// `/model`, which saves the person's default), and back from at its
+    /// reset; set, full power also switches Claude Code's model-refusal pause
+    /// (`Session paused`, exactly its switch and its retry). No other
+    /// vendor's box is ever answered with a model switch under it — Codex's
+    /// rate-limit nudge is [`Self::rate_nudge`]'s. `None`: wait for the reset
+    /// instead, and leave the pause to a person.
     pub model_fallback: Option<String>,
+    /// CODEX'S RATE-LIMIT NUDGE (`Approaching rate limits`): answered by full
+    /// power — its switch to the cheaper model ONLY when Codex's own usage
+    /// reading shows the window at 90% or more, and then only to save the
+    /// work (commit and push, then stop) before the session is put back on
+    /// its own model and held until the window resets; any other nudge is
+    /// kept on its model. Off: the nudge is a person's.
+    pub rate_nudge: bool,
     /// Type `/compact` when the worker stops on a full context.
     pub compact_on_context_wall: bool,
-    /// Relaunch a Claude Code that crashed (its session record left behind,
+    /// Relaunch a Claude Code or a Codex that crashed (Claude Code's session
+    /// record left behind, a Codex's exit status as its shell recorded it —
     /// read as the exit is seen), on its own conversation; a graceful exit is
-    /// someone's decision.
+    /// someone's decision. Its limit limits the stall's remedy too: an agent
+    /// frozen past its bound is ended only where it is relaunched
+    /// (`supervise/stall.rs`).
     pub relaunch: bool,
+    /// How long an agent stands frozen — not reading its input, nobody's
+    /// hand on it — before the supervisor ends it with `signal term` for its
+    /// relaunch (`supervise/stall.rs`); `0` never. Its own limit, apart
+    /// from [`Self::relaunch`]: the automatic end of a frozen worker can be
+    /// switched off while crashes are still relaunched.
+    pub stall_term_after_s: u32,
     /// Restart an idle agent onto a newer installed build of itself.
     pub upgrade: bool,
     /// After a person's keystroke into a session, the supervisor keeps its
@@ -222,9 +252,12 @@ impl Default for SupervisorConfig {
             retry_api_errors: true,
             probe_api: true,
             resume_limits: true,
+            limit_wait: true,
             model_fallback: Some("opus".to_string()),
+            rate_nudge: true,
             compact_on_context_wall: true,
             relaunch: true,
+            stall_term_after_s: 600,
             upgrade: true,
             human_grace_s: 120,
             withheld: Withheld::default(),
@@ -273,6 +306,8 @@ impl SupervisorConfig {
             "retry_api_errors" => switch!(retry_api_errors),
             "probe_api" => switch!(probe_api),
             "resume_limits" => switch!(resume_limits),
+            "limit_wait" => switch!(limit_wait),
+            "rate_nudge" => switch!(rate_nudge),
             "compact_on_context_wall" => switch!(compact_on_context_wall),
             "relaunch" => switch!(relaunch),
             "upgrade" => switch!(upgrade),
@@ -304,6 +339,10 @@ impl SupervisorConfig {
             "human_grace_s" => match value.trim().parse() {
                 Ok(n) => self.human_grace_s = n,
                 Err(_) => return bad(self, "a count of seconds"),
+            },
+            "stall_term_after_s" => match value.trim().parse() {
+                Ok(n) => self.stall_term_after_s = n,
+                Err(_) => return bad(self, "a count of seconds (0: never)"),
             },
             "rules_file" => self.rules_file = text.map(PathBuf::from),
             "model_fallback" => self.model_fallback = text,
@@ -374,7 +413,8 @@ impl SupervisorConfig {
     }
 
     /// Set `key` to its LIMITING value: the least power it can give. A switch
-    /// is off, `approve` is `none`, a cap is one an hour, the grace is an hour;
+    /// is off, `approve` is `none`, a cap is one an hour, the grace is an
+    /// hour, a frozen agent is never ended (`stall_term_after_s = 0`);
     /// a text keeps its default (no text limits more than another).
     pub fn limit(&mut self, key: &str) {
         match key {
@@ -388,9 +428,12 @@ impl SupervisorConfig {
             "retry_api_errors" => self.retry_api_errors = false,
             "probe_api" => self.probe_api = false,
             "resume_limits" => self.resume_limits = false,
+            "limit_wait" => self.limit_wait = false,
             "model_fallback" => self.model_fallback = None,
+            "rate_nudge" => self.rate_nudge = false,
             "compact_on_context_wall" => self.compact_on_context_wall = false,
             "relaunch" => self.relaunch = false,
+            "stall_term_after_s" => self.stall_term_after_s = 0,
             "upgrade" => self.upgrade = false,
             "human_grace_s" => self.human_grace_s = 3600,
             retired if RETIRED_KEYS.contains(&retired) => {
@@ -542,7 +585,7 @@ impl SupervisorConfig {
 
     /// Whether `self` is `before` with power taken away and none given: some
     /// field moved, and no switch is on that was off, no approval looser, no
-    /// cap higher or absent, no grace shorter, no trust root or fallback model
+    /// cap higher or absent, no grace or stall bound shorter, no trust root or fallback model
     /// new, and no text changed (a text neither limits nor grants, so where a
     /// key may only limit, a text is not taken).
     fn limits(&self, before: &Self) -> bool {
@@ -567,9 +610,12 @@ impl SupervisorConfig {
             && no_more(self.retry_api_errors, before.retry_api_errors)
             && no_more(self.probe_api, before.probe_api)
             && no_more(self.resume_limits, before.resume_limits)
+            && no_more(self.limit_wait, before.limit_wait)
             && (self.model_fallback.is_none() || self.model_fallback == before.model_fallback)
+            && no_more(self.rate_nudge, before.rate_nudge)
             && no_more(self.compact_on_context_wall, before.compact_on_context_wall)
             && no_more(self.relaunch, before.relaunch)
+            && cap(self.stall_term_after_s) >= cap(before.stall_term_after_s)
             && no_more(self.upgrade, before.upgrade)
             && self.human_grace_s >= before.human_grace_s
             && (self.withheld.rm_breaker || !before.withheld.rm_breaker)
@@ -579,7 +625,7 @@ impl SupervisorConfig {
     /// Every key's value, in [`KEYS`] order, as the text [`Self::set`] takes
     /// back. The destructure names every field, so a field added without a
     /// key here does not build (and `texts_are_the_keys` holds the order).
-    fn texts(&self) -> [(&'static str, String); 19] {
+    fn texts(&self) -> [(&'static str, String); 22] {
         let Self {
             enabled,
             headless,
@@ -595,9 +641,12 @@ impl SupervisorConfig {
             retry_api_errors,
             probe_api,
             resume_limits,
+            limit_wait,
             model_fallback,
+            rate_nudge,
             compact_on_context_wall,
             relaunch,
+            stall_term_after_s,
             upgrade,
             human_grace_s,
             // No key of its own: a retired key's (`against_default` names it).
@@ -626,12 +675,15 @@ impl SupervisorConfig {
             ("retry_api_errors", retry_api_errors.to_string()),
             ("probe_api", probe_api.to_string()),
             ("resume_limits", resume_limits.to_string()),
+            ("limit_wait", limit_wait.to_string()),
             ("model_fallback", model_fallback.clone().unwrap_or_default()),
+            ("rate_nudge", rate_nudge.to_string()),
             (
                 "compact_on_context_wall",
                 compact_on_context_wall.to_string(),
             ),
             ("relaunch", relaunch.to_string()),
+            ("stall_term_after_s", stall_term_after_s.to_string()),
             ("upgrade", upgrade.to_string()),
             ("human_grace_s", human_grace_s.to_string()),
         ]
@@ -648,6 +700,7 @@ impl SupervisorConfig {
             _ if text.is_empty() => None,
             "trust_roots" => Some(format!("[{}]", full.trust_roots.join(", "))),
             "continue_per_hour" if full.continue_per_hour == 0 => Some(format!("{text} (no cap)")),
+            "stall_term_after_s" => Some(format!("{text} (0: never)")),
             _ => Some(text),
         }
     }
@@ -957,6 +1010,9 @@ mod tests {
         let full = SupervisorConfig::default();
         assert!(full.enabled && full.headless && full.approve == Approve::All);
         assert!(full.answer_questions && full.continue_policy && full.relaunch && full.upgrade);
+        assert!(full.limit_wait, "the usage-limit wait is chosen by default");
+        assert!(!read("[harness]\nlimit_wait = false\n").limit_wait);
+        assert!(!read("[harness]\nlimit_wait = \"never\"\n").limit_wait);
         assert_eq!(full.continue_per_hour, 0, "no cap");
         assert_eq!(read(""), full, "no file, no table: every power");
         for key in KEYS {

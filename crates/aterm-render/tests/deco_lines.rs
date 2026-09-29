@@ -641,10 +641,10 @@ fn curly_gates_on_the_shared_mask_predicate() {
         !underline_rects(UnderlineStyle::Curly, 0, 0, 18, 9, 24, dm, false).is_empty(),
         "mask-unsupported curly falls back to square-wave rects"
     );
-    // The shared predicate itself: 9 sprites must fit 2048 texels
-    // (⌊2048/9⌋ = 227 is the widest supported base cell).
-    assert!(undercurl_supported(227, 24), "9·227 ≤ 2048");
-    assert!(!undercurl_supported(228, 24), "9·228 > 2048");
+    // The shared predicate itself: 8 sprites must fit 2048 texels
+    // (⌊2048/8⌋ = 256 is the widest supported base cell).
+    assert!(undercurl_supported(256, 24), "8·256 ≤ 2048");
+    assert!(!undercurl_supported(257, 24), "8·257 > 2048");
     assert!(!undercurl_supported(9, 2049), "height cap");
     // Band derivation across styles.
     assert_eq!(underline_band(UnderlineStyle::None, 24, dm), None);

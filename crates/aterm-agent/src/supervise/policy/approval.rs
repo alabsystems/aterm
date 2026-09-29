@@ -25,9 +25,40 @@
 //!   `Yes, enter plan mode` — never `auto mode`, `accept edits`, `bypass
 //!   permissions` or `clear context`, each a standing mode or the
 //!   conversation wiped; a plan box with no such yes is declined;
-//! * the model-refusal pause (`Session paused`): its `Switch to <model>`
+//! * Claude Code's model-refusal pause (`Session paused`, its options exactly
+//!   `Switch to <model>` and `Edit prompt and retry…`): its switch
 //!   ([`RULE_MODEL_SWITCH`]) while `[harness] model_fallback` is set — the
-//!   switch the owner approved for a model's limit — else a person's;
+//!   switch the owner approved for a model's limit (aab68649f) — else a
+//!   person's. NO OTHER BOX'S `Switch to …` is ever pressed by that rule: on
+//!   2026-09-27 and 09-28 it pressed Codex's rate-limit nudge's `Switch to
+//!   gpt-6-luna`, at 99% of the weekly window and again at 1% right after a
+//!   usage reset, and luna then ran the owner's work for eleven hours;
+//! * Codex's RATE-LIMIT MODEL NUDGE (aterm-phase's `RateNudge`), under
+//!   `[harness] rate_nudge`: its `Switch to <model>`
+//!   ([`RULE_RATE_NUDGE_SWITCH`], [`rate_nudge`]) ONLY when Codex's own usage
+//!   reading says the window is near its limit (≥ 90%, the owner's number,
+//!   2026-09-28) and the model it leaves was read off the footer — and then
+//!   only to SAVE the work: the loop ledgers the switch's intent before the
+//!   key and opens it once the box has left; the loop's busy reads stop
+//!   Codex's goal; the turn-end policy types a commit-and-push-then-stop
+//!   instruction, puts the thread back on its own model and effort, and
+//!   holds the session until the window resets (`turn_end`'s
+//!   save-then-wait). Every other nudge — a stale one, one while
+//!   a switch is already open, one whose reading is unknown — gets `Keep
+//!   current model` ([`RULE_RATE_NUDGE_KEEP`]); `Keep current model (never
+//!   show again)` is never pressed (it writes Codex's config);
+//! * Codex's `/model` picker (aterm-phase's `ModelPick`) only while the
+//!   harness's OWN restore is in flight ([`ApprovalCtx::model_restore`]: its
+//!   picker not yet left, no person's keystroke since its `/model`): the
+//!   exact model and effort the thread had before the switch, the effort by
+//!   its `s` — this conversation only — never Enter, which saves a default
+//!   ([`RULE_MODEL_RESTORE_PICK`], [`model_restore_pick`]). A picker a person
+//!   opened is theirs;
+//! * Codex's paused-goal box (aterm-phase's `GoalResume`) only where the
+//!   live upgrade paused that goal for its move and owes it its resume
+//!   ([`ApprovalCtx::goal_resume`]): its focused first option, the resume
+//!   ([`RULE_GOAL_RESUME`], [`goal_resume_pick`]). A box a person's own
+//!   `codex resume` drew is theirs, and `Leave paused` is never pressed;
 //! * the model-switch confirmation (`Switch model?` / `Change effort
 //!   level?`, aterm-phase's `ModelSwitch`): its `Yes, switch to <m>`
 //!   ([`RULE_MODEL_CONFIRM`], [`model_confirm`]) — the box asks whether to
@@ -46,7 +77,9 @@
 //!   ([`RULE_DECLINE`]): their yes settles something for good, their `No`
 //!   or `Not now` nothing;
 //! * a model's or extra usage's CONSENT to go on (`Continue with …`, the
-//!   credits already on): accepted, as the owner directed (2026-09-24: *"a
+//!   credits already on) on Claude Code's screen — never Codex's, where
+//!   `Continue with Luna Reserve` is a model change and `Continue with
+//!   detected credentials` a sign-in: accepted, as the owner directed (2026-09-24: *"a
 //!   model/extra-usage consent dialog → accept"*) — it is a permission box
 //!   like any other, and its yes is its one-shot allow. Turning usage
 //!   credits back ON (`Yes, re-enable and continue`, `Turn on usage
@@ -56,9 +89,10 @@
 //!   answered with the option that waits (the hazards review of
 //!   2026-09-25; *"configuration limits power"*);
 //! * and never a PURCHASE ([`buys`]: an option whose label OPENS with buy,
-//!   purchase, add funds, upgrade, subscribe, or a spend limit raised — `Yes,
-//!   buy usage credits`, `Add funds to continue with …`, `Upgrade your plan`,
-//!   `Adjust monthly limit`): a box whose every yes buys is answered with the
+//!   purchase, add funds, upgrade, subscribe, usage credits, or a spend limit
+//!   raised — `Yes, buy usage credits`, `Add funds to continue with …`,
+//!   `Upgrade your plan`, `Switch to usage credits`, `Adjust monthly limit`):
+//!   a box whose every yes buys is answered with the
 //!   option that waits instead ([`RULE_NO_SPEND`]). The label's opening
 //!   words are matched, never a word anywhere in it, so a path in a one-shot
 //!   label (`billing/upgrade.rs`) cannot trip it. These dialogs (the
@@ -117,6 +151,27 @@
 //! consulted, and `answer_questions = false` hands every question to a
 //! person, a dialog as much as a question in prose.
 //!
+//! **The usage-limit dialog is neither.** Claude Code's usage-limit options
+//! dialog (`What do you want to do?`, 2.1.282; aterm-phase's "THE
+//! USAGE-LIMIT DIALOG", [`PromptKind::UsageLimit`]) is answered by its own
+//! rule, [`RULE_LIMIT_WAIT`] ([`limit_wait`]), under its own key,
+//! `limit_wait` ([`ApprovalCtx::limit_wait`], on by default) — decided FIRST,
+//! before the question rule and before any level, so neither full power nor
+//! the safe rules ever see it: when it offers `Wait here, then continue
+//! automatically …` ([`Role::AutoResume`], matched by its label in any of its
+//! three spellings, never by its place) the focus is moved onto that row and
+//! Enter confirms it, as for the trust dialog, so the vendor's own automatic
+//! continue is armed and the session goes on by itself when the limit
+//! resets. Observed 2026-09-24: a weekly limit's dialog sat ~14 h for the
+//! owner, because the vendor's `autoContinueAtUsageLimit` arms that wait by
+//! itself only for a reset under 24 h away (the owner: "you should not
+//! depend on the user to choose"). Never `Stop and wait for limit to reset`
+//! (it stops for good — the option full power's [`waits`] would otherwise
+//! take), never `Switch to usage credits`/`Add funds …`/`Upgrade your plan`
+//! (money: [`buys`]), never a reset claim or low priority (a one-time
+//! allowance), never `Don’t continue automatically`; a menu without the wait
+//! row, or `limit_wait = false`, is a person's.
+//!
 //! [`Approve::Safe`] is the rules below alone, [`Approve::None`] escalates
 //! every box. Under `All` those rules decide first, so a proven-safe box is
 //! ledgered under the rule that proved it.
@@ -143,8 +198,13 @@
 //!   box is a vendor circuit breaker.
 //! * [`RULE_RM_BREAKER`] — the vendor's `Dangerous rm operation on
 //!   possibly-empty variable path` box in a bypass session, when every `rm`
-//!   operand under every reading resolves strictly inside a scratch root
-//!   ([`super::rm_breaker`]) AND the rest of the line is a read
+//!   operand under every reading resolves strictly inside a scratch root,
+//!   as written and where the disk leads it, with no `$(mktemp -d)` it is
+//!   built on able to reach it empty and no variable the line does not
+//!   assign — or is a directory the line's own `mktemp -d` made, `"$D"` or
+//!   a path under it — ([`super::rm_breaker`]; `$TMPDIR` is a root a
+//!   literal path may sit in, never a value) AND the rest of the line is a
+//!   read
 //!   ([`classify_except_rm`]), on a box that runs on this machine (a
 //!   `(runs on <m>)` box's targets resolve there, not here). The rest was
 //!   once left unjudged ("in bypass it
@@ -287,11 +347,15 @@
 //! exempt, and a filter driver counts only where the attributes select it
 //! ([`super::git_config`]).
 //!
-//! Pure but for the Read rule's one look at the filesystem (where the path's
-//! symlinks lead) and the git rule's `git config` in the directories a git read
-//! runs in ([`ApprovalCtx::worker`]): no socket, no clock. The caller supplies the
-//! screen rows, the [`Reading`] of them and an [`ApprovalCtx`] (the session's
-//! cwd, the permission mode its footer last showed, the approve level and roots).
+//! Pure but for two looks at the filesystem, both at where a path's
+//! symlinks lead — the Read rule's, and the rm rule's
+//! ([`super::rm_breaker`], "On the disk"; it runs for every rm breaker it
+//! resolves, under full power too, where it only names the rule) — and the
+//! git rule's `git config` in the directories a git read runs in
+//! ([`ApprovalCtx::worker`]): no socket, no clock. The caller supplies the
+//! screen rows, the [`Reading`] of them and an [`ApprovalCtx`] (the
+//! session's cwd, the permission mode its footer last showed, the approve
+//! level and roots).
 
 use std::path::{Path, PathBuf};
 
@@ -300,16 +364,19 @@ use aterm_phase::prompt::{
 };
 use aterm_phase::{Phase, Program, Reading, anchor};
 
+use super::super::codex_usage::LimitRead;
 use super::super::config::Approve;
 use super::git_config::{GitView, WorkerEnv, git_reads, hazard};
 use super::guard::row_guard;
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
+use super::shell_startup::ShellStartup;
+use super::turn_end::CodexSetting;
 use crate::supervise::classify::{classify_command_with, classify_except_rm, glob_match};
 
 /// The read-only Bash rule's id (the classifier generation it trusts).
 pub const RULE_READ_ONLY: &str = "read-only@classify-v3";
 /// The rm circuit-breaker rule's id.
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v2";
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v3";
 /// The Read-outside-cwd rule's id.
 pub const RULE_READ_OUTSIDE_CWD: &str = "read-outside-cwd@v2";
 /// The folder-trust dialog rule's id.
@@ -327,16 +394,40 @@ pub const RULE_NO_SPEND: &str = "no-spend@v1";
 /// Full power: a box with no yes it may take (a standing grant, a purchase)
 /// and nothing that waits, answered with the refusal that settles nothing.
 pub const RULE_DECLINE: &str = "decline@v1";
-/// Full power: the model-refusal pause (`Session paused`), its `Switch to
-/// <fallback>` — the switch `[harness] model_fallback` already approves for
-/// a model's limit ([`ApprovalCtx::model_fallback`]).
+/// Full power: Claude Code's model-refusal pause (`Session paused`) ALONE,
+/// its `Switch to <model>` while `[harness] model_fallback` is set
+/// ([`ApprovalCtx::model_fallback`], [`refusal_pause_switch`]) — the switch
+/// that setting approves for a model's limit. No other box's switch is ever
+/// pressed under it.
 pub const RULE_MODEL_SWITCH: &str = "model-switch@v1";
+/// Full power, `[harness] rate_nudge`: Codex's rate-limit nudge, its `Switch
+/// to <model>`, pressed only to SAVE THE WORK when Codex's usage window is
+/// near its limit ([`rate_nudge`]). Its approved row opens the switch the
+/// turn-end policy winds down, restores and holds.
+pub const RULE_RATE_NUDGE_SWITCH: &str = "rate-nudge-switch@v1";
+/// Full power, `[harness] rate_nudge`: Codex's rate-limit nudge, its `Keep
+/// current model` — a stale nudge, one while a switch is open, one no usage
+/// reading vouches for ([`rate_nudge`]). Never `… (never show again)`.
+pub const RULE_RATE_NUDGE_KEEP: &str = "rate-nudge-keep@v1";
+/// Full power: the harness's OWN restore of a Codex thread's model after a
+/// save-then-wait switch — the `/model` picker's exact original model and
+/// effort, the effort for this conversation only ([`model_restore_pick`]).
+pub const RULE_MODEL_RESTORE_PICK: &str = "model-restore-pick@v1";
+/// Full power: the LIVE UPGRADE'S OWN resume of a Codex goal it paused for
+/// its move — the paused goal's box the relaunched Codex opens with, its
+/// focused first option, the resume ([`goal_resume_pick`]). Never its other
+/// option, and never a box a person's own `codex resume` drew.
+pub const RULE_GOAL_RESUME: &str = "goal-resume@v1";
 /// A box taller than the screen in a bypass session, DECLINED with what its
 /// foot note flags ([`tall_box`]): it never approves.
 pub const RULE_TALL_BOX: &str = "tall-box@v1";
 /// Full power: the model-switch confirmation's `Yes, switch to <m>` — the
 /// `/model` or `/effort` change the person typed ([`model_confirm`]).
 pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
+/// The usage-limit dialog's rule ([`limit_wait`]): its `Wait here, then
+/// continue automatically …` row, at every level, under
+/// [`ApprovalCtx::limit_wait`].
+pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
 
 /// What every decline's text opens with ([`decline_text`]): Claude Code hands
 /// the text to the worker as the words of the person at the box (`To tell you
@@ -361,13 +452,25 @@ pub enum Choice {
     /// negative), then press Enter once a fresh read shows it on the option
     /// labelled `label` — an unnumbered dialog ([`Select::ArrowsEnter`]):
     /// the folder-trust dialog, and under full power any unnumbered box (the
-    /// `Tool use` box whose vendor default is `No`, Codex's folder gate).
-    /// `steps` 0: the focus is on it already.
+    /// `Tool use` box whose vendor default is `No`, Codex's folder gate) —
+    /// and the usage-limit dialog's wait row, numbered but never chosen by
+    /// its digit ([`limit_wait`]). `steps` 0: the focus is on it already.
     Focus { steps: i32, label: String },
     /// A question dialog's answer ([`super::question::RULE_ANSWER_RECOMMENDED`]):
     /// every key under the screen-generation fence, never unfenced, and
     /// never a digit.
     Answer(Answer),
+    /// Move the focus as [`Self::Focus`] does, then press `key` — not Enter
+    /// — once a fresh read shows it on `label`: Codex's effort boxes' `s`,
+    /// which applies the focused effort to this conversation only, where
+    /// Enter would save it as the default for every new session (the
+    /// footer's `enter default · s session`, measured 0.158.0). Never a
+    /// digit there: a digit chooses as Enter does.
+    FocusKey {
+        steps: i32,
+        label: String,
+        key: &'static str,
+    },
 }
 
 /// How a question dialog is answered ([`Choice::Answer`]). ONE form, on
@@ -413,14 +516,15 @@ pub enum Decision {
     Approve {
         /// Which rule approved ([`RULE_READ_ONLY`], [`RULE_RM_BREAKER`],
         /// [`RULE_READ_OUTSIDE_CWD`], [`RULE_TRUST_DIALOG`], one of full
-        /// power's, or a question's
+        /// power's, [`RULE_LIMIT_WAIT`], or a question's
         /// [`super::question::RULE_ANSWER_RECOMMENDED`]).
         rule_id: &'static str,
         /// The option, and how it is chosen.
         choice: Choice,
         /// The anchored `key if=` pattern of the judged row
         /// ([`super::guard::row_guard`]): the command's first row, the
-        /// path's, the trust dialog's folder.
+        /// path's, the trust dialog's folder, the usage-limit dialog's
+        /// title.
         guard: String,
         /// What was judged: the command or the path; for the rm rule, the
         /// resolved targets follow after ` => `; for a trust dialog's
@@ -610,20 +714,35 @@ pub struct ApprovalCtx {
     /// whatever [`Self::approve`] says: off, it is a person's, as a question
     /// in prose is.
     pub answer_questions: bool,
-    /// Whether full power may switch the session's model on the
+    /// Whether full power may switch the session's model on Claude Code's
     /// model-refusal pause ([`RULE_MODEL_SWITCH`]): `[harness]
     /// model_fallback` set. Written empty, the pause is a person's.
     pub model_fallback: bool,
+    /// What answers Codex's rate-limit nudge ([`rate_nudge`]).
+    pub nudge: NudgeCtx,
+    /// The Codex model and effort the harness's own restore is putting back,
+    /// while it is in flight (`TurnEndState::restore_target`): the only time
+    /// the `/model` picker is answered ([`model_restore_pick`]).
+    pub model_restore: Option<CodexSetting>,
+    /// The LIVE UPGRADE owes this tab's Codex goal its resume — it paused
+    /// the goal for its move (the tab's goal record beside the loop's
+    /// ledger, `harness::goal_hold`): the only time the paused goal's box is
+    /// answered ([`goal_resume_pick`]).
+    pub goal_resume: bool,
+    /// Whether the usage-limit dialog's wait row is chosen
+    /// ([`RULE_LIMIT_WAIT`], `[harness] limit_wait`), whatever
+    /// [`Self::approve`] says: off, the dialog is a person's.
+    pub limit_wait: bool,
     /// Where a folder-trust dialog's folder may be trusted
     /// ([`RULE_TRUST_DIALOG`]).
     pub trust_roots: Vec<ScratchRoot>,
     /// Where a Read box may read ([`RULE_READ_OUTSIDE_CWD`]): the trust
     /// roots and the system roots ([`Self::new`]).
     pub read_roots: Vec<ScratchRoot>,
-    /// Where an rm operand may point ([`RULE_RM_BREAKER`]).
+    /// Where an rm operand may point ([`RULE_RM_BREAKER`]). Empty is the
+    /// rule withheld (the loop clears it for the retired `rm_breaker =
+    /// false`), and then no rm is proven at all ([`RmScope::roots`]).
     pub scratch_roots: Vec<ScratchRoot>,
-    /// The worker's `$TMPDIR`, for `$TMPDIR` and `$(mktemp -d)` on an rm line.
-    pub tmpdir: Option<PathBuf>,
     /// What a Read box may not be approved for, under an allowed root.
     pub secrets: Vec<SecretRule>,
     /// The `python3 <script>` globs the classifier treats as reads (none by
@@ -639,13 +758,23 @@ pub struct ApprovalCtx {
     /// ([`crate::harness::footer::shell_cwds`]): a git read is checked there
     /// too. Empty until the loop reads it for a box that may run git.
     pub shell_cwds: Vec<PathBuf>,
+    /// What the worker's Bash tool's shell starts with beyond the defaults
+    /// the rm rule and the classifier model ([`super::shell_startup::read`]):
+    /// the aliases and functions that fail the lines naming them — or the
+    /// option, variable or file that fails every Bash line, or why the
+    /// startup could not be read. Unread until the loop reads it for a Bash
+    /// box ([`shell_unread`]).
+    pub shell: Result<ShellStartup, String>,
 }
 
 impl ApprovalCtx {
     /// The defaults for a session in `cwd`, owned by `uid` — full power
-    /// ([`Approve::All`], the owner's default), questions answered:
-    /// scratch roots `/private/tmp/claude-<uid>/`, `$TMPDIR` (when it is at
-    /// least two levels deep and holds neither `cwd` nor `home`), any
+    /// ([`Approve::All`], the owner's default), questions answered, the
+    /// usage-limit dialog's wait chosen:
+    /// scratch roots `/private/tmp/claude-<uid>/`, `tmpdir` (this process's
+    /// `$TMPDIR`: a root a literal path may sit in, never what `$TMPDIR`
+    /// means on the worker's line; when it is at least two levels deep and
+    /// holds neither `cwd` nor `home`), any
     /// `/tmp/<x>/` and `/private/tmp/<x>/`, and `<cwd>/target*`; the default
     /// trust roots (`~/aterm*`, `~/ay*`, `$HOME/trust*`,
     /// `/private/tmp/claude-*`; [`Self::set_trust_roots`] replaces them);
@@ -680,13 +809,17 @@ impl ApprovalCtx {
             approve: Approve::All,
             answer_questions: true,
             model_fallback: true,
+            nudge: NudgeCtx::default(),
+            model_restore: None,
+            goal_resume: false,
+            limit_wait: true,
             trust_roots: Vec::new(),
             read_roots: Vec::new(),
             scratch_roots,
-            tmpdir,
             python_allow: Vec::new(),
             worker: worker_unread(),
             shell_cwds: Vec::new(),
+            shell: shell_unread(),
         };
         ctx.set_trust_roots(&defaults, uid);
         ctx
@@ -726,6 +859,47 @@ fn worker_unread() -> Result<WorkerEnv, String> {
     {
         Err("the worker's environment was not read".to_string())
     }
+}
+
+/// What [`ApprovalCtx::shell`] holds before the loop reads the worker's
+/// shell startup: nothing, so no Bash line is proven or read-only — but in
+/// this crate's own unit-test build the defaults the line models assume, so
+/// no test's verdict depends on the developer's shell or live Claude Code
+/// sessions (a test that means the startup sets it).
+fn shell_unread() -> Result<ShellStartup, String> {
+    #[cfg(test)]
+    {
+        Ok(ShellStartup::default())
+    }
+    #[cfg(not(test))]
+    {
+        Err("the Bash tool's shell startup was not read".to_string())
+    }
+}
+
+/// `Ok` when the worker's Bash tool's shell starts as the rm rule and the
+/// classifier model it for every reading ([`ApprovalCtx::shell`],
+/// [`ShellStartup::admits`]); `Err` names the option, alias, function,
+/// variable or file that makes them prove nothing, or why the startup is
+/// unknown. A box that runs on another machine (`runs_on`) has that
+/// machine's startup, which this one cannot read.
+fn shell_models_hold(
+    readings: &[String],
+    runs_on: Option<&str>,
+    ctx: &ApprovalCtx,
+) -> Result<(), String> {
+    if let Some(machine) = runs_on {
+        return Err(format!(
+            "a command on {machine}: the shell startup it runs under is that machine's"
+        ));
+    }
+    let state = ctx.shell.as_ref().map_err(|why| {
+        format!("the Bash tool's shell may not start as this check reads a line: {why}")
+    })?;
+    for line in readings {
+        state.admits(line)?;
+    }
+    Ok(())
 }
 
 /// `spec`, with a `claude-*` glob under `/private/tmp` or `/tmp` narrowed to
@@ -774,7 +948,7 @@ pub fn footer_mode(rows: &[String]) -> Option<FooterMode> {
         if t.contains("plan mode on") {
             return Some(FooterMode::Plan);
         }
-        if t.contains("? for shortcuts") {
+        if t.contains(aterm_phase::anchor("footer.shortcuts")) {
             return Some(FooterMode::Default);
         }
     }
@@ -788,6 +962,23 @@ pub fn footer_mode(rows: &[String]) -> Option<FooterMode> {
 /// `rows` are required, not only the reading: a press is guarded on the
 /// judged row as drawn, and the rows around the box are cross-checked.
 pub fn decide(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision {
+    // The usage-limit dialog is no permission and no question (module
+    // header): its one rule answers it under its own key, FIRST — before the
+    // question rule and before any level, so full power (whose no-spend
+    // answer is `Stop and wait …`, and whose model switch once read `Switch
+    // to usage credits` as one) never sees it.
+    if let Some(prompt) = reading.prompt.as_ref()
+        && prompt.kind == PromptKind::UsageLimit
+    {
+        return if reading.program != Program::Claude
+            || reading.phase != Phase::Prompt
+            || !reading.phase_authoritative
+        {
+            Decision::escalate("no usage-limit dialog the reader vouches for")
+        } else {
+            limit_wait(prompt, rows, ctx)
+        };
+    }
     // A question is no permission (module header): answered under its own
     // key, before any level is consulted.
     if let Some(prompt) = reading.prompt.as_ref()
@@ -1257,7 +1448,6 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         let scope = RmScope {
             cwd: &ctx.cwd,
             home: ctx.home.as_deref(),
-            tmpdir: ctx.tmpdir.as_deref(),
             roots: &ctx.scratch_roots,
         };
         let mut targets = Vec::new();
@@ -1280,6 +1470,12 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
                 ));
             }
         }
+        // After the line's own proof, as the read-only rule orders it: a
+        // line the proof refuses is refused on where it points, and one it
+        // proves still needs the shell startup the proof assumes.
+        if let Err(why) = shell_models_hold(&readings, None, ctx) {
+            return Decision::escalate(format!("rm circuit breaker: {why}"));
+        }
         if let Err(why) = git_reads_clear(&readings, None, ctx) {
             return Decision::escalate(format!("rm circuit breaker: {why}"));
         }
@@ -1301,6 +1497,9 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         return Decision::escalate("a box in a bypass session is a vendor circuit breaker");
     }
     if let Err(why) = read_only_every_reading(&readings, &ctx.python_allow) {
+        return Decision::escalate(why);
+    }
+    if let Err(why) = shell_models_hold(&readings, prompt.runs_on().as_deref(), ctx) {
         return Decision::escalate(why);
     }
     if let Err(why) = git_reads_clear(&readings, prompt.runs_on().as_deref(), ctx) {
@@ -1939,11 +2138,18 @@ fn backstop_warnings(body: &[String]) -> Vec<String> {
 /// the 2.1.282 binary draws that yes exactly when the account holder turned
 /// the credits off and a balance remains (`Usage credits are turned off.
 /// Re-enable to use`), so its yes is spend the account's own setting took
-/// away (the hazards review of 2026-09-25). Consent to go on with credits
+/// away (the hazards review of 2026-09-25). Moving the session onto usage
+/// credits is spend too: the usage-limit dialog's `Switch to usage credits`
+/// (the 2.1.282 `rate_limit_options_menu`'s `extra-usage` row), which opens
+/// with `Switch to ` as the model-refusal pause's switch does and was read as
+/// one ([`switches_model`]) — so it, and any option that opens by naming the
+/// credits, is a purchase wherever it is drawn. Consent to go on with credits
 /// already on (`Continue with …`) buys nothing and is none of them.
 const PURCHASE: &[&str] = &[
     "re-enable",
     "turn on usage credits",
+    "switch to usage credits",
+    "usage credits",
     "buy",
     "purchase",
     "add funds",
@@ -2023,7 +2229,15 @@ fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: Strin
             .map(|o| (RULE_DECLINE, o))
             .ok_or_else(|| "the read-outside setting with no `No`".to_string()),
         PromptKind::ModelSwitch => model_confirm(p, rows),
-        PromptKind::Other => other_dialog(p, ctx),
+        PromptKind::RateNudge => {
+            return match rate_nudge(p, reading.program, ctx) {
+                Ok((rule, o, why)) => answer(p, rows, Ok((rule, o)), why),
+                Err(why) => Decision::escalate(format!("{why} (the safe rules: {safe})")),
+            };
+        }
+        PromptKind::ModelPick => return model_restore_pick(p, rows, reading.program, ctx),
+        PromptKind::GoalResume => return goal_resume_pick(p, rows, reading.program, ctx),
+        PromptKind::Other => other_dialog(reading.program, p, ctx),
         _ => allow_once(p),
     };
     answer(p, rows, pick, safe)
@@ -2182,43 +2396,54 @@ fn consents(opt: &Opt) -> bool {
     CONSENT.iter().any(|w| l.starts_with(w))
 }
 
-/// A dialog of no kind aterm-phase names ([`PromptKind::Other`]): a limit's
-/// consent to go on is accepted (module header); a box whose every yes buys
-/// gets the option that waits; any other — a setup or config dialog: the
-/// auto-mode default, the Chrome upsell, Remote Control, a custom API key,
-/// a model upgrade that restarts — is DECLINED with its refusal
-/// ([`RULE_DECLINE`]): its yes settles something for good (a default mode,
-/// the key's billing, a restart), its `No` or `Not now` settles nothing.
-/// The model-refusal pause (`Session paused`: `Switch to <fallback>` /
-/// `Edit prompt and retry with <model>`) is answered with its switch while
-/// the owner's `[harness] model_fallback` is set ([`RULE_MODEL_SWITCH`]):
-/// the same switch that setting approves for a model's limit, one choice
-/// that grants nothing standing. With none of these it is a person's.
-fn other_dialog<'p>(p: &'p PromptV2, ctx: &ApprovalCtx) -> Result<(&'static str, &'p Opt), String> {
-    if let Some(o) = p.options.iter().find(|o| consents(o) && !buys(o)) {
+/// A dialog of no kind aterm-phase names ([`PromptKind::Other`]): on Claude
+/// Code's screen a limit's consent to go on is accepted (module header) —
+/// on Codex's a `Continue with …` is a model change (`Continue with Luna
+/// Reserve`) or a sign-in (`Continue with detected credentials`), never a
+/// consent; a box whose every yes buys gets the option that waits; any other
+/// — a setup or config dialog: the auto-mode default, the Chrome upsell,
+/// Remote Control, a custom API key, a model upgrade that restarts — is
+/// DECLINED with its refusal ([`RULE_DECLINE`]): its yes settles something
+/// for good (a default mode, the key's billing, a restart), its `No` or `Not
+/// now` settles nothing. Claude Code's model-refusal pause is answered with
+/// its switch while `model_fallback` is set ([`refusal_pause_switch`],
+/// [`RULE_MODEL_SWITCH`]); NO other box's `Switch
+/// to …` is ever chosen here, nor taken for the option that waits. With none
+/// of these it is a person's.
+fn other_dialog<'p>(
+    program: Program,
+    p: &'p PromptV2,
+    ctx: &ApprovalCtx,
+) -> Result<(&'static str, &'p Opt), String> {
+    if program == Program::Claude
+        && let Some(o) = p.options.iter().find(|o| consents(o) && !buys(o))
+    {
         return Ok((RULE_ALLOW_ONCE, o));
     }
-    if let Some(o) = p.options.iter().find(|o| switches_model(o)) {
-        return if ctx.model_fallback {
-            Ok((RULE_MODEL_SWITCH, o))
-        } else {
-            Err(format!(
-                "a model switch (`{}`): model_fallback is off",
-                o.label
-            ))
-        };
+    if let Some(o) = refusal_pause_switch(program, p) {
+        return fallback_switch(o, ctx);
     }
     if p.options.iter().any(buys)
-        && let Some(o) = p.options.iter().find(|o| waits(o) && !buys(o))
+        && let Some(o) = p
+            .options
+            .iter()
+            .find(|o| waits(o) && !buys(o) && !switches_model(o))
     {
         return Ok((RULE_NO_SPEND, o));
     }
     p.with_role(Role::Deny)
+        .filter(|o| !switches_model(o))
         .map(|o| (RULE_DECLINE, o))
         .ok_or_else(|| {
+            let switch = p
+                .options
+                .iter()
+                .find(|o| switches_model(o))
+                .map(|o| format!("its `{}` is no switch aterm makes; ", o.label))
+                .unwrap_or_default();
             format!(
-                "a dialog of no kind aterm reads, with no consent, nothing that waits and no \
-                 refusal among its options ({})",
+                "a dialog of no kind aterm reads, {switch}with no consent, nothing that waits and \
+                 no refusal among its options ({})",
                 p.options
                     .iter()
                     .map(|o| format!("{}:{}", o.role.name(), o.label))
@@ -2228,11 +2453,392 @@ fn other_dialog<'p>(p: &'p PromptV2, ctx: &ApprovalCtx) -> Result<(&'static str,
         })
 }
 
-/// Whether choosing `opt` switches the session's model and nothing more:
-/// the model-refusal pause's `Switch to <model>` (the 2.1.282 render code's
-/// `_5e()`), with no purchase in it.
+/// Whether choosing `opt` switches the session's model: a `Switch to
+/// <model>` label (Claude Code's refusal pause, the 2.1.282 render code's
+/// `_5e()`; Codex's nudge), with no purchase in it.
 fn switches_model(opt: &Opt) -> bool {
     opt.label.trim_start().starts_with("Switch to ") && !buys(opt)
+}
+
+/// CLAUDE CODE'S MODEL-REFUSAL PAUSE, and nothing else: its switch when the
+/// box is exactly it — program Claude, its head read, titled `Session
+/// paused` (anchor `paused.title`), its options exactly `Switch to <model>`
+/// and `Edit prompt and retry…` (anchor `paused.edit`) — Claude Code's
+/// `refusal_fallback_prompt` (2.1.282/2.1.283).
+fn refusal_pause_switch(program: Program, p: &PromptV2) -> Option<&Opt> {
+    if program != Program::Claude || p.head_off_screen || p.title.trim() != anchor("paused.title") {
+        return None;
+    }
+    match p.options.as_slice() {
+        [switch, edit]
+            if switches_model(switch)
+                && edit.label.trim_start().starts_with(anchor("paused.edit")) =>
+        {
+            Some(switch)
+        }
+        _ => None,
+    }
+}
+
+/// The refusal pause's switch `o`, pressed while `model_fallback` is set
+/// ([`RULE_MODEL_SWITCH`]).
+fn fallback_switch<'p>(o: &'p Opt, ctx: &ApprovalCtx) -> Result<(&'static str, &'p Opt), String> {
+    if ctx.model_fallback {
+        Ok((RULE_MODEL_SWITCH, o))
+    } else {
+        Err(format!(
+            "a model switch (`{}`): model_fallback is off",
+            o.label
+        ))
+    }
+}
+
+/// What answers Codex's rate-limit nudge ([`rate_nudge`]): the loop's word
+/// on the session at the moment the box shows. The default is the full-power
+/// default with nothing read: enabled, no switch open, the model and the
+/// usage window unread — which keeps the current model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NudgeCtx {
+    /// `[harness] rate_nudge`: off, the nudge is a person's.
+    pub enabled: bool,
+    /// A save-then-wait switch is open already (winding down, restoring or
+    /// holding): the same nudge again is no new switch.
+    pub open: bool,
+    /// The thread's model and effort as the footer last showed them — the
+    /// box covers the footer, so the loop's cache (`None`: never read).
+    pub from: Option<CodexSetting>,
+    /// What Codex's own records say of its usage window
+    /// ([`crate::supervise::codex_usage::read_limits`]).
+    pub limits: LimitRead,
+}
+
+impl Default for NudgeCtx {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            open: false,
+            from: None,
+            limits: LimitRead::default(),
+        }
+    }
+}
+
+/// A model name as the picker and the nudge compare it: lowercased, its
+/// `(current)` / `(default)` marks dropped, spaces as `-` — `GPT-6-Astra
+/// (default)` and `gpt-6-astra` are one model.
+fn model_key(label: &str) -> String {
+    let mut l = label.trim().to_lowercase();
+    loop {
+        let before = l.len();
+        for mark in [" (current)", " (default)"] {
+            if let Some(head) = l.strip_suffix(mark) {
+                l = head.trim_end().to_string();
+            }
+        }
+        if l.len() == before {
+            break;
+        }
+    }
+    l.split_whitespace().collect::<Vec<_>>().join("-")
+}
+
+/// An effort as the effort boxes and the footer compare it: [`model_key`]'s
+/// marks dropped, `extra high` as the config's `xhigh`.
+fn effort_key(label: &str) -> String {
+    let k = model_key(label);
+    if k == "extra-high" {
+        "xhigh".to_string()
+    } else {
+        k
+    }
+}
+
+/// FULL POWER'S ANSWER TO CODEX'S RATE-LIMIT NUDGE (module header): its
+/// switch ([`RULE_RATE_NUDGE_SWITCH`]) only when every one of these holds —
+/// no switch is open, Codex's usage window reads NEAR its limit, the model
+/// it leaves was read off the footer, and the option names another model;
+/// otherwise its plain keep ([`RULE_RATE_NUDGE_KEEP`]). Never the keep that
+/// never shows it again (a [`Role::Persist`]: it writes Codex's config).
+/// `Err` — a person's — on another program's screen, under `rate_nudge =
+/// false`, and on a nudge without exactly one plain keep. The `String` is
+/// why, for the ledger.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "SupervisorCodexRateNudge",
+        action = "PressSwitch",
+        project = "supervise_conformance_codex_rate_nudge::ph_of"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "SupervisorCodexRateNudge",
+        action = "PressKeep",
+        project = "supervise_conformance_codex_rate_nudge::ph_of"
+    )
+)]
+fn rate_nudge<'p>(
+    p: &'p PromptV2,
+    program: Program,
+    ctx: &ApprovalCtx,
+) -> Result<(&'static str, &'p Opt, String), String> {
+    if program != Program::Codex {
+        return Err(format!(
+            "a rate-limit nudge on a {} session's screen",
+            program.name()
+        ));
+    }
+    if !ctx.nudge.enabled {
+        return Err("rate_nudge is off: Codex's rate-limit model nudge is a person's".to_string());
+    }
+    let keeps: Vec<&Opt> = p
+        .options
+        .iter()
+        .filter(|o| o.role == Role::Deny && o.label == anchor("codex.nudge.keep"))
+        .collect();
+    let [keep] = keeps.as_slice() else {
+        return Err(format!(
+            "a rate-limit nudge without exactly one `{}` ({})",
+            anchor("codex.nudge.keep"),
+            p.options
+                .iter()
+                .map(|o| format!("{}:{}", o.role.name(), o.label))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    let keep_because = |why: String| Ok((RULE_RATE_NUDGE_KEEP, *keep, why));
+    let n = &ctx.nudge;
+    if n.open {
+        return keep_because("a save-then-wait switch is open already".to_string());
+    }
+    let LimitRead::Near { back_at, .. } = &n.limits else {
+        return keep_because(format!("{}: no switch", n.limits.words()));
+    };
+    let Some(from) = &n.from else {
+        return keep_because("the thread's model was never read off its footer".to_string());
+    };
+    let switches: Vec<&Opt> = p
+        .options
+        .iter()
+        .filter(|o| o.role == Role::Other && switches_model(o))
+        .collect();
+    let [switch] = switches.as_slice() else {
+        return keep_because("no one `Switch to <model>` among its options".to_string());
+    };
+    let to = switch
+        .label
+        .trim_start()
+        .trim_start_matches("Switch to ")
+        .trim();
+    if model_key(to) == model_key(&from.model) {
+        return keep_because(format!("its model is the current one, {}", from.model));
+    }
+    Ok((
+        RULE_RATE_NUDGE_SWITCH,
+        *switch,
+        format!(
+            "{}{}: switched only to save the work, then back to {}",
+            n.limits.words(),
+            back_at
+                .map(|t| format!(
+                    ", back at its reset {}",
+                    aterm_types::rfc3339::format_rfc3339(u64::try_from(t).unwrap_or(0))
+                ))
+                .unwrap_or_default(),
+            from.words()
+        ),
+    ))
+}
+
+/// FULL POWER'S ANSWER TO CODEX'S `/model` PICKER: only the harness's OWN
+/// restore in flight ([`ApprovalCtx::model_restore`]) — every other picker
+/// is the person's who opened it. The model box: the option that IS the
+/// original model (its `(current)` / `(default)` marks aside), by the focus
+/// and Enter, which opens its effort box and saves nothing. The effort box,
+/// titled for that model: the original effort by the focus and `s` — this
+/// conversation only — never Enter or a digit, which save it as Codex's
+/// default; `max` and `ultra` by `More reasoning…` (Enter opens the advanced
+/// box). The advanced box: `Max` or `Ultra` by the focus and `s`. A box
+/// offering no `s` (anchor `codex.pick.session`), no exact option, or
+/// titled for another model is escalated.
+fn model_restore_pick(
+    p: &PromptV2,
+    rows: &[String],
+    program: Program,
+    ctx: &ApprovalCtx,
+) -> Decision {
+    match restore_pick(p, rows, program, ctx) {
+        Ok((choice, label, why)) => Decision::Approve {
+            rule_id: RULE_MODEL_RESTORE_PICK,
+            choice,
+            guard: row_guard(&rows[p.span.0.min(rows.len().saturating_sub(1))]),
+            subject: format!("{} => {label}", p.title),
+            unproven: Some(why),
+        },
+        Err(why) => Decision::escalate(why),
+    }
+}
+
+/// FULL POWER'S ANSWER TO CODEX'S PAUSED-GOAL BOX (aterm-phase's
+/// `GoalResume`: the box a `codex resume` with no prompt opens with over a
+/// paused goal): only where the LIVE UPGRADE paused this goal for its move
+/// and owes it its resume ([`ApprovalCtx::goal_resume`]) — the relaunched
+/// Codex opens on it — and only its FOCUSED option when that is the resume
+/// (anchor `codex.goal.resume.yes`, which Codex focuses first: the same
+/// `thread/goal/set … active` as `/goal resume`), pressed by the focus and
+/// Enter under the guard of its row ([`RULE_GOAL_RESUME`]). The upgrade's
+/// own step answers it first where it can (`upgrade_codex_drive`'s
+/// `resume_on_relaunch`); this answers the box that came later. Every other
+/// such box — a person's own `codex resume` over their paused goal, a box
+/// whose focus a person moved — is the person's, escalated, and its `Leave
+/// paused` is never pressed.
+fn goal_resume_pick(
+    p: &PromptV2,
+    rows: &[String],
+    program: Program,
+    ctx: &ApprovalCtx,
+) -> Decision {
+    if program != Program::Codex || !ctx.goal_resume {
+        return Decision::escalate(
+            "Codex asks whether to resume a paused goal aterm did not pause: the person's",
+        );
+    }
+    let Some(o) = p.options.iter().find(|o| o.focused) else {
+        return Decision::escalate("the paused goal's box with no focused option");
+    };
+    if o.label != anchor("codex.goal.resume.yes") || o.row >= rows.len() {
+        return Decision::escalate(format!(
+            "the paused goal's box has `{}` focused, not the resume: the person's",
+            o.label
+        ));
+    }
+    Decision::Approve {
+        rule_id: RULE_GOAL_RESUME,
+        choice: Choice::Focus {
+            steps: 0,
+            label: o.label.clone(),
+        },
+        guard: row_guard(&rows[o.row]),
+        subject: format!("{} => {}", p.title, o.label),
+        unproven: Some("the live upgrade's resume of the goal it paused for its move".to_string()),
+    }
+}
+
+fn restore_pick(
+    p: &PromptV2,
+    rows: &[String],
+    program: Program,
+    ctx: &ApprovalCtx,
+) -> Result<(Choice, String, String), String> {
+    if program != Program::Codex {
+        return Err(format!(
+            "a model picker on a {} session's screen",
+            program.name()
+        ));
+    }
+    let Some(target) = &ctx.model_restore else {
+        return Err(
+            "Codex's model picker, not opened by the harness's own restore: the person's"
+                .to_string(),
+        );
+    };
+    let title = p.title.trim();
+    let focus_to = |o: &Opt| -> Result<i32, String> {
+        let at = p
+            .options
+            .iter()
+            .position(|q| q.focused)
+            .ok_or_else(|| "a picker with no focused option".to_string())?;
+        let to = p
+            .options
+            .iter()
+            .position(|q| std::ptr::eq(q, o))
+            .unwrap_or(at);
+        Ok(i32::try_from(to).unwrap_or(0) - i32::try_from(at).unwrap_or(0))
+    };
+    let find =
+        |want: &str, key: fn(&str) -> String| p.options.iter().find(|o| key(&o.label) == key(want));
+    let session_key = || {
+        let footer = rows.get(p.span.1).map_or("", |r| r.as_str());
+        if footer.contains(anchor("codex.pick.session")) {
+            Ok(())
+        } else {
+            Err(format!(
+                "`{title}` offers no this-conversation choice (`{}`): Enter would save a default",
+                anchor("codex.pick.session")
+            ))
+        }
+    };
+    let why = format!("the harness's own restore to {}", target.words());
+    if title == anchor("codex.pick.model") {
+        let o = find(&target.model, model_key)
+            .ok_or_else(|| format!("`{title}` lists no {}", target.model))?;
+        return Ok((
+            Choice::Focus {
+                steps: focus_to(o)?,
+                label: o.label.clone(),
+            },
+            o.label.clone(),
+            why,
+        ));
+    }
+    let effort = target
+        .effort
+        .as_deref()
+        .ok_or_else(|| format!("the effort {} ran at was never read", target.model))?;
+    let advanced = matches!(effort_key(effort).as_str(), "max" | "ultra");
+    if let Some(model) = title.strip_prefix(anchor("codex.pick.effort")) {
+        if model_key(model) != model_key(&target.model) {
+            return Err(format!(
+                "`{title}` is for another model than {}",
+                target.model
+            ));
+        }
+        if advanced {
+            let o = find(anchor("codex.pick.more"), model_key)
+                .ok_or_else(|| format!("`{title}` has no `{}`", anchor("codex.pick.more")))?;
+            return Ok((
+                Choice::Focus {
+                    steps: focus_to(o)?,
+                    label: o.label.clone(),
+                },
+                o.label.clone(),
+                why,
+            ));
+        }
+        session_key()?;
+        let o = find(effort, effort_key)
+            .ok_or_else(|| format!("`{title}` lists no effort {effort}"))?;
+        return Ok((
+            Choice::FocusKey {
+                steps: focus_to(o)?,
+                label: o.label.clone(),
+                key: "s",
+            },
+            o.label.clone(),
+            why,
+        ));
+    }
+    if title == anchor("codex.pick.advanced") && advanced {
+        session_key()?;
+        let o = find(effort, effort_key)
+            .ok_or_else(|| format!("`{title}` lists no effort {effort}"))?;
+        return Ok((
+            Choice::FocusKey {
+                steps: focus_to(o)?,
+                label: o.label.clone(),
+                key: "s",
+            },
+            o.label.clone(),
+            why,
+        ));
+    }
+    Err(format!(
+        "`{title}` is no step of the restore to {}",
+        target.words()
+    ))
 }
 
 /// The words only plan mode's boxes' options carry, lowercased (Claude Code
@@ -2401,6 +3007,68 @@ fn judged_row(p: &PromptV2, rows: &[String]) -> usize {
             .or(p.question.filter(|&q| q < rows.len() && p.path.is_some())),
     };
     own.unwrap_or(p.span.0)
+}
+
+/// The usage-limit options dialog ([`RULE_LIMIT_WAIT`], module header): its
+/// wait row, by label, reached with the arrows from where the focus is and
+/// confirmed with Enter once a fresh read shows the focus on it (the loop's
+/// part, `press_focused`) — the same verified path as the trust dialog, never
+/// a digit, never Esc. The guard is the dialog's own title row. Nothing else
+/// on it is ever chosen: a menu with no wait row (or more than one), with no
+/// focus, or with the rule off is a person's.
+fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
+    if !ctx.limit_wait {
+        return Decision::escalate("a usage-limit dialog (limit_wait is off)");
+    }
+    let title = anchor("limit.title");
+    if prompt.title != title {
+        return Decision::escalate(format!(
+            "a usage-limit dialog whose title is not `{title}`: {}",
+            prompt.title
+        ));
+    }
+    let waits: Vec<usize> = (0..prompt.options.len())
+        .filter(|&k| prompt.options[k].role == Role::AutoResume)
+        .collect();
+    let [target] = waits.as_slice() else {
+        return Decision::escalate(format!(
+            "a usage-limit dialog with {} `{} …` row{} ({}): only that row is chosen, never \
+             stop, usage credits, an upgrade or a reset claim",
+            if waits.is_empty() {
+                "no"
+            } else {
+                "more than one"
+            },
+            anchor("limit.wait"),
+            if waits.is_empty() { "" } else { "s" },
+            prompt
+                .options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    };
+    if buys(&prompt.options[*target]) {
+        return Decision::escalate("a usage-limit dialog whose wait row reads as a purchase");
+    }
+    let Some(at) = prompt.options.iter().position(|o| o.focused) else {
+        return Decision::escalate("a usage-limit dialog with no focused option");
+    };
+    let Some(title_row) = rows.get(prompt.span.0).filter(|r| r.trim() == title) else {
+        return Decision::escalate("the usage-limit dialog's title is not on the screen");
+    };
+    let label = prompt.options[*target].label.clone();
+    Decision::Approve {
+        rule_id: RULE_LIMIT_WAIT,
+        choice: Choice::Focus {
+            steps: focus_steps(at, *target),
+            label: label.clone(),
+        },
+        guard: row_guard(title_row),
+        subject: label,
+        unproven: None,
+    }
 }
 
 #[cfg(test)]

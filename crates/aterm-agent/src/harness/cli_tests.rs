@@ -50,9 +50,12 @@ fn env_at(tmp: &Tmp) -> Env {
         aterm_state: Some(tmp.path().join("aterm-state")),
         cwd: tmp.path().join("work"),
         home: Some(tmp.path().join("home")),
+        claude_dir: None,
+        claude_config_unusable: None,
+        claude_session: None,
+        claude_pid: None,
         now: 1_758_412_800, // 2025-09-21T00:00:00Z — fixed, never `now()`.
         sid: "s-test".to_string(),
-        utc_offset_s: 0,
         sock: None,
         config: Some(tmp.path().join("aterm.toml")),
     }
@@ -168,14 +171,11 @@ fn the_grammar_parses_what_the_help_text_advertises() {
         assert_eq!(got, want, "{line}");
     }
     assert_eq!(parse(&[]).expect("empty").0, Cmd::Help);
-    let (_, over) = parse(&words(
-        "usage --state /s --config /c.toml --sock /a.sock --utc-offset 3600",
-    ))
-    .expect("the environment flags parse");
+    let (_, over) = parse(&words("usage --state /s --config /c.toml --sock /a.sock"))
+        .expect("the environment flags parse");
     assert_eq!(over.state, Some(PathBuf::from("/s")));
     assert_eq!(over.config, Some(PathBuf::from("/c.toml")));
     assert_eq!(over.sock.as_deref(), Some("/a.sock"));
-    assert_eq!(over.utc_offset_s, Some(3600));
 }
 
 /// What it does not know is refused, and the hook-era ring names are gone.
@@ -194,6 +194,8 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "ledger statusline",
         "disk --apply everything",
         "usage --bogus",
+        // Retired 2026-09-27 with the windows it placed on the clock.
+        "usage --utc-offset 3600",
         "usage --state",
         "upgrade abc",
         // The loop is gone: the window's host takes the steps, on a push.
@@ -394,6 +396,14 @@ fn usage_folds_the_newest_transcript_and_says_what_that_costs() {
 
     let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
     assert!(ok);
+    // The HUD line, whole: the model the newest row names, and no window —
+    // nothing here reads one (the statusLine reader went 2026-09-27; every
+    // live `harness usage` printed `?%` before it did too).
+    assert_eq!(
+        out.lines().next(),
+        Some("fable ?%/5h · ?%/7d · acct account · resets ? · none  [source=transcript-newest]"),
+        "{out}"
+    );
     assert!(out.contains("source=transcript-newest"), "{out}");
     assert!(out.contains("session-a.jsonl"), "the path is named: {out}");
     assert!(out.contains("2 assistant rows"), "{out}");
@@ -409,6 +419,199 @@ fn usage_folds_the_newest_transcript_and_says_what_that_costs() {
     );
     assert!(json.contains("claude-fable-5-1"), "{json}");
     assert!(json.contains("107"), "the input tokens are summed: {json}");
+    // Schema 1's `windows` stays an empty object, and the model is named.
+    assert!(json.contains("\"windows\":{}"), "{json}");
+    assert!(json.contains("\"model\":\"claude-fable-5-1\""), "{json}");
+}
+
+/// A `CLAUDE_CONFIG_DIR` set to a RELATIVE path names a directory relative
+/// to Claude Code's own working directory, which this command cannot know:
+/// `usage` folds nothing and says why, rather than folding `~/.claude`'s
+/// newest transcript — another configuration's sessions. Control: unset, the
+/// same `~/.claude` transcript folds.
+#[test]
+fn usage_with_a_relative_claude_config_dir_folds_nothing_and_says_so() {
+    let tmp = Tmp::new("usage-relative-config");
+    let mut env = env_at(&tmp);
+    let dir = env
+        .transcripts_root()
+        .expect("home is injected")
+        .join(project_dir_name(&env.cwd));
+    std::fs::create_dir_all(&dir).expect("project dir");
+    std::fs::write(
+        dir.join("other-config.jsonl"),
+        r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":5}}}
+"#,
+    )
+    .expect("transcript");
+    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    assert!(out.contains("other-config.jsonl"), "control: {out}");
+
+    env.claude_config_unusable = Some("cfg".to_owned());
+    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    assert!(ok);
+    assert!(out.contains("source=none"), "{out}");
+    assert!(!out.contains("other-config.jsonl"), "{out}");
+    assert!(
+        out.contains("CLAUDE_CONFIG_DIR is \"cfg\", not an absolute path"),
+        "{out}"
+    );
+    let (_, json, _) = go(&Cmd::Usage { json: true }, &env);
+    let doc: Value = aterm_json::from_str(&json).expect("json");
+    assert_eq!(doc["transcript_pick"].as_str(), Some("none"), "{json}");
+    assert_eq!(
+        doc["claude_config_dir_unusable"].as_str(),
+        Some("cfg"),
+        "{json}"
+    );
+}
+
+/// Run from a Claude Code session, `usage` folds THAT session's transcript —
+/// the one `CLAUDE_CODE_SESSION_ID` names — and its subagents', never the
+/// newer file another session in the same directory wrote. Named but not yet
+/// written is nothing, not the neighbour's file. `CLAUDE_PID`'s sessions
+/// file names it too, and `CLAUDE_CONFIG_DIR` is where it is looked for.
+/// Negative control: without a name, the newest (the neighbour's) is what
+/// folds, labelled so. The JSON only ADDS keys to schema 1.
+#[test]
+fn usage_folds_the_session_claude_code_names_not_the_newest() {
+    let tmp = Tmp::new("usage-named");
+    let mut env = env_at(&tmp);
+    // A Claude directory of its own (`CLAUDE_CONFIG_DIR`), not `~/.claude`.
+    env.claude_dir = Some(tmp.path().join("claude-config"));
+    let dir = env
+        .transcripts_root()
+        .expect("a claude dir")
+        .join(project_dir_name(&env.cwd));
+    assert!(dir.starts_with(tmp.path().join("claude-config")), "{dir:?}");
+    std::fs::create_dir_all(dir.join("mine-1").join("subagents")).expect("project dir");
+    let row = |id: &str, model: &str, output: u64| {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{id}\",\"model\":\"{model}\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":{output}}}}}}}\n"
+        )
+    };
+    std::fs::write(dir.join("mine-1.jsonl"), row("m1", "claude-opus-5-5", 1234)).expect("mine");
+    // A subagent's message streamed over two rows: counted once, at its end.
+    std::fs::write(
+        dir.join("mine-1").join("subagents").join("agent-a.jsonl"),
+        format!(
+            "{}{}",
+            row("s1", "claude-haiku-4-5", 4),
+            row("s1", "claude-haiku-4-5", 40)
+        ),
+    )
+    .expect("subagent");
+    // The neighbour wrote LAST: newest-by-mtime would pick it.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        dir.join("theirs-2.jsonl"),
+        row("t1", "claude-opus-5-5", 99_999),
+    )
+    .expect("theirs");
+
+    env.claude_session = Some("mine-1".to_owned());
+    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    assert!(ok);
+    assert!(out.contains("source=transcript]"), "{out}");
+    assert!(out.contains("mine-1.jsonl"), "the path is named: {out}");
+    assert!(out.contains("+1 subagent transcripts"), "{out}");
+    assert!(
+        out.contains("opus 1 in 1.2k out"),
+        "this session's opus: {out}"
+    );
+    assert!(
+        out.contains("haiku 1 in 40 out"),
+        "its subagent's haiku, at its final figures: {out}"
+    );
+    let token_lines: String = out
+        .lines()
+        .take_while(|l| !l.starts_with("SPEND folded from"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !token_lines.contains("99"),
+        "never the neighbour's tokens: {out}"
+    );
+    assert!(out.contains("CLAUDE_CODE_SESSION_ID"), "{out}");
+    let (_, json, _) = go(&Cmd::Usage { json: true }, &env);
+    let doc: Value = aterm_json::from_str(&json).expect("json");
+    assert_eq!(doc["schema"].as_u64(), Some(1));
+    assert_eq!(doc["source"].as_str(), Some("transcript"), "{json}");
+    assert_eq!(
+        doc["transcript_pick"].as_str(),
+        Some("session-id"),
+        "{json}"
+    );
+    assert_eq!(doc["subagent_transcripts"].as_u64(), Some(1), "{json}");
+    assert_eq!(doc["complete"].as_bool(), Some(true), "{json}");
+    let haiku = &doc["usage"]["accounts"][0]["spend"]["claude-haiku-4-5"];
+    assert_eq!(haiku["out"].as_u64(), Some(40), "{json}");
+
+    // A subagent transcript that exists and cannot be read is NOT in the
+    // totals, and the output says so.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let locked = dir.join("mine-1").join("subagents").join("agent-b.jsonl");
+        std::fs::write(&locked, row("s2", "claude-haiku-4-5", 7)).expect("subagent");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+        let (_, json, _) = go(&Cmd::Usage { json: true }, &env);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::fs::remove_file(&locked).expect("unlock");
+        assert!(out.contains("+1 unread"), "{out}");
+        assert!(
+            out.contains("1 subagent transcripts are NOT in these totals"),
+            "{out}"
+        );
+        assert!(
+            out.contains("past the 2048 files one session's fold follows"),
+            "{out}"
+        );
+        assert!(!out.contains("PREFIX"), "the cap did not stop it: {out}");
+        assert!(json.contains("\"complete\":false"), "{json}");
+        assert!(json.contains("\"subagent_transcripts_unread\":1"), "{json}");
+    }
+
+    env.claude_session = Some("not-written-yet".to_owned());
+    let (ok, out, _) = go(&Cmd::Usage { json: false }, &env);
+    assert!(ok);
+    assert!(out.contains("source=none"), "{out}");
+    assert!(
+        out.contains("not-written-yet has written no transcript"),
+        "{out}"
+    );
+
+    // A build that names only the PROCESS (`CLAUDE_PID`).
+    env.claude_session = None;
+    let claude = env.claude_dir().expect("a claude dir");
+    std::fs::create_dir_all(claude.join("sessions")).expect("sessions dir");
+    std::fs::write(
+        claude.join("sessions").join("777.json"),
+        format!(
+            r#"{{"pid":777,"sessionId":"mine-1","cwd":"{}"}}"#,
+            env.cwd.display()
+        ),
+    )
+    .expect("sessions file");
+    env.claude_pid = Some(777);
+    assert_eq!(
+        pick_transcript(&env),
+        Pick::Named {
+            path: dir.join("mine-1.jsonl"),
+            how: "claude-pid"
+        }
+    );
+    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    assert!(out.contains("named by CLAUDE_PID"), "{out}");
+    env.claude_pid = None;
+
+    let (_, out, _) = go(&Cmd::Usage { json: false }, &env);
+    assert!(
+        out.contains("theirs-2.jsonl"),
+        "the control: newest wins: {out}"
+    );
+    assert!(out.contains("source=transcript-newest"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
@@ -754,28 +957,41 @@ fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
     assert!(USAGE.contains(&format!("{} MiB", DISK_LEDGER_MAX_BYTES / (1024 * 1024))));
 }
 
-/// THE HOST'S TICK: at or above the automatic floor it reads nothing and
-/// writes nothing; below it the stale build directory is removed and the
-/// report, the removal (with its witness) and nothing else land in the disk
-/// ledger. `[disk] auto_free_gib` moves the floor; `0` turns it off.
+/// `now` far enough past the files a test just wrote that every profile in
+/// them is idle.
+fn idle_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap())
+        .unwrap()
+        + (disk::DEFAULT_TARGET_STALE_DAYS + 1) * 86_400
+}
+
+/// The real remover the window's tick runs, at `now`, on any device.
+fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed> {
+    disk::remover(disk::Judge {
+        now,
+        threshold_days: disk::DEFAULT_TARGET_STALE_DAYS,
+        device: None,
+    })
+}
+
+/// THE HOST'S TICK, ON A BUILD DIRECTORY LAID OUT AS CARGO LAYS ONE: at or
+/// above the automatic floor it reads nothing and writes nothing; below it
+/// the idle profile's `incremental/` — and nothing else of the build
+/// directory — is reclaimed, and the report, the intent row (BEFORE the
+/// removal) and the outcome row (with its witness, the bytes actually
+/// released and the unit that went) land in the disk ledger, in that order.
+/// `[disk] auto_free_gib` moves the floor; `0` turns it off.
+///
+/// The fixture plants NO root `.cargo-lock` (cargo never writes one); the
+/// witness that dated a build directory by one could never pass here.
 #[test]
 fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
     let tmp = Tmp::new("disk-tick");
     let state = tmp.path().join("state");
-    let target = tmp.path().join("repo/target");
-    std::fs::create_dir_all(target.join("debug")).expect("target");
-    std::fs::write(
-        target.join("CACHEDIR.TAG"),
-        format!("{}\n", disk::CACHEDIR_SIGNATURE),
-    )
-    .expect("tag");
-    std::fs::write(target.join(disk::CARGO_LOCK_FILE), b"").expect("lock");
-    std::fs::write(target.join("debug/blob"), vec![1u8; 2048]).expect("blob");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap())
-        .unwrap()
-        + (disk::DEFAULT_TARGET_STALE_DAYS + 1) * 86_400;
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let now = idle_now();
     let gib = 1024 * 1024 * 1024;
     let cfg = disk::Config::default();
     let targets = [target.clone()];
@@ -788,9 +1004,12 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
         transcripts: None,
         now,
     };
-    let plenty = disk_tick(&look(Some(cfg.auto_free_gib * gib)), cfg, &mut |p| {
-        panic!("removed {} above the floor", p.display())
-    });
+    let plenty = disk_tick(
+        &look(Some(cfg.auto_free_gib * gib)),
+        cfg,
+        &mut |row| panic!("removed {} above the floor", row.path.display()),
+        &mut disk::tests::no_pressure,
+    );
     assert_eq!(plenty, DiskTick::Plenty);
     assert!(
         !state.join(DISK_LEDGER).exists(),
@@ -800,50 +1019,452 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
         auto_free_gib: 0,
         ..cfg
     };
-    let tick = disk_tick(&look(Some(1)), off, &mut |p| {
-        panic!("removed {} with the floor off", p.display())
-    });
+    let tick = disk_tick(
+        &look(Some(1)),
+        off,
+        &mut |row| panic!("removed {} with the floor off", row.path.display()),
+        &mut disk::tests::no_pressure,
+    );
     assert_eq!(tick, DiskTick::Plenty);
 
-    let DiskTick::Reclaimed(done) = disk_tick(&look(Some(gib)), cfg, &mut disk::remove_tree) else {
+    let DiskTick::Reclaimed(done) = disk_tick(
+        &look(Some(gib)),
+        cfg,
+        &mut real_remover(now),
+        &mut disk::tests::no_pressure,
+    ) else {
         panic!("below the floor, the tick applies");
     };
     assert_eq!(done.removed.len(), 1, "{done:?}");
-    assert!(!target.exists(), "the stale target is gone");
+    assert!(done.denials.is_empty(), "{done:?}");
+    assert!(target.join("debug").exists(), "the build directory stays");
+    assert!(
+        !target.join("debug/incremental").exists(),
+        "its idle incremental/ is gone"
+    );
+    for kept in [
+        "CACHEDIR.TAG",
+        "debug/deps/liblay.rlib",
+        "debug/build",
+        "debug/.fingerprint",
+    ] {
+        assert!(target.join(kept).exists(), "{kept} is kept");
+    }
+    let freed = done.removed[0].1.bytes;
+    assert!(freed >= 8192, "the query cache's blocks: {done:?}");
+    assert_eq!(done.freed_bytes, freed);
+    let ledger = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
+    let rows: Vec<&str> = ledger.lines().collect();
+    assert_eq!(rows.len(), 3, "{ledger}");
+    assert!(rows[0].contains("\"trigger\":\"tick\""), "{}", rows[0]);
+    assert!(rows[1].contains("\"kind\":\"removing\""), "{}", rows[1]);
+    assert!(rows[2].contains("\"kind\":\"removed\""), "{}", rows[2]);
+    assert!(rows[2].contains("stale-build-dir"), "{}", rows[2]);
+    assert!(
+        rows[2].contains(&format!("\"freed_bytes\":{freed}")),
+        "{}",
+        rows[2]
+    );
+    assert!(rows[2].contains("debug/incremental"), "{}", rows[2]);
+}
+
+/// `aterm harness disk --help` states the idle window's shipped default, one
+/// day, where it defines idle and again where it says what the tick takes
+/// under the floor: least recently used first, the stop (the floor plus
+/// [`disk::PRESSURE_MARGIN_GIB`], or the counted bytes), the minutes every
+/// reclaim leaves alone ([`disk::PRESSURE_MIN_IDLE_S`]), the headline's
+/// upper bound, and what the window still means.
+#[test]
+fn the_disk_help_states_the_one_day_window() {
+    let flat = USAGE.split_whitespace().collect::<Vec<_>>().join(" ");
+    let days = disk::DEFAULT_TARGET_STALE_DAYS;
+    for said in [
+        format!("`disk.target_stale_days` (default {days} day:"),
+        format!("within `disk.target_stale_days` ({days} day), measuring free space again"),
+        // The rule under pressure, and what the window still means.
+        "LEAST RECENTLY USED FIRST: every idle profile's cache, then, one profile at a time \
+         and oldest first"
+            .to_owned(),
+        format!(
+            "stopping once it is back at the floor plus {} GiB",
+            disk::PRESSURE_MARGIN_GIB
+        ),
+        // The second stop: the counted bytes, for a figure that does not
+        // rise (review follow-up, 2026-09-28).
+        "or once the bytes those removals released cover what free space was short".to_owned(),
+        format!(
+            "No reclaim, the tick's or this verb's, takes a profile written into within the last {} min",
+            disk::PRESSURE_MIN_IDLE_S / 60
+        ),
+        "not even at `target_stale_days = 0`".to_owned(),
+        "`under_pressure_up_to=` is what every one of them would free, an upper bound".to_owned(),
+        "no longer keeps a recently built checkout's cache once the volume is under the floor"
+            .to_owned(),
+    ] {
+        assert!(flat.contains(&said), "missing {said:?}:\n{USAGE}");
+    }
+}
+
+/// Set the mtime of the directory at `path` to `at` (unix seconds).
+fn set_mtime(path: &Path, at: i64) {
+    let when = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
+    std::fs::File::open(path)
+        .and_then(|f| f.set_modified(when))
+        .expect("set mtime");
+}
+
+/// A build directory at `<tmp>/<name>` holding `debug/`, built just now, and
+/// `release/`, whose compile outputs were last written two days before `now`.
+fn two_day_old_release(tmp: &Tmp, name: &str, now: i64) -> PathBuf {
+    let target = disk::tests::lay_target(&tmp.path().join(name));
+    disk::tests::lay_profile(&target.join("release"));
+    for c in ["deps", ".fingerprint", "build"] {
+        set_mtime(&target.join("release").join(c), now - 2 * 86_400);
+    }
+    target
+}
+
+/// One tick below the floor over `target`, under `cfg` and on the real
+/// remover judging by `cfg`'s own window, as the window's host runs it, free
+/// space measured again through `measure`.
+fn tick_below_floor(
+    tmp: &Tmp,
+    target: &Path,
+    now: i64,
+    cfg: disk::Config,
+    measure: &mut disk::Measure<'_>,
+) -> disk::Applied {
+    let state = tmp.path().join("state");
+    let targets = [target.to_path_buf()];
+    let look = DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free: Some(1024 * 1024 * 1024),
+        targets: &targets,
+        transcripts: None,
+        now,
+    };
+    let mut remover = disk::remover(disk::Judge {
+        now,
+        threshold_days: cfg.target_stale_days,
+        device: None,
+    });
+    let DiskTick::Reclaimed(done) = disk_tick(&look, cfg, &mut remover, measure) else {
+        panic!("below the floor, the tick applies");
+    };
+    done
+}
+
+/// THE SHIPPED WINDOW IS ONE DAY, AND IT REACHES THE CACHES AN AGENT LEFT.
+/// The tick reads `[disk]` with no file (the default the window runs with),
+/// on the real clock: one build directory holds a profile no compile has
+/// written into for two days (`release/`) and one built just now
+/// (`debug/`). Below the floor the idle one's `incremental/` goes and the
+/// fresh one's stays. At the old default, 14 days, the two-day profile was
+/// not idle and the tick took nothing: the agents' build directories are
+/// written into daily (measured 2026-09-27), so it never freed a byte.
+/// An explicit `target_stale_days = 14` is still read as written: the
+/// two-day profile is not idle, so it is kept once free space measured
+/// again is back — and, since 2026-09-28, taken (least recently used first)
+/// while the volume is still short. The profile built just now is kept
+/// either way: it is inside the ten minutes every build keeps.
+#[test]
+fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today() {
+    let tmp = Tmp::new("disk-window");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap())
+        .unwrap();
+    let target = two_day_old_release(&tmp, "repo/target", now);
+    let cfg = disk_config_at(None);
+    assert_eq!(cfg.target_stale_days, 1, "the shipped idle window");
+    let done = tick_below_floor(&tmp, &target, now, cfg, &mut disk::tests::no_pressure);
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert!(done.denials.is_empty(), "{done:?}");
+    assert!(
+        !target.join("release/incremental").exists(),
+        "the profile idle two days gives up its incremental/"
+    );
+    assert!(
+        target
+            .join("debug/incremental/lay-1x2y3z/s-abc-def/query-cache.bin")
+            .exists(),
+        "the profile built today keeps its cache"
+    );
+    for kept in [
+        "release/deps/liblay.rlib",
+        "release/.fingerprint",
+        "release/build",
+    ] {
+        assert!(target.join(kept).exists(), "{kept} is kept");
+    }
+    let units = &done.removed[0].1.units;
+    assert_eq!(units.len(), 1, "{units:?}");
+    assert!(units[0].ends_with("release/incremental"), "{units:?}");
+
+    // An explicit setting is read as written: at 14 the same two-day
+    // profile is not idle. Free space measured again is back above the
+    // floor: the pressure pass stops before it, and nothing goes.
+    let tmp = Tmp::new("disk-window-explicit");
+    let target = two_day_old_release(&tmp, "repo/target", now);
+    let config = tmp.path().join("aterm.toml");
+    std::fs::write(&config, "[disk]\ntarget_stale_days = 14\n").expect("write");
+    let cfg = disk_config_at(Some(&config));
+    assert_eq!(cfg.target_stale_days, 14);
+    let done = tick_below_floor(&tmp, &target, now, cfg, &mut || Some(u64::MAX));
+    assert!(done.removed.is_empty(), "{done:?}");
+    assert!(
+        done.stopped.as_ref().is_some_and(|s| s.left == 1),
+        "{done:?}"
+    );
+    assert!(target.join("release/incremental").exists());
+    assert!(target.join("debug/incremental").exists());
+    // Still short: the two-day profile goes, the one built just now stays.
+    let done = tick_below_floor(&tmp, &target, now, cfg, &mut || Some(1));
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert!(done.removed[0].1.units[0].ends_with("release/incremental"));
+    assert!(!target.join("release/incremental").exists());
+    assert!(target.join("debug/incremental").exists());
+}
+
+/// THE HOST'S TICK UNDER PRESSURE, END TO END: every profile in the agents'
+/// build directories is hours old (the machine measured 2026-09-27/28, where
+/// the idle window alone took nothing). Below the floor the least recently
+/// used profile gives up its `incremental/`; free space measured again is
+/// back above the floor plus the margin, so the pass stops, and the disk
+/// ledger holds the report, the intent, the outcome (its witness and the
+/// bytes released) and the stop, in that order.
+#[cfg(unix)]
+#[test]
+fn the_disk_tick_under_pressure_takes_the_oldest_profile_and_stops_when_free() {
+    let tmp = Tmp::new("disk-pressure-tick");
+    let state = tmp.path().join("state");
+    let (a, b, now) = disk::pressure_tests::three_recent(tmp.path());
+    let gib = 1024 * 1024 * 1024;
+    let cfg = disk::Config::default();
+    let targets = [a.clone(), b.clone()];
+    let look = DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free: Some(gib),
+        targets: &targets,
+        transcripts: None,
+        now,
+    };
+    let mut reads = Vec::new();
+    let mut measure = || {
+        let free = if reads.is_empty() { gib } else { 20 * gib };
+        reads.push(free);
+        Some(free)
+    };
+    let DiskTick::Reclaimed(done) = disk_tick(&look, cfg, &mut real_remover(now), &mut measure)
+    else {
+        panic!("below the floor, the tick applies");
+    };
+    assert_eq!(
+        reads.len(),
+        2,
+        "measured before each pressure row it reached"
+    );
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert_eq!(done.removed[0].0.path, b.join("debug"));
+    assert!(!b.join("debug/incremental").exists());
+    assert!(a.join("debug/incremental").exists());
+    assert!(a.join("release/incremental").exists());
+    let ledger = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
+    let rows: Vec<&str> = ledger.lines().collect();
+    assert_eq!(rows.len(), 4, "{ledger}");
+    assert!(rows[0].contains("\"kind\":\"report\""), "{}", rows[0]);
+    assert!(rows[1].contains("\"kind\":\"removing\""), "{}", rows[1]);
+    assert!(rows[2].contains("\"kind\":\"removed\""), "{}", rows[2]);
+    assert!(rows[2].contains("least-recently-used"), "{}", rows[2]);
+    assert!(
+        rows[2].contains(&format!("\"freed_bytes\":{}", done.freed_bytes)),
+        "{}",
+        rows[2]
+    );
+    assert!(rows[3].contains("\"kind\":\"stopped\""), "{}", rows[3]);
+    assert!(rows[3].contains("\"left\":2"), "{}", rows[3]);
+}
+
+/// THE OWNER'S VERB SAYS WHAT IT WOULD TAKE UNDER PRESSURE, AND TAKES IT.
+/// With the floor set above the scratch volume's free space (so `df` reads
+/// it as short), `aterm harness disk <dirs>` lists every recent profile as
+/// a least-recently-used row, OLDEST FIRST — not in path order — and says
+/// the pass measures again before each; with `disk.apply = true`,
+/// `--apply cargo-targets` takes them in that order while the volume stays
+/// short, and journals each.
+#[cfg(unix)]
+#[test]
+fn the_verb_says_what_it_would_take_under_pressure_in_order() {
+    let tmp = Tmp::new("disk-pressure-verb");
+    let (a, b, now) = disk::pressure_tests::three_recent(tmp.path());
+    let env = Env {
+        now,
+        ..env_at(&tmp)
+    };
+    std::fs::create_dir_all(&env.cwd).expect("the working directory");
+    let config = env.config.clone().expect("config");
+    std::fs::write(&config, "[disk]\nauto_free_gib = 1000000000\n").expect("write");
+    let report_only = Cmd::Disk {
+        targets: vec![a.clone(), b.clone()],
+        apply: None,
+        json: false,
+    };
+    let (ok, out, err) = go(&report_only, &env);
+    assert!(ok, "{err}");
+    let at = |p: &Path| {
+        out.find(&format!("{} — ", p.display()))
+            .unwrap_or_else(|| panic!("{} is not a row:\n{out}", p.display()))
+    };
+    let (b_debug, a_debug, a_release) = (
+        at(&b.join("debug")),
+        at(&a.join("debug")),
+        at(&a.join("release")),
+    );
+    assert!(
+        b_debug < a_debug && a_debug < a_release,
+        "oldest first:\n{out}"
+    );
+    assert!(
+        out.contains("least recently used profiles give up incremental/ first"),
+        "{out}"
+    );
+    assert!(
+        out.contains("under pressure: the least-recently-used rows above go in that order"),
+        "{out}"
+    );
+    for p in [a.join("debug"), a.join("release"), b.join("debug")] {
+        assert!(p.join("incremental").exists(), "a report removes nothing");
+    }
+
+    std::fs::write(
+        &config,
+        "[disk]\napply = true\nauto_free_gib = 1000000000\n",
+    )
+    .expect("write");
+    let apply = Cmd::Disk {
+        targets: vec![a.clone(), b.clone()],
+        apply: Some(disk::Class::CargoTargets),
+        json: false,
+    };
+    let (ok, out, err) = go(&apply, &env);
+    assert!(ok, "{err}");
+    assert!(out.contains("removed=3"), "{out}");
+    for p in [a.join("debug"), a.join("release"), b.join("debug")] {
+        assert!(!p.join("incremental").exists(), "{}:\n{out}", p.display());
+        assert!(p.join("deps/liblay.rlib").exists());
+    }
+    let ledger = std::fs::read_to_string(env.disk_ledger()).expect("ledger");
+    let intents: Vec<&str> = ledger
+        .lines()
+        .filter(|l| l.contains("\"kind\":\"removing\""))
+        .collect();
+    assert_eq!(intents.len(), 3, "{ledger}");
+    assert!(
+        intents[0].contains(&b.join("debug").display().to_string()),
+        "{}",
+        intents[0]
+    );
+}
+
+/// A PASS CUT SHORT STILL LEAVES ITS RECORD: the intent row is journalled
+/// BEFORE a removal starts, so a remover that dies mid-pass (a panic here; a
+/// quit or an update in the window) leaves the report and the intent on
+/// record, naming the build directory it was working in.
+#[test]
+fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
+    let tmp = Tmp::new("disk-cut");
+    let state = tmp.path().join("state");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let targets = [target.clone()];
+    let look = DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free: Some(1),
+        targets: &targets,
+        transcripts: None,
+        now: idle_now(),
+    };
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        disk_tick(
+            &look,
+            disk::Config::default(),
+            &mut |_| panic!("the window quit mid-removal"),
+            &mut disk::tests::no_pressure,
+        )
+    }));
+    assert!(died.is_err(), "the remover died");
     let ledger = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
     let rows: Vec<&str> = ledger.lines().collect();
     assert_eq!(rows.len(), 2, "{ledger}");
-    assert!(rows[0].contains("\"trigger\":\"tick\""), "{}", rows[0]);
-    assert!(rows[1].contains("\"kind\":\"removed\""), "{}", rows[1]);
-    assert!(rows[1].contains("stale-build-dir"), "{}", rows[1]);
+    assert!(rows[0].contains("\"kind\":\"report\""), "{}", rows[0]);
+    assert!(rows[1].contains("\"kind\":\"removing\""), "{}", rows[1]);
+    let canonical = std::fs::canonicalize(&target).expect("canonical");
+    assert!(
+        rows[1].contains(&canonical.display().to_string()),
+        "{}",
+        rows[1]
+    );
+}
+
+/// A CHECKOUT'S `target -> target.noindex` LINK STILL RESOLVES AFTER A TICK:
+/// the window names `target.noindex` (a real directory; the link is not a
+/// candidate), and the reclaim never removes the directory the link needs —
+/// cargo can build through the link again, and the tag that keeps the twin
+/// out of backups is still there.
+#[cfg(unix)]
+#[test]
+fn a_target_noindex_twin_survives_the_tick_and_its_link_resolves() {
+    let tmp = Tmp::new("disk-twin");
+    let state = tmp.path().join("state");
+    let repo = tmp.path().join("repo");
+    let twin = disk::tests::lay_target(&repo.join("target.noindex"));
+    std::os::unix::fs::symlink("target.noindex", repo.join("target")).expect("the link");
+    let targets = [twin.clone()];
+    let now = idle_now();
+    let look = DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free: Some(1),
+        targets: &targets,
+        transcripts: None,
+        now,
+    };
+    let DiskTick::Reclaimed(done) = disk_tick(
+        &look,
+        disk::Config::default(),
+        &mut real_remover(now),
+        &mut disk::tests::no_pressure,
+    ) else {
+        panic!("below the floor, the tick runs");
+    };
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert!(
+        std::fs::metadata(repo.join("target")).is_ok_and(|m| m.is_dir()),
+        "the link resolves to a real directory"
+    );
+    assert!(repo.join("target/CACHEDIR.TAG").exists());
+    assert!(repo.join("target/debug/deps/liblay.rlib").exists());
+    assert!(!repo.join("target/debug/incremental").exists());
 }
 
 /// THE TICK FREES THE VOLUME IT MEASURED. The free figure is the home
 /// volume's, but the targets come from every agent's working directory: a
-/// stale build directory on another volume (an external disk, a second APFS
-/// volume) was removed when home ran short, freeing nothing there. Now only
-/// the measured volume's targets are looked at. The fixture measures `/dev`
-/// (devfs / devtmpfs: a volume of its own on macOS and Linux) against a
-/// stale target in the scratch dir; the control is the same look measuring
-/// the scratch dir's own volume.
+/// build directory on another volume (an external disk, a second APFS
+/// volume) is not looked at when home runs short, since reclaiming it frees
+/// nothing there. The fixture measures `/dev` (devfs / devtmpfs: a volume of
+/// its own on macOS and Linux) against an idle build directory in the
+/// scratch dir; the control is the same look measuring the scratch dir's own
+/// volume.
 #[cfg(unix)]
 #[test]
 fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
     let tmp = Tmp::new("disk-volume");
     let state = tmp.path().join("state");
-    let target = tmp.path().join("repo/target");
-    std::fs::create_dir_all(target.join("debug")).expect("target");
-    std::fs::write(
-        target.join("CACHEDIR.TAG"),
-        format!("{}\n", disk::CACHEDIR_SIGNATURE),
-    )
-    .expect("tag");
-    std::fs::write(target.join(disk::CARGO_LOCK_FILE), b"").expect("lock");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap())
-        .unwrap()
-        + (disk::DEFAULT_TARGET_STALE_DAYS + 1) * 86_400;
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let now = idle_now();
     let elsewhere = Path::new("/dev");
     assert_ne!(
         volume_id(elsewhere),
@@ -859,25 +1480,245 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
         transcripts: None,
         now,
     };
-    let DiskTick::Reclaimed(done) =
-        disk_tick(&look(elsewhere), disk::Config::default(), &mut |p| {
-            panic!("removed {} to free another volume", p.display())
-        })
-    else {
+    let DiskTick::Reclaimed(done) = disk_tick(
+        &look(elsewhere),
+        disk::Config::default(),
+        &mut |row| panic!("removed {} to free another volume", row.path.display()),
+        &mut disk::tests::no_pressure,
+    ) else {
         panic!("below the floor, the tick runs");
     };
     assert!(done.removed.is_empty(), "{done:?}");
-    assert!(target.exists());
-    // CONTROL: measured on its own volume, the same target goes.
+    assert!(target.join("debug/incremental").exists());
+    // CONTROL: measured on its own volume, the same idle cache goes.
     let DiskTick::Reclaimed(done) = disk_tick(
         &look(tmp.path()),
         disk::Config::default(),
-        &mut disk::remove_tree,
+        &mut real_remover(now),
+        &mut disk::tests::no_pressure,
     ) else {
         panic!("below the floor, the tick runs");
     };
     assert_eq!(done.removed.len(), 1, "{done:?}");
-    assert!(!target.exists());
+    assert!(!target.join("debug/incremental").exists());
+    assert!(target.join("debug/deps").exists());
+}
+
+/// THE OWNER'S VERB USES THE SAME UNIT: `aterm harness disk <dir> --apply
+/// cargo-targets`, with `disk.apply = true`, reclaims the idle profile's
+/// `incremental/` and nothing else, prints what went and what it freed, and
+/// journals the intent and the outcome.
+#[test]
+fn the_verb_applies_cargo_targets_with_the_same_unit() {
+    let tmp = Tmp::new("disk-verb");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let env = Env {
+        now: idle_now(),
+        ..env_at(&tmp)
+    };
+    std::fs::write(
+        env.config.as_ref().expect("config"),
+        "[disk]\napply = true\n",
+    )
+    .expect("write");
+    let cmd = Cmd::Disk {
+        targets: vec![target.clone()],
+        apply: Some(disk::Class::CargoTargets),
+        json: false,
+    };
+    let (ok, out, err) = go(&cmd, &env);
+    assert!(ok, "{err}");
+    assert!(out.contains("removed=1"), "{out}");
+    assert!(out.contains("went: "), "{out}");
+    assert!(out.contains("debug/incremental"), "{out}");
+    assert!(!target.join("debug/incremental").exists());
+    assert!(target.join("debug/deps/liblay.rlib").exists());
+    assert!(target.join("CACHEDIR.TAG").exists());
+    let ledger = std::fs::read_to_string(env.disk_ledger()).expect("ledger");
+    let kinds: Vec<bool> = [
+        "\"kind\":\"report\"",
+        "\"kind\":\"removing\"",
+        "\"kind\":\"removed\"",
+    ]
+    .iter()
+    .map(|k| ledger.contains(k))
+    .collect();
+    assert_eq!(kinds, [true, true, true], "{ledger}");
+}
+
+/// NOTHING IS REMOVED WITHOUT ITS INTENT ON RECORD. When the disk journal
+/// cannot take a row — the state directory cannot be made (here a FILE sits
+/// where it should be), or the append fails on a full disk — the tick removes
+/// nothing: each row it would have reclaimed is a denial saying the intent
+/// could not be journalled, and the cache stays.
+#[test]
+fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
+    let tmp = Tmp::new("disk-unjournalled");
+    let state = tmp.path().join("state");
+    std::fs::write(&state, b"not a directory").expect("a file where the state dir goes");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let targets = [target.clone()];
+    let now = idle_now();
+    let look = DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free: Some(1),
+        targets: &targets,
+        transcripts: None,
+        now,
+    };
+    let DiskTick::Reclaimed(done) = disk_tick(
+        &look,
+        disk::Config::default(),
+        &mut real_remover(now),
+        &mut disk::tests::no_pressure,
+    ) else {
+        panic!("below the floor, the tick runs");
+    };
+    assert!(done.removed.is_empty(), "{done:?}");
+    assert!(
+        done.denials
+            .iter()
+            .any(|d| d.code() == "unjournalled" && d.describe().contains("journal")),
+        "{done:?}"
+    );
+    assert!(target.join("debug/incremental").exists(), "the cache stays");
+}
+
+/// THE VERB, TOO: with the disk journal unopenable (a directory sits at its
+/// path), `--apply cargo-targets` removes nothing and says why.
+#[test]
+fn the_verb_removes_nothing_whose_intent_it_cannot_journal() {
+    let tmp = Tmp::new("disk-verb-unjournalled");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let env = Env {
+        now: idle_now(),
+        ..env_at(&tmp)
+    };
+    std::fs::write(
+        env.config.as_ref().expect("config"),
+        "[disk]\napply = true\n",
+    )
+    .expect("write");
+    std::fs::create_dir_all(env.disk_ledger()).expect("a directory where the ledger goes");
+    let cmd = Cmd::Disk {
+        targets: vec![target.clone()],
+        apply: Some(disk::Class::CargoTargets),
+        json: false,
+    };
+    let (ok, out, _err) = go(&cmd, &env);
+    assert!(ok);
+    assert!(out.contains("removed=0"), "{out}");
+    assert!(out.contains("could not be journalled"), "{out}");
+    assert!(target.join("debug/incremental").exists(), "the cache stays");
+}
+
+/// `--json` CARRIES WHAT EACH ROW KEPT AND WHY, as the text form does: a
+/// profile a build holds (skipped) and an entry that could not be deleted
+/// (trouble) are in the disk-apply object, beside what went and what it
+/// freed — a caller reading the JSON sees a partial reclaim as partial.
+/// Unix-only: it holds a profile's cargo lock and makes an entry undeletable
+/// by mode bits, and the reclaim it drives refuses on every other OS.
+#[cfg(unix)]
+#[test]
+fn the_verb_json_carries_what_each_row_went_kept_and_why() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = Tmp::new("disk-verb-json");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    disk::tests::lay_profile(&target.join("release"));
+    let target = std::fs::canonicalize(&target).expect("canonical");
+    let hold = disk::target::Build::holds(&target.join("release/.cargo-lock"));
+    let stuck = target.join("debug/incremental/stuck");
+    std::fs::create_dir_all(&stuck).expect("stuck");
+    std::fs::write(stuck.join("file"), b"kept").expect("file");
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    let env = Env {
+        now: idle_now(),
+        ..env_at(&tmp)
+    };
+    std::fs::write(
+        env.config.as_ref().expect("config"),
+        "[disk]\napply = true\n",
+    )
+    .expect("write");
+    let cmd = Cmd::Disk {
+        targets: vec![target.clone()],
+        apply: Some(disk::Class::CargoTargets),
+        json: true,
+    };
+    let (ok, out, err) = go(&cmd, &env);
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    drop(hold);
+    assert!(ok, "{err}");
+    let applied = out
+        .lines()
+        .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("kind").and_then(Value::as_str) == Some("disk-apply"))
+        .unwrap_or_else(|| panic!("no disk-apply object: {out}"));
+    let rows = applied
+        .get("rows")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("no rows: {applied:?}"));
+    assert_eq!(rows.len(), 1, "{applied:?}");
+    let row = &rows[0];
+    let texts = |k: &str| -> Vec<String> {
+        row.get(k)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        row.get("path").and_then(Value::as_str),
+        Some(target.display().to_string().as_str()),
+        "{row:?}"
+    );
+    assert!(
+        row.get("freed_bytes").and_then(Value::as_u64).is_some(),
+        "{row:?}"
+    );
+    assert!(
+        texts("skipped")
+            .iter()
+            .any(|s| s.contains("release") && s.contains("a build holds")),
+        "{row:?}"
+    );
+    assert!(
+        texts("trouble").iter().any(|s| s.contains("stuck")),
+        "{row:?}"
+    );
+}
+
+/// THE FREED FIGURE IS SAID TO BE A COUNT, NOT A MEASUREMENT: the verb
+/// prints "freed about", and its help says what the count is — the blocks
+/// of each unlinked file that was its last name, an APFS clone's shared
+/// blocks included, a file it could not open left out.
+#[test]
+fn the_verb_says_what_its_freed_figure_counts() {
+    assert!(USAGE.contains("APFS clone"), "{USAGE}");
+    let tmp = Tmp::new("disk-verb-about");
+    let target = disk::tests::lay_target(&tmp.path().join("repo/target"));
+    let env = Env {
+        now: idle_now(),
+        ..env_at(&tmp)
+    };
+    std::fs::write(
+        env.config.as_ref().expect("config"),
+        "[disk]\napply = true\n",
+    )
+    .expect("write");
+    let cmd = Cmd::Disk {
+        targets: vec![target],
+        apply: Some(disk::Class::CargoTargets),
+        json: false,
+    };
+    let (ok, out, err) = go(&cmd, &env);
+    assert!(ok, "{err}");
+    assert!(out.contains("; freed about "), "{out}");
 }
 
 /// [`on_volume`] keeps the targets whose volume id is the measured one's, and
@@ -1637,6 +2478,39 @@ fn a_give_up_row_in_the_ledger_view_names_what_held_it() {
     assert!(!other.contains("grep -m1"), "{other}");
 }
 
+/// THE WORST GIVE-UP ROW FITS ITS CUT WHOLE ([`GAVE_UP_DETAIL_BYTES`], whose
+/// const assertion counts on the give-up's own words staying under 512
+/// bytes): more processes than are named, each with a longest name and a
+/// longest command of four-byte characters, and the count of the rest still
+/// ends the row.
+#[test]
+fn the_worst_give_up_row_fits_its_cut_whole() {
+    use super::super::upgrade::{HELD_COMMAND_CHARS, HELD_NAMED, Held};
+    let lead =
+        super::super::upgrade_drive::gave_up_words(super::super::upgrade::Agent::Claude, &[]);
+    assert!(lead.len() < 512, "{} bytes: {lead}", lead.len());
+    let held: Vec<Held> = (0..HELD_NAMED + 2)
+        .map(|i| Held {
+            pid: u32::MAX - u32::try_from(i).expect("small"),
+            name: "𝔷".repeat(40),
+            age_s: u64::from(u32::MAX),
+            command: "𝔷".repeat(HELD_COMMAND_CHARS * 2),
+        })
+        .collect();
+    let detail =
+        super::super::upgrade_drive::gave_up_words(super::super::upgrade::Agent::Claude, &held);
+    assert!(
+        detail.len() <= GAVE_UP_DETAIL_BYTES,
+        "{} bytes",
+        detail.len()
+    );
+    assert_eq!(
+        super::super::one_line(&detail, GAVE_UP_DETAIL_BYTES),
+        detail
+    );
+    assert!(detail.ends_with("; and 2 more"), "{detail}");
+}
+
 /// `upgrade --status` PRINTS WHAT THE SWEEP RECORDED — how long behind, what
 /// it waits on, the owner's word, whether it is stalled — sweeping nothing:
 /// no lock is taken — for each upgrade a live Claude Code still holds behind
@@ -1673,7 +2547,7 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
         format!(
             "upgrade tab={tab} session=03396a15 from=2.1.281 to=2.1.282(managed) phase=pending \
              pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- \
-             stalled=overdue held_by=-\n"
+             stalled=overdue held_by=- release=- rung=land looked=- by=- point=- guard=- watch_at=due\n"
         )
     );
     assert!(

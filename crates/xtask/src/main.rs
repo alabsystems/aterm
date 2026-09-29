@@ -4,17 +4,15 @@
 
 //! aterm's build-graph tasks. Four subcommands:
 //!
-//!   * `harness-manifest`: enumerate every REAL `#[kani::proof] fn` across the
-//!     workspace `crates/` and write a `HarnessManifest` JSON to
-//!     `target/trust/harness-manifest.json` in the shape `trust-ir spec-link
-//!     --harness-manifest` expects (`{"harnesses":[{"name","span"}]}`) — the data
-//!     trust-ir's L1 resolves `proof_name` against. aterm-gui's
+//!   * `harness-manifest`: `aterm_spec::harness_manifest` — every
+//!     `#[kani::proof] fn` under `crates/`, written to
+//!     `target/trust/harness-manifest.json` for `trust-ir spec-link`. aterm-gui's
 //!     `spec_xref_closure` runs it.
 //!   * `gate <verb>`: the checks the merge gate shells into this binary for
 //!     (`gate.rs`).
 //!   * `perf [--record]`: the measuring perf lanes and the same-box trend ledger
 //!     (`perf.rs`). It has no automatic caller; it measures.
-//!   * `verify [args…]`: `tools/verify.sh`, the `cargo verify` alias's target.
+//!   * `verify [args…]`: `tools/verify.sh`, the `targo --unverified verify` alias's target.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -57,7 +55,7 @@ fn main() -> ExitCode {
                  gate <verb>       the merge gate's xtask checks: {}\n\
                  perf [--record]   the perf lanes against tools/golden (--record rewrites them)\n\
                  verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
-                 \x20                 (this is what the `cargo verify` alias dispatches to)",
+                 \x20                 (this is what the `targo --unverified verify` alias dispatches to)",
                 gate::verb_names().join("|")
             );
             ExitCode::FAILURE
@@ -66,7 +64,7 @@ fn main() -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// verify — the `cargo verify` verb
+// verify — the `targo --unverified verify` verb
 // ---------------------------------------------------------------------------
 
 /// Dispatch to `tools/verify.sh`, forwarding every argument verbatim.
@@ -80,7 +78,7 @@ fn main() -> ExitCode {
 ///
 /// Fail-closed in both directions that matter:
 ///   * a missing / unrunnable `tools/verify.sh` is a FAILURE, never a silent
-///     success — `cargo verify` must not be able to report "fine" without the
+///     success — `targo --unverified verify` must not be able to report "fine" without the
 ///     gate having run;
 ///   * a non-zero child status stays non-zero. A status that is non-zero but
 ///     not representable as a non-zero `u8` (a signal death, or an exit code
@@ -140,154 +138,12 @@ pub(crate) fn workspace_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// harness-manifest (finding 1a)
+// harness-manifest
 // ---------------------------------------------------------------------------
 
-/// One `#[kani::proof]` harness: its fn name + a `file:line` span (opaque to L1,
-/// which matches only on `name`).
-struct HarnessEntry {
-    name: String,
-    span: String,
-}
-
-/// Enumerate every `#[kani::proof] fn <name>` under the workspace `crates/` and write
-/// the `HarnessManifest` JSON. Returns the path written. The scan is a line walk:
-/// a `#[kani::proof]` attribute line arms the next `fn <ident>` (allowing intervening
-/// `#[kani::…]` / `#[cfg(kani)]` attribute lines), exactly as the harnesses are
-/// authored. Names are de-duplicated (a harness name is the L1 key, unique per build).
+/// `aterm_spec::harness_manifest`, into `<root>/target/trust`, where
+/// `aterm-gui`'s `spec_xref_closure` reads it.
 fn write_harness_manifest() -> std::io::Result<PathBuf> {
     let root = workspace_root();
-    let mut entries: Vec<HarnessEntry> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut files = Vec::new();
-    collect_rs_files(&root.join("crates"), &mut files)?;
-    files.sort();
-    for file in &files {
-        let text = std::fs::read_to_string(file)?;
-        let rel = file
-            .strip_prefix(&root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .into_owned();
-        let lines: Vec<&str> = text.lines().collect();
-        let mut armed = false;
-        for (i, raw) in lines.iter().enumerate() {
-            let line = raw.trim_start();
-            if line.starts_with("#[kani::proof") {
-                armed = true;
-                continue;
-            }
-            if armed {
-                // Skip further attribute lines (#[kani::should_panic], #[cfg(kani)], …)
-                // and blank/comment lines between the attr and the fn.
-                if line.starts_with("#[") || line.is_empty() || line.starts_with("//") {
-                    continue;
-                }
-                if let Some(name) = parse_fn_name(line) {
-                    if seen.insert(name.clone()) {
-                        entries.push(HarnessEntry {
-                            name,
-                            span: format!("{rel}:{}:1", i + 1),
-                        });
-                    }
-                    armed = false;
-                } else {
-                    // A non-attr, non-fn line after the attr — not a harness; disarm.
-                    armed = false;
-                }
-            }
-        }
-    }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let out_dir = root.join("target").join("trust");
-    std::fs::create_dir_all(&out_dir)?;
-    let out_path = out_dir.join("harness-manifest.json");
-    std::fs::write(&out_path, render_manifest_json(&entries))?;
-    eprintln!("xtask: {} kani harness(es) enumerated", entries.len());
-    Ok(out_path)
-}
-
-/// Recursive `*.rs` collection (skips `target/` + hidden dirs), the census
-/// library's walk, so the manifest reads the tree the censuses read.
-use aterm_census::collect_rs_files;
-
-/// Extract `<ident>` from a `(pub )?(unsafe )?fn <ident>…` line; `None` otherwise.
-fn parse_fn_name(line: &str) -> Option<String> {
-    let mut rest = line;
-    for kw in [
-        "pub ",
-        "pub(crate) ",
-        "unsafe ",
-        "const ",
-        "async ",
-        "extern ",
-    ] {
-        if let Some(s) = rest.strip_prefix(kw) {
-            rest = s.trim_start();
-        }
-    }
-    let rest = rest.strip_prefix("fn ")?;
-    let ident: String = rest
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if ident.is_empty() { None } else { Some(ident) }
-}
-
-/// Render the `HarnessManifest` JSON in the documented shape. Hand-rolled (no serde
-/// dep): each `name`/`span` is JSON-escaped (both are plain identifiers / file paths
-/// here, but escape defensively).
-fn render_manifest_json(entries: &[HarnessEntry]) -> String {
-    let mut s = String::from("{\n  \"harnesses\": [");
-    for (i, e) in entries.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        // Spelled as direct `push_str`s, byte-identical to the former
-        // `format!("\n    {{ \"name\": {}, \"span\": {} }}", …)`:
-        // `fmt::Arguments::new` is an unmodeled construct the strict gate's
-        // native TrustIr lowering refuses, which failed this function's
-        // panic-freedom proof outright.
-        s.push_str("\n    { \"name\": ");
-        s.push_str(&json_str(&e.name));
-        s.push_str(", \"span\": ");
-        s.push_str(&json_str(&e.span));
-        s.push_str(" }");
-    }
-    if !entries.is_empty() {
-        s.push_str("\n  ");
-    }
-    s.push_str("]\n}\n");
-    s
-}
-
-fn json_str(s: &str) -> String {
-    // Capacity is a pure allocation hint — the escaped output is identical
-    // with any starting capacity (`push`/`push_str` grow on demand) — so
-    // clamping it is behavior-preserving. The `len < 4096` check dominates
-    // each branch-local `with_capacity` call (a joined `cap` variable would
-    // lose the bound at the phi node), which discharges both the `len + 2`
-    // overflow obligation and the L0 unbounded-allocation budget. Real
-    // inputs are fn identifiers and `file:line` spans, far below 4 KiB, so
-    // the hint stays exact for every input the callers produce.
-    let len = s.len();
-    let mut out = if len < 4096 {
-        String::with_capacity(len + 2)
-    } else {
-        String::with_capacity(4096)
-    };
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    aterm_spec::harness_manifest::write(&root, &root.join("target").join("trust"))
 }

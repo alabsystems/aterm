@@ -44,7 +44,7 @@ path = "src/lib.rs"
 # so this empty table is what takes both packages off those two cells.
 
 # NO `[dev-dependencies]` ORACLE, and the omission is judged rather than
-# forgotten — `cargo forge check` [OB-15] would FAIL the build if it were here.
+# forgotten — `targo --unverified forge check` [OB-15] would FAIL the build if it were here.
 #
 # The natural oracle is `libm`: compare this shim's answers to the very
 # implementation upstream forwards to. But `libm` is itself a `[patch.crates-io]`

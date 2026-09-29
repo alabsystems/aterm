@@ -1,3 +1,7 @@
+# PUBLIC BOUNDARY: the public snapshot's pin, copied over rust-toolchain.toml at
+# export (publish/transforms.sh). The public cannot resolve the locally linked
+# `trust` channel, so the exported source builds on stock Rust; the dev tree pins
+# the `trust` channel (owner directive 2026-09-28).
 [toolchain]
 channel = "1.97.1"
 profile = "minimal"

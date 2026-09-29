@@ -103,8 +103,10 @@ impl HashTable for HashTable4KU16 {
     // (direct boxed-array alloc, 1047ada0) — non-null and align-2 by
     // construction; no transmute exists in this crate. A hoisted-reborrow
     // respelling was measured NET-NEGATIVE (adds a Misaligned assert row) and
-    // reverted per the ratchet discipline. Verify-only; droppable when
-    // cross-fn box facts or validity-invariant modeling land.
+    // reverted per the ratchet discipline. Verify-only. Re-measured
+    // 2026-09-27 on seal 321aaeda7 with this skip removed: the row is still
+    // unknown. Needed from $HOME/trust, in a promoted seal: cross-fn Box
+    // allocation facts or validity-invariant modeling; then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
     fn put_at(&mut self, hash: usize, val: usize) {
         // Same `%` mask idiom as `get_at` above (identical on all real calls).

@@ -54,16 +54,16 @@
 //! missing one reads `-`, exactly as `ls` renders a missing token — the reader
 //! never has to distinguish "absent" from "unknown".
 //!
-//! ## Bounds, because this file is durable and a fleet is not bounded
+//! ## Bounds, because one roster read serves every caller and a fleet is not bounded
 //!
 //! * At most [`MAX_ROWS`] rows. A `Last` answer is one row per SUBJECT, so a
 //!   fleet that has ever hosted a million sessions has a million-row answer, and
-//!   a menu bar that reads it at every wake would be the fleet's biggest cost.
-//!   When the answer is cut, `"truncated": true` says so IN THE FILE rather
-//!   than leaving a short list to be read as a complete one.
+//!   a reader that took it whole at every wake would be the fleet's biggest
+//!   cost. When the answer is cut, [`Glance::truncated`] says so rather than
+//!   leaving a short list to be read as a complete one.
 //! * **EVERY key and EVERY value is capped, not just `attention=`.** Each is cut
 //!   to [`FIELD_CAP`] bytes and a row keeps at most [`FIELDS_MAX`] of them, so
-//!   one row costs a bounded number of bytes and the file as a whole is bounded
+//!   one row costs a bounded number of bytes and a read as a whole is bounded
 //!   by [`MAX_ROWS`] times that. `attention=` is capped at [`ATTENTION_CAP`],
 //!   which is the same number and is also the cap aterm applies to its own
 //!   (§4.1's presence row) — ONE number, so the two sides cannot disagree.
@@ -72,32 +72,18 @@
 //!   one is a bounded token". Nothing bounded them. [`fields_of`] keeps whatever
 //!   the first line of the body holds, [`Row::parse`] validates only the
 //!   SUBJECT, and a record is 16 MiB at the broker — so a hostile node's
-//!   `detail=` was a multi-megabyte durable write per row, on a path a UI thread
-//!   is meant to read at every wake. A bound the code does not keep is worse
-//!   than no bound, because it is what the next reader budgets against.
+//!   `detail=` was a multi-megabyte value per row handed to every reader. A
+//!   bound the code does not keep is worse than no bound, because it is what the
+//!   next reader budgets against.
 //!
 //!   A CUT VALUE IS MARKED with a trailing `…`, and the mark is INSIDE the cap:
 //!   [`truncate`] answers at most `cap` bytes including the ellipsis, so a
 //!   reader sizing a buffer from [`ATTENTION_CAP`] is not handed `cap + 3`.
-//! * A value is written verbatim — still pct-encoded, exactly as it crossed the
+//! * A value is kept verbatim — still pct-encoded, exactly as it crossed the
 //!   bus. `detail=`, `host=` and `title=` are pct-encoded at the publisher
 //!   (§4.1), and decoding them here would put a caller-chosen byte sequence
-//!   (a newline, an ESC) into a file another program renders. The reader
+//!   (a newline, an ESC) into every string a caller renders. The reader
 //!   decodes what it is about to show, at the moment it shows it.
-//!
-//! ## What A8 built, and what it did not
-//!
-//! It does not RENDER. The consuming half — the menu-bar `FabricGlance` above —
-//! is DESIGNED and not built, and it is the first thing to check for before
-//! treating this file's row shape, its `truncated` flag or its `-` defaults as a
-//! contract with a shipped reader: there is none.
-//!
-//! It does not WATCH. §11.2 gives `serve` a `--glance` flag, so that the bridge
-//! that already tails presence rewrites the file as they change; that flag needs
-//! a line in `bridge.rs`, which A8 does not own. What is here is the whole
-//! mechanism — the read, the projection, the atomic write — behind an
-//! `aterm-link glance` subcommand that produces byte-identical output. See the
-//! rung report.
 
 use std::collections::BTreeMap;
 use std::io;

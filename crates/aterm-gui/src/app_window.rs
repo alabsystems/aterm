@@ -2680,11 +2680,15 @@ impl App {
 
     /// THE one busy predicate every close path reads — the ctl `close` / `tab
     /// close` refusal, the caption ✕ / red light, Close Tab and Quit — so the
-    /// four cannot disagree. [`crate::quit_safety::foreground_busy`]: the PTY's
-    /// verdict (`tcgetpgrp` on unix; the child-process walk on windows) OR the
+    /// four cannot disagree. [`crate::quit_safety::foreground_busy`]: the
     /// shell-integration state — the fact `status`/`blocks` already showed
     /// (executing: OSC 133;C opened, no 133;D yet) while the windows walk alone
-    /// let `close` end an instance mid-`Start-Sleep 60` (audit 2026-09-22).
+    /// let `close` end an instance mid-`Start-Sleep 60` (audit 2026-09-22) — OR
+    /// the PTY's verdict (`tcgetpgrp` on unix; on windows the child-process
+    /// walk, which counts only a child the shell started since it last said it
+    /// went idle, [`crate::quit_safety::ShellWord`]: the walk alone refused an
+    /// idle pwsh over a recycled parent pid and every idle Git Bash over its
+    /// launcher, 2026-09-27).
     ///
     /// The engine is LOCKED, not `try_lock`ed: a close gesture is a one-off on
     /// the main thread, which already takes this lock every frame to render, and
@@ -2693,17 +2697,17 @@ impl App {
     /// killed job or a wedged close. Poison is recovered the way every other
     /// main-thread read of the engine recovers it.
     fn session_busy(s: &crate::Session) -> bool {
-        let executing = {
+        let word = {
             let term = s
                 .term
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::quit_safety::shell_executing(&term)
+            crate::quit_safety::shell_word(&term)
         };
         crate::quit_safety::foreground_busy(
             crate::quit_safety::foreground_pgrp(s.master),
             s.pid,
-            executing,
+            word,
         )
     }
 

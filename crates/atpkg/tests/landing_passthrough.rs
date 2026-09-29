@@ -24,14 +24,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// Far under the retired wait's 45 s bound, far over a cold exec on a loaded box.
+/// Far under the retired wait's 45 s bound, far over an exec of files macOS has already
+/// assessed, on a loaded box.
 ///
 /// It was 10 s until 2026-09-23, when a full `tools/verify.sh --fast` run measured
-/// `an_older_twin_under_a_standing_marker_runs_the_tool_at_once` at 11.14 s: `/bin/sh`
-/// then the freshly built debug `atpkg` then the shim, cold, with the gate's other
-/// stages on every core (1.1–1.4 s in isolation, three runs of three). The regression
-/// this bound exists for is the retired 45 s wait, which 30 s still catches with a
-/// 15 s margin.
+/// `an_older_twin_under_a_standing_marker_runs_the_tool_at_once` at 11.14 s (1.1–1.4 s in
+/// isolation, three runs of three) and called it a cold exec. It was not: every file a
+/// timed run execs — the twin, the freshly linked debug `atpkg`, the `bin/` shim and the
+/// store script — is new, and the FIRST exec of a new file waits, at 0% CPU, until
+/// macOS `syspolicyd` has assessed it, one file at a time behind every test binary the
+/// gate links (2026-09-28: both timed cases at 33 s, 0.3 s apart). No bound outgrows
+/// that queue, so each timed case first runs its exact command once, unbounded
+/// ([`Fixture::warm`]); a later exec of the same files costs nothing. The regression this
+/// bound exists for is the retired 45 s wait, which the timed run still meets in full —
+/// its live writer's marker stands — and 30 s catches with a 15 s margin.
 const AT_ONCE: Duration = Duration::from_secs(30);
 
 struct Fixture {
@@ -123,6 +129,14 @@ impl Fixture {
             .expect("run under the fixture");
         (out, started.elapsed())
     }
+
+    /// `program argv…` run once exactly as [`Fixture::run`] runs it, unbounded, its result
+    /// discarded: it pays macOS's one-time assessment of every new file the command execs
+    /// (the manual.rs `run_once` rule), so the timed run after it measures the verb, not
+    /// the assessor's queue ([`AT_ONCE`]).
+    fn warm(&self, program: &Path, argv: &[OsString]) {
+        let _ = self.run(program, argv);
+    }
 }
 
 impl Drop for Fixture {
@@ -155,6 +169,11 @@ fn the_landing_verb_execs_the_bin_shim_at_once_and_prints_nothing() {
         OsString::from("-p"),
         OsString::from("a b"),
     ];
+    // Untimed first: `atpkg`, the shim and the store script are each exec'd here for the
+    // first time. The marker is stood again after it, so the timed run meets exactly the
+    // state the retired verb waited out, whatever the warm run did.
+    fx.warm(atpkg(), &argv);
+    fx.stand_marker();
     let (out, took) = fx.run(atpkg(), &argv);
     assert_eq!(out.status.code(), Some(7), "the shim's own code: {out:?}");
     assert_eq!(text(&out.stdout), "fake: -p a b\n");
@@ -195,7 +214,13 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     );
     std::fs::write(&twin, body).unwrap();
     std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let (out, took) = fx.run(&twin, &[OsString::from("--probe")]);
+    let argv = [OsString::from("--probe")];
+    // Untimed first: one run under the marker execs the twin, `atpkg`, the shim and the
+    // store script, each for the first time. The marker is stood again after it, so the
+    // timed run takes the landing prelude exactly as the field does.
+    fx.warm(&twin, &argv);
+    fx.stand_marker();
+    let (out, took) = fx.run(&twin, &argv);
     assert_eq!(out.status.code(), Some(7), "{out:?}");
     assert_eq!(text(&out.stdout), "fake: --probe\n");
     assert_eq!(text(&out.stderr), "", "nothing printed");

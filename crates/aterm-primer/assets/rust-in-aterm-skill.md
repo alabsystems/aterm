@@ -12,6 +12,25 @@ TOOLCHAIN NOT RUST! this needs to be very strongly encouraged by the aterm syste
 itself."* Stock `cargo`/`rustc` is not blocked; it is the exception: if you run it,
 say in your reply that you did and why.
 
+That holds **in every repository, including one whose `rust-toolchain.toml` pins a
+stock channel** (owner ruling, 2026-09-23, after an orchestrating agent wrote
+`cargo +1.97.1` and "clippy/fmt" into ~45 subagent prompts for two such repos).
+Never write `cargo`, `cargo +<channel>`, clippy or rustfmt into a command or a
+prompt for another agent: the spellings are the right column below.
+
+## A stock pin moves only rustup's proxies
+
+A `rust-toolchain.toml` saying `channel = "1.97.1"` is read by **rustup**, so it
+moves rustup's proxies — `cargo`, `rustc`, `rustfmt`, `cargo-clippy` — and nothing
+else. `targo`, `tippy`, `trustfmt` and `trustdoc` are not rustup proxies. Measured
+2026-09-23/24 in a crate pinning 1.97.1 (store build 9192): `targo --unverified check
+-v` ran the store's `trustc`, `targo tippy -v` its `tippy-driver`, `targo fmt --
+--version` answered `trustfmt`, `targo --unverified doc -v` ran `trustdoc`. What DOES
+move targo off trustc is an explicit `RUSTC` or `build.rustc`; `aterm help rust`
+checks both for the directory you are in (its `targo here` row). So in a stock-pinned
+repo you build, lint and format exactly as anywhere else: `targo --unverified <cmd>` /
+`targo trust <cmd>`, `targo tippy`, `targo fmt`.
+
 ## The tools
 
 | you would type | type this instead | what it is |
@@ -55,18 +74,32 @@ The refusal you get from a bare `targo build` is that rule, not a broken tool.
 Do not fall back to stock `cargo` because of it — add the lane.
 
 Which verbs take a lane is not uniform, so measure rather than assume: `build`,
-`check` and `test` REFUSE a bare call; `run` and `doc` have no verified lane at
-all, so a bare one proceeds unverified and says so (*nobody was asked*); and
-`fmt`, `tippy` and `metadata` take no lane — `--unverified` there is refused
-(*`--unverified` is valid only for a Targo compilation command*), so run those
-bare.
+`check` and `test` REFUSE a bare call; `run`, `doc`, `bench`, `rustc`, `rustdoc` and
+`fix` have no verified lane at all, so a bare one proceeds unverified and says so
+(*nobody was asked*), while a bare `package`, `install` or `publish` is refused —
+`targo --unverified <verb>` for all of them; and `fmt`, `tippy`, `metadata`, `tree`,
+`clean`, `update` take no lane — `--unverified` there is refused (*`--unverified` is
+valid only for a Targo compilation command*), so run those bare.
 
-Inside an aterm session, typing a bare `cargo …` prints the `targo` spelling of
-your exact command in both lanes and then runs upstream. Two verbs are the
-exception: `cargo clippy` and `cargo fmt` print **one** branded spelling
-(`targo tippy`, `targo fmt`) and no lane question, because linting and
-formatting neither prove nor build. That printout is the answer;
-`[reroute] announce = false` in aterm.toml silences it if you have decided.
+Inside an aterm session, typing a bare `cargo …` prints the `targo` spelling targo
+accepts for your exact command — both lanes for `build`/`check`/`test`, `targo
+--unverified …` for `run`/`doc`/`install`…, plain `targo …` for `metadata`/`tree`/
+`fmt`…, `targo tippy …` for `cargo clippy` — and then runs upstream. `cargo +<stock
+channel> …` (and `rustfmt +1.97.1 …`, `rustc +stable …`) prints the same spelling
+and that the channel moves only rustup's proxies, then runs as named. That
+printout is the answer; `[reroute] announce = false` in aterm.toml silences it if
+you have decided.
+
+If a guard in your setup **refuses a stock command before it runs**, the refusal
+carries the Trust spelling of it: retype it that way. Only when stock Rust is
+genuinely required — a cross target the Trust sysroot does not carry, a check that
+exists to test the public stock-Rust build — put `ATERM_STOCK_REASON='<why>'` in
+front of the command and say why in your reply. A stock pin alone is not such a
+reason. To check a command before you run it or write it into another agent's
+prompt, `aterm pkg lane -- <command>` reads it the way the shell would: exit 2 and
+the Trust spelling when it runs stock Rust, exit 0 when it does not. `--` joins its
+words with spaces, so a command with quotes goes on stdin instead:
+`aterm pkg lane - <<'EOF'`, the command, `EOF`.
 
 ## Before the first build in a project: measure, do not guess
 
@@ -77,11 +110,16 @@ aterm help rust      # which toolchain this directory gets, and why — measured
 It prints which toolchain aterm's own gates pick and which candidates were
 refused, where a bare `targo` on this PATH really runs (followed through an
 atpkg shim) and whether that is a different directory or build from the gates'
-pick, what `rustc` on this PATH answers to `--print sysroot`, whether
-`rust-toolchain.toml` pins a channel, and whether `.cargo/config.toml` switches
-verification off. It reads no instruction file: if a project's `CLAUDE.md` or
-`AGENTS.md` names a different toolchain or lane, that one is yours to open, and
-the project wins — say so when you use it.
+pick, which compiler that `targo` runs HERE and whether anything (`RUSTC`,
+`build.rustc`) moves it, what `targo fmt` and `targo tippy` answer here, what
+`rustc` on this PATH answers to `--print sysroot`, whether `rust-toolchain.toml`
+pins a channel, and whether `.cargo/config.toml` switches verification off.
+
+It reads no instruction file. A project's `CLAUDE.md` or `AGENTS.md` may name a
+lane (`targo --unverified` versus `targo trust`) — follow that. If it names stock
+Rust for a specific job, that job is a reason you can state (above); if it only
+says "the repo pins 1.97.1", it is describing rustup's proxies, and you still
+build with targo.
 
 ## Errors that are not what they look like
 

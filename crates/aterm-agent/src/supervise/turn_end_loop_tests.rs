@@ -7,7 +7,9 @@
 // Each behaviour has its negative control. Included from `run.rs`'s tests
 // (`mod turn_end`), so the `Mock` and the helpers there are in scope.
 
-use crate::supervise::policy::turn_end::{RULE_CONSENT, RULE_CONTINUE, RULE_SUGGESTION};
+use crate::supervise::policy::turn_end::{
+    DONE_CHECK, RULE_CONSENT, RULE_CONTINUE, RULE_DONE_CHECK, RULE_SUGGESTION,
+};
 
 /// The host's policy, every switch on (`SupervisorConfig::default()`) but
 /// the answers: these scripts end on a request for a decision ([`STOP`]),
@@ -51,7 +53,7 @@ fn suggesting(said: &str) -> Vec<String> {
 const STOP: &str = "I need your decision on the schema before I go on.";
 
 fn ledger_at(tag: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("aterm-te-ledger-{tag}-{}", std::process::id()));
+    let dir = crate::supervise::test_scratch_path("te-ledger", tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("tmp dir");
     let path = dir.join("s-1.jsonl");
@@ -135,6 +137,74 @@ fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
     off.policy.continue_policy = false;
     let _ = watch_lines(&mut m, &off);
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+}
+
+/// A WORKER THAT SAYS IT IS DONE is asked once (decided 2026-09-27 under
+/// the owner's standing direction): the done check is typed where `keep
+/// going` was, and when its answer is `DONE` the task is done — nothing more
+/// is typed, and the journal says so once (`DONE …`). NEGATIVE CONTROL: the
+/// same turn reported as progress is continued with `keep going`.
+#[test]
+fn a_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
+    let (dir, journal) = journal_file("done-check");
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; all done."),
+            busy_screen(),
+            ended("DONE"),
+        ],
+    );
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(4);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        journal: Some(journal.clone()),
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines(&mut m, &opts);
+    assert!(
+        lines.contains(&format!(
+            "CONTINUED seq=102 rule={RULE_DONE_CHECK} {DONE_CHECK}"
+        )),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "the check alone: {:#?}", m.requests);
+    let done: Vec<String> = journal_records(&journal)
+        .0
+        .into_iter()
+        .map(|r| r.line)
+        .filter(|l| l.starts_with("DONE "))
+        .collect();
+    assert_eq!(done.len(), 1, "{done:#?}");
+    assert!(
+        done[0].starts_with(&format!("DONE seq=104 rule={RULE_DONE_CHECK} ")),
+        "{done:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // NEGATIVE CONTROL: progress, not a done report.
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+        ],
+    );
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(2);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines(&mut m, &opts);
+    assert!(
+        lines.contains(&format!(
+            "CONTINUED seq=102 rule={RULE_CONTINUE} keep going"
+        )),
+        "{lines:#?}"
+    );
 }
 
 /// The request after the write that starts `write` waits for the worker's
@@ -1784,6 +1854,51 @@ fn a_draft_left_standing_is_submitted_once_the_grace_has_passed() {
     );
 }
 
+/// CODEX 0.158.0 DRAWS ITS INPUT LINE `»` (measured 2026-09-28 on the
+/// owner's goal-mode tab: `cell 60 0` read `»` bold): the loop reads the
+/// same screens with that mark as it reads 0.156.1's, and the continuation
+/// is guarded on the mark DRAWN (`submit=guarded:^»\skeep…`) — spelled `›`,
+/// the guard never matched the new input line and the text was left typed
+/// and unsent. NEGATIVE CONTROL: the 0.156.1 screens keep `^›`
+/// (`a_codex_session_is_supervised_end_to_end`, below).
+#[test]
+fn a_codex_0_158_input_line_is_typed_into_under_its_own_mark() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let marked = |text: &str| {
+        let mut rows = screen(text);
+        let at = aterm_phase::codex::composer(&rows).expect("the input line");
+        rows[at] = rows[at].replacen('›', "»", 1);
+        rows
+    };
+    let mut m = Mock::new(true, vec![marked(cx::BUSY), marked(cx::END_OF_TURN)]);
+    m.program = "codex";
+    m.cursor_on_caret = true;
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(1);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let turn = m
+        .requests
+        .iter()
+        .find(|r| r.starts_with("turn "))
+        .unwrap_or_else(|| panic!("the continuation: {lines:#?} {:#?}", m.requests));
+    assert!(
+        turn.starts_with("turn submit=guarded:^»\\skeep\\x20going\\s*$ "),
+        "{turn}"
+    );
+}
+
 /// CODEX, END TO END over the scripted server (codex 0.156.1's measured
 /// screens, `program=codex`): the loop reads Codex's own grammar — busy
 /// while its status row runs, an ended turn at its end row — and at full
@@ -2202,4 +2317,2282 @@ fn an_ordinary_or_escalated_point_never_asks_for_the_reach_again() {
     assert_eq!(count(&m, "turn"), 0, "{lines:#?}");
     assert_eq!(count(&m, "meta set attention"), 1, "{:#?}", m.requests);
     assert_eq!(host.asks(), 1, "only at the point: {lines:#?}");
+}
+
+// --- Codex's rate-limit nudge and its save-then-wait switch (2026-09-28) ------
+
+/// A Codex screen whose footer shows `model` and, right-aligned, `goal`.
+fn codex_footer(mut rows: Vec<String>, model: &str, goal: Option<&str>) -> Vec<String> {
+    let at = rows
+        .iter()
+        .rposition(|r| r.starts_with("  GPT-"))
+        .expect("the footer");
+    let left = format!("  {model} · ~/pj · Fix the parser bugs · Main [default]");
+    rows[at] = match goal {
+        Some(g) => format!(
+            "{left}{}{g}",
+            " ".repeat(120 - left.chars().count() - g.len())
+        ),
+        None => left,
+    };
+    rows
+}
+
+/// The switch's rows as a loop that opened it wrote them, up to `phase`
+/// ([`crate::supervise::approvals::wind_switch_words`]), on the TEST'S clock
+/// ([`TEST_NOW`]): the loop reads a person's keystrokes against the rows'
+/// times, and rows stamped on the wall clock lie days after the test's.
+fn seed_wind(path: &std::path::Path, sid: Option<&str>, back_at_unix: i64, phase: &str) {
+    use crate::supervise::approvals::{Outcome, Row};
+    let now = TEST_NOW * 1000;
+    let words = |p: &str| {
+        format!(
+            "(model switch: kind=wind-down from=GPT-6-Astra effort=ultra to=gpt-6-luna \
+             back_at={back_at_unix} marker=ATERM-SAVED-3f9a1c2e goal=paused phase={p})"
+        )
+    };
+    let owed = format!("unproven: near {}", words("owed"));
+    let winding = format!("the turn-end policy {}", words("winding"));
+    let later = format!("the turn-end policy {}", words(phase));
+    let rows = [
+        Row {
+            rule_id: crate::supervise::policy::RULE_RATE_NUDGE_SWITCH,
+            outcome: Outcome::Approved,
+            command: "Approaching rate limits => Switch to gpt-6-luna",
+            reason: &owed,
+            box_seq: 90,
+        }
+        .to_json(now - 30 * 60_000, sid),
+        Row {
+            rule_id: crate::supervise::policy::turn_end::RULE_WIND_DOWN,
+            outcome: Outcome::Typed,
+            command: "[aterm harness] GPT-6-Astra is close to its usage limit …",
+            reason: &winding,
+            box_seq: 91,
+        }
+        .to_json(now - 29 * 60_000, sid),
+        Row {
+            rule_id: crate::supervise::policy::turn_end::RULE_MODEL_RESTORE,
+            outcome: Outcome::Skipped,
+            command: "back on GPT-6-Astra ultra",
+            reason: &later,
+            box_seq: 92,
+        }
+        .to_json(now - 20 * 60_000, sid),
+    ];
+    std::fs::write(path, rows.join("\n") + "\n").expect("the ledger");
+}
+
+/// A HOLD SURVIVES THE LOOP'S RESTART: a switch whose last row says the
+/// session is held on GPT-6-Astra ultra until its window resets, read back
+/// by a loop that starts after it at the idle point the hold left, types
+/// NOTHING into the idle Codex — no
+/// continuation, no `/model`, no answer — and raises nothing. The switch's
+/// rows round-trip ([`crate::supervise::approvals::open_wind_down`]).
+/// NEGATIVE CONTROLS: a switch whose last row says `done` is no switch — the
+/// point is continued; `released` too.
+#[test]
+fn a_codex_hold_is_read_back_and_types_nothing() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let test_now: i64 = 1_789_660_500;
+    let back = test_now + 3 * 86_400;
+    for (phase, holds) in [("holding", true), ("done", false), ("released", false)] {
+        let (dir, ledger) = ledger_at(&format!("wind-{phase}"));
+        seed_wind(&ledger, None, back, phase);
+        let open = crate::supervise::approvals::open_wind_down(&ledger, None);
+        assert_eq!(open.is_some(), holds, "{phase}: {open:?}");
+        if let Some(o) = &open {
+            assert_eq!(o.from.words(), "GPT-6-Astra ultra");
+            assert_eq!((o.to.as_str(), o.back_at_unix), ("gpt-6-luna", Some(back)));
+            assert!(o.goal_paused);
+        }
+        // The session sits idle where the hold left it; with no back-off
+        // the first point is continued at once unless the switch holds it.
+        let idle = codex_footer(screen(cx::END_OF_TURN), "GPT-6-Astra ultra", None);
+        let mut m = Mock::new(true, vec![idle]);
+        m.program = "codex";
+        m.cursor_on_caret = true;
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                short_backoff: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let typed: Vec<&String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("turn ") || r.starts_with("send "))
+            .collect();
+        if holds {
+            assert!(typed.is_empty(), "{phase}: {typed:#?}\n{lines:#?}");
+            assert_eq!(count(&m, "meta set attention"), 0, "a hold raises nothing");
+            assert!(
+                !m.presses().iter().any(|p| p.ends_with(" esc")),
+                "{:#?}",
+                m.requests
+            );
+        } else {
+            assert!(
+                typed.iter().any(|r| r.contains("keep")),
+                "{phase}: the control is continued: {typed:#?}\n{lines:#?}"
+            );
+        }
+    }
+}
+
+/// CODEX'S PURSUED GOAL IN THE LOOP: an ended turn whose footer says the goal
+/// is pursued gets nothing typed and nothing raised — Codex starts the next
+/// turn itself. NEGATIVE CONTROL: the same point with the goal paused is
+/// continued.
+#[test]
+fn a_codex_whose_goal_is_pursued_is_never_continued() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    for (goal, continued) in [
+        (Some("Pursuing goal (10d 3h 2m)"), false),
+        (Some("Goal paused (/goal resume)"), true),
+    ] {
+        let mut m = Mock::new(
+            true,
+            vec![
+                codex_footer(screen(cx::BUSY), "GPT-6-Astra ultra", goal),
+                codex_footer(screen(cx::END_OF_TURN), "GPT-6-Astra ultra", goal),
+            ],
+        );
+        m.program = "codex";
+        m.cursor_on_caret = true;
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+        });
+        let typed = m
+            .requests
+            .iter()
+            .any(|r| r.starts_with("turn ") || r.starts_with("send "));
+        assert_eq!(typed, continued, "{goal:?}: {lines:#?}\n{:#?}", m.requests);
+        assert_eq!(
+            count(&m, "meta set attention"),
+            0,
+            "{goal:?}: nothing raised"
+        );
+    }
+}
+
+/// Codex's rate-limit nudge NEAR ITS LIMIT, END TO END over the scripted
+/// server — the incident's shape (a goal pursued, 99% of the weekly window):
+/// the nudge's `1` pressed under `rate-nudge-switch@v1`, its row carrying the
+/// switch; the goal turn under the box stopped by ONE Esc guarded on its
+/// status row; the save instruction typed (never `keep going`); its marker
+/// line read as the save; `/model` typed and the picker driven to the
+/// original model (Enter on the model box) and effort (`s` — this
+/// conversation — on the effort box, never Enter or a digit); the thread
+/// seen back on GPT-6-Astra medium, HELD: nothing typed after. The ledger
+/// carries every edge, and reads back as a hold.
+#[test]
+fn a_codex_nudge_near_its_limit_saves_the_work_restores_and_holds() {
+    use crate::supervise::codex_usage::{CodexSeen, LimitRead};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let test_now: i64 = 1_789_660_500;
+    let astra = "GPT-6-Astra medium";
+    let luna = "GPT-6-Luna medium";
+    let pursuing = Some("Pursuing goal (1h 2m)");
+    let paused = Some("Goal paused (/goal resume)");
+    let marker = crate::harness::upgrade::saved_marker(
+        "-",
+        "gpt-6-luna",
+        u64::try_from(test_now).expect("after 1970"),
+    );
+    let mut saved = screen(cx::END_OF_TURN);
+    let last = saved
+        .iter()
+        .rposition(|r| r.contains("as it evolves continuously."))
+        .expect("the answer's last row");
+    saved[last] = format!("  {marker}");
+    let screens = vec![
+        codex_footer(screen(cx::BUSY), astra, pursuing),
+        screen(cx::RATE_NUDGE),
+        // The goal turn under the box: read as the box leaves, and again
+        // for the Esc's guard.
+        codex_footer(screen(cx::BUSY), luna, pursuing),
+        codex_footer(screen(cx::BUSY), luna, pursuing),
+        codex_footer(screen(cx::INTERRUPTED), luna, paused),
+        codex_footer(screen(cx::BUSY), luna, paused),
+        codex_footer(saved.clone(), luna, paused),
+        screen(cx::MODEL_PICK),
+        // The effort box: read as the model box leaves, and again to judge.
+        screen(cx::EFFORT_PICK),
+        screen(cx::EFFORT_PICK),
+        codex_footer(saved, astra, paused),
+    ];
+    let mut m = Mock::new(true, screens);
+    m.program = "codex";
+    m.cursor_on_caret = true;
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.turn_gates = vec![4, 6];
+    m.vanish_after = Some(2);
+    // `key` takes the generation fence (the picker's focus moves need it);
+    // `send` does not, so text goes through the guarded `turn`.
+    m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
+    let (dir, ledger) = ledger_at("nudge-flow");
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        ..auto(60, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_codex_records(CodexSeen {
+            limits: LimitRead::Near {
+                used: 99,
+                back_at: Some(test_now + 3 * 86_400),
+            },
+            ..CodexSeen::default()
+        });
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let open = crate::supervise::approvals::open_wind_down(&ledger, None);
+    let _ = std::fs::remove_dir_all(&dir);
+    let why = format!("{lines:#?}\n{:#?}\n{rows}", m.requests);
+    let keys: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("key "))
+        .collect();
+    let turns: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("turn "))
+        .collect();
+    assert!(keys.iter().any(|k| k.ends_with(" 1")), "the switch: {why}");
+    assert!(
+        keys.iter()
+            .any(|k| k.contains("esc.to.interrupt") && k.ends_with(" esc")),
+        "the goal turn stopped: {why}"
+    );
+    assert!(
+        turns.iter().any(|t| t.contains(&marker)),
+        "the save instruction: {why}"
+    );
+    assert!(
+        !turns.iter().any(|t| t.contains("keep going")),
+        "never continued: {why}"
+    );
+    assert!(
+        turns.iter().any(|t| t.ends_with(" /model")),
+        "the restore: {why}"
+    );
+    assert!(
+        keys.iter().any(|k| k.ends_with(" enter")),
+        "the model box: {why}"
+    );
+    assert!(
+        keys.iter().any(|k| k.ends_with(" s")),
+        "the effort, this conversation: {why}"
+    );
+    assert!(
+        !keys.iter().any(|k| k.ends_with(" 2") || k.ends_with(" 3")),
+        "no keep, no never-show-again, no digit on the picker: {why}"
+    );
+    for rule in [
+        "rate-nudge-switch@v1",
+        "model-wind-down@v1",
+        "model-restore@v1",
+        "model-restore-pick@v1",
+    ] {
+        assert!(rows.contains(rule), "{rule}: {why}");
+    }
+    assert!(rows.contains("phase=holding"), "{why}");
+    // The press's INTENT is ledgered before its key, and the switch's rows
+    // carry its stops.
+    let intent = rows
+        .lines()
+        .position(|l| l.contains("pressing; the switch opens once the box leaves"))
+        .unwrap_or_else(|| panic!("the intent row: {why}"));
+    let approved = rows
+        .lines()
+        .position(|l| l.contains("\"approved\"") && l.contains("rate-nudge-switch@v1"))
+        .unwrap_or_else(|| panic!("the approved row: {why}"));
+    assert!(intent < approved, "{why}");
+    // Both only INTENDED until the box is seen leaving; the Esc's row, the
+    // switch's first act, carries it as owed — and its Esc (`esc=`), its
+    // point still to come.
+    for at in [intent, approved] {
+        assert!(
+            rows.lines()
+                .nth(at)
+                .is_some_and(|l| l.contains("phase=intent")),
+            "{why}"
+        );
+    }
+    assert!(
+        rows.lines().any(|l| l.contains("model-wind-down@v1")
+            && l.contains("\"typed\"")
+            && l.contains("stops=1")
+            && l.contains("phase=owed")
+            && !l.contains("esc=-")),
+        "{why}"
+    );
+    assert!(rows.contains("stops=1"), "{why}");
+    // ONE Esc: the goal turn under the box.
+    assert_eq!(
+        keys.iter().filter(|k| k.ends_with(" esc")).count(),
+        1,
+        "{why}"
+    );
+    // The hold is said, in plain words, with the model it waits on.
+    assert!(
+        lines.iter().any(|l| l.starts_with("HOLDING ")
+            && l.contains(
+                "Codex saved its work and waits for GPT-6-Astra medium's limit to reset at"
+            )),
+        "{why}"
+    );
+    let open = open.unwrap_or_else(|| panic!("the hold reads back: {why}"));
+    assert_eq!(open.phase, "holding");
+    assert_eq!(open.from.words(), astra);
+    assert!(open.since_unix.is_some(), "the hold's start is carried");
+}
+
+/// THE GOAL STOP, BOUND TO THE LOOP (the Tier-1 walk binds the decision,
+/// `TurnEndState::goal_stop`; this binds the key): a switch owed its
+/// wind-down — carried on from the ledger, as after a restart — and Codex
+/// running a turn on the cheaper model: the busy read sends ONE Esc guarded
+/// on the turn's status row (`key if=<busy guard> esc`), ledgered under
+/// `model-wind-down@v1` with the switch's stops. NEGATIVE CONTROLS: a
+/// person's keystroke within the grace (`status human_ms=`) sends nothing;
+/// with no switch open, the same busy screen sends nothing.
+#[test]
+fn a_turn_running_while_the_switch_is_owed_is_stopped_on_its_busy_read() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let test_now: i64 = 1_789_660_500;
+    let luna = "GPT-6-Luna medium";
+    for (switch, human_ms, stops) in [
+        (true, None, true),
+        (true, Some(1_000), false),
+        (false, None, false),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("goal-stop-{switch}-{human_ms:?}"));
+        if switch {
+            seed_wind(&ledger, None, test_now + 3 * 86_400, "owed");
+        }
+        let screens = vec![
+            codex_footer(screen(cx::BUSY), luna, Some("Pursuing goal (1h 2m)")),
+            codex_footer(screen(cx::BUSY), luna, Some("Pursuing goal (1h 2m)")),
+            codex_footer(
+                screen(cx::INTERRUPTED),
+                luna,
+                Some("Goal paused (/goal resume)"),
+            ),
+        ];
+        let mut m = Mock::new(true, screens);
+        m.program = "codex";
+        m.cursor_on_caret = true;
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.vanish_after = Some(2);
+        m.human_ms = human_ms;
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{lines:#?}\n{:#?}\n{rows}", m.requests);
+        let escs: Vec<&String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .collect();
+        if stops {
+            assert_eq!(escs.len(), 1, "{why}");
+            assert!(escs[0].contains("esc.to.interrupt"), "guarded: {why}");
+            assert!(
+                rows.lines().any(|l| l.contains("model-wind-down@v1")
+                    && l.contains("\"typed\"")
+                    && l.contains("stops=1")),
+                "{why}"
+            );
+        } else {
+            assert!(escs.is_empty(), "{switch} {human_ms:?}: {why}");
+        }
+    }
+}
+
+/// A PRESS OF THE NUDGE'S SWITCH THAT DID NOT LAND (the box did not change):
+/// its intent row is closed as `released`, no switch opens — nothing of the
+/// wind-down goes — and a restarted loop reads none back.
+#[test]
+fn a_nudge_switch_that_did_not_land_opens_nothing() {
+    use crate::supervise::codex_usage::{CodexSeen, LimitRead};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let test_now: i64 = 1_789_660_500;
+    let astra = "GPT-6-Astra medium";
+    let screens = vec![
+        codex_footer(screen(cx::END_OF_TURN), astra, None),
+        screen(cx::RATE_NUDGE),
+    ];
+    let mut m = Mock::new(true, screens);
+    m.program = "codex";
+    m.cursor_on_caret = true;
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.vanish_after = Some(3);
+    let (dir, ledger) = ledger_at("nudge-missed");
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            approve: crate::supervise::config::Approve::All,
+            ..SupervisorConfig::default()
+        },
+        ..auto(20, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_codex_records(CodexSeen {
+            limits: LimitRead::Near {
+                used: 99,
+                back_at: Some(test_now + 3 * 86_400),
+            },
+            ..CodexSeen::default()
+        });
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let open = crate::supervise::approvals::open_wind_down(&ledger, None);
+    let _ = std::fs::remove_dir_all(&dir);
+    let why = format!("{lines:#?}\n{:#?}\n{rows}", m.requests);
+    assert!(
+        m.requests
+            .iter()
+            .any(|r| r.starts_with("key ") && r.ends_with(" 1")),
+        "the switch pressed: {why}"
+    );
+    assert!(
+        rows.contains("the box did not change after the press: the switch is not open"),
+        "{why}"
+    );
+    assert!(open.is_none(), "{open:?}: {why}");
+    assert!(
+        !m.requests
+            .iter()
+            .any(|r| r.starts_with("turn ") && r.contains("saving your work")),
+        "{why}"
+    );
+}
+
+/// A switch's three rows as a loop that opened it wrote them — the press,
+/// its wind-down, then `phase` with `extra` words (`stops=3 told=goal`) —
+/// on the TEST'S clock ([`TEST_NOW`]), the last `last_age_s` before it.
+fn seed_wind_at(path: &std::path::Path, phase: &str, extra: &str, last_age_s: i64) {
+    use crate::supervise::approvals::{Outcome, Row};
+    let now_ms = TEST_NOW * 1000;
+    let back = TEST_NOW + 3 * 86_400;
+    let words = |p: &str, x: &str| {
+        format!(
+            "(model switch: kind=wind-down from=GPT-6-Astra effort=ultra to=gpt-6-luna \
+             back_at={back} marker=ATERM-SAVED-3f9a1c2e goal=paused {x} phase={p})"
+        )
+    };
+    let owed = format!("unproven: near {}", words("owed", ""));
+    let winding = format!("the turn-end policy {}", words("winding", ""));
+    let later = format!("the turn-end policy {}", words(phase, extra));
+    let rows = [
+        Row {
+            rule_id: crate::supervise::policy::RULE_RATE_NUDGE_SWITCH,
+            outcome: Outcome::Approved,
+            command: "Approaching rate limits => Switch to gpt-6-luna",
+            reason: &owed,
+            box_seq: 90,
+        }
+        .to_json(now_ms - 40 * 60_000, None),
+        Row {
+            rule_id: crate::supervise::policy::turn_end::RULE_WIND_DOWN,
+            outcome: Outcome::Typed,
+            command: "[aterm harness] GPT-6-Astra is close to its usage limit …",
+            reason: &winding,
+            box_seq: 91,
+        }
+        .to_json(now_ms - 39 * 60_000, None),
+        Row {
+            rule_id: crate::supervise::policy::turn_end::RULE_MODEL_RESTORE,
+            outcome: Outcome::Skipped,
+            command: "the switch's last edge",
+            reason: &later,
+            box_seq: 92,
+        }
+        .to_json(now_ms - last_age_s * 1000, None),
+    ];
+    std::fs::write(path, rows.join("\n") + "\n").expect("the ledger");
+}
+
+/// A Codex loop over `screens` with the switch's rows in `ledger`.
+fn codex_mock(screens: Vec<Vec<String>>, vanish: u32) -> Mock {
+    let mut m = Mock::new(true, screens);
+    m.program = "codex";
+    m.cursor_on_caret = true;
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.vanish_after = Some(vanish);
+    m
+}
+
+/// A PERSON'S OWN TURN IS NEVER STOPPED BY THE LOOP (the re-review of
+/// 2026-09-28, its scratch loop test made real): a switch carried on from
+/// the ledger — held, owed its save, owed its model back — and a turn
+/// running whose person's keystroke (`status human_ms=121000`) is past the
+/// grace but after the switch's last row: their `/goal resume`, their
+/// message. No Esc goes. NEGATIVE CONTROL: a keystroke from before that row
+/// (25 minutes) is no hand in the turn — the goal's turn is stopped, one Esc
+/// guarded on its status row.
+#[test]
+fn a_persons_turn_past_the_grace_is_never_stopped() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let astra = "GPT-6-Astra ultra";
+    let luna = "GPT-6-Luna medium";
+    let pursuing = "Pursuing goal (1h 2m)";
+    let paused = "Goal paused (/goal resume)";
+    for (phase, model, goal, human_ms, stopped) in [
+        ("holding", astra, pursuing, 121_000, false),
+        ("owed", luna, paused, 121_000, false),
+        ("restore", luna, paused, 121_000, false),
+        ("holding", astra, pursuing, 1_500_000, true),
+        ("owed", luna, paused, 1_500_000, true),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("persons-turn-{phase}-{human_ms}"));
+        seed_wind_at(&ledger, phase, "", 20 * 60);
+        let mut m = codex_mock(
+            vec![
+                codex_footer(screen(cx::BUSY), model, Some(goal)),
+                codex_footer(screen(cx::BUSY), model, Some(goal)),
+                codex_footer(screen(cx::INTERRUPTED), model, Some(paused)),
+            ],
+            2,
+        );
+        m.human_ms = Some(human_ms);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{phase} {human_ms}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        let escs = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .count();
+        assert_eq!(escs, usize::from(stopped), "{why}");
+        assert_eq!(
+            rows.lines()
+                .any(|l| l.contains("\"typed\"") && l.contains("\"command\":\"esc\"")),
+            stopped,
+            "{why}"
+        );
+    }
+}
+
+/// THE LATCH: a busy read that saw a person's hand IN the running turn keeps
+/// it theirs until the turn's point, however the keystroke ages; the turn's
+/// own work keeps it theirs past the grace. A keystroke from before the open
+/// switch opened is none of any turn it reads (the round-3 re-review).
+/// NEGATIVE CONTROLS: unlatched, a keystroke older than the turn so far is
+/// none; one after the opening, within the turn, is theirs.
+#[test]
+fn a_persons_hand_seen_in_a_turn_is_latched_until_its_point() {
+    use crate::supervise::policy::turn_end::{CodexSetting, RunningTurn, WindDown};
+    let mut m = Mock::new(true, vec![rows(&["x"])]);
+    let mut s = session(&mut m, None);
+    let now = Instant::now() + Duration::from_secs(3600);
+    let ago = |d: u64| now.checked_sub(Duration::from_secs(d));
+    s.running.busy(now);
+    s.person = ago(1);
+    assert!(s.person_in_this_turn(now), "within the turn");
+    s.person = ago(400);
+    assert!(s.person_in_this_turn(now), "latched");
+    s.running = RunningTurn::default();
+    s.running.busy(now);
+    assert!(!s.person_in_this_turn(now), "unlatched: before the turn");
+    s.running = RunningTurn::default();
+    s.running.busy(ago(400).expect("the clock"));
+    assert!(s.person_in_this_turn(now), "the turn's own work");
+    // The floor: the switch opened 10 s ago; a keystroke a minute ago, in
+    // the span the loop kept, is none of the goal turn running now.
+    s.turn_end.open_switch(WindDown {
+        opened_at: ago(10),
+        ..WindDown::opened(
+            CodexSetting {
+                model: "GPT-6-Astra".to_string(),
+                effort: Some("ultra".to_string()),
+            },
+            "gpt-6-luna".to_string(),
+            None,
+            "ATERM-SAVED-3f9a1c2e".to_string(),
+        )
+    });
+    s.running = RunningTurn::default();
+    s.running.busy(ago(600).expect("the clock"));
+    s.person = ago(60);
+    assert!(!s.person_in_this_turn(now), "floored at the opening");
+    s.person = ago(5);
+    assert!(s.person_in_this_turn(now), "after the opening: theirs");
+}
+
+/// A Codex screen whose turn ended under a background terminal (`1
+/// background terminal running`, which reads busy for as long as it runs),
+/// the agent's last words `said`, its footer `model` and `goal`.
+fn under_background(said: &[&str], model: &str, goal: Option<&str>, bg: bool) -> Vec<String> {
+    let mut r = vec![
+        "› [aterm harness] GPT-6-Astra is close to its usage limit ...".to_string(),
+        String::new(),
+    ];
+    for l in said {
+        r.push((*l).to_string());
+    }
+    r.extend([String::new(), "  1:41 AM".to_string(), String::new()]);
+    if bg {
+        r.push("  1 background terminal running · /ps to view · /stop to close".to_string());
+        r.push(String::new());
+    }
+    r.push("› Ask Codex to do anything".to_string());
+    r.push(String::new());
+    r.push("  GPT-6-Luna medium · ~/pj · Main [default]".to_string());
+    codex_footer(r, model, goal)
+}
+
+/// A SWITCH UNDER A CODEX BACKGROUND TERMINAL GOES ON (the re-review of
+/// 2026-09-28, its scratch loop tests made real): the save's own turn ends
+/// with a background terminal still running — Codex draws its line under
+/// the ended turn, and the screen reads busy for as long as it runs — and
+/// the break is the switch's point: the marker judged (`saved`) and `/model`
+/// typed; an owed save under the same line is typed. Nothing else goes at
+/// that break: no continuation, no host step. CONTROLS: the same screens
+/// without the line do the same at an ordinary point.
+#[test]
+fn a_switch_under_a_background_terminal_goes_on() {
+    let paused = Some("Goal paused (/goal resume)");
+    for bg in [true, false] {
+        // Winding: the save's end carries its marker.
+        let (dir, ledger) = ledger_at(&format!("bg-winding-{bg}"));
+        seed_wind_at(&ledger, "winding", "", 60);
+        let end = under_background(
+            &["• Committed and pushed.", "", "  ATERM-SAVED-3f9a1c2e"],
+            "GPT-6-Luna medium",
+            paused,
+            bg,
+        );
+        let mut m = codex_mock(vec![end.clone(), end.clone(), end], 3);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.set_background_settle(Duration::ZERO);
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("bg={bg}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert!(
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("turn ") && r.ends_with(" /model")),
+            "the restore: {why}"
+        );
+        assert!(
+            rows.contains("\"command\":\"saved\""),
+            "judged saved: {why}"
+        );
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("turn ") && r.contains("keep going")),
+            "{why}"
+        );
+        assert_eq!(
+            m.requests
+                .iter()
+                .filter(|r| r.starts_with("turn ") && r.ends_with(" /model"))
+                .count(),
+            1,
+            "once, the break read again deciding nothing new: {why}"
+        );
+        // Owed: the goal turn in flight when the loop started ended, a
+        // terminal it started still running.
+        let (dir, ledger) = ledger_at(&format!("bg-owed-{bg}"));
+        seed_wind_at(&ledger, "owed", "", 60);
+        let stopped = under_background(
+            &["• The parser's second step is done."],
+            "GPT-6-Luna medium",
+            paused,
+            bg,
+        );
+        let mut m = codex_mock(vec![stopped.clone(), stopped.clone(), stopped], 3);
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("bg={bg}: {lines:#?}\n{:#?}", m.requests);
+        assert!(
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("turn ") && r.contains("saving your work")),
+            "the save: {why}"
+        );
+    }
+}
+
+/// A host that wants every point, counts the background breaks offered, and
+/// keeps the guards the loop said withheld one ([`IdleHost::withheld`]).
+#[derive(Debug, Default)]
+struct BackgroundHost {
+    backgrounds: std::sync::atomic::AtomicUsize,
+    informed: std::sync::Mutex<Vec<String>>,
+    withheld: std::sync::Mutex<Vec<crate::supervise::Guard>>,
+}
+
+impl IdleHost for BackgroundHost {
+    fn wants(&self) -> bool {
+        true
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn at_background(&self) -> Option<String> {
+        self.backgrounds.fetch_add(1, Ordering::SeqCst);
+        Some("upgrade step=announced:1".to_string())
+    }
+    fn inform(&self, text: &str) {
+        self.informed.lock().unwrap().push(text.to_string());
+    }
+    fn withheld(&self, guard: crate::supervise::Guard) {
+        self.withheld.lock().unwrap().push(guard);
+    }
+}
+
+/// NO UPGRADE NOTICE INTO AN OPEN SWITCH AT A BACKGROUND BREAK (the
+/// re-review of 2026-09-28): the host's background step is offered no break
+/// while a save-then-wait switch is open, as at an idle point — over the
+/// loop (where the switch takes the break as its own point first) and at
+/// the step's own gate (a loop that does not take it: another supervisor's
+/// claim, an attended look), where the loop SAYS so to the host
+/// (`guard=switch-open`, [`IdleHost::withheld`]). NEGATIVE CONTROL: with no
+/// switch, the same break is offered and nothing is said withheld.
+#[test]
+fn the_hosts_background_step_waits_for_an_open_switch() {
+    // The step's own gate.
+    for open in [true, false] {
+        let bg = under_background(
+            &["• The server runs in the background."],
+            "GPT-6-Astra ultra",
+            None,
+            true,
+        );
+        let host = Arc::new(BackgroundHost::default());
+        let mut m = codex_mock(vec![bg.clone()], 3);
+        m.program = "codex";
+        let mut s = session(&mut m, None);
+        s.program = Some("codex".to_string());
+        s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        s.background_settle = Duration::ZERO;
+        if open {
+            s.turn_end
+                .open_switch(crate::supervise::policy::turn_end::WindDown::opened(
+                    crate::supervise::policy::turn_end::CodexSetting {
+                        model: "GPT-6-Astra".to_string(),
+                        effort: Some("ultra".to_string()),
+                    },
+                    "gpt-6-luna".to_string(),
+                    None,
+                    "ATERM-SAVED-3f9a1c2e".to_string(),
+                ));
+        }
+        let screen = Screen {
+            rows: bg,
+            cursor_row: 0,
+            cursor_col: 0,
+            seq: 101,
+            first: 0,
+            generation: None,
+            human: crate::supervise::screen::HumanInput::Unknown,
+            human_seq: None,
+        };
+        let mut since = Some(Instant::now());
+        s.host_steps_in_background(&screen, &mut since, &mut Alone);
+        let offered = host.backgrounds.load(Ordering::SeqCst);
+        assert_eq!(offered > 0, !open, "switch open: {open}");
+        let said = host.withheld.lock().unwrap().clone();
+        let expected = if open {
+            vec![crate::supervise::Guard::SwitchOpen]
+        } else {
+            vec![]
+        };
+        assert_eq!(said, expected, "switch open: {open}");
+    }
+    for phase in [Some("holding"), Some("owed"), None] {
+        let (dir, ledger) = ledger_at(&format!("bg-host-{phase:?}"));
+        if let Some(p) = phase {
+            seed_wind_at(&ledger, p, "", 60);
+        }
+        let model = if phase == Some("owed") {
+            "GPT-6-Luna medium"
+        } else {
+            "GPT-6-Astra ultra"
+        };
+        let bg = under_background(&["• The server runs in the background."], model, None, true);
+        let host = Arc::new(BackgroundHost::default());
+        let mut m = codex_mock(vec![bg], 3);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.set_background_settle(Duration::ZERO);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let offered = host.backgrounds.load(Ordering::SeqCst);
+        assert_eq!(
+            offered > 0,
+            phase.is_none(),
+            "{phase:?}: {offered} {lines:#?}"
+        );
+    }
+}
+
+/// THE GOAL'S NOTE STAYS UP (the re-review of 2026-09-28): the stops spent
+/// and Codex's goal running on while the switch stands, a person is told —
+/// the badge raised, the note recorded for them by the host, and the
+/// switch's row carrying it as said (`told=goal`) — and the goal's next
+/// turn does NOT take the badge down. A loop restarted from those rows says
+/// it no more. NEGATIVE CONTROL: the footer shows the goal paused — the
+/// badge goes.
+#[test]
+fn the_goal_note_stays_up_while_the_goal_runs() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let luna = "GPT-6-Luna medium";
+    let pursuing = Some("Pursuing goal (1h 2m)");
+    let paused = Some("Goal paused (/goal resume)");
+    let (dir, ledger) = ledger_at("goal-note");
+    seed_wind_at(&ledger, "owed", "stops=3", 60);
+    let host = Arc::new(BackgroundHost::default());
+    let mut m = codex_mock(
+        vec![
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::END_OF_TURN), luna, pursuing),
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::END_OF_TURN), luna, pursuing),
+        ],
+        4,
+    );
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+    });
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let why = format!("{lines:#?}\n{:#?}\n{rows}", m.requests);
+    assert!(
+        m.attention
+            .as_deref()
+            .is_some_and(|a| a.contains("Codex's goal keeps running")),
+        "the badge stands through the goal's next turn: {why}"
+    );
+    assert_eq!(count(&m, "meta set attention"), 1, "said once: {why}");
+    assert!(
+        host.informed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("Codex's goal keeps running")),
+        "{why}"
+    );
+    assert!(rows.contains("told=goal"), "{why}");
+    // A loop restarted from these rows says it no more.
+    let mut again = codex_mock(
+        vec![
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::END_OF_TURN), luna, pursuing),
+        ],
+        2,
+    );
+    let (lines, _) = watch_lines_with(&mut again, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+    });
+    assert_eq!(
+        count(&again, "meta set attention"),
+        0,
+        "{lines:#?}\n{:#?}",
+        again.requests
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // The control: the goal seen paused, the badge goes.
+    let (dir, ledger) = ledger_at("goal-note-paused");
+    seed_wind_at(&ledger, "owed", "stops=3", 60);
+    let mut m = codex_mock(
+        vec![
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::END_OF_TURN), luna, pursuing),
+            codex_footer(screen(cx::END_OF_TURN), luna, paused),
+        ],
+        3,
+    );
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        count(&m, "meta set attention"),
+        1,
+        "{lines:#?}\n{:#?}",
+        m.requests
+    );
+    assert_eq!(count(&m, "meta unset attention"), 1, "{:#?}", m.requests);
+    assert_eq!(m.attention, None, "{lines:#?}\n{:#?}", m.requests);
+}
+
+/// A PRESS ONLY INTENDED, READ BACK (the re-review's nit): a loop that died
+/// between the intent row and the key finds the nudge still up — its row
+/// only intended (`phase=intent`), the box is decided again and its switch
+/// pressed, near the limit. NEGATIVE CONTROL: a switch whose row says it
+/// landed (`owed`) keeps the model at the same nudge.
+#[test]
+fn an_intended_press_leaves_the_nudge_to_be_decided_again() {
+    use crate::supervise::approvals::{Outcome, Row};
+    use crate::supervise::codex_usage::{CodexSeen, LimitRead};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    for (phase, switched) in [("intent", true), ("owed", false)] {
+        let (dir, ledger) = ledger_at(&format!("intent-{phase}"));
+        let row = Row {
+            rule_id: crate::supervise::policy::RULE_RATE_NUDGE_SWITCH,
+            outcome: Outcome::Skipped,
+            command: "Approaching rate limits => Switch to gpt-6-luna",
+            reason: &format!(
+                "pressing; the switch opens once the box leaves (model switch: kind=wind-down \
+                 from=GPT-6-Astra effort=medium to=gpt-6-luna back_at={} \
+                 marker=ATERM-SAVED-3f9a1c2e goal=- phase={phase})",
+                TEST_NOW + 3 * 86_400
+            ),
+            box_seq: 90,
+        }
+        .to_json(TEST_NOW * 1000 - 5_000, None);
+        std::fs::write(&ledger, row + "\n").expect("the ledger");
+        // The loop starts at the box, which covers the footer: the intended
+        // switch's own `from` is the thread's model.
+        let mut m = codex_mock(vec![screen(cx::RATE_NUDGE)], 2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                approve: crate::supervise::config::Approve::All,
+                ..SupervisorConfig::default()
+            },
+            ..auto(20, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(CodexSeen {
+                limits: LimitRead::Near {
+                    used: 99,
+                    back_at: Some(TEST_NOW + 3 * 86_400),
+                },
+                ..CodexSeen::default()
+            });
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{phase}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert_eq!(
+            rows.contains("rate-nudge-switch@v1\",\"decision\":\"approved\""),
+            switched,
+            "{why}"
+        );
+        assert_eq!(
+            rows.contains("rate-nudge-keep@v1\",\"decision\":\"approved\""),
+            !switched,
+            "{why}"
+        );
+    }
+}
+
+/// A SWITCH THAT CANNOT GO ON UNDER A BACKGROUND TERMINAL IS SAID, NAMING
+/// WHAT HOLDS IT (the round-3 re-review: it blamed the terminal, and advised
+/// a hand `/model` before the save, whatever held it): the save owed at a
+/// break a person is typing through types nothing, and past the bound
+/// (shortened here) a person is told once that THEIR TYPING holds it; with
+/// nobody's hand the save is typed, and when the break does not move after
+/// it, the TERMINAL is named, with `/ps`, `/stop`. Neither advises putting
+/// the model back by hand before the save. The note rides its own row
+/// (`told=background`), so a loop restarted from it says it no more.
+/// NEGATIVE CONTROL: within the bound, nothing is raised.
+#[test]
+fn a_switch_standing_still_under_a_background_terminal_is_said() {
+    for (bound, human_ms, said) in [
+        (
+            Duration::ZERO,
+            Some(1_000),
+            Some("a person is typing into the session"),
+        ),
+        (
+            Duration::ZERO,
+            None,
+            Some("a Codex background terminal keeps the session busy"),
+        ),
+        (Duration::from_secs(3600), Some(1_000), None),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("bg-still-{human_ms:?}-{}", said.is_some()));
+        seed_wind_at(&ledger, "owed", "", 60);
+        let stopped = under_background(
+            &["• The parser's second step is done."],
+            "GPT-6-Luna medium",
+            Some("Goal paused (/goal resume)"),
+            true,
+        );
+        let mut m = codex_mock(vec![stopped.clone(), stopped.clone(), stopped.clone()], 3);
+        m.human_ms = human_ms;
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.set_switch_break_note(bound);
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let why = format!(
+            "{bound:?} {human_ms:?}: {lines:#?}\n{:#?}\n{rows}",
+            m.requests
+        );
+        let typed = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("turn ") && r.contains("saving your work"))
+            .count();
+        assert_eq!(typed, usize::from(human_ms.is_none()), "{why}");
+        let noted: Vec<&str> = rows
+            .lines()
+            .filter(|l| l.contains("the session stays on gpt-6-luna meanwhile"))
+            .collect();
+        match said {
+            Some(held) => {
+                assert_eq!(noted.len(), 1, "said once: {why}");
+                assert!(noted[0].contains(held), "{why}");
+                assert!(noted[0].contains("told=background"), "its row: {why}");
+                assert!(
+                    !noted[0].contains("/model"),
+                    "no hand `/model` before the save: {why}"
+                );
+                assert_eq!(count(&m, "meta set attention"), 1, "{why}");
+                // A loop restarted from these rows says it no more.
+                let mut again = codex_mock(vec![stopped.clone(), stopped.clone()], 2);
+                again.human_ms = human_ms;
+                let (lines, _) = watch_lines_with(&mut again, &opts, |s| {
+                    s.set_approval_ledger(Some(ledger.clone()));
+                    s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+                    s.set_switch_break_note(bound);
+                });
+                let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+                assert_eq!(
+                    rows.lines()
+                        .filter(|l| l.contains("the session stays on gpt-6-luna meanwhile"))
+                        .count(),
+                    1,
+                    "{lines:#?}\n{:#?}\n{rows}",
+                    again.requests
+                );
+            }
+            None => {
+                assert!(noted.is_empty(), "{why}");
+                assert_eq!(count(&m, "meta set attention"), 0, "{why}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// --- the round-3 re-review's scenarios (2026-09-28), made real -------------
+
+/// THE GOAL TURN UNDER THE NUDGE'S BOX IS STOPPED, WHOEVER BEGAN THE TURN THE
+/// BOX COVERED (the round-3 re-review's regression, its two scratch loop
+/// tests made real): the nudge flow near the limit, the loop's span of the
+/// turn before the box preset — a person's message began it ten minutes ago
+/// (`human_ms=610000`), typed into it five minutes ago (`300000`), or their
+/// `/goal` three hours ago with the goal's turns chained since — and Codex's
+/// goal runs its own turn under the box on GPT-6-Luna: ONE Esc, guarded on
+/// its status row — as with nobody's hand (the control). (A person's
+/// keystroke after the switch opened is their hand in the goal turn:
+/// `a_persons_hand_seen_in_a_turn_is_latched_until_its_point`.)
+#[test]
+fn the_goal_turn_under_the_box_is_stopped_whoever_began_the_covered_turn() {
+    use crate::supervise::codex_usage::{CodexSeen, LimitRead};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let astra = "GPT-6-Astra medium";
+    let luna = "GPT-6-Luna medium";
+    let pursuing = Some("Pursuing goal (1h 2m)");
+    let paused = Some("Goal paused (/goal resume)");
+    for (label, human_ms, covered_s, escs) in [
+        (
+            "a person began the covered turn",
+            Some(610_000u64),
+            Some(600u64),
+            1,
+        ),
+        (
+            "a person typed into the covered turn",
+            Some(300_000),
+            Some(600),
+            1,
+        ),
+        (
+            "a person's /goal three hours ago, the goal chained since",
+            Some(3 * 3_600_000 + 5_000),
+            Some(3 * 3600),
+            1,
+        ),
+        ("nobody's hand", None, Some(600), 1),
+    ] {
+        let screens = vec![
+            codex_footer(screen(cx::BUSY), astra, pursuing),
+            screen(cx::RATE_NUDGE),
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::INTERRUPTED), luna, paused),
+        ];
+        let mut m = Mock::new(true, screens);
+        m.program = "codex";
+        m.cursor_on_caret = true;
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.vanish_after = Some(2);
+        m.human_ms = human_ms;
+        m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
+        let (dir, ledger) = ledger_at(&format!("covered-{}", label.len()));
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(CodexSeen {
+                limits: LimitRead::Near {
+                    used: 99,
+                    back_at: Some(TEST_NOW + 3 * 86_400),
+                },
+                ..CodexSeen::default()
+            });
+            if let Some(c) = covered_s {
+                s.running.busy(
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(c))
+                        .expect("the clock"),
+                );
+            }
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{label}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert!(
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("key ") && r.ends_with(" 1")),
+            "the switch pressed: {why}"
+        );
+        let esc: Vec<&String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .collect();
+        assert_eq!(esc.len(), escs, "{why}");
+        assert!(esc[0].contains("esc.to.interrupt"), "guarded: {why}");
+        assert!(
+            rows.lines().any(|l| l.contains("model-wind-down@v1")
+                && l.contains("\"typed\"")
+                && l.contains("\"command\":\"esc\"")),
+            "ledgered: {why}"
+        );
+    }
+}
+
+/// A CARRIED-ON HOLD'S ESCAPED GOAL IS STOPPED THOUGH A PERSON TYPED A DAY
+/// AGO (the round-3 re-review, its scratch loop test made real): the hold's
+/// last row three days old, a person's keystroke a day ago (after the row,
+/// long before the turn in flight), and Codex's goal running on the
+/// thread's own model at the restart: ONE Esc, the hold stands (never "a
+/// person resumed Codex's goal during the hold"), and the goal is paused at
+/// its point. NEGATIVE CONTROL: a keystroke two minutes ago — their `/goal
+/// resume` — is theirs: no Esc, and its end releases the hold.
+#[test]
+fn a_carried_on_holds_escaped_goal_is_stopped_past_an_old_keystroke() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let astra = "GPT-6-Astra ultra";
+    let pursuing = Some("Pursuing goal (1h 2m)");
+    for (human_ms, theirs) in [(86_400_000u64, false), (120_000, true)] {
+        let (dir, ledger) = ledger_at(&format!("seeded-old-{human_ms}"));
+        seed_wind_at(&ledger, "holding", "", 3 * 86_400);
+        let mut m = codex_mock(
+            vec![
+                codex_footer(screen(cx::BUSY), astra, pursuing),
+                codex_footer(screen(cx::BUSY), astra, pursuing),
+                codex_footer(screen(cx::END_OF_TURN), astra, pursuing),
+            ],
+            3,
+        );
+        m.human_ms = Some(human_ms);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{human_ms}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        let escs = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .count();
+        assert_eq!(escs, usize::from(!theirs), "{why}");
+        assert_eq!(
+            rows.contains("a person resumed Codex's goal during the hold"),
+            theirs,
+            "{why}"
+        );
+        if !theirs {
+            assert!(
+                m.requests
+                    .iter()
+                    .any(|r| r.starts_with("turn ") && r.ends_with(" /goal pause")),
+                "the goal paused at its point: {why}"
+            );
+        }
+    }
+}
+
+/// A GOAL THE LIVE UPGRADE HOLDS IS NEVER THE SWITCH'S (the owner's decision
+/// of 2026-09-28; the tab's goal record, `harness::goal_hold`): the carried-on
+/// hold above, its goal turn running — but the record beside the loop's
+/// ledger says the upgrade paused Codex's goal for its move. The switch
+/// presses no Esc into the turn that pause lets finish, types no `/goal
+/// pause`, and writes no claim of its own over the upgrade's. NEGATIVE
+/// CONTROL: no record — the Esc and the pause, as above, and the switch's
+/// claim on the record.
+#[test]
+fn a_goal_the_upgrade_holds_is_never_stopped_or_paused_by_the_switch() {
+    use crate::harness::goal_hold::{self, Hold, How, Owner, Stage};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let astra = "GPT-6-Astra ultra";
+    let pursuing = Some("Pursuing goal (1h 2m)");
+    for upgrade_holds in [true, false] {
+        let (dir, ledger) = ledger_at(&format!("upgrade-holds-{upgrade_holds}"));
+        seed_wind_at(&ledger, "holding", "", 3 * 86_400);
+        let record = goal_hold::path_beside(&ledger);
+        if upgrade_holds {
+            goal_hold::write(
+                &record,
+                &Hold {
+                    stage: Stage::Paused,
+                    ..Hold::pausing(Owner::Upgrade, How::Typed, 42, "0.158.0", 1)
+                },
+            )
+            .expect("record");
+        }
+        let mut m = codex_mock(
+            vec![
+                codex_footer(screen(cx::BUSY), astra, pursuing),
+                codex_footer(screen(cx::BUSY), astra, pursuing),
+                codex_footer(screen(cx::END_OF_TURN), astra, pursuing),
+            ],
+            3,
+        );
+        m.human_ms = Some(86_400_000);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        });
+        let held = goal_hold::read(&record);
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{upgrade_holds}: {lines:#?}\n{:#?}", m.requests);
+        let escs = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+            .count();
+        let paused = m
+            .requests
+            .iter()
+            .any(|r| r.starts_with("turn ") && r.ends_with(" /goal pause"));
+        assert_eq!(
+            (escs, paused),
+            (usize::from(!upgrade_holds), !upgrade_holds),
+            "{why}"
+        );
+        let owner = held.map(|h| (h.owner, h.stage));
+        if upgrade_holds {
+            assert_eq!(owner, Some((Owner::Upgrade, Stage::Paused)), "{why}");
+        } else {
+            assert_eq!(
+                owner,
+                Some((Owner::Switch, Stage::Paused)),
+                "claimed: {why}"
+            );
+        }
+    }
+}
+
+/// THE SAVE'S END UNDER A BACKGROUND TERMINAL, HOWEVER IT ENDED (the round-3
+/// re-review, rr3's and crs7q's scratch loop tests made real): the save's
+/// turn ends ASKING — a rejected push, "Should I merge them and push
+/// again?" — with a background terminal still running: the break is the
+/// switch's point as an idle end is — the marker judged (not saved: a
+/// person told, quoting its words) and `/model` typed; an owed save under
+/// the same line is typed. A saved turn that ends on an offer is judged
+/// saved. A save that ended on luna's own usage WALL under the line is
+/// judged there too. CONTROLS: the same screens without the line.
+#[test]
+fn a_switch_under_a_background_terminal_goes_on_however_the_turn_ended() {
+    let paused = Some("Goal paused (/goal resume)");
+    let asks = [
+        "• The push was rejected: the remote has two new commits.",
+        "",
+        "  Should I merge them and push again?",
+    ];
+    let offers = [
+        "• Committed and pushed.",
+        "",
+        "  ATERM-SAVED-3f9a1c2e",
+        "",
+        "  Want me to open a pull request for the branch as well?",
+    ];
+    let wall = [
+        "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at",
+        "Sep 25th, 2026 3:05 PM.",
+    ];
+    for bg in [true, false] {
+        for (phase, said, saved) in [
+            ("winding", &asks[..], Some(false)),
+            ("winding", &offers[..], Some(true)),
+            ("winding", &wall[..], Some(false)),
+            ("owed", &asks[..], None),
+        ] {
+            let (dir, ledger) = ledger_at(&format!("bg-ended-{phase}-{bg}-{}", said.len()));
+            seed_wind_at(&ledger, phase, "", 60);
+            let end = under_background(said, "GPT-6-Luna medium", paused, bg);
+            let mut m = codex_mock(vec![end.clone(), end.clone(), end], 3);
+            let opts = SuperviseOpts {
+                policy: SupervisorConfig::default(),
+                ..auto(30, None)
+            };
+            let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+                s.set_approval_ledger(Some(ledger.clone()));
+                s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+                s.set_background_settle(Duration::ZERO);
+            });
+            let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+            let _ = std::fs::remove_dir_all(&dir);
+            let why = format!(
+                "{phase} bg={bg} {:?}: {lines:#?}\n{:#?}\n{rows}",
+                said.last(),
+                m.requests
+            );
+            let turns: Vec<&String> = m
+                .requests
+                .iter()
+                .filter(|r| r.starts_with("turn "))
+                .collect();
+            assert!(
+                !turns.iter().any(|t| t.contains("keep going")),
+                "never continued: {why}"
+            );
+            match saved {
+                Some(saved) => {
+                    assert_eq!(
+                        turns.iter().filter(|t| t.ends_with(" /model")).count(),
+                        1,
+                        "the restore, once: {why}"
+                    );
+                    let judged = if saved {
+                        "\"command\":\"saved\""
+                    } else {
+                        "\"command\":\"not saved\""
+                    };
+                    assert!(rows.contains(judged), "{why}");
+                    assert_eq!(
+                        rows.contains("did not confirm that the work is committed and pushed"),
+                        !saved,
+                        "{why}"
+                    );
+                }
+                None => assert!(
+                    turns.iter().any(|t| t.contains("saving your work")),
+                    "the save: {why}"
+                ),
+            }
+        }
+    }
+}
+
+/// FRAMES BETWEEN THE PICKER'S BOXES (the round-3 re-review, crs7q's
+/// scratch test made real): the nudge flow with idle frames between the
+/// model box and the effort box — frames the loop's own settle outlasts and
+/// reads as an idle POINT — types `/model` ONCE: the restore's claim on the
+/// picker stands until it has been gone [`PICKER_SETTLE`], the effort box is
+/// answered as the restore's (`s`, this conversation), and the session is
+/// held on its own model. NEGATIVE CONTROL: no frame between — the same.
+///
+/// [`PICKER_SETTLE`]: crate::supervise::policy::turn_end::PICKER_SETTLE
+#[test]
+fn frames_between_the_pickers_boxes_type_one_model() {
+    use crate::supervise::codex_usage::{CodexSeen, LimitRead};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let astra = "GPT-6-Astra medium";
+    let luna = "GPT-6-Luna medium";
+    let pursuing = Some("Pursuing goal (1h 2m)");
+    let paused = Some("Goal paused (/goal resume)");
+    let marker = crate::harness::upgrade::saved_marker(
+        "-",
+        "gpt-6-luna",
+        u64::try_from(TEST_NOW).expect("after 1970"),
+    );
+    let mut saved = screen(cx::END_OF_TURN);
+    let last = saved
+        .iter()
+        .rposition(|r| r.contains("as it evolves continuously."))
+        .expect("the answer's last row");
+    saved[last] = format!("  {marker}");
+    for between in [0usize, 2, 3] {
+        let mut screens = vec![
+            codex_footer(screen(cx::BUSY), astra, pursuing),
+            screen(cx::RATE_NUDGE),
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::BUSY), luna, pursuing),
+            codex_footer(screen(cx::INTERRUPTED), luna, paused),
+            codex_footer(screen(cx::BUSY), luna, paused),
+            codex_footer(saved.clone(), luna, paused),
+            screen(cx::MODEL_PICK),
+        ];
+        for _ in 0..between {
+            screens.push(codex_footer(saved.clone(), luna, paused));
+        }
+        screens.extend([
+            screen(cx::EFFORT_PICK),
+            screen(cx::EFFORT_PICK),
+            codex_footer(saved.clone(), astra, paused),
+        ]);
+        let mut m = Mock::new(true, screens);
+        m.program = "codex";
+        m.cursor_on_caret = true;
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.turn_gates = vec![4, 6];
+        m.vanish_after = Some(2);
+        m.help = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n".to_string();
+        let (dir, ledger) = ledger_at(&format!("between-{between}"));
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(60, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(CodexSeen {
+                limits: LimitRead::Near {
+                    used: 99,
+                    back_at: Some(TEST_NOW + 3 * 86_400),
+                },
+                ..CodexSeen::default()
+            });
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{between}: {lines:#?}\n{:#?}", m.requests);
+        assert_eq!(
+            m.requests
+                .iter()
+                .filter(|r| r.starts_with("turn ") && r.ends_with(" /model"))
+                .count(),
+            1,
+            "one `/model`: {why}"
+        );
+        assert!(
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("key ") && r.ends_with(" s")),
+            "the effort, this conversation: {why}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("HOLDING ")),
+            "held: {why}"
+        );
+    }
+}
+
+/// THE OWED FOOTER GATE READS THE THREAD SINCE THE SWITCH OPENED (the
+/// round-3 re-review, bound to the loop's reading): a switch carried on as
+/// owed, opened at `opened=`, its footer back on GPT-6-Astra at a point,
+/// and the thread's rollout saying its last turn ran gpt-6-luna BEFORE the
+/// opening — the goal turn under the box, say — is the switch that did not
+/// land: released, nothing typed. NEGATIVE CONTROL: that turn begun after
+/// the opening is a footer lagging it — the save waits, the switch open.
+#[test]
+fn the_owed_footer_gate_reads_the_thread_since_the_switch_opened() {
+    use crate::supervise::codex_usage::CodexSeen;
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let opened = TEST_NOW - 10 * 60;
+    for (turn_at, released) in [(opened - 60, true), (opened + 60, false)] {
+        let (dir, ledger) = ledger_at(&format!("footer-since-{released}"));
+        seed_wind_at(&ledger, "owed", &format!("opened={opened}"), 5 * 60);
+        let end = codex_footer(
+            screen(cx::END_OF_TURN),
+            "GPT-6-Astra ultra",
+            Some("Goal paused (/goal resume)"),
+        );
+        let mut m = codex_mock(vec![end.clone(), end], 2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(CodexSeen {
+                thread_model: Some("gpt-6-luna".to_string()),
+                thread_model_at: Some(turn_at),
+                ..CodexSeen::default()
+            });
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let open = crate::supervise::approvals::open_wind_down(&ledger, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{turn_at}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert_eq!(open.is_none(), released, "{why}");
+        assert_eq!(rows.contains("did not land"), released, "{why}");
+        assert!(
+            !m.requests.iter().any(|r| r.starts_with("turn ")),
+            "nothing typed: {why}"
+        );
+    }
+}
+
+// --- the round-4 re-review's scenarios (2026-09-28), made real -------------
+
+/// Esc keys the loop sent.
+fn escs(m: &Mock) -> usize {
+    m.requests
+        .iter()
+        .filter(|r| r.starts_with("key ") && r.ends_with(" esc"))
+        .count()
+}
+
+/// THE SAVE'S OWN TURN PAST ITS BOUND IS STOPPED ONCE, JUDGED, AND THE
+/// MODEL PUT BACK (the owner's rule: the cheaper model only commits and
+/// pushes; the round-4 re-review: nothing bounded the save's turn): a switch
+/// carried on WINDING, the save's turn running on gpt-6-luna with 16 minutes
+/// of busy work behind it (the loop's span preset), gets ONE Esc guarded on
+/// its status row, journaled as the save's; its interrupted point judges
+/// the marker — none: a person is told, naming the stop — and `/model` is
+/// typed. NEGATIVE CONTROL: five minutes into the save, no Esc goes; its
+/// end, carrying the marker, is the save, and `/model` follows all the same.
+#[test]
+fn the_save_turn_past_its_bound_is_stopped_judged_and_restored() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let luna = "GPT-6-Luna medium";
+    let paused = Some("Goal paused (/goal resume)");
+    for (worked_min, stopped) in [(16u64, true), (5, false)] {
+        let (dir, ledger) = ledger_at(&format!("wind-bound-{worked_min}"));
+        seed_wind_at(&ledger, "winding", "", 60);
+        let busy = codex_footer(screen(cx::BUSY), luna, paused);
+        let end = if stopped {
+            codex_footer(screen(cx::INTERRUPTED), luna, paused)
+        } else {
+            under_background(
+                &["• Pushed.", "", "  ATERM-SAVED-3f9a1c2e"],
+                luna,
+                paused,
+                false,
+            )
+        };
+        let mut m = codex_mock(vec![busy.clone(), busy, end], 2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.running.busy(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(worked_min * 60))
+                    .expect("the clock"),
+            );
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{worked_min}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert_eq!(escs(&m), usize::from(stopped), "{why}");
+        assert!(
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("turn ") && r.ends_with(" /model")),
+            "the model put back: {why}"
+        );
+        if stopped {
+            assert!(
+                m.requests
+                    .iter()
+                    .any(|r| r.starts_with("key ") && r.contains("esc.to.interrupt")),
+                "guarded: {why}"
+            );
+            assert!(
+                rows.lines()
+                    .any(|l| l.contains("\"typed\"") && l.contains("\"command\":\"esc\"")),
+                "the Esc ledgered: {why}"
+            );
+            assert!(
+                rows.lines().any(|l| l.contains("did not confirm")
+                    && l.contains("aterm stopped its turn after 15 min")
+                    && l.contains("told=unsaved")),
+                "said, on its row: {why}"
+            );
+            assert!(
+                rows.contains("not saved: its turn stopped past 15 min"),
+                "{why}"
+            );
+        } else {
+            assert!(!rows.contains("did not confirm"), "{why}");
+            assert!(rows.contains("\"command\":\"saved\""), "{why}");
+        }
+    }
+}
+
+/// An owed switch's press only INTENDED, as the loop ledgers it before the
+/// key ([`Session::nudge_intended`]) — or, `phase`, one said to have landed.
+fn intent_ledger(ledger: &std::path::Path, phase: &str) {
+    use crate::supervise::approvals::{Outcome, Row};
+    let row = Row {
+        rule_id: crate::supervise::policy::RULE_RATE_NUDGE_SWITCH,
+        outcome: Outcome::Skipped,
+        command: "Approaching rate limits => Switch to gpt-6-luna",
+        reason: &format!(
+            "pressing; the switch opens once the box leaves (model switch: kind=wind-down \
+             from=GPT-6-Astra effort=medium to=gpt-6-luna back_at={} \
+             marker=ATERM-SAVED-3f9a1c2e goal=- phase={phase})",
+            TEST_NOW + 3 * 86_400
+        ),
+        box_seq: 90,
+    }
+    .to_json(TEST_NOW * 1000 - 5_000, None);
+    std::fs::write(ledger, row + "\n").expect("the ledger");
+}
+
+/// A NOTE SAID WHILE THE PRESS IS ONLY INTENDED KEEPS IT INTENDED (the
+/// round-4 re-review, its scratch loop test made real): a press carried on
+/// as only intended (`phase=intent`: the key may never have gone), the
+/// session at a break under a background terminal whose footer shows no
+/// model — the stood-still note (its bound shortened) rides its own row,
+/// which says `phase=intent` and names the footer as what holds the switch,
+/// never that the session is on gpt-6-luna. A loop restarted from those
+/// rows, Codex's goal running on the thread's OWN model, sends NO Esc (the
+/// press may never have landed). NEGATIVE CONTROLS: the intent row alone —
+/// no Esc either; the same rows said as landed (`phase=owed`, the defect's
+/// word) — the Esc goes.
+#[test]
+fn a_note_said_while_the_press_is_only_intended_keeps_it_intended() {
+    use crate::supervise::approvals::open_wind_down;
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let (dir, ledger) = ledger_at("intent-note");
+    intent_ledger(&ledger, "intent");
+    assert_eq!(open_wind_down(&ledger, None).expect("open").phase, "intent");
+    let mut scr = under_background(
+        &["• The parser's second step is done."],
+        "GPT-6-Astra medium",
+        None,
+        true,
+    );
+    let n = scr.len();
+    scr[n - 1] = "  ? for shortcuts".to_string();
+    let mut m = codex_mock(vec![scr.clone(), scr.clone(), scr], 3);
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig::default(),
+        ..auto(30, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        s.set_switch_break_note(Duration::ZERO);
+    });
+    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let why = format!("{lines:#?}\n{:#?}\n{rows}", m.requests);
+    let noted: Vec<&str> = rows
+        .lines()
+        .filter(|l| l.contains("\"skipped\"") && l.contains("told=background"))
+        .collect();
+    assert_eq!(noted.len(), 1, "said once, on its row: {why}");
+    assert!(noted[0].contains("phase=intent"), "{why}");
+    assert!(
+        noted[0].contains("footer has not shown gpt-6-luna") && !noted[0].contains("stays on"),
+        "{why}"
+    );
+    assert_eq!(
+        open_wind_down(&ledger, None).expect("open").phase,
+        "intent",
+        "{why}"
+    );
+    // A restart from those rows, Codex's goal on the thread's own model.
+    let busy = codex_footer(
+        screen(cx::BUSY),
+        "GPT-6-Astra medium",
+        Some("Pursuing goal (1h 2m)"),
+    );
+    let escs_of = |ledger: &std::path::Path| {
+        let mut again = codex_mock(vec![busy.clone(), busy.clone(), busy.clone()], 3);
+        let (lines, _) = watch_lines_with(&mut again, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.to_path_buf()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        });
+        (escs(&again), format!("{lines:#?}\n{:#?}", again.requests))
+    };
+    let (after_note, why2) = escs_of(&ledger);
+    assert_eq!(after_note, 0, "{why2}");
+    // CONTROLS: the intent row alone; the rows said as landed.
+    let (dir2, alone) = ledger_at("intent-note-alone");
+    intent_ledger(&alone, "intent");
+    assert_eq!(escs_of(&alone).0, 0);
+    let (dir3, landed) = ledger_at("intent-note-landed");
+    intent_ledger(&landed, "owed");
+    let (landed_escs, why3) = escs_of(&landed);
+    assert_eq!(landed_escs, 1, "{why3}");
+    for d in [dir, dir2, dir3] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A PRESS ONLY INTENDED, A DRAFT AT ITS POINT (the round-4 re-review's
+/// second loop probe made real): the footer showing no model, or
+/// gpt-6-luna, and a person's draft standing — nothing is typed over it, no
+/// row claims the session is on gpt-6-luna to save the work, and a
+/// restarted loop still reads the press as intended (a footer seen landing
+/// it writes no row of its own: the next loop reads it off the footer
+/// again).
+#[test]
+fn an_intended_press_with_a_draft_stays_intended() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    for footer in ["none", "luna"] {
+        let (dir, ledger) = ledger_at(&format!("intent-draft-{footer}"));
+        intent_ledger(&ledger, "intent");
+        let mut end = codex_footer(
+            screen(cx::END_OF_TURN),
+            "GPT-6-Luna medium",
+            Some("Goal paused (/goal resume)"),
+        );
+        if footer == "none" {
+            let at = end
+                .iter()
+                .rposition(|r| r.starts_with("  GPT-"))
+                .expect("footer");
+            end[at] = "  ~/pj · Fix the parser bugs · Main [default]".to_string();
+        }
+        let draft = "› wait, one more thing";
+        let at = end
+            .iter()
+            .rposition(|r| r.starts_with("› Ask Codex"))
+            .expect("composer");
+        end[at] = draft.to_string();
+        let mut m = codex_mock(vec![end.clone(), end], 2);
+        m.screen_cols.insert(0, draft.chars().count());
+        m.screen_cols.insert(1, draft.chars().count());
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(20, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let open = crate::supervise::approvals::open_wind_down(&ledger, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{footer}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert_eq!(open.expect("still open").phase, "intent", "{why}");
+        assert!(!rows.contains("gpt-6-luna to save the work"), "{why}");
+        assert!(
+            !m.requests.iter().any(|r| r.starts_with("turn ")),
+            "nothing typed over the draft: {why}"
+        );
+    }
+}
+
+/// THE OWED FOOTER GATE READS THE THREAD SINCE THE PRESS (the round-4
+/// re-review, its scratch probe made real): a switch carried on as owed,
+/// pressed at `pressed=` and seen opening twenty seconds later at
+/// `opened=`, its footer back on GPT-6-Astra at a point, and the thread's
+/// rollout saying its last turn ran gpt-6-luna — begun between the press and
+/// the opening (the goal turn under the box: ten seconds, or one, before the
+/// opening), or in the press's own second (the rollout's time cut to the
+/// second): a footer lagging it — the save waits, the switch open. With no
+/// `pressed=` (an older row), the opening floors it, a second's slack
+/// included. NEGATIVE CONTROL: a turn a minute before
+/// the press is none of the switch's — released as the switch that did not
+/// land, nothing typed.
+#[test]
+fn the_owed_footer_gate_reads_the_thread_since_the_press() {
+    use crate::supervise::codex_usage::CodexSeen;
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let opened = TEST_NOW - 10 * 60;
+    let pressed = opened - 20;
+    for (words, turn_at, released) in [
+        (
+            format!("opened={opened} pressed={pressed}"),
+            opened - 10,
+            false,
+        ),
+        (
+            format!("opened={opened} pressed={pressed}"),
+            opened - 1,
+            false,
+        ),
+        (
+            format!("opened={opened} pressed={pressed}"),
+            pressed - 1,
+            false,
+        ),
+        (
+            format!("opened={opened} pressed={pressed}"),
+            pressed - 60,
+            true,
+        ),
+        (format!("opened={opened}"), opened - 1, false),
+        (format!("opened={opened}"), opened - 60, true),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("footer-press-{turn_at}-{}", words.len()));
+        seed_wind_at(&ledger, "owed", &words, 5 * 60);
+        let end = codex_footer(
+            screen(cx::END_OF_TURN),
+            "GPT-6-Astra ultra",
+            Some("Goal paused (/goal resume)"),
+        );
+        let mut m = codex_mock(vec![end.clone(), end], 2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(CodexSeen {
+                thread_model: Some("gpt-6-luna".to_string()),
+                thread_model_at: Some(turn_at),
+                ..CodexSeen::default()
+            });
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let open = crate::supervise::approvals::open_wind_down(&ledger, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{words} {turn_at}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert_eq!(open.is_none(), released, "{why}");
+        assert_eq!(rows.contains("did not land"), released, "{why}");
+        if let Some(open) = open
+            && words.contains("pressed=")
+        {
+            assert_eq!(open.pressed_unix, Some(pressed), "{why}");
+        }
+        assert!(
+            !m.requests.iter().any(|r| r.starts_with("turn ")),
+            "nothing typed: {why}"
+        );
+    }
+}
+
+/// THE STOOD-STILL NOTE AT A BREAK IS ONLY SAID (the round-4 re-review, its
+/// ports made real): the save's turn ended under a background terminal —
+/// on its marker and an offer, on a rejected push's question, or plainly —
+/// and the note's bound at zero: the break is decided ONCE (the marker
+/// judged, `/model` typed once), and read again before the wait that
+/// decision named, the switch standing still is said without deciding the
+/// break again — no second `/model`. CONTROL: the same screens without the
+/// line type one `/model` at an ordinary point.
+#[test]
+fn a_stood_still_note_at_a_break_decides_nothing_again() {
+    let paused = Some("Goal paused (/goal resume)");
+    let marker = "  ATERM-SAVED-3f9a1c2e";
+    let rejected = [
+        "• The push was rejected: the remote has two new commits.",
+        "",
+        "  Should I merge them and push again?",
+    ];
+    let offer = [
+        "• Committed and pushed.",
+        marker,
+        "",
+        "  Want me to open a pull request for the branch as well?",
+    ];
+    let plain = ["• Committed and pushed.", "", marker];
+    for (label, said) in [
+        ("offer", &offer[..]),
+        ("rejected", &rejected[..]),
+        ("plain", &plain[..]),
+    ] {
+        for bg in [true, false] {
+            let (dir, ledger) = ledger_at(&format!("still-once-{label}-{bg}"));
+            seed_wind_at(&ledger, "winding", "", 60);
+            let end = under_background(said, "GPT-6-Luna medium", paused, bg);
+            let mut m = codex_mock(vec![end.clone(), end.clone(), end], 3);
+            let opts = SuperviseOpts {
+                policy: SupervisorConfig::default(),
+                ..auto(30, None)
+            };
+            let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+                s.set_approval_ledger(Some(ledger.clone()));
+                s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+                s.set_background_settle(Duration::ZERO);
+                s.set_switch_break_note(Duration::ZERO);
+            });
+            let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+            let _ = std::fs::remove_dir_all(&dir);
+            let why = format!("{label} {bg}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+            assert_eq!(
+                m.requests
+                    .iter()
+                    .filter(|r| r.starts_with("turn ") && r.ends_with(" /model"))
+                    .count(),
+                1,
+                "one `/model`: {why}"
+            );
+            assert!(
+                !m.requests
+                    .iter()
+                    .any(|r| r.starts_with("turn ") && r.contains("keep going")),
+                "{why}"
+            );
+        }
+    }
+}
+
+/// THE POLICY'S OWN HOLD IS NAMED AT A BREAK (the round-4 re-review: a
+/// switch held by the policy's own wait was told as the terminal's, with
+/// `/ps` and `/stop`, which move nothing): an owed save at a break under a
+/// background terminal whose footer shows no model — its bound shortened —
+/// is said to wait on the footer; one whose thread fell into a sandbox, to
+/// be held by the sandbox, with the resume that fixes it. NEGATIVE CONTROL:
+/// the footer on gpt-6-luna types the save, and the break that then stands
+/// still names the terminal.
+#[test]
+fn the_policys_own_hold_is_named_at_a_break() {
+    use crate::supervise::codex_usage::CodexSeen;
+    for (label, footer, sandbox, held) in [
+        ("footer", false, false, "footer has not shown gpt-6-luna"),
+        ("sandbox", true, true, "fell into a sandbox"),
+        (
+            "terminal",
+            true,
+            false,
+            "background terminal keeps the session busy",
+        ),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("own-hold-{label}"));
+        seed_wind_at(&ledger, "owed", "", 60);
+        let mut scr = under_background(
+            &["• The parser's second step is done."],
+            "GPT-6-Luna medium",
+            Some("Goal paused (/goal resume)"),
+            true,
+        );
+        if !footer {
+            let n = scr.len();
+            scr[n - 1] = "  ? for shortcuts".to_string();
+        }
+        let mut m = codex_mock(vec![scr.clone(), scr.clone(), scr], 3);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(CodexSeen {
+                sandbox_fell: sandbox.then(|| "workspace-write".to_string()),
+                ..CodexSeen::default()
+            });
+            s.set_switch_break_note(Duration::ZERO);
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{label}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        let noted: Vec<&str> = rows
+            .lines()
+            .filter(|l| l.contains("\"skipped\"") && l.contains("told=background"))
+            .collect();
+        assert_eq!(noted.len(), 1, "said once: {why}");
+        assert!(noted[0].contains(held), "{why}");
+        assert_eq!(noted[0].contains("/ps"), label == "terminal", "{why}");
+        assert_eq!(
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("turn ") && r.contains("saving your work")),
+            label == "terminal",
+            "{why}"
+        );
+    }
+}
+
+/// THE SWITCH'S OPENING CLOSES THE BOX'S SPAN ITSELF (the round-4
+/// re-review: no test pinned `open_wind`'s call of the box close, and
+/// deleting it left every suite green): a person's hand latched in the turn
+/// the nudge's box covered, then the switch opened by the loop's own
+/// `open_wind` — the latch is spent and the span begun afresh, so the goal
+/// turn Codex runs under the box is no person's, and a busy read of it
+/// measures its own work. The keystroke itself (before the opening) is
+/// floored as before. NEGATIVE CONTROL: the switch opened without the box
+/// close (the policy's `open_switch` alone) keeps the latch — the goal
+/// turn would be spared.
+#[test]
+fn the_switchs_opening_closes_the_boxs_span() {
+    use crate::supervise::policy::turn_end::{CodexSetting, WindDown};
+    let wind = || {
+        WindDown::opened(
+            CodexSetting {
+                model: "GPT-6-Astra".to_string(),
+                effort: Some("ultra".to_string()),
+            },
+            "gpt-6-luna".to_string(),
+            None,
+            "ATERM-SAVED-3f9a1c2e".to_string(),
+        )
+    };
+    for through_the_loop in [true, false] {
+        let mut m = Mock::new(true, vec![rows(&["x"])]);
+        let mut s = session(&mut m, None);
+        let t = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("the clock");
+        // The covered turn: a person's message began it, seen by a busy read.
+        s.running.busy(t);
+        s.person = Some(t + Duration::from_secs(1));
+        assert!(
+            s.person_in_this_turn(t + Duration::from_secs(60)),
+            "their turn"
+        );
+        assert!(s.running.latched());
+        if through_the_loop {
+            s.open_wind(wind());
+        } else {
+            s.turn_end.open_switch(WindDown {
+                opened_at: Some(Instant::now()),
+                ..wind()
+            });
+        }
+        assert_eq!(
+            s.running.latched(),
+            !through_the_loop,
+            "the latch at the opening"
+        );
+        assert_eq!(
+            s.running.since().is_none(),
+            through_the_loop,
+            "the span at the opening"
+        );
+        // The goal turn under the box, read busy after the opening.
+        let now = Instant::now() + Duration::from_secs(5);
+        s.running.busy(now);
+        assert_eq!(
+            s.person_in_this_turn(now),
+            !through_the_loop,
+            "the goal turn under the box"
+        );
+    }
+}
+
+// --- the goal-pause review's scenarios (2026-09-28), made real -------------
+
+/// THE SAVE'S BOUND STANDS UNDER THE UPGRADE'S GOAL HOLD (the goal-pause
+/// review of 2026-09-28, its probe made real): the owner's bound test above
+/// — a switch carried on WINDING, 16 minutes of save work behind it — run
+/// with and without the live upgrade's Paused hold on the tab's goal record.
+/// The upgrade's hold keeps the loop's Esc off a GOAL's turn (the one its
+/// pause lets finish), never off the switch's own save turn: ONE Esc either
+/// way. Until that day it was none under the hold, and the cheaper model's
+/// save ran unbounded.
+#[test]
+fn the_saves_bound_stands_under_the_upgrades_goal_hold() {
+    use crate::harness::goal_hold::{self, Hold, How, Owner, Stage};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let luna = "GPT-6-Luna medium";
+    let paused = Some("Goal paused (/goal resume)");
+    let mut got = Vec::new();
+    for upgrade_holds in [false, true] {
+        let (dir, ledger) = ledger_at(&format!("wind-bound-upgrade-{upgrade_holds}"));
+        seed_wind_at(&ledger, "winding", "", 60);
+        if upgrade_holds {
+            goal_hold::write(
+                &goal_hold::path_beside(&ledger),
+                &Hold {
+                    stage: Stage::Paused,
+                    ..Hold::pausing(Owner::Upgrade, How::Typed, 42, "0.158.0", 1)
+                },
+            )
+            .expect("record");
+        }
+        let busy = codex_footer(screen(cx::BUSY), luna, paused);
+        let end = codex_footer(screen(cx::INTERRUPTED), luna, paused);
+        let mut m = codex_mock(vec![busy.clone(), busy, end], 2);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig::default(),
+            ..auto(30, None)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.running.busy(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(16 * 60))
+                    .expect("the clock"),
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        got.push((upgrade_holds, escs(&m)));
+    }
+    assert_eq!(got, vec![(false, 1), (true, 1)]);
+}
+
+/// THE PAUSED GOAL'S BOX IS ANSWERED ONLY ON THE UPGRADE'S OWN RELAUNCH (the
+/// goal-pause review of 2026-09-28: `goal-resume@v1` was armed by the
+/// upgrade's hold alone, and pressed `Resume goal` on any paused-goal box in
+/// the tab — a person's own `codex resume` of another goal included). The
+/// box is pressed where the hold names the Codex it relaunched and that
+/// Codex still leads its terminal; its press is on the upgrade's record
+/// (`Resuming`, `moved`). NEGATIVE CONTROLS, each alone: the relaunch no
+/// longer leading (the box is another Codex's), and the box left to a person
+/// at the keys (`BOX_THEIRS`) — nothing pressed, the record as it was.
+#[test]
+fn only_the_upgrades_relaunch_has_its_goal_box_answered() {
+    use crate::harness::goal_hold::{self, Hold, How, Owner, Stage};
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    for (leads, theirs, pressed) in [
+        (true, false, true),
+        (false, false, false),
+        (true, true, false),
+    ] {
+        let (dir, ledger) = ledger_at(&format!("goal-box-{leads}-{theirs}"));
+        let record = goal_hold::path_beside(&ledger);
+        let mut hold = Hold {
+            stage: Stage::Paused,
+            took_at: 10,
+            relaunched: 5151,
+            ..Hold::pausing(Owner::Upgrade, How::Typed, 42, "0.158.0", 1)
+        };
+        if theirs {
+            hold.say(crate::harness::upgrade_codex::BOX_THEIRS);
+        }
+        goal_hold::write(&record, &hold).expect("record");
+        // The box sits until a key reaches it; then the goal runs again.
+        let resumed = codex_footer(
+            screen(cx::END_OF_TURN),
+            "GPT-6-Astra ultra",
+            Some("Pursuing goal (1h 2m)"),
+        );
+        let mut m = codex_mock(vec![screen(cx::GOAL_RESUME), resumed], 2);
+        m.key_releases = Some(0);
+        // A host that fences a focus move on the screen generation.
+        m.help = FENCED_HELP.to_string();
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                approve: crate::supervise::config::Approve::All,
+                ..SupervisorConfig::default()
+            },
+            ..auto(20, None)
+        };
+        let lead: fn(u32) -> bool = if leads { |p| p == 5151 } else { |_| false };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.set_codex_records(crate::supervise::codex_usage::CodexSeen::default());
+            s.codex_leads = lead;
+        });
+        let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let after = goal_hold::read(&record);
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = format!("{leads}/{theirs}: {lines:#?}\n{:#?}\n{rows}", m.requests);
+        assert_eq!(
+            rows.contains("goal-resume@v1\",\"decision\":\"approved\""),
+            pressed,
+            "{why}"
+        );
+        assert_eq!(
+            after.map(|h| (h.stage, h.why)),
+            Some(if pressed {
+                (Stage::Resuming, "moved".to_string())
+            } else {
+                (Stage::Paused, String::new())
+            }),
+            "{why}"
+        );
+    }
 }

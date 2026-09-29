@@ -121,6 +121,48 @@ fn a_chunked_reply_is_reassembled() {
 }
 
 #[test]
+fn a_chunk_size_at_the_top_of_usize_is_an_error_not_a_panic() {
+    // The exact byte sequence that reproduced the defect: one real chunk, then
+    // a chunk-size line of ffffffffffffffff (usize::MAX). The old `body.len() +
+    // size > limit` panicked outright under debug-assertions and WRAPPED in
+    // release — where the wrap passed the limit check, resize truncated instead
+    // of grew, and read_exact panicked on the slice range. A panic here unwinds
+    // the single named worker thread, which has no catch_unwind, so smart
+    // titles would stay dead for the rest of the process's life.
+    let (endpoint, _rx) = stub(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\nffffffffffffffff\r\n",
+    );
+    let error = client()
+        .post(&endpoint)
+        .limit(4096)
+        .send(b"{}")
+        .expect_err("a chunk size that cannot fit must be refused");
+    assert!(
+        matches!(error, Error::TooLarge { limit: 4096 }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn conflicting_duplicate_content_lengths_are_refused() {
+    // One `find` returning the first of N is how two peers end up disagreeing
+    // about where this response ends. RFC 9112 also permits only 1*DIGIT, so a
+    // sign-prefixed length — which Rust's usize parser accepts — is refused too.
+    for response in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 9\r\n\r\nhi" as &[u8],
+        b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nhi",
+    ] {
+        let (endpoint, _rx) = stub(response);
+        let error = client()
+            .post(&endpoint)
+            .limit(4096)
+            .send(b"{}")
+            .expect_err("ambiguous framing must be refused");
+        assert!(matches!(error, Error::Protocol(_)), "{error:?}");
+    }
+}
+
+#[test]
 fn a_non_2xx_status_reaches_the_caller_intact() {
     let (endpoint, _rx) = stub(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot here\n");
     let response = client().post(&endpoint).limit(4096).send(b"{}").unwrap();
@@ -215,6 +257,137 @@ fn a_silent_server_hits_the_deadline_instead_of_hanging() {
     let _ = error;
 }
 
+/// A stub that captures every byte it is sent, to EOF, and never replies.
+fn capturing_stub() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(read) = stream.read(&mut buf) {
+            if read == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..read]);
+        }
+        let _ = tx.send(seen);
+    });
+    (port, rx)
+}
+
+#[test]
+fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
+    // The trust model is this crate's headline claim, and the regression that
+    // would hurt most is the silent one: `Client::open` stops running the
+    // handshake and the worker's prompt — terminal context, and a bearer token
+    // in the headers — goes out in the clear. This peer speaks no TLS at all,
+    // so the handshake cannot finish; what is asserted is what reached the
+    // socket BEFORE it failed.
+    //
+    // Non-vacuity is the 0x16 check: a downgrade to plaintext would put "POST "
+    // in this buffer instead of a TLS handshake record, and the canary assert
+    // below would fire on the same run.
+    //
+    // NOT covered here, deliberately: that a server certificate is actually
+    // VERIFIED, and an invalid one refused. That needs a peer holding a real
+    // certificate, which needs a private key — and a key fixture cannot be
+    // tracked (tools/grep_guard.sh B6/B8), while generating one at test time
+    // means either an `openssl s_server` child (LibreSSL here, OpenSSL on CI —
+    // different flags, a bound port, and a process to reap) or hand-rolled
+    // X.509 DER against a new dev-dependency. In a change whose whole purpose
+    // is retiring dependencies, neither is the right trade to make silently.
+    let secret = br#"{"model":"m","prompt":"CANARY-MUST-NEVER-APPEAR-IN-CLEARTEXT"}"#;
+    let (port, rx) = capturing_stub();
+    let error = Client::new(
+        Trust::PlatformVerifier,
+        ProxyMode::Direct,
+        Duration::from_secs(1),
+    )
+    .post(&format!("https://127.0.0.1:{port}/api/chat"))
+    .limit(4096)
+    .send(secret)
+    .expect_err("a peer that speaks no TLS cannot complete a handshake");
+
+    let seen = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the stub must report what it saw");
+    assert_eq!(
+        seen.first(),
+        Some(&0x16),
+        "an https endpoint must open with a TLS handshake record, not \
+         {:?}: {error:?}",
+        String::from_utf8_lossy(&seen[..seen.len().min(16)])
+    );
+    assert!(
+        !seen
+            .windows(secret.len())
+            .any(|window| window == secret.as_slice()),
+        "the request body reached the socket in cleartext: {error:?}"
+    );
+    assert!(
+        !seen.windows(5).any(|window| window == b"POST "),
+        "the request head reached the socket in cleartext: {error:?}"
+    );
+}
+
+/// A peer that completes the TCP connect, claims a big TLS record, and then
+/// emits one byte at a time forever. It never speaks TLS; the point is only
+/// that bytes keep ARRIVING.
+fn dribbling_tls_peer(step: Duration, steps: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        // A handshake record header claiming 16384 bytes of body, so rustls
+        // stays in `read_tls` waiting for a flight that never completes.
+        if stream.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
+            return;
+        }
+        for _ in 0..steps {
+            if stream.write_all(&[0x00]).is_err() || stream.flush().is_err() {
+                return;
+            }
+            std::thread::sleep(step);
+        }
+    });
+    format!("https://127.0.0.1:{port}/api/chat")
+}
+
+#[test]
+fn a_dribbling_tls_peer_cannot_outlive_the_global_deadline() {
+    // The deadline has to be enforced INSIDE the handshake, not just before it:
+    // `complete_io` loops on `read_tls`, so a per-syscall timeout applied once
+    // at the top bounds one read while every dribbled byte restarts the clock.
+    // This peer dribbles for ~6s against a client budgeted 1s. Before the fix
+    // the client stayed on the socket until the stub gave up; the bound below
+    // is what makes this test non-vacuous rather than the error alone.
+    let endpoint = dribbling_tls_peer(Duration::from_millis(100), 60);
+    let client = Client::new(
+        Trust::PlatformVerifier,
+        ProxyMode::Direct,
+        Duration::from_secs(1),
+    );
+    let started = std::time::Instant::now();
+    let error = client
+        .post(&endpoint)
+        .limit(4096)
+        .send(b"{}")
+        .expect_err("a handshake that never finishes must hit the deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the handshake ran {elapsed:?} on a 1s budget: {error:?}"
+    );
+    assert!(matches!(error, Error::Io(_)), "{error:?}");
+}
+
 #[test]
 fn a_refused_port_is_an_error_not_a_panic() {
     // Bind then drop, so the port is almost certainly closed.
@@ -242,5 +415,15 @@ fn an_unusable_endpoint_fails_before_any_socket_is_opened() {
             .send(b"{}")
             .expect_err("must reject the endpoint");
         assert!(matches!(error, Error::Invalid(_)), "{bad}: {error:?}");
+        // The refusal must not echo what it refused. This message reaches
+        // stderr through the title-summary worker, and the userinfo shape above
+        // is refused precisely because it carries a credential; printing the
+        // raw endpoint back would put that password on the terminal.
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !rendered.contains("pass"),
+                "{bad}: the error echoed the credential: {rendered}"
+            );
+        }
     }
 }

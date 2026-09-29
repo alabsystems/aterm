@@ -7,7 +7,7 @@
 //! Plus the `egress_to_outcome` reply mapper and the `base_logical_key` cfg pair.
 //! A verbatim inherent-impl split of `App`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
@@ -96,6 +96,13 @@ const ORDERED_EGRESS_WITNESS_GRACE: std::time::Duration = std::time::Duration::f
 #[derive(Default)]
 pub(crate) struct OutputEchoTracker {
     active_writes: AtomicUsize,
+    /// Every attempt to write INPUT to the session — a key, a paste, a raw
+    /// editor frame, a controller's `send` — counted at [`Self::begin`], the
+    /// one egress law all of them take. Reports (focus, mouse, colour scheme)
+    /// and the engine's own replies (DA, DSR) never pass here, so they never
+    /// move it: this is what a person or a controller SENT
+    /// ([`Self::input_sent`]).
+    sent: AtomicU64,
     published: Mutex<OutputEchoPublished>,
 }
 
@@ -343,6 +350,9 @@ impl OutputEchoInput {
 impl OutputEchoTracker {
     /// Begin immediately before the real PTY seam (never at FIFO admission).
     fn begin(&self, kind: OutputEchoInput) -> OutputEchoWrite<'_> {
+        if kind != OutputEchoInput::Ignored {
+            self.sent.fetch_add(1, Ordering::AcqRel);
+        }
         let counted = kind != OutputEchoInput::Ignored
             && self
                 .active_writes
@@ -371,6 +381,15 @@ impl OutputEchoTracker {
         let mut write = self.begin(kind);
         write.ticket = ticket.filter(|t| !t.is_empty());
         write
+    }
+
+    /// How many input writes have been attempted on the session: keys,
+    /// pastes, raw editor frames and controller sends — never a report nor an
+    /// engine reply. A change between two reads means someone typed or sent
+    /// something in between (`handoff_history::InputWatch`).
+    #[must_use]
+    pub(crate) fn input_sent(&self) -> u64 {
+        self.sent.load(Ordering::Acquire)
     }
 
     pub(crate) fn begin_event(&self, ev: &InputEvent) -> OutputEchoWrite<'_> {
@@ -3999,8 +4018,9 @@ mod paste_order_sink_isolation_tests {
         use std::time::Duration;
 
         let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // The drain below waits for bytes that must arrive: a hang detector.
         reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
         let wedged = fill_socket_to_backpressure(&mut writer);
@@ -4029,8 +4049,12 @@ mod paste_order_sink_isolation_tests {
             tx.send(paste_order::completed_queued_key_wake(receipt, Some(7)))
                 .unwrap();
         });
+        // A hang detector, not a latency budget: nothing reads the wedged
+        // sink until after this answer, so a decision that waited for the
+        // whole-sink drain would never answer — a minute catches that as
+        // surely as 2 s did, and a loaded machine cannot fail the pass.
         assert!(
-            rx.recv_timeout(Duration::from_secs(2))
+            rx.recv_timeout(Duration::from_secs(60))
                 .expect("spill decision never waits for whole-sink drain")
                 .is_none()
         );
@@ -4391,6 +4415,13 @@ fn field_edit_action(mods: ModifiersState, ev: &KeyEvent) -> Option<crate::app_s
             .map(SearchEdit::Insert),
         _ => None,
     }
+}
+
+/// A ⌘ (Super) chord on a character key: a command, never text, so an open
+/// overlay swallows it instead of typing it into its search
+/// (`App::on_key_overlay_mode`).
+fn overlay_command_chord(mods: ModifiersState, ev: &KeyEvent) -> bool {
+    mods.super_key() && matches!(ev.logical_key, Key::Character(_))
 }
 
 /// Is this a bare MODIFIER press? A focused text field must neither consume one as
@@ -5890,11 +5921,11 @@ fn revoke_trick_line(ws: &mut crate::WindowState, now: std::time::Instant) {
 /// matched, so a newer dispatch's licence is untouched.
 fn revoke_dispatch(ws: &mut crate::WindowState, at: std::time::Instant, write_failed: bool) {
     if write_failed {
-        ws.cursor_glow.revoke_failed_input_at(at);
+        ws.cursor_fx.glow.revoke_failed_input_at(at);
     } else {
-        ws.cursor_glow.revoke_input_hints_at(at);
+        ws.cursor_fx.glow.revoke_input_hints_at(at);
     }
-    ws.cursor_trail.revoke_input_hints_at(at);
+    ws.cursor_fx.trail.revoke_input_hints_at(at);
 }
 
 /// A mouse, wheel or focus report REFUSED because its session's input queue
@@ -6040,8 +6071,8 @@ impl App {
     /// it expires two timestamps.
     pub(crate) fn clear_move_license(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.clear_typed(std::time::Instant::now());
-            ws.cursor_trail.clear_typed();
+            ws.cursor_fx.glow.clear_typed(std::time::Instant::now());
+            ws.cursor_fx.trail.clear_typed();
         }
     }
 
@@ -6120,6 +6151,10 @@ impl App {
     /// `Source`, so the bytes a Human and a Controller produce for the SAME
     /// `InputEvent` are byte-identical (the indistinguishability invariant, proven
     /// by `input::tests::bytes_human_eq_controller`).
+    ///
+    /// `#[track_caller]` on this one-line forwarder: a resize it carries is
+    /// booked with the line that called it (`site=input`).
+    #[track_caller]
     pub(crate) fn input(&mut self, wid: WindowId, ev: InputEvent, src: Source) -> InputOutcome {
         self.input_to_session(wid, ev, src, None, crate::app_input::PressPhase::Initial)
     }
@@ -6199,7 +6234,7 @@ impl App {
         // one: a shed or motion-reduced trail is still `trail_on`).
         let inputs = crate::sound_seam::verb_seam_inputs(
             &glow,
-            &ws.cursor_glow,
+            &ws.cursor_fx.glow,
             crate::sound_seam::HostSoundTerms {
                 sounds_on: self.config.trail_sounds_or_default(),
                 volume: self.config.trail_sound_volume(),
@@ -6922,7 +6957,26 @@ impl App {
     /// solely for a physical key hold whose press already established immutable
     /// session ownership: focus or tab changes must not retarget later repeats.
     /// `None` is the ordinary path and resolves the current front terminal.
+    ///
+    /// A resize ENTRY POINT for the ledger (`site=input`: the control `resize`
+    /// verb arrives as an `InputEvent::Resize`): this shim alone is
+    /// `#[track_caller]`, so a panic or a `term_lock` hold inside the body
+    /// ([`Self::input_to_session_inner`]) still names its own line.
+    #[track_caller]
     pub(crate) fn input_to_session(
+        &mut self,
+        wid: WindowId,
+        ev: InputEvent,
+        src: Source,
+        target_session: Option<u64>,
+        phase: PressPhase,
+    ) -> InputOutcome {
+        let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Input);
+        self.input_to_session_inner(wid, ev, src, target_session, phase)
+    }
+
+    /// The body of [`Self::input_to_session`].
+    fn input_to_session_inner(
         &mut self,
         wid: WindowId,
         ev: InputEvent,
@@ -7715,10 +7769,10 @@ impl App {
                             // nothing to supersede
                         } else if typed_press_supersede || typed_enter || tab_key || paste_chord_key
                         {
-                            ws.cursor_glow.supersede_typed_press();
+                            ws.cursor_fx.glow.supersede_typed_press();
                         } else {
-                            ws.cursor_glow.clear_typed(input_now);
-                            ws.cursor_trail.clear_typed();
+                            ws.cursor_fx.glow.clear_typed(input_now);
+                            ws.cursor_fx.trail.clear_typed();
                         }
                         // ECHO-CORRELATION DEADLINE. Clearing the bypass on the FIRST
                         // content present after the key would not correlate it with THIS
@@ -7776,7 +7830,7 @@ impl App {
                         // must not ignite the comet, spin the rainbow cursor, or
                         // charge the phaser emitter's wings.
                         if !navigation_key && !kill_key && !inert_modifier {
-                            ws.typing_cadence.on_keystroke(input_now);
+                            ws.cursor_fx.cadence.on_keystroke(input_now);
                         }
                         // THE WORD ENGINE'S "A HUMAN TYPED" WITNESS IS ARMED
                         // AFTER THE EGRESS, NOT HERE — see the arm below the
@@ -7798,7 +7852,7 @@ impl App {
                             // 0), or `None` — nothing remembered — for the
                             // engine's whole-press retire.
                             let erased = ws.erase_prices.pop();
-                            ws.cursor_glow.note_backspace_erasing(input_now, erased);
+                            ws.cursor_fx.glow.note_backspace_erasing(input_now, erased);
                         }
                         // Feed only classifier/cadence state here. The
                         // LICENSE itself is stamped below, per class: plain
@@ -7830,7 +7884,7 @@ impl App {
                         // Composer-newline remains a useful morphology hint for
                         // non-movement consumers, but it is never provenance.
                         if shift_enter_insert {
-                            ws.cursor_glow.note_newline_break(input_now);
+                            ws.cursor_fx.glow.note_newline_break(input_now);
                             composer_newline = true;
                         }
                         if typed_forward == Some(true) && (!enter_like || shift_enter_insert) {
@@ -7865,7 +7919,7 @@ impl App {
                             // The momentum glow builds from PRINTABLE typing only —
                             // this arm, never the navigation/kill arms above, and
                             // never a bare modifier: "for typing faster".
-                            ws.momentum_glow.on_key(
+                            ws.cursor_fx.momentum.on_key(
                                 input_now,
                                 aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
                             );
@@ -7878,7 +7932,7 @@ impl App {
                                 if let Some(ch) =
                                     typed.filter(|_| ime.is_none() && typed_cells == 1)
                                 {
-                                    ws.cursor_glow.note_typed_expected(
+                                    ws.cursor_fx.glow.note_typed_expected(
                                         input_now,
                                         typed_cells,
                                         glyph_shifted && !spacebar,
@@ -7886,7 +7940,7 @@ impl App {
                                         ch,
                                     );
                                 } else {
-                                    ws.cursor_glow.note_typed_glyph(
+                                    ws.cursor_fx.glow.note_typed_glyph(
                                         input_now,
                                         typed_cells,
                                         glyph_shifted && !spacebar,
@@ -7917,7 +7971,7 @@ impl App {
                                 // `a_press_the_tty_will_not_echo_banks_no_credit`
                                 // and, for the delivery path, by the
                                 // queued-delivery tests under `comet`.
-                                ws.cursor_trail.note_typed(input_now);
+                                ws.cursor_fx.trail.note_typed(input_now);
                             }
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
                             // audio): past ~20 ms a click stops feeling attached
@@ -8017,31 +8071,33 @@ impl App {
                                 typed,
                             );
                             if click_audible
-                                && ws.cursor_glow.cue_keystroke_shifted(
+                                && ws.cursor_fx.glow.cue_keystroke_shifted(
                                     input_now,
                                     stamp.kind,
                                     stamp.shifted,
                                 )
                             {
-                                let delivered =
-                                    match (click_synth.as_ref(), ws.cursor_glow.take_key_cue()) {
-                                        (Some(synth), Some(cue)) => {
-                                            // The glyph CLASS and RANK ride the
-                                            // keyed cue only (§16 row 8,
-                                            // §3.1's R2): the echo path has
-                                            // no key to read.
-                                            pending_key_sound = Some((
-                                                cue,
-                                                *synth,
-                                                term_cols,
-                                                stamp.glyph_class,
-                                                stamp.rank,
-                                                key_sound_at_ms(),
-                                            ));
-                                            true
-                                        }
-                                        _ => false,
-                                    };
+                                let delivered = match (
+                                    click_synth.as_ref(),
+                                    ws.cursor_fx.glow.take_key_cue(),
+                                ) {
+                                    (Some(synth), Some(cue)) => {
+                                        // The glyph CLASS and RANK ride the
+                                        // keyed cue only (§16 row 8,
+                                        // §3.1's R2): the echo path has
+                                        // no key to read.
+                                        pending_key_sound = Some((
+                                            cue,
+                                            *synth,
+                                            term_cols,
+                                            stamp.glyph_class,
+                                            stamp.rank,
+                                            key_sound_at_ms(),
+                                        ));
+                                        true
+                                    }
+                                    _ => false,
+                                };
                                 if !delivered && let Some(w) = ws.os_window.as_ref() {
                                     w.request_redraw();
                                 }
@@ -8064,7 +8120,7 @@ impl App {
                             && press_kind == PressKind::Inert
                             && !shift_lift_withheld
                             && click_audible
-                            && ws.cursor_glow.cue_modifier(input_now)
+                            && ws.cursor_fx.glow.cue_modifier(input_now)
                         {
                             // The tuple's `take_key_cue` pops the lift
                             // whether or not it can be delivered, which IS
@@ -8072,7 +8128,7 @@ impl App {
                             // not sit in the backlog for the next frame's
                             // drain to replay stale.
                             if let (Some(synth), Some(cue)) =
-                                (click_synth.as_ref(), ws.cursor_glow.take_key_cue())
+                                (click_synth.as_ref(), ws.cursor_fx.glow.take_key_cue())
                             {
                                 // A bare modifier lands no glyph: class 0,
                                 // rank 0.
@@ -8105,8 +8161,8 @@ impl App {
                         // that follows one (navigation re-stamps its own class
                         // immediately below).
                         if navigation_key || kill_key {
-                            ws.cursor_glow.clear_typed(input_now);
-                            ws.cursor_trail.clear_typed();
+                            ws.cursor_fx.glow.clear_typed(input_now);
+                            ws.cursor_fx.trail.clear_typed();
                         }
                         // Plain Enter LICENSES its response (2026-08-30): the
                         // shell echo-back / prompt repaint after a submit is
@@ -8119,8 +8175,8 @@ impl App {
                         // flood after it still declines. The bank was already
                         // preserved by the supersede arm above.
                         if typed_enter && !shift_enter_insert {
-                            ws.cursor_glow.note_return(input_now);
-                            ws.cursor_trail.note_return(input_now);
+                            ws.cursor_fx.glow.note_return(input_now);
+                            ws.cursor_fx.trail.note_return(input_now);
                         }
                         // A TAB / ⌃V IS A USER GESTURE — a completion sweep
                         // or an app's own clipboard insert (Claude Code's
@@ -8145,11 +8201,12 @@ impl App {
                         // gesture and arms no insert, having no echo for
                         // the stamp to spend on.
                         if (tab_key || paste_chord_key) && !tty_swallows {
-                            ws.cursor_glow.note_user_gesture(input_now);
-                            ws.cursor_trail.note_user_gesture(input_now);
+                            ws.cursor_fx.glow.note_user_gesture(input_now);
+                            ws.cursor_fx.trail.note_user_gesture(input_now);
                         }
                         if insert_gesture_armed {
-                            ws.cursor_glow
+                            ws.cursor_fx
+                                .glow
                                 .note_insert_armed(input_now, InsertWidth::Unknown);
                         }
                         // ...except NAVIGATION, which re-stamps its own class:
@@ -8159,17 +8216,17 @@ impl App {
                         // classifier's call — a scrub earns no heat and no
                         // meteor, and the trail's comet stays a typing effect.
                         if navigation_key {
-                            ws.cursor_glow.note_motion(input_now);
-                            ws.cursor_trail.note_navigation(input_now);
+                            ws.cursor_fx.glow.note_motion(input_now);
+                            ws.cursor_fx.trail.note_navigation(input_now);
                         }
                         // Establish KILL AFTER the generic disarm. Moving kills
                         // need `note_kill`'s fresh nav classifier; stationary
                         // kills keep only their row-shrink poof witness and
                         // license no movement class.
                         if kill_key && kill_word {
-                            ws.cursor_glow.note_word_kill(input_now, kill_moves);
+                            ws.cursor_fx.glow.note_word_kill(input_now, kill_moves);
                         } else if kill_key {
-                            ws.cursor_glow.note_kill(input_now, kill_moves);
+                            ws.cursor_fx.glow.note_kill(input_now, kill_moves);
                         }
                         // Feed the kitty-cursor metric — DELETES ONLY, at the key.
                         // A backspace drains the cat's momentum at the KEY instant,
@@ -8432,7 +8489,7 @@ impl App {
                     && outcome != InputOutcome::WriteFailed
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
-                    ws.cursor_glow.note_typed_swallowed_no_echo();
+                    ws.cursor_fx.glow.note_typed_swallowed_no_echo();
                 }
                 // Successful FIFO admission commits an input INTENT, not a
                 // delivery or edit witness. Inline input needs an accepted
@@ -8531,7 +8588,7 @@ impl App {
                             // `trail status` prints as `flow=`, so what the
                             // music box opens on and what an agent reads off
                             // the socket can never disagree.
-                            flow: ws.cursor_glow.flow_status().heat,
+                            flow: ws.cursor_fx.glow.flow_status().heat,
                         },
                     );
                 }
@@ -9052,8 +9109,8 @@ impl App {
                     // A focus report is not a keystroke. Whether the child
                     // consumes or ignores it, it closes an older swallowed
                     // typed/delete license.
-                    ws.cursor_glow.clear_typed(std::time::Instant::now());
-                    ws.cursor_trail.clear_typed();
+                    ws.cursor_fx.glow.clear_typed(std::time::Instant::now());
+                    ws.cursor_fx.trail.clear_typed();
                 }
                 // SOLE focus-report egress (in `seam_egress`): ESC[I / ESC[O,
                 // gated on DEC 1004. The GUI-visual blink/cursor-override side-effect stays in
@@ -9083,8 +9140,8 @@ impl App {
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.clear_typed(std::time::Instant::now());
-            ws.cursor_trail.clear_typed();
+            ws.cursor_fx.glow.clear_typed(std::time::Instant::now());
+            ws.cursor_fx.trail.clear_typed();
         }
         // Carry the gesture-relevant fields out before `seam_egress` (which borrows
         // `ev`) for the tracking-OFF local fallback.
@@ -9154,8 +9211,8 @@ impl App {
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.clear_typed(std::time::Instant::now());
-            ws.cursor_trail.clear_typed();
+            ws.cursor_fx.glow.clear_typed(std::time::Instant::now());
+            ws.cursor_fx.trail.clear_typed();
         }
         // PHOSPHOR alt-screen scroll-quiet gate (design §6), stamped HOST-side
         // at the input funnel BEFORE egress: an alt-screen wheel becomes PTY
@@ -9997,8 +10054,8 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             // Viewport control is not typing. Close the older license before
             // the coordinate class changes.
-            ws.cursor_glow.clear_typed(std::time::Instant::now());
-            ws.cursor_trail.clear_typed();
+            ws.cursor_fx.glow.clear_typed(std::time::Instant::now());
+            ws.cursor_fx.trail.clear_typed();
         }
         // PHOSPHOR alt-screen scroll-quiet gate (design §6): PgUp/PgDn (and
         // the keybinding/controller scroll verbs) are reading intent exactly
@@ -10208,8 +10265,8 @@ impl App {
         }
         self.snap_to_bottom(wid);
         if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.note_user_gesture(input_now);
-            ws.cursor_trail.note_user_gesture(input_now);
+            ws.cursor_fx.glow.note_user_gesture(input_now);
+            ws.cursor_fx.trail.note_user_gesture(input_now);
             // THE BACKSPACE PRICE MEMORY: the pasted glyphs sit between the
             // last typed press and any Backspace that follows, so each such
             // erase is the paste's and retires nothing of the press ring —
@@ -10230,7 +10287,7 @@ impl App {
             // music box alone (`cue_paste` records nothing under the nine
             // other styles). The redraw is the courier: the frame's drain
             // delivers it under the same host policy as every echo cue.
-            if ws.cursor_glow.cue_paste(input_now)
+            if ws.cursor_fx.glow.cue_paste(input_now)
                 && let Some(w) = ws.os_window.as_ref()
             {
                 w.request_redraw();
@@ -11511,7 +11568,7 @@ impl App {
             && matches!(base_key.as_ref(), Some(Key::Character(c)) if c.eq_ignore_ascii_case("v"));
         if plain_typed_glyph || paste_chord {
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.cursor_glow.supersede_typed_press();
+                ws.cursor_fx.glow.supersede_typed_press();
             }
         } else if !keymap::press_is_inert(&ev) {
             // A BARE MODIFIER IS NOT A SUPERSESSION (2026-09-13). macOS
@@ -11624,7 +11681,9 @@ impl App {
         // keybinding, `[key_sequences]` rule, hardcoded Cmd chord, scrollback chord, or
         // Cmd-F can fire. Checked first; without this a `[key_sequences]` rule would write
         // RAW bytes to the PTY (and chords would mutate the window) under the modal.
-        let overlay_repeat = self.palette_repeat_event(wid, &ev);
+        let overlay_repeat = self
+            .palette_repeat_event(wid, &ev)
+            .filter(|_| !overlay_command_chord(mods, &ev));
         if self.on_key_overlay_mode(wid, mods, &ev) {
             self.note_press_disposition(
                 wid,
@@ -13035,14 +13094,23 @@ impl App {
     /// ACTIVE variant's handler and SWALLOW the key (return `true`); closed ⇒ `false` (keys
     /// flow normally). Dispatch is by the one live variant, so there is no gate ORDERING:
     /// one slot holds one surface, and a hidden surface can never swallow keys.
-    fn on_key_overlay_mode(&mut self, wid: WindowId, _mods: ModifiersState, ev: &KeyEvent) -> bool {
+    ///
+    /// A ⌘ chord is swallowed without reaching the variant: it is a command, never
+    /// text. A menu row the bar greys (Copy with no selection, Show Next Tab with
+    /// one tab, Reopen Closed Tab with nothing to reopen) hands its key equivalent
+    /// to `on_key`, and the palette and session picker would type it into their
+    /// search (⌘C as `c`, ⇧⌘] as `}`).
+    fn on_key_overlay_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         use crate::overlay::OverlayKind;
-        match self
+        let kind = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.overlay.as_ref())
-            .map(|o| o.kind())
-        {
+            .map(|o| o.kind());
+        if kind.is_some() && overlay_command_chord(mods, ev) {
+            return true;
+        }
+        match kind {
             Some(OverlayKind::Palette) => self.on_key_palette_mode(wid, ev),
             Some(OverlayKind::ConnCard) => self.on_key_conn_card_mode(wid, ev),
             Some(OverlayKind::SessionPicker) => self.on_key_session_picker_mode(wid, ev),
@@ -13776,7 +13844,7 @@ impl App {
         let reaches_pty = !text.is_empty() && matches!(route, PreeditOwner::Grid);
         if reaches_pty {
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.cursor_glow.supersede_typed_press();
+                ws.cursor_fx.glow.supersede_typed_press();
             }
         } else {
             self.clear_move_license(wid);
@@ -13926,14 +13994,44 @@ impl App {
         let mut p = crate::palette::PaletteState::new();
         p.resolve(&self.palette_live());
         let action = p.action_by_name(name)?;
+        let question_stood = self.close_banner.is_some();
         // Clear first: a refusal left by an EARLIER invocation must never be
         // reported against this one.
         self.pending_action_refusal = None;
         self.dispatch_menu_action(el, action);
-        // AN ARM THAT DECLINED SAYS SO HERE. A menu press has nowhere to print
-        // and answers on glass; `invoke` mints a reply, so reporting `OK` over
-        // a refusal tells a driver the action happened when it did not.
-        match self.pending_action_refusal.take() {
+        self.invoke_reply(name, question_stood)
+    }
+
+    /// `invoke`'s reply once its action has run; `question_stood` is whether a
+    /// close/quit question was already up before it did.
+    ///
+    /// AN ARM THAT DECLINED SAYS SO HERE. A menu press has nowhere to print and
+    /// answers on glass; `invoke` mints a reply, so reporting `OK` over a
+    /// refusal tells a driver the action happened when it did not.
+    ///
+    /// A close or quit that ASKS FIRST (Windows, `close_confirm`) is not a
+    /// refusal, and answering it `ERR`, as 0.95.0 did, told a driver that
+    /// checks the exit code that `invoke CloseTab` had failed while its question
+    /// stood in the window (measured 2026-09-27: exit 1). The action did what
+    /// it does — it asked — so the reply is `OK` in words that cannot be read as
+    /// a close done: `confirm pending kind=… window=…; `confirm yes|no` answers
+    /// it`. A gesture refused because ANOTHER question already stood is still a
+    /// refusal, `ERR`, naming the standing one.
+    pub(crate) fn invoke_reply(
+        &mut self,
+        name: &str,
+        question_stood: bool,
+    ) -> Result<String, String> {
+        let refusal = self.pending_action_refusal.take();
+        if !question_stood
+            && let Some(pending) = self
+                .close_banner
+                .as_ref()
+                .filter(|pending| pending.wire_may_answer())
+        {
+            return Ok(pending.wire_pending());
+        }
+        match refusal {
             Some(why) => Err(format!("{name}: {why}")),
             None => Ok(format!("invoked {name}")),
         }
@@ -14199,8 +14297,8 @@ impl App {
                 }
             }
             // THE FABRIC MENU (round 19, SPEC19 §9; the App side lives in
-            // `app_fabric_menu.rs`). Fleet… is the Fabric menu's route to the
-            // Sessions/Connection Map — the fleet view, not a second screen.
+            // `app_fabric_menu.rs`). Fleet is the Fabric menu's route to the
+            // Connection Map — the fleet view, not a second screen.
             MenuAction::Fleet => {
                 if let Err(e) = self.open_connection_map() {
                     aterm_log::info!("fleet (the connection map): {e}");
@@ -14244,6 +14342,16 @@ impl App {
                     );
                 }
             }
+            // Edit ▸ Reset Terminal (2026-09-26, `crate::manual_reset`): the
+            // front session's terminal back to its host defaults. Queued on
+            // that session's PTY reader and NOT waited for — the main thread
+            // never blocks on a reader; the reader records `modes-restored
+            // reason=manual source=menu` and wakes the window when it ran.
+            MenuAction::ResetTerminal => {
+                if let Some(wid) = self.frontmost_window {
+                    self.menu_reset_terminal(wid);
+                }
+            }
             // Window ▸ Show Identity: the focused session's identity, read-only,
             // as a Markdown tab.
             MenuAction::ShowIdentity => {
@@ -14267,8 +14375,9 @@ impl App {
                 self.user_toggle_presence(action);
             }
             MenuAction::CloseTab => {
-                // Same rule as Cmd-W: close the frontmost window's active tab; when
-                // that was its LAST tab, escalate to closing THAT window (which exits
+                // Same rule as Cmd-W: close the focused pane; a tab's last pane
+                // closes the tab (`App::close_active_tab`). When that was the
+                // window's LAST tab, escalate to closing THAT window (which exits
                 // the app IFF it was the last window).
                 if let Some(closed) = self.close_active_tab() {
                     self.close_window(el, closed);
@@ -14806,6 +14915,7 @@ mod forwarded_release_handoff_activity_tests {
             layout_digest: [0; 32],
             screen_digest: [0; 32],
             activity_epoch: app.update_handoff_activity_epoch,
+            hold_serials: 0,
             cancel,
             arbiter: crate::HandoffAttemptArbiter::new(),
             teardown: crate::DeferredHandoffTeardown::None,
@@ -15654,7 +15764,7 @@ mod ledger_key_tests {
             .filter(|(c, _)| Chord::parse(c).ok().as_ref() == Some(&chord))
             .collect();
         assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].1, "Open Session Ledger");
+        assert_eq!(rows[0].1, "Ledger for This Session");
     }
 }
 
@@ -18251,6 +18361,80 @@ mod smooth_scroll_tests {
         assert!(app.windows[&wid].scroll_glide.is_none());
     }
 
+    /// Tier-1 binding for `scroll_glide_model::Output`: output that re-pins the
+    /// viewport under a glide bound into history (SCR-1) projects onto the
+    /// model's `Output` successor — the viewport AND the glide's target move by
+    /// the machine's row (`Glide::shift`, found through `engine_row` at the next
+    /// wake) — and the landing is the aimed content, `aim + drift`
+    /// (`TargetIsAnchored`). Negative control: the model's Buggy `Output` (the
+    /// pre-2026-09-22 tick that left the target behind) violates the invariant,
+    /// so this bind cannot pass vacuously.
+    #[test]
+    fn output_mid_glide_conforms_to_scroll_glide_model() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let cell_h = app.cell_size().1.max(1) as i64;
+        app.scroll_wheel_animated(wid, &term, 2);
+        let end = app.windows[&wid].scroll_glide.as_ref().unwrap().glide.end();
+        app.tick_scroll_glide(wid, end - Duration::from_millis(150));
+        let mid = term_lock(&term).grid().display_offset() as i64;
+        assert_eq!(mid, 1, "fixture: mid-ease, one row short of the target");
+
+        let model = aterm_spec::derive::scroll_glide_model();
+        let mut before = model.init_state();
+        before.insert("pos", mid);
+        before.insert("target", 2);
+        before.insert("armed", 1);
+        before.insert("wakes", 1);
+        assert!(model.check_invariant("TargetIsAnchored", &before));
+        assert!(model.action_enabled("Output", &before));
+        let expected = model
+            .successors("Output", &before)
+            .into_iter()
+            .next()
+            .expect("Output has one deterministic successor");
+
+        // One line of machine output: SCR-1 re-pins the reader's content.
+        term_lock(&term).process(b"late output\r\n");
+        assert_eq!(
+            term_lock(&term).grid().display_offset() as i64,
+            expected["pos"],
+            "the viewport moved with the content, as the model's Output does"
+        );
+        // The next wake discovers the machine's row and shifts the glide.
+        app.tick_scroll_glide(wid, end - Duration::from_millis(100));
+        let target_rows = app.windows[&wid]
+            .scroll_glide
+            .as_ref()
+            .expect("still easing")
+            .glide
+            .target_px()
+            / cell_h;
+        assert_eq!(target_rows, expected["target"], "the target moved with it");
+        assert!(model.check_invariant("TargetIsAnchored", &expected));
+
+        // The landing is the aimed content: aim + drift.
+        app.tick_scroll_glide(wid, end + Duration::from_millis(1));
+        assert_eq!(
+            term_lock(&term).grid().display_offset() as i64,
+            expected["aim"] + expected["drift"]
+        );
+        assert!(app.windows[&wid].scroll_glide.is_none());
+
+        // NEGATIVE CONTROL: the mutant that re-pins the viewport but leaves the
+        // target behind is exactly what the invariant refuses.
+        let mut buggy = aterm_spec::derive::scroll_glide_model();
+        buggy.consts = vec![("Buggy", 1)];
+        let left_behind = buggy
+            .successors("Output", &before)
+            .into_iter()
+            .next()
+            .expect("the mutant's Output fires too");
+        assert_eq!(left_behind["target"], 2, "the mutant leaves the target");
+        assert!(!buggy.check_invariant("TargetIsAnchored", &left_behind));
+    }
+
     /// A GLIDE BOUND FOR LIVE LANDS ON LIVE (audit, 2026-09-24). The relative
     /// law above is right for a history target, which is content; the live
     /// bottom is a DESTINATION. Shifted by SCR-1's re-pin, a notch toward live
@@ -19377,15 +19561,17 @@ mod keystroke_press_side_effect_tests {
             let mut trail_out = Vec::new();
             {
                 let ws = app.windows.get_mut(&wid).unwrap();
-                ws.cursor_glow
+                ws.cursor_fx
+                    .glow
                     .tick(Some((0, 0)), seed, &glow_cfg, geom, &mut glow_out);
-                ws.cursor_trail
+                ws.cursor_fx
+                    .trail
                     .tick(Some((0, 0)), seed, &trail_cfg, &mut trail_out);
                 // Simulate swallowed older movement gestures. Ctrl-K is newer,
                 // stationary input and must supersede them without replacing
                 // them with another move licence.
-                arm_glow(&mut ws.cursor_glow, seed);
-                ws.cursor_trail.note_user_gesture(seed);
+                arm_glow(&mut ws.cursor_fx.glow, seed);
+                ws.cursor_fx.trail.note_user_gesture(seed);
             }
             // The headless fixture's synthetic PTY peer may already be closed;
             // classifier supersession is intentionally a pre-egress host side
@@ -19393,11 +19579,13 @@ mod keystroke_press_side_effect_tests {
             let _ = app.input(wid, ctrl_k.clone(), Source::Human);
             let moved = Instant::now();
             let ws = app.windows.get_mut(&wid).unwrap();
-            let glow_fp = ws
-                .cursor_glow
-                .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow_out);
+            let glow_fp =
+                ws.cursor_fx
+                    .glow
+                    .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow_out);
             let trail_fp = ws
-                .cursor_trail
+                .cursor_fx
+                .trail
                 .tick(Some((0, 1)), moved, &trail_cfg, &mut trail_out);
             assert_eq!(glow_fp, 0, "stationary kill clears prior glow licences");
             assert_eq!(trail_fp, 0, "stationary kill clears prior trail licences");
@@ -19432,14 +19620,14 @@ mod keystroke_press_side_effect_tests {
             app.config.cursor_trail_style = Some("comet".to_string());
             let cfg = app.trail_config();
             let mut out = Vec::new();
-            app.windows.get_mut(&wid).unwrap().cursor_trail.tick(
+            app.windows.get_mut(&wid).unwrap().cursor_fx.trail.tick(
                 Some((0, 20)),
                 Instant::now(),
                 &cfg,
                 &mut out,
             );
             let _ = app.input(wid, moving_kill, Source::Human);
-            let fp = app.windows.get_mut(&wid).unwrap().cursor_trail.tick(
+            let fp = app.windows.get_mut(&wid).unwrap().cursor_fx.trail.tick(
                 Some((0, 2)),
                 Instant::now(),
                 &cfg,
@@ -19508,9 +19696,11 @@ mod keystroke_press_side_effect_tests {
             let mut trail_out = Vec::new();
             {
                 let ws = app.windows.get_mut(&wid).unwrap();
-                ws.cursor_glow
+                ws.cursor_fx
+                    .glow
                     .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow_out);
-                ws.cursor_trail
+                ws.cursor_fx
+                    .trail
                     .tick(Some((0, 0)), now, &trail_cfg, &mut trail_out);
             }
             assert_eq!(
@@ -19521,13 +19711,15 @@ mod keystroke_press_side_effect_tests {
             let ws = app.windows.get_mut(&wid).unwrap();
             let moved = now + Duration::from_millis(4);
             assert_eq!(
-                ws.cursor_glow
+                ws.cursor_fx
+                    .glow
                     .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow_out),
                 0,
                 "failed input cannot fund a later glow move"
             );
             assert_eq!(
-                ws.cursor_trail
+                ws.cursor_fx
+                    .trail
                     .tick(Some((0, 1)), moved, &trail_cfg, &mut trail_out),
                 0,
                 "failed input cannot fund a later classic comet move"
@@ -19730,7 +19922,7 @@ mod press_path_lock_elision_tests {
             bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
             let bare_cfg = bare.glow_config();
             let b0 = Instant::now();
-            bare.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+            bare.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
                 Some((0, 0)),
                 b0,
                 &bare_cfg,
@@ -19753,15 +19945,16 @@ mod press_path_lock_elision_tests {
             let _ = drain(bare_pipe);
             let ws = bare.windows.get_mut(&wid).unwrap();
             let b1 = Instant::now();
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((2, 0)), b1, &bare_cfg, geom, &mut out);
             assert_eq!(
-                ws.cursor_glow.spawns(),
+                ws.cursor_fx.glow.spawns(),
                 1,
                 "a bare Enter's response move is licensed by note_return alone"
             );
             // …and consumed ONCE: the program flood after it stays dark.
-            ws.cursor_glow.tick(
+            ws.cursor_fx.glow.tick(
                 Some((3, 0)),
                 b1 + Duration::from_millis(16),
                 &bare_cfg,
@@ -19769,12 +19962,12 @@ mod press_path_lock_elision_tests {
                 &mut out,
             );
             assert_eq!(
-                ws.cursor_glow.spawns(),
+                ws.cursor_fx.glow.spawns(),
                 1,
                 "the return license is depth-1/consume-once — floods still decline"
             );
         }
-        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+        app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
             Some((0, 0)),
             t0,
             &glow_cfg,
@@ -19821,15 +20014,16 @@ mod press_path_lock_elision_tests {
         // which left `i`'s echo dark; before that the dangling stamp laid
         // it by accident.)
         let e1 = Instant::now();
-        ws.cursor_glow
+        ws.cursor_fx
+            .glow
             .tick(Some((0, 1)), e1, &glow_cfg, geom, &mut out);
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             1,
             "the first glyph's echo is licensed"
         );
         assert_eq!(
-            ws.cursor_glow.in_flight_tally().credits,
+            ws.cursor_fx.glow.in_flight_tally().credits,
             1,
             "`i` is still in flight after `g`'s echo — the Return forgot nothing"
         );
@@ -19837,22 +20031,23 @@ mod press_path_lock_elision_tests {
         // the pre-fix `clear_typed` would have emptied it)…
         let e2 = e1 + Duration::from_millis(16);
         assert!(
-            ws.cursor_glow.move_licensed(e2),
+            ws.cursor_fx.glow.move_licensed(e2),
             "banked typed stamps must survive a plain Enter"
         );
         // …and licenses `i`'s echo: the in-flight glyph echo that precedes
         // a Return's own move is lit by its credit (§17.3).
-        ws.cursor_glow
+        ws.cursor_fx
+            .glow
             .tick(Some((0, 2)), e2, &glow_cfg, geom, &mut out);
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             2,
             "the in-flight glyph echo after a plain Enter is licensed"
         );
-        assert_eq!(ws.cursor_glow.in_flight_tally().credits, 0);
+        assert_eq!(ws.cursor_fx.glow.in_flight_tally().credits, 0);
         // The Return's own move — the row change — is licensed by
         // `note_return` (was: deterministic no-fresh-hint +1 per Enter).
-        ws.cursor_glow.tick(
+        ws.cursor_fx.glow.tick(
             Some((2, 0)),
             e1 + Duration::from_millis(32),
             &glow_cfg,
@@ -19860,12 +20055,12 @@ mod press_path_lock_elision_tests {
             &mut out,
         );
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             3,
             "Enter's own response move must be licensed"
         );
         // Depth-1/consume-once: everything is spent — a program flood declines.
-        ws.cursor_glow.tick(
+        ws.cursor_fx.glow.tick(
             Some((3, 0)),
             e1 + Duration::from_millis(48),
             &glow_cfg,
@@ -19873,7 +20068,7 @@ mod press_path_lock_elision_tests {
             &mut out,
         );
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             3,
             "the return license is consume-once — a program flood after it stays dark"
         );
@@ -19914,7 +20109,8 @@ mod press_path_lock_elision_tests {
             app.windows
                 .get(&wid)
                 .unwrap()
-                .cursor_glow
+                .cursor_fx
+                .glow
                 .insert_tally()
                 .delivered,
             0,
@@ -19929,7 +20125,8 @@ mod press_path_lock_elision_tests {
             app.windows
                 .get(&wid)
                 .unwrap()
-                .cursor_glow
+                .cursor_fx
+                .glow
                 .insert_tally()
                 .delivered,
             1,
@@ -19991,7 +20188,7 @@ mod press_path_lock_elision_tests {
         };
         let t0 = Instant::now();
         let mut out = Vec::new();
-        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+        app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
             Some((0, 0)),
             t0,
             &glow_cfg,
@@ -20030,15 +20227,16 @@ mod press_path_lock_elision_tests {
         let ws = app.windows.get_mut(&wid).unwrap();
         // The tab sweep is licensed by the gesture hint…
         let e1 = Instant::now();
-        ws.cursor_glow
+        ws.cursor_fx
+            .glow
             .tick(Some((0, 8)), e1, &glow_cfg, geom, &mut out);
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             1,
             "the Tab completion sweep must be licensed (was: the 8-cell black notch)"
         );
         // …and the surviving banked stamp still licenses the in-flight echo.
-        ws.cursor_glow.tick(
+        ws.cursor_fx.glow.tick(
             Some((0, 9)),
             e1 + Duration::from_millis(16),
             &glow_cfg,
@@ -20046,7 +20244,7 @@ mod press_path_lock_elision_tests {
             &mut out,
         );
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             2,
             "banked typed stamps must survive a mid-burst Tab"
         );
@@ -20058,7 +20256,7 @@ mod press_path_lock_elision_tests {
         bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
         let bare_cfg = bare.glow_config();
         let b0 = Instant::now();
-        bare.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+        bare.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
             Some((0, 0)),
             b0,
             &bare_cfg,
@@ -20081,15 +20279,16 @@ mod press_path_lock_elision_tests {
         let _ = drain(bare_pipe);
         let ws = bare.windows.get_mut(&wid).unwrap();
         let b1 = Instant::now();
-        ws.cursor_glow
+        ws.cursor_fx
+            .glow
             .tick(Some((0, 8)), b1, &bare_cfg, geom, &mut out);
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             1,
             "a bare Tab's sweep is licensed by note_user_gesture alone"
         );
         // …and consumed ONCE: the program move after it stays dark.
-        ws.cursor_glow.tick(
+        ws.cursor_fx.glow.tick(
             Some((3, 0)),
             b1 + Duration::from_millis(16),
             &bare_cfg,
@@ -20097,7 +20296,7 @@ mod press_path_lock_elision_tests {
             &mut out,
         );
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             1,
             "the gesture license is consume-once — floods still decline"
         );
@@ -20154,7 +20353,7 @@ mod press_path_lock_elision_tests {
             let glow_cfg = app.glow_config();
             let t0 = Instant::now();
             let mut out = Vec::new();
-            app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+            app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
                 Some((0, 0)),
                 t0,
                 &glow_cfg,
@@ -20170,9 +20369,10 @@ mod press_path_lock_elision_tests {
             }
             let ws = app.windows.get_mut(&wid).unwrap();
             let e1 = Instant::now();
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((0, 1)), e1, &glow_cfg, geom, &mut out);
-            ws.cursor_glow.tick(
+            ws.cursor_fx.glow.tick(
                 Some((0, 2)),
                 e1 + Duration::from_millis(16),
                 &glow_cfg,
@@ -20181,14 +20381,14 @@ mod press_path_lock_elision_tests {
             );
             if !release_fence {
                 assert_eq!(
-                    ws.cursor_glow.spawns(),
+                    ws.cursor_fx.glow.spawns(),
                     2,
                     "banked typed stamps must survive a ⌃V press"
                 );
             }
-            let before = ws.cursor_glow.spawns();
+            let before = ws.cursor_fx.glow.spawns();
             // The app's placeholder echo, 11 cells, laid as one insert.
-            ws.cursor_glow.tick(
+            ws.cursor_fx.glow.tick(
                 Some((0, 13)),
                 e1 + Duration::from_millis(300),
                 &glow_cfg,
@@ -20196,24 +20396,24 @@ mod press_path_lock_elision_tests {
                 &mut out,
             );
             assert_eq!(
-                ws.cursor_glow.spawns(),
+                ws.cursor_fx.glow.spawns(),
                 before + 1,
                 "the ⌃V placeholder echo is licensed (release fence: {release_fence})"
             );
             assert_eq!(
-                ws.cursor_glow.admission_log().last().map(|r| r.licence),
+                ws.cursor_fx.glow.admission_log().last().map(|r| r.licence),
                 Some("insert"),
                 "…as a delivered insert (release fence: {release_fence})"
             );
             // Consume-once: the next keyless hop declines.
-            ws.cursor_glow.tick(
+            ws.cursor_fx.glow.tick(
                 Some((0, 20)),
                 e1 + Duration::from_millis(320),
                 &glow_cfg,
                 geom,
                 &mut out,
             );
-            assert_eq!(ws.cursor_glow.spawns(), before + 1, "one ⌃V, one insert");
+            assert_eq!(ws.cursor_fx.glow.spawns(), before + 1, "one ⌃V, one insert");
         }
     }
 
@@ -20255,12 +20455,12 @@ mod press_path_lock_elision_tests {
             let _ = drain(pipe);
             let ws = app.windows.get(&wid).unwrap();
             assert_eq!(
-                ws.cursor_glow.insert_tally().delivered,
+                ws.cursor_fx.glow.insert_tally().delivered,
                 armed,
                 "{style}: a bare Tab and a bare ⌃V arm the insert for Rainbow Kitty only"
             );
             assert!(
-                ws.cursor_trail.move_licensed(std::time::Instant::now()),
+                ws.cursor_fx.trail.move_licensed(std::time::Instant::now()),
                 "{style}: the gesture class is armed in every style"
             );
         }
@@ -20295,7 +20495,7 @@ mod press_path_lock_elision_tests {
         };
         let t0 = Instant::now();
         let mut out = Vec::new();
-        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+        app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
             Some((0, 0)),
             t0,
             &glow_cfg,
@@ -20322,7 +20522,7 @@ mod press_path_lock_elision_tests {
         let ws = app.windows.get_mut(&wid).unwrap();
         let e1 = Instant::now();
         for (i, col) in [1u16, 2, 4].into_iter().enumerate() {
-            ws.cursor_glow.tick(
+            ws.cursor_fx.glow.tick(
                 Some((0, col)),
                 e1 + Duration::from_millis(16 * i as u64),
                 &glow_cfg,
@@ -20331,7 +20531,7 @@ mod press_path_lock_elision_tests {
             );
         }
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             3,
             "the two in-flight glyph echoes and the commit's own echo all light"
         );
@@ -20866,16 +21066,16 @@ mod press_path_lock_elision_tests {
                 let ws = app.windows.get_mut(&wid).expect("window");
                 // Option+Left: the press stamps the only licence a word move
                 // ever gets, and its echo has not landed yet.
-                ws.cursor_glow.note_motion(now);
-                ws.cursor_trail.note_navigation(now);
-                assert!(ws.cursor_glow.move_licensed(now));
+                ws.cursor_fx.glow.note_motion(now);
+                ws.cursor_fx.trail.note_navigation(now);
+                assert!(ws.cursor_fx.glow.move_licensed(now));
             }
             app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
             let ws = &app.windows[&wid];
             assert_eq!(
                 (
-                    ws.cursor_glow.move_licensed(now),
-                    ws.cursor_trail.move_licensed(now)
+                    ws.cursor_fx.glow.move_licensed(now),
+                    ws.cursor_fx.trail.move_licensed(now)
                 ),
                 (keeps, keeps),
                 "{named:?}: a bare modifier expresses no intent and must not \
@@ -21902,7 +22102,7 @@ mod paste_cursor_gesture_tests {
         let mut out = Vec::new();
         let seed = Instant::now();
         assert_eq!(
-            app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+            app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
                 Some((2, 2)),
                 seed,
                 &cfg,
@@ -21921,7 +22121,7 @@ mod paste_cursor_gesture_tests {
         );
 
         let now = Instant::now();
-        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_glow;
+        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_fx.glow;
         let fingerprint = glow.tick(Some((2, 3)), now, &cfg, geom, &mut out);
         let admitted = fingerprint != 0
             || !out.is_empty()
@@ -22003,7 +22203,7 @@ mod paste_cursor_gesture_tests {
         };
         let mut out = Vec::new();
         let seed = Instant::now();
-        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+        app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
             Some((2, 2)),
             seed,
             &cfg,
@@ -22027,13 +22227,18 @@ mod paste_cursor_gesture_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(!super::paste_order::is_ordering(&sink));
-        let now = Instant::now();
+        // The frame that observes the paste's delivery (see
+        // `typed_kitty_summon_tests::observing_frame`).
+        let now = super::typed_kitty_summon_tests::observing_frame(
+            super::typed_kitty_summon_tests::delivery_edge(&app, wid, 1),
+            1,
+        );
         let session = app.front_terminal(wid).unwrap().session;
         let ctx = &app.pool.get(session).unwrap().ctx;
         let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
         let ticket = batch.items[0].map(|(_, t)| t);
         let width = ticket.and_then(|t| t.insert);
-        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_glow;
+        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_fx.glow;
         if apply
             && let Some((at, ticket)) = batch.items[0]
             && let Some(width) = ticket.insert
@@ -22130,6 +22335,7 @@ mod paste_cursor_gesture_tests {
     #[cfg(unix)]
     #[test]
     fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
+        use super::typed_kitty_summon_tests::{delivery_edge, observing_frame};
         use crate::app_render::CursorFxInputs;
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
         for style in ["rainbow kitty", "comet"] {
@@ -22158,6 +22364,7 @@ mod paste_cursor_gesture_tests {
                 }
                 let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
                 app.frontmost_window = Some(wid_a);
+                let pressed = Instant::now();
                 assert_eq!(
                     app.input(
                         wid_a,
@@ -22179,26 +22386,33 @@ mod paste_cursor_gesture_tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 assert!(!super::paste_order::is_ordering(&sink));
-                let now = Instant::now();
+                // The frames that observe the key: its dispatch inline, its
+                // receipt queued ([`observing_frame`]).
+                let edge = if queued {
+                    delivery_edge(&app, wid_a, 1)
+                } else {
+                    pressed
+                };
+                let now = observing_frame(edge, 1);
                 let mut live = CursorFxInputs::sample_for_test(now);
                 live.cur = Some((2, 2));
                 app.tick_cursor_fx(wid_b, live).expect("B's prelude");
                 let b = &app.windows[&wid_b];
                 assert!(
-                    !b.cursor_glow.move_licensed(now),
+                    !b.cursor_fx.glow.move_licensed(now),
                     "{style} queued={queued}: window B typed nothing and banked nothing, yet holds a typed licence"
                 );
                 assert!(
-                    !b.cursor_trail.move_licensed(now),
+                    !b.cursor_fx.trail.move_licensed(now),
                     "{style} queued={queued}: the classic trail too"
                 );
-                assert_eq!(b.cursor_glow.in_flight_tally().credits, 0);
+                assert_eq!(b.cursor_fx.glow.in_flight_tally().credits, 0);
                 // …while A, which typed it, is licensed either way.
                 let mut live = CursorFxInputs::sample_for_test(now);
                 live.cur = Some((2, 2));
                 app.tick_cursor_fx(wid_a, live).expect("A's prelude");
                 assert!(
-                    app.windows[&wid_a].cursor_glow.move_licensed(now),
+                    app.windows[&wid_a].cursor_fx.glow.move_licensed(now),
                     "{style} queued={queued}: window A holds the key's licence"
                 );
                 if style == "comet" {
@@ -22206,13 +22420,14 @@ mod paste_cursor_gesture_tests {
                     // dispatching window (its tick is disabled under rainbow
                     // kitty, where it clears its hints every frame).
                     assert!(
-                        app.windows[&wid_a].cursor_trail.move_licensed(now),
+                        app.windows[&wid_a].cursor_fx.trail.move_licensed(now),
                         "{style} queued={queued}: window A's classic trail holds the key's typed twin"
                     );
                 }
                 // The one-shot classes are the dispatching window's too: an
                 // Enter typed in A behind a paste re-licenses A, never B.
                 let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
+                let pressed = Instant::now();
                 assert_eq!(
                     app.input(
                         wid_a,
@@ -22233,19 +22448,24 @@ mod paste_cursor_gesture_tests {
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                let now = Instant::now();
+                let edge = if queued {
+                    delivery_edge(&app, wid_a, 1)
+                } else {
+                    pressed
+                };
+                let now = observing_frame(edge, 1);
                 let mut live = CursorFxInputs::sample_for_test(now);
                 live.cur = Some((2, 2));
                 app.tick_cursor_fx(wid_b, live).expect("B's prelude");
                 assert!(
-                    !app.windows[&wid_b].cursor_glow.move_licensed(now),
+                    !app.windows[&wid_b].cursor_fx.glow.move_licensed(now),
                     "{style} queued={queued}: window B did not press Enter, yet holds its return licence"
                 );
                 let mut live = CursorFxInputs::sample_for_test(now);
                 live.cur = Some((2, 2));
                 app.tick_cursor_fx(wid_a, live).expect("A's prelude");
                 assert!(
-                    app.windows[&wid_a].cursor_glow.move_licensed(now),
+                    app.windows[&wid_a].cursor_fx.glow.move_licensed(now),
                     "{style} queued={queued}: window A holds the Enter's licence"
                 );
                 // The insert half stays session-wide: a paste delivered on the
@@ -22273,7 +22493,7 @@ mod paste_cursor_gesture_tests {
                 live.cur = Some((2, 2));
                 app.tick_cursor_fx(wid_b, live).expect("B's prelude");
                 assert_eq!(
-                    app.windows[&wid_b].cursor_glow.insert_tally().delivered,
+                    app.windows[&wid_b].cursor_fx.glow.insert_tally().delivered,
                     u64::from(style == "rainbow kitty"),
                     "{style} queued={queued}: the delivered paste arms B too"
                 );
@@ -22360,10 +22580,13 @@ mod paste_cursor_gesture_tests {
             crate::input::InputOutcome::Ok
         );
         std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(app.windows[&wid].cursor_glow.in_flight_tally().credits, 1);
+        assert_eq!(
+            app.windows[&wid].cursor_fx.glow.in_flight_tally().credits,
+            1
+        );
         // The response: the prompt one row down, caret at column 2.
         tick(&mut app, Instant::now(), (3, 2));
-        let glow = &app.windows[&wid].cursor_glow;
+        let glow = &app.windows[&wid].cursor_fx.glow;
         assert_eq!(
             glow.in_flight_tally().credits,
             1,
@@ -22375,7 +22598,7 @@ mod paste_cursor_gesture_tests {
         std::thread::sleep(Duration::from_millis(20));
         // `c`'s own echo.
         tick(&mut app, Instant::now(), (3, 3));
-        let glow = &app.windows[&wid].cursor_glow;
+        let glow = &app.windows[&wid].cursor_fx.glow;
         let row = glow
             .admission_log()
             .last()
@@ -22453,17 +22676,24 @@ mod paste_cursor_gesture_tests {
         }
         assert!(!super::paste_order::is_ordering(&sink));
         // The frame that first observes the echo: the prelude reads the
-        // receipt, arms the engine, and the tick judges the hop.
-        let mut live = CursorFxInputs::sample_for_test(Instant::now());
+        // receipt, arms the engine, and the tick judges the hop — presented
+        // on the delivery's clock (see
+        // `typed_kitty_summon_tests::observing_frame`).
+        let now = super::typed_kitty_summon_tests::observing_frame(
+            super::typed_kitty_summon_tests::delivery_edge(&app, wid, 1),
+            1,
+        );
+        let mut live = CursorFxInputs::sample_for_test(now);
         live.cur = Some((2, 2 + hop));
         app.tick_cursor_fx(wid, live).expect("live tick");
         let ws = &app.windows[&wid];
         let licence = ws
-            .cursor_glow
+            .cursor_fx
+            .glow
             .admission_log()
             .last()
             .map_or("no-row", |r| r.licence);
-        let out = (ws.cursor_glow.spawns(), licence, ws.delivery_seen);
+        let out = (ws.cursor_fx.glow.spawns(), licence, ws.delivery_seen);
         drop(app);
         drop(sink);
         unsafe {
@@ -22571,7 +22801,12 @@ mod paste_cursor_gesture_tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert!(!super::paste_order::is_ordering(&sink));
-            let now = Instant::now();
+            // The frame that observes the batch's delivery (see
+            // `typed_kitty_summon_tests::observing_frame`).
+            let now = super::typed_kitty_summon_tests::observing_frame(
+                super::typed_kitty_summon_tests::delivery_edge(&app, wid, queued_keys as u64 + 1),
+                1,
+            );
             let ctx = &app.pool.get(session).unwrap().ctx;
             let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
             assert_eq!(
@@ -22590,18 +22825,18 @@ mod paste_cursor_gesture_tests {
             app.tick_cursor_fx(wid, live).expect("first echoed frame");
             let ws = &app.windows[&wid];
             assert_eq!(
-                ws.cursor_glow.insert_tally().delivered,
+                ws.cursor_fx.glow.insert_tally().delivered,
                 1,
                 "{queued_keys} keys: the prelude must apply the paste receipt"
             );
             assert_eq!(
-                ws.cursor_glow.insert_tally().lit,
+                ws.cursor_fx.glow.insert_tally().lit,
                 1,
                 "{queued_keys} later keys cannot steal the paste's own echo"
             );
-            assert_eq!(ws.cursor_glow.spawns(), 1);
+            assert_eq!(ws.cursor_fx.glow.spawns(), 1);
             assert!(
-                !ws.glow_scratch.is_empty(),
+                !ws.cursor_fx.glow_scratch.is_empty(),
                 "{queued_keys} keys: the licensed sweep must emit visible light"
             );
             assert_eq!(
@@ -22678,8 +22913,12 @@ mod paste_cursor_gesture_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(!super::paste_order::is_ordering(&sink));
+        // The paste's and the 33 keys' receipts: the output frames below are
+        // the first and second to observe that delivery, presented on its
+        // clock (see `typed_kitty_summon_tests::observing_frame`).
+        let edge = super::typed_kitty_summon_tests::delivery_edge(&app, wid, 34);
 
-        let present_output = |app: &mut App, bytes: &[u8]| {
+        let present_output = |app: &mut App, bytes: &[u8], nth: u32| {
             let mut row = Vec::new();
             let (cur, print_anchor) = {
                 let front = app.front_terminal(wid).unwrap();
@@ -22689,7 +22928,7 @@ mod paste_cursor_gesture_tests {
                 term.row_cols_into(usize::from(cursor.row), &mut row);
                 ((cursor.row, cursor.col), term.print_anchor())
             };
-            let now = Instant::now();
+            let now = super::typed_kitty_summon_tests::observing_frame(edge, nth);
             app.windows.get_mut(&wid).unwrap().poof_row_buf = row;
             let mut frame = CursorFxInputs::sample_for_test(now);
             frame.cur = Some(cur);
@@ -22700,16 +22939,16 @@ mod paste_cursor_gesture_tests {
         };
 
         let paste_output = [b"\x1b[3;3H".as_slice(), b"p".repeat(33).as_slice()].concat();
-        assert_eq!(present_output(&mut app, &paste_output), (2, 35));
+        assert_eq!(present_output(&mut app, &paste_output, 1), (2, 35));
         let ws = &app.windows[&wid];
-        assert_eq!(ws.cursor_glow.insert_tally().delivered, 1);
+        assert_eq!(ws.cursor_fx.glow.insert_tally().delivered, 1);
         assert_eq!(
-            ws.cursor_glow.insert_tally().lit,
+            ws.cursor_fx.glow.insert_tally().lit,
             1,
             "the paste's first frame must use its own delivered insert licence"
         );
         assert_eq!(
-            ws.cursor_glow.in_flight_tally().credits,
+            ws.cursor_fx.glow.in_flight_tally().credits,
             33,
             "later queued keys have not echoed yet"
         );
@@ -22727,10 +22966,10 @@ mod paste_cursor_gesture_tests {
         ] {
             assert!(model.fire(action, &mut before), "{action}");
         }
-        let key_credit = i64::from(ws.cursor_glow.in_flight_tally().credits == 33);
-        let insert_lit = i64::try_from(ws.cursor_glow.insert_tally().lit).unwrap();
-        let licensed = i64::try_from(ws.cursor_glow.admission_tally().licensed).unwrap();
-        let spawns = i64::try_from(ws.cursor_glow.spawns()).unwrap();
+        let key_credit = i64::from(ws.cursor_fx.glow.in_flight_tally().credits == 33);
+        let insert_lit = i64::try_from(ws.cursor_fx.glow.insert_tally().lit).unwrap();
+        let licensed = i64::try_from(ws.cursor_fx.glow.admission_tally().licensed).unwrap();
+        let spawns = i64::try_from(ws.cursor_fx.glow.spawns()).unwrap();
         let mut observed = before.clone();
         observed.insert("insert_hint", 1 - insert_lit);
         observed.insert("hint", key_credit);
@@ -22740,7 +22979,7 @@ mod paste_cursor_gesture_tests {
         observed.insert("admissions", licensed);
         observed.insert("spawns", spawns);
         observed.insert("births", licensed);
-        observed.insert("resident", i64::from(ws.cursor_glow.is_active()));
+        observed.insert("resident", i64::from(ws.cursor_fx.glow.is_active()));
         observed.insert("licensed_tally", licensed);
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
             &model,
@@ -22766,10 +23005,14 @@ mod paste_cursor_gesture_tests {
         );
         assert!(!ok, "the old typed-class verdict must be refused");
 
-        assert_eq!(present_output(&mut app, &b"k".repeat(33)), (2, 68));
+        assert_eq!(present_output(&mut app, &b"k".repeat(33), 2), (2, 68));
         let ws = &app.windows[&wid];
-        assert_eq!(ws.cursor_glow.in_flight_tally().credits, 0);
-        let ribbon = ws.cursor_glow.v2_ribbon().expect("rainbow kitty engaged");
+        assert_eq!(ws.cursor_fx.glow.in_flight_tally().credits, 0);
+        let ribbon = ws
+            .cursor_fx
+            .glow
+            .v2_ribbon()
+            .expect("rainbow kitty engaged");
         for col in 35..68 {
             assert!(
                 ribbon
@@ -23488,6 +23731,61 @@ mod typed_kitty_summon_tests {
         bytes[..read as usize].to_vec()
     }
 
+    /// THE FRAME THAT OBSERVES A KEY IS PRESENTED ON THE KEY'S OWN CLOCK
+    /// (2026-09-28). Every licence a key banks — the typed stamp, Return,
+    /// newline, nav, quench, gesture — is fresh for a quarter second from
+    /// its EDGE (the dispatch for an inline key, the writer thread's
+    /// completed write for one queued behind a paste), and the render
+    /// prelude judges it at the clock of the frame that observes the echo.
+    /// A test that reads that clock off `Instant::now()` after polling the
+    /// FIFO writer judges it at whenever this thread was next scheduled
+    /// instead: with the gui lib binary run three times over at 18 threads
+    /// (load 20-40), a stall past 250 ms failed
+    /// [`a_queued_one_shot_key_keeps_its_licence_at_delivery`] 1 run in ~8
+    /// with the licence re-stamped exactly as the product should. The
+    /// observing frame is presented at most one refresh after the edge —
+    /// `Instant::now()` while the thread keeps up, the bound when it does
+    /// not — so the verdict is the product's, never the scheduler's.
+    pub(super) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
+
+    /// The clock of the `nth` (1-based) frame after the key edge `edge`
+    /// ([`OBSERVING_FRAME`]): never before `edge` (an edge the caller has
+    /// already observed), monotone in `nth` and in real time. An inline
+    /// key's edge is bounded below by an instant read just before its
+    /// dispatch; a queued key's is its receipt ([`delivery_edge`]).
+    pub(super) fn observing_frame(edge: Instant, nth: u32) -> Instant {
+        Instant::now().min(edge + OBSERVING_FRAME * nth)
+    }
+
+    /// The DELIVERY EDGE of a queued write: the newest of the `receipts`
+    /// receipts `wid`'s session published past the window's baseline
+    /// (`delivery_seen`), placed as the render prelude places it — waited
+    /// for, because a finished FIFO job can hold its receipt until its
+    /// spill reaches the kernel, and the prelude sees it only after that.
+    pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant {
+        let session = app.front_terminal(wid).expect("a terminal").session;
+        let after = app.windows[&wid]
+            .delivery_seen
+            .map_or(0, |(_, serial)| serial);
+        let ctx = &app.pool.get(session).expect("the session").ctx;
+        for _ in 0..400 {
+            let batch = ctx
+                .output_echo
+                .deliveries_after(&ctx.sink, Some(after), Instant::now());
+            if batch.latest >= after + receipts {
+                let (at, _) = batch
+                    .items
+                    .iter()
+                    .flatten()
+                    .next_back()
+                    .expect("a resolved receipt");
+                return *at;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no {receipts} delivery receipt(s) past serial {after}");
+    }
+
     /// The reply-bearing control `signal` fence is deliberately not an empty
     /// synthetic key. It clears only the two exact movement candidates: no PTY
     /// bytes, typing heat, rain scheduling, or latency-hot stamp. A tab-switch
@@ -23538,20 +23836,22 @@ mod typed_kitty_summon_tests {
         let mut trail_out = Vec::new();
         for candidate in [wid, second] {
             let ws = app.windows.get_mut(&candidate).unwrap();
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow_out);
-            ws.cursor_trail
+            ws.cursor_fx
+                .trail
                 .tick(Some((0, 0)), now, &trail_cfg, &mut trail_out);
-            ws.cursor_glow.note_synthetic_move(now);
-            ws.cursor_trail.note_synthetic_move(now);
-            assert!(ws.cursor_glow.move_licensed(now));
-            assert!(ws.cursor_trail.move_licensed(now));
+            ws.cursor_fx.glow.note_synthetic_move(now);
+            ws.cursor_fx.trail.note_synthetic_move(now);
+            assert!(ws.cursor_fx.glow.move_licensed(now));
+            assert!(ws.cursor_fx.trail.move_licensed(now));
         }
         let (cadence_before, rain_deadline_before, input_hot_before) = {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.typing_cadence.on_keystroke(now);
+            ws.cursor_fx.cadence.on_keystroke(now);
             (
-                ws.typing_cadence.sample(now),
+                ws.cursor_fx.cadence.sample(now),
                 ws.next_rain_tick,
                 ws.input_hot_until,
             )
@@ -23560,11 +23860,11 @@ mod typed_kitty_summon_tests {
         assert!(app.clear_move_license_for_session(session));
         for candidate in [wid, second] {
             let ws = &app.windows[&candidate];
-            assert!(!ws.cursor_glow.move_licensed(now));
-            assert!(!ws.cursor_trail.move_licensed(now));
+            assert!(!ws.cursor_fx.glow.move_licensed(now));
+            assert!(!ws.cursor_fx.trail.move_licensed(now));
         }
         let ws = &app.windows[&wid];
-        assert_eq!(ws.typing_cadence.sample(now), cadence_before);
+        assert_eq!(ws.cursor_fx.cadence.sample(now), cadence_before);
         assert_eq!(ws.next_rain_tick, rain_deadline_before);
         assert_eq!(ws.input_hot_until, input_hot_before);
         assert!(
@@ -23615,26 +23915,30 @@ mod typed_kitty_summon_tests {
             let mut trail = Vec::new();
             {
                 let ws = app.windows.get_mut(&wid).unwrap();
-                ws.cursor_glow
+                ws.cursor_fx
+                    .glow
                     .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow);
-                ws.cursor_trail
+                ws.cursor_fx
+                    .trail
                     .tick(Some((0, 0)), now, &trail_cfg, &mut trail);
-                ws.cursor_glow.note_synthetic_move(now);
-                ws.cursor_trail.note_synthetic_move(now);
+                ws.cursor_fx.glow.note_synthetic_move(now);
+                ws.cursor_fx.trail.note_synthetic_move(now);
             }
 
             boundary(&mut app, wid);
             let ws = app.windows.get_mut(&wid).unwrap();
-            assert!(!ws.cursor_glow.move_licensed(now));
-            assert!(!ws.cursor_trail.move_licensed(now));
+            assert!(!ws.cursor_fx.glow.move_licensed(now));
+            assert!(!ws.cursor_fx.trail.move_licensed(now));
             let moved = now + Duration::from_millis(1);
             assert_eq!(
-                ws.cursor_glow
+                ws.cursor_fx
+                    .glow
                     .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow),
                 0
             );
             assert_eq!(
-                ws.cursor_trail
+                ws.cursor_fx
+                    .trail
                     .tick(Some((0, 1)), moved, &trail_cfg, &mut trail),
                 0
             );
@@ -23890,7 +24194,7 @@ mod typed_kitty_summon_tests {
             head: 0,
         };
         let mut out = Vec::new();
-        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+        app.windows.get_mut(&wid).unwrap().cursor_fx.glow.tick(
             Some((2, 4)),
             Instant::now(),
             &glow_cfg,
@@ -23903,7 +24207,7 @@ mod typed_kitty_summon_tests {
         {
             let ws = app.windows.get(&wid).unwrap();
             assert!(
-                !ws.cursor_glow.move_licensed(Instant::now()),
+                !ws.cursor_fx.glow.move_licensed(Instant::now()),
                 "PRECONDITION: the queued key's arrival stamp is revoked"
             );
         }
@@ -23915,24 +24219,26 @@ mod typed_kitty_summon_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!super::paste_order::is_ordering(&sink));
-        let now = Instant::now();
+        // The frame that observes the key's delivery ([`observing_frame`]).
+        let now = observing_frame(delivery_edge(&app, wid, 1), 1);
         let session = app.front_terminal(wid).unwrap().session;
         let ctx = &app.pool.get(session).unwrap().ctx;
         let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
         let (at, ticket) = batch.items[0].expect("the queued key's delivery receipt");
         assert!(ticket.key == Some(DeliveredClass::Typed) && ticket.insert.is_none());
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.cursor_glow.note_delivered(at, DeliveredClass::Typed);
-        ws.cursor_trail.note_typed(at);
-        ws.cursor_glow
+        ws.cursor_fx.glow.note_delivered(at, DeliveredClass::Typed);
+        ws.cursor_fx.trail.note_typed(at);
+        ws.cursor_fx
+            .glow
             .tick(Some((2, 5)), now, &glow_cfg, geom, &mut out);
         assert_eq!(
-            ws.cursor_glow.spawns(),
+            ws.cursor_fx.glow.spawns(),
             1,
             "the queued key's echo is licensed by its delivered stamp"
         );
         assert_eq!(
-            ws.cursor_glow.admission_log().last().map(|r| r.licence),
+            ws.cursor_fx.glow.admission_log().last().map(|r| r.licence),
             Some("key")
         );
         unsafe {
@@ -23977,6 +24283,33 @@ mod typed_kitty_summon_tests {
     #[cfg(unix)]
     #[test]
     fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
+        queued_one_shot_licence_cases(Duration::ZERO);
+    }
+
+    /// THE VERDICT ABOVE IS THE PRODUCT'S, NOT THE SCHEDULER'S (2026-09-28).
+    /// Measured: the case above failed 1 of ~8 gui lib runs under load (two
+    /// more copies of the binary at 18 threads, load 20-40) as `rainbow
+    /// kitty ArrowLeft queued=true: the key's one-shot licence stands after
+    /// the prelude`, with the receipt's class asserted correct just before.
+    /// The licence is fresh for 250 ms from the key's edge, and the prelude
+    /// ran at `Instant::now()` — whenever this thread was next scheduled
+    /// after polling the FIFO writer. The losing interleaving, forced: this
+    /// thread stalls past the freshness window between the edge and the
+    /// frame. RED with the frame read off `Instant::now()`: `rainbow kitty
+    /// Enter queued=false: the key's one-shot licence stands after the
+    /// prelude`. The frame that observes the key is presented on the key's
+    /// clock ([`observing_frame`]).
+    #[cfg(unix)]
+    #[test]
+    fn a_one_shot_licence_is_judged_on_its_own_frame_however_late_the_test_thread_runs() {
+        queued_one_shot_licence_cases(Duration::from_millis(300));
+    }
+
+    /// The cases of [`a_queued_one_shot_key_keeps_its_licence_at_delivery`],
+    /// with `stall` spent by this thread between the key's edge and the frame
+    /// that observes it.
+    #[cfg(unix)]
+    fn queued_one_shot_licence_cases(stall: Duration) {
         use crate::app_render::CursorFxInputs;
         let chord = |key: Key, mods: Modifiers| InputEvent::Key {
             key,
@@ -24046,6 +24379,7 @@ mod typed_kitty_summon_tests {
                     if queued {
                         assert!(super::paste_order::is_ordering(&sink));
                     }
+                    let pressed = Instant::now();
                     assert_eq!(
                         app.input(wid, ev.clone(), Source::Human),
                         crate::input::InputOutcome::Ok,
@@ -24059,6 +24393,8 @@ mod typed_kitty_summon_tests {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     assert!(!super::paste_order::is_ordering(&sink));
+                    // The key's edge: its dispatch inline, its receipt queued.
+                    let mut edge = pressed;
                     if queued {
                         let ctx = &app.pool.get(session).unwrap().ctx;
                         // A finished FIFO job can still leave a receipt held
@@ -24089,13 +24425,17 @@ mod typed_kitty_summon_tests {
                             batch.evicted,
                             ctx.sink.egress_drained_to_kernel()
                         );
+                        edge = batch.items.iter().flatten().next_back().unwrap().0;
                     }
-                    let now = Instant::now();
+                    // However late this thread runs, the prelude is the frame
+                    // that observes the key ([`observing_frame`]).
+                    std::thread::sleep(stall);
+                    let now = observing_frame(edge, 1);
                     let mut live = CursorFxInputs::sample_for_test(now);
                     live.cur = Some((2, 2));
                     app.tick_cursor_fx(wid, live).expect("the prelude");
                     assert!(
-                        app.windows[&wid].cursor_glow.move_licensed(now),
+                        app.windows[&wid].cursor_fx.glow.move_licensed(now),
                         "{style} {label} queued={queued}: the key's one-shot licence stands after the prelude"
                     );
                     // The classic trail's twin is re-stamped beside it; under
@@ -24109,7 +24449,7 @@ mod typed_kitty_summon_tests {
                         )
                     {
                         assert!(
-                            app.windows[&wid].cursor_trail.move_licensed(now),
+                            app.windows[&wid].cursor_fx.trail.move_licensed(now),
                             "{style} {label} queued={queued}: the classic trail's twin stands after the prelude"
                         );
                     }
@@ -24166,7 +24506,7 @@ mod typed_kitty_summon_tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         {
-            let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_glow;
+            let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_fx.glow;
             glow.tick(Some((2, 2)), t0, &glow_cfg, geom, &mut out);
             // A program's own same-row +2 (a prompt print) — no key behind
             // it: refused, and remembered as the pending hop.
@@ -24186,7 +24526,7 @@ mod typed_kitty_summon_tests {
             crate::input::InputOutcome::Ok
         );
         {
-            let glow = &app.windows[&wid].cursor_glow;
+            let glow = &app.windows[&wid].cursor_fx.glow;
             assert_eq!(
                 glow.spawns(),
                 0,
@@ -24199,7 +24539,7 @@ mod typed_kitty_summon_tests {
             assert_eq!(glow.insert_tally().delivered, 1, "the licence is armed");
         }
         // The completion itself: an 8-cell completion on the hand's row.
-        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_glow;
+        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_fx.glow;
         glow.tick(
             Some((2, 12)),
             t0 + Duration::from_millis(60),
@@ -24286,7 +24626,7 @@ mod typed_kitty_summon_tests {
         let bytes = drain(pipe);
         assert_eq!(bytes, b"\x1b[97;1:3u\x1b[9;1:3u");
         assert!(
-            !app.windows[&wid].cursor_glow.move_licensed(now),
+            !app.windows[&wid].cursor_fx.glow.move_licensed(now),
             "a key-up arms no typed licence"
         );
         unsafe {
@@ -24421,7 +24761,7 @@ mod typed_kitty_summon_tests {
         // REAL clock order: the hop is refused BEFORE the Tab is pressed.
         std::thread::sleep(Duration::from_millis(30));
         {
-            let glow = &app.windows[&wid].cursor_glow;
+            let glow = &app.windows[&wid].cursor_fx.glow;
             assert_eq!(glow.spawns(), 0, "the keyless hop is refused");
             assert_eq!(glow.insert_tally().lit, 0);
         }
@@ -24447,7 +24787,7 @@ mod typed_kitty_summon_tests {
         let mut live = CursorFxInputs::sample_for_test(now);
         live.cur = Some((2, 4));
         app.tick_cursor_fx(wid, live).expect("the prelude");
-        let glow = &app.windows[&wid].cursor_glow;
+        let glow = &app.windows[&wid].cursor_fx.glow;
         let last = glow
             .admission_log()
             .last()
@@ -24571,7 +24911,7 @@ mod typed_kitty_summon_tests {
             );
             let ws = app.windows.get(&wid).unwrap();
             assert_eq!(
-                ws.cursor_glow.move_licensed(now),
+                ws.cursor_fx.glow.move_licensed(now),
                 banks,
                 "{label}: the typed licence"
             );
@@ -24580,12 +24920,12 @@ mod typed_kitty_summon_tests {
             // glow's twin, and this assertion pins the withheld pair (no
             // frame asserts it at runtime).
             assert_eq!(
-                ws.cursor_trail.move_licensed(now),
+                ws.cursor_fx.trail.move_licensed(now),
                 banks,
                 "{label}: the classic trail's typed licence, in lockstep"
             );
             assert_eq!(
-                ws.cursor_glow.in_flight_tally().swallowed_no_echo,
+                ws.cursor_fx.glow.in_flight_tally().swallowed_no_echo,
                 if banks { 0 } else { 3 },
                 "{label}: the `swallowed_no_echo=` tally"
             );
@@ -24721,7 +25061,7 @@ mod typed_kitty_summon_tests {
             // counts the five glyph keys at the prompt and none off it.
             let ws = app.windows.get(&wid).unwrap();
             assert_eq!(
-                ws.cursor_glow.in_flight_tally().swallowed_no_echo,
+                ws.cursor_fx.glow.in_flight_tally().swallowed_no_echo,
                 if secret { 5 } else { 0 },
                 "{label}: the `swallowed_no_echo=` tally"
             );
@@ -24827,9 +25167,10 @@ mod typed_kitty_summon_tests {
         let mut out = Vec::new();
         let mut credits = |app: &mut App| {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
-            ws.cursor_glow.in_flight_tally().credits
+            ws.cursor_fx.glow.in_flight_tally().credits
         };
         // Seed the engine: the unseeded first draw drops every bank.
         assert_eq!(credits(&mut app), 0);
@@ -25032,9 +25373,10 @@ mod typed_kitty_summon_tests {
         let mut out = Vec::new();
         let mut credits = |app: &mut App| {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
-            ws.cursor_glow.in_flight_tally().credits
+            ws.cursor_fx.glow.in_flight_tally().credits
         };
         assert_eq!(credits(&mut app), 0, "seeded");
         let ok = crate::input::InputOutcome::Ok;
@@ -25119,9 +25461,10 @@ mod typed_kitty_summon_tests {
         let mut out = Vec::new();
         let mut credits = |app: &mut App| {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
-            ws.cursor_glow.in_flight_tally().credits
+            ws.cursor_fx.glow.in_flight_tally().credits
         };
         assert_eq!(credits(&mut app), 0, "seeded");
         let ok = crate::input::InputOutcome::Ok;
@@ -25263,11 +25606,11 @@ mod typed_kitty_summon_tests {
         );
         let ws = app.windows.get(&wid).unwrap();
         assert_eq!(
-            ws.cursor_glow.in_flight_tally().swallowed_no_echo,
+            ws.cursor_fx.glow.in_flight_tally().swallowed_no_echo,
             0,
             "a press that never reached the tty was not swallowed by it"
         );
-        assert!(!ws.cursor_glow.move_licensed(Instant::now()));
+        assert!(!ws.cursor_fx.glow.move_licensed(Instant::now()));
         drop(app);
         drop(sink);
         // SAFETY: the three descriptors are ours and still open — the borrowed-fd sink
@@ -25369,7 +25712,7 @@ mod typed_kitty_summon_tests {
             );
             let ws = &app.windows[&wid];
             assert!(
-                !ws.cursor_glow.move_licensed(now) && !ws.cursor_trail.move_licensed(now),
+                !ws.cursor_fx.glow.move_licensed(now) && !ws.cursor_fx.trail.move_licensed(now),
                 "{label}: a paste's gesture stamp is revoked at enqueue whatever the tty"
             );
             assert_eq!(
@@ -25454,17 +25797,17 @@ mod typed_kitty_summon_tests {
             {
                 let ws = app.windows.get(&wid).unwrap();
                 assert_eq!(
-                    ws.cursor_glow.insert_tally().delivered,
+                    ws.cursor_fx.glow.insert_tally().delivered,
                     u64::from(arms),
                     "{label}: the inline Tab's insert arm"
                 );
                 assert_eq!(
-                    ws.cursor_glow.move_licensed(Instant::now()),
+                    ws.cursor_fx.glow.move_licensed(Instant::now()),
                     arms,
                     "{label}: the gesture class follows the tty's verdict"
                 );
                 assert_eq!(
-                    ws.cursor_trail.move_licensed(Instant::now()),
+                    ws.cursor_fx.trail.move_licensed(Instant::now()),
                     arms,
                     "{label}: …on the classic trail in lockstep"
                 );
@@ -27210,6 +27553,55 @@ mod favourite_kitty_tests {
         // The channel starts clean, so a refusal can never be reported against
         // a LATER invocation than the one that raised it.
         assert!(app.pending_action_refusal.is_none());
+    }
+
+    /// `invoke CloseTab` that raises the in-window close question answers `OK
+    /// confirm pending …`: the action did what it does, it asked. 0.95.0
+    /// answered `ERR … confirm yes|no answers it` with exit 1 while the question
+    /// stood (measured 2026-09-27). A second close while it stands was not
+    /// asked, so it is still refused, `ERR`, naming the standing question; and
+    /// an action that simply ran still answers `invoked`.
+    #[test]
+    fn an_invoke_that_asks_first_answers_ok_pending_and_a_second_is_refused() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // What `invoke_menu_action_by_name` does around the action, with the
+        // action a close that must ask (a busy last window: a quit).
+        let invoke_close_tab = |app: &mut App| {
+            app.invoke_attributed(crate::session_store::ExitActor::Ctl, |app| {
+                let question_stood = app.close_banner.is_some();
+                app.pending_action_refusal = None;
+                let prompt =
+                    crate::quit_safety::confirm_prompt(true, true).expect("a busy quit prompts");
+                app.present_close_banner(
+                    wid,
+                    prompt,
+                    crate::close_confirm::CloseReplay::Window(wid),
+                );
+                app.invoke_reply("CloseTab", question_stood)
+            })
+        };
+        assert_eq!(
+            invoke_close_tab(&mut app),
+            Ok("confirm pending kind=quit window=0; `confirm yes|no` answers it".to_string())
+        );
+        assert!(
+            app.pending_action_refusal.is_none(),
+            "the reply consumed the channel"
+        );
+        assert_eq!(
+            invoke_close_tab(&mut app),
+            Err(
+                "CloseTab: a quit is waiting for an answer in the window; `confirm yes|no` \
+                 answers it"
+                    .to_string()
+            )
+        );
+        assert_eq!(app.answer_close_banner(false), None);
+        assert_eq!(
+            app.invoke_reply("NewTab", false),
+            Ok("invoked NewTab".to_string())
+        );
     }
 
     /// THE LAST THREE ARMS THAT ANSWERED `OK` OVER A DECLINE. A menu press has

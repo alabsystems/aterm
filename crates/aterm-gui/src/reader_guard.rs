@@ -13,8 +13,9 @@
 //! * the operator's approval check (`crate::operator_host::approval_gate`,
 //!   behind `looks_like_approval` for the refusal sites in `control.rs`, and
 //!   the operator Classifier / `manage` baseline that announce boxes);
-//! * the Claude Code footer (`crate::claude_footer`: `footer::mode_row` +
-//!   `footer::plan_row`, every frame on the main thread);
+//! * the Claude Code footer (`crate::claude_footer`: `composer_bottom` +
+//!   `footer::mode_row`, and `footer::launch_card` while a process's model
+//!   or effort is unnamed — every frame on the main thread);
 //! * the Claude Code lights (`crate::claude_lights`: `lights::read_screen` +
 //!   `composer_draft` every frame, and a toggle's `composer_draft` +
 //!   `upgrade::composer_is_empty` — the main thread).

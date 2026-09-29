@@ -1,0 +1,31 @@
+# codex 0.157.1 · MEASURED 2026-09-27 in a private headless aterm (network denied, a loopback Responses API answering the turn with HTTP 429 `usage_limit_reached`, `resets_in_seconds` 5400): the wall row names no reset · the last 30 rows
+
+
+• ok
+
+  3:26 PM
+
+
+› hit the wall please
+
+
+■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/
+settings/usage to purchase more credits or try again later.
+
+
+
+
+
+
+
+
+
+
+
+
+                                              Tip: Start a fresh idea with /new; the previous session stays in history.
+
+› Ask Codex to do anything
+
+  fake-model default · /private/tmp/aterm-lab/work
+  ? for shortcuts                                                                              ⚠ 1 warning · f2 to view

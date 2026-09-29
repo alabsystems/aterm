@@ -257,9 +257,18 @@ fn aterm_grid_rlib() -> Option<std::path::PathBuf> {
 /// assumption: the probe found the six-weeks-stale dev stage2, E0514'd on the
 /// fresh rlib, and the positive control failed on a healthy tree.
 ///
-/// So the DEFAULT candidates — PATH `trustc` (the atpkg lane), then PATH `rustc`
-/// (upstream boxes) — are each VETTED with a metadata-touch compile against
-/// the real rlib, and the first that passes wins. E0514 fires at metadata
+/// So the DEFAULT candidates — the `trustc` beside `$CARGO` (the driver running
+/// this test), then the `rustc` beside `$CARGO`, then PATH `trustc` (the atpkg
+/// shim) — are each VETTED with a metadata-touch compile against
+/// the real rlib, and the first that passes wins. Whether a candidate IS Trust
+/// is asked of it ([`answers_as_trust`]), never read off its file name.
+///
+/// PUBLIC BOUNDARY. `$CARGO`'s sibling `rustc` is what keeps this suite
+/// running in the exported snapshot, which builds under a stock cargo with no
+/// `trustc` anywhere: there it is that cargo's own rustc, and it probes as not
+/// Trust, so it gets no off-switch. Under targo it is the store's `rustc`, the
+/// same inode as `trustc` (measured 2026-09-28, store 9192). There is no PATH
+/// `rustc` rung (owner directive 2026-09-28). E0514 fires at metadata
 /// load, so the vet is precisely the skew check. If NONE vets, the first that
 /// merely runs is returned so the positive control can fail with the real
 /// compiler stderr instead of a bare "no compiler".
@@ -291,10 +300,21 @@ fn probe_compiler(
             .ok()?;
         return runs(&explicit).then_some((explicit, true));
     }
-    let mut candidates: Vec<(std::path::PathBuf, bool)> = Vec::new();
-    candidates.push((std::path::PathBuf::from("trustc"), true));
-    candidates.push((std::path::PathBuf::from("rustc"), false));
-    candidates.retain(|(path, _)| runs(path));
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(cargo) = std::env::var_os("CARGO").filter(|c| !c.is_empty()) {
+        let cargo = std::path::Path::new(&cargo);
+        paths.push(cargo.with_file_name("trustc"));
+        paths.push(cargo.with_file_name("rustc"));
+    }
+    paths.push(std::path::PathBuf::from("trustc"));
+    let candidates: Vec<(std::path::PathBuf, bool)> = paths
+        .into_iter()
+        .filter(|path| runs(path))
+        .map(|path| {
+            let trust = answers_as_trust(&path);
+            (path, trust)
+        })
+        .collect();
     // The vet: `extern crate` alone forces the metadata load where an
     // incompatible-compiler rlib is rejected, and asserts nothing about the
     // crate's API — a vet that used a real snippet could never be told apart
@@ -309,35 +329,27 @@ fn probe_compiler(
         .or(fallback)
 }
 
-/// Compile `src` against the real `aterm_grid` rlib. `Some(true)` = compiled,
-/// `Some(false)` = rejected, `None` = could not run the probe at all (no
-/// usable compiler, no rlib) — reported as a SKIP rather than a silent pass.
-/// The verification off-switch spelling THIS compiler accepts.
-///
-/// Hardcoding one spelling silently voids this whole file. The two spellings
-/// partition the compilers (AGENTS.md "Flag-spelling skew"): a `trustc` that
-/// does not know the one we pass rejects it at flag-parse, so the probe fails to
-/// build a VALID reference, the harness declares itself broken, and every
-/// compile-fail assertion below it proves nothing — on a SECURITY regression
-/// suite. That is exactly what was happening here: the literal
-/// `-Ztrust-verify=off` is rejected by every trust compiler on this machine.
-///
-/// So ask the compiler instead of assuming. `-Z help` lists the options it
-/// actually has; prefer whichever off-switch appears there, and fall back to the
-/// post-rename spelling when the probe cannot be read (an unusable compiler is
-/// already reported as a SKIP downstream, never a silent pass).
-fn trust_off_switch(compiler: &std::path::Path) -> &'static str {
-    let help = std::process::Command::new(compiler)
-        .arg("-Zhelp")
+/// Does `<compiler> -vV` carry the `trust:` row? Every Trust compiler prints one
+/// (`trust: 0.1.0` from store 9192, whether it is invoked as `trustc` or as its
+/// hard-linked `rustc`); an upstream rustc has no such row. This, not the file
+/// name, decides whether the probe passes the verification off-switch.
+fn answers_as_trust(compiler: &std::path::Path) -> bool {
+    std::process::Command::new(compiler)
+        .arg("-vV")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    if help.contains("no-trust-verify") {
-        "-Zno-trust-verify"
-    } else {
-        "-Ztrust-verify=off"
-    }
+        .is_ok_and(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|l| l.starts_with("trust: "))
+        })
 }
+
+/// The verification off-switch for a direct `trustc` probe: `-Ztrust-verify=off`,
+/// the only spelling the store compiler accepts (the pre-rename
+/// `-Zno-trust-verify` is "unknown unstable option" there, measured 2026-08-29;
+/// the `-Z help` sniff that chose between the two was removed 2026-09-28).
+const TRUST_OFF_SWITCH: &str = "-Ztrust-verify=off";
 
 /// One compile of `src` against the rlib under the given compiler — the ONE
 /// command shape shared by the candidate vet and every real probe, so the
@@ -358,7 +370,7 @@ fn compile_probe(
     ));
     let mut cmd = std::process::Command::new(compiler);
     if is_trustc {
-        cmd.arg(trust_off_switch(compiler));
+        cmd.arg(TRUST_OFF_SWITCH);
     }
     let mut child = cmd
         .arg("--edition=2021")
@@ -384,6 +396,9 @@ fn compile_probe(
     Some(probe_out)
 }
 
+/// Compile `src` against the real `aterm_grid` rlib. `Some(true)` = compiled,
+/// `Some(false)` = rejected, `None` = could not run the probe at all (no
+/// usable compiler, no rlib) — reported as a SKIP rather than a silent pass.
 fn probe_compiles(src: &str) -> Option<bool> {
     let rlib = aterm_grid_rlib()?;
     let deps = deps_dir()?;
@@ -434,9 +449,8 @@ fn compile_probe_harness_actually_reaches_aterm_grid() {
                  probe compiler (a mixed-compiler build — e.g. RUSTC= overridden to dodge an \
                  ICE). Build the crate and run the probe with the same toolchain."
             } else if why.contains("unknown unstable option") {
-                "\nLIKELY CAUSE: the probe compiler rejects the verification off-switch \
-                 spelling — see AGENTS.md \"Flag-spelling skew\". `trust_off_switch` asks the \
-                 compiler which one it knows, so this means it answered with neither."
+                "\nLIKELY CAUSE: the probe compiler rejects `-Ztrust-verify=off` — it is not \
+                 the Trust compiler the workspace pins (`aterm pkg which trustc`)."
             } else {
                 ""
             };
@@ -446,7 +460,7 @@ fn compile_probe_harness_actually_reaches_aterm_grid() {
                  --- probe compiler stderr ---\n{why}"
             )
         }
-        None => eprintln!("SKIP: no rustc / no aterm_grid rlib for the compile probe"),
+        None => eprintln!("SKIP: no compiler / no aterm_grid rlib for the compile probe"),
     }
 }
 
@@ -470,7 +484,7 @@ fn row_new_rejects_safe_call() {
             "aterm_grid::Row::new coerced to a SAFE fn pointer — it is no longer \
              `unsafe fn`, reopening the #5573 page-backed use-after-free"
         ),
-        None => eprintln!("SKIP: no rustc / no aterm_grid rlib for the compile-fail check"),
+        None => eprintln!("SKIP: no compiler / no aterm_grid rlib for the compile-fail check"),
     }
 }
 
@@ -486,6 +500,6 @@ fn row_resize_rejects_safe_call() {
             "aterm_grid::Row::resize coerced to a SAFE fn pointer — it is no longer \
              `unsafe fn`, reopening the #5573 page-backed use-after-free"
         ),
-        None => eprintln!("SKIP: no rustc / no aterm_grid rlib for the compile-fail check"),
+        None => eprintln!("SKIP: no compiler / no aterm_grid rlib for the compile-fail check"),
     }
 }

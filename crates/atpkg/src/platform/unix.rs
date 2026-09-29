@@ -58,6 +58,18 @@ pub fn our_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// SIGKILL the process group `leader` leads (a child started with `process_group(0)`),
+/// so whatever it started goes with it. The caller must not have reaped `leader` yet,
+/// or its id could have been reused. Best effort: a group already gone is not an error.
+pub fn kill_process_group(leader: u32) {
+    if let Ok(pgid) = libc::pid_t::try_from(leader) {
+        // SAFETY: `killpg` takes two integers and touches no memory of ours.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+}
+
 /// This ACCOUNT's home directory, as the OS knows it — `getpwuid(getuid())->pw_dir` —
 /// which is NOT `$HOME`.
 ///
@@ -197,10 +209,8 @@ pub fn exclude_from_backup(dir: &Path) {
 /// stop shipping.
 ///
 /// `/usr/bin/mdfind` is named absolutely, never through `PATH`, mirroring
-/// `install::run_tool`. The predicate is assembled with `push_str` rather than `format!`
-/// because this file is compiled under the strict Trust verification gate, which cannot
-/// lower `fmt::Arguments` (see the note on [`crate::call1`]). Interpolating `filename`
-/// bare is safe by CONSTRUCTION and not by escaping: its only caller passes
+/// `install::run_tool`. Interpolating `filename` into the predicate bare is safe by
+/// CONSTRUCTION and not by escaping: its only caller passes
 /// [`crate::noindex::probe_token`], which is `[a-z0-9]+`.
 ///
 /// Non-macOS: `None`. There is no index here to ask.
@@ -208,9 +218,7 @@ pub fn exclude_from_backup(dir: &Path) {
 pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
     #[cfg(target_os = "macos")]
     {
-        let mut predicate = String::from("kMDItemFSName == \"");
-        predicate.push_str(filename);
-        predicate.push('"');
+        let predicate = format!("kMDItemFSName == \"{filename}\"");
         let mut cmd = Command::new("/usr/bin/mdfind");
         cmd.arg("-onlyin").arg(scope.as_os_str()).arg(&predicate);
         let stdout = bounded_stdout(&mut cmd)?;
@@ -416,8 +424,7 @@ fn mount_point_of(path: &Path) -> Option<PathBuf> {
     }
     // `f_mntonname` is a fixed 1024-byte NUL-terminated field of `c_char` (i8 on Darwin).
     // Converted byte-wise, never through `from_utf8_lossy`: a mount point is PATH bytes and
-    // need not be UTF-8, and the lossy decoder's inlined `unsafe` is what the strict Trust
-    // lane on this file cannot lower.
+    // need not be UTF-8.
     let mut bytes: Vec<u8> = Vec::new();
     for b in st.f_mntonname {
         if b == 0 {
@@ -736,25 +743,11 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
 /// missing or partially written — even if a previous `link` already existed. The
 /// directory-indirection primitive behind `store/<program>/current` and the sysroot dir links.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
-    // `Path::file_name` / `OsStr::to_str` go via `call1`: std's INLINED `unsafe`
-    // (the `from_utf8_unchecked` fast path, the `OsStr` byte-slice casts) is
-    // otherwise attributed to this function's spans as missing-SAFETY-comment
-    // refutations under the strict Trust gate (see `lib.rs`). Same calls, same
-    // receivers; behavior identical.
-    let file_name = match crate::call1(std::path::Path::file_name, link) {
-        Some(name) => crate::call1(std::ffi::OsStr::to_str, name),
-        None => None,
-    }
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "link has no file name"))?;
-    // Manual rendering of the previous
-    // `format!(".{file_name}.tmp-{}", std::process::id())` — byte-identical: the
-    // `format!` expansion embeds `fmt::Arguments` construction (with inlined
-    // `unsafe`) that the strict gate cannot lower and fails closed on.
-    let mut tmp_name = String::from(".");
-    tmp_name.push_str(file_name);
-    tmp_name.push_str(".tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = link.with_file_name(tmp_name);
+    let file_name = link
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "link has no file name"))?;
+    let tmp = link.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
     // A leftover temp from a crashed run must not block us.
     let _ = fs::remove_file(&tmp);
     std::os::unix::fs::symlink(target, &tmp)?;
@@ -836,7 +829,7 @@ pub fn install_twin_to_env(
 /// single quote as the POSIX `'\''` sequence. A shim name only ever reaches here after
 /// `shim_allowed` (no `/`, no NUL, non-empty), but that gate does NOT forbid other shell
 /// metacharacters, so the failing-shim body must never let a crafted `exposes` name break out
-/// of the quoted string. Built by hand (no `format!`) for the strict Trust gate (see `lib.rs`).
+/// of the quoted string.
 fn sh_single_quote(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -856,10 +849,11 @@ fn sh_single_quote(s: &str) -> String {
 pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     // The failing script. `printf '%s\n' <quoted>` keeps the message a fixed format with the
     // (quoted) tool-bearing text as a separate arg — no format-string or shell injection — and
-    // exits 70 (EX_SOFTWARE), a clear nonzero. Built with `push_str` (no `format!`, Trust gate).
-    let mut script = String::from("#!/bin/sh\nprintf '%s\\n' ");
-    script.push_str(&sh_single_quote(message));
-    script.push_str(" 1>&2\nexit 70\n");
+    // exits 70 (EX_SOFTWARE), a clear nonzero.
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' {} 1>&2\nexit 70\n",
+        sh_single_quote(message)
+    );
 
     // Atomic install through the one executable writer (`crate::lay`): a sibling temp,
     // `0755`, then `rename(2)` over `shim` — atomic on POSIX and replacing the

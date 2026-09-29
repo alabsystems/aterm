@@ -55,7 +55,8 @@ The other tabs on this machine are often other agents mid-task. Before any `turn
    when idle or the engine was busy). A compound line reports the segment that RUNS:
    the last `;`-group, and within it a trailing `|| …` alternative (it runs only on
    failure) is dropped and the last segment left is read — `cd ~/proj && claude` reads
-   `claude`, `a || b` reads `a`, `a && b || c` reads `b`, `a || b && c` reads `c`; a
+   `claude`, `a || b` reads `a`, `a && b || c` reads `b`, `a || b && c` reads `c`; one
+   wrapper (`sudo`, `env`, `time`, `nice`, `command`, `nohup`, `exec`) is unwrapped; a
    keyword opener stays the keyword (`for i in …; do …; done` reads `for`,
    not the program inside). On older builds that same `cd … && claude` reads `detail=cd`
    — when `detail=` is a shell builtin (`cd`, `export`, `source`), confirm with `text`
@@ -68,9 +69,11 @@ The other tabs on this machine are often other agents mid-task. Before any `turn
    Claude Code and Codex session — is already answering its prompts: leave its boxes to it and the
    human.
    `input=` is whether it is READING its input (macOS; `-` elsewhere): `stalled` or
-   `stopped` is a frozen or stopped program whose screen still looks live, and a key into
-   it is refused `ERR busy input-unread …` — a fact about the peer, not a flaky tool:
-   never retry it in a loop (`aterm help introspection` has the remedies).
+   `stopped` is a frozen or stopped program whose screen still looks live. A key into a
+   program that left input unread is refused `ERR busy input-unread … (<why>; <what to
+   do>)` and nothing is written: back off, and never retry it in a loop. Its `signal …`
+   remedies act on the peer's program: leave them to its owner unless the human told you
+   to.
 2. `aterm ctl "@$SID" meta` — `role=` is whatever its owner stamped (`-` = unset).
 3. **Never type into another agent's prompt unless the human named the session AND the
    message.** Reading (`text`, `image`, `status`, `blocks`) is always fine.
@@ -95,11 +98,8 @@ No environment variable changes what aterm does: the launch choices are FLAGS.
 Auth is automatic: a per-launch 32-byte token file sits beside the socket —
 `aterm-<pid>.token` for a default socket, and for an explicit
 `--control-sock` path a token named after that socket (`x.sock` →
-`x.sock.token`). Socket and token are 0600, same-uid only. The per-socket name
-is what lets **two private instances share one directory**: they used to both
-write `aterm.token`, so the second to start silently took the first's
-credential and the first's clients were refused `ERR auth` against a socket
-that was still listening.
+`x.sock.token`). Socket and token are 0600, same-uid only. Two private instances
+can share one directory.
 
 ## Spin up a target (optional)
 
@@ -136,11 +136,10 @@ aterm ctl ls                         # the whole fleet (unscoped)
 ```
 
 Unscoped, the enumeration reads the rendezvous dir, so a custom `XDG_RUNTIME_DIR` must match
-the server's. *(`--sock`/`--pid` used to be silently ignored here, so a scoped `ls` returned
-the user's real terminals. Fixed 2026-07-26; a stale build still has the old behavior.)*
+the server's.
 
 Line shapes:
-- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> nonce=<hex32> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<cmd|-> identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=… agent_rev=<n> agent_since_ms=<ms> agent_gen=… agent_fp=… human_ms=<ms|-> supervisor=<holder|->[ *]` (an older build ends earlier: parse by key)
+- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> nonce=<hex32> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|-> identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=… agent_rev=<n> agent_since_ms=<ms> agent_gen=… agent_fp=… human_ms=<ms|-> role=<pct|-> attention=<pct|-> user_title=<pct|-> supervisor=<holder|-> path_evidence=… copy=<managed|foreign|-> upgrade=…[ *]` (columns are added over time: parse by key)
 - `sessions` → the same without the leading pid
 - `windows` → `<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]` (`active=-`
   when nothing is on the active tab), then
@@ -154,12 +153,8 @@ session, else the lowest window id; `none` = no window holds it; `-` = the insta
 ask its main thread); `active=` the session is on that window's active tab; `wfocus=` that
 window is aterm's MOST RECENTLY FOCUSED window — set when a window takes focus and never
 cleared by a blur, a minimize or the app deactivating, so exactly one window per instance
-reads `1`; `detail=` the sanitized RUNNING command — the program plus an
-allow-listed subcommand, never its arguments (`claude`, `codex`, `targo%20test`; `-` idle;
-a compound line reads as the segment that runs — the last one once a trailing `|| …`
-alternative is dropped, so `a && b` → `b`, `a || b` → `a` — one wrapper (`sudo`, `env`,
-`time`, `nice`, `command`, `nohup`, `exec`) is unwrapped, and a keyword opener stays
-the keyword; older builds read the first word, `cd`); `identity=` the agent identity the
+reads `1`; `detail=` the running command (read it by the rule under *Before you type
+into a peer*); `identity=` the agent identity the
 session was spawned under (`spawn identity=<name>`), `-` for the human's own config. `program=`
 the foreground program (argv0's basename: `claude`, `codex`, `zsh`); `agent=` the server's
 own verdict on an identified agent's screen (`busy|prompt|question|idle|survey|unknown|
@@ -205,7 +200,7 @@ The selector is a **leading** argument, before the verb. Quote it so the shell d
 | *(omitted)* or `@.` | the currently **active** tab — retargets when the human switches tabs |
 | `@<sid>` | that stable session; relayed transparently if another instance hosts it |
 | `@self` (alias `@env`) | expands client-side to `@$ATERM_PARENT_SESSION_ID` — your own session, stable across tab switches |
-| `@<n>` | that instance's local tab id |
+| `@<n>` | the session with that local number (`ls` field 2) — not a tab index |
 
 ```sh
 aterm ctl "@s-69d0080c3cc90873" text
@@ -233,9 +228,9 @@ pane: a split's other panes keep their shells, and a job running in the pane ref
 ```sh
 aterm ctl "@$SID" status        # OK schema=1 … phase= … detail=<running program|-> … — read this BEFORE driving
 aterm ctl "@$SID" text          # visible screen, one row per line — the CHEAP read
-aterm ctl "@$SID" text trim     # the same minus the trailing all-blank rows: header OK <n> trimmed=<k>
-aterm ctl "@$SID" text tail=20 trim  # only the LAST 20 rows: header OK <n> trimmed=<k> first=<row> (line i = screen row first+i)
-aterm ctl "@$SID" text rows=40-62    # an inclusive 0-based span, clamped to the grid: header OK <n> first=40
+aterm ctl "@$SID" text trim     # the same minus the trailing all-blank rows
+aterm ctl "@$SID" text tail=20 trim  # only the LAST 20 rows
+aterm ctl "@$SID" text rows=40-62    # an inclusive 0-based span, clamped to the grid
 aterm ctl "@$SID" text --json   # {"rows":[…],"cursor":{…},"dims":{…},"seq":N} (+ "trimmed":k with trim, "first":row with tail=/rows=)
 aterm ctl "@$SID" cursor        # OK <row> <col> <visible 0|1> <style>   (0-based)
 aterm ctl "@$SID" dims          # OK <rows> <cols> <px_w> <px_h> … window=<id> …
@@ -252,11 +247,13 @@ aterm ctl "@$SID" blocks        # shell-integration command blocks; the executin
   grid (a span with no row on it, or `b < a`, is `ERR bad rows`). **The `first=` rule:**
   whenever the reply does not start at row 0 the header closes with `first=<row>` — `OK
   <n>[ trimmed=<k>][ first=<row>]` — so reply line *i* is screen row `first+i`; `--json`
-  carries `"first":<row>` the same way and `dims.rows` stays the grid. `trim` trims the
-  SLICE, not the grid. All off by default (scripts count rows). **Anything else is `ERR
-  usage: text [--json] [trim] [tail=<n>|rows=<a>-<b>]`** — `text 20` and `tail=0` are
-  refused, not silently treated as `text`. `blocktext <id> trim` and `temporal <tick> trim`
-  take the `trim` modifier too.
+  carries `"first":<row>` the same way and `dims.rows` stays the grid; `aterm ctl` prints
+  only the rows, so take `first`/`trimmed` from `--json`. `trim` trims the SLICE, not the
+  grid. All off by default (scripts count rows). `order=display` gives each row as the
+  frame paints it (right-to-left runs reversed). **Anything else is `ERR usage:
+  text [--json] [trim] [tail=<n>|rows=<a>-<b>] [order=<logical|display>]`** — `text 20` and
+  `tail=0` are refused, not silently treated as `text`. `blocktext <id> trim` and
+  `temporal <tick> trim` take the `trim` modifier too.
 - `screen` is always JSON and budgets ~213 bytes per cell — **~400 KB on a 24×80 grid**.
   Reach for `text trim` unless you genuinely need attributes.
 - On a bottom-pinned TUI `trim` buys nothing: Claude Code pins its composer to the LAST
@@ -265,11 +262,11 @@ aterm ctl "@$SID" blocks        # shell-integration command blocks; the executin
   trim` is the cheap read there. Let `await gone` / `await seq` decide WHEN to read, and
   read the prompt box only at decision points — never on a poll.
 - `search` replies `OK <n>` (or `OK <n> incomplete` when the match cap was hit or
-  scrollback was evicted mid-scan),
+  scrollback was evicted mid-scan; `aterm ctl` says `results may be incomplete` on stderr),
   then one `<row> <col> <len>` per match where **row is the ABSOLUTE scrollback row**.
 - `--json` goes *after* the verb. The verbs that honor it are named in the protocol header of
   `aterm ctl help --full`, which is GENERATED from the server's own allowlist — read it rather
-  than a copy. (A copy here listed seven and was already wrong about `metrics` and `privacy`.)
+  than a copy.
 - Free-text fields anywhere (titles, `history` `text=`, `status` `subject=`/`detail=`, meta
   values) are percent-encoded.
 - `status` carries no `window=` on purpose (it is polled; the window lives on the main
@@ -294,6 +291,86 @@ aterm ctl "@$SID" image --bytes                # OK 1 + "<w> <h> <nbytes> <base6
   the *server's* filesystem. PNG is 8-bit RGBA, full device-pixel (Retina 2×) —
   budget ~0.8–1.2 MB of base64 per shot.
 - `OK` means the file is fully written and readable.
+
+## Detect a render desync in a peer
+
+A full-screen app (Claude Code, vim, htop) draws DIFFS onto the screen it believes is
+there. A resize on the alternate screen can move that screen under it: the shrink
+demotes the top row (the alt screen keeps no history) and the grow back appends a blank
+one, so a net-zero flap (64 -> 63 -> 64 rows) shifts everything up one row. An app that
+repaints only when its SIGWINCH handler reads a CHANGED size (Node's does) misses a flap
+whose two halves both land before the handler runs, and every later frame is drawn one
+row off: text on the wrong rows, a rule drawn over, a blank bottom row. All three reads
+are Read-class, so they are safe against a tab a human is using:
+
+```sh
+aterm ctl "@$SID" status | tr ' ' '\n' | grep -E '^(render|resizes|flaps)='  # 1. the cheap check
+aterm ctl "@$SID" resizes 20    # 2. the ledger: what each resize moved, and who asked
+aterm ctl "@$SID" cast drift    # 3. the proof: the recording replayed with and without each suspect run
+```
+
+1. `status` carries `render=<ok|displaced|desync-risk|unverified|->`. `displaced`: a
+   resize moved alt-screen content the app has not drawn over yet (or drew over under 1 s
+   ago). `desync-risk`: after a NET-ZERO flap the app drew over the moved content (judged
+   1 s after the resize) and no full clear or screen switch has repainted it since. It is
+   a risk, not a proof: an app that repaints every row without clearing keeps it set.
+   `unverified`: the app drew over rows a resize that CHANGED the size moved, and no
+   clear followed — its repaint or a diff on shifted rows, which the counters cannot tell
+   apart; run `cast drift`. `-`: the engine was busy; ask again. `resizes=`/`flaps=` are
+   lifetime counts.
+2. `resizes [<n>] [since=<id>]` answers `resize` rows (`from=`/`to=` as `<cols>x<rows>`,
+   `demoted=`/`appended=`, `shift=` negative = content moved UP, `site=` the entry point
+   that asked — `input` (a ctl `resize`), `window`, `chrome` (a strip, band or presence
+   row appeared or folded), `pass`, `ctl-cross`, `-` unbooked — and `at=` its source
+   line) and `run` rows grouping resizes at most 250 ms apart with nothing drawn between
+   (once a run has displaced rows: whatever was drawn between when the resize takes the
+   previous one back, and however late while nothing has drawn since; a full clear or
+   screen switch always splits; `site=-` rows carry no reliable time);
+   every run still `silent`, `desync-risk` or `unverified` is listed whatever `<n>`
+   selects. `net=zero displaced=-1 verdict=desync-risk` is the incident's shape (a flap
+   with output between its halves, a mode set or a spinner frame, so the grow appended:
+   `appended=1 restored=0`; one with none is undone by the engine: `restored=1`, the row
+   goes back to the shrink's run, `displaced=+0`, `verdict=none`, `render=ok`, even when
+   the 250 ms gap split the halves); `verdict=healed` means a later ESC[2J or alt-screen
+   switch repainted it; `unverified` is a size change the app drew over afterwards with
+   no clear (a repaint, or not). A flap whose halves are over 250 ms apart with a draw
+   between is two runs, each `net=changed`, never a risk: `cast drift` decides it,
+   however far apart the halves were.
+   `t=` is milliseconds on the `timeline` clock, not the cast's seconds. `aterm ctl`
+   prints its `OK` header on stderr. A watcher sees the same as it happens on `subscribe
+   "@$SID" events` (`EVENT <n> resize …`, `EVENT <n> render desync-risk …`), and
+   `timeline` keeps a `kind=render` row per entry into and exit from desync-risk.
+3. `cast drift [max_runs=<k>] [rows=<n>] [seed=auto|alt|primary]` replays the session's
+   cast recording in fresh engines, with and without the resize runs:
+   `OK <n> verdict=<clean|desync|unfaithful|unknown|empty> fidelity=<pass|fail|-> …
+   candidates=<c> capped=<k> culprit=<t|-> …`, a `run t=<t> … culprit=<0|1>` line per
+   listed candidate run (every culprit, and the newest `max_runs`; `capped=` counts the
+   rest, which the verdict still weighs), then `row <r> live=<pct> expected=<pct>` for
+   each row that differs. `fidelity=pass` says the faithful replay reproduces the live
+   screen, so the verdict is about the resizes and not the recording; `unfaithful` names
+   no culprit (output the recording lost, or a screen it cannot reproduce). A candidate
+   is a run of resizes at most 250 ms apart, or a RETURN: an alt-screen shrink that lost
+   rows, through the resize that brought the size back, however long after (its `run`
+   line's `gap_ms=` is the whole span). A screen that kept moving while it was read
+   (`cut=racy`: a busy app) is answered with the replays against each other
+   (`against=replay fidelity=-`) instead. `run t=` is seconds on the cast's own clock,
+   not `resizes`' `t=`.
+
+**An older peer.** An aterm that predates these verbs has no `render=` and answers
+`resizes` with `ERR`, but `aterm ctl … cast drift` from a newer build still works
+against it, through `dial <name>` too: when the server answers only the plain `cast`,
+the client computes the same report itself from `status`, `text`, `cursor`, `modes` and
+`cast` (the header ends `computed=client`, with a note on stderr). Such an aterm also
+predates the terminal's resize undo, so a flap with nothing between its halves shifted
+its screen too: the client replays without the undo, and the header says `undo=off`.
+Offline, from a saved recording: `aterm ctl cast drift --file <cast.txt> [--screen
+<text.txt>] [--until <t>] [seed=alt]` (the undo is dropped only when that alone
+reproduces the `--screen`); a recording that starts mid-app (no alt-screen toggle in
+it) needs `seed=alt`, unless a `--screen` lets the fidelity check pick the seed: without
+either, when the two seeds disagree the answer is `verdict=unknown seed=ambiguous`.
+
+The reads change nothing. A desync ends at the app's next full repaint; do not resize,
+key or signal a human's tab to force one: report what the reads say.
 
 ## Act
 
@@ -323,7 +400,7 @@ lock the server tests `<re>` against the visible rows and, only if some row matc
 the key — no output can land between the check and the press.
 
 - A match answers `OK seq=<n>` like a plain press. **No match writes nothing and answers
-  `OK skipped seq=<n>` — exit 0: a skipped guard is an answer (the prompt was gone), not
+  `OK skipped seq=<n>` — exit 0: a skipped guard is an answer (no visible row matched), not
   an error.** A bad pattern is `ERR badregex` (nothing written); `ERR busy sink` is
   transient (zero bytes) — retry.
 - **The regex is ONE wire token.** The control line is split on whitespace and nothing
@@ -337,12 +414,18 @@ the key — no output can land between the check and the press.
   screen instead of answered `dup=1`. A halted session is `ERR halted` whatever the guard
   says. `send if=<re> <text>` is the same guard on a raw write; `key` and `send` are the
   two verbs that take it.
+- **Fence the press to the read you decided on:** `key if-gen=<gen> 1` presses only while
+  the screen generation is still the one your read returned (`status gen=`, `text --json`
+  `"gen"`; `agent_gen=` for a press decided from `agent=`), and `if-fp=<hash>` only while
+  the screen hash is (`status hash=`, `agent_fp=`). A screen that moved answers `OK skipped
+  reason=changed seq=<n>` and writes nothing. Both compose with `if=` and `id=`.
 
 ### Exact bytes without shell-quoting hell
 
-Request lines are newline-delimited and args are joined with single spaces, so inline
-`send` **collapses internal whitespace and rejects embedded newlines**. For anything
-multi-line or whitespace-exact, use the stdin-payload forms (length-prefixed binary frames):
+Request lines are newline-delimited, so inline `send` **rejects embedded newlines**, and
+separate arguments are joined with one space (`send 'a   b'` keeps its spaces; `send a   b`
+does not). For anything multi-line or byte-exact, use the stdin-payload forms
+(length-prefixed binary frames):
 
 ```sh
 printf 'line one\nline two\n' | aterm ctl "@$SID" send --stdin   # RAW, verbatim
@@ -370,12 +453,12 @@ settle, and returns the settled screen.
 
 - **A `settle=` pattern is ONE whitespace-free token — `esc.to.interrupt`, never
   `'esc to interrupt'`.** The client joins argv with single spaces and the server
-  re-splits the line on whitespace (the same rule that collapses inline `send`, above), so
-  shell quotes do not survive the wire: `turn settle=gone:'esc to interrupt' timeout=600000
-  'fix it'` arrives as `turn settle=gone:esc to interrupt timeout=600000 fix it` — the regex
-  is `esc`, the option parse stops at `to`, and `to interrupt timeout=600000 fix it` is what
-  gets TYPED into the session, with the timeout left at its 240 s default. `.` (or `\s+`,
-  quoted so the shell keeps the backslash) is regex, not the shell's business.
+  re-splits the line on whitespace, so shell quotes do not survive the wire: `turn
+  settle=gone:'esc to interrupt' timeout=600000 'fix it'` arrives as `turn settle=gone:esc
+  to interrupt timeout=600000 fix it` — the regex is `esc`, the option parse stops at `to`,
+  and `to interrupt timeout=600000 fix it` is what gets TYPED into the session, with the
+  timeout left at its 240 s default. `.` (or `\s+`, quoted so the shell keeps the
+  backslash) is regex, not the shell's business.
 - `settle=gone:<re>` is TWO waits: after the verified submit it first waits (bounded by
   `submit_window`, default 2000 ms) for `<re>` to APPEAR, then for it to LEAVE — `gone` is
   level-triggered and the footer can land a frame after the submit verified, so arming it
@@ -478,8 +561,7 @@ aterm ctl "@$SID" wait 30000                         # OK complete <id> exit=<co
   when `content_seq` has *already* moved past `<n>`. Record the `seq` from `text --json`
   (or an input verb's `OK … seq=<n>` reply) one turn, pass it back the next:
   `await seq <n> timeout 0` answers `OK seq <new>` (~15 bytes) or `OK timeout`, instead of
-  re-reading the screen. *(It was edge-triggered and silently answered `OK timeout` until
-  the fix in `observe.rs`; a stale build will still show the old behavior.)*
+  re-reading the screen.
 - **Caveat: `seq` is per-grid.** An alt-screen (1049) round trip leaves the main grid's
   counter untouched, so a seq check alone can miss a whole TUI session. It also does not
   move on render-only changes (OSC recolor, DECSCNM, DECTCEM) or cursor moves.
@@ -529,7 +611,12 @@ aterm ctl exits 20 since=<id>        # the newest 20 with id > <id> — page wit
 `0` = OK. `1` = usage/connect error or server `ERR` (and, for discovery, a readable but empty
 socket dir). `2` = discovery only: found-but-unreachable, or a missing/unreadable/unresolvable
 dir (see above). **`124` = timeout** (client deadline, or server `OK timeout`, or a `turn`
-verdict with `status=timeout`; for discovery, every socket timed out).
+verdict with `status=timeout`; for discovery, every socket timed out). **`75`** = a
+`subscribe` or a blocking read (`text`, `wait`, `ready`, `await`, `inbox`) lost its instance
+and nothing replaced it within 30 s (less if `--timeout` ran out first): find the session
+with `ls` before you retry. Those follow a self-update, except `await seq <n>`, `await inbox
+since=`, `inbox` with arguments and a read naming its session `@<n>`, which exit 75 too; any
+other verb cut by an update exits 1.
 
 Unit mismatch: the client's `--timeout` is in **SECONDS** (default 900, `0` disables);
 every server-side verb timeout is in **milliseconds**.
@@ -562,25 +649,18 @@ token, not trailing args, so `… cells since=1234 ts` is `ERR unknown subscribe
 modifier-only list** (bare `ts` or `trim` is `ERR usage` — it would ack and then push nothing
 forever; `trim` is inert without `screen`). `sessions` is **Owner-only**: it reports the whole
 instance roster, which your per-target read grants do not cover, so a scoped edge gets
-`ERR denied` rather than an empty stream. `mail` narrows INSIDE the same token with
-`mail:kinds=<k,…>` and/or `mail:from=<class|principal>` (class = `human|agent|service|other`,
-by the sender's `h-`/`s-`/`a-` prefix; `from=` takes exactly ONE value, never a list) — an
-unknown kind, key or repeat is `ERR usage`, never a subscription that silently matches
-nothing. Max 256 targets; `since=` anchors require a single target.
+`ERR denied` rather than an empty stream. Max 256 targets; `since=` anchors require a
+single target.
 
 `mail` takes its own parameters, colon-joined onto the stream name and in any order:
-`mail:kinds=<k,..>`, `mail:from=<class|principal>` (class is `human|agent|service|other`),
-and `mail:topic=<t>` — BROADCAST rows only, on that topic. Each `MAIL` line is metadata
-and never a body (`MAIL <sid> id= off= from= kind= [re=] [topic=]`); read the words with
-your own `inbox get`. An unknown key or kind is `ERR usage`, never a subscription that
-silently matches nothing, and the refusal prints the whole vocabulary on its second line.
-`topic=` is there because a broadcast is in a mailbox for a different reason than an
-addressed message: the session asked for the topic with `aterm ctl @<sid> topic add <t>`
-(Owner-only; `topic ls`/`topic drop <t>`), and a session that asked for nothing receives
-no broadcast at all. Each add or drop is pushed as `EVENT <local> topic add|drop …` on the
-`events` digest, which is how the session's bridge learns of it at once — or, for a session
-its push lane does not watch (past the 256-target cap), from the `topic ls` it reads on every
-2 s roster round.
+`mail:kinds=<k,..>`, `mail:from=<class|principal>` (ONE value; class is
+`human|agent|service|other`, by the sender's `h-`/`s-`/`a-` prefix), and `mail:topic=<t>` —
+BROADCAST rows only, on that topic. Each `MAIL` line is metadata and never a body
+(`MAIL <local> id= off= from= kind= [re=] [topic=]`); read the words with your own
+`inbox get`. An unknown key or kind, or a repeated one, is `ERR usage`, never a subscription
+that silently matches nothing, and the refusal prints the whole vocabulary on its second
+line. A session receives a broadcast only for a topic it added (`aterm ctl @<sid> topic add
+<t>`, Owner-only; `topic ls`, `topic drop <t>`).
 
 After the ack the connection is **push-only forever**.
 
@@ -590,6 +670,9 @@ After the ack the connection is **push-only forever**.
 - `DELTA <local> seq=<n> cursor <row> <col> <visible> <style>`
 - `DELTA <local> seq=<n> cells <nbytes>` + bytes + newline
 - `EVENT <local> turn <id> submitted= status= dur_ms=` / `block-complete <id> exit=` / `title` / `bell` / `meta`
+- `EVENT <local> resize n=<k> id=<last> to=<CxR> run=<r>[ dropped=<n>]` (grid resizes, one per wake)
+  / `EVENT <local> render desync-risk run= …` / `render healed run= after_ms=` — see
+  "Detect a render desync in a peer"
 - `EVENT <local> closing reason= by=` then `EVENT <local> exited` — the `exits` row, live
 - `BYTES <local> <len>` + raw PTY bytes
 - `MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]` — `mail` only, one line per row
@@ -633,10 +716,6 @@ aterm drive --dial <name> prompt 'run the tests'
 
 - **`dial <name>` with no verb is rejected** — a bare dial would deadlock a one-shot client.
 - Dialing out is owner-only. Use `image --bytes` remotely (a path names the server's disk).
-- `aterm drive --dial` authenticates the way `aterm ctl` does: the sibling token file by the
-  SHARED convention. *(It used to derive `<sock without
-  .sock>.token`, a name the server never writes, so `--dial` silently failed to authenticate
-  where `aterm ctl` worked. Fixed — a stale build still has the old behavior.)*
 
 ## Fleet
 
@@ -707,8 +786,7 @@ task`, which posts them as mail and types only a one-line inbox nudge.
 **`--ready REGEX`** sets the prompt-ready row pattern for that final best-effort settle.
 The default matches a **Claude** input caret (`(^|\s)❯(\s|$)`) — right only when the driven
 program *is* Claude. Point it at your own REPL's prompt otherwise, or pass `''` for
-idle-only. Also settable via `$ATERM_DRIVE_READY` (the flag wins). A non-matching pattern
-costs a bounded extra wait, never a failed turn.
+idle-only. A non-matching pattern costs a bounded extra wait, never a failed turn.
 
 Everything from `classify` down is the `supervise-agent` skill's loop (`aterm drive
 --help`, *SUPERVISING A WORKER*): `classify` is the read-only judgment, `phase` one read →
@@ -719,27 +797,12 @@ point and keeping on, `task` the work sent by mail, `report` what the worker sai
 your turn (`--final` its last message block alone), `ledger` how the whole loop ran.
 `--timeout` is milliseconds; `--max-s` is seconds.
 
-**Every agent session aterm hosts is already supervised** by the window's own host, by
-default and FULLY AUTOMATIC (aterm.toml `[harness]`, whose every key only takes power
-away; `enabled = false` or the Harness switch in Settings (search "harness") turns it
-off). It answers every box — a permission box its one-shot `Yes`, vendor notes and rm
-circuit breakers included, and the folder-trust dialog, even the form whose Yes makes the
-folder's pre-approved permissions apply without asking in every later session there;
-a plan its yes that grants no standing mode (`Yes, manually approve edits`, never auto
-mode, bypass or a cleared context) (owner, 2026-09-24; `approve = "safe"`, or "Approve
-permission boxes" set to `safe` in Settings — search "approve" — limits it to the boxes
-it proves safe) — answers a question dialog with its recommended option whatever
-`approve` says (Enter on the `(Recommended)` one, option 1 when none is marked, never a
-digit; `answer_questions = false`, or "Answer questions with the recommended option" off
-in Settings — search "question" — hands every question over), continues a turn that
-ended, relaunches a Claude Code that crashed, holds off while a person types or another
-driver holds a lease or a named turn on the session (`hand=`), and escalates only what the
-table limited or nothing can answer — a question a person has begun answering or it
-cannot read whole among them — to the menu bar (the session's
-`attention`, `owner=supervisor`). `status`/`ls` name it —
-`supervisor=aterm-harness@<pid>` — beside `program=` and the server's `agent=` verdict.
-A `watch` you start on such a session watches only; the `supervise-agent` skill has the
-rules.
+**Every Claude Code and Codex session aterm hosts is already supervised** by the window's
+own host (`supervisor=aterm-harness@<pid>` in `status`/`ls`): it answers boxes and
+questions, continues ended turns, relaunches a crashed Claude Code, holds off while a person
+types (`human_ms=`) or another driver holds the session (`hand=`), and escalates the rest to
+the menu bar (`attention`). A `watch` you start there watches only. Its limits are aterm.toml
+`[harness]` (`aterm help harness`); the `supervise-agent` skill has the rules.
 
 **With the fabric on, mail is the channel and the screen is the safety net.** `watch
 --mail` parks ONE `await inbox since=<id>` on YOUR session (`@self`, or `--inbox @sid`)
@@ -749,14 +812,7 @@ more, except one screen read per 20 s step while an idle point is held, and noth
 [re=<o>]` as each row lands (`aterm ctl @self inbox get <id>` is the body). The worker's
 end-of-turn `report` (one it posts itself, if it does) is folded into the idle point of
 the same turn: `EVENT turn seq=<n> report=<id>
-rows=<n> <summary>`, one line per worker turn — measured 2026-09-14, one wake and one 2 KB
-read where the same turn was a 689-row `report`. Since round 22 that report is what the
-worker's SCREEN says, read over the control socket: its body opens with a `seq=<n>
-hash=<hex16>[ busy=1]` stamp line (not counted by `rows=`), so you can hold it against
-`history` instead of believing it — `busy=1` means the screen was still mid-turn on every
-try and the stamp will NOT match the ledger. The rows are from the last `⏺` row down to
-the live zone, or the last six non-blank rows above it, trimmed to 4 KiB, posted once per
-screen. An idle whose report never came within
+rows=<n> <summary>`, one line per worker turn. An idle whose report never came within
 `--idle-grace` (default 5 s) is `EVENT idle-no-report …` — and so is one a prompt or a new turn
 superseded under the hold (the screen is read once a step there). A report is the turn's
 when it came after the worker was read busy for the turn, or after the point; one from
@@ -777,7 +833,7 @@ with: …` once when it appears under `[harness] dismiss_surveys = false`; other
 `watch` presses the `0` itself and prints `DISMISSED survey seq=<n>` once the survey has
 gone (still open, it prints the `EVENT survey` line and presses the `0` again on a growing
 back-off, badging the session from the second miss); a monitor that filters `watch`'s lines keeps it:
-`grep --line-buffered -E '^(EVENT|APPROVED|DISMISSED|TIMEOUT|EXIT)'`.
+`grep --line-buffered -E '^(EVENT|APPROVED|CHOSE|DISMISSED|CONTINUED|TYPED|RESTARTED|MAIL|EXTEND|RECONNECT|WATCHING|TIMEOUT|EXIT)'`.
 
 **A worker running out of context is a decision point too.** Claude Code parks `1% until
 auto-compact` (or `Context left until auto-compact: 7%`) right-aligned above its composer
@@ -819,9 +875,8 @@ is empty, so `report` starts at the last `❯` row it can still see (`marker=use
 (`history`: your turns, their settle verdicts), the rows each reply drew (one
 `offscreen … screen=1` read, joined as `report` joins it), the watcher's
 `--journal` lines (`watch|supervise --journal FILE` writes one JSON object per
-line it prints — every EVENT, APPROVED, DISMISSED, RECONNECT, TIMEOUT and EXIT,
-with the wall-clock time; opened append-only, created 0600, and a failure to
-write it is said once and stops nothing) and this session's fabric mail with that
+line it prints, with the wall-clock time; opened append-only, created 0600, and a
+failure to write it is said once and stops nothing) and this session's fabric mail with that
 worker (`inbox --peek --meta` and the `timeline`'s posts; nothing is listed or
 handled). `--format text` aligns columns, `md` writes tables, `html --out PATH`
 writes ONE self-contained page with the manager, watcher and worker swimlanes on a
@@ -849,10 +904,11 @@ use `aterm ctl` — that path is in-process.
    per-grid and misses alt-screen flips, recolors, and cursor moves.
 7. `wait`/`await block`/`blocks` are silent no-ops without OSC-133.
 8. `image` can't capture a background tab, needs a bare filename, returns a path with spaces.
-9. Inline `send` collapses whitespace and forbids newlines — use `--stdin` forms (≤256 KiB).
-10. `search` rows are absolute scrollback rows; header may carry ` incomplete`.
+9. Inline `send` forbids newlines — use `--stdin` forms (≤256 KiB).
+10. `search` rows are absolute scrollback rows; a cut result says `aterm-ctl: results may be
+    incomplete` on stderr.
 11. `screen` is ~400 KB; `text trim` is the cheap read (`text tail=<n> trim` on a bottom-pinned
-    TUI). `text <anything but trim / tail= / rows=>` is `ERR usage`.
+    TUI). `text <anything but trim / tail= / rows= / order=>` is `ERR usage`.
 12. Client `--timeout` is seconds; server-side timeouts are milliseconds (cap 600000).
 13. A subscribe `seq` skip is coalescing, never loss; a `GAP resync=` is a real discontinuity.
 14. `@.` follows the human's tab switches; `@self` and `@<sid>` do not.
@@ -867,11 +923,8 @@ use `aterm ctl` — that path is in-process.
     bottom-pinned TUI `text trim` trims nothing — read `text tail=20 trim` and let `await
     gone`/`await seq` decide when to read. `aterm ctl` prints a stderr `note:` before
     sending a pattern with whitespace, and still sends it.
-18. `detail=` on a compound line is the segment that runs (the last one once a trailing
-    `|| …` alternative is dropped: `a && b` → `b`, `a || b` → `a`, `a && b || c` → `b`);
-    an older build reads the first word, so `detail=cd` means "confirm with `text`".
-19. `key if=<re> <name>` / `send if=<re> <text>` check and press under ONE lock: `OK skipped
+18. `key if=<re> <name>` / `send if=<re> <text>` check and press under ONE lock: `OK skipped
     seq=<n>` (exit 0) means no row matched and nothing was written — an answer, not an
     error. The guard is ONE token: `if=Do.you.want.to.proceed`.
-20. `tab <N>`, `tab close <N>`, `tab move` and the `index=` of `inspect app/v1 tabs` count
+19. `tab <N>`, `tab close <N>`, `tab move` and the `index=` of `inspect app/v1 tabs` count
     from 0; the ordinals painted on the tab strip count from 1.

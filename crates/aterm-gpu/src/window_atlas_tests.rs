@@ -128,10 +128,12 @@ fn artwork_input(gpu: &GpuRenderer, tag: u8) -> RenderInput {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
-                pixel_exact: false,
+                scaling: aterm_core::grid::extra::ImageScaling::Fit,
+                source_rect: None,
             }),
             cell_row: 0,
             cell_col: 0,
+            kitty: None,
         },
     ));
     input

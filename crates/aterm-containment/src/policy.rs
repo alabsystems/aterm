@@ -51,13 +51,14 @@ impl ContainmentPolicy {
 
     /// Network capability for mode.
     ///
-    /// - Master → Full, User → Full, Safety → Allowlist, Containment → None
+    /// - Master, User, Safety → Full; Containment → None
     #[inline(always)]
     #[must_use]
     pub const fn network(mode: ContainmentMode) -> NetworkCapability {
         match mode {
-            ContainmentMode::Master | ContainmentMode::User => NetworkCapability::Full,
-            ContainmentMode::Safety => NetworkCapability::Allowlist,
+            ContainmentMode::Master | ContainmentMode::User | ContainmentMode::Safety => {
+                NetworkCapability::Full
+            }
             ContainmentMode::Containment => NetworkCapability::None,
         }
     }
@@ -98,9 +99,9 @@ mod tests {
     ///
     /// | Mode        | Net       | Fs        | Proc      |
     /// |-------------|-----------|-----------|-----------|
-    /// | Master(3)   | Full(2)   | Full(3)   | Full(2)   |
-    /// | User(2)     | Full(2)   | HomeRW(2) | Full(2)   |
-    /// | Safety(1)   | Allow(1)  | ProjRW(1) | Restr(1)  |
+    /// | Master(3)   | Full(1)   | Full(3)   | Full(2)   |
+    /// | User(2)     | Full(1)   | HomeRW(2) | Full(2)   |
+    /// | Safety(1)   | Full(1)   | ProjRW(1) | Restr(1)  |
     /// | Contain(0)  | None(0)   | TmpOnly(0)| NoFork(0) |
     #[test]
     fn test_master_policy() {
@@ -121,7 +122,9 @@ mod tests {
     #[test]
     fn test_safety_policy() {
         let c = ContainmentPolicy::capabilities(ContainmentMode::Safety);
-        assert_eq!(c.network, NetworkCapability::Allowlist);
+        // Safety narrows nothing on the network: no level promises filtering
+        // that nothing does.
+        assert_eq!(c.network, NetworkCapability::Full);
         assert_eq!(c.fs, FsCapability::ProjectReadWrite);
         assert_eq!(c.process, ProcessCapability::Restricted);
     }
@@ -166,7 +169,7 @@ mod tests {
     /// function returns the matching capability, catching any drift between the
     /// documented encoding and the implementation.
     ///
-    ///   Network: None=0, Allowlist=1, Full=2
+    ///   Network: None=0, Full=1
     ///   Fs:      TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3
     ///   Process: NoFork=0, Restricted=1, Full=2
     #[test]
@@ -175,8 +178,8 @@ mod tests {
         let table: [(u8, [u8; 3]); 4] = [
             (0, [0, 0, 0]), // Containment
             (1, [1, 1, 1]), // Safety
-            (2, [2, 2, 2]), // User
-            (3, [2, 3, 2]), // Master
+            (2, [1, 2, 2]), // User
+            (3, [1, 3, 2]), // Master
         ];
 
         let modes = [

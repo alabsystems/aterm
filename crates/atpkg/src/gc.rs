@@ -485,9 +485,7 @@ fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>>
             }
         }
         for build in candidates {
-            // Manual (byte-identical) render of `format!("{build}")`: Trust-gate lowering
-            // workaround — see `lib.rs::dec_u64`.
-            let dir = prog.path().join(crate::dec_u64(build));
+            let dir = prog.path().join(build.to_string());
             // `crate::store::sweep_stage_scratch`'s `parked_only_copy`, asked here: the
             // recovery did not put a tree back AND nothing stands at `<build>`.
             if !crate::store::recover_interrupted_swap(&dir)
@@ -554,7 +552,7 @@ fn interrupted_debris(
                 && let Some(build) = entry.file_name().to_str().and_then(orphan_sidecar_build)
                 && !parked.get(&program).is_some_and(|b| b.contains(&build))
                 && matches!(
-                    crate::store::presence(&prog.path().join(crate::dec_u64(build))),
+                    crate::store::presence(&prog.path().join(build.to_string())),
                     crate::store::Presence::Absent
                 )
             {
@@ -1973,10 +1971,7 @@ mod tests {
     /// because the swap takes it down before the first rename.
     fn seed_killed_mid_swap(l: &Layout, program: &str, build: u64) -> (PathBuf, PathBuf) {
         let dir = l.build_dir(program, build);
-        // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
-        let mut name = crate::dec_u64(build);
-        name.push_str(".superseded-4242");
-        let parked = dir.with_file_name(name);
+        let parked = dir.with_file_name(format!("{build}.superseded-4242"));
         crate::store::clear_build_ready(&dir).unwrap();
         std::fs::rename(&dir, &parked).unwrap();
         assert!(

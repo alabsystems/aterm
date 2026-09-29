@@ -12,15 +12,82 @@
 //! matching sub-tile of the stored image in that cell — so an image can flow
 //! through a pager / multiplexer as plain text + colors.
 //!
-//! This module is the pure DECODE half (diacritic → value); the engine reads a
-//! placeholder cell's stored char + combining marks + fg color at render time and
-//! emits an `ImageRef` into the same shared-image render path that direct
-//! placements use (see `render_cells::images_row_into`). The diacritic table is the
-//! canonical Kitty `rowcolumn-diacritics` list (297 entries, sorted by codepoint so
-//! the array index IS the encoded value).
+//! The cell's UNDERLINE colour names the virtual placement (`p=`) it shows — `0`
+//! (no underline colour) lets the terminal pick one.
+//!
+//! This module is the DECODE half ([`decode_cell`]: a cell's char, marks and
+//! colours → which image, placement and tile); the engine decodes a placeholder
+//! cell at render time and emits an `ImageRef` into the same shared-image render
+//! path that direct placements use (see `render_cells::images_row_into`), and the
+//! handler decodes them to damage the cells an image change repaints. The
+//! diacritic table is the canonical Kitty `rowcolumn-diacritics` list (297
+//! entries, sorted by codepoint so the array index IS the encoded value).
+
+use aterm_grid::{CellExtra, Grid};
 
 /// The Kitty Unicode placeholder base character.
 pub(crate) const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// One Unicode placeholder cell, decoded: the image and virtual placement it
+/// names, and the tile of that placement it draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlaceholderCell {
+    /// The image id: the foreground colour's 24 bits, under the third
+    /// diacritic's byte.
+    pub(crate) image_id: u32,
+    /// The virtual placement id: the underline colour's 24 bits (an indexed
+    /// underline colour is its palette index), `0` without one.
+    pub(crate) placement_id: u32,
+    /// The tile's row within the placement (the first diacritic).
+    pub(crate) row: u16,
+    /// The tile's column within the placement (the second diacritic).
+    pub(crate) col: u16,
+}
+
+/// Decode the cell at (`row`, `col`) of `grid`, whose extra is `extra`, if it is
+/// a Kitty Unicode placeholder; `None` for any other cell. A missing diacritic
+/// decodes as `0`.
+pub(crate) fn decode_cell(
+    grid: &Grid,
+    row: u16,
+    col: u16,
+    extra: &CellExtra,
+) -> Option<PlaceholderCell> {
+    // The placeholder is non-BMP, so it always resolves via the overflow table.
+    if grid.resolved_char(row, col) != Some(PLACEHOLDER) {
+        return None;
+    }
+    let marks = extra.combining();
+    let mark = |i: usize| marks.get(i).and_then(|&c| diacritic_value(c)).unwrap_or(0);
+    let id_high = mark(2) & 0xFF;
+    let placement_id = extra
+        .underline_color_index()
+        .map_or_else(|| extra.underline_color().map_or(0, rgb_id), u32::from);
+    Some(PlaceholderCell {
+        image_id: (id_high << 24) | fg_image_id(grid, row, col),
+        placement_id,
+        row: u16::try_from(mark(0)).unwrap_or(0),
+        col: u16::try_from(mark(1)).unwrap_or(0),
+    })
+}
+
+/// The low 24 bits of a Kitty image id, encoded in a cell's foreground color:
+/// an RGB fg is `(r<<16)|(g<<8)|b`; an indexed fg is the palette index; a
+/// default fg is 0 (matching kitty's `colorToId`).
+fn fg_image_id(grid: &Grid, row: u16, col: u16) -> u32 {
+    if let Some(rgb) = grid.fg_rgb_at(row, col) {
+        return rgb_id(rgb);
+    }
+    grid.cell(row, col)
+        .map(aterm_grid::Cell::colors)
+        .filter(aterm_grid::PackedColors::fg_is_indexed)
+        .map_or(0, |colors| u32::from(colors.fg_index()))
+}
+
+/// A 24-bit id spelled as an RGB colour.
+fn rgb_id([r, g, b]: [u8; 3]) -> u32 {
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
 
 /// The encoded value of a row/column/high diacritic = its index in this table, or
 /// `None` if the codepoint is not a Kitty rowcolumn diacritic. Sorted by codepoint.

@@ -21,15 +21,15 @@
 //! must still self-report `+t` (see [`run`]).
 //!
 //! The ONE exception: the x86_64-apple-darwin compat slice of the universal
-//! binary rides upstream stable via `RUSTUP_TOOLCHAIN=stable`. The reason is
-//! NOT that Trust lacks an x86_64 std — it has one, and six ALab programs ship
-//! x86_64 artifacts built with it. What a CROSS-HOST Trust sysroot lacks is
-//! rustc_private, so an out-of-tree rustc-driver tool cannot link against it;
-//! that is a narrower gap than "no std", and it is why the rustc coherence
-//! group is still aarch64-only while the plain programs are not. The compat
-//! slice rides stable because this lane wants no Trust-specific state on it at
-//! all. That pin lives HERE and nowhere else, and the lane scrubs
-//! inherited RUSTC/RUSTFLAGS state so stale shell exports cannot steer it.
+//! binary rides upstream stable via `RUSTUP_TOOLCHAIN=stable`. STOCK EXCEPTION
+//! (Trust lacks an x86_64-apple-darwin std in the aarch64 sysroot this lane
+//! builds with; measured 2026-09-28 on store build 9192: `targo --unverified
+//! check --target x86_64-apple-darwin -p aterm` → error[E0463] can't find crate
+//! for `std`, and the sysroot's lib/rustlib holds only aarch64-apple-darwin).
+//! This comment used to say Trust "has one"; that is not what the pinned sysroot
+//! measures. Whether a native x86_64-host Trust build could produce the slice
+//! instead was not measured. That pin lives HERE and nowhere else, and the lane
+//! scrubs inherited RUSTC/RUSTFLAGS state so stale shell exports cannot steer it.
 //!
 //! Preserved semantics:
 //!   * `SOURCE_DATE_EPOCH` inherited by every cargo child so the binary's
@@ -59,8 +59,8 @@ pub mod linux;
 /// window (a no-TTY/Finder launch), the transparent session (a TTY launch),
 /// and every verb (`aterm ctl/pkg/fleet/drive/help`) in-process. The bundle
 /// adds argv0 compat SYMLINKS (aterm-ctl, atpkg, aterm-fleet, aterm-drive,
-/// aterm-gui, aterm-cli) pointing at it — see `bundle::assemble` — so
-/// pre-one-binary scripts, installs, and Help examples keep resolving.
+/// aterm-link, aterm-gui, aterm-cli) pointing at it — see `bundle::assemble` —
+/// so pre-one-binary scripts, installs, and Help examples keep resolving.
 const PACKAGES: [(&str, &str, &str); 1] = [("aterm", "aterm", "aterm")];
 
 const ARM64: &str = "aarch64-apple-darwin";
@@ -131,14 +131,25 @@ pub fn x86_64_probe_asset_name(version: &str) -> String {
     format!("aterm-{version}-x86_64-probe.txt")
 }
 
-/// The x86_64 execution record's text: what ran, what was checked, and the slice's own
-/// `--diagnose` report verbatim.
+/// The x86_64 execution record's text: what ran, what was checked, the session turn's
+/// outcome, and the slice's own `--diagnose` report verbatim.
+///
+/// PII-free by construction: the report is produced under a cleared environment whose
+/// `HOME` is a private scratch directory named by the cut's pid and a timestamp
+/// ([`x86_64_slice_runs`]), so its `config:` and `environment:` lines name nothing of the
+/// builder, and the session turn is recorded as a fixed sentence — never the screen,
+/// whose prompt carries the host and user. That `HOME` is writable and `SHELL` is
+/// [`X86_64_PROBE_SHELL`], as on a real Mac, so the report's `shell-int:` line reads the
+/// x86_64 slice preparing its own shell loader, not the probe's environment.
 #[must_use]
 pub fn x86_64_probe_transcript(version: &str, report: &str) -> String {
     let mut text = format!(
         "# aterm {version}: the universal binary's x86_64 slice, RUN under Rosetta by the\n\
-         # release cut (`arch -x86_64 aterm --diagnose`) before it shipped. Its updater pin\n\
-         # and app version were checked against the release's; its report follows verbatim.\n\
+         # release cut before it shipped: `arch -x86_64 aterm --diagnose` (cleared\n\
+         # environment, a private scratch HOME, SHELL={X86_64_PROBE_SHELL}), whose updater\n\
+         # pin and app version were checked against the release's, then one headless\n\
+         # session driven over the control socket: `{X86_64_TURN_TEXT}` typed, `x86_64`\n\
+         # answered on the screen. The report follows verbatim.\n\
          # docs/DESIGN-intel-just-works-2026-09-14.md section 3.1\n\n"
     );
     text.push_str(report);
@@ -1559,9 +1570,9 @@ fn run_with_take(
 
     if !plan.arm64_only {
         // x86_64 compat slice: upstream stable via rustup's target std — THE
-        // one exception to the single Trust lane; see the module docs for why
-        // (it is NOT that Trust lacks an x86_64 std; it has one). NOT auto-added here: spec
-        // decision 18 — print the remediation and require an explicit
+        // one exception to the single Trust lane. STOCK EXCEPTION (Trust lacks
+        // an x86_64-apple-darwin std; E0463, see the module docs). NOT auto-added
+        // here: spec decision 18 — print the remediation and require an explicit
         // --arm64-only to ship single-arch.
         let t = Instant::now();
         println!("==> [{X86_64}] upstream stable (+r): --target compat slice");
@@ -1725,14 +1736,29 @@ fn run_with_take(
     // No Rosetta is a refusal naming the remedy, never an unexecuted slice.
     let mut x86_64_probe = None;
     if !plan.arm64_only {
-        let report = x86_64_slice_runs(&shipped[0], &plan.repo_root, &mut |command| {
-            command.output()
-        })?;
-        let label = "x86_64 slice under Rosetta";
-        if let Some(expected) = &plan.expected_update_pin_sha256 {
-            validate_slice_update_pin_reports(expected, &[(label, &report)])?;
-        }
-        validate_app_version_reports(&plan.short_version, &[(label, &report)])?;
+        let scratch = private_x86_64_scratch()?;
+        let probed = (|| {
+            let report = x86_64_slice_runs(&shipped[0], &scratch.join("home"), &mut |command| {
+                command.output()
+            })?;
+            let label = "x86_64 slice under Rosetta";
+            if let Some(expected) = &plan.expected_update_pin_sha256 {
+                validate_slice_update_pin_reports(expected, &[(label, &report)])?;
+            }
+            validate_app_version_reports(&plan.short_version, &[(label, &report)])?;
+            // `--diagnose` never reaches the session, PTY and CoreText paths, which is
+            // where x86_64 stret/`BOOL` faults live: the slice must also DRIVE a session.
+            x86_64_slice_drives_a_session(
+                &shipped[0],
+                &scratch,
+                &mut |command| command.spawn(),
+                &mut |command| command.output(),
+                X86_64_SOCKET_WAIT,
+            )?;
+            Ok::<_, String>(report)
+        })();
+        let _ = std::fs::remove_dir_all(&scratch);
+        let report = probed?;
         // The record of the run, staged beside the dSYM and published into `dist/`
         // with it: the proof §3.1 promises the site gate, not a line that scrolled by.
         let record = symbol_out.join(x86_64_probe_asset_name(&plan.short_version));
@@ -1742,8 +1768,8 @@ fn run_with_take(
         )
         .map_err(|error| format!("write {}: {error}", record.display()))?;
         println!(
-            "    x86_64 slice: ran under Rosetta — --diagnose answered, pin and version agree \
-             (record: {})",
+            "    x86_64 slice: ran under Rosetta — --diagnose answered, pin and version agree, \
+             a headless session answered `{X86_64_TURN_TEXT}` with x86_64 (record: {})",
             x86_64_probe_asset_name(&plan.short_version)
         );
         x86_64_probe = Some(record);
@@ -1886,9 +1912,9 @@ fn build_one(
     // The build driver, per lane. Native slice: `targo` from the Trust stage2
     // tool dir — never a PATH `cargo`, which since the stock-name purge is a
     // rustup shim the repo's toolchain pin can no longer satisfy. Compat
-    // slice: upstream stable's `cargo` via the rustup shim — the ONE
-    // deliberately stock lane (see the module docs; Trust DOES have an
-    // x86_64-apple-darwin std, so that is not the reason).
+    // slice: upstream stable's `cargo` via the rustup shim — the ONE stock
+    // lane, a STOCK EXCEPTION (the pinned Trust sysroot has no
+    // x86_64-apple-darwin std: E0463; see the module docs).
     let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;
     let compat_shim = if target.is_some() {
         Some(release_rustup_shim_dir(&home)?)
@@ -2601,24 +2627,51 @@ fn verify_built_slice_update_pins(
     validate_slice_update_pin_reports(expected, &[("native architecture slice", &report)])
 }
 
+/// The `SHELL` the x86_64 `--diagnose` probe runs with: the macOS default login shell,
+/// so the report's `shell-int:` line exercises the slice's zsh loader-prepare path.
+const X86_64_PROBE_SHELL: &str = "/bin/zsh";
+
+/// What the session turn types into the x86_64 slice's shell. A shell spawned by a
+/// Rosetta-translated process runs its x86_64 slice, so the screen answers `x86_64`.
+const X86_64_TURN_TEXT: &str = "uname -m";
+
+/// How long the translated instance may take to open its control socket. Rosetta
+/// translates the whole binary on its first run, which is most of this.
+const X86_64_SOCKET_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Scope `command` to a cleared environment: the system `PATH`, `HOME` = `home`, and
+/// nothing else from the cutter (its `ATERM_*`, its `HOME`, its user name).
+fn x86_64_hermetic(command: &mut Command, home: &Path) {
+    command
+        .env_clear()
+        .env("PATH", RELEASE_SYSTEM_PATH)
+        .env("HOME", home);
+}
+
 /// Run the x86_64 slice of `universal` under Rosetta (`/usr/bin/arch -x86_64 … --diagnose`)
 /// and return its report. `run` spawns, injected so the refusal paths are testable without
 /// Rosetta. `Err` when Rosetta cannot run a trivial x86_64 program
 /// ([`crate::gates::ROSETTA_REFUSAL`] — the pre-claim [`crate::gates::universal_gate`] asks
 /// the same probe first, so on a real cut this arm is Rosetta vanishing mid-build), or the
-/// slice does not answer.
+/// slice does not answer. The report is the record's body, so the slice runs in a cleared
+/// environment, from `/`, with `home` (created here, inside the cut's private scratch) as
+/// `HOME` and [`X86_64_PROBE_SHELL`] as `SHELL`: nothing of the builder can reach it, and
+/// the slice prepares its shell loader in `home` as it would on a real Mac.
 fn x86_64_slice_runs(
     universal: &Path,
-    repo_root: &Path,
+    home: &Path,
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
 ) -> Result<String, String> {
     crate::gates::rosetta_runs(run)?;
+    std::fs::create_dir_all(home).map_err(|error| format!("create {}: {error}", home.display()))?;
     let mut probe = Command::new("/usr/bin/arch");
     probe
         .arg("-x86_64")
         .arg(universal)
         .arg("--diagnose")
-        .current_dir(repo_root);
+        .current_dir("/");
+    x86_64_hermetic(&mut probe, home);
+    probe.env("SHELL", X86_64_PROBE_SHELL);
     let out =
         run(&mut probe).map_err(|error| format!("run the x86_64 slice under Rosetta: {error}"))?;
     if !out.status.success() {
@@ -2630,6 +2683,137 @@ fn x86_64_slice_runs(
     }
     String::from_utf8(out.stdout)
         .map_err(|_| "the x86_64 slice's diagnostics are not UTF-8".to_string())
+}
+
+/// A fresh, private (0700) scratch directory for the x86_64 probes (`--diagnose`, then
+/// the session turn), under `/tmp` so the control socket's path stays inside `sun_path`.
+/// Its name carries the cut's pid and a timestamp — nothing of the builder.
+fn private_x86_64_scratch() -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let dir = PathBuf::from(format!(
+        "/tmp/aterm-x86-probe-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|error| format!("create {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
+/// §3.1's second half: the x86_64 slice DRIVES A SESSION under Rosetta. A headless,
+/// hermetic instance (`--headless --cpu --no-reroute`, `HOME`/XDG dirs under `scratch`,
+/// updates and packages off) is spawned under `arch -x86_64`; once its control socket
+/// appears, one `aterm ctl turn` — the slice's own client, also translated — types
+/// [`X86_64_TURN_TEXT`] and settles on a row reading `x86_64`. `spawn` and `run` are
+/// injected so every refusal is testable without Rosetta. The instance is killed and
+/// reaped on every path.
+fn x86_64_slice_drives_a_session(
+    universal: &Path,
+    scratch: &Path,
+    spawn: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Child>,
+    run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
+    socket_wait: std::time::Duration,
+) -> Result<(), String> {
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let home = scratch.join("home");
+    let config = scratch.join("cfg");
+    let runtime = scratch.join("run");
+    for dir in [&home, &config.join("aterm"), &runtime] {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| format!("create {}: {error}", dir.display()))?;
+    }
+    let toml = config.join("aterm").join("aterm.toml");
+    std::fs::write(
+        &toml,
+        "[update]\nenabled = false\n[packages]\nenabled = false\n",
+    )
+    .map_err(|error| format!("write {}: {error}", toml.display()))?;
+    let sock = scratch.join("a.sock");
+    let hermetic = |command: &mut Command| {
+        x86_64_hermetic(command, &home);
+        command
+            .env("SHELL", "/bin/sh")
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .current_dir(&home);
+    };
+
+    let mut instance = Command::new("/usr/bin/arch");
+    instance
+        .arg("-x86_64")
+        .arg(universal)
+        .args(["--headless", "--cpu", "--no-reroute", "--control-sock"])
+        .arg(&sock)
+        .args(["--columns", "80", "--lines", "24"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    hermetic(&mut instance);
+    let mut instance = Reap(
+        spawn(&mut instance)
+            .map_err(|error| format!("start the x86_64 slice headless under Rosetta: {error}"))?,
+    );
+
+    let started = Instant::now();
+    while !sock.exists() {
+        if let Ok(Some(status)) = instance.0.try_wait() {
+            return Err(format!(
+                "the x86_64 slice's headless instance exited ({status}) before its control \
+                 socket appeared"
+            ));
+        }
+        if started.elapsed() >= socket_wait {
+            return Err(format!(
+                "the x86_64 slice's headless instance opened no control socket within {}s",
+                socket_wait.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let mut turn = Command::new("/usr/bin/arch");
+    turn.arg("-x86_64")
+        .arg(universal)
+        .arg("ctl")
+        .arg("--sock")
+        .arg(&sock)
+        .args(["turn", "settle=match:^x86_64$", "timeout=30000"])
+        .args(X86_64_TURN_TEXT.split(' '));
+    hermetic(&mut turn);
+    let out = run(&mut turn)
+        .map_err(|error| format!("drive the x86_64 slice's session under Rosetta: {error}"))?;
+    x86_64_turn_verdict(&out)
+}
+
+/// Judge the session turn: the client succeeded, its verdict (stderr) says the screen
+/// SETTLED on the awaited row, and a row (stdout) reads exactly `x86_64`. Anything else is
+/// a refusal naming what the turn saw, never a pass.
+fn x86_64_turn_verdict(out: &std::process::Output) -> Result<(), String> {
+    let verdict = String::from_utf8_lossy(&out.stderr);
+    let rows = String::from_utf8_lossy(&out.stdout);
+    let settled = verdict
+        .lines()
+        .any(|line| line.contains(" turn ") && line.contains("status=settled"));
+    let answered = rows.lines().any(|row| row.trim() == "x86_64");
+    if out.status.success() && settled && answered {
+        return Ok(());
+    }
+    Err(format!(
+        "the x86_64 slice did not drive a session under Rosetta: `{X86_64_TURN_TEXT}` was \
+         not answered with x86_64 (client {}; {})",
+        out.status,
+        verdict.trim()
+    ))
 }
 
 /// Combine slices into one fat binary, or pass a single slice through
@@ -2823,7 +3007,7 @@ mod tests {
         validate_embedded_update_pin, validate_final_slice_records, validate_lipo_architectures,
         validate_named_cli_app_version, validate_slice_update_pin_reports,
         write_release_target_owner, x86_64_probe_asset_name, x86_64_probe_transcript,
-        x86_64_slice_runs,
+        x86_64_slice_drives_a_session, x86_64_slice_runs, x86_64_turn_verdict,
     };
 
     /// §3.1 of DESIGN-intel-just-works: a universal cut RUNS its x86_64 slice. A builder
@@ -2839,7 +3023,6 @@ mod tests {
             stderr: b"bad CPU type in executable".to_vec(),
         };
         let bin = std::path::Path::new("/stage/ship/aterm");
-        let root = std::path::Path::new("/repo");
         let argv = |command: &std::process::Command| -> Vec<String> {
             std::iter::once(command.get_program())
                 .chain(command.get_args())
@@ -2847,8 +3030,15 @@ mod tests {
                 .collect()
         };
 
+        let scratch = std::env::temp_dir().join(format!(
+            "aterm-x86-probe-test-diagnose-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let home = scratch.join("home");
+
         let mut seen = Vec::new();
-        let err = x86_64_slice_runs(bin, root, &mut |command| {
+        let err = x86_64_slice_runs(bin, &home, &mut |command| {
             seen.push(argv(command));
             Ok(output(1, ""))
         })
@@ -2861,7 +3051,7 @@ mod tests {
         );
 
         let mut calls = 0;
-        let err = x86_64_slice_runs(bin, root, &mut |_| {
+        let err = x86_64_slice_runs(bin, &home, &mut |_| {
             calls += 1;
             Ok(output(if calls == 1 { 0 } else { 134 }, ""))
         })
@@ -2869,11 +3059,31 @@ mod tests {
         assert!(err.contains("did not run under Rosetta"), "{err}");
 
         let mut seen = Vec::new();
-        let report = x86_64_slice_runs(bin, root, &mut |command| {
+        let mut rendered = Vec::new();
+        let mut home_writable = false;
+        let report = x86_64_slice_runs(bin, &home, &mut |command| {
             seen.push(argv(command));
+            rendered.push(format!("{command:?}"));
+            home_writable = std::fs::write(home.join("probe"), b"").is_ok();
             Ok(output(0, "app-version: 0.93.0\n"))
         })
         .unwrap();
+        // PII-free by construction: the report that becomes the record runs in a
+        // cleared environment under a HOME that names nobody, from `/`. That HOME is
+        // writable and SHELL is zsh, as on a real Mac, so the report's `shell-int:`
+        // line describes the slice, not a read-only probe HOME with no shell (the
+        // `/var/empty` probe read `NOT ACTIVE — loader cache unwritable`).
+        let home_env = format!("HOME={:?}", home.display().to_string());
+        assert!(
+            rendered[1].starts_with("cd \"/\" && env -i ")
+                && rendered[1].contains(&home_env)
+                && rendered[1].contains("SHELL=\"/bin/zsh\"")
+                && rendered[1].contains("PATH=\"/usr/bin:/bin:/usr/sbin:/sbin\""),
+            "{}",
+            rendered[1]
+        );
+        assert!(home_writable, "the probe HOME must exist and be writable");
+        let _ = std::fs::remove_dir_all(&scratch);
         assert_eq!(report, "app-version: 0.93.0\n");
         assert_eq!(
             seen[1],
@@ -2892,8 +3102,147 @@ mod tests {
         );
         let record = x86_64_probe_transcript("0.93.0", &report);
         assert!(record.starts_with("# aterm 0.93.0: the universal binary's x86_64 slice, RUN"));
+        assert!(
+            record.contains("a private scratch HOME, SHELL=/bin/zsh")
+                && record.contains("`uname -m` typed")
+        );
         assert!(record.ends_with("\n\napp-version: 0.93.0\n"), "{record}");
         assert!(x86_64_probe_transcript("0.93.0", "no newline").ends_with("no newline\n"));
+    }
+
+    /// §3.1's session turn: the x86_64 slice runs headless under Rosetta in a hermetic
+    /// scratch tree, and one translated `aterm ctl turn` must SETTLE on a row reading
+    /// `x86_64`. An instance that dies or never opens its socket is refused, and so is a
+    /// turn that timed out or saw another architecture (the negative controls). The
+    /// instance is reaped on every path.
+    #[test]
+    fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let bin = std::path::Path::new("/stage/ship/aterm");
+        let wait = std::time::Duration::from_secs(5);
+        let turn_out = |code: i32, verdict: &str, rows: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: rows.as_bytes().to_vec(),
+            stderr: verdict.as_bytes().to_vec(),
+        };
+        let settled = "aterm-ctl: turn submitted=1 status=settled seq=4 id=1 dur_ms=188\n";
+        let scratch_for = |name: &str| {
+            let dir = std::env::temp_dir()
+                .join(format!("aterm-x86-turn-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        // The fake instance: the real command's --control-sock operand becomes a file,
+        // then it sleeps until reaped — standing in for the translated headless aterm.
+        let fake_instance = |command: &mut std::process::Command| {
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(&args[..2], ["-x86_64", "/stage/ship/aterm"]);
+            for flag in ["--headless", "--cpu", "--no-reroute"] {
+                assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
+            }
+            let rendered = format!("{command:?}");
+            assert!(rendered.contains("env -i "), "{rendered}");
+            let sock = &args[args.iter().position(|a| a == "--control-sock").unwrap() + 1];
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("touch '{sock}'; exec sleep 30"))
+                .spawn()
+        };
+
+        // A turn that settles on `x86_64` passes, and the instance is gone afterwards.
+        let dir = scratch_for("pass");
+        let mut turn_argv = Vec::new();
+        x86_64_slice_drives_a_session(
+            bin,
+            &dir,
+            &mut |c| fake_instance(c),
+            &mut |command| {
+                turn_argv = command
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                Ok(turn_out(0, settled, "sh$ uname -m\nx86_64\n\n"))
+            },
+            wait,
+        )
+        .unwrap();
+        assert_eq!(
+            turn_argv[..4],
+            ["-x86_64", "/stage/ship/aterm", "ctl", "--sock"]
+        );
+        assert_eq!(
+            turn_argv[5..],
+            [
+                "turn",
+                "settle=match:^x86_64$",
+                "timeout=30000",
+                "uname",
+                "-m"
+            ]
+        );
+        let toml = std::fs::read_to_string(dir.join("cfg/aterm/aterm.toml")).unwrap();
+        assert!(toml.contains("[update]\nenabled = false") && toml.contains("[packages]"));
+
+        // Negative controls: the screen answered another architecture; the turn timed
+        // out; the client failed.
+        for (verdict, rows, code) in [
+            (settled, "sh$ uname -m\narm64\n", 0),
+            (
+                "aterm-ctl: turn submitted=1 status=timeout seq=7\n",
+                "sh$ uname -m\n",
+                0,
+            ),
+            ("aterm-ctl: ERR no session\n", "", 1),
+        ] {
+            let dir = scratch_for("refuse");
+            let err = x86_64_slice_drives_a_session(
+                bin,
+                &dir,
+                &mut |c| fake_instance(c),
+                &mut |_| Ok(turn_out(code, verdict, rows)),
+                wait,
+            )
+            .unwrap_err();
+            assert!(err.contains("did not drive a session"), "{err}");
+        }
+        assert!(x86_64_turn_verdict(&turn_out(0, settled, "x86_64\n")).is_ok());
+
+        // An instance that exits before its socket appears is refused, naming that.
+        let dir = scratch_for("exit");
+        let err = x86_64_slice_drives_a_session(
+            bin,
+            &dir,
+            &mut |_| std::process::Command::new("/usr/bin/false").spawn(),
+            &mut |_| panic!("no turn without a socket"),
+            wait,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("exited") && err.contains("before its control socket"),
+            "{err}"
+        );
+
+        // One that stays up but never opens it is refused at the bound.
+        let dir = scratch_for("silent");
+        let err = x86_64_slice_drives_a_session(
+            bin,
+            &dir,
+            &mut |_| std::process::Command::new("/bin/sleep").arg("30").spawn(),
+            &mut |_| panic!("no turn without a socket"),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.contains("opened no control socket"), "{err}");
+        for name in ["pass", "refuse", "exit", "silent"] {
+            let _ = std::fs::remove_dir_all(
+                std::env::temp_dir()
+                    .join(format!("aterm-x86-turn-test-{name}-{}", std::process::id())),
+            );
+        }
     }
 
     /// The release proof's Python runs isolated (`-I`), and isolated mode ignores

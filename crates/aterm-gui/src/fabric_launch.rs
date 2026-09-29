@@ -27,7 +27,7 @@
 //! bridge is to be the process this function spawned.
 //!
 //! The child gets NO token and NO socket path, and its environment is aterm's own
-//! with [`aterm_types::domain::is_ai_env_var`] applied — the SAME deny list the
+//! with [`aterm_types::domain::is_ai_env_key`] applied — the SAME deny list the
 //! PTY spawn seam runs (`aterm-pty`'s `build_child_env`), applied HERE because
 //! that one is a different seam and protects a different child. So aterm's
 //! identity (`ATERM_SESSION_ID`, `ATERM_LAUNCH_NONCE`), its control-socket path,
@@ -458,11 +458,10 @@ fn launch_once(argv: &[String]) -> std::io::Result<std::process::Child> {
 /// needs `HOME`/`XDG_STATE_HOME` for its state directory, `PATH`, and the locale,
 /// and an allow list would have to grow every time it learns a new one — silently
 /// breaking the bridge each time it did not. The deny list is the canonical
-/// [`aterm_types::domain::is_ai_env_var`], so a var added there is stripped here
-/// too, with no second copy to drift.
-///
-/// Non-UTF-8 keys pass through, which is safe because every deny-listed name is
-/// ASCII — the same reasoning `aterm-pty`'s `is_denied_env_key` records.
+/// [`aterm_types::domain::is_ai_env_key`], the classifier `aterm-pty`'s child
+/// shells are built by, so a var added there is stripped here too, with no
+/// second copy to drift — non-UTF-8 keys included (it reads their lossy
+/// spelling, so a deny-listed prefix on one still denies it).
 /// PURE IN ITS INPUT, so the wiring is unit-tested without mutating the
 /// process-global environment — the same shape (and for the same reason) as
 /// `aterm-pty`'s `build_child_env`.
@@ -470,10 +469,7 @@ fn filter_child_env(
     inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     inherited
-        .filter(|(k, _)| {
-            k.to_str()
-                .is_none_or(|k| !aterm_types::domain::is_ai_env_var(k))
-        })
+        .filter(|(k, _)| !aterm_types::domain::is_ai_env_key(k))
         .collect()
 }
 
@@ -737,6 +733,29 @@ mod tests {
         for keeper in ["PATH", "HOME", "XDG_STATE_HOME", "ATERM_LINK_FAULT"] {
             assert!(has(keeper), "the bridge child still needs {keeper}");
         }
+    }
+
+    /// A NON-UTF-8 key that carries a deny-listed PREFIX is still denied
+    /// (2026-09-27). The filter let every non-UTF-8 key through on the grounds
+    /// that "every deny-listed name is ASCII" — true of the exact names, but the
+    /// prefixes match a key's leading bytes, so `ANTHROPIC_\xffX` kept its
+    /// `ANTHROPIC_` and reached the bridge child. The last key is the control: a
+    /// non-UTF-8 key with no deny-listed prefix still passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_key_with_a_denied_prefix_does_not_reach_the_bridge_child() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = |b: &[u8]| std::ffi::OsString::from_vec(b.to_vec());
+        let inherited = vec![
+            (raw(b"ANTHROPIC_\xffX"), raw(b"sk-x")),
+            (raw(b"CLAUDE\xfe"), raw(b"1")),
+            (raw(b"PLAIN_\xffKEY"), raw(b"kept")),
+        ];
+        let kept: Vec<Vec<u8>> = filter_child_env(inherited.into_iter())
+            .into_iter()
+            .map(|(k, _)| k.into_vec())
+            .collect();
+        assert_eq!(kept, vec![b"PLAIN_\xffKEY".to_vec()]);
     }
 
     /// The filter is WIRED, not merely available: `launch_once` clears the child's

@@ -30,8 +30,7 @@
 //!
 //! Every constructor here is the ONLY place its spelling lives; the parsers beside them
 //! (`system_path`, `managed_pin`, …) read the same words back so `doctor` and `which` can
-//! never drift from what the pass wrote. Strings are built by hand (no `format!`) — see
-//! `lib.rs` on the strict Trust gate.
+//! never drift from what the pass wrote.
 
 use std::path::Path;
 
@@ -98,9 +97,9 @@ pub fn is_unserved_toolset(state: &str) -> bool {
 #[must_use]
 pub fn managed(build: u64, index_build: u64) -> String {
     let mut s = String::from(MANAGED_PREFIX);
-    s.push_str(&crate::dec_u64(build));
+    s.push_str(&build.to_string());
     s.push_str(" — pinned by index ");
-    s.push_str(&crate::dec_u64(index_build));
+    s.push_str(&index_build.to_string());
     s
 }
 
@@ -112,9 +111,9 @@ pub fn managed(build: u64, index_build: u64) -> String {
 #[must_use]
 pub fn rolled_back(to: u64, from: u64) -> String {
     let mut s = String::from(MANAGED_PREFIX);
-    s.push_str(&crate::dec_u64(to));
+    s.push_str(&to.to_string());
     s.push_str(" — rolled back from ");
-    s.push_str(&crate::dec_u64(from));
+    s.push_str(&from.to_string());
     s
 }
 
@@ -225,14 +224,14 @@ pub const AGENT_SHADOWED_IN_SHELL: &str = " — SHADOWED in this shell by ";
 /// never "remove or reorder that copy". `remedy` is the command the CALLER has checked is
 /// true for this machine (`cli::shell_remedy_command`): the hook sourced in place —
 /// `. ~/.aterm/shell.d/00-atpkg.zsh` (`source …fish`, `. …ps1`) — wherever that hook
-/// file exists, the same sentence the window's status row says, and a `PATH` line in
-/// the shell's dialect only where it does not. NEVER `exec $SHELL`: measured the same day,
-/// a re-exec'd shell inside an aterm tab loses the tab's shell integration (the zsh
-/// wrapper consumes `ATERM_ORIGINAL_ZDOTDIR`; bash rides `--rcfile`), while the source
-/// heals `PATH` and keeps it. The cause is stated as what is KNOWN — this shell has not run
-/// the hook — not as a guess about when it was opened. NEVER RECORDED: `status.toml` and
-/// the Packages row keep the machine-wide managed row (`managed <version> — <Vendor>
-/// latest`) for such a program.
+/// file exists, the same sentence the window records (an `aterm ctl appstatus` entry since
+/// 2026-09-22), and a `PATH` line in the shell's dialect only where it does not. NEVER
+/// `exec $SHELL`: measured the same day, a re-exec'd shell inside an aterm tab loses the
+/// tab's shell integration (the zsh wrapper consumes `ATERM_ORIGINAL_ZDOTDIR`; bash rides
+/// `--rcfile`), while the source heals `PATH` and keeps it. The cause is stated as what
+/// is KNOWN — this shell has not run the hook — not as a guess about when it was opened.
+/// NEVER RECORDED: `status.toml` and the Packages row keep the machine-wide managed row
+/// (`managed <version> — <Vendor> latest`) for such a program.
 #[must_use]
 pub fn agent_shadowed_in_shell(
     build: u64,
@@ -431,7 +430,7 @@ pub fn flip_deferred(to: Option<u64>, current: Option<u64>, until: &str) -> Stri
     match to {
         Some(to) => {
             s.push_str("build ");
-            s.push_str(&crate::dec_u64(to));
+            s.push_str(&to.to_string());
             s.push_str(" is staged");
         }
         None => s.push_str("the update is staged"),
@@ -441,7 +440,7 @@ pub fn flip_deferred(to: Option<u64>, current: Option<u64>, until: &str) -> Stri
     s.push_str(" at the latest while an aterm window or terminal session is open");
     if let Some(current) = current {
         s.push_str("; staying on build ");
-        s.push_str(&crate::dec_u64(current));
+        s.push_str(&current.to_string());
     }
     s
 }
@@ -459,11 +458,11 @@ pub fn held_unpublished(owner: Option<&str>, build: u64, target: &str, current: 
         s.push_str("'s ");
     }
     s.push_str("pinned build ");
-    s.push_str(&crate::dec_u64(build));
+    s.push_str(&build.to_string());
     s.push_str(" is not published for ");
     s.push_str(target);
     s.push_str("; staying on build ");
-    s.push_str(&crate::dec_u64(current));
+    s.push_str(&current.to_string());
     s
 }
 
@@ -542,7 +541,7 @@ pub fn source_words(program: &str, state: &str, last_index_build: u64) -> String
     let mut s = String::from("ALab index");
     if index > 0 {
         s.push(' ');
-        s.push_str(&crate::dec_u64(index));
+        s.push_str(&index.to_string());
     }
     s
 }

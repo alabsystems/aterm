@@ -88,7 +88,7 @@
 //! `-magnification` answers on Magnify, `-rotation` on Rotate, and `-phase`
 //! on both (measured, same machine — `tools/nsevent-probe/matrix2.txt`).
 //!
-//! # The exit contract, which `aterm_verify::stages::objc_event_outcome` reads
+//! # The exit contract, which `aterm_verify::stages::OBJC_DRIVES` reads
 //!
 //! | code | meaning |
 //! |---|---|

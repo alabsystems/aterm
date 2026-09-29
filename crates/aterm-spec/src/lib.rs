@@ -54,6 +54,7 @@ pub use aterm_spec_macros::{refines, spec_invariant, spec_unmodeled, ty_model};
 pub use inventory;
 
 pub mod derive;
+pub mod harness_manifest;
 pub mod interp;
 pub mod ir;
 pub mod tla_check;

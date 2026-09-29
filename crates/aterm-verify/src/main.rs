@@ -150,6 +150,7 @@ fn main() {
         )
         .with_gui_smoke_skipped(parsed.skip_gui_smoke)
         .with_baseline(parsed.baseline)
+        .with_nearest_base(parsed.nearest_base)
         .with_notes(identity::own_output_note(&excluded))
         .in_snapshot_of(snap.caller.clone(), snap.tree.clone(), snap.notes.clone())
         // AFTER the snapshot is chosen, because the git stamp is resolved from the

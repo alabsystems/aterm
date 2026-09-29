@@ -1032,13 +1032,32 @@ pub(crate) fn attention_items(
     programs: &[PackagesProgramRow],
     declined: bool,
     pass_trouble: Option<&PassTrouble>,
+    cc_prereq: Option<&atpkg::prereq::CcVerdict>,
 ) -> Vec<String> {
     programs
         .iter()
         .filter(|_| !declined)
         .filter_map(|row| attention_item(&row.name, &row.state))
         .chain(pass_trouble.map(PassTrouble::item))
+        .chain(cc_prereq.map(cc_prereq_item))
         .collect()
+}
+
+/// The attention item for a C toolchain that blocks builds ([`PackagesStatusReport::
+/// cc_prereq`]): short enough for the headline. A MISSING toolchain carries the one act
+/// that installs it — the part a one-line headline must never lose to an ellipsis. A
+/// compiler that is there and REFUSES is named as one: its own stderr (an unaccepted
+/// Xcode license, a PATH-first `cc` with no SDK) is the cause and rides the detail, and
+/// on macOS the install act would only answer that the tools are installed
+/// ([`atpkg::prereq::CcVerdict::fix`]).
+pub(crate) fn cc_prereq_item(verdict: &atpkg::prereq::CcVerdict) -> String {
+    if matches!(verdict, atpkg::prereq::CcVerdict::Broken { .. }) {
+        "the C compiler cannot build a program".to_string()
+    } else if cfg!(target_os = "macos") {
+        format!("no C toolchain \u{2014} run {}", atpkg::prereq::act())
+    } else {
+        "no working C compiler".to_string()
+    }
 }
 
 /// The longest cause a headline item quotes, in characters.
@@ -1213,6 +1232,13 @@ pub(crate) struct PackagesStatusReport {
     /// `atpkg::config::ignored_prefix_note`'s words): while it stands, atpkg installs
     /// nothing unattended, and this page is where a person learns why.
     pub(crate) ignored_prefix: Option<String>,
+    /// The C toolchain's verdict when it BLOCKS builds — no compiler, or one that
+    /// cannot build a program — probed only over an installed, undeclined toolset, the
+    /// same gate as doctor's section. `None` when a compiler builds, or the probe could
+    /// not tell. It is an attention item ([`attention_items`]): the badge and the
+    /// headline name it ([`cc_prereq_item`]), and the detail carries `aterm pkg
+    /// doctor`'s whole sentence ([`atpkg::prereq::CcVerdict::line`]).
+    pub(crate) cc_prereq: Option<atpkg::prereq::CcVerdict>,
 }
 
 impl PackagesStatusReport {
@@ -1235,6 +1261,7 @@ impl PackagesStatusReport {
             declined: false,
             last_success_at: String::new(),
             ignored_prefix: None,
+            cc_prereq: None,
         }
     }
 
@@ -1331,6 +1358,7 @@ impl PackagesStatusReport {
             log_path: None,
             clock: LocalClock::UNKNOWN,
             ignored_prefix: None,
+            cc_prereq: None,
         }
     }
 
@@ -1394,9 +1422,11 @@ fn collection_error_summary(errors: Vec<String>, total: usize) -> Option<String>
 }
 
 /// Collect the packages report from the real machine — filesystem reads, no network, and
-/// one subprocess kind: `date`, for the local clock ([`LocalClock::read`]). MUST run off
-/// the event loop (worker threads only): it stats the co-located binary, parses
-/// `status.toml` and runs `date`.
+/// two subprocess kinds: `date`, for the local clock ([`LocalClock::read`]), and, over an
+/// installed toolset, the C toolchain probe ([`atpkg::prereq::probe`]: the compiler asked
+/// to build one small program, each step bounded, never Apple's install shim without a
+/// compiler behind it). MUST run off the event loop (worker threads only): it stats the
+/// co-located binary, parses `status.toml` and runs those.
 pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
     // The CONFIGURED prefix, not the default: this page is what every seed notice
     // points at, and reading the default store made a relocated lab store report
@@ -1411,6 +1441,8 @@ pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
         .ignored_prefix
         .as_deref()
         .map(atpkg::config::ignored_prefix_note);
+    // The C toolchain, over the login shell's PATH (what a build in a terminal sees).
+    report.cc_prereq = cc_prereq_note(&report, || atpkg::prereq::probe(Some(&login_path)));
     // The package log's tail (Phase 4) — atpkg's own file, beside `aterm.log` — and the
     // local clock every time on the page is shown in.
     report.log_path = atpkg::packages_log::log_path();
@@ -1420,6 +1452,28 @@ pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     report.clock = LocalClock::read(now);
     report
+}
+
+/// The C toolchain's verdict for the page ([`PackagesStatusReport::cc_prereq`]):
+/// `probe` runs only where there is a toolset it would stop building — an installed
+/// program, and nothing removed on purpose: doctor's own gate (section (11)) — and the
+/// verdict is said only when it is an ANSWER that blocks builds. An unknown (a wedged
+/// compiler, a temp root it could not use) stays doctor's warn and never reaches the
+/// badge.
+fn cc_prereq_note(
+    report: &PackagesStatusReport,
+    probe: impl FnOnce() -> atpkg::prereq::CcVerdict,
+) -> Option<atpkg::prereq::CcVerdict> {
+    let toolset_installed = !report.declined
+        && report
+            .programs
+            .iter()
+            .any(|row| row.installed_build.is_some());
+    if !toolset_installed {
+        return None;
+    }
+    let verdict = probe();
+    verdict.blocks_builds().then_some(verdict)
 }
 
 /// The page's report over `layout`, its SHADOWED rows computed for `path_var` — the login
@@ -2110,6 +2164,7 @@ impl PackagesState {
             &report.programs,
             report.declined,
             self.pass_trouble.as_ref(),
+            report.cc_prereq.as_ref(),
         );
         let attention_line = attention_headline(&attention);
         let unserved = !report.declined
@@ -2304,6 +2359,22 @@ impl PackagesState {
                     detail.push_str(note);
                 }
                 None => detail = Some(note.to_string()),
+            }
+        }
+        // A C toolchain that blocks builds: the attention item names it with its act, and
+        // the detail carries doctor's whole sentence (what is missing, and why it matters).
+        if self.observed
+            && let Some(line) = report
+                .cc_prereq
+                .as_ref()
+                .map(atpkg::prereq::CcVerdict::line)
+        {
+            match detail.as_mut() {
+                Some(detail) => {
+                    detail.push_str("  ·  ");
+                    detail.push_str(&line);
+                }
+                None => detail = Some(line),
             }
         }
         // A retired `auto_update = false` holding Automatic updates off does NOT ride this
@@ -2960,6 +3031,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         }
@@ -3615,6 +3687,116 @@ mod tests {
         assert!(shown.detail.as_deref().is_some_and(|d| d.contains(&note)));
     }
 
+    /// A C TOOLCHAIN THAT BLOCKS BUILDS IS NAMED ON THE PAGE (design
+    /// `DESIGN-clt-prerequisite-2026-08-31.md` §6): the badge counts it, the headline
+    /// names it with its one act, the detail carries doctor's whole sentence — and it is
+    /// no program row (the index names no such program). FAILED before 2026-09-27: the
+    /// report had no field for it, so a window-only user never saw doctor's line.
+    #[test]
+    fn a_missing_c_toolchain_is_the_badge_and_names_its_act() {
+        let mut service = PackagesService::new();
+        let healthy = report_with(&[("ay", atpkg::state::managed(1971, 44))]);
+        observe(&mut service, healthy.clone());
+        assert!(
+            projection(&service).attention.is_empty(),
+            "control: no badge"
+        );
+        let line = atpkg::prereq::CcVerdict::NoDriver.line();
+        let mut blocked = healthy;
+        blocked.cc_prereq = Some(atpkg::prereq::CcVerdict::NoDriver);
+        observe(&mut service, blocked);
+        let shown = projection(&service);
+        let item = cc_prereq_item(&atpkg::prereq::CcVerdict::NoDriver);
+        assert_eq!(shown.attention, vec![item.clone()], "one badge item");
+        assert!(
+            shown.headline.starts_with(ATTENTION_PREFIX) && shown.headline.contains(&item),
+            "{}",
+            shown.headline
+        );
+        assert_eq!(presented_result_of(&shown.headline), 0, "no command result");
+        if cfg!(target_os = "macos") {
+            assert!(
+                shown.headline.contains("xcode-select --install"),
+                "{}",
+                shown.headline
+            );
+        }
+        assert!(
+            shown.detail.as_deref().is_some_and(|d| d.contains(&line)),
+            "{:?}",
+            shown.detail
+        );
+        assert_eq!(shown.programs.len(), 1, "no synthetic program row");
+
+        // A program's own failure outranks it: the headline names the failure first.
+        let mut troubled = report_with(&[("ay", "error: verify failed".to_string())]);
+        troubled.cc_prereq = Some(atpkg::prereq::CcVerdict::NoDriver);
+        observe(&mut service, troubled);
+        let shown = projection(&service);
+        assert_eq!(shown.attention.len(), 2, "{:?}", shown.attention);
+        assert_eq!(shown.attention[1], item, "{:?}", shown.attention);
+    }
+
+    /// A COMPILER THAT IS THERE AND REFUSES IS NOT "NO C TOOLCHAIN". The headline names
+    /// what blocked builds: a missing toolchain with its install act, a refusing one as a
+    /// compiler that cannot build — its own stderr, in the detail, is the cause (an
+    /// unaccepted Xcode license, a PATH-first `cc` with no SDK), and on macOS `xcode-select
+    /// --install` only answers that the tools are installed. FAILED before 2026-09-28:
+    /// every blocking verdict read `no C toolchain — run xcode-select --install`.
+    #[test]
+    fn a_refusing_compiler_is_named_as_one_not_as_a_missing_toolchain() {
+        let mut service = PackagesService::new();
+        let broken = atpkg::prereq::CcVerdict::Broken {
+            driver: std::path::PathBuf::from("/Library/Developer/CommandLineTools/usr/bin/cc"),
+            why: "Agreeing to the Xcode/iOS license requires admin privileges".into(),
+        };
+        let mut blocked = report_with(&[("ay", atpkg::state::managed(1971, 44))]);
+        blocked.cc_prereq = Some(broken);
+        observe(&mut service, blocked);
+        let shown = projection(&service);
+        assert_eq!(shown.attention.len(), 1, "{:?}", shown.attention);
+        let item = &shown.attention[0];
+        assert!(!item.contains("no C toolchain"), "{item}");
+        assert!(!item.contains("xcode-select"), "{item}");
+        assert!(item.contains("cannot build a program"), "{item}");
+        assert!(
+            shown
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("license requires admin privileges")),
+            "the cause rides the detail: {:?}",
+            shown.detail
+        );
+    }
+
+    /// The page probes where doctor does and says only an answer that blocks builds
+    /// (ported from the platform lane's twin, 2026-09-27): a blocking verdict is
+    /// doctor's own sentence ending in the act; an unknown and a ready compiler say
+    /// nothing; no installed program, or a toolset removed on purpose, never probes.
+    #[test]
+    fn the_c_toolchain_is_probed_where_doctor_probes_and_said_only_when_it_blocks() {
+        let installed = report_with(&[("ay", atpkg::state::managed(1971, 44))]);
+        let note = cc_prereq_note(&installed, || atpkg::prereq::CcVerdict::NoDriver)
+            .expect("an installed toolset with no C compiler is named");
+        assert_eq!(note, atpkg::prereq::CcVerdict::NoDriver);
+        let cc = std::path::PathBuf::from("/usr/bin/cc");
+        let wedged = atpkg::prereq::CcVerdict::Unanswered { driver: cc.clone() };
+        assert_eq!(cc_prereq_note(&installed, || wedged), None, "an unknown");
+        let ready = atpkg::prereq::CcVerdict::Ready { driver: cc };
+        assert_eq!(cc_prereq_note(&installed, || ready), None, "a compiler");
+        let nothing = report_with(&[]);
+        assert_eq!(
+            cc_prereq_note(&nothing, || panic!("probed with nothing installed")),
+            None
+        );
+        let mut declined = installed;
+        declined.declined = true;
+        assert_eq!(
+            cc_prereq_note(&declined, || panic!("probed a declined toolset")),
+            None
+        );
+    }
+
     /// A PASS TROUBLE WITH NO ROW OF ITS OWN — a refusal at atpkg's dispatch edge
     /// (`prefix is not writable`), a child that died after announcing — is the
     /// badge too: its cause leads the detail, the headline names it, and a later
@@ -3830,7 +4012,13 @@ mod tests {
             noted_unix: 0,
         };
         assert_eq!(
-            attention_headline(&attention_items(&many.programs, false, Some(&trouble))).as_deref(),
+            attention_headline(&attention_items(
+                &many.programs,
+                false,
+                Some(&trouble),
+                None
+            ))
+            .as_deref(),
             Some("Needs attention: a failed \u{b7} b failed \u{b7} c failed \u{b7} and 2 more")
         );
         assert_eq!(attention_headline(&[]), None);
@@ -3923,6 +4111,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 0,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };

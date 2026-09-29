@@ -10,7 +10,7 @@
 // span inside the expansion — where no `#[allow]` a caller writes can reach.
 // The macro now emits the allow itself, alongside the `non_snake_case` and
 // `dead_code` it already emitted. The absence of the attribute here IS F9's
-// arming: put the ten-colon method back under a bare `cargo clippy` and the
+// arming: put the ten-colon method back under a bare `targo tippy` and the
 // lint fires again if the macro stops emitting it.
 
 use std::ffi::{CStr, c_char, c_void};

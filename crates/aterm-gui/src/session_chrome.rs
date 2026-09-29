@@ -538,14 +538,16 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
 }
 
 /// Whether a timeline event earns a row in the tab's hover chrome. An agent's
-/// verdict moves, a person's own typing and the bus's own traffic (a fetch, a
-/// topic, a read receipt, a delivery receipt) say nothing without their
-/// payload, which this surface never shows (the `timeline` verb does), and on
-/// an agent's or a fabric session's tab they would fill the tail.
+/// verdict moves, a person's own typing, the bus's own traffic (a fetch, a
+/// topic, a read receipt, a delivery receipt) and the resize ledger's
+/// `render` verdict (a desync risk and its heal are one kind, told apart only
+/// by the payload) say nothing without their payload, which this surface
+/// never shows (the `timeline` verb does), and on an agent's or a fabric
+/// session's tab they would fill the tail.
 pub(crate) fn timeline_row_shown(kind: &str) -> bool {
     !matches!(
         kind,
-        "agent-change" | "human" | "fetch" | "topic" | "inbox-seen" | "post-landed"
+        "agent-change" | "human" | "fetch" | "topic" | "inbox-seen" | "post-landed" | "render"
     )
 }
 
@@ -573,6 +575,7 @@ pub(crate) fn timeline_tail(
 fn event_words(kind: &str) -> &str {
     match kind {
         "spawned" => "started",
+        "handoff" => "carried across an update",
         "cwd-change" => "changed directory",
         "meta-change" => "details changed",
         "title-change" => "renamed",
@@ -1104,8 +1107,9 @@ mod tests {
         assert_eq!(headers, TIMELINE_TAIL);
     }
 
-    /// An agent's verdict moves, a person's own typing and the bus's own
-    /// traffic are no rows: without their payload they say nothing. The cut
+    /// An agent's verdict moves, a person's own typing, the bus's own traffic
+    /// and a render verdict are no rows: without their payload they say
+    /// nothing. The cut
     /// runs BEFORE the cap ([`timeline_tail`]), so a burst of them never
     /// hides the older rows that say something.
     #[test]
@@ -1117,6 +1121,7 @@ mod tests {
             ("topic", 90),
             ("inbox-seen", 90),
             ("post-landed", 90),
+            ("render", 90),
             ("agent-change", 90),
             ("inbox", 90),
             ("cwd-change", 90),

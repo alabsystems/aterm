@@ -436,6 +436,29 @@ pub(crate) mod consts {
     /// titlebar's colours, not a failure). The instrument earned its place on
     /// its first row.
     pub(crate) const NS_COLOR_RENDERING_INTENT_PERCEPTUAL: isize = 3;
+
+    // ---- the App Nap opt-out's activity options (2026-09-28) ----
+
+    /// `NSProcessInfo.h:384` (Foundation, MacOSX27.0.sdk) —
+    /// `NSActivityUserInitiatedAllowingIdleSystemSleep = (NSActivityUserInitiated
+    /// & ~NSActivityIdleSystemSleepDisabled)`, over `NSProcessInfo.h:382`,
+    /// `NSActivityUserInitiated = (0x00FFFFFFULL | NSActivityIdleSystemSleepDisabled)`,
+    /// and `NSProcessInfo.h:353`, `NSActivityIdleSystemSleepDisabled = (1ULL << 20)`.
+    ///
+    /// REASONED FROM THOSE NAMES, then folded: bit 20 (`0x0010_0000`) already
+    /// lies inside `0x00FF_FFFF`, so `NSActivityUserInitiated` is `0x00FF_FFFF`
+    /// itself, and clearing bit 20 leaves `0x00EF_FFFF`. That is every
+    /// user-initiated flag, the set that keeps App Nap off, minus the one that
+    /// would stop the Mac idle-sleeping.
+    ///
+    /// `crates/aterm-objc/tests/gui_appkit_constants.rs` holds this value to
+    /// the SDK's on both arches, reading the literal as C — which is why it is
+    /// spelled folded and never as a Rust `!` expression: in C, `!` is LOGICAL
+    /// not. `NSActivityOptions` is `uint64_t`; it is passed as `NSUInteger`
+    /// because that is the width `send_id_usize_id` takes, and both are 64-bit
+    /// unsigned on every Apple target this compiles for (the
+    /// `NS_EVENT_MASK_KEY_DOWN` precedent above).
+    pub(crate) const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: usize = 0x00EF_FFFF;
 }
 
 // The two `NSAppearanceName` constants — the EXCEPTION the [`consts`] note

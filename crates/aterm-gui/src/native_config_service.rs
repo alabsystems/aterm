@@ -836,7 +836,25 @@ fn read_config_file(
     allow_missing: bool,
 ) -> Result<crate::native_document_host::AtomicFileContents, String> {
     crate::native_document_host::read_config_atomic_file(path, MAX_CONFIG_FILE_BYTES, allow_missing)
-        .map_err(|error| format!("{} unreadable ({error})", path.display()))
+        .map_err(|error| config_read_error(path, error))
+}
+
+/// Why `aterm.toml` at `path` could not be read, naming the file once: the
+/// host's own sentence without its internal stage tag (most already name the
+/// file, "could not open <path>: Permission denied"). Every reader of the
+/// config file (the service's observation, a Settings save) says it this way.
+pub(crate) fn config_read_error(
+    path: &Path,
+    error: crate::native_document_host::DocumentHostError,
+) -> String {
+    use crate::native_document_host::DocumentHostError;
+    match error {
+        DocumentHostError::Io { message, .. } if message.contains(&*path.to_string_lossy()) => {
+            message
+        }
+        DocumentHostError::Io { message, .. } => format!("{}: {message}", path.display()),
+        other => format!("{}: {other}", path.display()),
+    }
 }
 
 fn decode_config_bytes(bytes: &[u8], path: &Path) -> Result<String, String> {
@@ -1198,6 +1216,32 @@ mod tests {
         let not_file = VersionedConfigService::observe_path(&dir, false).unwrap_err();
         assert!(not_file.contains("not a regular file"), "{not_file}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A config the OS will not open says so once: the file, the OS error, no
+    /// internal stage tag and no second "unreadable" wrapped around the first.
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_config_names_the_file_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_config_dir("unopenable");
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "font_px = 14.0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = VersionedConfigService::observe_path(&path, false);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // A process the permission bits do not stop (root) has nothing to say.
+        let Err(error) = result else {
+            return;
+        };
+        let shown = path.display().to_string();
+        assert_eq!(error.matches(&shown).count(), 1, "{error}");
+        assert!(error.starts_with("could not open "), "{error}");
+        assert!(
+            !error.contains("Preflight") && !error.contains("unreadable"),
+            "{error}"
+        );
     }
 
     #[test]

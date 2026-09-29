@@ -45,7 +45,7 @@ fn owner_env() -> ApprovalEnv {
 const SCRATCH_RM: &str = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
 
 fn ledger_file(tag: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("aterm-ledger-{tag}-{}", std::process::id()));
+    let dir = crate::supervise::test_scratch_path("ledger", tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("tmp dir");
     let path = dir.join("s-1.jsonl");
@@ -58,6 +58,28 @@ fn ledger_rows(path: &Path) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+/// ONE HOSTED LOOP'S LEDGER IS NEVER ANOTHER'S (measured 2026-09-28: every
+/// test behind [`hosted_with_host`] asked `ledger_file("idle-host")`, and on
+/// parallel threads one's set-up deleted another's ledger mid-run, or failed
+/// `create_dir_all` with `AlreadyExists`). The interleaving forced: the
+/// second caller of the same tag sets up while the first holds a row, then
+/// the first cleans up while the second runs.
+#[test]
+fn a_second_caller_of_one_ledger_tag_leaves_the_first_ones_rows() {
+    let (first_dir, first) = ledger_file("idle-host");
+    std::fs::write(&first, "{\"decision\":\"approved\"}\n").expect("write");
+    let (second_dir, _second) = ledger_file("idle-host");
+    assert_eq!(
+        ledger_rows(&first),
+        vec!["{\"decision\":\"approved\"}".to_string()],
+        "the second set-up kept the first ledger's row"
+    );
+    assert_ne!(first_dir, second_dir);
+    let _ = std::fs::remove_dir_all(&first_dir);
+    assert!(second_dir.is_dir(), "the first clean-up kept the second's");
+    let _ = std::fs::remove_dir_all(&second_dir);
 }
 
 /// THE SWAP (audit APR-6): the box judged read-only is replaced by another
@@ -291,7 +313,16 @@ fn a_read_box_under_a_ticking_screen_is_approved_within_one_wake() {
             "help key",
         ]
     );
-    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    // "Within one wake" is the trace above, exactly: three `await gone` reads
+    // and no idle step before the press. The clock cannot say it — this mock
+    // caps every wait it is asked for at 50 ms, so the idle steps that cost
+    // 12-18 s a box live would add milliseconds here. What is left for the
+    // clock is a stall no capped wait explains, so it is a minute, a hang
+    // detector: a stall under it that asks the screen nothing (a local sleep)
+    // leaves no mark in the trace and is not caught. (It was 1 s around a watch
+    // measured at 86-92 ms on a box at load 40: a margin the gate's parallel
+    // load can eat on a correct tree.)
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
 
     let mut m = Mock::new(false, vec![busy_screen(), bash_one_row()]);
     m.idle_never = true;
@@ -481,7 +512,7 @@ fn turn_of_rows(rows: &[String]) -> Turn {
 /// THE RM BREAKER in the loop (owner decision 1): in a bypass session (its
 /// footer read before the box) with the session's cwd known (`meta`), a
 /// breaker whose every operand resolves under a scratch root is pressed under
-/// its command row and ledgered `rm-breaker@v2`; `S=/usr` escalates, badged
+/// its command row and ledgered `rm-breaker@v3`; `S=/usr` escalates, badged
 /// `claude rm-breaker: <command> (<reason>)`. Negative controls: the same
 /// scratch command escalates with the cwd unknown, and outside bypass.
 #[test]
@@ -506,7 +537,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"rm-breaker@v2\""),
+        rows[0].contains("\"rule_id\":\"rm-breaker@v3\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -554,6 +585,61 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
             .expect("escalated");
         assert!(set.contains(why), "{why}: {set}");
     }
+}
+
+/// A variable from the environment in the loop (the coordinator's ruling of
+/// 2026-09-26): the safe rules escalate `rm -rf "$SCRATCH/t5"`, which the
+/// line does not assign, naming why — whatever this process's environment
+/// holds; the owner's default presses it at full power, ledgered as the
+/// one-shot allow with that reason as `unproven`.
+#[test]
+fn a_breaker_on_an_environment_variable_is_escalated_proven_and_pressed_by_default() {
+    const ENV_RM: &str = "rm -rf \"$SCRATCH/t5\"";
+    let screens = || vec![bypass_busy(), rm_box(ENV_RM), rm_box(ENV_RM), busy_screen()];
+    let mut m = Mock::new(true, screens());
+    m.cwd = Some("/Users/_owner/proj".to_string());
+    m.vanish_after = Some(0);
+    let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+        s.set_approval_env(owner_env());
+    });
+    assert!(lines[0].starts_with("EVENT prompt "), "{lines:?}");
+    assert!(m.presses().is_empty(), "{:?}", m.requests);
+    let set = m
+        .requests
+        .iter()
+        .find_map(|r| r.strip_prefix("meta set attention owner=supervisor "))
+        .expect("escalated");
+    assert!(
+        set.contains("$SCRATCH is not assigned on this line"),
+        "{set}"
+    );
+
+    let (ldir, ledger) = ledger_file("env-all");
+    let mut m = Mock::new(true, screens());
+    m.cwd = Some("/Users/_owner/proj".to_string());
+    m.vanish_after = Some(0);
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..full_power_opts(None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    assert!(
+        lines[0].starts_with(&format!("APPROVED seq=102 {ENV_RM}")),
+        "{lines:?}"
+    );
+    let rows = ledger_rows(&ledger);
+    assert!(
+        rows[0].contains("\"rule_id\":\"allow-once@v1\""),
+        "{rows:?}"
+    );
+    assert!(
+        rows[0].contains("a value from the environment is not proven"),
+        "{rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ldir);
 }
 
 /// An idle bypass session as Claude Code draws it: a reply, the composer,
@@ -863,7 +949,7 @@ impl Drop for StandIn {
 
 /// A scratch directory for a loop test, canonical, removed by the caller.
 fn loop_scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("aterm-loop-{tag}-{}", std::process::id()));
+    let dir = crate::supervise::test_scratch_path("loop", tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
     std::fs::canonicalize(&dir).expect("canonical")
@@ -881,9 +967,39 @@ fn loop_git(dir: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}");
 }
 
+/// A shell snapshot as Claude Code 2.1.284 writes it for a zsh whose
+/// startup sets `options` (`setopt …` rows) beyond a login shell's defaults.
+fn zsh_snapshot(options: &str) -> String {
+    format!(
+        "# Snapshot file\nunalias -a 2>/dev/null || true\n# Functions\n# Shell Options\n\
+         setopt nohashdirs\nsetopt login\n{options}# Aliases\nalias -- run-help=man\n\
+         # Check for rg availability\nexport PATH='/usr/bin:/bin'\n"
+    )
+}
+
+/// Put one shell snapshot of a zsh started with `options` in the Claude
+/// Code directory `claude`.
+fn write_snapshot(claude: &Path, options: &str) {
+    let dir = claude.join("shell-snapshots");
+    std::fs::create_dir_all(&dir).expect("shell-snapshots");
+    std::fs::write(
+        dir.join("snapshot-zsh-1790000000000-a1b2c3.sh"),
+        zsh_snapshot(options),
+    )
+    .expect("snapshot");
+}
+
 /// A worker's hermetic environment in the session `sid`: this process's
-/// `PATH`, no system or global git config.
+/// `PATH`, no system or global git config, and a `$HOME` whose Claude Code
+/// directory holds a snapshot of a zsh started with the defaults (one
+/// scratch home for the test process, never the developer's).
 fn worker_vars(sid: &str) -> Vec<(String, String)> {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| {
+        let home = crate::supervise::test_scratch_path("loop", "worker-home");
+        write_snapshot(&home.join(".claude"), "");
+        home
+    });
     vec![
         (
             "PATH".to_string(),
@@ -892,6 +1008,7 @@ fn worker_vars(sid: &str) -> Vec<(String, String)> {
         ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
         ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
         ("ATERM_PARENT_SESSION_ID".to_string(), sid.to_string()),
+        ("HOME".to_string(), home.display().to_string()),
     ]
 }
 
@@ -1001,6 +1118,7 @@ fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
     let claude = root.join("identity-claude");
     let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 2);
     let register = |pid: u32| {
+        write_snapshot(&claude, "");
         std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
         std::fs::write(
             claude.join("sessions").join(format!("{pid}.json")),
@@ -1026,6 +1144,8 @@ fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
     };
 
     let mut plain = worker_vars(&sid);
+    plain.retain(|(k, _)| k != "HOME");
+    write_snapshot(&home.join(".claude"), "");
     plain.push(("HOME".to_string(), home.display().to_string()));
     let worker = StandIn::spawn(&plain);
     register(worker.pid());
@@ -1054,6 +1174,54 @@ fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
     );
     drop(worker);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// THE WORKER'S SHELL STARTUP (audit §5's residual, Claude Code 2.1.284): a
+/// Bash box is judged under the options the worker's Bash tool's shell
+/// starts with — read from the shell snapshot in the worker's own Claude
+/// Code directory — and an option the read-only classifier does not model
+/// (`setopt globsubst`) escalates the read, naming it. NEGATIVE CONTROL: the
+/// same worker with a default snapshot is pressed (the first loop above);
+/// with no snapshot at all the startup is unknown, and escalated.
+#[test]
+fn a_bash_box_is_judged_under_the_workers_shell_startup() {
+    let repo = loop_scratch("worker-shell");
+    loop_git(&repo, &["init", "-q", "."]);
+    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 5);
+    let home = loop_scratch("worker-shell-home");
+    let mut vars = worker_vars(&sid);
+    vars.retain(|(k, _)| k != "HOME");
+    vars.push(("HOME".to_string(), home.display().to_string()));
+
+    let worker = StandIn::spawn(&vars);
+    let (presses, rows) = judge_git_box_with(&worker, &sid, &repo);
+    assert_eq!(presses, 0, "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("no shell snapshot of zsh")),
+        "no snapshot: unknown: {rows:?}"
+    );
+    drop(worker);
+
+    write_snapshot(&home.join(".claude"), "setopt globsubst\n");
+    let worker = StandIn::spawn(&vars);
+    let (presses, rows) = judge_git_box_with(&worker, &sid, &repo);
+    assert_eq!(presses, 0, "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("`setopt globsubst`")),
+        "escalated naming the option: {rows:?}"
+    );
+    drop(worker);
+
+    write_snapshot(&home.join(".claude"), "setopt autocd\n");
+    let worker = StandIn::spawn(&vars);
+    assert_eq!(
+        judge_git_box_with(&worker, &sid, &repo).0,
+        1,
+        "an inert option: pressed"
+    );
+    drop(worker);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// Which `who` row is the session's, and the process group it names: by the
@@ -1529,8 +1697,13 @@ fn a_stop_in_a_turns_wait_ends_the_turn_spent_before_its_next_wait() {
         let mut s = session(&mut side, None);
         s.stop = Some(stop);
         let mut moved = false;
-        let turn = match s.await_turn_from(Duration::from_secs(3600), true, &mut moved, &mut Alone)
-        {
+        let turn = match s.await_turn_from(
+            Duration::from_secs(3600),
+            true,
+            &mut moved,
+            None,
+            &mut Alone,
+        ) {
             Ok(turn) => turn,
             Err(e) => panic!("{tag}: the turn ended as {:?}", String::from(e)),
         };
@@ -1682,6 +1855,186 @@ fn a_focus_move_the_dialog_dropped_is_made_again_from_a_fresh_read() {
     assert!(presses[0].ends_with(" down") && presses[1].ends_with(" down"));
     assert!(presses[2].ends_with(" enter"), "{presses:?}");
     assert_eq!(m.attention, None);
+}
+
+/// The usage-limit dialog (aterm-phase's hand-built fixture of the owner's
+/// screen, 2026-09-24) with its three rows, the `›` cursor on option `focus`.
+fn limit_dialog(labels: &[&str], focus: usize) -> Vec<String> {
+    aterm_phase::prompt::fixtures::limit_options_dialog(labels, focus)
+}
+
+const LIMIT_STOP: &str = "Stop and wait for limit to reset";
+const LIMIT_WAIT: &str = "Wait here, then continue automatically at Sep 27 at 7pm";
+const LIMIT_CREDITS: &str = "Switch to usage credits";
+
+/// THE USAGE-LIMIT DIALOG in the loop (the owner, 2026-09-24: "YOU SHOULD
+/// NOT DEPEND ON THE USER TO CHOOSE"): under the window's own defaults the
+/// focus is moved from `Stop and wait …` onto `Wait here, then continue
+/// automatically …` with a fenced `down` guarded on the dialog's title, a
+/// fresh read confirms it landed, and Enter goes fenced on THAT read,
+/// guarded on the focused wait row — never a digit, never Esc; ONE Enter
+/// for the one dialog, which then leaves; the act is an approval line and a
+/// ledger row under `limit-wait@v1`, and no badge is raised.
+#[test]
+fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
+    let (dir, ledger) = ledger_file("limit-wait");
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
+    };
+    let first =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LIMIT_OPTIONS_DIALOG);
+    let mut m = fenced(vec![
+        first,
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 1),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(0);
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    assert_eq!(
+        lines[0],
+        format!("APPROVED seq=102 {LIMIT_WAIT}"),
+        "{lines:?}"
+    );
+    let title = crate::supervise::policy::row_guard(" What do you want to do?");
+    let wait = crate::supervise::policy::row_guard(&format!(" › 2. {LIMIT_WAIT}"));
+    assert_eq!(
+        m.presses(),
+        [
+            format!("key if-gen=1.101 if={title} down").as_str(),
+            format!("key if-gen=1.102 if={wait} enter").as_str(),
+        ],
+        "{:?}",
+        m.requests
+    );
+    assert_eq!(m.attention, None, "nothing asked of the owner");
+    let rows = ledger_rows(&ledger);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("limit-wait@v1") && r.contains("approved")),
+        "{rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The wait row FIRST, the focus already on it: no move, Enter alone.
+    let mut m = fenced(vec![
+        limit_dialog(&[LIMIT_WAIT, LIMIT_STOP, LIMIT_CREDITS], 0),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(0);
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_approval_env(owner_env()));
+    assert_eq!(
+        lines[0],
+        format!("APPROVED seq=101 {LIMIT_WAIT}"),
+        "{lines:?}"
+    );
+    let presses = m.presses();
+    assert_eq!(presses.len(), 1, "{:?}", m.requests);
+    assert!(presses[0].ends_with(" enter"), "{presses:?}");
+
+    // The dialog stays after the Enter: at full power a box that comes back
+    // is answered again — but only ever by the wait row, each Enter fenced on
+    // a fresh read and guarded on the focused wait row itself; never a digit,
+    // never another row.
+    let mut m = fenced(vec![
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 0),
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 1),
+    ]);
+    m.vanish_after = Some(2);
+    watch_lines_with(&mut m, &opts, |s| s.set_approval_env(owner_env()));
+    let presses = m.presses();
+    assert!(
+        presses.iter().any(|p| p.ends_with(" enter")),
+        "{:?}",
+        m.requests
+    );
+    for p in &presses {
+        assert!(
+            p.ends_with(&format!("if={title} down")) || p.ends_with(&format!("if={wait} enter")),
+            "a press that is not the wait row's: {p} ({:?})",
+            m.requests
+        );
+    }
+}
+
+/// No `approve` level limits the usage-limit wait (it is `limit_wait`'s
+/// alone): under `[harness] approve = "none"`, which hands every other box to
+/// the owner unread, the owner's dialog still gets its wait row — the same
+/// fenced `down` and confirmed Enter, ledgered `limit-wait@v1`, no badge.
+#[test]
+fn the_limit_wait_is_chosen_under_approve_none_too() {
+    let mut cfg = crate::supervise::SupervisorConfig::default();
+    cfg.set("approve", "none").expect("a level");
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&cfg)
+    };
+    let mut m = fenced(vec![
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LIMIT_OPTIONS_DIALOG),
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_CREDITS], 1),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(0);
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_approval_env(owner_env()));
+    assert_eq!(
+        lines[0],
+        format!("APPROVED seq=102 {LIMIT_WAIT}"),
+        "{lines:?}"
+    );
+    let presses = m.presses();
+    assert_eq!(presses.len(), 2, "{:?}", m.requests);
+    assert!(presses[0].ends_with(" down") && presses[1].ends_with(" enter"));
+    assert_eq!(m.attention, None, "nothing asked of the owner");
+}
+
+/// Every usage-limit dialog the rule does not answer is escalated as it was
+/// before — with its own kind now, not `other` — and nothing is pressed: no
+/// wait row, the armed wait's `Don’t continue automatically` in its place,
+/// and `[harness] limit_wait = false` over the owner's very dialog.
+#[test]
+fn a_limit_options_dialog_without_a_wait_row_goes_to_the_owner() {
+    let defaults = crate::supervise::SupervisorConfig::default();
+    let mut off = defaults.clone();
+    off.set("limit_wait", "false").expect("a switch");
+    for (cfg, screen, why) in [
+        (
+            &defaults,
+            limit_dialog(&[LIMIT_STOP, LIMIT_CREDITS], 0),
+            "with no `Wait here",
+        ),
+        (
+            &defaults,
+            limit_dialog(
+                &[LIMIT_STOP, "Don’t continue automatically", LIMIT_CREDITS],
+                0,
+            ),
+            "with no `Wait here",
+        ),
+        (
+            &off,
+            aterm_phase::prompt::fixtures::screen(
+                aterm_phase::prompt::fixtures::LIMIT_OPTIONS_DIALOG,
+            ),
+            "limit_wait is off",
+        ),
+    ] {
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            ..SuperviseOpts::hosted_with(cfg)
+        };
+        let mut m = fenced(vec![screen]);
+        m.vanish_after = Some(0);
+        watch_lines_with(&mut m, &opts, |s| s.set_approval_env(owner_env()));
+        assert!(m.presses().is_empty(), "{why}: {:?}", m.requests);
+        let badge = m.attention.clone().unwrap_or_default();
+        assert!(
+            badge.starts_with("claude usage-limit: ") && badge.contains(why),
+            "{why}: {badge:?}"
+        );
+    }
 }
 
 /// THE HOST'S `[harness] trust_roots` reach the decision under the safe
@@ -3198,6 +3551,11 @@ struct TestHost {
     taskless: AtomicBool,
     /// Its step lets the turn ends go: `owns` cleared by `at_idle`.
     lets_go: AtomicBool,
+    /// Its step is a person's hold at the point (`wait:attended`), owning the
+    /// turn ends.
+    holds: AtomicBool,
+    /// Each hold after the first is said as a repeat ([`HostStep::repeat`]).
+    marks: AtomicBool,
     /// The turns the loop said ran ([`IdleHost::turn_ran`]).
     turns_ran: std::sync::atomic::AtomicUsize,
     /// Its step TYPES into the agent and owns nothing after it — a
@@ -3214,11 +3572,26 @@ struct TestHost {
     /// How many times the loop asked whether the host owns a turn end — the
     /// host-side evidence that the loop reached one ([`Stop::Reached`]).
     turn_ends: std::sync::atomic::AtomicUsize,
+    /// The guards the loop said withheld a point ([`IdleHost::withheld`]),
+    /// in order.
+    withheld: std::sync::Mutex<Vec<Guard>>,
+    /// How many of the loop's first asks whether the host wants a point it
+    /// answers `false` to, whatever [`Self::wants`] says: a host that asks for
+    /// no point until the loop has acted at the first one.
+    deaf_for: std::sync::atomic::AtomicUsize,
+    /// How many times the loop asked ([`IdleHost::wants`]).
+    asked: std::sync::atomic::AtomicUsize,
+    /// Its first step RELAUNCHES the agent (`upgrade step=adopted`: moved,
+    /// nothing typed) and asks for the next idle point, where its second types
+    /// the relaunched agent's carry-on (`carry-on step=continued`) — the live
+    /// upgrade's restart as the window's host takes it.
+    adopts: AtomicBool,
 }
 
 impl IdleHost for TestHost {
     fn wants(&self) -> bool {
-        self.wants.load(Ordering::SeqCst)
+        let n = self.asked.fetch_add(1, Ordering::SeqCst);
+        n >= self.deaf_for.load(Ordering::SeqCst) && self.wants.load(Ordering::SeqCst)
     }
     fn at_idle(&self) -> Option<HostStep> {
         let again = self.again.load(Ordering::SeqCst) > 0;
@@ -3232,8 +3605,22 @@ impl IdleHost for TestHost {
                 line: line.to_string(),
                 moved,
                 typed: moved && !line.contains("done:fresh"),
+                repeat: false,
             })
         };
+        if self.adopts.load(Ordering::SeqCst) {
+            self.owns.store(false, Ordering::SeqCst);
+            if self.steps.load(Ordering::SeqCst) == 1 {
+                self.wants.store(true, Ordering::SeqCst);
+                return Some(HostStep {
+                    line: "upgrade step=adopted".to_string(),
+                    moved: true,
+                    typed: false,
+                    repeat: false,
+                });
+            }
+            return step("carry-on step=continued", true);
+        }
         if self.ends.load(Ordering::SeqCst) {
             self.owns.store(false, Ordering::SeqCst);
             return step("upgrade step=done:fresh", true);
@@ -3245,6 +3632,15 @@ impl IdleHost for TestHost {
         if self.lets_go.load(Ordering::SeqCst) {
             self.owns.store(false, Ordering::SeqCst);
             return step("upgrade step=wait:settling", false);
+        }
+        if self.holds.load(Ordering::SeqCst) {
+            self.owns.store(true, Ordering::SeqCst);
+            return Some(HostStep {
+                line: "upgrade step=wait:attended".to_string(),
+                moved: false,
+                typed: false,
+                repeat: self.marks.load(Ordering::SeqCst) && self.steps.load(Ordering::SeqCst) > 1,
+            });
         }
         step("upgrade step=announced:1", true)
     }
@@ -3277,6 +3673,9 @@ impl IdleHost for TestHost {
     }
     fn limited(&self, open: bool) {
         self.limits.lock().unwrap().push(open);
+    }
+    fn withheld(&self, guard: Guard) {
+        self.withheld.lock().unwrap().push(guard);
     }
 }
 
@@ -3449,6 +3848,215 @@ fn a_break_of_the_agents_background_work_is_offered_to_the_host_once_it_stood() 
         "not stood its settle"
     );
     assert_eq!(run(bg(), Duration::ZERO, false).0, 0, "no point asked for");
+}
+
+/// T1-b, THE LOOP SAYS WHICH GUARD WITHHELD A POINT (design record
+/// 2026-09-28, "No upgrade stuck forever", §3.2 C5): the real loop, over
+/// scripted screens, tells a host that asked for a point which of its guards
+/// kept it from one ([`IdleHost::withheld`]) — ONCE while the guard stands,
+/// however many reads it stands through — and the hooks fire exactly at a
+/// settled break and at an idle point. Tab #1's posture of 2026-09-27: the
+/// weekly limit's notice on screen at a break of the agent's own work is a
+/// WALL, and no break is offered there. NEGATIVE CONTROLS: the same break
+/// without the notice IS offered (the wall alone withheld it); a host that
+/// asks for no point is told nothing.
+#[test]
+fn the_loop_says_which_guard_withheld_the_point_the_host_asked_for() {
+    let bg = |wall: bool| {
+        let mut r = rows(&["⏺ Waiting for the build."]);
+        if wall {
+            r.push(WEEKLY.to_string());
+        }
+        r.extend(rows(&[
+            "",
+            "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
+            "",
+        ]));
+        r.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+        r
+    };
+    let run = |screens: Vec<Vec<String>>, settle: Duration, wants: bool| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(wants, Ordering::SeqCst);
+        let mut m = Mock::new(true, screens);
+        m.vanish_after = Some(3);
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..auto(30, None)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| s.set_background_settle(settle));
+        let withheld = host.withheld.lock().unwrap().clone();
+        (
+            withheld,
+            host.backgrounds.load(Ordering::SeqCst),
+            host.steps.load(Ordering::SeqCst),
+        )
+    };
+    use Guard::{NoBackgroundWait, NotIdle, Settle, Wall};
+    // Tab #1's posture: the weekly limit's notice at a break of its own work.
+    // Withheld as a wall, said once over every read, and no break offered.
+    assert_eq!(
+        run(vec![bg(true)], Duration::ZERO, true),
+        (vec![Wall], 0, 0)
+    );
+    // CONTROL: the same break with no notice is offered, and nothing withheld.
+    let (withheld, offered, _) = run(vec![bg(false)], Duration::ZERO, true);
+    assert!(
+        withheld.is_empty() && offered >= 1,
+        "{withheld:?} {offered}"
+    );
+    // A break that has not stood its settle.
+    assert_eq!(
+        run(vec![bg(false)], Duration::from_secs(3_600), true),
+        (vec![Settle], 0, 0)
+    );
+    // A running turn (a spinner): more than the agent's background work.
+    assert_eq!(
+        run(vec![busy_screen()], Duration::ZERO, true),
+        (vec![NoBackgroundWait], 0, 0)
+    );
+    // The turn ends at an idle point: the host's step, and no guard after.
+    assert_eq!(
+        run(vec![busy_screen(), idle_screen()], Duration::ZERO, true),
+        (vec![NoBackgroundWait], 0, 1)
+    );
+    // A box, and the weekly limit at a turn end: no idle point.
+    for screen in [bash_one_row(), weekly_limited()] {
+        assert_eq!(
+            run(vec![busy_screen(), screen], Duration::ZERO, true),
+            (vec![NoBackgroundWait, NotIdle], 0, 0)
+        );
+    }
+    // A host that asks for no point is told nothing.
+    assert_eq!(run(vec![bg(true)], Duration::ZERO, false), (vec![], 0, 0));
+}
+
+/// THE LOOP'S OWN ACT, ONCE THE AGENT HAS TAKEN IT, NEVER WITHHOLDS A BREAK
+/// (2026-09-28): behind the loop's own `keep going` every break of the agent's
+/// background work was withheld from the live upgrade until an idle point —
+/// the act's point judged — and an agent that orchestrates all day never
+/// reached one: s-d3346 had no look of the upgrade's from 14:52:45 (the owner's
+/// `--now` standing) and s-5c03a none from 18:21:04. The loop continues a turn
+/// that ended after real work (`CONTINUED … keep going`), the agent's live
+/// turn is read, and its break of background work stands: offered to the host
+/// (`HOST seq=<n> background …`). NEGATIVE CONTROL: the same act followed
+/// straight by a break — no live turn read, the act perhaps queued behind work
+/// the reader missed — is not offered: no line of the host's is stacked on a
+/// continuation the agent has not read.
+///
+/// **TIER-1 FOR `SupervisorBreakOffer`** (aterm-spec
+/// `supervisor_break_offer_model`): each script is a path of the model's
+/// (`LoopActs`, `LiveTurn` or not, `BreakSettles`), and the real loop offers
+/// the break exactly where the model's `Offer` is enabled at its end; each
+/// dial is caught against the real loop — 0.98's guard (`Judged`) withholds
+/// the taken act's break the real loop offers, a guard that asks nothing
+/// (`Blind`) offers the untaken act's break the real loop withholds.
+#[test]
+fn a_break_after_the_loops_own_taken_act_is_offered_to_the_host() {
+    let ended = || {
+        let mut r = rows(&[
+            "⏺ Fixed the parser; the suite is green.",
+            "",
+            "✻ Worked for 3m 2s · done 4:24 PM",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let bg = || {
+        let mut r = rows(&[
+            "⏺ Waiting for the build.",
+            "",
+            "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+        r
+    };
+    let run = |screens: Vec<Vec<String>>| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        // Deaf at the first point, where the loop's own act goes.
+        host.deaf_for.store(1, Ordering::SeqCst);
+        let (jdir, journal) = journal_file("taken-act-break");
+        let mut m = Mock::new(true, screens);
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(3);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(journal.clone()),
+            ..auto(30, None)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| s.set_background_settle(Duration::ZERO));
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("CONTINUED ") && l.contains("keep going")),
+            "the loop's own act: {lines:#?}"
+        );
+        let withheld = host.withheld.lock().unwrap().clone();
+        (host.backgrounds.load(Ordering::SeqCst), lines, withheld)
+    };
+    let model = aterm_spec::derive::supervisor_break_offer_model();
+    let judged = aterm_spec::interp::with_consts(&model, &[("Judged", 1)]);
+    let blind = aterm_spec::interp::with_consts(&model, &[("Blind", 1)]);
+    // (the screens after the loop's act, the model's path, why)
+    for (after, path, why) in [
+        (
+            vec![busy_screen(), bg()],
+            &["LoopActs", "LiveTurn", "BreakSettles"][..],
+            "taken: a live turn, then its break",
+        ),
+        (
+            vec![bg()],
+            &["LoopActs", "BreakSettles"][..],
+            "not taken: the break straight after the act",
+        ),
+    ] {
+        let mut screens = vec![busy_screen(), ended()];
+        screens.extend(after);
+        let (offered, lines, withheld) = run(screens);
+        let walk = |m: &aterm_spec::derive::Model| {
+            let mut st = m.init_state();
+            for action in path {
+                assert!(m.fire(action, &mut st), "{why}: {action} at {st:?}");
+            }
+            st
+        };
+        let st = walk(&model);
+        assert_eq!(
+            offered > 0,
+            model.action_enabled("Offer", &st),
+            "{why}: the real loop offered {offered} at {st:?}: {lines:#?}"
+        );
+        if offered > 0 {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("HOST seq=") && l.contains(" background ")),
+                "{why}: journaled: {lines:#?}"
+            );
+            // NEGATIVE CONTROL: 0.98's guard withholds it.
+            assert!(!judged.action_enabled("Offer", &walk(&judged)), "{why}");
+            assert!(
+                !withheld.contains(&Guard::ActUntaken),
+                "{why}: {withheld:?}"
+            );
+        } else {
+            // The host is told which guard withheld the break (C5).
+            assert!(withheld.contains(&Guard::ActUntaken), "{why}: {withheld:?}");
+            // NEGATIVE CONTROL: a guard that asks nothing stacks on it.
+            assert!(blind.action_enabled("Offer", &walk(&blind)), "{why}");
+        }
+    }
 }
 
 /// When [`hosted_with_host_ledger`] stops the loop it runs.
@@ -3949,6 +4557,147 @@ fn the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on() {
     assert_eq!(count(&m, "@s-1 turn"), 0, "{:?}", m.requests);
 }
 
+/// A RESUMED CODEX DAEMON CLIENT IS THE HOST'S IDLE POINT (lane A of
+/// `tools/test-codex-live-upgrade.sh`, the review of 2026-09-27): a
+/// daemon-mode Codex the upgrade relaunched redraws its conversation over a
+/// BARE composer — `›`, no placeholder — which no reader names Codex by its
+/// layout. A loop that had read no program yet (it had typed nothing:
+/// `continue = false`, the lab's) read the point generically, no evidence,
+/// and the host's step at it — the relaunch's carry-on — was never taken:
+/// the upgrade stood at `relaunched` for good (`upgrade=restarting/…/
+/// relaunched/13m` in the lab). The host's step now reads the program first,
+/// and the point is Codex's idle. NEGATIVE CONTROL: a program that is no
+/// agent (the shell) still gets no step there.
+#[test]
+fn a_resumed_codex_daemon_client_is_the_hosts_idle_point() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::screen;
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |program: &'static str, step: bool| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(true, vec![busy_screen(), screen(cx::RESUMED_DAEMON)]);
+        m.program = program;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let stop = if step {
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 1,
+                Duration::from_millis(100),
+            )
+        } else {
+            Stop::After(Duration::from_millis(400))
+        };
+        let (r, _) = hosted_with_host(&mut m, &full, &host, stop, None);
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            host.steps.load(Ordering::SeqCst),
+            usize::from(step),
+            "{program}: {:?}",
+            m.requests
+        );
+    };
+    run("codex", true);
+    run("zsh", false);
+}
+
+/// A RELAUNCHED CODEX 0.159.0 IS THE HOST'S NEXT IDLE POINT, WHERE ITS
+/// CARRY-ON IS TYPED (0.99.0's `--full`, 2026-09-29: every tab of
+/// `tools/test-codex-live-upgrade.sh` stood at `adopted`, its journal's last
+/// line `HOST seq=620 upgrade step=adopted`, no idle point after it). The
+/// host's step at the old Codex's idle point relaunches it — `adopted`,
+/// moved, nothing typed — and asks for the next point; the relaunched TUI
+/// redraws its conversation with each end row's clock after ` • `
+/// (`aterm_phase::codex::END_ROW_MARKS`), and the loop must read that screen
+/// as the ended turn it is, so the host's carry-on step is taken there,
+/// journaled after the adoption. Read with ` · ` alone the relaunched
+/// screen was a turn still running: the loop never reached another idle
+/// point, and the carry-on was never typed. NEGATIVE CONTROL: the same
+/// relaunched screen with its last end row gone — a turn that IS still
+/// running — gets the relaunch and no carry-on.
+#[test]
+fn a_relaunched_codex_0_159_is_the_hosts_next_idle_point_for_its_carry_on() {
+    use aterm_phase::codex::fixtures as cx;
+    use aterm_phase::prompt::fixtures::{cursor, screen};
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |relaunched: Vec<String>, carried: bool| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        host.adopts.store(true, Ordering::SeqCst);
+        // The old Codex at the idle point of an ended turn (its end row
+        // `  7:43 AM`), then the TUI the host's step relaunched.
+        let mut m = Mock::new(
+            true,
+            vec![busy_screen(), screen(cx::END_OF_TURN_TIP), relaunched],
+        );
+        m.program = "codex";
+        m.cursor_on_caret = true;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let (jdir, journal) = journal_file("relaunched-0-159");
+        let journaled = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..full.clone()
+        };
+        // Both arms wait for what they assert did happen (the carry-on; the
+        // adoption) on the 60 s hang detector; the negative arm's tail is
+        // the window in which no carry-on may appear.
+        let stop = if carried {
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 2,
+                Duration::from_millis(100),
+            )
+        } else {
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 1,
+                Duration::from_millis(600),
+            )
+        };
+        let (r, _) = hosted_with_host(&mut m, &journaled, &host, stop, None);
+        assert_eq!(r, Ok(()));
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        let host_lines: Vec<String> = records
+            .iter()
+            .filter(|r| r.line.starts_with("HOST seq="))
+            .map(|r| r.line.splitn(3, ' ').nth(2).unwrap_or("").to_string())
+            .collect();
+        (
+            host.steps.load(Ordering::SeqCst),
+            host_lines,
+            m.requests.clone(),
+        )
+    };
+    let (row, _) = cursor(cx::RESUMED_DAEMON_0_159).expect("a measured cursor");
+    let relaunched = screen(cx::RESUMED_DAEMON_0_159);
+    assert!(
+        relaunched[row].starts_with("› Ask Codex"),
+        "{}",
+        relaunched[row]
+    );
+    let (steps, lines, requests) = run(relaunched.clone(), true);
+    assert_eq!(steps, 2, "{lines:?} {requests:?}");
+    assert_eq!(
+        lines,
+        ["upgrade step=adopted", "carry-on step=continued"],
+        "{requests:?}"
+    );
+    // NEGATIVE CONTROL: its last turn still running — no carry-on there.
+    let mut running = relaunched;
+    let end = running
+        .iter()
+        .rposition(|r| r.trim_start().starts_with("Worked for "))
+        .expect("the last end row");
+    running[end].clear();
+    let (steps, lines, requests) = run(running, false);
+    assert_eq!(steps, 1, "{lines:?} {requests:?}");
+    assert_eq!(lines, ["upgrade step=adopted"], "{requests:?}");
+}
+
 /// THE INLINE REPL IS AN IDLE POINT (the review of 2026-09-26): Claude
 /// Code's inline renderer draws its REPL at the top of the pane, blank rows
 /// below it, and the loop's 40-row tail read of a 150x50 pane held the
@@ -4379,6 +5128,68 @@ fn a_turn_the_host_typed_never_holds_the_hosts_next_step() {
         m.requests
     );
     assert_eq!(count(&m, "@s-1 turn"), 0, "the upgrade owns the point");
+}
+
+/// A HOST'S SAME WAIT SAID AGAIN AT ONE POINT IS JOURNALED ONCE (the review of
+/// 2026-09-28): a person's hold is looked at every twenty seconds while it owns
+/// the point, and a `HOST` row for each look would push the rows a diagnosis
+/// reads out of the session's kept journal within hours. The host marks every
+/// look after the first a repeat ([`HostStep::repeat`]); the loop takes each
+/// step as before — here three at one point, the point owned throughout, nothing
+/// typed — and journals the first. NEGATIVE CONTROL: the same steps unmarked
+/// are journaled each time.
+#[test]
+fn a_hosts_same_wait_said_again_at_one_point_is_journaled_once() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |repeats: bool| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        host.again.store(2, Ordering::SeqCst);
+        host.holds.store(true, Ordering::SeqCst);
+        host.marks.store(repeats, Ordering::SeqCst);
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        m.cursor_on_caret = true;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let (jdir, journal) = journal_file("idle-host-repeat");
+        let journaled = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..full.clone()
+        };
+        let (r, _) = hosted_with_host(
+            &mut m,
+            &journaled,
+            &host,
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 3,
+                Duration::from_millis(300),
+            ),
+            None,
+        );
+        assert_eq!(r, Ok(()));
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        let rows = records
+            .iter()
+            .filter(|r| r.line.starts_with("HOST seq="))
+            .count();
+        (
+            host.steps.load(Ordering::SeqCst),
+            rows,
+            count(&m, "@s-1 turn"),
+        )
+    };
+    let (steps, rows, typed) = run(true);
+    assert_eq!(steps, 3, "every look is taken");
+    assert_eq!(rows, 1, "the first look alone is journaled");
+    assert_eq!(typed, 0, "the point is the upgrade's throughout");
+    // NEGATIVE CONTROL: unmarked, each step is a row.
+    let (steps, rows, typed) = run(false);
+    assert_eq!(steps, 3);
+    assert_eq!(rows, 3, "each step journaled");
+    assert_eq!(typed, 0);
 }
 
 /// D1 OF THE LIVE E2E OF 2026-09-26, IN THE LOOP: a session its host says
@@ -6341,7 +7152,23 @@ fn q_projected_run(
     let mut last_stamp: Option<u64> = None;
     let mut keys = Vec::new();
     let mut person_seen = None;
-    for (req, _) in &m.order {
+    for (at, (req, _)) in m.order.iter().enumerate() {
+        if m.person_skipped.contains(&at) {
+            // A person keyed between the loop's read and this key, and the
+            // server's person fence skipped it (`reason=person`): the model's
+            // `PersonKey` then, and its own key is not enabled there.
+            assert!(model.fire("PersonKey", &mut st), "PersonKey at {st:?}");
+            for action in ["HarnessMove", "HarnessEnter"] {
+                assert!(
+                    !model.action_enabled(action, &st),
+                    "the model allows {action} past a person's key: {st:?}"
+                );
+            }
+            if person_seen.is_none() {
+                person_seen = Some(st.clone());
+            }
+            continue;
+        }
         if req.starts_with("text ") {
             let (i, stamp) = *reads.next().expect("a served read");
             let age = stamp.parse::<u64>().ok();
@@ -6398,6 +7225,75 @@ fn q_bound(m: &mut Mock) -> (QState, Vec<String>, Option<QState>) {
         &aterm_spec::derive::supervisor_question_answer_model(),
         2,
     )
+}
+
+/// R3b, THE ROUND TRIP (built 2026-09-27): a PERSON's key lands between the
+/// loop's last read and its question key — nothing on the screen says so —
+/// and the key's person fence (`if-human=<the read's count>`, checked by the
+/// server under its lock) skips it: `OK skipped reason=person`, nothing
+/// written, and the loop sends nothing more on that read. Bound to the model:
+/// the skipped key is `PersonKey` there, and neither harness key is enabled
+/// after it. NEGATIVE CONTROL: without the fence (`PersonFence = 0`, the
+/// assumption that stood before) the model enables the key the server
+/// refused, and a host that sends no count gets no `if-human=` at all.
+#[test]
+fn a_persons_key_between_the_read_and_the_write_skips_the_question_key() {
+    use aterm_phase::prompt::fixtures as f;
+    let model = aterm_spec::derive::supervisor_question_answer_model();
+    let third = q(f::QUESTION_TABS_THIRD);
+    let on_free = focused_on(&third, "3. Type something");
+    let on_two = focused_on(&third, "2. Font");
+    // The first `↑` is raced; the person's own key moved the focus (the
+    // next read shows it on option 2), and the answer goes on from there.
+    let screens = || {
+        vec![
+            on_free.clone(),
+            on_two.clone(),
+            third.clone(),
+            q(f::QUESTION_TABS_FOURTH),
+            q(f::QUESTION_REVIEW),
+            idle_screen(),
+        ]
+    };
+    let mut m = questioned(screens());
+    m.human = vec!["15000"];
+    m.human_seq = Some(4);
+    m.person_at_key = 1;
+    let (_, keys, raced) = q_bound(&mut m);
+    let fenced: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("key "))
+        .collect();
+    assert!(
+        fenced
+            .first()
+            .is_some_and(|r| r.starts_with("key if-human=4 if-gen=")),
+        "{fenced:#?}"
+    );
+    assert_eq!(m.person_skipped.len(), 1, "{:#?}", m.requests);
+    assert!(
+        keys.len() < fenced.len(),
+        "the skipped key is not counted as written"
+    );
+    let raced = raced.expect("the person's key is in the bind");
+    let unfenced = aterm_spec::interp::with_consts(&model, &[("PersonFence", 0)]);
+    assert!(
+        unfenced.action_enabled("HarnessMove", &raced),
+        "without the fence the model allows the key the server refused: {raced:?}"
+    );
+    // NEGATIVE CONTROL: a host that sends no count gets no person fence.
+    let mut m = questioned(screens());
+    m.human = vec!["15000"];
+    let _ = q_bound(&mut m);
+    assert!(
+        m.requests
+            .iter()
+            .filter(|r| r.starts_with("key "))
+            .all(|r| !r.contains("if-human=")),
+        "{:#?}",
+        m.requests
+    );
 }
 
 /// TIER-1 for `SupervisorQuestionAnswer` (aterm-spec

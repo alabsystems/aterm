@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Sparkle-words lexicon. Each [[entry]] declares surface forms for one
-# (class, language). class = "profanity" | "feline" | "canine" | "orca" | "animal" | "emphasis".
-# Cross-class homographs resolve by total order: profanity > feline > canine > orca > animal > emphasis.
+# (class, language). class = "profanity" | "feline" | "canine" | "animal" | "emphasis".
+# Cross-class homographs resolve by total order: profanity > feline > canine > animal > emphasis.
+# (class = "orca" was deleted 2026-09-27 with the suspended orca splash; an external
+# lexicon's orca entries are skipped: they decorate nothing, and no longer outrank the
+# same word under animal or emphasis, which now decorates as that class.)
 # class = "animal" entries additionally carry species = "<id>" naming the authored sprite.
 # mode="suffix": surfaces = stems x suffixes (+ forms[]). mode="forms": forms[] only.
 # cjk=true: no-space script; forms[] are whole compounds matched by maximal run.
@@ -21,15 +24,6 @@ forms    = ["motherfucker", "motherfucking", "clusterfuck", "fuckwit", "fuckup",
 cjk      = false
 ambiguous= false
 notes    = "Strong general-purpose English expletive. Concatenative suffixing is clean. 'fuckin' is the common dropped-g colloquial spelling. Irregular compounds enumerated in forms[]."
-
-[[entry]]
-class    = "orca"
-lang     = "en"
-mode     = "forms"
-forms    = ["orca", "orcas"]
-cjk      = false
-ambiguous= false
-notes    = "Orca / killer whale family — drawn as the randomized water-droplet 'splash'. Low-ambiguity whole word (also a name/brand; word-boundary matching handles those)."
 
 [[entry]]
 class    = "feline"
@@ -1675,9 +1669,9 @@ notes    = "سگ = dog; توله / توله سگ = puppy; سگ کوچولو = li
 # surfaces ARE ordinary English prose, so the live-caret deferral is the
 # mid-typing guard ('bee' inside 'been' never fires) and the fold-collision
 # gate's unambiguous set stays clean; the default languages = ["en"]
-# un-gates them for everyone. Homograph law: profanity > feline > orca >
-# animal, so cat/kitty keep the cat and orca keeps its splash. One surface ->
-# one species, pinned by animal_surface_species_are_unique.
+# un-gates them for everyone. Homograph law: profanity > feline > canine >
+# animal, so cat/kitty keep the cat. One surface -> one species, pinned by
+# animal_surface_species_are_unique.
 # (2026-08-10: the ambiguous=true law above is the ENGLISH group's — the
 # animal-multilingual group at the end of this file extends the roster to
 # zh/ja/ko/hi/th/vi/id under its own load laws; see that header.)
@@ -2090,7 +2084,7 @@ species  = "whale"
 forms    = ["whale", "whales"]
 cjk      = false
 ambiguous= true
-notes    = "orca stays the orca class's splash (higher rank); the generic whale is this sprite."
+notes    = "The generic whale sprite. 'orca' is not a form here: it was the deleted orca class's word and decorates nothing."
 
 [[entry]]
 class    = "animal"

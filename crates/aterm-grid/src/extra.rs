@@ -117,14 +117,14 @@ pub(crate) struct HyperlinkData {
 // covers, defeating both the renderer's pointer-keyed decode cache and the
 // memory budget. Re-exported so `aterm_grid::ImageData` stays the name every
 // caller already uses.
-pub use aterm_types::{ImageData, ImageFormat};
+pub use aterm_types::{ImageData, ImageFormat, ImageScaling, SourceRect};
 
 /// A single cell's reference into a placed [`ImageData`].
 ///
 /// The shared image lives behind the `Arc`; `cell_row`/`cell_col` say which tile
 /// of the `rows`×`cols` footprint THIS cell paints (0-indexed from the image's
 /// top-left). The renderer maps that tile to a pixel sub-rect of the decoded
-/// image. Cheap to clone (one `Arc` bump + two `u16`).
+/// image. Cheap to clone (one `Arc` bump + two `u16` + a `Copy` tag).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef {
     /// The shared image this cell belongs to.
@@ -133,23 +133,28 @@ pub struct ImageRef {
     pub cell_row: u16,
     /// Column of this cell within the image footprint (0-indexed).
     pub cell_col: u16,
+    /// Which Kitty placement stamped this cell, or `None` for every image that
+    /// is not a Kitty placement (iTerm2, sixel, host rasters). Kitty's delete
+    /// selectors address placements by this tag, so no Kitty command can erase
+    /// a picture another protocol drew.
+    pub kitty: Option<KittyPlacementTag>,
 }
 
-/// Kitty graphics Unicode placeholder data for a cell.
+/// The identity of one Kitty graphics placement, stamped into every cell it
+/// covers.
 ///
-/// Stored in `CellExtra` when the parser encounters a placeholder character
-/// (U+10EEEE with combining characters encoding image/placement coordinates).
-/// The renderer uses this to draw the corresponding sub-region of a Kitty image.
+/// Rows that scroll into history keep their pixels but not this tag: Kitty
+/// deletion addresses the screen, so a placement that left it is no longer a
+/// delete target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KittyPlaceholderData {
-    /// Image ID (from diacritics on the base placeholder character).
+pub struct KittyPlacementTag {
+    /// The image id (`i=`, or the id the terminal assigned an `I=` number).
     pub image_id: u32,
-    /// Placement ID (0 = default placement).
+    /// The client's placement id (`p=`); `0` when the client named none.
     pub placement_id: u32,
-    /// Row offset within the image placement (0-indexed).
-    pub row: u32,
-    /// Column offset within the image placement (0-indexed).
-    pub col: u32,
+    /// A per-terminal serial, unique to this one placement act, so two
+    /// unnamed placements of the same image stay distinct targets.
+    pub serial: std::num::NonZeroU32,
 }
 
 /// Extra attributes for a cell that don't fit in the packed 8-byte structure.
@@ -160,7 +165,9 @@ pub struct KittyPlaceholderData {
 /// - True color RGB (foreground/background)
 /// - Zero-width combining characters
 /// - Complex characters (non-BMP, grapheme clusters)
-/// - Kitty graphics Unicode placeholders
+///
+/// A Kitty Unicode placeholder needs no field of its own: it is its character,
+/// combining marks and colours, decoded at render time.
 ///
 /// ## Memory Layout (M9 optimization + perf-memory boxing)
 ///
@@ -172,10 +179,9 @@ pub struct KittyPlaceholderData {
 /// - `complex_char: Option<Box<Arc<str>>>` - boxed; rare, so the 8-byte niche
 ///   pointer replaces the 16-byte inline `Arc<str>` fat pointer on the common path
 /// - `combining: SmallVec<char, 2>` - inline for the common case
-/// - `kitty_placeholder: Option<Box<KittyPlaceholderData>>` - niche optimized (8 bytes)
 /// - `image: Option<Box<ImageRef>>` - inline-image ref, niche optimized (8 bytes)
 ///
-/// Total: ~72 bytes (64 after boxing `complex_char`, plus 8 for the niche
+/// Total: 64 bytes (56 after boxing `complex_char`, plus 8 for the niche
 /// `image` pointer). Boxing only adds an allocation when a grapheme-cluster
 /// complex char (or inline image) is actually present; the values returned by
 /// the accessors are byte-identical. `CellExtra` is allocated only for cells
@@ -215,15 +221,10 @@ pub struct CellExtra {
     /// Most cells have 0-2 combining chars; SmallVec avoids allocation.
     combining: SmallVec<char, 2>,
 
-    /// Kitty graphics Unicode placeholder data.
-    /// Present when this cell represents part of a Kitty image via the
-    /// Unicode placeholder protocol (U+10EEEE with combining diacritics).
-    kitty_placeholder: Option<Box<KittyPlaceholderData>>,
-
     /// Inline image reference (iTerm2 OSC 1337 `File=`).
     /// Present when this cell is covered by an inline image; the renderer paints
     /// the cell's tile of the shared image and skips the glyph. Boxed for niche
-    /// optimization (8 bytes when absent), mirroring `kitty_placeholder`.
+    /// optimization (8 bytes when absent).
     image: Option<Box<ImageRef>>,
 }
 
@@ -236,7 +237,6 @@ impl CellExtra {
             || self.complex_char.is_some()
             || !self.combining.is_empty()
             || self.flags != 0
-            || self.kitty_placeholder.is_some()
             || self.image.is_some()
             || self.underline_color_idx.is_some()
     }
@@ -565,18 +565,13 @@ impl CellExtra {
         } else {
             0 // Inline storage, already counted in base
         };
-        let placeholder_mem = if self.kitty_placeholder.is_some() {
-            std::mem::size_of::<KittyPlaceholderData>()
-        } else {
-            0
-        };
         // The image payload is shared via Arc (counted once at the source, not
         // per covered cell); each cell pays only the boxed ImageRef.
         let image_mem = self
             .image
             .as_ref()
             .map_or(0, |_| std::mem::size_of::<ImageRef>());
-        base + hyperlink_mem + complex_char_mem + combining_mem + placeholder_mem + image_mem
+        base + hyperlink_mem + complex_char_mem + combining_mem + image_mem
     }
 }
 

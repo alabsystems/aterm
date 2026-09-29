@@ -147,11 +147,7 @@ fn vet_components(raw: &Path) -> Result<PathBuf, ExtractReject> {
         }
     }
     // A path that was empty, or only `.`/separators, names no target.
-    // `OsStr::is_empty` goes via `call1`: std's INLINED `unsafe` (the `OsStr`
-    // byte-slice cast) is otherwise attributed to this function's span as a
-    // missing-SAFETY-comment refutation under the strict Trust gate (see
-    // `lib.rs`). Same call, same receiver; behavior identical.
-    if crate::call1(std::ffi::OsStr::is_empty, rel.as_os_str()) {
+    if rel.as_os_str().is_empty() {
         return Err(ExtractReject::EmptyPath);
     }
     Ok(rel)
@@ -169,7 +165,7 @@ fn strip_leading(rel: &Path, strip: u32) -> Option<PathBuf> {
         }
         out.push(comp);
     }
-    if crate::call1(std::ffi::OsStr::is_empty, out.as_os_str()) {
+    if out.as_os_str().is_empty() {
         None
     } else {
         Some(out)
@@ -321,7 +317,7 @@ pub fn vet_symlink(
     let Some(rel) = strip_leading(&rel, strip.saturating_sub(leading_curdirs(raw))) else {
         return Ok(None);
     };
-    if crate::call1(std::ffi::OsStr::is_empty, target.as_os_str()) {
+    if target.as_os_str().is_empty() {
         return Err(ExtractReject::EmptyPath);
     }
     if target.is_absolute() {
@@ -433,30 +429,14 @@ fn io_at(err: io::Error, op: &'static str, path: &Path) -> ExtractError {
     }
 }
 
-// Hand-rendered through `Formatter::write_str` + direct `Display::fmt`/`Debug::fmt`
-// calls (no `write!`): the `write!`/`format_args!` expansion embeds `fmt::Arguments`
-// construction (with inlined `unsafe`) that the strict Trust gate cannot lower and
-// fails closed on. Byte-identical output (`write!` with `{}`/`{:?}` args performs
-// exactly these formatter writes in sequence; no width/fill flags are used).
 impl std::fmt::Display for ExtractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExtractError::Io { err, op, path } => {
-                f.write_str("io: ")?;
-                if let Some(p) = path {
-                    f.write_str(op)?;
-                    f.write_str(" ")?;
-                    std::fmt::Debug::fmt(p, f)?;
-                    f.write_str(": ")?;
-                }
-                std::fmt::Display::fmt(err, f)
-            }
-            ExtractError::Rejected(r, p) => {
-                f.write_str("rejected entry ")?;
-                std::fmt::Debug::fmt(p, f)?;
-                f.write_str(": ")?;
-                std::fmt::Debug::fmt(r, f)
-            }
+            ExtractError::Io { err, op, path } => match path {
+                Some(p) => write!(f, "io: {op} {p:?}: {err}"),
+                None => write!(f, "io: {err}"),
+            },
+            ExtractError::Rejected(r, p) => write!(f, "rejected entry {p:?}: {r:?}"),
             ExtractError::TooLarge(r) => std::fmt::Display::fmt(r, f),
         }
     }
@@ -464,7 +444,6 @@ impl std::fmt::Display for ExtractError {
 
 impl std::error::Error for ExtractError {}
 
-// Hand-rendered for the same reason as [`ExtractError`]'s Display: no `write!`.
 impl std::fmt::Display for TooLargeReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -476,25 +455,18 @@ impl std::fmt::Display for TooLargeReason {
                 "one entry's header/extension reads exceeded the per-entry structural budget",
             ),
             TooLargeReason::DirectoryWithBody(p) => {
-                f.write_str("directory member ")?;
-                std::fmt::Debug::fmt(p, f)?;
-                f.write_str(" declares a nonzero body size")
+                write!(f, "directory member {p:?} declares a nonzero body size")
             }
             TooLargeReason::HardlinkWithBody(p) => {
-                f.write_str("hardlink member ")?;
-                std::fmt::Debug::fmt(p, f)?;
-                f.write_str(" declares a nonzero body size")
+                write!(f, "hardlink member {p:?} declares a nonzero body size")
             }
             TooLargeReason::SymlinkWithBody(p) => {
-                f.write_str("symlink member ")?;
-                std::fmt::Debug::fmt(p, f)?;
-                f.write_str(" declares a nonzero body size")
+                write!(f, "symlink member {p:?} declares a nonzero body size")
             }
-            TooLargeReason::LinkTargetTooLong(p) => {
-                f.write_str("symlink member ")?;
-                std::fmt::Debug::fmt(p, f)?;
-                f.write_str(" declares a link target over the 4096-byte limit")
-            }
+            TooLargeReason::LinkTargetTooLong(p) => write!(
+                f,
+                "symlink member {p:?} declares a link target over the 4096-byte limit"
+            ),
         }
     }
 }
@@ -573,29 +545,10 @@ impl<R: Read> Read for CappedReader<R> {
         // Never offer the inner reader more room than the budget allows, so a single
         // read cannot decompress past the cap (tar's `read_to_end` grows its buffer as
         // it reads, so an uncapped `buf` would let one call overshoot by a lot).
-        // (Branch instead of `usize::try_from(..).unwrap_or(..).min(..)`: same value —
-        // `remaining < buf.len() as u64` implies it fits in usize — in a shape whose
-        // bounds the strict Trust gate can prove; `try_from` was unlowerable.)
-        let len = buf.len();
-        let cap = if remaining < len as u64 {
-            // Dominated by the branch: `remaining` fits in usize, so the
-            // truncating cast is exact (same value `try_from` produced).
-            remaining as usize
-        } else {
-            len
-        };
-        // No-op re-clamp in the usize domain (`cap <= len` already holds on both
-        // branches above): hands the strict Trust gate the dominating bound its
-        // slice proof needs without reasoning through the u64 cast.
-        let cap = if cap < len { cap } else { len };
-        // `Read::read` goes via `call2`: the hardened pass name-matches any direct
-        // callee named `read` against the libc `read(2)` FFI-boundary contracts,
-        // which do not apply to this safe trait method (see `lib.rs`). Same call,
-        // same receiver and buffer; behavior identical.
-        let n = crate::call2(<R as Read>::read, &mut self.inner, &mut buf[..cap])?;
-        // The `Read` contract guarantees `n <= cap <= remaining`; saturating is a
-        // no-op on every conforming reader, and it carries the no-underflow proof
-        // the gate refuted (it cannot constrain an external call's return value).
+        let cap = usize::try_from(remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let n = self.inner.read(&mut buf[..cap])?;
+        // The `Read` contract guarantees `n <= cap <= remaining`; saturating keeps a
+        // nonconforming reader from wrapping the budget.
         self.budget.set(remaining.saturating_sub(n as u64));
         Ok(n)
     }
@@ -835,16 +788,12 @@ pub(crate) fn require_empty_destination(dest_root: &Path) -> Result<(), ExtractE
     if let Ok(mut existing) = std::fs::read_dir(dest_root)
         && let Some(entry) = existing.next()
     {
-        let mut msg = String::from(
-            "extraction destination is not empty; refusing to fold a tree_root \
-that would not describe everything under it: ",
+        let found = entry.map_or_else(|_| dest_root.to_path_buf(), |e| e.path());
+        let msg = format!(
+            "extraction destination is not empty; refusing to fold a tree_root that would \
+             not describe everything under it: {}",
+            found.to_string_lossy()
         );
-        msg.push_str(&crate::call1(
-            std::path::Path::to_string_lossy,
-            &entry
-                .map(|e| e.path())
-                .unwrap_or_else(|_| dest_root.to_path_buf()),
-        ));
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, msg).into());
     }
     Ok(())
@@ -1188,7 +1137,7 @@ impl<'a> Layer<'a> {
         create_symlink(target, &dest).map_err(|e| io_at(e, "symlink", &dest))?;
         if let Some(tree) = self.tree.as_mut() {
             let rel = rel_bytes_under(self.root, &dest)?;
-            let target_bytes = crate::call1(crate::platform::os_str_bytes, target.as_os_str());
+            let target_bytes = crate::platform::os_str_bytes(target.as_os_str());
             tree.record_symlink(rel, target_bytes);
         }
         self.laid_symlink = true;
@@ -1499,10 +1448,8 @@ fn write_capped(
         if n == 0 {
             break;
         }
-        // The `Read` contract guarantees `n <= buf.len()`; the clamp is a no-op
-        // on every conforming reader that hands the strict Trust gate the
-        // dominating bound its slice proof needs (the gate cannot constrain an
-        // external call's return value).
+        // The `Read` contract guarantees `n <= buf.len()`; the clamp keeps a
+        // nonconforming reader from panicking the slice below.
         let n = if n <= buf.len() { n } else { buf.len() };
         // Refund the file-content bytes to the structural budget: file content is
         // separately bounded by `remaining` (the signed content cap), so it must not

@@ -450,6 +450,58 @@ fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons
     );
 }
 
+/// The never-block design's incident (§4 of
+/// `DESIGN-harness-never-block-2026-09-24.md`): `Want me to publish this
+/// now?` with `Deploy and push` / `Push only` / `Hold everything` and no
+/// `(Recommended)`. Option 1 is NOT pressed — the question names an act and
+/// no option refuses it (`Hold everything` does not start `No`), so it is the
+/// person's. Control: the same labels on a question that names nothing are
+/// answered; and with `Hold everything` spelled `No, hold everything` that
+/// one refusal is the answer.
+#[test]
+fn the_incidents_unmarked_publish_question_is_escalated() {
+    let incident = |refusal: &str| -> Vec<String> {
+        screen(f::QUESTION_NO_RECOMMENDATION)
+            .iter()
+            .map(|r| {
+                [
+                    (
+                        "Where should the message band sit?",
+                        "Want me to publish this now?",
+                    ),
+                    ("1. Top", "1. Deploy and push"),
+                    ("2. Bottom", "2. Push only"),
+                    ("3. Floating", refusal),
+                ]
+                .iter()
+                .fold(r.clone(), |r, (from, to)| r.replace(from, to))
+            })
+            .collect()
+    };
+    let rows = incident("3. Hold everything");
+    assert!(
+        rows.iter().any(|r| r.trim() == "❯ 1. Deploy and push"),
+        "PRECONDITION: the edit landed, the cursor on option 1: {rows:#?}"
+    );
+    assert_eq!(
+        reason(&decide_rows(&rows)),
+        "a question with no recommended option that would deploy, and no one option that \
+         refuses it: a person answers that"
+    );
+    // Control: the labels alone name no act.
+    let neutral: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.replace("Want me to publish this now?", "Which should come first?")
+                .replace("1. Deploy and push", "1. Tests and docs")
+        })
+        .collect();
+    assert_eq!(answer(&decide_rows(&neutral)).1, AnswerTarget::Option(1));
+    // With one option that refuses, that option is the answer.
+    let refused = incident("3. No, hold everything");
+    assert_eq!(answer(&decide_rows(&refused)).1, AnswerTarget::Option(3));
+}
+
 /// D2's refusal is `No` itself or `No` then a separator — never a word that
 /// merely starts with it.
 #[test]
@@ -672,12 +724,15 @@ fn verdict(d: &Decision) -> Verdict {
 }
 
 /// What the model lets the loop do at `st` once the loop's own guards hold
-/// (a person quiet, its last key taken, the queue empty): its DECISION
+/// (a person quiet, no person key since its read, its last key taken, the
+/// queue empty): its DECISION
 /// part, which is the pure decider's.
 fn decision_of(model: &aterm_spec::derive::Model, st: &ModelState) -> Verdict {
     let mut free = st.clone();
     for (var, v) in [
         ("quiet", 1),
+        ("seen_quiet", 1),
+        ("touched", 0),
         ("mine", 0),
         ("stilled", 0),
         ("retried", 0),

@@ -46,54 +46,145 @@ impl Drop for TempDir {
 #[test]
 fn a_child_that_never_returns_is_killed_at_the_deadline() {
     // THE POINT of this shape: `wait_with_output` on a child that hangs never
-    // returns, and a stale NFS mount does that to `df`.
+    // returns, and a stale NFS mount does that to `df`. The child hangs for
+    // two minutes and the capture must return inside a minute's hang detector
+    // — the spawn is inside that window, so a loaded machine's slow spawn never
+    // reads as a capture that waited the child out.
     let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg("sleep 30");
+    cmd.arg("-c").arg("sleep 120");
     let started = std::time::Instant::now();
     let got = capture_bounded(cmd, Duration::from_millis(250), None, 1024);
     let why = got.expect_err("a hung child is an error, not a wait");
     assert!(why.contains("deadline"), "{why}");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(60),
         "it returned in {:?}",
         started.elapsed()
     );
 }
 
+// THE TWO STDOUT-HANG TESTS BELOW READ SURVIVAL OFF THE KERNEL, NOT A CLOCK.
+// They used to hang a child for 1 s inside a 200 ms deadline, bound the capture
+// at 2 s from before its `spawn`, and then sleep 1.1 s to see whether a marker
+// the survivor would write had appeared. Each number was a race a loaded box
+// could lose on a correct tree: a stall past the child's second let its sleep
+// finish before the kill (`Ok`, or the marker), and a slow spawn ate the bound.
+//
+// Now the fixture hangs for `HANG_S`, and the process that must not survive
+// writes `$$` (the capture's child: a subshell's `$$` is still its parent's) and
+// the process group the KERNEL says that child is in (`ps -o pgid=`). The two
+// must be equal — the capture's child leads a group of its own — before the
+// group is read at all: `kill(-pgid, 0)` answers ESRCH for a group that never
+// existed just as it does for one that emptied, so without that check a capture
+// that never made a group (every fixture left running in the test runner's)
+// would pass. Once the capture gives up, the group must have no member left —
+// every process killed, which is the property — with a minute's hang detector
+// for the reaping of an orphan.
+//
+// A take is the verdict only when it says something: its fixture wrote the
+// report, and the capture gave up on the PATH the test is named for (`path`, a
+// word of the error). A take starved past its deadline before its fixture ran,
+// or one whose closed stdout reached the reader only after the deadline (the
+// reader's timeout then does the kill, not the post-EOF wait), runs again on a
+// wider budget, up to a minute.
+#[cfg(unix)]
+const HANG_S: u64 = 300;
+
+/// Capture `script` (which writes `"<$$> <its pgid>"` to `$PGIDF`, then hangs
+/// for `$HANG_S`) until a take's fixture has run and the capture gave up on
+/// `path`: the group, and how long the capture took. Panics when the capture's
+/// child does not lead its own process group.
+#[cfg(unix)]
+fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t, Duration) {
+    let mut last = String::from("no take ran");
+    for budget in [200, 2_000, 60_000].map(Duration::from_millis) {
+        let tmp = TempDir::new(tag);
+        let pgid_file = tmp.path().join("pgid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(script)
+            .env("PGIDF", &pgid_file)
+            .env("HANG_S", HANG_S.to_string());
+        let started = std::time::Instant::now();
+        let why = capture_bounded(cmd, budget, None, 1024)
+            .expect_err("a hung child is an error, not a wait");
+        let took = started.elapsed();
+        let report = std::fs::read_to_string(&pgid_file).unwrap_or_default();
+        let mut words = report
+            .split_whitespace()
+            .map(|word| word.parse::<libc::pid_t>().ok().filter(|&id| id > 1));
+        let (Some(Some(pid)), Some(Some(pgid))) = (words.next(), words.next()) else {
+            last = format!("the fixture wrote no report ({report:?}); the capture said: {why}");
+            continue;
+        };
+        assert_eq!(
+            pgid, pid,
+            "the capture's child does not lead its own process group (it is in \
+             {pgid}), so no group kill can reach what it leaves running"
+        );
+        if !why.contains(path) {
+            last = format!("the capture gave up on another path: {why}");
+            continue;
+        }
+        return (pgid, took);
+    }
+    panic!("no take tested the {path:?} path, even on a minute's budget: {last}");
+}
+
+/// Whether process group `pgid` has emptied — every member killed and reaped —
+/// within a minute. A survivor is killed (SIGKILL) before this answers `false`.
+#[cfg(unix)]
+fn group_emptied(pgid: libc::pid_t) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        // SAFETY: signal 0 delivers nothing: `kill` only reports whether the
+        // group still has a member this user may signal.
+        if unsafe { libc::kill(-pgid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+        if started.elapsed() >= Duration::from_secs(60) {
+            // SAFETY: as above; SIGKILL to a group this test's fixture made.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_child_that_closes_stdout_then_hangs_cannot_survive_the_deadline() {
-    let tmp = TempDir::new("closed-stdout-hang");
-    let marker = tmp.path().join("survived");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg("exec 1>&-; sleep 1; : > \"$MARKER\"")
-        .env("MARKER", &marker);
-    let started = std::time::Instant::now();
-    let why = capture_bounded(cmd, Duration::from_millis(200), None, 1024)
-        .expect_err("closing stdout must not bypass the child deadline");
-    assert!(why.contains("deadline"), "{why}");
-    assert!(started.elapsed() < Duration::from_secs(2));
-    std::thread::sleep(Duration::from_millis(1_100));
-    assert!(!marker.exists(), "the timed-out child was left running");
+    // The report is written after the close, so the post-EOF wait starts as soon
+    // as the shell does.
+    let (pgid, took) = capture_a_hanging_group(
+        "closed-stdout-hang",
+        "exec 1>&-; echo \"$$ $(ps -o pgid= -p $$)\" > \"$PGIDF\"; sleep \"$HANG_S\"",
+        "closed its output",
+    );
+    assert!(
+        took < Duration::from_secs(HANG_S / 2),
+        "closing stdout bypassed the deadline: the capture took {took:?}"
+    );
+    assert!(group_emptied(pgid), "the timed-out child was left running");
 }
 
 #[cfg(unix)]
 #[test]
 fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
-    let tmp = TempDir::new("descendant-stdout-hang");
-    let marker = tmp.path().join("survived");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg("(sleep 1; : > \"$MARKER\") & exit 0")
-        .env("MARKER", &marker);
-    let started = std::time::Instant::now();
-    let why = capture_bounded(cmd, Duration::from_millis(200), None, 1024)
-        .expect_err("a descendant-held stdout must still time out");
-    assert!(why.contains("deadline"), "{why}");
-    assert!(started.elapsed() < Duration::from_secs(2));
-    std::thread::sleep(Duration::from_millis(1_100));
-    assert!(!marker.exists(), "the descendant was left running");
+    // The child reads its group before it forks; the descendant, which inherits
+    // it, writes the report, so a report means the descendant was running.
+    let (pgid, took) = capture_a_hanging_group(
+        "descendant-stdout-hang",
+        "g=$(ps -o pgid= -p $$); (echo \"$$ $g\" > \"$PGIDF\"; sleep \"$HANG_S\") & exit 0",
+        "ran past its",
+    );
+    assert!(
+        took < Duration::from_secs(HANG_S / 2),
+        "a descendant-held stdout did not time out: the capture took {took:?}"
+    );
+    assert!(group_emptied(pgid), "the descendant was left running");
 }
 
 // THE ESCAPE HAPPENS INSIDE THE SPAWN, BEFORE THE CAPTURE'S DEADLINE STARTS

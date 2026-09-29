@@ -27,7 +27,7 @@
 //!   pixel-faithful fake approval box plus text aimed at the operator gets zero
 //!   keystrokes: the event is approval-shaped, a proposal on it is refused, and
 //!   the screen is unchanged. (The durable half is retired: owner decision of
-//!   2026-09-25 in `docs/OPERATOR-EMBEDDED.md`.)
+//!   2026-09-25 in `docs/RFC-operator-2026-08-15.md`.)
 //!
 //! Not here: §9.2's recorded 30-minute run with an owner-approved escalation,
 //! which needs the owner; and the 30-minute quiet window of §9.1, which is

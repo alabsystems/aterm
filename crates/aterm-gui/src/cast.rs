@@ -19,22 +19,49 @@
 //!    the terminal's OWN bytes and MUST NOT appear as `"o"` events. Enforcing
 //!    that is the *caller's* contract (this module never sees responses).
 //! 3. **Monotonic non-decreasing timestamps** from one epoch captured at
-//!    recorder construction; inter-event deltas are clamped to ≥ 0.
-//! 4. **Bounded** — a byte budget with drop-oldest, so an idle terminal costs
-//!    nothing and a flood cannot balloon RAM.
+//!    recorder construction; inter-event deltas are clamped to ≥ 0, in the
+//!    order the events are written (the engine's, below).
+//! 4. **Bounded** — payload and entry budgets with drop-oldest, so an idle
+//!    terminal costs nothing and tiny bursts cannot balloon queue metadata.
 //!
 //! The recorder does no fs/socket/lock work; the GUI hands bursts to it
 //! lock-free off a dedicated writer thread (mirroring the OSC52 clipboard
 //! thread), so the reader's hot path is never serialized under `term_lock`.
+//!
+//! ## The engine's order, not the arrival order (2026-09-28, P4(b))
+//! A burst reaches this recorder through the writer thread and a resize
+//! through the thread that resized (the main thread's window pass, a control
+//! worker's cross-session `resize`), each after its `term_lock` hold ended.
+//! Stamped on arrival, a resize could land on the wrong side of a burst the
+//! engine processed first, and a replay (`cast frames`, `cast drift`) then
+//! re-lays the alternate screen out at the wrong moment: the very flap `cast
+//! drift` exists to find would be reproduced wrong. So each burst and each
+//! resize carries the engine's resize ordinal (`Terminal::resize_ordinal`,
+//! under its lifetime token), read INSIDE the hold that applied it
+//! ([`CastCuts`], [`ResizeStamp`]), and a time on this recorder's timeline (a
+//! resize's read in its own hold; a burst's at its arrival, before the
+//! reader's first hold, so the reader reads no clock under the lock), and
+//! the recorder INSERTS by that order: a burst the engine processed after
+//! resize `k` observed ordinal `k`, so it sorts after that resize and before
+//! resize `k+1`, whatever order the two threads reached this lock in. A burst
+//! whose slices straddle a resize (the reader releases the lock between
+//! slices) is cut there. Unstamped calls (tests, a burst with no stamp) append.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aterm_core::terminal::Terminal;
+
 /// Default byte budget for the retained event payloads: a flood cannot balloon
 /// RAM past this, and an idle terminal costs nothing (no events ⇒ no bytes).
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bound the allocations and deque entries as well as their payloads. A long
+/// interactive session can emit millions of one-byte bursts within 4 MiB.
+/// Keep the newest 65,536 events and disclose every eviction just as for bytes.
+const MAX_RETAINED_EVENTS: usize = 65_536;
 
 /// One recorded asciicast v2 event: program output (`"o"`) or a resize (`"r"`).
 /// `Clone` is an `Arc` refcount bump for `Output` (no byte copy) + a few bytes
@@ -48,9 +75,171 @@ enum Event {
     /// `Arc<[u8]>` so the common complete-burst case retains the reader thread's
     /// shared allocation directly (see [`CastRecorder::record_output_shared`])
     /// instead of re-copying every output byte into the deque.
-    Output { t: Duration, data: Arc<[u8]> },
+    Output {
+        t: Duration,
+        data: Arc<[u8]>,
+        key: Option<OrderKey>,
+    },
     /// `[t, "r", "<cols>x<rows>"]` — a geometry change the program observed.
-    Resize { t: Duration, cols: u16, rows: u16 },
+    Resize {
+        t: Duration,
+        cols: u16,
+        rows: u16,
+        key: Option<OrderKey>,
+    },
+}
+
+/// Where an event sits in the ENGINE's order (see the module note): the
+/// engine's lifetime token, then a rank on its resize ordinal — `2k` for
+/// resize `k`, `2o + 1` for a burst processed with `o` resizes applied — so a
+/// burst sorts after every resize it followed and before the next one. Bursts
+/// of one rank keep their arrival order (one reader, one writer, FIFO).
+/// Lifetime tokens only grow (a counter), so a replaced engine's events sort
+/// after the old one's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OrderKey {
+    lifetime: u64,
+    rank: u64,
+}
+
+impl OrderKey {
+    fn output(lifetime: u64, ordinal: u64) -> Self {
+        Self {
+            lifetime,
+            rank: ordinal.saturating_mul(2).saturating_add(1),
+        }
+    }
+
+    fn resize(lifetime: u64, ordinal: u64) -> Self {
+        Self {
+            lifetime,
+            rank: ordinal.saturating_mul(2),
+        }
+    }
+}
+
+/// One piece's place in the engine's order, read INSIDE the `term_lock` hold
+/// that processed its first byte: the engine's resize lifetime and ordinal
+/// then. No clock is read there; the burst carries one time for every piece
+/// ([`CastBurst::t`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CastStamp {
+    lifetime: u64,
+    ordinal: u64,
+}
+
+/// Where the engine's resize ordinal moved while one burst was processed —
+/// the reader releases `term_lock` between slices, and a resize can take it
+/// there — so the recorder can cut the burst at that offset.
+/// [`observe`](Self::observe) runs inside every hold that processes bytes of
+/// the burst; the common burst (no resize meanwhile) keeps one stamp and
+/// allocates nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CastCuts {
+    first: Option<CastStamp>,
+    /// `(offset into the burst, stamp)` of each later piece, ascending; `None`
+    /// until a resize really cuts the burst (never `Some` and empty).
+    /// Boxed: a burst straddles a resize rarely, and the channel's slots stay
+    /// small.
+    #[expect(
+        clippy::box_collection,
+        reason = "one pointer, not a 24-byte Vec, in each of the cast queue's 1024 \
+                  preallocated slots per session; the Vec is built only for a burst a \
+                  resize cut (a_stamped_burst_stays_small_in_the_queue pins the size)"
+    )]
+    rest: Option<Box<Vec<(usize, CastStamp)>>>,
+}
+
+impl CastCuts {
+    /// Note the hold about to process the burst's bytes from offset `at` (in
+    /// the burst as the recorder receives it: a manual reset's bytes first, a
+    /// foreground handback's where the reader splices them). The caller holds
+    /// `term`'s lock. Two loads and a compare; no clock read, and an
+    /// allocation only when a resize really cut the burst.
+    #[inline]
+    pub(crate) fn observe(&mut self, at: usize, term: &Terminal) {
+        let stamp = CastStamp {
+            lifetime: term.resize_lifetime(),
+            ordinal: term.resize_ordinal(),
+        };
+        let Some(first) = self.first.as_mut() else {
+            self.first = Some(stamp);
+            return;
+        };
+        match self.rest.as_deref_mut().and_then(|rest| rest.last_mut()) {
+            Some((_, last)) if *last == stamp => {}
+            // A hold that processed none of the burst's bytes (an empty manual
+            // reset) is superseded by the next one at the same offset.
+            Some((offset, last)) if *offset == at => *last = stamp,
+            Some(_) => self.push_cut(at, stamp),
+            None if *first == stamp => {}
+            None if at == 0 => *first = stamp,
+            None => self.push_cut(at, stamp),
+        }
+    }
+
+    /// The rare path: a resize cut the burst at `at`.
+    #[cold]
+    fn push_cut(&mut self, at: usize, stamp: CastStamp) {
+        self.rest.get_or_insert_with(Box::default).push((at, stamp));
+    }
+
+    /// How many pieces the burst is cut into (tests).
+    #[cfg(test)]
+    fn pieces(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.as_deref().map_or(0, Vec::len)
+    }
+}
+
+/// One burst for the cast writer: the bytes the engine processed, where they
+/// sit in its order, and when they arrived.
+pub(crate) struct CastBurst {
+    bytes: Arc<[u8]>,
+    cuts: CastCuts,
+    /// The burst's time on the recorder's timeline, in nanoseconds (a `u64`,
+    /// not a 16-byte `Duration`, keeps the queue slot at 56 bytes): see
+    /// [`new`](Self::new).
+    t_ns: u64,
+}
+
+impl CastBurst {
+    /// `bytes` as the engine processed them, `cuts` as the reader's holds
+    /// noted them, at `t` on the recorder's timeline (since
+    /// [`CastRecorder::epoch`]): the burst's arrival, read by the reader before
+    /// its first `term_lock` hold (for a manual reset's empty batch, after its
+    /// last). Every piece carries that one time; where a resize sits between
+    /// two pieces or next to the burst, the recorder clamps the piece's time
+    /// against the resize's, so the timeline stays non-decreasing in the
+    /// engine's order (a time off by at most the burst's own ingest).
+    pub(crate) fn new(bytes: Arc<[u8]>, cuts: CastCuts, t: Duration) -> Self {
+        Self {
+            bytes,
+            cuts,
+            t_ns: u64::try_from(t.as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// One resize's place in the engine's order, taken INSIDE the `term_lock` hold
+/// that applied it ([`ResizeStamp::take`]): the instant (converted onto the
+/// recorder's timeline when it is recorded) and the engine's lifetime and the
+/// resize's own ordinal.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResizeStamp {
+    at: Instant,
+    lifetime: u64,
+    ordinal: u64,
+}
+
+impl ResizeStamp {
+    /// Stamp the resize `term` just applied (the caller holds its lock).
+    pub(crate) fn take(term: &Terminal) -> Self {
+        Self {
+            at: Instant::now(),
+            lifetime: term.resize_lifetime(),
+            ordinal: term.resize_ordinal(),
+        }
+    }
 }
 
 impl Event {
@@ -59,6 +248,18 @@ impl Event {
     fn t(&self) -> Duration {
         match self {
             Event::Output { t, .. } | Event::Resize { t, .. } => *t,
+        }
+    }
+
+    fn set_t(&mut self, to: Duration) {
+        match self {
+            Event::Output { t, .. } | Event::Resize { t, .. } => *t = to,
+        }
+    }
+
+    fn key(&self) -> Option<OrderKey> {
+        match self {
+            Event::Output { key, .. } | Event::Resize { key, .. } => *key,
         }
     }
 
@@ -98,8 +299,10 @@ pub(crate) struct CastRecorder {
     /// if a caller hands a `t` that went backwards.
     last_t: Duration,
     /// The monotonic epoch this recorder's timeline is relative to, captured at
-    /// construction. [`now`](Self::now) reads it so the output-burst tap (reader
-    /// thread) and the resize tap (main thread) share ONE timeline per session.
+    /// construction. The reader stamps its bursts on it ([`epoch`](Self::epoch),
+    /// copied per attach) and a resize's in-hold instant is converted onto it
+    /// ([`record_resize_stamped`](Self::record_resize_stamped)), so the
+    /// output-burst tap and the resize tap share ONE timeline per session.
     epoch: Instant,
     /// A trailing INCOMPLETE multibyte UTF-8 lead carried from the previous burst:
     /// PTY reads routinely split a multibyte sequence across the 64 KiB boundary,
@@ -107,6 +310,45 @@ pub(crate) struct CastRecorder {
     /// reassembling the character losslessly instead of emitting a U+FFFD that the
     /// continuation in the next read would never repair. Always ≤ 3 bytes.
     pending: Vec<u8>,
+    /// Bursts the READER could not hand to this recorder's writer thread (its
+    /// bounded queue was full, or the writer was gone). Shared with the reader
+    /// through [`drop_counter`](Self::drop_counter), which counts each failed
+    /// `try_send` without touching this recorder's lock, and disclosed in the
+    /// header ([`to_asciicast`](Self::to_asciicast)) and by `cast frames` / `cast
+    /// drift`: a burst the engine processed but the recording lacks makes every
+    /// replay of it wrong, and saying so is the recorder's no-silent-caps rule.
+    drops: Arc<CastDrops>,
+    /// Set on an ADOPTED session's recorder (round five, item 17): this
+    /// recording starts at a seamless update, and what the session showed and
+    /// printed before it is not here. Disclosed in the header as
+    /// `aterm_handoff` ([`to_asciicast`](Self::to_asciicast)) and by `cast
+    /// frames`, as a truncation is.
+    handoff: Option<crate::session_timeline::HandoffGap>,
+}
+
+/// The reader-side count of bursts the cast tap DROPPED (see
+/// [`CastRecorder::drop_counter`]): two relaxed counters, bumped only on a failed
+/// `try_send`, so the reader's hot path pays nothing while the queue keeps up.
+#[derive(Default)]
+pub(crate) struct CastDrops {
+    bursts: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl CastDrops {
+    /// Count one dropped burst of `len` bytes.
+    pub(crate) fn note(&self, len: usize) {
+        self.bursts.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    /// `(bursts, bytes)` dropped so far.
+    pub(crate) fn load(&self) -> (u64, u64) {
+        (
+            self.bursts.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl CastRecorder {
@@ -127,15 +369,36 @@ impl CastRecorder {
             last_t: Duration::ZERO,
             epoch: Instant::now(),
             pending: Vec::new(),
+            drops: Arc::default(),
+            handoff: None,
         }
     }
 
+    /// Mark this recording as one that starts at a seamless update
+    /// ([`crate::session_timeline::HandoffGap`]).
+    pub(crate) fn mark_handoff(&mut self, gap: crate::session_timeline::HandoffGap) {
+        self.handoff = Some(gap);
+    }
+
+    /// The counter the reader bumps when it cannot hand this recorder a burst.
+    /// Taken ONCE per attach (the reader holds its own `Arc`), so counting a
+    /// drop never takes the recorder lock the writer thread contends.
+    pub(crate) fn drop_counter(&self) -> Arc<CastDrops> {
+        self.drops.clone()
+    }
+
     /// The current relative timestamp on this recorder's timeline (elapsed since
-    /// its construction epoch). Both taps call this so a resize event recorded on
-    /// the main thread and an output event recorded on the reader thread share
-    /// one consistent, monotonic-able timeline.
+    /// its construction epoch), for a caller with no stamp of its own (tests; a
+    /// burst that arrives unstamped).
     pub(crate) fn now(&self) -> Duration {
         self.epoch.elapsed()
+    }
+
+    /// This recorder's epoch. The reader copies it once per attach so it can
+    /// put a burst's arrival on this timeline ([`CastBurst::new`]) without
+    /// taking this recorder's lock.
+    pub(crate) fn epoch(&self) -> Instant {
+        self.epoch
     }
 
     /// Clamp `t` to be non-decreasing w.r.t. the last emitted timestamp.
@@ -145,20 +408,70 @@ impl CastRecorder {
         t
     }
 
-    /// Push `ev`, then drop oldest events until the budget holds. We never drop
-    /// the event just pushed (a single burst over budget is truncated only by
-    /// the caller's read size, not here), so the most recent activity survives.
-    /// Every evicted head event is COUNTED (`evicted`) so [`to_asciicast`](Self::to_asciicast)
-    /// can disclose the truncation rather than emit a silently-lossy recording.
-    fn push(&mut self, ev: Event) {
-        self.used += ev.cost();
-        self.events.push_back(ev);
-        while self.used > self.budget && self.events.len() > 1 {
+    /// Push `ev` at its place, dropping oldest events FIRST so the deque never
+    /// grows past its entry ceiling ([`MAX_RETAINED_EVENTS`]) or its payload
+    /// budget just to evict one. An UNSTAMPED event goes last (its `t` clamped
+    /// non-decreasing). A stamped one goes before every trailing stamped event
+    /// the engine applied after it ([`OrderKey`]); the walk back stops at the
+    /// first event that is not, so it is as long as the race it repairs (the
+    /// bursts a writer recorded while the resizing thread was on its way to
+    /// this lock). Its `t` is clamped between its neighbours', so the timeline
+    /// stays non-decreasing in the order the events are written.
+    ///
+    /// The event being pushed is never dropped (a single burst over budget is
+    /// truncated only by the caller's read size, not here), so the most recent
+    /// activity survives. Every evicted head event is COUNTED (`evicted`) so
+    /// [`to_asciicast`](Self::to_asciicast) can disclose the truncation rather
+    /// than emit a silently-lossy recording.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "OutputRetention",
+            action = "Push",
+            project = "cast::tests::tiny_output_retention_conforms"
+        )
+    )]
+    fn push(&mut self, mut ev: Event) {
+        let cost = ev.cost();
+        while !self.events.is_empty()
+            && (self.used.saturating_add(cost) > self.budget
+                || self.events.len() >= MAX_RETAINED_EVENTS)
+        {
             if let Some(old) = self.events.pop_front() {
                 self.used = self.used.saturating_sub(old.cost());
                 self.evicted += 1;
             }
         }
+        let mut at = self.events.len();
+        match ev.key() {
+            None => {
+                let t = self.monotonic(ev.t());
+                ev.set_t(t);
+            }
+            Some(key) => {
+                while at > 0
+                    && self
+                        .events
+                        .get(at - 1)
+                        .and_then(Event::key)
+                        .is_some_and(|before| before > key)
+                {
+                    at -= 1;
+                }
+                let lo = at
+                    .checked_sub(1)
+                    .and_then(|i| self.events.get(i))
+                    .map_or(Duration::ZERO, Event::t);
+                let mut t = ev.t().max(lo);
+                if let Some(next) = self.events.get(at) {
+                    t = t.min(next.t()).max(lo);
+                }
+                ev.set_t(t);
+                self.last_t = self.last_t.max(t);
+            }
+        }
+        self.used += cost;
+        self.events.insert(at, ev);
     }
 
     /// Record a coalesced output burst at relative time `t` (since the epoch the
@@ -177,12 +490,56 @@ impl CastRecorder {
     /// copy); only the rare UTF-8 reassembly path (a multibyte sequence split
     /// across reads) still builds a fresh buffer. Byte-identical output either way.
     pub(crate) fn record_output_shared(&mut self, t: Duration, bytes: Arc<[u8]>) {
-        let t = self.monotonic(t);
+        self.record_output_keyed(t, None, bytes);
+    }
+
+    /// Record one burst from the reader, at its place in the engine's order:
+    /// one event per piece its [`CastCuts`] name (the common burst is one
+    /// piece and keeps the reader's allocation; a burst a resize cut copies
+    /// its pieces). A burst with no stamp (none reaches here from the reader)
+    /// is recorded now, last.
+    pub(crate) fn record_burst(&mut self, burst: CastBurst) {
+        let CastBurst { bytes, cuts, t_ns } = burst;
+        let t = Duration::from_nanos(t_ns);
+        let Some(first) = cuts.first else {
+            let t = self.now();
+            self.record_output_shared(t, bytes);
+            return;
+        };
+        // One piece (an empty cut list reads as none): keep the reader's
+        // allocation.
+        let Some(rest) = cuts.rest.filter(|rest| !rest.is_empty()) else {
+            self.record_output_stamped(t, first, bytes);
+            return;
+        };
+        let (mut start, mut stamp) = (0usize, first);
+        for &(at, next) in rest.iter() {
+            let at = at.clamp(start, bytes.len());
+            if at > start {
+                self.record_output_stamped(t, stamp, Arc::from(&bytes[start..at]));
+            }
+            (start, stamp) = (at, next);
+        }
+        if start < bytes.len() {
+            self.record_output_stamped(t, stamp, Arc::from(&bytes[start..]));
+        }
+    }
+
+    fn record_output_stamped(&mut self, t: Duration, stamp: CastStamp, bytes: Arc<[u8]>) {
+        let key = OrderKey::output(stamp.lifetime, stamp.ordinal);
+        self.record_output_keyed(t, Some(key), bytes);
+    }
+
+    fn record_output_keyed(&mut self, t: Duration, key: Option<OrderKey>, bytes: Arc<[u8]>) {
         // Fast path REQUIRES both checks: an empty `pending` (nothing carried to
         // prepend) AND a complete tail (nothing to peel off) — otherwise a split
         // multibyte char would be emitted raw. Empty bursts push no event.
         if self.pending.is_empty() && !bytes.is_empty() && incomplete_tail_len(&bytes) == 0 {
-            self.push(Event::Output { t, data: bytes });
+            self.push(Event::Output {
+                t,
+                data: bytes,
+                key,
+            });
             return;
         }
         // Reassemble across reads: prepend any incomplete lead carried from the
@@ -200,13 +557,33 @@ impl CastRecorder {
         self.push(Event::Output {
             t,
             data: Arc::from(buf),
+            key,
         });
     }
 
-    /// Record a geometry change (`[t, "r", "<cols>x<rows>"]`) at relative `t`.
+    /// Record a geometry change (`[t, "r", "<cols>x<rows>"]`) at relative `t`,
+    /// last (unstamped: tests).
+    #[cfg(test)]
     pub(crate) fn record_resize(&mut self, t: Duration, cols: u16, rows: u16) {
-        let t = self.monotonic(t);
-        self.push(Event::Resize { t, cols, rows });
+        self.push(Event::Resize {
+            t,
+            cols,
+            rows,
+            key: None,
+        });
+    }
+
+    /// Record a geometry change at its place in the engine's order: `stamp`
+    /// was taken inside the hold that applied it ([`ResizeStamp::take`]), so a
+    /// burst the engine processed before it sorts before it and one processed
+    /// after it sorts after it, whichever thread reached this lock first.
+    pub(crate) fn record_resize_stamped(&mut self, stamp: ResizeStamp, cols: u16, rows: u16) {
+        self.push(Event::Resize {
+            t: stamp.at.saturating_duration_since(self.epoch),
+            cols,
+            rows,
+            key: Some(OrderKey::resize(stamp.lifetime, stamp.ordinal)),
+        });
     }
 
     /// Number of recorded events (output + resize), for tests.
@@ -236,6 +613,8 @@ impl CastRecorder {
             height: self.height,
             events: self.events.iter().cloned().collect(),
             evicted: self.evicted,
+            dropped: self.drops.load(),
+            handoff: self.handoff,
         }
     }
 
@@ -266,30 +645,51 @@ impl CastRecorder {
         };
         // Header: a small fixed-shape object; width/height are plain integers so
         // no escaping is needed. The disclosure note is a static ASCII literal.
-        let mut out = if truncated {
-            format!(
-                "{{\"version\": 2, \"width\": {}, \"height\": {}, \
-                 \"aterm_truncated\": {{\"evicted_events\": {}, \"note\": \
+        // A burst the READER dropped (a full writer queue) is disclosed the same
+        // way, `aterm_dropped`, and only when there was one: a recording that
+        // neither evicted nor dropped keeps the plain header byte for byte.
+        let mut out = format!(
+            "{{\"version\": 2, \"width\": {}, \"height\": {}",
+            self.width, self.height
+        );
+        if truncated {
+            out.push_str(&format!(
+                ", \"aterm_truncated\": {{\"evicted_events\": {}, \"note\": \
                  \"drop-oldest evicted the head; leading ANSI state incomplete; \
-                 timestamps rebased to the first retained event\"}}}}\n",
-                self.width, self.height, self.evicted
-            )
-        } else {
-            format!(
-                "{{\"version\": 2, \"width\": {}, \"height\": {}}}\n",
-                self.width, self.height
-            )
-        };
+                 timestamps rebased to the first retained event\"}}",
+                self.evicted
+            ));
+        }
+        let (dropped_bursts, dropped_bytes) = self.drops.load();
+        if dropped_bursts > 0 {
+            out.push_str(&format!(
+                ", \"aterm_dropped\": {{\"bursts\": {dropped_bursts}, \"bytes\": {dropped_bytes}}}"
+            ));
+        }
+        // An adopted session's recording starts at the update that adopted it:
+        // the screen it restored and everything before are not in it. Only
+        // when set, so a fresh session's header is unchanged byte for byte.
+        if let Some(gap) = self.handoff {
+            let from = gap
+                .from_build
+                .map_or_else(|| "null".to_string(), |build| build.to_string());
+            out.push_str(&format!(
+                ", \"aterm_handoff\": {{\"carried\": 0, \"from_build\": {from}, \"note\": \
+                 \"recording restarted at a seamless update; the output and screen before it \
+                 are not in this recording\"}}"
+            ));
+        }
+        out.push_str("}\n");
         for ev in &self.events {
             match ev {
-                Event::Output { t, data } => {
+                Event::Output { t, data, .. } => {
                     out.push_str(&format!(
                         "[{}, \"o\", \"{}\"]\n",
                         fmt_t(t.saturating_sub(rebase)),
                         json_escape_bytes(data)
                     ));
                 }
-                Event::Resize { t, cols, rows } => {
+                Event::Resize { t, cols, rows, .. } => {
                     out.push_str(&format!(
                         "[{}, \"r\", \"{cols}x{rows}\"]\n",
                         fmt_t(t.saturating_sub(rebase))
@@ -318,6 +718,11 @@ pub(crate) struct CastSnapshot {
     /// that overflowed the RAM budget presents as a faithful full run with incomplete
     /// leading ANSI state (SGR/alt-screen/scroll) and no warning.
     evicted: u64,
+    /// `(bursts, bytes)` the reader dropped before they reached the recorder
+    /// ([`CastDrops`]), as of the snapshot.
+    dropped: (u64, u64),
+    /// The recorder's handoff gap, when it starts at a seamless update.
+    handoff: Option<crate::session_timeline::HandoffGap>,
 }
 
 impl CastSnapshot {
@@ -327,6 +732,64 @@ impl CastSnapshot {
     #[must_use]
     pub(crate) fn evicted(&self) -> u64 {
         self.evicted
+    }
+
+    /// `(bursts, bytes)` the reader dropped before they reached the recorder.
+    /// `> 0` means the engine processed output this recording does not hold.
+    #[must_use]
+    pub(crate) fn dropped(&self) -> (u64, u64) {
+        self.dropped
+    }
+
+    /// The handoff gap this recording starts at, if it does
+    /// ([`CastRecorder::mark_handoff`]).
+    #[must_use]
+    pub(crate) fn handoff(&self) -> Option<crate::session_timeline::HandoffGap> {
+        self.handoff
+    }
+
+    /// The recording as `cast drift` reads it: the header facts and every event
+    /// on the SAME timeline `to_asciicast` prints (rebased to the first retained
+    /// event after a head eviction), so a run's `t=` finds its line in the `cast`
+    /// text. Each burst is an `Arc` refcount bump, not a copy.
+    #[must_use]
+    pub(crate) fn drift_input(
+        &self,
+    ) -> (
+        aterm_control::cast_drift::CastHeader,
+        Vec<aterm_control::cast_drift::CastEvent<Arc<[u8]>>>,
+    ) {
+        use aterm_control::cast_drift::{CastDrops as Drops, CastEvent, CastHeader};
+        let rebase = if self.evicted > 0 {
+            self.events.first().map_or(Duration::ZERO, Event::t)
+        } else {
+            Duration::ZERO
+        };
+        let events = self
+            .events
+            .iter()
+            .map(|ev| match ev {
+                Event::Output { t, data, .. } => CastEvent::Output {
+                    t: t.saturating_sub(rebase).as_secs_f64(),
+                    data: data.clone(),
+                },
+                Event::Resize { t, cols, rows, .. } => CastEvent::Resize {
+                    t: t.saturating_sub(rebase).as_secs_f64(),
+                    cols: *cols,
+                    rows: *rows,
+                },
+            })
+            .collect();
+        let header = CastHeader {
+            width: self.width,
+            height: self.height,
+            evicted: self.evicted,
+            dropped: Some(Drops {
+                bursts: self.dropped.0,
+                bytes: self.dropped.1,
+            }),
+        };
+        (header, events)
     }
 }
 
@@ -343,7 +806,6 @@ impl CastSnapshot {
     /// Empty recording ⇒ empty vec. Returns `(rebased_elapsed, rows)` oldest-first.
     #[must_use]
     pub(crate) fn fold_frames(&self, count: usize) -> Vec<(Duration, Vec<String>)> {
-        use aterm_core::terminal::Terminal;
         let count = count.clamp(1, 240);
         let (Some(first), Some(last)) = (self.events.first(), self.events.last()) else {
             return Vec::new();
@@ -455,12 +917,12 @@ fn json_escape_bytes(bytes: &[u8]) -> String {
 // `Arc<[u8]>` it already builds, one extra refcount — no third copy) to each
 // live subscriber, who drains a byte-exact, every-frame queue. Where `subscribe
 // screen/cells` coalesces (latest grid per wake), the `bytes` stream loses
-// NOTHING: the queue accumulates every burst between wakes; only a flood past
-// the per-subscriber budget drops oldest, surfaced as a counted GAP. The
+// NOTHING: the queue accumulates every nonempty burst between wakes; only a flood
+// past the per-subscriber byte or entry budget drops oldest, surfaced as a counted GAP. The
 // producer NEVER blocks (push + drop-oldest under a leaf mutex), mirroring the
 // subscribe registry's never-block guarantee.
 
-/// One subscriber's bounded, byte-budget, drop-oldest queue of output bursts.
+/// One subscriber's byte- and entry-bounded, drop-oldest queue of output bursts.
 #[derive(Default)]
 struct ByteQueue {
     /// Bursts in arrival order; each is the reader thread's shared `Arc<[u8]>`.
@@ -522,7 +984,7 @@ impl ByteFanout {
     }
 
     /// Push `burst` (one `Arc` refcount bump) into every live subscriber's queue,
-    /// dropping each queue's OLDEST bursts past the budget and counting the dropped
+    /// dropping each queue's OLDEST bursts past either the byte or entry budget and counting the dropped
     /// bytes. NON-BLOCKING and infallible: a slow/stalled subscriber can never
     /// block or backpressure the producing reader thread. Zero subscribers ⇒
     /// zero locks: one atomic load and out (THRU-1a). A burst racing a brand-new
@@ -530,21 +992,32 @@ impl ByteFanout {
     /// with the registration, exactly as if it ran a moment earlier; a subscriber
     /// is only owed bursts teed after its slot-push completes, which `live`'s
     /// increment-before-push guarantees it sees.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "OutputRetention",
+            action = "Push",
+            project = "cast::tests::tiny_output_retention_conforms"
+        )
+    )]
     pub(crate) fn tee(&self, burst: &Arc<[u8]>) {
-        if self.live.load(Ordering::Acquire) == 0 {
+        if burst.is_empty() || self.live.load(Ordering::Acquire) == 0 {
             return;
         }
         let slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         for slot in slots.iter() {
             let mut q = slot.queue.lock().unwrap_or_else(|p| p.into_inner());
-            q.bursts.push_back(burst.clone());
-            q.used += burst.len();
-            while q.used > self.budget && q.bursts.len() > 1 {
+            while !q.bursts.is_empty()
+                && (q.used.saturating_add(burst.len()) > self.budget
+                    || q.bursts.len() >= MAX_RETAINED_EVENTS)
+            {
                 if let Some(old) = q.bursts.pop_front() {
                     q.used = q.used.saturating_sub(old.len());
                     q.dropped += old.len() as u64;
                 }
             }
+            q.bursts.push_back(burst.clone());
+            q.used += burst.len();
         }
     }
 
@@ -620,6 +1093,92 @@ impl Drop for ByteSubscription {
 mod tests {
     use super::*;
 
+    /// Tier-1: drive both shipping queues through the real entry ceiling and
+    /// project every one-byte append onto the derived model. The old payload-
+    /// only rule is the negative control at the first count eviction.
+    #[test]
+    fn tiny_output_retention_conforms() {
+        use aterm_spec::{derive::output_retention_model, interp};
+        let model = interp::with_consts(
+            &output_retention_model(),
+            &[
+                ("Cap", MAX_RETAINED_EVENTS as i64),
+                ("ByteBudget", DEFAULT_BUDGET_BYTES as i64),
+                ("MaxSeq", (MAX_RETAINED_EVENTS + 9) as i64),
+            ],
+        );
+        let mut state = model.init_state();
+        let mut rec = CastRecorder::new(80, 24);
+        let fan = Arc::new(ByteFanout::new());
+        let sub = fan.subscribe();
+        let first: Arc<[u8]> = Arc::from(&b"x"[..]);
+        let weak = Arc::downgrade(&first);
+        for i in 0..MAX_RETAINED_EVENTS + 9 {
+            let burst = if i == 0 {
+                first.clone()
+            } else {
+                Arc::from(&b"x"[..])
+            };
+            rec.record_output_shared(Duration::from_millis(i as u64), burst.clone());
+            fan.tee(&burst);
+            assert!(model.fire("Push", &mut state));
+            let count = (state["seq"] - state["lo"] + 1) as usize;
+            assert_eq!(rec.events.len(), count);
+            assert_eq!(rec.evicted, (state["lo"] - 1) as u64);
+            let q = sub.slot.queue.lock().unwrap();
+            assert_eq!(q.bursts.len(), count);
+            assert_eq!(q.dropped, (state["lo"] - 1) as u64);
+            assert_eq!(q.used, count);
+        }
+        drop(first);
+        assert!(
+            weak.upgrade().is_none(),
+            "evicted payload released by both queues"
+        );
+        assert_eq!(rec.events.capacity(), MAX_RETAINED_EVENTS);
+        eprintln!(
+            "tiny output retention: {} events, {} deque bytes; payload-only ceiling allowed {} deque bytes",
+            rec.events.len(),
+            rec.events.capacity() * std::mem::size_of::<Event>(),
+            DEFAULT_BUDGET_BYTES * std::mem::size_of::<Event>()
+        );
+        assert_eq!(
+            sub.slot.queue.lock().unwrap().bursts.capacity(),
+            MAX_RETAINED_EVENTS
+        );
+        assert!(
+            rec.to_asciicast()
+                .lines()
+                .next()
+                .unwrap()
+                .contains("aterm_truncated")
+        );
+        let (bursts, dropped) = sub.drain();
+        assert_eq!(bursts.len(), MAX_RETAINED_EVENTS);
+        assert_eq!(dropped, 9);
+        assert_eq!(sub.drain(), (Vec::new(), 0));
+
+        let old = interp::with_buggy(&model, 1);
+        let mut before = state.clone();
+        before.insert("seq", MAX_RETAINED_EVENTS as i64);
+        before.insert("lo", 1);
+        assert!(old.fire("Push", &mut before));
+        assert!(!model.check_invariant("EntriesBounded", &before));
+    }
+
+    #[test]
+    fn empty_live_bursts_use_no_queue_space() {
+        let fan = Arc::new(ByteFanout::new());
+        let sub = fan.subscribe();
+        for _ in 0..MAX_RETAINED_EVENTS + 1 {
+            fan.tee(&Arc::from(&b""[..]));
+        }
+        let q = sub.slot.queue.lock().unwrap();
+        assert_eq!(q.bursts.capacity(), 0);
+        assert_eq!(q.used, 0);
+        assert_eq!(q.dropped, 0);
+    }
+
     /// `fold_frames` is the "video" expansion: N keyframe engines stepping through
     /// the recording, each showing the screen as it was at ~k/N of the span. An
     /// empty recording yields no frames; a recording with output shows the LATER
@@ -659,7 +1218,6 @@ mod tests {
         let got = snap.fold_frames(count);
         assert_eq!(got.len(), count);
         // Reference: independently re-fold a FRESH engine per frame target.
-        use aterm_core::terminal::Terminal;
         let span = Duration::from_millis(300); // base is 0 here
         for (k, (_, rows)) in got.iter().enumerate() {
             let target = span * ((k + 1) as u32) / (count as u32);
@@ -893,6 +1451,95 @@ mod tests {
         assert_eq!(parse_event(cast.lines().nth(2).unwrap()).0, 0.400);
     }
 
+    /// A burst the READER dropped (its `try_send` failed) is disclosed in the
+    /// header as `aterm_dropped`, beside `aterm_truncated` when both happened,
+    /// and carried by the snapshot `cast drift` reads. With no drop the header
+    /// is the plain three-field object, byte for byte.
+    #[test]
+    fn a_dropped_burst_is_disclosed_in_the_header() {
+        let mut rec = CastRecorder::new(80, 24);
+        rec.record_output(Duration::from_millis(100), b"hi");
+        assert_eq!(
+            rec.to_asciicast().lines().next().unwrap(),
+            "{\"version\": 2, \"width\": 80, \"height\": 24}"
+        );
+        let drops = rec.drop_counter();
+        drops.note(4096);
+        drops.note(10);
+        let cast = rec.to_asciicast();
+        let header = cast.lines().next().unwrap();
+        assert_eq!(
+            header,
+            "{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_dropped\": \
+             {\"bursts\": 2, \"bytes\": 4106}}"
+        );
+        assert_eq!(rec.snapshot().dropped(), (2, 4106));
+        let parsed = aterm_control::cast_drift::parse_asciicast(&cast).expect("parses");
+        assert_eq!(
+            parsed.header.dropped,
+            Some(aterm_control::cast_drift::CastDrops {
+                bursts: 2,
+                bytes: 4106,
+            })
+        );
+        // Both disclosures at once stay one valid object.
+        let mut small = CastRecorder::with_budget(80, 24, 10);
+        for i in 0..10u32 {
+            small.record_output(Duration::from_secs(u64::from(i)), b"abcd");
+        }
+        small.drop_counter().note(1);
+        let header = small.to_asciicast().lines().next().unwrap().to_string();
+        assert!(header.contains("\"aterm_truncated\"") && header.contains("\"aterm_dropped\""));
+        let parsed = aterm_control::cast_drift::parse_asciicast(&small.to_asciicast())
+            .expect("both disclosures parse");
+        assert!(parsed.header.evicted > 0);
+    }
+
+    /// `cast drift` reads the snapshot on the SAME timeline the `cast` text
+    /// prints (rebased after an eviction), so the server's analysis and a
+    /// client's analysis of the fetched text see the same events — and a run's
+    /// `t=` is findable in the asciicast.
+    #[test]
+    fn drift_input_matches_the_asciicast_text() {
+        let mut rec = CastRecorder::with_budget(80, 24, 40);
+        for i in 0..20u32 {
+            rec.record_output(
+                Duration::from_millis(u64::from(i) * 1500 + 3),
+                b"abcd\x1b[2J",
+            );
+            if i % 5 == 0 {
+                rec.record_resize(Duration::from_millis(u64::from(i) * 1500 + 700), 80, 23);
+            }
+        }
+        let snap = rec.snapshot();
+        assert!(snap.evicted() > 0, "exercise the rebase");
+        let (header, events) = snap.drift_input();
+        let parsed =
+            aterm_control::cast_drift::parse_asciicast(&rec.to_asciicast()).expect("parses");
+        assert_eq!(parsed.header.width, header.width);
+        assert_eq!(parsed.header.height, header.height);
+        assert_eq!(parsed.header.evicted, header.evicted);
+        assert_eq!(parsed.events.len(), events.len());
+        for (a, b) in parsed.events.iter().zip(&events) {
+            use aterm_control::cast_drift::{CastEvent, fmt_t};
+            assert_eq!(fmt_t(a.t()), fmt_t(b.t()));
+            match (a, b) {
+                (CastEvent::Output { data: x, .. }, CastEvent::Output { data: y, .. }) => {
+                    assert_eq!(&x[..], &y[..]);
+                }
+                (
+                    CastEvent::Resize {
+                        cols: c1, rows: r1, ..
+                    },
+                    CastEvent::Resize {
+                        cols: c2, rows: r2, ..
+                    },
+                ) => assert_eq!((c1, r1), (c2, r2)),
+                _ => panic!("event kinds diverge"),
+            }
+        }
+    }
+
     /// A full round-trip: a header + several events parse as the asciicast v2
     /// shape `asciinema`-style parsing requires (header is a JSON object; each
     /// event line is a `[f64, string, string]` array).
@@ -1118,6 +1765,255 @@ mod tests {
             "second lifecycle delivers post-subscribe only"
         );
         assert_eq!(&bursts[0][..], b"again");
+    }
+
+    // ---- ENGINE-ORDERED CAST (P4(b)) --------------------------------------
+
+    /// The event kinds and payloads as written, oldest first: `o:<text>` and
+    /// `r:<cols>x<rows>`.
+    fn kinds(rec: &CastRecorder) -> Vec<String> {
+        rec.events
+            .iter()
+            .map(|ev| match ev {
+                Event::Output { data, .. } => format!("o:{}", String::from_utf8_lossy(data)),
+                Event::Resize { cols, rows, .. } => format!("r:{cols}x{rows}"),
+            })
+            .collect()
+    }
+
+    /// One reader hold: stamp the burst the way the reader does (inside the
+    /// hold, before its bytes), then process them.
+    fn hold(term: &mut Terminal, cuts: &mut CastCuts, at: usize, bytes: &[u8]) {
+        cuts.observe(at, term);
+        term.process(bytes);
+    }
+
+    /// One burst for the writer, as the reader hands it over.
+    fn burst(bytes: &[u8], cuts: CastCuts, t: Duration) -> CastBurst {
+        CastBurst::new(Arc::from(bytes), cuts, t)
+    }
+
+    /// The race P4(b) closes: burst A, then a resize, then burst B, in the
+    /// ENGINE; the recorder hears them in every order the two threads can
+    /// reach its lock in, and writes `A, r, B` each time, with non-decreasing
+    /// times. Recorded on arrival (the old taps: `now()` at the writer and at
+    /// the resizing thread) the resize lands after B in two of the three.
+    #[test]
+    fn a_resize_processed_between_two_bursts_serializes_between_them() {
+        let arrivals: [[u8; 3]; 3] = [[0, 1, 2], [1, 0, 2], [0, 2, 1]];
+        for order in arrivals {
+            let mut rec = CastRecorder::new(20, 8);
+            let mut term = Terminal::new(8, 20);
+            let mut a = CastCuts::default();
+            let ta = rec.now();
+            hold(&mut term, &mut a, 0, b"A");
+            term.resize(7, 20);
+            let r = ResizeStamp::take(&term);
+            let mut b = CastCuts::default();
+            let tb = rec.now();
+            hold(&mut term, &mut b, 0, b"B");
+            let (mut a, mut b) = (Some(a), Some(b));
+            for which in order {
+                match which {
+                    0 => rec.record_burst(burst(b"A", a.take().expect("once"), ta)),
+                    1 => rec.record_resize_stamped(r, 20, 7),
+                    _ => rec.record_burst(burst(b"B", b.take().expect("once"), tb)),
+                }
+            }
+            assert_eq!(kinds(&rec), ["o:A", "r:20x7", "o:B"], "arrival {order:?}");
+            let ts: Vec<Duration> = rec.events.iter().map(Event::t).collect();
+            assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{order:?}: {ts:?}");
+        }
+
+        // The negative control: the same arrivals on the old taps (each
+        // stamped `now()` on arrival, appended) misplace the resize.
+        let mut old = CastRecorder::new(20, 8);
+        old.record_output(old.now(), b"A");
+        old.record_output(old.now(), b"B");
+        old.record_resize(old.now(), 20, 7);
+        assert_eq!(kinds(&old), ["o:A", "o:B", "r:20x7"]);
+    }
+
+    /// A burst whose slices a resize split (the reader releases the lock
+    /// between slices, and the resize took it there) is cut at the slice: its
+    /// head before the resize, its tail after, in either arrival order.
+    #[test]
+    fn a_burst_straddling_a_resize_is_cut_at_the_slice() {
+        for resize_first in [false, true] {
+            let mut rec = CastRecorder::new(20, 8);
+            let mut term = Terminal::new(8, 20);
+            let mut cuts = CastCuts::default();
+            // The reader's one reading, before its first hold.
+            let arrived = rec.now();
+            hold(&mut term, &mut cuts, 0, b"head");
+            hold(&mut term, &mut cuts, 4, b"+more");
+            assert_eq!(cuts.pieces(), 1, "no resize yet: one piece");
+            assert!(cuts.rest.is_none(), "an uncut burst allocates nothing");
+            term.resize(7, 20);
+            let r = ResizeStamp::take(&term);
+            hold(&mut term, &mut cuts, 9, b"tail");
+            assert_eq!(cuts.pieces(), 2, "cut where the resize took the lock");
+            if resize_first {
+                rec.record_resize_stamped(r, 20, 7);
+            }
+            rec.record_burst(burst(b"head+moretail", cuts, arrived));
+            if !resize_first {
+                rec.record_resize_stamped(r, 20, 7);
+            }
+            assert_eq!(
+                kinds(&rec),
+                ["o:head+more", "r:20x7", "o:tail"],
+                "resize first: {resize_first}"
+            );
+            // One time for both pieces, clamped against the resize's: the
+            // timeline stays non-decreasing in the engine's order.
+            let ts: Vec<Duration> = rec.events.iter().map(Event::t).collect();
+            assert!(
+                ts.windows(2).all(|w| w[0] <= w[1]),
+                "{resize_first}: {ts:?}"
+            );
+        }
+
+        // A hold that processed nothing (an empty manual reset) is superseded
+        // by the next hold at the same offset: no empty piece, and no cut list
+        // allocated for it (it used to leave an empty one behind, and the
+        // recorder then copied the whole burst as if it had been cut).
+        let mut term = Terminal::new(8, 20);
+        let mut cuts = CastCuts::default();
+        cuts.observe(0, &term);
+        term.resize(7, 20);
+        cuts.observe(0, &term);
+        assert_eq!(cuts.pieces(), 1);
+        assert_eq!(cuts.first.map(|s| s.ordinal), Some(1));
+        assert!(
+            cuts.rest.is_none(),
+            "superseding the first stamp allocates nothing"
+        );
+    }
+
+    /// A one-piece burst keeps the reader's allocation (a refcount, not a
+    /// copy), even when handed an EMPTY cut list: the recorder reads it as no
+    /// cut at all.
+    #[test]
+    fn a_one_piece_burst_keeps_the_readers_allocation() {
+        let term = Terminal::new(8, 20);
+        let mut rec = CastRecorder::new(20, 8);
+        for rest in [None, Some(Box::default())] {
+            let mut cuts = CastCuts::default();
+            cuts.observe(0, &term);
+            cuts.rest = rest;
+            let bytes: Arc<[u8]> = Arc::from(&b"shared"[..]);
+            rec.record_burst(CastBurst::new(bytes.clone(), cuts, rec.now()));
+            let Some(Event::Output { data, .. }) = rec.events.back() else {
+                panic!("an output event");
+            };
+            assert!(Arc::ptr_eq(data, &bytes), "no copy of a one-piece burst");
+        }
+    }
+
+    /// Why the order matters: on the alternate screen a shrink demotes the top
+    /// row, so a diff frame drawn before the flap and one drawn after it leave
+    /// different screens. The engine-ordered recording replays to the live
+    /// screen; the arrival-ordered one (the resize written after the burst the
+    /// engine processed first) replays to a screen the session never showed.
+    #[test]
+    fn the_engine_ordered_recording_replays_to_the_live_screen() {
+        const ROWS: u16 = 6;
+        let frame: Vec<u8> = {
+            let mut f = String::from("\x1b[?1049h\x1b[2J");
+            for r in 0..ROWS {
+                f.push_str(&format!("\x1b[{};1HL{r}", r + 1));
+            }
+            f.push_str("\x1b[4;3H");
+            f.into_bytes()
+        };
+        // A diff frame at an absolute row: where it lands depends on whether
+        // the shrink moved the rows first.
+        let diff = b"\x1b[1;1HT1\x1b[K\x1b[4;3H".to_vec();
+        let mut live = Terminal::new(ROWS, 20);
+        let mut rec = CastRecorder::new(20, ROWS);
+        let mut old = CastRecorder::new(20, ROWS);
+        let mut c0 = CastCuts::default();
+        let t0 = rec.now();
+        hold(&mut live, &mut c0, 0, &frame);
+        live.resize(ROWS - 1, 20);
+        let shrink = ResizeStamp::take(&live);
+        let mut c1 = CastCuts::default();
+        let t1 = rec.now();
+        hold(&mut live, &mut c1, 0, &diff);
+        live.resize(ROWS, 20);
+        let grow = ResizeStamp::take(&live);
+        // The writer records both bursts before the main thread records
+        // either resize: the race.
+        rec.record_burst(burst(&frame, c0, t0));
+        rec.record_burst(burst(&diff, c1, t1));
+        rec.record_resize_stamped(shrink, 20, ROWS - 1);
+        rec.record_resize_stamped(grow, 20, ROWS);
+        old.record_output(Duration::from_millis(1), &frame);
+        old.record_output(Duration::from_millis(2), &diff);
+        old.record_resize(Duration::from_millis(3), 20, ROWS - 1);
+        old.record_resize(Duration::from_millis(4), 20, ROWS);
+
+        let screen = |t: &Terminal| -> Vec<String> {
+            (0..t.rows() as usize)
+                .map(|r| crate::control::visible_row(t, r))
+                .collect()
+        };
+        let last = |rec: &CastRecorder| {
+            rec.snapshot()
+                .fold_frames(1)
+                .pop()
+                .map(|(_, rows)| rows)
+                .expect("a frame")
+        };
+        assert_eq!(
+            last(&rec),
+            screen(&live),
+            "engine order replays the live screen"
+        );
+        assert_ne!(last(&old), screen(&live), "arrival order does not");
+        // And the parsed text keeps that order (`cast drift` reads it).
+        let parsed =
+            aterm_control::cast_drift::parse_asciicast(&rec.to_asciicast()).expect("parses");
+        let codes: Vec<&str> = parsed
+            .events
+            .iter()
+            .map(|ev| match ev {
+                aterm_control::cast_drift::CastEvent::Output { .. } => "o",
+                aterm_control::cast_drift::CastEvent::Resize { .. } => "r",
+            })
+            .collect();
+        assert_eq!(codes, ["o", "r", "o", "r"]);
+    }
+
+    /// Two engines in one session (a restored engine, a new lifetime token):
+    /// the newer engine's events sort after the older one's, and each
+    /// engine's own ordinals order its events.
+    #[test]
+    fn a_newer_engine_sorts_after_the_older_one() {
+        let mut rec = CastRecorder::new(20, 8);
+        let mut old = Terminal::new(8, 20);
+        old.resize(7, 20);
+        let old_resize = ResizeStamp::take(&old);
+        let mut fresh = Terminal::new(8, 20);
+        assert!(fresh.resize_lifetime() > old.resize_lifetime());
+        let mut cuts = CastCuts::default();
+        hold(&mut fresh, &mut cuts, 0, b"new");
+        rec.record_burst(burst(b"new", cuts, rec.now()));
+        rec.record_resize_stamped(old_resize, 20, 7);
+        assert_eq!(kinds(&rec), ["r:20x7", "o:new"]);
+    }
+
+    /// The cast queue preallocates `CAST_QUEUE_CAP` (1024) slots per session,
+    /// so the stamped burst's size is a per-session memory cost: 16 bytes of
+    /// shared bytes, a 24-byte first stamp, one pointer for the rare cuts and
+    /// an 8-byte time. Pinned so a field added here is a decision, not an
+    /// accident.
+    #[test]
+    fn a_stamped_burst_stays_small_in_the_queue() {
+        assert_eq!(std::mem::size_of::<Arc<[u8]>>(), 16);
+        assert_eq!(std::mem::size_of::<CastCuts>(), 32);
+        assert_eq!(std::mem::size_of::<CastBurst>(), 56);
     }
 
     // ---- test helper: a minimal asciicast-event parser ----

@@ -129,6 +129,21 @@ pub(crate) enum Verdict {
         /// The yanked build.
         from: Installed,
     },
+    /// The verified build's platform signature check did not FINISH in time
+    /// ([`StageError::VerifyDeferred`]): no verdict on the bytes and no fault, so nothing
+    /// moved, nothing is memoized, its archive is kept, and the next pass checks it again.
+    /// Not a failure ([`Outcome::is_failure`]) — until 2026-09-26 it was a
+    /// [`Verdict::Failed`], and codex 0.157.0's 238 MB binary, IO-throttled under the
+    /// window's utility clamp, raised "Package update failed" twice on 2026-09-25 for a
+    /// build that verified 21 s later.
+    Deferred {
+        /// The version whose check did not finish.
+        version: Version,
+        /// Which file, and codesign's words.
+        why: String,
+        /// What stays active.
+        keeping: Installed,
+    },
     /// Landing a verified build failed on this machine (a download, the disk, a shim).
     Failed {
         /// The version that did not land.
@@ -162,8 +177,9 @@ impl Outcome {
     }
 
     /// Why the vendor's head is not what runs, for a row that keeps the active build — a
-    /// hold, a yank, a newer install, a rollback, an unreached channel: no fault, and never
-    /// a claim to be the latest. `None` for every other verdict.
+    /// hold, a yank, a newer install, a rollback, an unreached channel, a signature check
+    /// that did not finish ([`Verdict::Deferred`]): no fault, and never a claim to be the
+    /// latest. `None` for every other verdict.
     #[must_use]
     pub(crate) fn kept_clause(&self) -> Option<String> {
         let vendor = self.spec.vendor;
@@ -197,12 +213,16 @@ impl Outcome {
                 format!("rolled back from yanked {}", installed_words(*from))
             }
             Verdict::Unreachable { .. } => format!("{vendor}'s release channel was not reached"),
+            Verdict::Deferred { version, .. } => {
+                format!("{latest} ({version}) waits for its signature check to finish")
+            }
             _ => return None,
         })
     }
 
     /// Whether this is a fault the caller counts (a refusal, a failed landing, a
-    /// tombstone). An unreachable vendor is not: nothing was checked, nothing is wrong.
+    /// tombstone). An unreachable vendor is not: nothing was checked, nothing is wrong —
+    /// nor is a deferred signature check ([`Verdict::Deferred`]): nothing was judged.
     #[must_use]
     pub(crate) const fn is_failure(&self) -> bool {
         matches!(
@@ -286,6 +306,7 @@ impl Outcome {
             Verdict::Current(v) => Some(*v),
             Verdict::Kept { keeping, .. }
             | Verdict::Unreachable { keeping, .. }
+            | Verdict::Deferred { keeping, .. }
             | Verdict::Refused { keeping, .. }
             | Verdict::Failed { keeping, .. } => keeping.version(),
             Verdict::Tombstoned { .. } | Verdict::Linked => None,
@@ -701,7 +722,16 @@ pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
                     | FlowError::StageRefused(_)
                     | FlowError::VendorRefused(_)
             );
-            let v = if refused {
+            // The signature check did not finish: a wait, never a refusal or a failure
+            // (2026-09-26). A yanked installed build still takes the fallback below, as
+            // for any landing that did not happen.
+            let v = if let FlowError::Stage(StageError::VerifyDeferred(why)) = &e {
+                Verdict::Deferred {
+                    version: c.version,
+                    why: why.clone(),
+                    keeping: pending.installed,
+                }
+            } else if refused {
                 Verdict::Refused {
                     version: Some(c.version),
                     why: e.to_string(),
@@ -1274,6 +1304,15 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
             "atpkg: {p} {version} could not be installed: {error} — {}",
             keeping(*k)
         ),
+        Verdict::Deferred {
+            version,
+            why,
+            keeping: k,
+        } => format!(
+            "atpkg: {p} {version} deferred: its signature check did not finish ({why}); the \
+             next pass checks it again — {}",
+            keeping(*k)
+        ),
         Verdict::Linked => format!("atpkg: {p} dev-linked — skipped"),
     }
 }
@@ -1354,6 +1393,23 @@ pub(crate) mod world {
             stderr: "test-requirement: code failed to satisfy specified code requirement(s)\n"
                 .into(),
         })
+    }
+
+    fn timeout_check(
+        _: &Path,
+        _: &str,
+        _: std::time::Instant,
+    ) -> Result<(), aterm_update_core::codesign::CodesignError> {
+        Err(aterm_update_core::codesign::CodesignError::TimedOut)
+    }
+
+    /// [`trust`] with a codesign stand-in that never finishes by its deadline — codex's
+    /// 238 MB binary under the window's utility clamp on 2026-09-25.
+    pub(crate) fn trust_timing_out() -> Trust {
+        Trust {
+            team_check: timeout_check,
+            ..trust()
+        }
     }
 
     /// The test key and a codesign stand-in that passes.
@@ -2374,6 +2430,61 @@ mod tests {
                 "no Apple anchor off macOS"
             );
         }
+    }
+
+    /// A SIGNATURE CHECK THAT DID NOT FINISH IS A WAIT, NOT A FAILURE (2026-09-26). On
+    /// 2026-09-25 codex 0.157.0's 238 MB binary ran past codesign's deadline twice under
+    /// the window's utility clamp, and each pass was a `Verdict::Failed` — exit 1, "Package
+    /// update failed" — for bytes that verified 21 s later. Now a timeout is
+    /// `Verdict::Deferred`: no failure, the installed build kept, nothing memoized (the
+    /// next pass is not refused as a signer memo would be), the verified archive carried
+    /// (the next pass re-stages it with no download), and that pass lands it. The control
+    /// in the same world: a real signature refusal is still a memoized failure
+    /// (`a_signer_refusal_is_memoized_like_a_digest_refusal`).
+    #[test]
+    fn a_signature_check_that_did_not_finish_defers_and_the_next_pass_lands_it() {
+        let l = world::layout("deferred");
+        let f = Fake::default();
+        f.publish_claude("2.1.281", &native_exe("a"));
+        run(&l, &f, &Policy::default(), claude());
+        f.publish_claude("2.1.282", &native_exe("b"));
+        let slow = world::trust_timing_out();
+        let o = run_with(&l, &f, &Policy::default(), &slow, claude(), false);
+        if !cfg!(target_os = "macos") {
+            assert!(
+                matches!(o.verdict, Verdict::Installed { .. }),
+                "no Apple anchor off macOS"
+            );
+            return;
+        }
+        assert!(matches!(o.verdict, Verdict::Deferred { .. }), "{o:?}");
+        assert!(!o.is_failure(), "a wait is never a failure");
+        assert_eq!(o.active_version(), Some(v("2.1.281")));
+        assert!(
+            o.line().starts_with(
+                "atpkg: claude 2.1.282 deferred: its signature check did not \
+                 finish (bin/claude: /usr/bin/codesign did not finish in time)"
+            ),
+            "{}",
+            o.line()
+        );
+        assert!(o.line().ends_with("— keeping 2.1.281"), "{}", o.line());
+        assert_eq!(
+            o.kept_clause().as_deref(),
+            Some("Anthropic's latest (2.1.282) waits for its signature check to finish")
+        );
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.281").build_id()));
+        // Not memoized, and the archive is carried: the next pass (codesign finishing now)
+        // lands the same bytes without fetching them again.
+        let downloads = f.downloads.borrow().len();
+        let o = run(&l, &f, &Policy::default(), claude());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+        assert_eq!(shim_build(&l, "claude"), Some(v("2.1.282").build_id()));
+        assert_eq!(
+            f.downloads.borrow().len(),
+            downloads,
+            "the verified archive was kept for the retry"
+        );
     }
 
     #[test]

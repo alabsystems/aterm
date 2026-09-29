@@ -77,9 +77,18 @@ impl WarmTier {
     /// # Panics
     ///
     /// Debug-asserts that `n <= self.line_count`.
-    // Skip: the residue is the blanket-unmodeled `drain`/iterator class plus
-    // the boundary rebuild's alloc — the arithmetic above is now saturating and
-    // proven. ARENA-SCROLL tested. Droppable with resize-aware tracking.
+    // Skip. Re-measured 2026-09-27 on seal 321aaeda7 with it removed (`targo
+    // trust check -p aterm-scrollback --lib --allow-l0-gaps`): VIOLATIONS, 7
+    // obligations. 1 proved. 1 refuted, falsely: the slice bound of
+    // `&lines[..keep]` (counterexample `keep = 1`) — the verifier does not
+    // relate `keep = lines.len().saturating_sub(boundary_trim)` to the Vec
+    // `decompress()` returned. 5 unknown: Overflow(Add) in the `.sum()` closures
+    // (2), the front trim's `pop_front().expect` (2 rows) and the global-alloc
+    // dealloc contract. The phase-1 arithmetic is saturating and raises no row.
+    // ARENA-SCROLL tested. Needed from $HOME/trust, in a promoted seal: a slice
+    // bound that follows a local derived from the slice's own `len()`,
+    // Overflow(Add) inside an iterator `sum` closure, and `Option::expect`
+    // panic-freedom from the `front()` guard that precedes it; then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_back_lines(&mut self, n: usize) -> Result<(), crate::ScrollbackError> {
         if n == 0 {

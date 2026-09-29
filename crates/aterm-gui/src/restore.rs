@@ -188,9 +188,31 @@ pub(crate) struct TerminalLeafRestore {
     /// writes, so an end they did not choose (a crash, a kill, a power loss,
     /// the system's quit) relaunches it on its conversation in its restored
     /// tab, and one they chose does not.
+    ///
+    /// ON A SEAMLESS UPDATE'S HANDOFF LAYOUT (round four of the 2026-09
+    /// update robustness work, plan item 7) it names an agent a cold
+    /// restore's relaunch queue STILL OWED this tab at the park
+    /// (`HostHandle::pending_restored_for`), and nothing else: the successor
+    /// relaunches it in the adopted shell the leaf names at its Commit
+    /// (`App::hand_carried_restored_agents`). An older producer never writes
+    /// one on a handoff leaf, and an older successor ignores it there.
     /// Boxed: the other leaf kinds are a fraction of its size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<Box<AgentRestore>>,
+    /// HELD BY A PROGRAM (audit #8; additive, absent tolerated, written only
+    /// when true): at capture a program other than the pane's shell held its
+    /// PTY (ssh, a container's shell, vim — the quit confirm's `tcgetpgrp`
+    /// test), and it was not the agent aterm hosts there, which runs on this
+    /// machine (`App::hosted_agent`), so `cwd` may name a folder on another
+    /// machine
+    /// ([`Self::folder_may_be_remote`]). The restore then takes it only when
+    /// a shell can start in it here ([`Self::start_cwd`]), as a New Tab from
+    /// that pane does. Only the durable capture (quit,
+    /// crash journal, a closed tab) records it; the seamless update's layout
+    /// never does, since its Commit compares layouts and a program may start
+    /// or end in between.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
 }
 
 /// A hosted agent as its leaf's restore carries it (see
@@ -214,6 +236,76 @@ pub(crate) struct AgentRestore {
     /// Its version, when it had registered one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// A CODEX's run (its home, its mode, when it started): what its
+    /// relaunch reads beside the thread `session` names. `None` for Claude
+    /// Code — and a Codex whose run is lost is relaunched by no lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexRestore>,
+}
+
+/// A Codex TUI's run as its leaf's restore carries it
+/// (`aterm_agent::harness::relaunch::CodexRun`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct CodexRestore {
+    /// The `$CODEX_HOME` it ran with.
+    pub home: String,
+    /// It held its thread's writer lock itself; `false`: its daemon did.
+    pub embedded: bool,
+    /// When it started, unix milliseconds.
+    pub started_ms: u64,
+}
+
+impl AgentRestore {
+    /// The durable half of the relaunch snapshot `snap`.
+    pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
+        Self {
+            pid: snap.pid,
+            start: snap.start,
+            program: snap.program.to_string_lossy().into_owned(),
+            argv: snap.argv,
+            session: snap.session,
+            cwd: snap.cwd,
+            version: snap.version,
+            codex: snap.codex.map(|run| CodexRestore {
+                home: run.home.to_string_lossy().into_owned(),
+                embedded: run.embedded,
+                started_ms: run.started_ms,
+            }),
+        }
+    }
+
+    /// The relaunch snapshot of this agent in the reopened tab `tab`, whose
+    /// shell is `shell`.
+    pub(crate) fn snapshot(
+        self,
+        tab: String,
+        shell: u32,
+    ) -> aterm_agent::harness::relaunch::Snapshot {
+        aterm_agent::harness::relaunch::Snapshot {
+            tab,
+            pid: self.pid,
+            start: self.start,
+            shell,
+            program: std::path::PathBuf::from(self.program),
+            argv: self.argv,
+            session: self.session,
+            cwd: self.cwd,
+            version: self.version,
+            codex: self
+                .codex
+                .map(|run| aterm_agent::harness::relaunch::CodexRun {
+                    home: std::path::PathBuf::from(run.home),
+                    embedded: run.embedded,
+                    started_ms: run.started_ms,
+                    ambiguous: false,
+                }),
+            // Read by the frozen remedy's wording alone
+            // (`relaunch::resumes_on_exit`), never by the relaunch, whose plan
+            // reads the shell's dialect itself when it runs; and not read here,
+            // on the event loop, from a shell that just started.
+            dialect: None,
+        }
+    }
 }
 
 impl AgentRestore {
@@ -238,6 +330,22 @@ pub(crate) fn agent_resumes(session: Option<&str>, argv: &[String]) -> bool {
 }
 
 impl TerminalLeafRestore {
+    /// Whether this leaf's folder may be another machine's: a program held
+    /// the pane ([`Self::held`]), and the leaf carries no agent aterm hosted
+    /// there ([`Self::agent`]), which ran on this machine in that folder.
+    pub(crate) fn folder_may_be_remote(&self) -> bool {
+        self.held && self.agent.is_none()
+    }
+
+    /// The folder this leaf's fresh shell is asked to start in: its `cwd`,
+    /// unless that folder may be another machine's
+    /// ([`Self::folder_may_be_remote`]) and no shell can start in it here.
+    /// Then it is not asked for and not reported: the shell starts where one
+    /// with no folder would ([`crate::spawn_folder::inherited`]).
+    pub(crate) fn start_cwd(&self) -> Option<String> {
+        crate::spawn_folder::inherited(self.cwd.clone()?, || self.folder_may_be_remote())
+    }
+
     /// The six USER fields this leaf carries, as the values of the
     /// [`SessionMeta`](crate::session_timeline::SessionMeta) they were captured
     /// from.
@@ -281,33 +389,33 @@ impl TerminalLeafRestore {
         self.user_title = self
             .user_title
             .as_deref()
-            .and_then(|value| crate::session_timeline::sanitize_metadata_value("title", value));
-        self.description = self.description.as_deref().and_then(|value| {
-            crate::session_timeline::sanitize_metadata_value("description", value)
-        });
+            .and_then(|value| carried_user_value("title", value));
+        self.description = self
+            .description
+            .as_deref()
+            .and_then(|value| carried_user_value("description", value));
         self.icon = self
             .icon
             .as_deref()
-            .and_then(|value| crate::session_timeline::sanitize_metadata_value("icon", value));
+            .and_then(|value| carried_user_value("icon", value));
         self.role = self
             .role
             .as_deref()
-            .and_then(|value| crate::session_timeline::sanitize_metadata_value("role", value));
+            .and_then(|value| carried_user_value("role", value));
         self.attention = self
             .attention
             .as_deref()
-            .and_then(|value| crate::session_timeline::sanitize_metadata_value("attention", value));
+            .and_then(|value| carried_user_value("attention", value));
         self.questions = self
             .questions
             .as_deref()
-            .and_then(|value| crate::session_timeline::sanitize_metadata_value("questions", value));
+            .and_then(|value| carried_user_value("questions", value));
     }
 
     fn user_metadata_is_canonical(&self) -> bool {
         let canonical = |field: &str, value: &Option<String>| {
             value.as_ref().is_none_or(|value| {
-                crate::session_timeline::sanitize_metadata_value(field, value).as_deref()
-                    == Some(value.as_str())
+                carried_user_value(field, value).as_deref() == Some(value.as_str())
             })
         };
         canonical("title", &self.user_title)
@@ -369,6 +477,20 @@ where
             .collect(),
         Entries::Unreadable(_) => vec![unreadable()],
     })
+}
+
+/// One USER field as a restore carries it: the presentation sanitizer, and for
+/// `attention` the carry's own rule as well
+/// ([`crate::session_timeline::carried_attention`]). The ONE rule both
+/// `sanitize_user_metadata` and `user_metadata_is_canonical` ask, so a
+/// sanitized leaf is canonical by construction: a value the sanitizer kept and
+/// the canonical check refused would make `from_toml` refuse the WHOLE
+/// manifest — on a handoff, the layout lost to the orphan net.
+fn carried_user_value(field: &str, value: &str) -> Option<String> {
+    if field == "attention" {
+        return crate::session_timeline::carried_attention(value);
+    }
+    crate::session_timeline::sanitize_metadata_value(field, value)
 }
 
 /// Per-view native state. Canonical document bytes and draft contents deliberately do not
@@ -587,6 +709,27 @@ pub(crate) struct PlaceholderLeafRestore {
     pub reason: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub metadata: String,
+    /// The terminal leaf this placeholder stands in for, when a seamless
+    /// successor retired it because no session was handed for it
+    /// ([`RestoreManifest::placed_for_handed`]): its outgoing pool id is what
+    /// a held pane's carried screen is matched by (`App::restore_held_leaf`,
+    /// round five, item 19), and its user identity — the `meta set` title,
+    /// icon, role, description, the spawn identity — is what that pane is
+    /// shown with (round six of the update audit, finding 35). NEVER ON THE
+    /// WIRE: set only by the successor's own placement, so no layout a
+    /// producer writes can name one.
+    #[serde(skip)]
+    pub unhanded: Option<Box<TerminalLeafRestore>>,
+}
+
+impl PlaceholderLeafRestore {
+    /// The outgoing pool id of the retired terminal leaf this placeholder
+    /// stands in for ([`Self::unhanded`]).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn unhanded_local_id(&self) -> Option<u64> {
+        self.unhanded.as_ref().and_then(|leaf| leaf.local_id)
+    }
 }
 
 /// Content descriptor at one recursive restore leaf.
@@ -613,6 +756,7 @@ impl RestoredView {
                     restore_tag: native.restore_tag.clone(),
                     reason: reason.to_string(),
                     metadata: native.copyable_metadata(),
+                    unhanded: None,
                 });
             }
             Self::Placeholder(_) => {}
@@ -750,10 +894,12 @@ impl RestoredSplitTree {
                     .chars()
                     .take(MAX_VIEW_METADATA_BYTES / 4)
                     .collect();
+                let unhanded = Some(Box::new(terminal.clone()));
                 *view = RestoredView::Placeholder(PlaceholderLeafRestore {
                     restore_tag: "terminal".to_string(),
                     reason: crate::update_words::PANE_NOT_CARRIED.to_string(),
                     metadata,
+                    unhanded,
                 });
             }
             Self::Split { first, second, .. } => {
@@ -799,19 +945,19 @@ impl RestoredSplitTree {
         }
     }
 
-    /// The first directory a TERMINAL leaf of this tree recorded, in the same
-    /// walk as [`Self::first_terminal_leaf`]: that leaf's own cwd when it has
-    /// one, else the next terminal pane's that does — see
+    /// The first TERMINAL leaf of this tree that recorded a directory, in the
+    /// same walk as [`Self::first_terminal_leaf`]: that leaf when it has one,
+    /// else the next terminal pane that does — see
     /// [`WindowLayout::bootstrap_cwd`].
-    fn first_terminal_cwd(&self) -> Option<&str> {
+    fn first_terminal_with_cwd(&self) -> Option<&TerminalLeafRestore> {
         match self {
             Self::Leaf {
                 view: RestoredView::Terminal(terminal),
-            } => terminal.cwd.as_deref(),
+            } => terminal.cwd.is_some().then_some(terminal),
             Self::Leaf { .. } => None,
             Self::Split { first, second, .. } => first
-                .first_terminal_cwd()
-                .or_else(|| second.first_terminal_cwd()),
+                .first_terminal_with_cwd()
+                .or_else(|| second.first_terminal_with_cwd()),
         }
     }
 }
@@ -1160,11 +1306,20 @@ impl WindowLayout {
     /// first directory another terminal pane of the SAME tab recorded, in
     /// rebuild order, since panes split off one another usually share a
     /// directory. Never another tab's: when no pane of this tab recorded a
-    /// directory, the bootstrap starts in the default one.
-    pub(crate) fn bootstrap_cwd(&self) -> Option<&str> {
+    /// directory, the bootstrap starts in the default one. The leaf's
+    /// [`TerminalLeafRestore::start_cwd`] decides it, so a folder a program's
+    /// pane reported that is not here (ssh's remote one) is not asked for;
+    /// the legacy mirror records no program and passes its folder as it is.
+    pub(crate) fn bootstrap_cwd(&self) -> Option<String> {
         match self.bootstrap_tab() {
-            Some(tab) => tab.root.first_terminal_cwd(),
-            None => self.tabs.first()?.leaves().first()?.cwd(),
+            Some(tab) => tab.root.first_terminal_with_cwd()?.start_cwd(),
+            None => self
+                .tabs
+                .first()?
+                .leaves()
+                .first()?
+                .cwd()
+                .map(str::to_owned),
         }
     }
 
@@ -1342,6 +1497,7 @@ impl RestoredTab {
                         questions: None,
                         identity: None,
                         agent: None,
+                        held: false,
                     }))
                 }
                 PaneLayout::Split {
@@ -1423,10 +1579,19 @@ impl RestoreManifest {
     }
 
     /// Return the exact set of live terminal ids carried by a seamless-update
-    /// layout. Durable cold-restore manifests intentionally omit these ids, so
-    /// they are not valid handoff authority. A duplicate or missing id is also
-    /// rejected: either would make one inherited PTY ambiguous or leave a
-    /// terminal leaf backed by a newly spawned shell during the overlap.
+    /// layout, sorted and distinct. Durable cold-restore manifests
+    /// intentionally omit these ids, so they are not valid handoff authority.
+    /// A terminal leaf with NO id is rejected: it would be backed by a newly
+    /// spawned shell during the overlap.
+    ///
+    /// AN ID NAMED TWICE IS ONE SESSION SHOWN TWICE (round six, finding 10).
+    /// `Open Session in New Window` (Cmd-Shift-O) puts one pooled session in
+    /// two views, and every build's capture stamps that session's id on both
+    /// leaves. Rejecting the repeat dropped the WHOLE layout on every update
+    /// for as long as the co-view stayed open: every window folded into tabs
+    /// of the first. The successor adopts the shell at the first leaf it
+    /// rebuilds that names it and shows it again at every later one
+    /// (`App::restore_terminal_leaf`), so a repeat is not ambiguous.
     pub(crate) fn seamless_terminal_ids(&self) -> Option<Vec<u64>> {
         fn collect(node: &RestoredSplitTree, ids: &mut Vec<u64>) -> Option<()> {
             match node {
@@ -1449,9 +1614,7 @@ impl RestoreManifest {
             }
         }
         ids.sort_unstable();
-        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
-            return None;
-        }
+        ids.dedup();
         Some(ids)
     }
 
@@ -1527,9 +1690,11 @@ impl RestoreManifest {
     /// exact check exists for: each handed PTY is still named exactly once
     /// (nothing ambiguous), and no terminal leaf is left to be backed by a
     /// shell spawned during the overlap (the unhanded one is no terminal any
-    /// more). A layout that MISSES a handed session, names one twice, or has a
-    /// terminal leaf with no id at all is still unplaced: those are not a pane
-    /// the outgoing process chose not to hand, and the orphan net answers them.
+    /// more). A layout that MISSES a handed session or has a terminal leaf
+    /// with no id at all is still unplaced: those are not a pane the outgoing
+    /// process chose not to hand, and the orphan net answers them. A session
+    /// NAMED twice is a co-view, and is placed (see
+    /// [`Self::seamless_terminal_ids`]); one HANDED twice is not placed.
     pub(crate) fn placed_for_handed(mut self, expected: &[u64]) -> Result<Self, Self> {
         let Some(named) = self.seamless_terminal_ids() else {
             return Err(self);
@@ -1592,7 +1757,7 @@ impl RestoreManifest {
     /// [`WindowLayout::bootstrap_cwd`] — so its spawn can start in the right
     /// directory (every other leaf is spawned later by `apply_pending_restore`
     /// with its own cwd).
-    pub(crate) fn first_leaf_cwd(&self) -> Option<&str> {
+    pub(crate) fn first_leaf_cwd(&self) -> Option<String> {
         self.windows.first()?.bootstrap_cwd()
     }
 
@@ -2184,6 +2349,7 @@ mod tests {
             questions: None,
             identity: None,
             agent: None,
+            held: false,
         }))
     }
 
@@ -2299,6 +2465,18 @@ mod tests {
         assert_eq!(retired.reason, crate::update_words::PANE_NOT_CARRIED);
         assert!(retired.metadata.contains("build"), "{}", retired.metadata);
         assert_eq!(
+            retired.unhanded_local_id(),
+            Some(7),
+            "the placeholder names the pane a held screen is matched by"
+        );
+        assert!(
+            !placed
+                .to_toml()
+                .expect("the placed layout serializes")
+                .contains("unhanded"),
+            "and that id never reaches a wire"
+        );
+        assert_eq!(
             placed.carried_settings_drafts(),
             (
                 vec![SettingsDraftRestore {
@@ -2347,6 +2525,46 @@ mod tests {
             unnamed.placed_for_handed(&[0]).is_err(),
             "a leaf with no id"
         );
+    }
+
+    /// ROUND SIX, FINDING 10: a layout that names one session in two leaves —
+    /// `Open Session in New Window` — is PLACED, whole: the repeat is one
+    /// session shown twice, not an ambiguous PTY. Before this, every update
+    /// taken while a co-view was open dropped the layout, and every window
+    /// folded into tabs of the first.
+    #[test]
+    fn a_layout_naming_a_session_in_two_windows_is_placed_whole() {
+        let mut desk = held_desk(Some(7));
+        desk.windows.push(WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            show: WindowShow::UNKNOWN,
+            tabs: vec![PaneLayout::Leaf {
+                cwd: Some("/tmp/work".to_string()),
+                title: "zsh".to_string(),
+                focused: true,
+                local_id: Some(0),
+            }],
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: Some(0),
+            restored_tabs: vec![RestoredTab {
+                root: terminal(Some(0), "zsh"),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        });
+        let parsed = RestoreManifest::from_toml(&desk.to_toml().unwrap())
+            .expect("the successor parses a co-viewed layout");
+        assert_eq!(parsed.seamless_terminal_ids(), Some(vec![0, 7]));
+        let placed = parsed
+            .placed_for_handed(&[0, 7])
+            .expect("a co-viewed session does not unplace the layout");
+        assert_eq!(placed.windows.len(), 2, "both windows are kept");
     }
 
     /// The placeholder's reason fits the leaf it is written into: a reason over
@@ -2720,6 +2938,11 @@ mod tests {
             }
             for desk in fs::read_dir(&release).expect("a release's desks") {
                 let desk = desk.expect("a desk").path();
+                // A release directory also holds files of its own (its
+                // `rendezvous.toml`); only its directories are desks.
+                if !desk.is_dir() {
+                    continue;
+                }
                 for file in fs::read_dir(&desk).expect("a desk's files") {
                     let path = file.expect("a fixture file").path();
                     if !path.to_string_lossy().ends_with(".layout.toml") {
@@ -2775,6 +2998,50 @@ mod tests {
             description
         ));
         assert!(terminal.user_metadata_is_canonical());
+    }
+
+    /// The retired Claude Code hooks' bare badge does not survive the parse —
+    /// the half that clears one an older parent still writes into the wire —
+    /// and dropping it keeps the rest of the leaf and the round trip's fixed
+    /// point. NEGATIVE CONTROL: an attention without the prefix arrives intact.
+    #[test]
+    fn restore_parse_drops_the_retired_hook_badge_and_keeps_the_rest() {
+        let parse = |attention: &str| {
+            let mut manifest = sample();
+            let RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } = &mut manifest.windows[0].restored_tabs[0].root
+            else {
+                panic!("sample first tab is a terminal leaf");
+            };
+            terminal.user_title = Some("worker".to_string());
+            terminal.attention = Some(attention.to_string());
+            // Serialized directly, as an unfixed parent writes it: the
+            // ordinary constructor would drop the badge before the parse.
+            let wire = aterm_toml::to_string(&manifest).expect("serialize legacy fixture");
+            assert!(wire.contains(attention), "the wire carries it: {wire}");
+            let decoded = RestoreManifest::from_toml(&wire).expect("the manifest still parses");
+            let again = RestoreManifest::from_toml(&decoded.to_toml().expect("serialize"))
+                .expect("reparse");
+            assert_eq!(again, decoded, "the parse is a fixed point");
+            let RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } = &decoded.windows[0].restored_tabs[0].root
+            else {
+                panic!("decoded first tab is a terminal leaf");
+            };
+            assert_eq!(terminal.user_title.as_deref(), Some("worker"));
+            assert!(terminal.user_metadata_is_canonical());
+            terminal.attention.clone()
+        };
+        assert_eq!(
+            parse("claude needs approval: Claude needs your permission - permission_prompt"),
+            None
+        );
+        assert_eq!(
+            parse("waiting on a human review").as_deref(),
+            Some("waiting on a human review")
+        );
     }
 
     #[test]
@@ -2929,6 +3196,7 @@ metadata = "opaque=copy-me"
                     restore_tag,
                     reason,
                     metadata,
+                    ..
                 })
             } if restore_tag == "future.diagram"
                 && reason.contains("unavailable")
@@ -2978,6 +3246,7 @@ metadata = "opaque=copy-me"
                     questions: None,
                     identity: None,
                     agent: None,
+                    held: false,
                 },
             ))),
         };
@@ -3004,6 +3273,7 @@ metadata = "opaque=copy-me"
             questions: None,
             identity: None,
             agent: None,
+            held: false,
         }));
         for _ in 0..=MAX_SPLIT_DEPTH {
             root = RestoredSplitTree::Split {
@@ -3024,6 +3294,7 @@ metadata = "opaque=copy-me"
                         questions: None,
                         identity: None,
                         agent: None,
+                        held: false,
                     },
                 ))),
             };
@@ -3082,6 +3353,7 @@ metadata = "opaque=copy-me"
                     identity: None,
                     questions: None,
                     agent: None,
+                    held: false,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -3133,6 +3405,98 @@ metadata = "opaque=copy-me"
             round_trip.as_ref(),
             Some(&captured),
             "the worker's layout round trip holds on a sanitized capture"
+        );
+    }
+
+    /// AUDIT #8 — A LEAF A PROGRAM HELD (ssh) is written `held = true`, a
+    /// leaf that was not is written as it always was (so an older writer's
+    /// layout and today's unheld one are the same bytes), and the bootstrap
+    /// session does not ask for a folder a held pane reported that is not
+    /// here. NEGATIVE CONTROLS: the same folder from an unheld pane is asked
+    /// for (its spawn falls back and says so), a held pane's folder that is
+    /// here is kept, and a pane the agent aterm hosted held ran on this
+    /// machine, so its folder is asked for.
+    #[test]
+    fn a_held_leaf_round_trips_and_its_folder_that_is_not_here_is_not_asked_for() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-restore-remote")
+            .tempdir()
+            .expect("scratch dir");
+        let here = scratch
+            .path()
+            .to_str()
+            .expect("utf-8 scratch path")
+            .to_owned();
+        let remote = format!("{here}/on-the-remote-host/proj");
+        let window = |cwd: &str, held: bool| {
+            let RestoredSplitTree::Leaf {
+                view: RestoredView::Terminal(mut leaf),
+            } = terminal(Some(1), "ssh")
+            else {
+                unreachable!("a terminal leaf");
+            };
+            leaf.cwd = Some(cwd.to_owned());
+            leaf.held = held;
+            RestoreManifest::new(vec![WindowLayout {
+                rows: 24,
+                cols: 80,
+                active_tab: 0,
+                outer_x: None,
+                outer_y: None,
+                maximized: None,
+                show: WindowShow::UNKNOWN,
+                tabs: Vec::new(),
+                native_tabs: Vec::new(),
+                tab_order: Vec::new(),
+                active_item: None,
+                restored_tabs: vec![RestoredTab {
+                    root: RestoredSplitTree::leaf(RestoredView::Terminal(leaf)),
+                    focused_path: Vec::new(),
+                    zoomed: false,
+                }],
+            }])
+        };
+        let wire = |manifest: &RestoreManifest| manifest.to_toml().expect("serializes");
+
+        let unheld = window(&remote, false);
+        assert!(!wire(&unheld).contains("held ="), "{}", wire(&unheld));
+        let held = window(&remote, true);
+        assert!(wire(&held).contains("held = true"), "{}", wire(&held));
+        let back = RestoreManifest::from_toml(&wire(&held)).expect("parses");
+        assert_eq!(back, held, "held survives the wire");
+
+        assert_eq!(back.first_leaf_cwd(), None, "the held pane's remote folder");
+        assert_eq!(
+            unheld.first_leaf_cwd().as_deref(),
+            Some(remote.as_str()),
+            "NEGATIVE CONTROL: the shell's own folder"
+        );
+        assert_eq!(
+            window(&here, true).first_leaf_cwd().as_deref(),
+            Some(here.as_str()),
+            "NEGATIVE CONTROL: a held pane's folder that is here"
+        );
+        let mut hosted = window(&remote, true);
+        if let RestoredSplitTree::Leaf {
+            view: RestoredView::Terminal(leaf),
+        } = &mut hosted.windows[0].restored_tabs[0].root
+        {
+            leaf.agent = Some(Box::new(AgentRestore {
+                pid: 4242,
+                start: "Sat Sep 27 01:02:03 2026".into(),
+                program: "/opt/claude/bin/claude".into(),
+                argv: vec!["/opt/claude/bin/claude".into()],
+                session: None,
+                cwd: remote.clone(),
+                version: None,
+                codex: None,
+            }));
+        }
+        assert_eq!(
+            hosted.first_leaf_cwd().as_deref(),
+            Some(remote.as_str()),
+            "the agent aterm hosted ran on this machine: its gone folder is asked for, and \
+             the spawn says it was not found"
         );
     }
 
@@ -3509,6 +3873,7 @@ metadata = "opaque=copy-me"
             session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
             cwd: "/Users//me/work".into(),
             version: Some("2.1.283".into()),
+            codex: None,
         };
         let mut m = sample();
         let mut next = 0;
@@ -3525,5 +3890,105 @@ metadata = "opaque=copy-me"
         assert_eq!(filled[1].as_ref(), Some(&claude));
         let back = RestoreManifest::from_toml(&m.to_toml().expect("toml")).expect("parse");
         assert_eq!(agents(&back), filled, "through the codec unchanged");
+    }
+
+    /// A CODEX rides its leaf too (2026-09-27, the harness's Codex parity):
+    /// the run its relaunch reads — its home, its mode, when it started —
+    /// goes from the host's snapshot into the leaf, through the codec, and
+    /// back into the reopened tab's snapshot, so the next launch relaunches it
+    /// on its Codex lane, never as a Claude Code. NEGATIVE CONTROL: a Claude
+    /// Code's snapshot comes back with no Codex run.
+    #[test]
+    fn a_codex_run_rides_its_leaf_back_into_its_relaunch() {
+        use aterm_agent::harness::relaunch::{CodexRun, Snapshot};
+        let codex = Snapshot {
+            tab: "s-old".into(),
+            pid: 5151,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            shell: 5150,
+            program: "/opt/codex/bin/codex".into(),
+            argv: vec!["/opt/codex/bin/codex".into(), "--no-daemon".into()],
+            session: Some("01a0e4bd-2b37-75a0-9d52-7f1e2c3a4b5c".into()),
+            cwd: "/work/c".into(),
+            version: Some("0.157.1".into()),
+            codex: Some(CodexRun {
+                home: "/Users//me/.codex".into(),
+                embedded: true,
+                started_ms: 1_790_543_997_000,
+                ambiguous: false,
+            }),
+            dialect: None,
+        };
+        let mut m = sample();
+        let mut next = 0;
+        for w in &mut m.windows {
+            for t in &mut w.restored_tabs {
+                number_leaves(&mut t.root, &mut next);
+            }
+        }
+        let carried = AgentRestore::of(codex.clone());
+        m.fill_agents(&|id| (id == 0).then(|| carried.clone()));
+        let back = RestoreManifest::from_toml(&m.to_toml().expect("toml")).expect("parse");
+        let mut found = None;
+        for w in &back.windows {
+            for t in &w.restored_tabs {
+                first_agent(&t.root, &mut found);
+            }
+        }
+        let snap = found
+            .expect("the leaf carries it")
+            .snapshot("s-new".into(), 6161);
+        assert_eq!(snap.codex, codex.codex, "the Codex run, unchanged");
+        assert_eq!((snap.tab.as_str(), snap.shell), ("s-new", 6161));
+        assert_eq!(
+            Snapshot {
+                tab: codex.tab.clone(),
+                shell: codex.shell,
+                ..snap
+            },
+            codex
+        );
+        let claude = Snapshot {
+            codex: None,
+            ..codex
+        };
+        assert_eq!(
+            AgentRestore::of(claude)
+                .snapshot("s-new".into(), 6161)
+                .codex,
+            None
+        );
+
+        fn number_leaves(node: &mut RestoredSplitTree, next: &mut u64) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(t),
+                } => {
+                    t.local_id = Some(*next);
+                    *next += 1;
+                }
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    number_leaves(first, next);
+                    number_leaves(second, next);
+                }
+            }
+        }
+        fn first_agent(node: &RestoredSplitTree, out: &mut Option<AgentRestore>) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(t),
+                } => {
+                    if out.is_none() {
+                        out.clone_from(&t.agent.as_deref().cloned());
+                    }
+                }
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    first_agent(first, out);
+                    first_agent(second, out);
+                }
+            }
+        }
     }
 }

@@ -9,10 +9,9 @@
 //! — hundreds of milliseconds at deep scrollback, all of it blocking the
 //! caller's event loop (in the wasm render worker, that freezes input echo).
 //! [`Terminal::search_budgeted`] performs the SAME search in caller-sized
-//! slices: each call indexes + verifies at most `row_budget` rows and delivers
-//! at most 4,096 stable match deltas (reusing the index's incremental
-//! `index_line` construction via
-//! [`aterm_search::BudgetedSearch`]) and returns a cursor to continue, so the
+//! slices: each call verifies at most `row_budget` rows and delivers
+//! at most 4,096 stable match deltas via [`aterm_search::BudgetedSearch`],
+//! then returns a cursor to continue, so the
 //! caller can yield between slices and CANCEL a superseded search instead of
 //! finishing it.
 //!
@@ -35,7 +34,7 @@ use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
 use crate::search::{BudgetedSearch, SearchOptionsError, SearchResults};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Maximum match records copied out on one resume turn. Index/verification
+/// Maximum match records copied out on one resume turn. Verification
 /// remains row-budgeted; this second bound prevents dense searches from
 /// repeatedly marshalling an ever-growing 100k-match prefix.
 const MAX_MATCHES_PER_STEP: usize = 4_096;
@@ -76,7 +75,7 @@ impl From<SearchOptionsError> for BudgetedSearchError {
 }
 
 /// Lifecycle phase of a retained budgeted search. `InFlight` keeps the cursor
-/// live for resume; `Complete` retains the fully-built index for `search_summary`
+/// live for resume; `Complete` retains verified matches for `search_summary`
 /// to read with zero rebuild (fed E-1) but RETIRES the cursor, so a presented
 /// token restarts rather than resumes (fed E-6). Modeled as an enum (not a
 /// `bool`) so the retain/retire distinction is a state, not a flag.
@@ -104,12 +103,12 @@ pub(crate) struct BudgetedSearchState {
     /// Scrollback line count at start (fixed while the snapshot key holds:
     /// any change bumps `content_seq`). Rows below this are history lines.
     scrollback: usize,
-    /// The incremental engine: partial index + verified matches + progress.
+    /// The incremental engine: verified matches + progress; no retained rows.
     engine: BudgetedSearch,
     /// Number of stable match records already delivered to the caller.
     emitted_matches: usize,
     /// Whether the scan has run to completion. A `Complete` state is RETAINED
-    /// (not dropped) so `search_summary` can read its already-built index with
+    /// (not dropped) so `search_summary` can read its verified matches with
     /// zero rebuild (fed E-1); it lives until a fresh Start supersedes it or
     /// `release_search_index()` frees it. A retained-complete state is NEVER
     /// resumable — its cursor is retired, so a presented token restarts (the
@@ -124,7 +123,7 @@ pub struct BudgetedSearchStep {
     /// metadata. Append each step's `matches` in order; once `complete`, the
     /// concatenation equals a one-shot [`Terminal::indexed_search`] query.
     pub results: SearchResults,
-    /// Whether every retained row has been indexed + verified and every match
+    /// Whether every searchable row has been verified and every match
     /// delta has been delivered.
     pub complete: bool,
     /// Token to resume with; `None` once complete.
@@ -368,8 +367,8 @@ impl Terminal {
             total_rows: state.engine.total_rows(),
         };
         // Retain the state whether complete or not. An incomplete state keeps
-        // its cursor live for resume; a COMPLETE state RETAINS its already-built
-        // index (fed E-1) so a same-key `search_summary` reads it with zero
+        // its cursor live for resume; a COMPLETE state RETAINS its verified
+        // matches (fed E-1) so a same-key `search_summary` reads them with zero
         // rebuild instead of rebuilding from scratch. The retired cursor cannot
         // resume it (guarded above), and a fresh Start / release frees it.
         state.phase = if complete {
@@ -409,7 +408,7 @@ impl Terminal {
         }
     }
 
-    /// Drop any in-flight budgeted search (frees its partial index; any
+    /// Drop any in-flight budgeted search (frees its matches and scratch; any
     /// outstanding cursor becomes stale and would restart). Call when the
     /// search UI closes or a query is abandoned between slices.
     #[cfg_attr(
@@ -425,16 +424,15 @@ impl Terminal {
     }
 
     /// Results for a federated `search_summary` (fed E-1), preferring the
-    /// RETAINED completed budgeted index over a from-scratch rebuild.
+    /// RETAINED completed budgeted results over a from-scratch rebuild.
     ///
     /// When a budgeted search for the SAME `(query, case_sensitive, is_regex)`
     /// has run to completion over the CURRENT content snapshot
-    /// `(alternate_screen, content_seq())`, its already-built index answers
+    /// `(alternate_screen, content_seq())`, its verified matches answer
     /// directly — a bounded READ, doing ZERO rebuild work
     /// ([`search_index_rebuilds`](Self::search_index_rebuilds) unchanged). This
-    /// is exactly the "read over the index the budgeted scan just built" the
-    /// federation hot path needs: `search_budgeted` to completion, then
-    /// `search_summary` reuses that retained index.
+    /// lets the federation hot path run `search_budgeted` to completion, then
+    /// reuse those results in `search_summary` without retaining row text.
     ///
     /// On any miss (no retained search, different query/options, or content
     /// changed) it falls back to the cached one-shot index
@@ -442,7 +440,7 @@ impl Terminal {
     /// two paths are byte-identical by the budgeted/one-shot equivalence oracle
     /// (`budgeted_completion_equals_one_shot_all_modes`), so which path served
     /// a result is never observable in the result itself.
-    // Waive: a PURE READ over the retained completed index — it returns
+    // Waive: a PURE READ over the retained completed results — it returns
     // `SearchResults` (not a `BudgetedSearchStep`) and does not transition the
     // BudgetedSearchResume lifecycle machine (live/cursor/progress unchanged);
     // result correctness is pinned by the equivalence oracle above, not a model
@@ -452,7 +450,7 @@ impl Terminal {
         aterm_spec::spec_unmodeled(
             reason = "BudgetedSearchResume models the search_budgeted STEP lifecycle; \
                       search_summary_results is a pure read over the retained completed \
-                      index (results-equal to the modeled completed set by the \
+                      results (equal to the modeled completed set by the \
                       budgeted/one-shot equivalence oracle), not a lifecycle transition"
         )
     )]
@@ -472,7 +470,7 @@ impl Terminal {
                 && state.case_sensitive == case_sensitive
                 && state.is_regex == is_regex
             {
-                // The completing scan just built this index; reuse it verbatim.
+                // The completed scan already verified these matches; reuse them.
                 return Ok(state.engine.results());
             }
         }
@@ -808,7 +806,7 @@ mod tests {
         assert_eq!(allocate_cursor(&counter), None);
     }
 
-    /// Dense results are delivered as bounded deltas. Once indexing finishes,
+    /// Dense results are delivered as bounded deltas. Once scanning finishes,
     /// a later turn drains the remainder without cloning/resending the prefix.
     #[test]
     fn dense_results_are_delta_bounded_and_concatenate_to_one_shot() {
@@ -887,7 +885,7 @@ mod tests {
     }
 
     /// Fed E-1 hot path: after a budgeted search completes, `search_summary`
-    /// reads the RETAINED completed index with ZERO rebuild — the build counter
+    /// reads the RETAINED completed results with ZERO rebuild — the build counter
     /// ([`Terminal::search_index_rebuilds`]) does not advance — yet returns the
     /// same result as the one-shot oracle. The negative control proves the zero
     /// is the retained-read path, not a dead counter: once content changes and
@@ -895,8 +893,8 @@ mod tests {
     #[test]
     fn search_summary_reads_completed_index_with_zero_rebuild() {
         let mut t = seeded_terminal();
-        // Drive the budgeted scan to completion; this builds and RETAINS the
-        // budgeted index without ever touching the one-shot cache counter.
+        // Drive the budgeted scan to completion; this verifies and RETAINS the
+        // matches without ever touching the one-shot cache counter.
         let (driven, _steps) = drive(&mut t, "NEEDLE", true, false, 7);
         assert_eq!(
             t.search_index_rebuilds(),
@@ -904,7 +902,7 @@ mod tests {
             "the budgeted scan must not build the one-shot index"
         );
 
-        // A same-key search_summary reads the just-built index: ZERO rebuild.
+        // A same-key search_summary reads the verified matches: ZERO rebuild.
         let before = t.search_index_rebuilds();
         let summary = t
             .search_summary_results("NEEDLE", true, false)
@@ -944,7 +942,7 @@ mod tests {
         );
     }
 
-    /// A retained completed index is non-resumable (fed E-6): presenting its
+    /// A retained completed search is non-resumable (fed E-6): presenting its
     /// retired cursor restarts a fresh scan, and `release_search_index` frees the
     /// retained footprint so a later `search_summary` rebuilds from the buffer.
     #[test]
@@ -963,7 +961,7 @@ mod tests {
             "a retained-complete cursor must restart at row zero, not resume"
         );
 
-        // Release frees the retained index; the next summary rebuilds from live
+        // Release frees the retained matches; the next summary rebuilds from live
         // content (the fed E-1 eviction contract).
         drive(&mut t, "NEEDLE", true, false, 7);
         t.release_search_index();

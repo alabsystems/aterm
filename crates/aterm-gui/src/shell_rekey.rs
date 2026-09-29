@@ -289,6 +289,15 @@ impl Deferred {
         }
     }
 
+    /// Whether [`Self::release`] has run: the incoming handoff COMMITTED, and
+    /// its adopted shells are this process's (`Session::handoff_commit`).
+    pub(crate) fn released(&self) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+    }
+
     /// THE COMMIT: write every held key; later ones are written at once.
     pub(crate) fn release(&self) {
         let queue = self

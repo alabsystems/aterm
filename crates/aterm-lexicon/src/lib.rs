@@ -58,8 +58,6 @@ pub enum Class {
     Feline,
     /// The dog / puppy family — the canine counterpart of [`Class::Feline`].
     Canine,
-    /// The orca / cetacean family — drawn as the randomized "splash" of water droplets.
-    Orca,
     /// The ambient animal-word family (monkey / camel / penguin / …): animal
     /// nouns, each entry tagged with a `species` id that names the authored
     /// sprite the renderer peeks beside the word. The ENGLISH (and other
@@ -638,7 +636,14 @@ impl Lexicon {
                 "profanity" => Class::Profanity,
                 "feline" => Class::Feline,
                 "canine" => Class::Canine,
-                "orca" => Class::Orca,
+                // The orca class was deleted on 2026-09-27 with the suspended
+                // orca splash (Sparkle Words v3 §4). An external lexicon that
+                // still names it is not malformed: its entries are skipped, so
+                // they decorate nothing, as while the class was suspended — and,
+                // unlike then, they no longer claim their words at orca's rank,
+                // so the same word under a lower class (animal, emphasis) now
+                // decorates as that class.
+                "orca" => continue,
                 "animal" => Class::Animal,
                 "emphasis" => Class::Emphasis,
                 other => {
@@ -1483,7 +1488,7 @@ fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
     SpeciesId(i as u16)
 }
 /// Cross-class homograph precedence, TOTAL ORDER:
-/// `profanity > feline > canine > orca > animal > emphasis`.
+/// `profanity > feline > canine > animal > emphasis`.
 ///
 /// A surface that is an expletive in *any* enabled language
 /// (e.g. "poes": Dutch pussycat, Afrikaans vulgar; "anjing": Indonesian dog,
@@ -1495,7 +1500,6 @@ fn class_rank(class: Class) -> u8 {
         Class::Profanity => 5,
         Class::Feline => 4,
         Class::Canine => 3,
-        Class::Orca => 2,
         Class::Animal => 1,
         Class::Emphasis => 0,
     }

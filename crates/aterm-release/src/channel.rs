@@ -99,7 +99,7 @@ pub enum ChannelVersion {
 ///
 /// This is the reconciliation the two-publisher model was missing. Source is
 /// published by `pub` (staging -> `alabsystems/<repo>` main + annotated tag) and
-/// binaries by `cargo ship cut`, and until this gate NOTHING compared the two.
+/// binaries by `targo --unverified ship cut`, and until this gate NOTHING compared the two.
 /// The observed consequence: `v0.6.0`'s tag came to rest on a tree still
 /// carrying `0.5.0`, and its appcast named a commit that does not exist in the
 /// public repository at all. A user who trusts the tag downloads source that

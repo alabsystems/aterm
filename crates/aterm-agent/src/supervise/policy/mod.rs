@@ -25,6 +25,10 @@
 //!   ruling of 2026-09-25).
 //! * [`rm_breaker`] — the resolver behind the approval rule for the vendor's
 //!   rm circuit breaker: where every `rm` operand on a line points.
+//! * [`shell_startup`] — what the worker's Bash tool's shell carries in from
+//!   the person's own startup (Claude Code's shell snapshot, `.zshenv`, the
+//!   hook env scripts): an option, alias or function the rm rule and the
+//!   read-only classifier do not model makes them prove nothing.
 //! * [`guard`] — the press guard that binds a keystroke to the row that was
 //!   judged, and the content-sequence fence where the server has one.
 //! * [`turn_end`] — THE turn-end decider: what to do when a worker's turn
@@ -36,16 +40,18 @@ pub mod git_config;
 pub mod guard;
 pub mod question;
 pub mod rm_breaker;
+pub mod shell_startup;
 pub mod turn_end;
 
 pub use approval::{
     Answer, AnswerTarget, ApprovalCtx, Choice, DECLINE_PREFIX, Decision, DeclineStep, FooterMode,
-    REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_DECLINE, RULE_MODEL_CONFIRM, RULE_MODEL_SWITCH,
-    RULE_NO_SPEND, RULE_PLAN, RULE_READ_ONLY, RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER,
-    RULE_TALL_BOX, RULE_TRUST_ANY, RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen,
-    decline, decline_step, decline_text, default_secrets, footer_mode, rm_breaker_label,
-    roots_from_config,
+    NudgeCtx, REFUSAL_LABEL, RULE_ALLOW_ONCE, RULE_DECLINE, RULE_GOAL_RESUME, RULE_MODEL_CONFIRM,
+    RULE_MODEL_RESTORE_PICK, RULE_MODEL_SWITCH, RULE_NO_SPEND, RULE_PLAN, RULE_RATE_NUDGE_KEEP,
+    RULE_RATE_NUDGE_SWITCH, RULE_READ_ONLY, RULE_READ_OUTSIDE_CWD, RULE_RM_BREAKER, RULE_TALL_BOX,
+    RULE_TRUST_ANY, RULE_TRUST_DIALOG, SecretRule, buys, decide, decide_screen, decline,
+    decline_step, decline_text, default_secrets, footer_mode, rm_breaker_label, roots_from_config,
 };
 pub use git_config::{GitView, WorkerEnv};
 pub use guard::{key_args, row_guard, server_fences_gen, server_fences_send};
 pub use question::{MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, answer_question};
+pub use shell_startup::ShellStartup;

@@ -114,7 +114,7 @@ fn an_idle_app_arms_nothing_and_a_record_or_a_folded_row_leaves_it_idle() {
                 app.messages.fingerprint(usize::from(ws.cols)),
                 ws.band_hover,
                 app.band_geometry(WID),
-                ws.band_motion_fp,
+                ws.band.motion_fp(),
             ),
             0,
             "{what}: the RepaintKey's band term"
@@ -220,13 +220,13 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     app.prepare_band_motion(WID, t0);
     let ws = &app.windows[&WID];
     let expected = app.messages.motion_deadline(
-        &ws.band_layout.as_ref().expect("prepared layout").2,
-        ws.band_motion.as_ref().expect("prepared frame").at,
+        ws.band.layout().expect("prepared layout"),
+        ws.band.motion().expect("prepared frame").at,
         Look::MOVING,
     );
     assert!(expected.is_some(), "the live bar has a future transition");
     assert_eq!(app.band_motion_deadline(t0), expected);
-    let first_scan = app.windows[&WID].band_motion_deadline_computations.get();
+    let first_scan = app.windows[&WID].band.deadline_computations();
     assert_eq!(first_scan, 1);
     for event in 0..64 {
         if event % 4 == 0 {
@@ -239,7 +239,7 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
         assert!(app.band_motion_due(t0).is_empty());
     }
     assert_eq!(
-        app.windows[&WID].band_motion_deadline_computations.get(),
+        app.windows[&WID].band.deadline_computations(),
         first_scan,
         "same-frame event and park queries reuse the cell-surface scan"
     );
@@ -247,7 +247,7 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     assert_eq!(app.band_motion_due(due), vec![WID]);
     app.prepare_band_motion(WID, due);
     assert!(app.band_motion_deadline(due).is_some_and(|next| next > due));
-    let after_frame = app.windows[&WID].band_motion_deadline_computations.get();
+    let after_frame = app.windows[&WID].band.deadline_computations();
     assert_eq!(
         after_frame,
         first_scan + 1,
@@ -264,7 +264,7 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
         due,
     ));
     let _ = app.band_motion_deadline(due);
-    let after_progress = app.windows[&WID].band_motion_deadline_computations.get();
+    let after_progress = app.windows[&WID].band.deadline_computations();
     assert_eq!(
         after_progress,
         after_frame + 1,
@@ -286,20 +286,20 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     assert_eq!(app.messages.revision(), revision);
     assert_ne!(app.messages.motion_input_epoch(), epoch);
     let _ = app.band_motion_deadline(due);
-    let after_heartbeat = app.windows[&WID].band_motion_deadline_computations.get();
+    let after_heartbeat = app.windows[&WID].band.deadline_computations();
     assert_eq!(after_heartbeat, after_progress + 1);
 
     app.windows.get_mut(&WID).unwrap().cols += 1;
     let width_probe = due + Duration::from_millis(7);
     let _ = app.band_motion_deadline(width_probe);
-    let after_width = app.windows[&WID].band_motion_deadline_computations.get();
+    let after_width = app.windows[&WID].band.deadline_computations();
     assert_eq!(
         after_width,
         after_heartbeat + 1,
         "width changes the surface cells"
     );
     assert_eq!(
-        app.windows[&WID].band_motion_deadline_last_from.get(),
+        app.windows[&WID].band.last_from(),
         Some(width_probe),
         "a layout mismatch starts from now, not the old frame"
     );
@@ -308,21 +308,18 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     app.windows.get_mut(&WID).unwrap().occluded = true;
     assert_eq!(app.band_motion_deadline(width_probe), None);
     assert!(app.band_motion_due(width_probe).is_empty());
-    assert_eq!(
-        app.windows[&WID].band_motion_deadline_computations.get(),
-        after_width
-    );
+    assert_eq!(app.windows[&WID].band.deadline_computations(), after_width);
     app.windows.get_mut(&WID).unwrap().occluded = false;
     app.windows.get_mut(&WID).unwrap().focused = false;
     let focus_probe = due + Duration::from_millis(11);
     let _ = app.band_motion_deadline(focus_probe);
     assert_eq!(
-        app.windows[&WID].band_motion_deadline_computations.get(),
+        app.windows[&WID].band.deadline_computations(),
         after_width + 1,
         "unfocus recomputes the next text-only transition"
     );
     assert_eq!(
-        app.windows[&WID].band_motion_deadline_last_from.get(),
+        app.windows[&WID].band.last_from(),
         Some(focus_probe),
         "a look mismatch starts from now, not the old frame"
     );
@@ -351,7 +348,7 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
         assert_eq!(off, 0, "a deadline off the grid");
         for wid in app.band_motion_due(t) {
             app.prepare_band_motion(wid, t);
-            let at = app.windows[&wid].band_motion.as_ref().unwrap().at;
+            let at = app.windows[&wid].band.motion().unwrap().at;
             if let Some(last) = frames.last() {
                 assert!(at >= *last + ANIM_FRAME, "two frames in one grid step");
             }
@@ -359,7 +356,15 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
         }
         t += Duration::from_millis(7);
     }
-    let cap = 3000 / ANIM_FRAME.as_millis() as usize + 1;
+    // A prepared frame sits on the grid step AT OR BEFORE the wake that
+    // prepared it, so the first can land up to one step before `t0`: the
+    // frames span `[first, t0 + 3 s)`, and that span holds at most one per
+    // step. (A fixed `3000 / 33 + 1` assumed the first frame at `t0`; with the
+    // grid anchored at the row's birth, a loaded run that read `t0` late saw 92
+    // honest frames against that cap of 91.)
+    let first = *frames.first().expect("the band animates");
+    let span = (t0 + Duration::from_secs(3)).saturating_duration_since(first);
+    let cap = (span.as_millis() / ANIM_FRAME.as_millis()) as usize + 1;
     assert!(
         frames.len() <= cap,
         "{} frames in 3 s (cap {cap})",
@@ -399,24 +404,22 @@ fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
     app.prepare_band_motion_with(WID, t1, Look::MOVING);
     compose(&mut app);
     let before = app.windows[&WID].input_scratch.clone();
-    let fp1 = app.windows[&WID].band_motion_fp;
-    let layout = app.windows[&WID].band_layout.as_ref().unwrap().2.rows[0].clone();
+    let fp1 = app.windows[&WID].band.motion_fp();
+    let layout = app.windows[&WID].band.layout().unwrap().rows[0].clone();
     assert!(layout.busy, "the pass is busy work: the comet's row");
 
-    // Poison the cached layout: a frame must read it, never rebuild it.
-    {
-        let ws = app.windows.get_mut(&WID).unwrap();
-        ws.band_layout.as_mut().unwrap().2.rows[0].full_title = "POISON".into();
-    }
+    // Count the layouts built: a frame must read the kept one, never rebuild
+    // it (each build reads the home once).
+    let built = crate::message_band::BAND_LAYOUTS_BUILT.with(std::cell::Cell::get);
 
     let t2 = t1 + ANIM_FRAME * 3;
     app.prepare_band_motion_with(WID, t2, Look::MOVING);
     assert_eq!(
-        app.windows[&WID].band_layout.as_ref().unwrap().2.rows[0].full_title,
-        "POISON",
+        crate::message_band::BAND_LAYOUTS_BUILT.with(std::cell::Cell::get),
+        built,
         "a motion frame re-ran the width law"
     );
-    assert_ne!(app.windows[&WID].band_motion_fp, fp1, "the comet moved");
+    assert_ne!(app.windows[&WID].band.motion_fp(), fp1, "the comet moved");
     compose(&mut app);
     let after = app.windows[&WID].input_scratch.clone();
     let words_may_move = |x: usize| {
@@ -530,7 +533,7 @@ fn every_still_gate_draws_static_frames_and_arms_no_frame_deadline() {
             let mut meters = Vec::new();
             for k in 0..90u32 {
                 fps.push(app.prepare_band_motion(WID, now + ANIM_FRAME * k));
-                let m = app.windows[&WID].band_motion.as_ref().expect("prepared");
+                let m = app.windows[&WID].band.motion().expect("prepared");
                 meters.push(m.rows.iter().map(|r| r.surface.clone()).collect::<Vec<_>>());
             }
             assert!(

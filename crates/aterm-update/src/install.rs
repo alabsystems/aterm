@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aterm_update_core::{FileLock, Sentinel, ensure_private_dir, handoff_policy, same_volume};
+use aterm_update_core::{FileLock, Sentinel, ensure_private_dir, same_volume};
 
 use crate::manifest::{Manifest, Ready};
 use crate::paths::Staging;
@@ -293,6 +293,10 @@ impl IsolatedCopy {
             let _ = std::fs::remove_dir(&root);
             return Err(format!("record isolated copy layout: {error}"));
         }
+        // Who started this attempt, for the reaper's lapsed rule
+        // ([`reap_abandoned_copy_attempts`]). Best effort: an attempt without it is
+        // read as a live caller's, the conservative reading.
+        let _ = std::fs::write(root.join(COPY_OWNER), format!("{}\n", std::process::id()));
         Ok(Self {
             payload: root.join("payload"),
             root,
@@ -300,10 +304,59 @@ impl IsolatedCopy {
     }
 }
 
-/// Reclaim only explicitly abandoned attempts whose fenced writer published a
+/// The file in a copy attempt naming the pid of the process that started it
+/// ([`IsolatedCopy::create`]).
+const COPY_OWNER: &str = "owner";
+
+/// How long a copy attempt must have existed before the reaper's LAPSED rule may
+/// reclaim it ([`reap_abandoned_copy_attempts`]): a day, against copy ceilings of
+/// minutes ([`STAGE_UNPACK_TIMEOUT`], [`CROSS_VOLUME_COPY_TIMEOUT`]). A writer
+/// still running that long after its caller's deadline is wedged for good.
+const STALE_COPY_ATTEMPT_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Whether the process an attempt's [`COPY_OWNER`] names is gone. Only a
+/// definite `ESRCH` is gone: a missing or unreadable record, or a pid that
+/// exists (possibly reused — the conservative direction), is a live caller.
+fn copy_owner_gone(root: &Path) -> bool {
+    let Some(pid) = crate::read_ledger_text(&root.join(COPY_OWNER))
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    // SAFETY: signal 0 delivers nothing; it only asks whether `pid` exists.
+    let asked = unsafe { libc::kill(pid, 0) };
+    asked != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether an attempt has existed past [`STALE_COPY_ATTEMPT_AFTER`], by its
+/// `copy-layout` marker, written once at creation. A stamp from the future (a
+/// clock stepped back) is young.
+fn copy_attempt_lapsed(root: &Path) -> bool {
+    std::fs::symlink_metadata(root.join("copy-layout"))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|written| std::time::SystemTime::now().duration_since(written).ok())
+        .is_some_and(|age| age >= STALE_COPY_ATTEMPT_AFTER)
+}
+
+/// Reclaim copy attempts no writer and no caller can still use.
+///
+/// SETTLED: an explicitly abandoned attempt whose fenced writer published a
 /// terminal status. A live caller may have finished copying but not promoted yet;
-/// completion alone is therefore not permission to remove its directory. The
-/// background checker owns this recursive maintenance. Copy allocation creates
+/// completion alone is therefore not permission to remove its directory.
+///
+/// LAPSED (round six, finding 50): an attempt past [`STALE_COPY_ATTEMPT_AFTER`]
+/// that its caller gave up (`abandoned`) or whose caller is gone
+/// ([`copy_owner_gone`]). The settled rule alone leaked an app-sized directory for
+/// good on two ordinary cuts: a caller killed mid-copy (a force-quit launch, a
+/// reboot) never marks its attempt abandoned, and a launchd copy stopped by the
+/// timeout's `launchctl remove` never publishes its status. The age stands in for
+/// the writer's end, which neither cut records: every copy's own ceiling is
+/// minutes. A live caller's attempt that it has not given up — it may be stopped,
+/// and will still promote it — is never reclaimed, however old.
+///
+/// The background checker owns this recursive maintenance. Copy allocation creates
 /// only its own directory and marker, regardless of abandoned payloads nearby.
 pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -341,8 +394,15 @@ pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
             || metadata.permissions().mode() & 0o077 != 0
             || crate::read_ledger_text(&root.join("copy-layout")).as_deref()
                 != Some("aterm-copy-v1\n")
-            || crate::read_ledger_text(&root.join("abandoned")).as_deref() != Some("1\n")
         {
+            continue;
+        }
+        let abandoned = crate::read_ledger_text(&root.join("abandoned")).as_deref() == Some("1\n");
+        if copy_attempt_lapsed(&root) && (abandoned || copy_owner_gone(&root)) {
+            let _ = std::fs::remove_dir_all(&root);
+            continue;
+        }
+        if !abandoned {
             continue;
         }
         let Some(label) = crate::read_ledger_text(&root.join("launchd.job")) else {
@@ -512,7 +572,9 @@ fn ditto_via_launchd_using(
     let run_until = |cmd: &mut Command, operation: &str, until: Instant| {
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!("{operation}: unpack deadline exhausted"));
+            return Err(crate::verify::mark_passing(format!(
+                "{operation}: unpack deadline exhausted"
+            )));
         }
         crate::verify::status_bounded_with_stderr(cmd.stdout(Stdio::null()), operation, remaining)
     };
@@ -546,10 +608,12 @@ fn ditto_via_launchd_using(
         loop {
             let remaining = work_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(format!(
+                // The disk's afternoon, like the direct helper's own ceiling —
+                // passing (round four, plan item 2).
+                return Err(crate::verify::mark_passing(format!(
                     "{what} did not finish within its {}s launchd job budget; treating as a failure",
                     limit.as_secs()
-                ));
+                )));
             }
             // The same bounded regular-file reader used for updater ledgers:
             // a FIFO, oversized file or incomplete publication is not a result.
@@ -1996,12 +2060,29 @@ impl Mounted {
                     |_| "unreadable".to_string(),
                     |meta| format!("{} bytes", meta.len()),
                 );
-                Err(format!(
-                    "hdiutil attach failed after {} attempts ({}, {size}): {}",
+                // PASSING ONLY IF EVERY ATTEMPT WAS (round six, finding 11): one
+                // attach past its limit beside an ENXIO is still the ENXIO's
+                // verdict, so each attempt's own key is taken off and the whole
+                // is marked once, when nothing but moments refused it.
+                let passing = attempts
+                    .iter()
+                    .all(|error| crate::is_passing_refusal(error));
+                let key = format!(" ({})", crate::PASSING_REFUSAL_KEY);
+                let joined = attempts
+                    .iter()
+                    .map(|error| error.replace(&key, ""))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let message = format!(
+                    "hdiutil attach failed after {} attempts ({}, {size}): {joined}",
                     attempts.len(),
                     dmg.display(),
-                    attempts.join(" | ")
-                ))
+                );
+                Err(if passing {
+                    crate::verify::mark_passing(message)
+                } else {
+                    message
+                })
             }
         }
     }
@@ -2206,7 +2287,7 @@ pub fn preverify_staged_handoff_candidate(
     current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
-) -> Result<handoff_policy::PolicyRead, String> {
+) -> Result<crate::HandoffCandidateFacts, String> {
     let Some(staging) = Staging::resolve() else {
         return Err("no private staging root is available".to_string());
     };
@@ -2217,8 +2298,9 @@ pub fn preverify_staged_handoff_candidate(
         current_commit,
         expected_build,
         expected_commit,
-        &handoff_policy::read_from_bundle,
+        &crate::HandoffCandidateFacts::read,
     )
+    .and_then(std::convert::identity)
 }
 
 /// THE OTHER HALF OF A SWAP'S PRECONDITION: can the bundle we are running from
@@ -2278,10 +2360,65 @@ pub fn is_rollback_source_refusal(reason: &str) -> bool {
     reason.contains(ROLLBACK_SOURCE_REFUSAL_KEY)
 }
 
+/// The refusal for an installed bundle whose verification returned `error`, on
+/// every lane that asks (the pre-park check below and the cold launch's steps
+/// 7-pre and 7).
+///
+/// ONLY A VERDICT BECOMES THE INSTALLED-SOURCE REFUSAL (round four, plan item
+/// 2). [`rollback_source_refusal`] says "a person must reinstall", and its key
+/// suspends automatic apply with no retry scheduled. A verification that did
+/// not FINISH — `codesign` past the 8 s apply budget on a loaded desk, a helper
+/// the kernel would not start, the apply lock held by a sibling — says nothing
+/// about the bundle, and wrapping it was how one slow `codesign` stopped a
+/// healthy machine's updates until someone reinstalled an app that was fine. A
+/// passing error is returned with its location and its own
+/// [`crate::PASSING_REFUSAL_KEY`], so every reader retries it.
+fn installed_source_refusal(installed: &Path, error: &str) -> String {
+    if crate::is_passing_refusal(error) {
+        format!(
+            "the installed bundle at {} could not be verified just then: {error}",
+            installed.display()
+        )
+    } else {
+        rollback_source_refusal(installed, error)
+    }
+}
+
+/// Whether a failed check of the STAGED bundle is a verdict on its bytes — the
+/// only kind that may discard the stage or record a failure memo against the
+/// artifact. A check that did not finish ([`crate::is_passing_refusal`]) is not:
+/// the same bytes are checked again at the next attempt.
+fn stage_failure_is_a_verdict(error: &str) -> bool {
+    !crate::is_passing_refusal(error)
+}
+
 fn preverify_installed_rollback_source(
     installed: Option<&Path>,
     current_build: u64,
     current_commit: Option<&str>,
+) -> Result<(), String> {
+    preverify_installed_rollback_source_with(
+        installed,
+        current_build,
+        current_commit,
+        &verified_bundle_identity,
+    )
+}
+
+/// A sealed-identity reader: `(build, commit)` of the bundle at a path, or the
+/// refusal (`verified_bundle_identity` in production).
+type IdentityReader = dyn Fn(&Path) -> Result<(u64, String), String>;
+
+/// Injectable core of [`preverify_installed_rollback_source`]: `verify` is the
+/// sealed-identity reader, injected the way
+/// [`preverify_staged_handoff_candidate_at`] injects its policy reader, so the
+/// refusal a timed-out verification mints is provable without a signed fixture
+/// bundle.
+fn preverify_installed_rollback_source_with(
+    installed: Option<&Path>,
+    current_build: u64,
+    current_commit: Option<&str>,
+    verify: &IdentityReader,
 ) -> Result<(), String> {
     let Some(installed) = installed else {
         // `bundle::resolve` is what the apply itself calls, and `None` there is
@@ -2295,7 +2432,7 @@ fn preverify_installed_rollback_source(
                 .to_string(),
         );
     };
-    match verified_bundle_identity(installed) {
+    match verify(installed) {
         Ok((build, commit)) => {
             if identity_matches_running(build, &commit, current_build, current_commit) {
                 Ok(())
@@ -2309,8 +2446,76 @@ fn preverify_installed_rollback_source(
                 ))
             }
         }
-        Err(error) => Err(rollback_source_refusal(installed, &error)),
+        Err(error) => Err(installed_source_refusal(installed, &error)),
     }
+}
+
+/// THE OPERATOR APPLY FLOOR, as a handoff to `build` must respect it (round six
+/// of the update audit, item 26): `Some(refusal)` when `build` is below the
+/// floor `staging` records — a yank the swap's gate 4b would answer by retiring
+/// the stage and leaving the successor the old build. Read-only and cheap (one
+/// small TOML read, no lock, no `codesign`), so it is asked both inside the full
+/// pre-verification and, on its own, by a worker a fresh cached pass let skip
+/// that verification: the floor can rise after the pass was cached (a check
+/// observes a manifest with a higher `min_build`), and the cache knows nothing
+/// of it.
+///
+/// AND THE REVOCATION SET (round seven, H1): a staged marker for `build` signed by a
+/// machine a roster has since revoked is refused the same way — the check lane
+/// retires such a stage when it observes the revocation, and a pass cached before
+/// that knows nothing of it, so without this the successor's own gate found no stage
+/// (or refused it) after every reader had parked.
+pub(crate) fn handoff_apply_floor_refusal_at(staging: &Staging, build: u64) -> Option<String> {
+    let floor = crate::manifest::Floor::read(&staging.floor());
+    if let Some(ready) = Ready::read(&staging.ready)
+        && ready.build_number == build
+        && floor.revokes(ready.machine_id.as_deref())
+    {
+        return Some(format!(
+            "staged build {build} was signed by machine {}, which the machine roster has \
+             revoked; not handing off to it",
+            ready.machine_id.as_deref().unwrap_or("?")
+        ));
+    }
+    let floor = floor.min_build;
+    (build < floor).then(|| {
+        format!(
+            "build {build} is below the operator apply floor {floor} (yanked); not handing off \
+             to it"
+        )
+    })
+}
+
+/// What a handoff pre-verification holds while it runs: the apply lock (when
+/// there is a staging root to take it in) and, under it, the verification
+/// budget. Declared budget first so the budget closes before the lock is let go.
+pub(crate) struct PreverifyGuard {
+    _budget: verify::ApplyBudget,
+    _lock: Option<FileLock>,
+}
+
+/// Enter a handoff pre-verification: take `apply_lock` within
+/// [`APPLY_LOCK_WAIT`], then open [`verify::APPLY_BUDGET`] for everything the
+/// check runs (round seven, item 36). The one door both pre-verifications — the
+/// staged candidate's and the activation's — go through, so the bound
+/// [`crate::HANDOFF_PREVERIFY_BOUND`] names (the lock wait plus the budget) is
+/// the bound they run under, and a caller that waits for one — the fork lane,
+/// for the candidate's handoff policy — waits on a number that holds.
+///
+/// Without the budget each helper was bounded only by its own 30 s, and one
+/// check runs two sealed-identity reads of five helpers each: minutes, on the
+/// loaded desk whose slow `spctl` is why that 30 s exists. A helper that outruns
+/// the budget is a PASSING refusal (`verify::timed_out`), retried like the lock
+/// wait's, never a verdict on the bundle.
+pub(crate) fn enter_preverify(apply_lock: Option<&Path>) -> Result<PreverifyGuard, String> {
+    let lock = apply_lock
+        .map(|path| FileLock::acquire_within(path, APPLY_LOCK_WAIT))
+        .transpose()
+        .map_err(|error| verify::lock_wait_refusal("pre-verify lock", &error))?;
+    Ok(PreverifyGuard {
+        _budget: verify::ApplyBudget::start(verify::APPLY_BUDGET),
+        _lock: lock,
+    })
 }
 
 /// Injectable core of [`preverify_staged_handoff_candidate`]; the split exists
@@ -2320,15 +2525,15 @@ fn preverify_installed_rollback_source(
 /// bundle root the swap would replace, injected for the same reason, and
 /// `read_policy` the handoff-policy reader, so a test can prove it is never
 /// called on a bundle that failed any check.
-fn preverify_staged_handoff_candidate_at(
+fn preverify_staged_handoff_candidate_at<R>(
     staging: &Staging,
     installed: Option<&Path>,
     current_build: u64,
     current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
-    read_policy: &dyn Fn(&Path) -> handoff_policy::PolicyRead,
-) -> Result<handoff_policy::PolicyRead, String> {
+    read_policy: &dyn Fn(&Path) -> R,
+) -> Result<R, String> {
     // Serialize against a concurrent publication/apply exactly like the swap
     // path: verifying a half-published candidate proves nothing.
     //
@@ -2340,8 +2545,12 @@ fn preverify_staged_handoff_candidate_at(
     // every later apply answer "an update handoff is already in flight"
     // (2026-09-01 audit). A timeout is an ordinary refusal: overlap rolls
     // back, readers resume, the stage stays armed for the next attempt.
-    let _lock = FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
-        .map_err(|error| format!("pre-verify lock: {error}"))?;
+    //
+    // And TIMED as a whole once the lock is held (round seven, item 36): the
+    // guard opens the apply's verification budget, so every `codesign`, `spctl`
+    // and `PlistBuddy` below answers inside `verify::APPLY_BUDGET` rather than
+    // each on its own 30 s — the bound `crate::HANDOFF_PREVERIFY_BOUND` states.
+    let _preverify = enter_preverify(Some(&staging.apply_lock))?;
     let ready = match read_ready(staging, current_build) {
         ReadyState::Newer(ready) => ready,
         ReadyState::NotNewer => {
@@ -2357,6 +2566,25 @@ fn preverify_staged_handoff_candidate_at(
             "staged build {} is not the authorized build {expected}",
             ready.build_number
         ));
+    }
+    // A stage an older stager published after this artifact was quarantined
+    // (round six, finding 15) is not a candidate, however well it verifies.
+    if crate::manifest::artifact_quarantined(staging, ready.build_number, &ready.dmg_sha256) {
+        return Err(format!(
+            "staged build {} is quarantined: it crash-looped on this machine and was reverted",
+            ready.build_number
+        ));
+    }
+    // THE OPERATOR APPLY FLOOR (a yank), as the swap's gate 4b reads it (round
+    // six of the update audit, item 26). The floor ratchets when a manifest is
+    // OBSERVED, before any download, and only an apply retires a stage below
+    // it — so a stage armed before the yank is still announced here, and
+    // without this check it parked every reader for a successor whose own swap
+    // then refused it (`NoUpdate`) and exited the old build. Read-only: the
+    // stage is retired by the apply that reaches gate 4b, not by a check. Before
+    // the sealed-identity read, which is `codesign`: a yanked stage costs none.
+    if let Some(refusal) = handoff_apply_floor_refusal_at(staging, ready.build_number) {
+        return Err(refusal);
     }
     let (staged_build, sealed_commit) = verified_bundle_identity(&staging.staged_app)?;
     // The same sealed-identity rebinds the apply path enforces (F10): the number
@@ -2450,6 +2678,31 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
     // Bounded (plan P2-1): this runs on the checker thread, under the stage lock.
     let _publish_lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
         .map_err(|error| format!("publish lock: {error}"))?;
+    // UNDER THE LOCK THE CRASH-LOOP REVERT HOLDS (round six, finding 15). This
+    // stage was decided before the download — minutes ago — and a revert may have
+    // quarantined this very artifact since: then it is not published. The other
+    // order is safe too: a revert after this publish retires the stage.
+    if crate::manifest::artifact_quarantined(staging, ready.build_number, &ready.dmg_sha256) {
+        return Err(format!(
+            "stage refused: build {} ({}) is quarantined — it crash-looped on this machine \
+             and was reverted while this check was downloading it",
+            ready.build_number, ready.dmg_sha256
+        ));
+    }
+    // …AND UNDER THE LOCK THE FLOOR'S READERS AND THE CHECK LANE'S RETIREMENT HOLD
+    // (round seven, H1 finding 33). The roster generation was judged before the
+    // download, minutes ago; a sibling's check may since have admitted a roster that
+    // REVOKES this build's signer (or seen a yank), recorded it in the floor, and
+    // found no published stage to retire. Publishing now would arm this process's
+    // apply lane for a withdrawn machine's build. Either order is safe: a withdrawal
+    // recorded after this publish finds the stage and retires it.
+    if let Some(why) = crate::manifest::Floor::read(&staging.floor())
+        .withdraws(ready.build_number, ready.machine_id.as_deref())
+    {
+        return Err(format!(
+            "stage refused: {why} — withdrawn while this check was downloading it"
+        ));
+    }
 
     // Invalidate the old generation first. Lock-free status readers may briefly
     // observe "absent", but never an old marker paired with the new bundle.
@@ -3373,8 +3626,12 @@ fn apply_staged_if_ready_inner(
         &staging,
         current_build,
         || {
+            // A sibling's hold past the wait is a MOMENT, marked so (round
+            // four, plan item 2): a seamless successor that returns this stays
+            // the old build and refuses its target, and the parent must read
+            // that as "try again later", not as the new bytes' verdict.
             FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
-                .map_err(|e| ApplyOutcome::Deferred(format!("lock: {e}")))
+                .map_err(|e| ApplyOutcome::Deferred(crate::verify::lock_wait_refusal("lock", &e)))
         },
         || {
             // Everything from here to the swap is verification work on the launch path.
@@ -3453,49 +3710,10 @@ fn apply_staged_if_ready_inner(
         ));
     }
 
-    // 4b. Honor an operator apply floor (yank): never apply a staged build below the
-    //     persisted, monotonic min_build — even though it's genuine and strictly newer
-    //     than us — so the owner can retire a bad-but-genuine release after the fact (F5).
-    let floor = crate::manifest::Floor::read(&staging.floor());
-    if ready.build_number < floor.min_build {
-        crate::warn(&format!(
-            "staged build {} is below the operator floor {}; discarding (yanked)",
-            ready.build_number, floor.min_build
-        ));
-        staging.retire_published();
-        crate::status::record(
-            &staging,
-            current_build,
-            &format!(
-                "held: staged build {} below floor {} (yanked)",
-                ready.build_number, floor.min_build
-            ),
-        );
-        return ApplyOutcome::NoUpdate;
+    // 4b/4c. The floor's withdrawals: a yank, and a revoked signer.
+    if let Some(outcome) = floor_withdrawal_gate(&staging, current_build, &ready) {
+        return outcome;
     }
-    // 4c. NO ROSTER-GENERATION GATE HERE, and the reason is worth recording.
-    //
-    //     A stage is an authorization made at stage time, and a revocation lands
-    //     afterwards, so "retract an already-staged build" is a real gap. But the
-    //     apply lane cannot answer it: revocation is a LIST inside the roster
-    //     document, and all this lane holds is `Floor::roster_seq`, a number.
-    //
-    //     Comparing the marker's recorded generation against that floor LOOKS like
-    //     the missing check and is not. `Floor::roster_seq` ratchets to the
-    //     generation of the roster ASSET the client observed, while the marker
-    //     records the generation the MANIFEST was attributed under — and those two
-    //     legitimately differ. A machine joining the roster attaches the new pair to
-    //     releases that already shipped, so `manifest_seq < floor` is the ordinary
-    //     POST-JOIN STEADY STATE, which `authorize_by_roster` deliberately admits
-    //     ("a newer roster paired with an older release"). Gating on it would retire
-    //     a perfectly good stage on every launch after any join: the update never
-    //     applies and the container is downloaded again forever — the exact
-    //     never-updates shape this file already carries two other scars from.
-    //
-    //     The check lane is where the answer lives, because that is where the roster
-    //     document (and its `revoked` list) is in hand. `Ready` records `machine_id`
-    //     and `roster_seq` so that retraction can be written there without a second
-    //     marker migration; it is deliberately NOT enforced from here.
     if !ready.is_publishable(&staging) {
         staging.retire_published();
         return ApplyOutcome::NoUpdate;
@@ -3522,6 +3740,24 @@ fn apply_staged_if_ready_inner(
     // commit can never authenticate a target while we later rename the symlink.
     let (staged_build, sealed_commit) = match verified_bundle_identity(&staging.staged_app) {
         Ok(identity) => identity,
+        // A VERIFICATION THAT DID NOT FINISH KEEPS THE STAGE (round four, plan
+        // item 2). Discarding is the answer to a verdict on the bytes; a
+        // `codesign` that ran out of the apply budget on a loaded machine is not
+        // one, and discarding for it cost a whole re-download on the checker's
+        // cadence — hours of a healthy build held off the machine. The swap
+        // re-verifies at the next attempt anyway, so keeping it trusts nothing.
+        Err(error) if !stage_failure_is_a_verdict(&error) => {
+            crate::warn(&format!(
+                "staged bundle re-verification did not finish: {error}; keeping the stage \
+                 for the next attempt"
+            ));
+            crate::status::record(
+                &staging,
+                current_build,
+                "deferred: staged bundle re-verification did not finish (kept)",
+            );
+            return ApplyOutcome::Deferred(format!("re-verify: {error}"));
+        }
         Err(error) => {
             crate::warn(&format!(
                 "staged bundle re-verification failed: {error}; discarding"
@@ -3587,7 +3823,7 @@ fn apply_staged_if_ready_inner(
     {
         return ApplyOutcome::Deferred(format!(
             "current installed rollback source is not verified: {}",
-            rollback_source_refusal(&b.app_root, &error)
+            installed_source_refusal(&b.app_root, &error)
         ));
     }
     // 7. Prepare/verify NEW at the fixed destination-volume recovery path BEFORE
@@ -3625,10 +3861,12 @@ fn apply_staged_if_ready_inner(
             recover_prepared_candidate(&prepared, &staging);
             // The same refusal the seamless lane mints, remedy included: the
             // cold launch is the "fallback" the stager promises, and on this
-            // bundle it refuses for the same reason.
+            // bundle it refuses for the same reason — and, the same way, only
+            // a verdict carries the remedy (a check that did not finish is
+            // retried).
             return ApplyOutcome::Deferred(format!(
                 "current installed rollback source is not verified: {}",
-                rollback_source_refusal(&b.app_root, &error)
+                installed_source_refusal(&b.app_root, &error)
             ));
         }
     };
@@ -3645,12 +3883,19 @@ fn apply_staged_if_ready_inner(
     // Start it once, here, while OLD is still installed and backing out is free.
     if let Err(error) = crate::verify::probe_bundle_starts(&prepared.fixed, ready.build_number) {
         recover_prepared_candidate(&prepared, &staging);
-        crate::manifest::FailedMark::record_stage_failure(
-            &staging.failed(),
-            ready.build_number,
-            &ready.dmg_sha256,
-            unix_now_secs(),
-        );
+        // A probe that could not RUN to an answer (it timed out on a loaded
+        // machine, or the kernel would not start it just then) is not a
+        // candidate that cannot start: no failure memo for the artifact, whose
+        // backoff would suppress re-staging healthy bytes (round four, plan
+        // item 2).
+        if stage_failure_is_a_verdict(&error) {
+            crate::manifest::FailedMark::record_stage_failure(
+                &staging.failed(),
+                ready.build_number,
+                &ready.dmg_sha256,
+                unix_now_secs(),
+            );
+        }
         return ApplyOutcome::Deferred(format!("staged candidate cannot start: {error}"));
     }
 
@@ -3901,7 +4146,12 @@ fn check_boot_health_with_lock_wait(
     }
     let apply_lock = match FileLock::acquire_within(&staging.apply_lock, lock_wait) {
         Ok(lock) => lock,
-        Err(error) => return Some(ApplyOutcome::Deferred(format!("health lock: {error}"))),
+        Err(error) => {
+            return Some(ApplyOutcome::Deferred(crate::verify::lock_wait_refusal(
+                "health lock",
+                &error,
+            )));
+        }
     };
     // Revalidate after acquiring the transaction lock. Another process may have
     // armed a newer build between the cheap peek and this point.
@@ -4128,11 +4378,10 @@ fn revert_to_rollback(
         // so the next background check (75 s later) re-downloaded and re-applied the
         // build that had just crash-looped, and the machine went straight back around
         // the crash/revert loop this code exists to break.
-        crate::manifest::FailedMark::record_quarantine(
-            &staging.failed(),
-            t.build_number,
-            &t.sha256,
-        );
+        //
+        // INTO ITS OWN LEDGER TOO (round six, finding 32): `failed.toml` holds one
+        // artifact, and the next stage event of any other build overwrote this.
+        crate::manifest::quarantine_artifact(staging, t.build_number, &t.sha256);
     }
     // OLD is restored at the install; failed NEW sits at rb. Disarm succeeded, so
     // transaction cleanup cannot leave an armed trial without recovery metadata.
@@ -4751,6 +5000,88 @@ fn ready_under_apply_lock(staging: &Staging, current_build: u64) -> Result<Ready
         }
         ReadyState::Absent => Err(ApplyOutcome::NoUpdate),
     }
+}
+
+/// Gates 4b and 4c of the swap: the operator floor's WITHDRAWALS of a staged build —
+/// a yank (`min_build`) and a signer the machine roster revoked (the floor's durable
+/// revocation set). `Some(NoUpdate)` once the stage is retired; `None` to go on. The
+/// caller holds the apply lock and has read `ready` under it.
+fn floor_withdrawal_gate(
+    staging: &Staging,
+    current_build: u64,
+    ready: &Ready,
+) -> Option<ApplyOutcome> {
+    // 4b. Honor an operator apply floor (yank): never apply a staged build below the
+    //     persisted, monotonic min_build — even though it's genuine and strictly newer
+    //     than us — so the owner can retire a bad-but-genuine release after the fact (F5).
+    let floor = crate::manifest::Floor::read(&staging.floor());
+    if ready.build_number < floor.min_build {
+        crate::warn(&format!(
+            "staged build {} is below the operator floor {}; discarding (yanked)",
+            ready.build_number, floor.min_build
+        ));
+        staging.retire_published();
+        crate::status::record(
+            staging,
+            current_build,
+            &format!(
+                "held: staged build {} below floor {} (yanked)",
+                ready.build_number, floor.min_build
+            ),
+        );
+        return Some(ApplyOutcome::NoUpdate);
+    }
+    // 4c. THE DURABLE REVOCATION SET — and NO roster-GENERATION gate, and the reason
+    //     is worth recording.
+    //
+    //     A stage is an authorization made at stage time, and a revocation lands
+    //     afterwards. The check lane that admits the revoking roster records the
+    //     revoked machine ids in the floor and retires the stage under this same lock
+    //     — but a check that could not take the lock in time leaves it for the next
+    //     check, and a quit app launches here first. So this gate reads the same set
+    //     (round seven, H1): a stage signed by a machine this client has seen revoked
+    //     is retired, never swapped in. It is EXACT — the machine id is inside the
+    //     manifest's signed bytes and the set holds only what an admitted,
+    //     master-verified roster revoked.
+    //
+    //     What it cannot see is a revocation no check on this Mac has observed yet (a
+    //     stage made, the app quit, the machine revoked, the app launched offline or
+    //     before its first check): the apply lane holds no roster, and fetching one
+    //     before the boot swap is a network wait at every launch. That residual is
+    //     `min_build`'s to yank (docs/RELEASE-KEYS.md: revocation stops future
+    //     acceptance).
+    //
+    //     Comparing the marker's recorded GENERATION against `Floor::roster_seq`
+    //     LOOKS like the missing check and is not. `Floor::roster_seq` ratchets to the
+    //     generation of the roster ASSET the client observed, while the marker
+    //     records the generation the MANIFEST was attributed under — and those two
+    //     legitimately differ. A machine joining the roster attaches the new pair to
+    //     releases that already shipped, so `manifest_seq < floor` is the ordinary
+    //     POST-JOIN STEADY STATE, which `authorize_by_roster` deliberately admits
+    //     ("a newer roster paired with an older release"). Gating on it would retire
+    //     a perfectly good stage on every launch after any join: the update never
+    //     applies and the container is downloaded again forever — the exact
+    //     never-updates shape this file already carries two other scars from.
+    if floor.revokes(ready.machine_id.as_deref()) {
+        let machine = ready.machine_id.as_deref().unwrap_or("?");
+        crate::warn(&format!(
+            "staged build {} was signed by machine {machine}, which the machine roster has \
+             revoked; discarding it",
+            ready.build_number
+        ));
+        crate::github::retire_revoked_stage(staging, ready.build_number);
+        crate::status::record(
+            staging,
+            current_build,
+            &format!(
+                "held: staged build {} was signed by machine {machine}, which the machine \
+                 roster has revoked",
+                ready.build_number
+            ),
+        );
+        return Some(ApplyOutcome::NoUpdate);
+    }
+    None
 }
 
 fn read_ready(staging: &Staging, current_build: u64) -> ReadyState {
@@ -5380,6 +5711,208 @@ staged_at = "2026-08-17T00:00:00Z"
         );
     }
 
+    /// A STAGE DECIDED BEFORE A CRASH-LOOP REVERT CANNOT OUTLIVE IT (round six,
+    /// finding 15). A checker still on the old build starts downloading Q during
+    /// Q's boot trial; the third failed launch of Q reverts and quarantines it; the
+    /// in-flight check then publishes Q and cleared the memo — erasing the verdict —
+    /// and nothing downstream looked at the quarantine, so Q was applied and
+    /// crash-looped again. The publish shares the revert's apply lock, so a check
+    /// under it closes the race; the readers refuse what an older stager published.
+    #[test]
+    fn a_stage_decided_before_a_crash_loop_revert_cannot_republish_the_quarantined_build() {
+        let (s, root) = temp_staging();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let sha = "ab".repeat(32);
+        let plist = format!(
+            "<plist><dict><key>CFBundleVersion</key><string>7</string>\
+             <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
+        );
+        let incoming = s.staged_dir().join("aterm.app.incoming");
+        make_app(&incoming, "Q");
+        std::fs::create_dir_all(incoming.join("Contents")).unwrap();
+        std::fs::write(incoming.join("Contents/Info.plist"), &plist).unwrap();
+        let ready = Ready {
+            build_number: 7,
+            version: "0.0.7".into(),
+            commit: Some(commit.into()),
+            dmg_sha256: sha.clone(),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: None,
+            roster_seq: None,
+        };
+
+        // The revert lands while the stager is still downloading.
+        crate::manifest::quarantine_artifact(&s, 7, &sha);
+        let refused = publish_verified_stage(&s, &incoming, &ready);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("quarantined")),
+            "{refused:?}"
+        );
+        assert!(Ready::read_publishable(&s).is_none());
+        // The stager's success tail must not erase the verdict.
+        crate::manifest::FailedMark::clear_backoff(&s.failed());
+        assert!(crate::manifest::artifact_quarantined(&s, 7, &sha));
+
+        // A stager of an older build publishes without asking: every reader
+        // still refuses the quarantined stage.
+        std::fs::rename(&incoming, &s.staged_app).unwrap();
+        std::fs::write(&s.ready, ready.to_toml().unwrap()).unwrap();
+        assert!(
+            Ready::read_publishable(&s).is_none(),
+            "a quarantined stage is not publishable"
+        );
+        let preverify =
+            preverify_staged_handoff_candidate_at(&s, None, 6, None, Some(7), None, &|_| ());
+        assert!(
+            preverify
+                .as_ref()
+                .is_err_and(|error| error.contains("quarantined")),
+            "{preverify:?}"
+        );
+        // NEGATIVE CONTROL: the same stage of an artifact nobody quarantined
+        // reads as publishable.
+        let other = Ready {
+            dmg_sha256: "cd".repeat(32),
+            ..ready
+        };
+        std::fs::write(&s.ready, other.to_toml().unwrap()).unwrap();
+        assert!(Ready::read_publishable(&s).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A STAGE WHOSE SIGNER A SIBLING SAW REVOKED MID-DOWNLOAD IS NEVER PUBLISHED
+    /// (round seven, H1 finding 33). Check A authorized build 7 by m11 under roster
+    /// generation 9 and began its download; the pre-download supersession guard had
+    /// passed. Meanwhile check B admitted generation 10, which revokes m11, recorded
+    /// that in the floor, and found no published stage to retire. A then published —
+    /// the only guard ran before the download — and armed its own apply lane for a
+    /// withdrawn machine's build. The publish now re-reads the floor under the lock
+    /// the check's retirement holds.
+    #[test]
+    fn a_stage_whose_signer_was_revoked_during_its_download_is_not_published() {
+        let (s, root) = temp_staging();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let incoming = s.staged_dir().join("aterm.app.incoming");
+        make_app(&incoming, "R");
+        std::fs::create_dir_all(incoming.join("Contents")).unwrap();
+        std::fs::write(
+            incoming.join("Contents/Info.plist"),
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>7</string>\
+                 <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
+            ),
+        )
+        .unwrap();
+        let ready = Ready {
+            build_number: 7,
+            version: "0.0.7".into(),
+            commit: Some(commit.into()),
+            dmg_sha256: "ab".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: Some("m11".into()),
+            roster_seq: Some(9),
+        };
+        // The sibling's check, landing while this one downloaded.
+        let revoked = vec!["m11".to_string()];
+        crate::manifest::Floor::observe_and_write(
+            &s.floor(),
+            &crate::manifest::FloorObservation {
+                roster_seq: 10,
+                revoked: &revoked,
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        let refused = publish_verified_stage(&s, &incoming, &ready);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("m11") && error.contains("revoked")),
+            "{refused:?}"
+        );
+        assert!(
+            Ready::read_published_bundle(&s).is_none(),
+            "nothing published"
+        );
+
+        // NEGATIVE CONTROL: a generation that only ADDS a machine (a join) does not
+        // withdraw a stage signed by one that stays — the exactness a
+        // roster-generation comparison would lose.
+        let by_m3 = Ready {
+            machine_id: Some("m3".into()),
+            ..ready
+        };
+        crate::manifest::Floor::observe_and_write(
+            &s.floor(),
+            &crate::manifest::FloorObservation {
+                roster_seq: 11,
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        publish_verified_stage(&s, &incoming, &by_m3).expect("m3 is still trusted");
+        assert!(Ready::read_publishable(&s).is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// THE SWAP REFUSES A STAGE SIGNED BY A MACHINE THIS CLIENT HAS SEEN REVOKED
+    /// (round seven, H1 finding 56's reachable half). The check that admits the
+    /// revoking roster retires the stage under the apply lock — unless it could not
+    /// take that lock in time, which leaves the stage for its next check; an app quit
+    /// in between launched straight into the swap, which read only `min_build`.
+    /// Gate 4c now reads the floor's durable revocation set.
+    #[test]
+    fn the_swap_retires_a_stage_whose_signer_the_floor_has_seen_revoked() {
+        let (s, root) = temp_staging();
+        let ready = |machine: &str| Ready {
+            build_number: 20,
+            version: "0.0.20".into(),
+            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            dmg_sha256: "ab".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: Some(machine.into()),
+            roster_seq: Some(9),
+        };
+        std::fs::write(&s.ready, ready("m11").to_toml().unwrap()).unwrap();
+        // NEGATIVE CONTROL: nothing revoked, nothing yanked — the gate lets it on.
+        assert!(floor_withdrawal_gate(&s, 10, &ready("m11")).is_none());
+        assert_eq!(handoff_apply_floor_refusal_at(&s, 20), None);
+
+        let revoked = vec!["m11".to_string()];
+        crate::manifest::Floor::observe_and_write(
+            &s.floor(),
+            &crate::manifest::FloorObservation {
+                roster_seq: 10,
+                revoked: &revoked,
+                ..crate::manifest::FloorObservation::default()
+            },
+        );
+        // Another machine's stage is untouched by m11's revocation.
+        assert!(floor_withdrawal_gate(&s, 10, &ready("m3")).is_none());
+        // The pre-park check refuses it before any reader parks…
+        let refusal = handoff_apply_floor_refusal_at(&s, 20).expect("revoked signer");
+        assert!(
+            refusal.contains("m11") && refusal.contains("revoked"),
+            "{refusal}"
+        );
+        // …and the swap retires it.
+        let outcome = floor_withdrawal_gate(&s, 10, &ready("m11"));
+        assert!(
+            matches!(outcome, Some(ApplyOutcome::NoUpdate)),
+            "{outcome:?}"
+        );
+        assert!(!s.ready.exists(), "the stage is retired");
+        let status = std::fs::read_to_string(&s.status).unwrap_or_default();
+        assert!(status.contains("revoked"), "{status}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A marker that would read as ABSENT must never be committed — and refusing it
     /// must not cost the readable generation that is already staged, which is why the
     /// size guard runs before the lock and before the old marker/bundle are removed.
@@ -5487,9 +6020,187 @@ staged_at = "2026-08-17T00:00:00Z"
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A STAGE YANKED AFTER IT WAS ARMED NEVER PARKS A READER (round six of the
+    /// update audit, item 26). The floor rose on observation (`min_build = 21`)
+    /// while build 20 was still staged; the swap's gate 4b would retire it and
+    /// leave the successor the old build, so the pre-park check must refuse it
+    /// by the floor — before the sealed-identity read — and read no policy.
+    ///
+    /// RED before the fix: the check never read the floor, and its only
+    /// refusal here was the unverifiable fixture bundle's, which says nothing
+    /// of a yank (a signed stage would have passed and parked).
+    /// The floor check a worker runs ALONE when a fresh cached pass let it skip
+    /// the full pre-verification (round six, item 26, review round two): the
+    /// same refusal the full check gives, read off the same file, and silent at
+    /// or above the floor and when no floor was ever written.
+    #[test]
+    fn the_floor_check_alone_refuses_only_below_the_floor() {
+        let (s, root) = temp_staging();
+        assert_eq!(
+            handoff_apply_floor_refusal_at(&s, 20),
+            None,
+            "no floor written"
+        );
+        std::fs::write(s.floor(), "min_build = 21\n").unwrap();
+        let refusal = handoff_apply_floor_refusal_at(&s, 20).expect("20 is below 21");
+        assert!(
+            refusal.contains("below the operator apply floor 21") && refusal.contains("yanked"),
+            "{refusal}"
+        );
+        assert_eq!(handoff_apply_floor_refusal_at(&s, 21), None, "at the floor");
+        assert_eq!(
+            handoff_apply_floor_refusal_at(&s, 22),
+            None,
+            "above the floor"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preverify_refuses_a_stage_below_the_operator_floor() {
+        let (s, root) = temp_staging();
+        write_ready(&s, 20);
+        std::fs::write(s.floor(), "min_build = 21\n").unwrap();
+        let yanked =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
+        let error = yanked.unwrap_err();
+        assert!(
+            error.contains("below the operator apply floor 21") && error.contains("yanked"),
+            "{error}"
+        );
+        // Read-only: the stage is still there for the apply to retire.
+        assert!(matches!(read_ready(&s, 10), ReadyState::Newer(_)));
+        // At the floor, the floor is not the refusal.
+        std::fs::write(s.floor(), "min_build = 20\n").unwrap();
+        let at_floor =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
+                .unwrap_err();
+        assert!(!at_floor.contains("floor"), "{at_floor}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A CHECK OF THE INSTALLED BUNDLE THAT DID NOT FINISH IS NOT A PERSON'S TO
+    /// CLEAR (round four of the 2026-09 update robustness work, plan item 2).
+    ///
+    /// The installed bundle's sealed-identity reader answers what
+    /// `verified_bundle_identity` answers when its team-pinned `codesign` outruns
+    /// the apply budget on a loaded desk — the verifier's own `timed_out`, under
+    /// the same "bundle policy:" prefix (the real helper outrunning a real budget
+    /// is `verify`'s `a_helper_timeout_is_a_passing_refusal`; a reader here that
+    /// raced a real `codesign` against a spent budget would be a flaky test). That
+    /// refusal must carry the passing key and must NOT be the installed-source
+    /// refusal — whose key suspends automatic apply with no retry and tells the
+    /// owner to reinstall an app that is fine. Before this change the pre-park
+    /// check wrapped EVERY error in `rollback_source_refusal`, so
+    /// `is_rollback_source_refusal` answered true here (the assertion below that
+    /// fails on that code).
+    ///
+    /// CONTROL: the REAL reader, given all the time it needs, refuses the same
+    /// unsigned bundle as a VERDICT — and that one is still the person's.
+    #[test]
+    fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-update-installed-timeout-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        ));
+        let app = root.join("aterm.app");
+        let _ = unsigned_bundle_with_a_policy(&app, 10);
+        let commit = Some("0123456789abcdef0123456789abcdef01234567");
+
+        let slow_machine = |_installed: &Path| -> Result<(u64, String), String> {
+            Err(format!(
+                "bundle policy: {}",
+                crate::verify::timed_out("codesign --verify (team-pinned)", true)
+            ))
+        };
+        let refusal =
+            preverify_installed_rollback_source_with(Some(&app), 10, commit, &slow_machine)
+                .expect_err("a check that did not finish must refuse, never pass");
+        assert!(
+            crate::is_passing_refusal(&refusal),
+            "a verification that ran out of the apply budget is a passing refusal: {refusal}"
+        );
+        assert!(
+            !is_rollback_source_refusal(&refusal),
+            "a check that did not finish must not read as the installed-source refusal: {refusal}"
+        );
+        assert!(
+            !crate::refusal_needs_person(&refusal),
+            "nothing about the bundle is known, so nothing is asked of a person: {refusal}"
+        );
+        assert!(
+            refusal.contains(&app.display().to_string()),
+            "the refusal still names the bundle it was about: {refusal}"
+        );
+        // The shape the old wrapping minted — the installed-source key AROUND a
+        // passing error — is not a person's either, wherever it is still read.
+        let wrapped = rollback_source_refusal(&app, &refusal);
+        assert!(is_rollback_source_refusal(&wrapped));
+        assert!(!crate::refusal_needs_person(&wrapped), "{wrapped}");
+
+        // CONTROL: the verdict on the same unsigned bundle keeps its remedy.
+        let verdict = preverify_installed_rollback_source_with(
+            Some(&app),
+            10,
+            commit,
+            &verified_bundle_identity,
+        )
+        .expect_err("an unsigned installed bundle is refused");
+        assert!(!crate::is_passing_refusal(&verdict), "{verdict}");
+        assert!(is_rollback_source_refusal(&verdict), "{verdict}");
+        assert!(crate::refusal_needs_person(&verdict), "{verdict}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// ONLY A VERDICT DISCARDS A STAGE OR MEMOS THE ARTIFACT AS FAILED (round
+    /// four, plan item 2): the cold launch's step 6 and step 7b both used to act
+    /// on any error, so a re-verification or a start probe that merely ran out of
+    /// time discarded a healthy stage or backed its re-download off. Passing
+    /// shapes minted for real — the apply lock held past its wait by a live
+    /// holder, a copy that outran its limit, a helper past the apply budget — are
+    /// kept; a codesign rejection is not.
+    #[test]
+    fn a_stage_check_that_did_not_finish_is_not_a_verdict_on_the_bytes() {
+        let held = std::env::temp_dir().join(format!(
+            "aterm-update-held-apply-lock-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        ));
+        let holder = FileLock::acquire(&held).expect("take the lock as a sibling would");
+        let waited = FileLock::acquire_within(&held, std::time::Duration::from_millis(40))
+            .err()
+            .expect("a held lock refuses the bounded wait");
+        let lock = crate::verify::lock_wait_refusal("lock", &waited);
+        drop(holder);
+        let _ = std::fs::remove_file(&held);
+
+        let copy = crate::verify::status_bounded_with_stderr(
+            Command::new("/bin/sleep").arg("30"),
+            "ditto to fixed swap path",
+            std::time::Duration::from_millis(50),
+        )
+        .expect_err("a copy past its limit refuses");
+        let budget = crate::verify::timed_out("candidate --version probe", true);
+        for passing in [&lock, &copy, &budget] {
+            assert!(
+                crate::is_passing_refusal(passing),
+                "a moment must be marked passing: {passing}"
+            );
+            assert!(
+                !stage_failure_is_a_verdict(passing),
+                "a moment must not discard the stage: {passing}"
+            );
+        }
+        let verdict = "bundle policy: codesign --verify (structural) failed: code object is not \
+                       signed at all";
+        assert!(stage_failure_is_a_verdict(verdict));
+    }
+
     /// The handoff-policy reader for a pre-verification that must refuse: a read
     /// is the failure (plan P0-5 — no refused bundle's policy is ever read).
-    const NEVER_READ: &dyn Fn(&Path) -> handoff_policy::PolicyRead = &|path| {
+    const NEVER_READ: &dyn Fn(&Path) -> aterm_update_core::handoff_policy::PolicyRead = &|path| {
         panic!(
             "a refused candidate's handoff policy was read: {}",
             path.display()
@@ -5499,7 +6210,10 @@ staged_at = "2026-08-17T00:00:00Z"
     /// A staged `.app` shaped like a release — an `Info.plist` naming `build` and
     /// a handoff policy asking every producer for blank screens — that carries NO
     /// signature. Returns the policy it holds, as a reader would parse it.
-    fn unsigned_bundle_with_a_policy(app: &Path, build: u64) -> handoff_policy::PolicyRead {
+    fn unsigned_bundle_with_a_policy(
+        app: &Path,
+        build: u64,
+    ) -> aterm_update_core::handoff_policy::PolicyRead {
         let contents = app.join("Contents");
         std::fs::create_dir_all(contents.join("MacOS")).unwrap();
         std::fs::create_dir_all(contents.join("Resources")).unwrap();
@@ -5517,11 +6231,11 @@ staged_at = "2026-08-17T00:00:00Z"
         .unwrap();
         std::fs::write(contents.join("MacOS/aterm"), b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::write(
-            app.join(handoff_policy::BUNDLE_PATH),
+            app.join(aterm_update_core::handoff_policy::BUNDLE_PATH),
             "schema = 1\ncarry = \"repaint\"\npark_quiet_gate_at_land = \"relaxed\"\n",
         )
         .unwrap();
-        handoff_policy::read_from_bundle(app)
+        aterm_update_core::handoff_policy::read_from_bundle(app)
     }
 
     /// A HANDOFF POLICY IN AN UNVERIFIED BUNDLE IS NEVER READ (the 2026-09-22/23
@@ -5537,14 +6251,14 @@ staged_at = "2026-08-17T00:00:00Z"
         write_ready(&s, 20);
         let held = unsigned_bundle_with_a_policy(&s.staged_app, 20);
         assert!(
-            matches!(held, handoff_policy::PolicyRead::Parsed(policy)
-                if policy.carry == Some(handoff_policy::CarryCeiling::Repaint)),
+            matches!(held, aterm_update_core::handoff_policy::PolicyRead::Parsed(policy)
+                if policy.carry == Some(aterm_update_core::handoff_policy::CarryCeiling::Repaint)),
             "PRECONDITION: the unsigned stage holds a policy a reader would follow: {held:?}"
         );
         let reads = std::cell::Cell::new(0_u32);
         let counting = |path: &Path| {
             reads.set(reads.get() + 1);
-            handoff_policy::read_from_bundle(path)
+            aterm_update_core::handoff_policy::read_from_bundle(path)
         };
         let refused =
             preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, &counting);
@@ -5559,7 +6273,10 @@ staged_at = "2026-08-17T00:00:00Z"
         let installed = root.join("Applications").join("aterm.app");
         let held = unsigned_bundle_with_a_policy(&installed, 20);
         assert!(
-            matches!(held, handoff_policy::PolicyRead::Parsed(_)),
+            matches!(
+                held,
+                aterm_update_core::handoff_policy::PolicyRead::Parsed(_)
+            ),
             "{held:?}"
         );
         let refused =
@@ -5619,6 +6336,94 @@ staged_at = "2026-08-17T00:00:00Z"
             "then it verified, and refused the unsigned bundle: {refused:?}"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// THE PRE-VERIFICATION IS TIMED AS A WHOLE (round seven, item 36). The fork
+    /// lane waits for a running pre-verification up to a ceiling derived from
+    /// [`crate::HANDOFF_PREVERIFY_BOUND`] — the lock wait plus the verification
+    /// budget. That ceiling is a bound only if the check really runs under the
+    /// budget: without it each helper had its own 30 s and one check runs ten of
+    /// them, so a read outlived the ceiling on exactly the slow desk the wait is
+    /// for, the lane parked without the policy, and its worker then queued for
+    /// the lock that read still held with every reader frozen. Here: entering a
+    /// pre-verification holds the apply lock AND opens a budget no longer than
+    /// `APPLY_BUDGET`, both released on drop, and the bound is their sum.
+    #[test]
+    fn a_pre_verification_holds_the_lock_and_runs_under_the_verification_budget() {
+        assert_eq!(
+            crate::HANDOFF_PREVERIFY_BOUND,
+            APPLY_LOCK_WAIT + verify::APPLY_BUDGET,
+            "the bound a waiter derives its ceiling from is the lock wait plus the budget"
+        );
+        let (s, root) = temp_staging();
+        assert!(verify::current_budget_deadline().is_none());
+        {
+            let entered = std::time::Instant::now();
+            let _guard = enter_preverify(Some(&s.apply_lock)).expect("an idle lock is taken");
+            let deadline = verify::current_budget_deadline()
+                .expect("every helper under a pre-verification answers inside the budget");
+            assert!(
+                deadline <= std::time::Instant::now() + verify::APPLY_BUDGET
+                    && deadline >= entered + verify::APPLY_BUDGET,
+                "the budget is the apply budget, opened once the lock is held"
+            );
+            assert!(
+                FileLock::acquire_within(&s.apply_lock, std::time::Duration::from_millis(50))
+                    .is_err(),
+                "the apply lock is held for the whole check"
+            );
+        }
+        assert!(
+            verify::current_budget_deadline().is_none(),
+            "the budget closes with the check"
+        );
+        let _free = FileLock::acquire_within(&s.apply_lock, std::time::Duration::from_millis(50))
+            .expect("and the lock is let go");
+        // No staging root: nothing to lock, and the budget still opens.
+        {
+            let _guard = enter_preverify(None).expect("no lock to wait for");
+            assert!(verify::current_budget_deadline().is_some());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Both pre-verifications — the staged candidate's and the activation's —
+    /// enter through [`enter_preverify`], once, and take the apply lock nowhere
+    /// else: a check that went back to its own `acquire_within` would drop the
+    /// budget, and the ceiling above would be a comment again. Asserted as source
+    /// because the helpers under the budget need a signed bundle to run long.
+    #[test]
+    fn both_pre_verifications_enter_through_the_budgeted_door() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            let from = &source[source.find(signature).expect(signature)..];
+            &from[..from.find("\n}\n").expect("end of fn")]
+        }
+        let install = include_str!("install.rs");
+        let install = install
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .map_or(install, |(before, _)| before);
+        let lib = include_str!("lib.rs");
+        for (what, lane) in [
+            (
+                "the staged candidate's",
+                body(install, "fn preverify_staged_handoff_candidate_at<"),
+            ),
+            (
+                "the activation's",
+                body(lib, "fn preverify_installed_locked<"),
+            ),
+        ] {
+            // Split so these assertions do not match themselves.
+            assert_eq!(
+                lane.matches(concat!("enter_preverify", "(")).count(),
+                1,
+                "{what} pre-verification enters through enter_preverify, once"
+            );
+            assert!(
+                !lane.contains(concat!("acquire_within", "(")),
+                "{what} pre-verification takes the lock only through the budgeted door"
+            );
+        }
     }
 
     #[test]
@@ -8455,6 +9260,11 @@ mod launchd_copy_tests {
         }
     }
 
+    /// The reaper's contract. SETTLED reclaims an attempt its caller abandoned once
+    /// the fenced writer published a terminal status; LAPSED (round six, finding 50)
+    /// reclaims one past every writer's ceiling whose caller gave it up or is gone.
+    /// Neither ever takes a live caller's attempt it has not given up, and neither
+    /// takes one a writer could still be filling.
     fn reaper_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             AbandonedCopyReclamation {
@@ -8462,16 +9272,19 @@ mod launchd_copy_tests {
                 var abandoned = 0;
                 var complete = 0;
                 var fenced = 1;
+                var owner_gone = 0;
+                var lapsed = 0;
                 var reaped = 0;
-                action Abandon when (abandoned == 0 && reaped == 0) { abandoned = 1; }
+                action Abandon when (abandoned == 0 && owner_gone == 0 && reaped == 0) { abandoned = 1; }
                 action Complete when (complete == 0 && reaped == 0) { complete = 1; }
                 action LoseFence when (fenced == 1 && reaped == 0) { fenced = 0; }
-                action Reap when (reaped == 0 && complete == 1 && fenced == 1 && (abandoned == 1 || Buggy == 1)) {
+                action OwnerDies when (owner_gone == 0 && reaped == 0) { owner_gone = 1; }
+                action Lapse when (lapsed == 0 && reaped == 0) { lapsed = 1; }
+                action Reap when (reaped == 0 && ((abandoned == 1 && complete == 1 && fenced == 1) || (lapsed == 1 && (abandoned == 1 || owner_gone == 1)) || Buggy == 1)) {
                     reaped = 1;
                 }
-                invariant ReclaimOnlyAbandoned: reaped == 0 || abandoned == 1;
-                invariant ReclaimOnlyCompleted: reaped == 0 || complete == 1;
-                invariant ReclaimOnlyFenced: reaped == 0 || fenced == 1;
+                invariant ReclaimOnlyDisowned: reaped == 0 || abandoned == 1 || owner_gone == 1;
+                invariant ReclaimOnlySettledOrLapsed: reaped == 0 || (complete == 1 && fenced == 1) || lapsed == 1;
             }
         }
     }
@@ -8480,71 +9293,194 @@ mod launchd_copy_tests {
     fn abandoned_copy_reaping_requires_terminal_status_and_the_one_shot_fence() {
         let model = reaper_model();
         aterm_spec::verify::prove_and_catch_scalar(&model, "abandoned copy reclamation");
+        let dead = {
+            let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let old = std::time::SystemTime::now()
+            - STALE_COPY_ATTEMPT_AFTER
+            - std::time::Duration::from_secs(60);
         for abandoned in [false, true] {
             for completed in ["absent", "malformed", "complete"] {
                 for fenced in [false, true] {
-                    let staging = Staging::scratch("copy-reaper");
-                    let attempt = IsolatedCopy::create(&staging.root.join("destination")).unwrap();
-                    let label = format!("systems.alab.aterm-update.unpack-{}", "ab".repeat(16));
-                    std::fs::write(attempt.root.join("launchd.job"), &label).unwrap();
-                    if abandoned {
-                        std::fs::write(attempt.root.join("abandoned"), "1\n").unwrap();
-                    }
-                    if fenced {
-                        std::fs::create_dir(attempt.root.join(format!(".{label}.status.once")))
-                            .unwrap();
-                    }
-                    match completed {
-                        "complete" => {
-                            std::fs::write(attempt.root.join(format!(".{label}.status")), "0\n")
-                                .unwrap()
+                    for owner_gone in [false, true] {
+                        for lapsed in [false, true] {
+                            reaper_case(
+                                &model, dead, old, abandoned, completed, fenced, owner_gone, lapsed,
+                            );
                         }
-                        "malformed" => std::fs::write(
-                            attempt.root.join(format!(".{label}.status")),
-                            "unfinished",
-                        )
-                        .unwrap(),
-                        _ => {}
                     }
-                    let mut state = model.init_state();
-                    state.insert("abandoned", i64::from(abandoned));
-                    state.insert("complete", i64::from(completed == "complete"));
-                    state.insert("fenced", i64::from(fenced));
-                    let admitted = model.action_enabled("Reap", &state);
-                    // Creating an apply/copy attempt must not recursively sweep
-                    // predecessors, even when their cleanup is already authorized.
-                    // The historical allocation-time sweep fails this assertion.
-                    let next =
-                        IsolatedCopy::create(&staging.root.join("next-destination")).unwrap();
-                    assert!(
-                        attempt.root.exists(),
-                        "allocation must leave bulk cleanup to the checker"
-                    );
-                    reap_abandoned_copy_attempts(&staging.root);
-                    assert!(
-                        next.root.exists(),
-                        "maintenance cannot reclaim the live new attempt"
-                    );
-                    assert_eq!(!attempt.root.exists(), admitted);
-                    if admitted {
-                        copy_model_step(&model, &mut state, "Reap");
-                        assert!(model.check_invariant("ReclaimOnlyAbandoned", &state));
-                        assert!(
-                            !staging.root.join("destination").exists(),
-                            "late completion cannot promote abandoned bytes"
-                        );
-                    }
-                    if !abandoned && completed == "complete" && fenced {
-                        // Negative control: completion alone is not authority to
-                        // delete the current caller's not-yet-promoted output.
-                        std::fs::remove_dir_all(&attempt.root).unwrap();
-                        state.insert("reaped", 1);
-                        assert!(!model.check_invariant("ReclaimOnlyAbandoned", &state));
-                    }
-                    let _ = std::fs::remove_dir_all(staging.root);
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reaper_case(
+        model: &aterm_spec::derive::Model,
+        dead: u32,
+        old: std::time::SystemTime,
+        abandoned: bool,
+        completed: &str,
+        fenced: bool,
+        owner_gone: bool,
+        lapsed: bool,
+    ) {
+        let staging = Staging::scratch("copy-reaper");
+        let attempt = IsolatedCopy::create(&staging.root.join("destination")).unwrap();
+        let label = format!("systems.alab.aterm-update.unpack-{}", "ab".repeat(16));
+        std::fs::write(attempt.root.join("launchd.job"), &label).unwrap();
+        if abandoned {
+            std::fs::write(attempt.root.join("abandoned"), "1\n").unwrap();
+        }
+        if fenced {
+            std::fs::create_dir(attempt.root.join(format!(".{label}.status.once"))).unwrap();
+        }
+        match completed {
+            "complete" => {
+                std::fs::write(attempt.root.join(format!(".{label}.status")), "0\n").unwrap()
+            }
+            "malformed" => {
+                std::fs::write(attempt.root.join(format!(".{label}.status")), "unfinished").unwrap()
+            }
+            _ => {}
+        }
+        if owner_gone {
+            std::fs::write(attempt.root.join(COPY_OWNER), format!("{dead}\n")).unwrap();
+        }
+        if lapsed {
+            std::fs::File::options()
+                .write(true)
+                .open(attempt.root.join("copy-layout"))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let mut state = model.init_state();
+        state.insert("abandoned", i64::from(abandoned));
+        state.insert("complete", i64::from(completed == "complete"));
+        state.insert("fenced", i64::from(fenced));
+        state.insert("owner_gone", i64::from(owner_gone));
+        state.insert("lapsed", i64::from(lapsed));
+        let admitted = model.action_enabled("Reap", &state);
+        // Creating an apply/copy attempt must not recursively sweep
+        // predecessors, even when their cleanup is already authorized.
+        // The historical allocation-time sweep fails this assertion.
+        let next = IsolatedCopy::create(&staging.root.join("next-destination")).unwrap();
+        assert!(
+            attempt.root.exists(),
+            "allocation must leave bulk cleanup to the checker"
+        );
+        reap_abandoned_copy_attempts(&staging.root);
+        assert!(
+            next.root.exists(),
+            "maintenance cannot reclaim the live new attempt"
+        );
+        let case = format!(
+            "abandoned={abandoned} completed={completed} fenced={fenced} \
+             owner_gone={owner_gone} lapsed={lapsed}"
+        );
+        assert_eq!(!attempt.root.exists(), admitted, "{case}");
+        if admitted {
+            copy_model_step(model, &mut state, "Reap");
+            assert!(
+                model.check_invariant("ReclaimOnlyDisowned", &state),
+                "{case}"
+            );
+            assert!(
+                model.check_invariant("ReclaimOnlySettledOrLapsed", &state),
+                "{case}"
+            );
+            assert!(
+                !staging.root.join("destination").exists(),
+                "late completion cannot promote abandoned bytes"
+            );
+        }
+        if !abandoned && !owner_gone && completed == "complete" && fenced {
+            // Negative control: completion alone — however old — is not authority
+            // to delete the live caller's not-yet-promoted output.
+            std::fs::remove_dir_all(&attempt.root).unwrap();
+            state.insert("reaped", 1);
+            assert!(
+                !model.check_invariant("ReclaimOnlyDisowned", &state),
+                "{case}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(staging.root);
+    }
+
+    /// A COPY ATTEMPT NOBODY CAN FINISH IS RECLAIMED IN THE END (round six, finding
+    /// 50). The reaper admitted only an attempt its caller had marked abandoned AND
+    /// whose fenced writer had published a status. Two ordinary cuts satisfy neither
+    /// and leaked an app-sized hidden directory each, for good: a caller killed
+    /// mid-copy (a force-quit launch, a reboot) never marks its attempt, and a
+    /// launchd copy stopped by the timeout's `launchctl remove` never writes its
+    /// status. An attempt whose caller is gone or gave it up, and that has outlived
+    /// every copy's ceiling by a wide margin, has no writer left to protect.
+    #[test]
+    fn an_attempt_whose_caller_or_writer_died_is_eventually_reclaimed() {
+        let staging = Staging::scratch("copy-lapsed");
+        let dead = {
+            let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let old = std::time::SystemTime::now()
+            - STALE_COPY_ATTEMPT_AFTER
+            - std::time::Duration::from_secs(60);
+        let label = format!("systems.alab.aterm-update.unpack-{}", "cd".repeat(16));
+        let attempt = |name: &str, owner: u32, aged: bool, launchd_cut: bool| {
+            let attempt = IsolatedCopy::create(&staging.root.join(name)).unwrap();
+            std::fs::create_dir_all(&attempt.payload).unwrap();
+            std::fs::write(attempt.payload.join("partial"), "bytes").unwrap();
+            std::fs::write(attempt.root.join(COPY_OWNER), format!("{owner}\n")).unwrap();
+            if launchd_cut {
+                std::fs::write(attempt.root.join("launchd.job"), &label).unwrap();
+                std::fs::create_dir(attempt.root.join(format!(".{label}.status.once"))).unwrap();
+                std::fs::write(attempt.root.join("abandoned"), "1\n").unwrap();
+            }
+            if aged {
+                std::fs::File::options()
+                    .write(true)
+                    .open(attempt.root.join("copy-layout"))
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            attempt.root
+        };
+        let live = std::process::id();
+        let caller_killed = attempt("killed", dead, true, false);
+        let launchd_cut = attempt("launchd-cut", live, true, true);
+        // NEGATIVE CONTROLS: a live caller that has not given its attempt up (it
+        // may be stopped, and will still promote it), and either cut while it is
+        // young enough that a writer could still be finishing.
+        let live_caller = attempt("live-caller", live, true, false);
+        let young_killed = attempt("young-killed", dead, false, false);
+        let young_cut = attempt("young-cut", live, false, true);
+
+        reap_abandoned_copy_attempts(&staging.root);
+        assert!(
+            !caller_killed.exists(),
+            "a dead caller's attempt is reclaimed"
+        );
+        assert!(!launchd_cut.exists(), "a cut launchd copy is reclaimed");
+        assert!(
+            live_caller.exists(),
+            "a live caller's attempt is never reclaimed"
+        );
+        assert!(
+            young_killed.exists(),
+            "a young attempt may still have a writer"
+        );
+        assert!(
+            young_cut.exists(),
+            "a young attempt may still have a writer"
+        );
+        let _ = std::fs::remove_dir_all(staging.root);
     }
 
     #[test]

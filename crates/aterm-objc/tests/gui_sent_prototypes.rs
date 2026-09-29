@@ -194,6 +194,9 @@ const ROWS: &[(&str, &str, &str)] = &[
     // Option-key alternates are skipped.
     ("NSMenuItem", "isHidden", "send_bool"),
     ("NSMenuItem", "isAlternate", "send_bool"),
+    // ⌘W's row title is live state: `chrome` reads the item's tag to find it
+    // (`menu::native_row_title`). `-tag` is a SIGNED NSInteger.
+    ("NSMenuItem", "tag", "send_isize"),
     // ---- NSBitmapImageRep: the chrome capture. THE OTHER NEAR-TWIN PAIR:
     // the rendering intent is a SIGNED NSInteger and the file type is an
     // UNSIGNED NSUInteger, in the same six lines of the same function.

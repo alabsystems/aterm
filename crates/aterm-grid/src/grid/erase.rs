@@ -40,6 +40,33 @@
 //! An earlier rule here kept the parked glyph and the wrap on every erase. It
 //! was modelled on xterm.js, which stores a pending wrap as `x == cols` and so
 //! erases the empty range `[cols, cols)`; real xterm (and Ghostty) do not.
+//!
+//! # DECSLRM horizontal margins do NOT bound an erase
+//!
+//! VT510 splits the control functions into two classes with one sentence each,
+//! and the split is the whole rule:
+//! - erase IN PLACE — EL, ECH and ED each carry "works inside or outside the
+//!   scrolling margins";
+//! - SHIFT data sideways — ICH and DCH each carry "has no effect outside the
+//!   scrolling margins".
+//!
+//! DECSLRM's own page ties the two together ("sets the left and right margins
+//! to define the scrolling region"), so those sentences are about exactly these
+//! margins. Every implementation reads it the same way, and each shows the split
+//! inside one file: xterm's `ClearRight` / `ClearLeft` / `ClearLine` (util.c)
+//! bound by `MaxCols` / column 0 and never call `ScrnLeftMargin`, while
+//! `ScrnInsertChar` / `ScrnDeleteChar` (screen.c) open with both margins; the
+//! same contrast holds in Ghostty (`eraseLine` / `eraseChars` use `self.cols`,
+//! `insertBlanks` / `deleteChars` return early outside `scrolling_region`),
+//! iTerm2 (`eraseLineBeforeCursor:afterCursor:decProtect:` uses
+//! `size.width`, `-[VT100Grid insertChar:...]` honours the margins) and WezTerm.
+//!
+//! aterm used to clamp EL 0/1/2, DECSEL 0/1/2 and ECH to the margins, and the
+//! comment on ECH cited "VT420/VT510 spec" for a claim the VT510 ECH page
+//! contradicts in so many words. The clamp was never chosen by any commit here —
+//! it arrived whole in the bootstrap import — and no test pinned it. ED and
+//! DECSED were already correct. aterm's own DECSLRM-bound operations (ICH, DCH,
+//! DECIC, DECDC, autowrap) keep their margins: see `line_ops.rs`.
 
 use super::{Cursor, Grid, ScrollRegion};
 use crate::PageStore;
@@ -117,10 +144,8 @@ impl Grid {
 
     /// Erase from cursor to end of line.
     ///
-    /// When DECLRMM horizontal margins are active and the cursor is within the
-    /// margin region, erases to the right margin instead of the screen edge
-    /// (#7644). When `selective`, only unprotected cells are cleared and extras
-    /// are preserved. Non-selective erase uses the BCE cursor template for fill.
+    /// When `selective`, only unprotected cells are cleared and extras are
+    /// preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_to_end_of_line_impl(&mut self, selective: bool) {
         // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
         // NOTHING before, so a `\r` + EL progress bar or spinner rewrote the row
@@ -128,25 +153,19 @@ impl Grid {
         // user never selected. One row of damage, the cursor's.
         let cursor_row = self.storage.cursor.row;
         self.damage_selection_visible_rows(cursor_row, cursor_row);
-        self.erase_to_end_of_line_core(selective, true);
+        self.erase_to_end_of_line_core(selective);
     }
 
     /// Core implementation for erase-to-end-of-line.
     ///
-    /// `respect_margins`: when true, clamps to DECLRMM right margin (for EL).
-    /// ED must pass false because ED is not affected by DECLRMM (#7644).
-    fn erase_to_end_of_line_core(&mut self, selective: bool, respect_margins: bool) {
+    /// The span ends at the ROW's own edge. DECLRMM's right margin does not move
+    /// it — xterm's `ClearRight` bounds by `MaxCols(screen)` — see the module
+    /// note on the erase/shift split. Shared with ED/DECSED, which differ only in
+    /// owning their own selection damage, so this is the one span for all of them.
+    fn erase_to_end_of_line_core(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
-        let mut right_bound = self.storage.effective_cols_for_row(cursor_row);
-        // Clamp to right margin when DECLRMM is active and cursor is within
-        // the margin region, matching ECH behavior (#7644).
-        if respect_margins && self.storage.has_horizontal_margins {
-            let margins = self.storage.horizontal_margins();
-            if cursor_col >= margins.left && cursor_col <= margins.right {
-                right_bound = right_bound.min(margins.right + 1);
-            }
-        }
+        let right_bound = self.storage.effective_cols_for_row(cursor_row);
         let fill = self.storage.cursor_template;
         if cursor_col < right_bound {
             // The BCE span for the truecolor side table: `clear_range_with_orphan`
@@ -175,12 +194,45 @@ impl Grid {
             }
             self.storage.mark_content_row(cursor_row);
         }
+        self.clear_wrap_into_next_row(cursor_row);
+    }
+
+    /// xterm `ClearRight` ends with `LineClrWrapped(ld)` — "with the right part
+    /// cleared, we can't be wrapping" — unconditionally, whatever the column,
+    /// the margins or the protection: after EL 0 / ED 0 / DECSEL 0 / DECSED 0
+    /// (and an ECH that reaches the same last column, see `erase_chars`) the
+    /// cursor row no longer continues into the row below. xterm keeps that
+    /// flag on the row that wraps; this grid keeps it on the continuation, so
+    /// the link to break is the NEXT row's `WRAPPED`.
+    ///
+    /// Left set, the link outlives the text it described. Measured on Windows
+    /// (aterm 0.95.0, pwsh under ConPTY): every prompt on an 80-column tab
+    /// wraps, conhost's `cls` erases the screen as `CSI K` row by row, and the
+    /// next output written over those rows by CR LF inherited the stale
+    /// continuation — `col-test 02`'s own first row read as a continuation of
+    /// `col-test 01`'s tail. Invisible at 80 columns; a widen to 120 then
+    /// rewrapped the pair as one line into a staircase (40 blanks, then
+    /// `col-test 02`), and a narrow to 60 pushed `pad 13` into history as
+    /// `pad 12`'s tail while conhost repainted it at row 0 — the stray,
+    /// shifted duplicate row.
+    pub(in crate::grid) fn clear_wrap_into_next_row(&mut self, row: u16) {
+        let next = row.saturating_add(1);
+        if next >= self.storage.visible_rows {
+            return;
+        }
+        if let Some(below) = self.row_mut(next)
+            && below.is_wrapped()
+        {
+            below.set_wrapped(false);
+            // The row's cells are unchanged but its logical line split in two,
+            // which is a content change to every reader that joins
+            // continuations (search, copy, the rewrap).
+            self.storage.mark_content_row(next);
+        }
     }
 
     /// Erase from start of line to cursor.
     ///
-    /// When DECLRMM horizontal margins are active and the cursor is within the
-    /// margin region, erases from the left margin instead of column 0 (#7644).
     /// When `selective`, only unprotected cells are cleared and extras are
     /// preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_from_start_of_line_impl(&mut self, selective: bool) {
@@ -190,41 +242,33 @@ impl Grid {
         // user never selected. One row of damage, the cursor's.
         let cursor_row = self.storage.cursor.row;
         self.damage_selection_visible_rows(cursor_row, cursor_row);
-        self.erase_from_start_of_line_core(selective, true);
+        self.erase_from_start_of_line_core(selective);
     }
 
     /// Core implementation for erase-from-start-of-line.
     ///
-    /// `respect_margins`: when true, clamps to DECLRMM left margin (for EL).
-    /// ED must pass false because ED is not affected by DECLRMM (#7644).
-    fn erase_from_start_of_line_core(&mut self, selective: bool, respect_margins: bool) {
+    /// The span starts at COLUMN 0. DECLRMM's left margin does not move it —
+    /// xterm's `ClearLeft` opens at column 0 and Ghostty's EL 1 span is
+    /// `{0, x + 1}` — see the module note on the erase/shift split.
+    fn erase_from_start_of_line_core(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
         let end = cursor_col.saturating_add(1).min(effective_cols);
-        // Clamp to left margin when DECLRMM is active and cursor is within
-        // the margin region (#7644).
-        let mut start = 0u16;
-        if respect_margins && self.storage.has_horizontal_margins {
-            let margins = self.storage.horizontal_margins();
-            if cursor_col >= margins.left && cursor_col <= margins.right {
-                start = margins.left;
-            }
-        }
         let fill = self.storage.cursor_template;
-        if end > start {
-            let mut bce = start..end;
+        if end > 0 {
+            let mut bce = 0..end;
             if let Some(row) = self.row_mut(cursor_row) {
                 if selective {
-                    row.selective_clear_range(start, end);
+                    row.selective_clear_range(0, end);
                 } else {
                     // BCE blank on the orphan, per xterm `ClearRight` (see
                     // `erase_to_end_of_line_core`).
-                    bce = row.clear_range_with_orphan(start, end, fill, fill);
+                    bce = row.clear_range_with_orphan(0, end, fill, fill);
                 }
             }
             if !selective {
-                self.storage.extras.clear_range(cursor_row, start, end);
+                self.storage.extras.clear_range(cursor_row, 0, end);
                 self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
             }
             self.storage.mark_content_row(cursor_row);
@@ -233,10 +277,10 @@ impl Grid {
 
     /// Erase entire line at cursor.
     ///
-    /// When DECLRMM horizontal margins are active and the cursor is within the
-    /// margin region, erases only from left margin to right margin (#7644).
-    /// When `selective`, only unprotected cells are cleared and extras are
-    /// preserved. Non-selective erase uses the BCE cursor template for fill.
+    /// The WHOLE row, margins or not — xterm's `ClearLine` bounds by `MaxCols`;
+    /// see the module note on the erase/shift split. When `selective`, only
+    /// unprotected cells are cleared and extras are preserved. Non-selective
+    /// erase uses the BCE cursor template for fill.
     fn erase_line_impl(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
         // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
@@ -244,33 +288,7 @@ impl Grid {
         // under a live highlight and left it painted: a copy then returned text the
         // user never selected. One row of damage, the cursor's.
         self.damage_selection_visible_rows(cursor_row, cursor_row);
-        let cursor_col = self.storage.cursor.col;
         let fill = self.storage.cursor_template;
-        // When DECLRMM is active and cursor is within margins, erase only
-        // the margin region instead of the full line (#7644).
-        if self.storage.has_horizontal_margins {
-            let margins = self.storage.horizontal_margins();
-            if cursor_col >= margins.left && cursor_col <= margins.right {
-                let start = margins.left;
-                let end = margins.right + 1;
-                let mut bce = start..end;
-                if let Some(row) = self.row_mut(cursor_row) {
-                    if selective {
-                        row.selective_clear_range(start, end);
-                    } else {
-                        // BCE blank on the orphan, per xterm `ClearRight` (see
-                        // `erase_to_end_of_line_core`).
-                        bce = row.clear_range_with_orphan(start, end, fill, fill);
-                    }
-                }
-                if !selective {
-                    self.storage.extras.clear_range(cursor_row, start, end);
-                    self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
-                }
-                self.storage.mark_content_row(cursor_row);
-                return;
-            }
-        }
         if let Some(row) = self.row_mut(cursor_row) {
             if selective {
                 row.selective_clear();
@@ -397,8 +415,8 @@ impl Grid {
     pub fn erase_line(&mut self) {
         // xterm path: charproc.c `CASE_EL` -> util.c `do_erase_line` case 2 ->
         // util.c `ClearLine` -> `ClearInLine` over the whole row -> `ClearInLine2`,
-        // which calls `ResetWrap`. (The DECLRMM clamp below is a separate, known
-        // cell divergence from xterm and does not affect the reset.)
+        // which calls `ResetWrap`. The span is the whole row: `ClearLine` bounds
+        // by `MaxCols`, and DECLRMM does not narrow it (module note).
         self.erase_line_impl(false);
         self.storage.clear_pending_wrap();
     }
@@ -423,9 +441,10 @@ impl Grid {
         // so no separate branch is needed. `do_cd_xtra_scroll` cannot change the
         // wrap (xtermScroll saves and restores `do_wrap`). VT52 ESC J shares this
         // path (VTPrsTbl.c maps VT52 'J' to `CASE_ED`).
-        // ED is NOT affected by DECLRMM horizontal margins per VT420 spec.
-        // Use _core with respect_margins=false to bypass margin clamping.
-        self.erase_to_end_of_line_core(false, false);
+        // `_core` rather than `_impl`: ED records its own selection damage for
+        // the whole band below, so the single-row mark `_impl` adds would be
+        // redundant. The SPAN is identical — no erase is bounded by DECLRMM.
+        self.erase_to_end_of_line_core(false);
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, false);
@@ -463,9 +482,9 @@ impl Grid {
         // `[0, cursor_col]` of the cursor row, so only the wrap reset is new.
         let cursor_row = self.storage.cursor.row;
         self.clear_rows(0..cursor_row, false);
-        // ED is NOT affected by DECLRMM horizontal margins per VT420 spec.
-        // Use _core with respect_margins=false to bypass margin clamping.
-        self.erase_from_start_of_line_core(false, false);
+        // `_core` rather than `_impl`: ED owns the whole-band selection damage
+        // recorded below (see `erase_to_end_of_screen`).
+        self.erase_from_start_of_line_core(false);
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
@@ -692,8 +711,8 @@ impl Grid {
         // with DEC_PROTECT -> util.c `ClearLeft` -> `ClearInLine` over
         // `[0, cur_col]` -> `ClearInLine2`, which resets the wrap only if that span
         // holds an unprotected cell (see `reset_wrap_unless_span_protected`). The
-        // span is xterm's, which ignores DECLRMM even though the cell clear here
-        // is clamped to the margins.
+        // cleared span and the wrap-reset span are now the same one: both ignore
+        // DECLRMM, as xterm's do.
         self.erase_from_start_of_line_impl(true);
         let cursor_row = self.storage.cursor.row;
         let span_end = self.storage.cursor.col.saturating_add(1);
@@ -709,8 +728,8 @@ impl Grid {
         // xterm path: charproc.c `CASE_DECSEL` -> util.c `do_erase_line` case 2
         // with DEC_PROTECT -> util.c `ClearLine` -> `ClearInLine` over the whole
         // row -> `ClearInLine2`, which keeps the wrap for a fully protected row and
-        // resets it otherwise (see `reset_wrap_unless_span_protected`). xterm's
-        // span ignores DECLRMM.
+        // resets it otherwise (see `reset_wrap_unless_span_protected`). The span is
+        // the whole row; DECLRMM does not narrow it.
         self.erase_line_impl(true);
         let cursor_row = self.storage.cursor.row;
         self.reset_wrap_unless_span_protected(cursor_row..cursor_row.saturating_add(1), None);
@@ -729,8 +748,8 @@ impl Grid {
         // `do_erase_display(2, DEC_PROTECT)`, the per-row `ClearInLine` loop, which
         // resets only if some visible cell is unprotected.
         let at_origin = self.storage.cursor.row == 0 && self.storage.cursor.col == 0;
-        // DECSED is NOT affected by DECLRMM horizontal margins per VT420 spec.
-        self.erase_to_end_of_line_core(true, false);
+        // `_core`: DECSED owns the whole-band damage recorded below.
+        self.erase_to_end_of_line_core(true);
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, true);
@@ -776,8 +795,8 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let span_end = self.storage.cursor.col.saturating_add(1);
         self.clear_rows(0..cursor_row, true);
-        // DECSED is NOT affected by DECLRMM horizontal margins per VT420 spec.
-        self.erase_from_start_of_line_core(true, false);
+        // `_core`: DECSED owns the whole-band damage recorded below.
+        self.erase_from_start_of_line_core(true);
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
@@ -835,7 +854,8 @@ impl Grid {
     /// span whose cells are all protected returns before `ResetWrap`. The span
     /// is every column of `full_rows` plus, when given, columns `[0, end)` of
     /// row `partial.0`. Columns run to the full width and ignore DECLRMM, like
-    /// xterm's `ClearLeft` / `ClearLine` / `ClearScreen` spans. A selective clear
+    /// xterm's `ClearLeft` / `ClearLine` / `ClearScreen` spans — and like the
+    /// cell clear itself now does. A selective clear
     /// never changes a protection flag, so asking after the clear gives the same
     /// answer as asking before it.
     fn reset_wrap_unless_span_protected(
@@ -1862,6 +1882,68 @@ mod tests {
                 "row 1 col {col} should be preserved"
             );
         }
+    }
+
+    /// Row 0 `ABCDE` autowrapped into row 1 `FG` (a continuation) on a 5-col grid.
+    fn wrapped_pair() -> Grid {
+        let mut grid = Grid::new(4, 5);
+        for c in "ABCDEFG".chars() {
+            grid.write_char_wrap(c);
+        }
+        assert!(
+            grid.row(1).is_some_and(|r| r.is_wrapped()),
+            "precondition: row 1 continues row 0"
+        );
+        grid
+    }
+
+    #[test]
+    fn test_el0_breaks_the_wrap_into_the_row_below_as_xterm_clear_right_does() {
+        // xterm util.c `ClearRight` ends with `LineClrWrapped(ld)`: "with the
+        // right part cleared, we can't be wrapping". The flag lives on the
+        // continuation here, so EL 0 on row 0 clears row 1's, whatever the
+        // column, and leaves row 1's cells alone.
+        for col in [0u16, 2, 4] {
+            let mut grid = wrapped_pair();
+            grid.move_cursor_to(0, col);
+            grid.erase_to_end_of_line();
+            assert!(
+                !grid.row(1).unwrap().is_wrapped(),
+                "EL 0 at col {col} breaks the link"
+            );
+            assert_eq!(char_at(&grid, 1, 0), 'F', "row 1's cells survive");
+            assert_eq!(char_at(&grid, 1, 1), 'G');
+        }
+        // DECSEL 0 is the same `ClearRight`.
+        let mut grid = wrapped_pair();
+        grid.move_cursor_to(0, 3);
+        grid.selective_erase_to_end_of_line();
+        assert!(!grid.row(1).unwrap().is_wrapped(), "DECSEL 0 too");
+    }
+
+    #[test]
+    fn test_el1_el2_and_el0_on_the_continuation_keep_the_link() {
+        // `ClearLeft` and `ClearLine` never call `LineClrWrapped`; and EL 0 on
+        // the continuation itself clears ITS right part, not the wrap that
+        // brought the text into it.
+        let mut grid = wrapped_pair();
+        grid.move_cursor_to(0, 2);
+        grid.erase_from_start_of_line();
+        assert!(grid.row(1).unwrap().is_wrapped(), "EL 1 keeps the link");
+        let mut grid = wrapped_pair();
+        grid.move_cursor_to(0, 2);
+        grid.erase_line();
+        assert!(grid.row(1).unwrap().is_wrapped(), "EL 2 keeps the link");
+        let mut grid = wrapped_pair();
+        grid.move_cursor_to(1, 0);
+        grid.erase_to_end_of_line();
+        assert!(
+            grid.row(1).unwrap().is_wrapped(),
+            "EL 0 on row 1 leaves row 1's own flag"
+        );
+        // The bottom row has no row below to unlink.
+        grid.move_cursor_to(3, 0);
+        grid.erase_to_end_of_line();
     }
 
     // =========================================================================

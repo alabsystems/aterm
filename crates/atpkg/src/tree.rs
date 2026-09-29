@@ -71,9 +71,7 @@ pub type DeclaredModes = BTreeMap<Vec<u8>, u32>;
 /// with (the module docs have the measured pair).
 #[must_use]
 pub(crate) fn rel_line_bytes(rel: &Path) -> Vec<u8> {
-    // `platform::os_str_bytes` goes via `call1` — see `walk` for why (std's inlined
-    // `unsafe` in the `OsStr` byte-slice cast is otherwise attributed here).
-    let raw = crate::call1(crate::platform::os_str_bytes, rel.as_os_str());
+    let raw = crate::platform::os_str_bytes(rel.as_os_str());
     #[cfg(windows)]
     {
         raw.iter()
@@ -248,11 +246,7 @@ fn walk(
             let rel_bytes = rel_line_bytes(rel);
             // The TARGET stays raw: it is digested, not framed, and it is whatever bytes
             // `symlink(2)` was handed (a `\` in a target is the target's own business).
-            // `platform::os_str_bytes` goes via `call1`: std's INLINED `unsafe` (the
-            // `OsStr` byte-slice cast) is otherwise attributed to this function's spans
-            // as missing-SAFETY-comment refutations under the strict Trust gate (see
-            // `lib.rs`). Same call, same receiver; behavior identical.
-            let target_bytes = crate::call1(crate::platform::os_str_bytes, target.as_os_str());
+            let target_bytes = crate::platform::os_str_bytes(target.as_os_str());
             out.push(symlink_line(&rel_bytes, &symlink_target_sha(target_bytes)));
         } else if ft.is_dir() {
             walk(root, &path, modes, out, buf)?;
@@ -273,50 +267,20 @@ fn walk(
             out.push(entry_line(&rel_bytes, mode, &fsha));
         } else {
             // device / fifo / socket — must not be in an extracted bundle.
-            // Manual concat of the previous
-            // `format!("unexpected non-file/dir entry in tree: {}", path.display())`
-            // — byte-identical (`Path::display` renders exactly the lossy UTF-8
-            // decode `to_string_lossy` produces): the `format!` expansion embeds
-            // `fmt::Arguments` construction (with inlined `unsafe`) that the
-            // strict Trust gate cannot lower and fails closed on.
-            // `Path::to_string_lossy` goes via `call1` (see `lib.rs`).
-            let mut msg = String::from("unexpected non-file/dir entry in tree: ");
-            msg.push_str(&crate::call1(std::path::Path::to_string_lossy, &path));
-            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected non-file/dir entry in tree: {}", path.display()),
+            ));
         }
     }
     Ok(())
 }
 
-/// Render the masked permission bits in octal — byte-identical to the previous
-/// `format!("{mode:o}")` for every masked input (minimal digits, no leading
-/// zeros, so `0` renders as `"0"` and `0o644` as `"644"`): the `format!`
-/// expansion embeds `fmt::Arguments` construction (with inlined `unsafe`) that
-/// the strict Trust gate cannot lower and fails closed on. LOOP-FREE, digit by
-/// constant shift (same idiom as `dec_u64` in `lib.rs`): the re-mask makes the
-/// helper total (a no-op for the already-masked caller), each digit is `< 8` by
-/// the `& 0x7`, and `wrapping_shr` by a constant `< 32` is a plain shift with
-/// no panic obligations.
-fn oct_mode(mode: u32) -> String {
-    let mode = mode & 0o7777;
-    let mut out = String::new();
-    let mut started = false;
-    macro_rules! emit_digit {
-        ($sh:expr) => {
-            let d = (mode.wrapping_shr($sh) & 0x7) as u8;
-            if started || d != 0 {
-                started = true;
-                out.push(char::from(b'0'.wrapping_add(d)));
-            }
-        };
-    }
-    emit_digit!(9);
-    emit_digit!(6);
-    emit_digit!(3);
-    // Ones digit is emitted unconditionally, so `0` renders as "0".
-    let _ = started;
-    out.push(char::from(b'0'.wrapping_add((mode & 0x7) as u8)));
-    out
+/// Render the masked permission bits in octal: minimal digits, no leading zeros, so `0`
+/// renders as `"0"` and `0o644` as `"644"`. The declared-mode record beside a build
+/// (`store::write_declared_modes`) spells its numbers the same way.
+pub(crate) fn oct_mode(mode: u32) -> String {
+    format!("{:o}", mode & 0o7777)
 }
 
 /// Streamed SHA-256 of a file's contents → lowercase hex (public producer helper: the
@@ -346,49 +310,19 @@ fn file_sha256_with(path: &Path, buf: &mut [u8]) -> io::Result<String> {
         if n == 0 {
             break;
         }
-        // The `Read` contract guarantees `n <= buf.len()`; the clamp is a no-op
-        // on every conforming reader (`File` is) that hands the strict Trust
-        // gate the dominating bound its slice proof needs, and `get` + full-
-        // slice fallback restates it in a panic-free shape (same idiom as
-        // `extract::write_capped`).
-        let n = if n <= buf.len() { n } else { buf.len() };
-        let chunk = match buf.get(..n) {
-            Some(c) => c,
-            None => &buf[..],
-        };
-        h.update(chunk);
+        // The `Read` contract guarantees `n <= buf.len()` (`File` keeps it); `min` keeps
+        // a nonconforming reader from panicking the slice.
+        h.update(&buf[..n.min(buf.len())]);
     }
     Ok(hex(&h.finalize()))
 }
 
 /// Lowercase-hex encode a digest.
-///
-/// Byte-identical to the previous `format!("{b:02x}")` loop — rewritten
-/// `format!`-free (the expansion embeds `fmt::Arguments` construction the
-/// strict Trust gate cannot lower) with pure nibble arithmetic (no table
-/// indexing: the gate's bitmask engine refuted the `< 16` bound it needed;
-/// `wrapping_*` ops are total and carry no obligations at all). The capacity
-/// hint is clamped behind a dominating comparison for the allocation-budget
-/// recognizer; every real input is a digest (32 bytes -> 64 chars), so the
-/// clamp never bites — and a capacity hint is behavior-neutral anyway.
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    /// The lowercase hex digit for nibble `n` (`n < 16` at every call site).
-    fn nibble(n: u8) -> char {
-        if n < 10 {
-            char::from(b'0'.wrapping_add(n))
-        } else {
-            char::from(b'a'.wrapping_add(n.wrapping_sub(10)))
-        }
-    }
-    let cap = bytes.len().saturating_mul(2);
-    let mut s = if cap <= 128 {
-        String::with_capacity(cap)
-    } else {
-        String::with_capacity(128)
-    };
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len().saturating_mul(2));
     for b in bytes {
-        s.push(nibble(*b >> 4));
-        s.push(nibble(*b & 0x0f));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
@@ -401,14 +335,13 @@ mod tests {
     use std::path::PathBuf;
 
     /// `tree_root` is a cross-version byte contract (signed manifests embed roots
-    /// computed by earlier releases), so the manual octal renderer must be
-    /// byte-identical to the `format!("{mode:o}")` it replaced — exhaustively,
-    /// over every maskable mode.
+    /// computed by earlier releases): the mode field is minimal octal of the masked bits.
     #[test]
-    fn oct_mode_matches_format_exhaustive() {
-        for mode in 0u32..=0o7777 {
-            assert_eq!(oct_mode(mode), format!("{mode:o}"), "mode = {mode:#o}");
-        }
+    fn oct_mode_is_minimal_octal_of_the_masked_bits() {
+        assert_eq!(oct_mode(0), "0");
+        assert_eq!(oct_mode(0o644), "644");
+        assert_eq!(oct_mode(0o4755), "4755");
+        assert_eq!(oct_mode(0o100_644), "644", "file-type bits are masked off");
     }
 
     fn tmp(label: &str) -> PathBuf {

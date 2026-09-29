@@ -871,12 +871,68 @@ impl DocumentJournalStore {
 
 /// Take the journal's advisory lock for as long as the returned handle lives —
 /// how a test makes a peer's (a successor's) journal publication refuse busy.
+/// Released by `LOCK_UN` when the handle drops, as the product's own holder is
+/// ([`with_journal_lock`]): a lock released by the close alone lives on in the
+/// copy of its description any shell another test thread forked meanwhile holds
+/// until it execs, and the next take — 25 ms of it on the event loop — is
+/// refused for a lock nobody holds.
 #[cfg(test)]
-pub(crate) fn hold_journal_lock_for_test(path: &Path) -> File {
+pub(crate) fn hold_journal_lock_for_test(
+    path: &Path,
+) -> crate::native_document_host::HeldAdvisoryLock {
     let lock = open_journal_lock(&journal_lock_path(path).expect("journal lock path"))
         .expect("open journal lock");
     lock.lock().expect("take journal lock");
-    lock
+    crate::native_document_host::HeldAdvisoryLock::adopt(lock)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Some while a [`ForkedJournalLockCopies`] lives on this thread: the
+    /// copies of every journal lock description this thread has locked since.
+    static FORKED_LOCK_COPIES: std::cell::RefCell<Option<Vec<File>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While this lives, every journal lock THIS THREAD takes leaves a second
+/// descriptor onto its open file description behind, taken while the lock is
+/// held and kept until this drops — exactly what a shell another thread forks
+/// at that instant holds until it execs (`aterm_pty`'s hand-rolled `fork`
+/// closes only the pty pair and the status pipe before `execve`). The losing
+/// interleaving of the fork-copy race, made deterministic: a lock released by
+/// the close alone stays taken in the copy, and the next take is refused.
+#[cfg(test)]
+pub(crate) struct ForkedJournalLockCopies(());
+
+#[cfg(test)]
+impl ForkedJournalLockCopies {
+    pub(crate) fn start() -> Self {
+        FORKED_LOCK_COPIES.with(|copies| *copies.borrow_mut() = Some(Vec::new()));
+        Self(())
+    }
+
+    /// How many held locks have been copied so far.
+    pub(crate) fn copied(&self) -> usize {
+        FORKED_LOCK_COPIES.with(|copies| copies.borrow().as_ref().map_or(0, Vec::len))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForkedJournalLockCopies {
+    fn drop(&mut self) {
+        FORKED_LOCK_COPIES.with(|copies| drop(copies.borrow_mut().take()));
+    }
+}
+
+/// The fork a [`ForkedJournalLockCopies`] stands in for, at the instant the
+/// lock is held.
+#[cfg(test)]
+fn copy_held_lock_for_test(lock: &File) {
+    FORKED_LOCK_COPIES.with(|copies| {
+        if let Some(copies) = copies.borrow_mut().as_mut() {
+            copies.push(lock.try_clone().expect("copy the held journal lock"));
+        }
+    });
 }
 
 fn entry_busy(entry: &JournalEntry) -> bool {
@@ -1669,6 +1725,8 @@ fn with_journal_lock<T>(
             .map_err(|error| format!("protect journal lock {}: {error}", lock_path.display()))?;
     }
     take_journal_lock(&lock, path, patience.budget())?;
+    #[cfg(test)]
+    copy_held_lock_for_test(&lock);
     // Released by `LOCK_UN` on every exit, not by the close: a shell forked while
     // this runs would otherwise keep the lock until its exec, and the event loop's
     // next take has 25 ms (the product fd-hygiene sweep of 2026-09-27).

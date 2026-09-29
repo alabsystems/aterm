@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use super::super::*;
-use crate::{CellExtras, ImageData, ImageFormat, ImageRef, StyleTable};
+use crate::{CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling, StyleTable};
 
 /// One `rows`×`cols` placement.
 fn placement(rows: u16, cols: u16) -> Arc<ImageData> {
@@ -24,7 +24,8 @@ fn placement(rows: u16, cols: u16) -> Arc<ImageData> {
         rows,
         z_index: 0,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: ImageScaling::Fit,
+        source_rect: None,
     })
 }
 
@@ -39,6 +40,7 @@ fn stamp(grid: &mut Grid, row_idx: u16, image: &Arc<ImageData>, image_row: u16, 
                 image: Arc::clone(image),
                 cell_row: image_row,
                 cell_col,
+                kitty: None,
             },
         );
     }
@@ -166,6 +168,7 @@ fn a_run_broken_by_a_second_placement_splits_into_two_spans() {
                 image: Arc::clone(&right),
                 cell_row: 0,
                 cell_col,
+                kitty: None,
             },
         );
     }

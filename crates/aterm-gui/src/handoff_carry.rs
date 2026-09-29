@@ -346,7 +346,7 @@ struct TurnWire {
     started_ms: u64,
     dur_ms: u64,
     submitted: bool,
-    /// `settled` or `timeout` — a word, never a code.
+    /// `settled`, `timeout` or `hangup` — a word, never a code.
     status: String,
     text: String,
     screen_hash: u64,

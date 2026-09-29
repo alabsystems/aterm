@@ -588,11 +588,10 @@ fn write_now(s: &mut SinkState) {
     let Ok(text) = aterm_json::to_string(&s.file) else {
         return;
     };
-    // Manual concat, mirroring status.rs's temp naming (same Trust-gate rationale).
-    let mut tmp_name = String::from("progress.json.tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = s.path.with_file_name(tmp_name);
-    if crate::call2(std::fs::write, &tmp, text).is_ok() && std::fs::rename(&tmp, &s.path).is_ok() {
+    let tmp = s
+        .path
+        .with_file_name(format!("progress.json.tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &s.path).is_ok() {
         s.last_write = Some(Instant::now());
         s.dirty = false;
     } else {

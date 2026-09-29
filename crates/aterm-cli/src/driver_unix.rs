@@ -122,6 +122,8 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     };
 
     let mut bytes_in: u64 = 0;
+    // The first output written through marks a healthy start (`on_first_shell_output`).
+    let mut spoke = false;
 
     let mut fds = [
         libc::pollfd {
@@ -184,6 +186,10 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
             let out = &buf[..r as usize];
             write_all(libc::STDOUT_FILENO, out);
             bytes_in += out.len() as u64;
+            if !spoke {
+                spoke = true;
+                crate::first_shell_output();
+            }
         }
     }
 
@@ -305,6 +311,79 @@ mod tests {
         let mut status = 0;
         unsafe { libc::waitpid(decoy_pid, &mut status, libc::WNOHANG) };
         assert_eq!(code, 3, "the session took another child's exit status");
+    }
+
+    /// THE SHELL'S FIRST OUTPUT IS A SESSION'S PROOF OF A HEALTHY START (2026-09-28):
+    /// the launcher confirms a replaced Linux executable's trial on it
+    /// ([`crate::on_first_shell_output`]). The hook runs once, after the first bytes
+    /// reached the terminal, however many more follow. A re-exec, like the test above:
+    /// the hook is process-wide, and raw mode must not touch a real terminal.
+    #[test]
+    fn the_shells_first_output_runs_the_hook_once() {
+        use std::sync::atomic::AtomicUsize;
+        const CHILD: &str = "ATERM_TEST_DRIVER_FIRST_OUTPUT_HOOK";
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::the_shells_first_output_runs_the_hook_once",
+                module_path!().split_once("::").map_or("", |(_, rest)| rest)
+            );
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("re-exec the test binary");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "the re-exec failed:\n{text}");
+            assert!(
+                text.contains("1 passed"),
+                "the re-exec ran no test:\n{text}"
+            );
+            return;
+        }
+        assert!(crate::on_first_shell_output(|| {
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(
+            !crate::on_first_shell_output(|| {}),
+            "the first registration wins"
+        );
+        // SAFETY: this is the isolated test child's trusted launch point.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let command = [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf one; sleep 0.2; printf two; sleep 0.2; printf three".to_string(),
+        ];
+        let shell = aterm_pty::spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+        )
+        .expect("protected shell spawn");
+        assert_eq!(
+            RAN.load(Ordering::SeqCst),
+            0,
+            "nothing before the shell speaks"
+        );
+        assert_eq!(run(shell, false), 0);
+        assert_eq!(RAN.load(Ordering::SeqCst), 1, "once, however much it said");
     }
 
     #[test]

@@ -6,7 +6,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; the host paints cells, appends the file and performs intents."
+description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; and the per-tab presence row's core (facts, story, levels, words, tones, cells); the host paints cells, appends the file, performs intents and senses the presence facts."
 
 [dependencies]
 # The engine-wide injected-clock idiom (the aterm-predict shape): EXACTLY

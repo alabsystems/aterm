@@ -88,3 +88,6 @@ aterm-spec = { workspace = true }
 [[bin]]
 name = "aterm-link"
 path = "src/main.rs"
+
+[lints]
+workspace = true

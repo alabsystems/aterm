@@ -3,7 +3,7 @@
 
 //! The two TOML records the updater reads/writes: the release-side **manifest**
 //! (`aterm-appcast.toml`, an attached release asset, emitted by the ship tool —
-//! `cargo ship cut`, crate aterm-release) and the local **ready marker**
+//! `targo --unverified ship cut`, crate aterm-release) and the local **ready marker**
 //! (`ready.toml`, written last when staging completes — its presence is the sole
 //! "ready" signal).
 
@@ -203,8 +203,12 @@ pub struct Ready {
     /// apply lane re-read only `min_build`, so a bundle staged at 10:00 by a machine
     /// revoked at 10:30 was applied anyway (in-session, or at the next launch), and only a separate
     /// `min_build` yank could have stopped a withdrawn machine's artifact. Recording
-    /// the generation here is what lets the apply gate ask the question the stage gate
-    /// already asks.
+    /// the machine here is what lets every later reader match it against the floor's
+    /// durable revocation set ([`Floor::withdraws`]): the check that observes the
+    /// revocation retires the stage, the publisher refuses it, and the apply lane's
+    /// gate 4c refuses it at the next launch — once a check on this Mac has seen the
+    /// revoking roster. A revocation no check has observed yet is out of reach of a
+    /// lane that holds no roster (see gate 4c).
     ///
     /// Absent ⇒ None: a marker written before these fields existed, or a release with
     /// no attribution at all (every pre-roster cut). `None` means UNKNOWN, never
@@ -253,11 +257,38 @@ impl Ready {
     /// to its build and source stamp too. Full signature/policy verification
     /// remains the apply-time authority; this local read is an early stale/corrupt
     /// rejection that does not spawn a helper process on status/check paths.
+    ///
+    /// AND THE FLOOR STILL ADMITS IT (round seven, H1 findings 55 and 33): a build
+    /// the operator has since yanked, or one signed by a machine a roster has since
+    /// revoked ([`Floor::withdraws`]), is no update either. The floor moves on
+    /// OBSERVATION, before anything retires the stage, and every surface that read
+    /// this — the check's `Some` answer that arms the apply lane, its backoff line
+    /// "NOT skipping apply: staged … is verified and ready", `update status` — went
+    /// on announcing a build the swap would only refuse after every reader parked.
     pub(crate) fn is_publishable(&self, staging: &crate::paths::Staging) -> bool {
+        self.is_published_bundle(staging)
+            && Floor::read(&staging.floor())
+                .withdraws(self.build_number, self.machine_id.as_deref())
+                .is_none()
+    }
+
+    /// [`Self::is_publishable`] without the floor: the marker names a real published,
+    /// non-quarantined bundle that rebinds to it. What a lane that RETIRES a
+    /// withdrawn stage looks for — the stage the floor now hides is exactly the one
+    /// it must find.
+    pub(crate) fn is_published_bundle(&self, staging: &crate::paths::Staging) -> bool {
         if !self.has_canonical_identity()
             || !std::fs::symlink_metadata(&staging.staged_app)
                 .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
         {
+            return false;
+        }
+        // A QUARANTINED ARTIFACT IS NEVER AN UPDATE (round six, finding 15): a
+        // stager that decided before a crash-loop revert — or an older build's,
+        // which never asks — can publish it after the revert, and every reader
+        // (the check's coverage, status, the apply gate, which retires it) must
+        // see nothing staged rather than a build that crash-looped here.
+        if artifact_quarantined(staging, self.build_number, &self.dmg_sha256) {
             return false;
         }
         cheap_staged_identity_matches(self, &staging.staged_app) == Some(true)
@@ -267,6 +298,12 @@ impl Ready {
     /// shared staged-ready read used by background checks and status surfaces.
     pub(crate) fn read_publishable(staging: &crate::paths::Staging) -> Option<Self> {
         Self::read(&staging.ready).filter(|ready| ready.is_publishable(staging))
+    }
+
+    /// Read a marker that passes [`Self::is_published_bundle`] — published, whether or
+    /// not the floor still admits it.
+    pub(crate) fn read_published_bundle(staging: &crate::paths::Staging) -> Option<Self> {
+        Self::read(&staging.ready).filter(|ready| ready.is_published_bundle(staging))
     }
 }
 
@@ -388,9 +425,9 @@ impl InstalledReceipt {
     }
 }
 
-/// A persisted, **monotonic** recency floor kept under `Updates/floor.toml`. Both
-/// fields only ever ratchet UP, so the file can never be used to force a *downgrade*;
-/// its purpose is to block replay/rollback and honor an operator yank (F5/F6):
+/// A persisted recency floor kept under `Updates/floor.toml`. Every field ratchets
+/// UP on observation, so the file can never be used to force a *downgrade*; its
+/// purpose is to block replay/rollback and honor an operator yank (F5/F6):
 ///
 /// * `min_build` — the highest `min_build` any observed manifest has declared; the
 ///   client refuses to stage/apply below it (operator-driven yank of a genuine build).
@@ -398,17 +435,41 @@ impl InstalledReceipt {
 ///   refuses to stage a "latest available" that is below this (an attacker who
 ///   re-points the newest release at an older genuine build can't roll a client back).
 ///
+/// ONE THING LOWERS THEM: A REVOCATION (round seven, H1 findings 2 and 10). Both
+/// numbers come from manifests signed by a rostered MACHINE, and the roster exists for
+/// the day one of those machines is stolen. A thief who published a release with
+/// `build_number = min_build = 9_999_999_999` raised both floors on every client that
+/// saw it — before any download, by observation — and nothing lowered them once the
+/// owner revoked the machine: every later genuine release was "held … below the
+/// operator floor" (or "below high-water") forever, as a HEALTHY check, and the file
+/// lives outside the app, so reinstalling did not help. So each floor now records who
+/// raised it ([`FloorSources`]), and a machine the roster revokes takes its
+/// contributions with it: the floor falls back to what the remaining machines (and
+/// every unattributed observation) asked for — never lower, so a genuine yank and a
+/// genuine rollback floor stand. `revoked_machines` is the durable record of those
+/// revocations, so a withdrawn machine's word never counts again here, a stage it
+/// signed is never published or applied, and a later check cannot re-raise a floor
+/// on its behalf.
+///
 /// NOTE: the first two fields are *unsigned* floors, so they cannot protect a brand-new
 /// client that has never seen a higher build (it has no high-water yet). `roster_seq` is
 /// the signed-channel answer to exactly that gap — see its own doc — though the residual
 /// it leaves is different rather than absent. All three DO stop replay against any client
 /// that has already advanced, and the first gives the operator a working yank.
+///
+/// MIXED VERSIONS. Every added field is `serde(default)` and skipped while empty, so a
+/// build that predates them reads the file exactly as before; when such a build
+/// rewrites the file it drops them, and the next reader treats the numbers it finds as
+/// unattributed ([`FloorSources::step`]) — the pre-provenance behaviour, never a
+/// lower floor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Floor {
-    /// Operator apply floor (max `min_build` ever seen). Absent ⇒ 0.
+    /// Operator apply floor (max `min_build` ever seen from a machine still trusted).
+    /// Absent ⇒ 0.
     #[serde(default)]
     pub min_build: u64,
-    /// Highest build ever successfully staged by this client. Absent ⇒ 0.
+    /// Highest build ever successfully staged by this client (from a machine still
+    /// trusted). Absent ⇒ 0.
     #[serde(default)]
     pub high_water: u64,
     /// Highest `roster_seq` from any machine roster this client has ever accepted — THE
@@ -435,9 +496,39 @@ pub struct Floor {
     /// reads as a protection still being relied on; the only thing this ratchet
     /// actually gives a fresh install is protection from the SECOND roster onwards.
     ///
-    /// Absent ⇒ 0, the permissive first-contact value, matching the other two.
+    /// Absent ⇒ 0, the permissive first-contact value, matching the other two. Never
+    /// lowered, by anything.
     #[serde(default)]
     pub roster_seq: u64,
+    /// Who raised [`Self::min_build`]. Empty ⇒ all of it is unattributed.
+    #[serde(default, skip_serializing_if = "FloorSources::is_empty")]
+    pub min_build_sources: FloorSources,
+    /// Who raised [`Self::high_water`]. Empty ⇒ all of it is unattributed.
+    #[serde(default, skip_serializing_if = "FloorSources::is_empty")]
+    pub high_water_sources: FloorSources,
+    /// Every machine id an admitted, master-verified roster has REVOKED — durable, the
+    /// way the Linux lane's `revoked_machines` is. Never shrinks: a machine withdrawn
+    /// once is not trusted again on this client under any later roster.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_machines: Vec<String>,
+}
+
+pub use crate::floor_sources::FloorSources;
+
+/// One observation the floor is told about ([`Floor::observe_and_write`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FloorObservation<'a> {
+    /// An observed manifest's `min_build` (0: none).
+    pub min_build: u64,
+    /// A build just staged (0: none).
+    pub high_water: u64,
+    /// An admitted roster's generation (0: none).
+    pub roster_seq: u64,
+    /// The machine whose signed manifest carried `min_build` / `high_water`; `None`
+    /// records them unattributed (no revocation can lower them).
+    pub machine: Option<&'a str>,
+    /// The machine ids an admitted roster revokes.
+    pub revoked: &'a [String],
 }
 
 impl Floor {
@@ -450,11 +541,52 @@ impl Floor {
             .unwrap_or_default()
     }
 
+    /// Whether `machine` has been revoked by a roster this client admitted. An unnamed
+    /// machine is never matched: "I cannot tell who signed this" is not evidence of
+    /// withdrawal.
+    #[must_use]
+    pub fn revokes(&self, machine: Option<&str>) -> bool {
+        machine.is_some_and(|id| self.revoked_machines.iter().any(|r| r == id))
+    }
+
+    /// Why this floor WITHDRAWS a build — `build` signed by `machine` — or `None` when
+    /// it still admits it: the operator yank (`min_build`) and the durable revocation
+    /// set. The one predicate the stage's publisher, its readers and the apply lane
+    /// share, so a withdrawn build is never published, announced or applied.
+    #[must_use]
+    pub fn withdraws(&self, build: u64, machine: Option<&str>) -> Option<String> {
+        if self.revokes(machine) {
+            return Some(format!(
+                "build {build} was signed by machine {}, which the machine roster has revoked",
+                machine.unwrap_or("?")
+            ));
+        }
+        (build < self.min_build).then(|| {
+            format!(
+                "build {build} is below the operator floor {} (yanked)",
+                self.min_build
+            )
+        })
+    }
+
+    /// This floor with its sources made to explain its numbers, in the one form it is
+    /// written in ([`FloorSources::step`] with nothing observed).
+    fn canonical(mut self) -> Self {
+        (self.min_build, self.min_build_sources) =
+            self.min_build_sources.step(self.min_build, &[], 0, None);
+        (self.high_water, self.high_water_sources) =
+            self.high_water_sources.step(self.high_water, &[], 0, None);
+        self
+    }
+
     /// Persist atomically (temp + rename), raising each field monotonically to at
     /// least the given observed values. The per-floor lock covers the complete
     /// read/max/write transaction, preventing two processes from overwriting each
     /// other's independent maxima. A no-op write is skipped. Best-effort — a
     /// failure to persist the floor never blocks an update decision.
+    ///
+    /// UNATTRIBUTED: nothing recorded here is lowered by a revocation. The check lane,
+    /// which knows the signing machine, goes through [`Self::observe_and_write`].
     ///
     /// Best-effort, but no longer SILENT. Every step here used to discard its error,
     /// so a full disk, a read-only remount, or a floor file this uid cannot replace
@@ -467,15 +599,31 @@ impl Floor {
     /// and documents why: report the failure, then carry on under the old value,
     /// because refusing outright would let anyone who can wedge the file wedge the
     /// updater. Same shape here.
+    #[cfg(test)]
     pub fn bump_and_write(
         path: &Path,
         seen_min_build: u64,
         staged_build: u64,
         seen_roster_seq: u64,
     ) {
-        if let Err(error) =
-            Self::bump_and_write_reporting(path, seen_min_build, staged_build, seen_roster_seq)
-        {
+        Self::observe_and_write(
+            path,
+            &FloorObservation {
+                min_build: seen_min_build,
+                high_water: staged_build,
+                roster_seq: seen_roster_seq,
+                ..FloorObservation::default()
+            },
+        );
+    }
+
+    /// [`Self::bump_and_write`] for an observation that names its signing machine and
+    /// the revocations of the roster it came under: the revocations are recorded
+    /// first and take back every floor their machines raised, then the observation is
+    /// raised — unless its own machine is revoked, whose word counts for nothing.
+    /// Best-effort in the same way, warning on a failure.
+    pub fn observe_and_write(path: &Path, observation: &FloorObservation<'_>) {
+        if let Err(error) = Self::observe_reporting(path, observation) {
             crate::warn(&format!(
                 "{error} — replay/rollback protection stays frozen at the values \
                  already on disk"
@@ -487,33 +635,70 @@ impl Floor {
     /// caller the failure instead of only warning about it, so a test can pin BOTH
     /// halves of a failed commit — the error is reported rather than swallowed, and the
     /// temp file is gone afterwards.
+    #[cfg(test)]
     fn bump_and_write_reporting(
         path: &Path,
         seen_min_build: u64,
         staged_build: u64,
         seen_roster_seq: u64,
     ) -> Result<(), String> {
-        Self::commit_bump(path, seen_min_build, staged_build, seen_roster_seq).map_err(|error| {
+        Self::observe_reporting(
+            path,
+            &FloorObservation {
+                min_build: seen_min_build,
+                high_water: staged_build,
+                roster_seq: seen_roster_seq,
+                ..FloorObservation::default()
+            },
+        )
+    }
+
+    fn observe_reporting(path: &Path, observation: &FloorObservation<'_>) -> Result<(), String> {
+        Self::commit_observation(path, observation).map_err(|error| {
             // NAME THE ADVANCE THAT WAS LOST, not just the step that failed. The raw
             // step error reads "commit /…/floor.toml: Is a directory", which leaves the
             // reader to work out on their own that replay and rollback protection just
             // stopped moving. Attaching the floor here makes that consequence legible at
             // EVERY call site instead of only at whichever one remembers to add it.
             format!(
-                "could not raise the update floor at {} to (min_build {seen_min_build}, \
-                 high_water {staged_build}, roster_seq {seen_roster_seq}): {error}",
-                path.display()
+                "could not raise the update floor at {} to (min_build {}, high_water {}, \
+                 roster_seq {}): {error}",
+                path.display(),
+                observation.min_build,
+                observation.high_water,
+                observation.roster_seq
             )
         })
     }
 
-    /// The locked read/max/write transaction itself, reporting the STEP that failed.
-    fn commit_bump(
-        path: &Path,
-        seen_min_build: u64,
-        staged_build: u64,
-        seen_roster_seq: u64,
-    ) -> Result<(), String> {
+    /// The floor `cur` becomes after `observation` — pure, so the rule is testable
+    /// without a file: record the revocations, retract what their machines raised,
+    /// then raise by the observation unless its machine is revoked.
+    fn after(cur: Self, observation: &FloorObservation<'_>) -> Self {
+        let mut next = cur;
+        for id in observation.revoked {
+            if !next.revoked_machines.iter().any(|known| known == id) {
+                next.revoked_machines.push(id.clone());
+            }
+        }
+        (next.min_build, next.min_build_sources) = next.min_build_sources.step(
+            next.min_build,
+            &next.revoked_machines,
+            observation.min_build,
+            observation.machine,
+        );
+        (next.high_water, next.high_water_sources) = next.high_water_sources.step(
+            next.high_water,
+            &next.revoked_machines,
+            observation.high_water,
+            observation.machine,
+        );
+        next.roster_seq = next.roster_seq.max(observation.roster_seq);
+        next
+    }
+
+    /// The locked read/observe/write transaction itself, reporting the STEP that failed.
+    fn commit_observation(path: &Path, observation: &FloorObservation<'_>) -> Result<(), String> {
         let lock_path = path.with_extension("toml.lock");
         // `_lock`, never `_`: the guard must live until this function returns, since
         // it covers the whole read/max/write transaction. BOUNDED (plan P2-1): the
@@ -524,12 +709,8 @@ impl Floor {
             crate::install::BACKGROUND_LOCK_WAIT,
         )
         .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
-        let cur = Self::read(path);
-        let next = Self {
-            min_build: cur.min_build.max(seen_min_build),
-            high_water: cur.high_water.max(staged_build),
-            roster_seq: cur.roster_seq.max(seen_roster_seq),
-        };
+        let cur = Self::read(path).canonical();
+        let next = Self::after(cur.clone(), observation);
         if next == cur {
             return Ok(());
         }
@@ -541,8 +722,8 @@ impl Floor {
         // zero-length floor.toml, which deserializes (#[serde(default)]) into the
         // permissive all-zero Floor — silently discarding roster_seq/min_build/
         // high_water, the exact replay/rollback window the ratchet closes. Writes
-        // only happen when a coordinate advances (the `next == cur` early return
-        // above), so the F_FULLFSYNC cost is one fsync per real ratchet bump, and
+        // only happen when a coordinate moves (the `next == cur` early return
+        // above), so the F_FULLFSYNC cost is one fsync per real change, and
         // write_durable already sweeps its temp on every failing path and
         // degrades gracefully on volumes that refuse full sync.
         write_durable(path, &text, "update floor")
@@ -893,6 +1074,117 @@ impl FailedMark {
     pub fn clear(path: &Path) {
         let _ = std::fs::remove_file(path);
     }
+
+    /// Clear the download/stage BACKOFF memo once a stage succeeds — and only that:
+    /// a quarantine verdict in the same file (another artifact's, or one an older
+    /// build wrote there alone) stays, because a success of one build says nothing
+    /// about a build that crash-looped (round six, finding 32).
+    pub fn clear_backoff(path: &Path) {
+        if Self::read(path).is_some_and(|mark| mark.is_quarantine()) {
+            return;
+        }
+        Self::clear(path);
+    }
+}
+
+/// THE CRASH-LOOP QUARANTINE, IN A LEDGER OF ITS OWN (`quarantine.toml`, round six,
+/// findings 15 and 32): every artifact that was swapped in, failed boot health
+/// `MAX_BOOT_ATTEMPTS` times and was reverted on this machine, as `build:sha256`.
+///
+/// WHY NOT [`FailedMark`] ALONE. The permanent verdict and the timed download
+/// backoff shared one record that holds ONE artifact: the next stage failure of any
+/// other build replaced it, and a successful stage cleared it outright — so a
+/// verdict meant to last until the channel offers different bytes lasted until the
+/// next stage event of anything. A withdrawn newer release (the channel naming the
+/// quarantined build again) then re-downloaded it and crash-looped the machine a
+/// second time. Here nothing but another quarantine writes, and nothing removes an
+/// entry; the list is bounded ([`Self::KEEP`], oldest dropped first), far beyond
+/// the handful of builds a machine ever reverts.
+///
+/// Older builds read only `failed.toml`, so the revert still writes the verdict
+/// there too ([`quarantine_artifact`]): a pairing with an older reader behaves
+/// exactly as before, and every reader of this build consults both
+/// ([`artifact_quarantined`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Quarantine {
+    /// `"<build_number>:<sha256>"`, lowercase digest, oldest first.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+}
+
+impl Quarantine {
+    /// How many verdicts the ledger keeps. A machine that reverted more builds
+    /// than this has older verdicts the channel has long since moved past.
+    pub const KEEP: usize = 64;
+
+    fn entry(build_number: u64, sha256: &str) -> String {
+        format!("{build_number}:{}", sha256.to_ascii_lowercase())
+    }
+
+    /// The ledger, or an empty one when it is absent or unreadable.
+    #[must_use]
+    pub fn read(path: &Path) -> Self {
+        crate::read_ledger_text(path)
+            .and_then(|text| aterm_toml::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Whether `(build_number, sha256)` is quarantined here.
+    #[must_use]
+    pub fn holds(&self, build_number: u64, sha256: &str) -> bool {
+        let entry = Self::entry(build_number, sha256);
+        self.artifacts.contains(&entry)
+    }
+
+    /// Whether any artifact of `build_number` is quarantined here.
+    #[must_use]
+    pub fn holds_build(&self, build_number: u64) -> bool {
+        let prefix = format!("{build_number}:");
+        self.artifacts.iter().any(|held| held.starts_with(&prefix))
+    }
+
+    /// Add `(build_number, sha256)`, DURABLY: like the verdict it supersedes, this
+    /// is the only thing standing between a build that just crash-looped and the
+    /// next check re-applying it.
+    pub fn record(path: &Path, build_number: u64, sha256: &str) -> Result<(), String> {
+        let mut ledger = Self::read(path);
+        if ledger.holds(build_number, sha256) {
+            return Ok(());
+        }
+        ledger.artifacts.push(Self::entry(build_number, sha256));
+        let excess = ledger.artifacts.len().saturating_sub(Self::KEEP);
+        ledger.artifacts.drain(..excess);
+        let text = aterm_toml::to_string(&ledger)
+            .map_err(|error| format!("serialize artifact quarantine: {error}"))?;
+        write_durable(path, &text, "artifact quarantine ledger")
+    }
+}
+
+/// QUARANTINE `(build_number, sha256)` on this machine — the crash-loop revert's
+/// verdict: into the quarantine ledger ([`Quarantine`]), which no later stage event
+/// touches, and into `failed.toml` ([`FailedMark::record_quarantine`]) for a reader
+/// of an older build, which knows only that one.
+pub fn quarantine_artifact(staging: &crate::paths::Staging, build_number: u64, sha256: &str) {
+    if let Err(error) = Quarantine::record(&staging.quarantine(), build_number, sha256) {
+        crate::warn(&format!(
+            "could not record the quarantine of build {build_number}: {error}"
+        ));
+    }
+    FailedMark::record_quarantine(&staging.failed(), build_number, sha256);
+}
+
+/// Whether `(build_number, sha256)` is quarantined on this machine: in the
+/// quarantine ledger, or in a `failed.toml` verdict (written by this build's revert
+/// beside the ledger, or by an older build's alone).
+#[must_use]
+pub fn artifact_quarantined(
+    staging: &crate::paths::Staging,
+    build_number: u64,
+    sha256: &str,
+) -> bool {
+    Quarantine::read(&staging.quarantine()).holds(build_number, sha256)
+        || FailedMark::read(&staging.failed())
+            .is_some_and(|mark| mark.is_quarantine() && mark.matches(build_number, sha256))
 }
 
 /// One bounded machine state as both spec tiers exchange it — variable name to
@@ -1095,6 +1387,41 @@ mod tests {
     /// also exactly what the pre-budget legacy marker above means. The two states were
     /// indistinguishable, so the poison was written and then ignored, and the build that
     /// had just crash-looped was re-downloaded and re-applied on the next check.
+    /// A QUARANTINE OUTLIVES EVERY LATER STAGE EVENT (round six, finding 32). The
+    /// verdict and the timed backoff shared ONE record holding ONE artifact, so the
+    /// next stage failure of any other build replaced it — and once that build was
+    /// withdrawn and the channel named the quarantined build again, it was
+    /// downloaded, applied and crash-looped a second time. Neither another build's
+    /// failure nor a success (which clears the backoff memo) may erase it.
+    #[test]
+    fn a_quarantine_survives_a_later_stage_failure_of_another_build() {
+        const NOW: u64 = 1_000_000;
+        let staging = crate::paths::Staging::scratch("quarantine-survives");
+        let (x, sx) = (41, "ab".repeat(32));
+        let (y, sy) = (42, "cd".repeat(32));
+        quarantine_artifact(&staging, x, &sx);
+        assert!(artifact_quarantined(&staging, x, &sx));
+
+        FailedMark::record_stage_failure(&staging.failed(), y, &sy, NOW);
+        assert!(
+            artifact_quarantined(&staging, x, &sx),
+            "another build's backoff must not erase the crash-loop verdict"
+        );
+        FailedMark::clear_backoff(&staging.failed());
+        assert!(
+            artifact_quarantined(&staging, x, &sx),
+            "nor may a later successful stage"
+        );
+        // A second quarantine keeps the first.
+        quarantine_artifact(&staging, y, &sy);
+        assert!(artifact_quarantined(&staging, x, &sx));
+        assert!(artifact_quarantined(&staging, y, &sy));
+        // The key is the artifact: a re-publish under another digest is not it.
+        assert!(!artifact_quarantined(&staging, x, &"ef".repeat(32)));
+        assert!(!artifact_quarantined(&staging, x + 2, &sx));
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
     #[test]
     fn a_quarantine_suppresses_forever_while_the_shape_it_used_to_take_does_not() {
         let root = std::env::temp_dir().join(format!("aterm-quarantine-{}", std::process::id()));
@@ -1514,6 +1841,7 @@ mod tests {
                 min_build: 1_000,
                 high_water: 2_000,
                 roster_seq: 9,
+                ..Floor::default()
             },
             "read/max/write is one locked transaction; no coordinate may regress"
         );
@@ -1795,6 +2123,98 @@ changelog = '''
         Floor::bump_and_write(&p, 0, 0, 7);
         assert_eq!(Floor::read(&p).roster_seq, 7);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// EVERY MIXED-VERSION PAIRING READS THE FLOOR AS BEFORE (round seven, H1). A
+    /// build that predates provenance reads a file this build wrote exactly as it
+    /// reads its own; and a number this build finds with no provenance — the file an
+    /// older build rewrote, dropping the fields it does not know — is unattributed:
+    /// no revocation lowers it, which is the pre-provenance floor, never a lower one.
+    #[test]
+    fn a_floor_without_provenance_is_never_lowered_and_an_old_reader_sees_the_numbers() {
+        #[derive(Deserialize)]
+        struct OldFloor {
+            #[serde(default)]
+            min_build: u64,
+            #[serde(default)]
+            high_water: u64,
+            #[serde(default)]
+            roster_seq: u64,
+        }
+        let root = std::env::temp_dir().join(format!("aterm-floor-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("floor.toml");
+        let revoked = vec!["m11".to_string()];
+        Floor::observe_and_write(
+            &path,
+            &FloorObservation {
+                min_build: 9_000,
+                high_water: 9_500,
+                roster_seq: 9,
+                machine: Some("m11"),
+                revoked: &[],
+            },
+        );
+        let old: OldFloor = aterm_toml::from_str(&std::fs::read_to_string(&path).unwrap())
+            .expect("an older build parses the file this one wrote");
+        assert_eq!(
+            (old.min_build, old.high_water, old.roster_seq),
+            (9_000, 9_500, 9)
+        );
+
+        // An older build rewrote it: the numbers stand, the provenance is gone.
+        std::fs::write(
+            &path,
+            "min_build = 9000\nhigh_water = 9500\nroster_seq = 9\n",
+        )
+        .unwrap();
+        Floor::observe_and_write(
+            &path,
+            &FloorObservation {
+                roster_seq: 10,
+                revoked: &revoked,
+                ..FloorObservation::default()
+            },
+        );
+        let floor = Floor::read(&path);
+        assert_eq!(
+            (floor.min_build, floor.high_water, floor.roster_seq),
+            (9_000, 9_500, 10),
+            "an unattributed floor is never lowered: {floor:?}"
+        );
+        assert!(floor.revokes(Some("m11")) && !floor.revokes(None));
+
+        // NEGATIVE CONTROL: the same history WITH provenance is withdrawn.
+        let _ = std::fs::remove_file(&path);
+        Floor::observe_and_write(
+            &path,
+            &FloorObservation {
+                min_build: 9_000,
+                high_water: 9_500,
+                roster_seq: 9,
+                machine: Some("m11"),
+                revoked: &[],
+            },
+        );
+        Floor::observe_and_write(
+            &path,
+            &FloorObservation {
+                roster_seq: 10,
+                revoked: &revoked,
+                ..FloorObservation::default()
+            },
+        );
+        let floor = Floor::read(&path);
+        assert_eq!((floor.min_build, floor.high_water), (0, 0), "{floor:?}");
+        assert_eq!(
+            floor
+                .withdraws(5, Some("m11"))
+                .map(|why| why.contains("revoked")),
+            Some(true)
+        );
+        assert_eq!(floor.withdraws(5, Some("m3")), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// THE LEAK AND THE SILENCE, TOGETHER. The ratchet removed its temp file only when

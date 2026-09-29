@@ -215,7 +215,6 @@ pub fn deco_coverage(glyph: crate::DecoGlyph, cell_w: usize, cell_h: usize) -> V
                     needle_star(px, py, cx, cy, r, 5, -std::f32::consts::FRAC_PI_2, 0.16)
                 }
                 DecoGlyph::Paw => paw(px, py, fw, fh),
-                DecoGlyph::Droplet => droplet(px, py, fw, fh),
                 DecoGlyph::RingArc => ring_arc(px, py, cx, cy, r),
                 DecoGlyph::Shade => soft_square(px, py, fw, fh),
             };
@@ -301,24 +300,6 @@ fn paw(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
         cov = cov.max(ellipse(px, py, tx, ty, toe_r, toe_r * 1.1));
     }
     cov
-}
-
-/// A water droplet / teardrop (the orca "splash" mark): a round bulb sitting low in the
-/// cell, with a tapering point above it. The point's half-width grows linearly from `0`
-/// at the tip to the bulb radius at the bulb centre, giving the classic teardrop.
-fn droplet(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
-    let cx = fw * 0.5;
-    let bulb_y = fh * 0.62;
-    let r = fw.min(fh) * 0.30;
-    let bulb = disc(px, py, cx, bulb_y, r);
-    let tip_y = fh * 0.12;
-    let point = if py >= tip_y && py <= bulb_y && bulb_y > tip_y {
-        let half = r * ((py - tip_y) / (bulb_y - tip_y));
-        (half - (px - cx).abs() + 0.5).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    bulb.max(point)
 }
 
 /// The Singularity nova's per-cell Over darkening mask (Sparkle Words v2
@@ -1458,34 +1439,6 @@ fn draw_braille(c: &mut Canvas, cp: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The orca "splash" glyph is a teardrop: a narrow tip up top widening to a round
-    /// bulb at the bottom. Prints ASCII art (`cargo test droplet -- --nocapture`).
-    #[test]
-    fn droplet_is_a_teardrop() {
-        let (w, h) = (16usize, 18usize);
-        let cov = deco_coverage(crate::DecoGlyph::Droplet, w, h);
-        let mut art = String::from("\n");
-        for y in 0..h {
-            for x in 0..w {
-                let c = cov[y * w + x];
-                art.push(if c > 160 {
-                    '#'
-                } else if c > 50 {
-                    '.'
-                } else {
-                    ' '
-                });
-            }
-            art.push('\n');
-        }
-        println!("{art}");
-        let filled = |row: usize| (0..w).filter(|&x| cov[row * w + x] > 128).count();
-        assert!(
-            filled(h * 3 / 4) > filled(h / 6),
-            "the bulb (lower) must be wider than the tip (upper): {art}"
-        );
-    }
 
     /// The Singularity darkening mask is a SOFT radial shadow (v2.1 polish —
     /// the earlier hollow-annulus mask stamped visible "ghost rings" per

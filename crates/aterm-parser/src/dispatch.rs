@@ -235,6 +235,7 @@ impl Parser {
             &self.params,
             &self.intermediates,
             &self.osc_data,
+            &self.osc_discard,
             &self.current_param,
             &self.param_started,
             &self.dcs_active,
@@ -705,7 +706,14 @@ impl Parser {
         // `&mut self`) so the contract verifier can treat it as having no effect
         // on the `TypeInvariant` state: the only self-mutation here is the
         // invariant-preserving `osc_data.clear()` (len -> 0). (#osc-pure-parse)
-        Self::parse_and_dispatch_osc(self.osc_data.as_slice(), sink, bel_terminated);
+        // An OSC a seamless update carried past its head (`osc_discard`, set
+        // only by `restore_carry`) ends here WITHOUT dispatching: its payload is
+        // a truncated tail.
+        if self.osc_discard {
+            self.osc_discard = false;
+        } else {
+            Self::parse_and_dispatch_osc(self.osc_data.as_slice(), sink, bel_terminated);
+        }
         self.osc_data.clear();
         // Shrink the buffer if a large OSC payload inflated it beyond 4 KiB.
         // Without this, a single OSC 1337 image permanently holds up to

@@ -94,6 +94,18 @@ pub(crate) enum HealthKind {
     /// The window's watchdog: the update check stopped answering
     /// ([`CHECKER_STALLED_TITLE`]).
     Stalled,
+    /// The window's watchdog: another aterm holds the machine's update check
+    /// without making progress ([`checker_lock_held_body`]).
+    ///
+    /// ITS OWN KIND, not [`Self::Stalled`] (round six, findings 9, 36 and 53). The
+    /// two conditions shared one latch and one heal: announced while a stall's
+    /// warning stood, this one was swallowed by the latch and cleared by the
+    /// stall's heal, never to be said again while the sibling stayed stuck; a
+    /// download's progress (the proof a check works) healed it with "aterm
+    /// updates work again" while the sibling was still stuck. No progress of this
+    /// process's own proves the sibling let go — only the streak's end does
+    /// (`crate::update_checker_watch::lock_held_look`) — so no proof heals it.
+    LockHeld,
 }
 
 impl HealthKind {
@@ -123,6 +135,7 @@ impl HealthKind {
             Self::Download => "update.health.download",
             Self::Check => "update.health.check",
             Self::Stalled => "update.health.stalled",
+            Self::LockHeld => "update.health.lock-held",
         }
     }
 
@@ -140,9 +153,20 @@ impl HealthKind {
                 Self::of_updater_title(&msg.title)
             });
         }
-        [Self::Install, Self::Download, Self::Check, Self::Stalled]
-            .into_iter()
-            .find(|kind| kind.key() == key)
+        Self::of_key(key)
+    }
+
+    /// The kind whose row key is `key` ([`Self::key`]); `None` for any other.
+    pub(crate) fn of_key(key: &str) -> Option<Self> {
+        [
+            Self::Install,
+            Self::Download,
+            Self::Check,
+            Self::Stalled,
+            Self::LockHeld,
+        ]
+        .into_iter()
+        .find(|kind| kind.key() == key)
     }
 }
 
@@ -919,9 +943,9 @@ pub(crate) fn switch_started(target: Option<&str>, running: &str) -> Message {
 
 /// THE SWITCH THAT DID NOT HAPPEN, on record: an attempt [`switch_started`]
 /// wrote down ended with this process still running — refused, failed, or
-/// stood down because the terminal was in use (`routine`) — so the record
-/// never leaves an "Installing" that was not. `why` is the attempt's own
-/// account, whole.
+/// stood down by itself to try again (`routine`) — so the record never
+/// leaves an "Installing" that was not. `why` is the attempt's own account,
+/// whole, in every arm.
 #[cfg(any(unix, test))]
 pub(crate) fn switch_stopped(
     target: Option<&str>,
@@ -931,9 +955,14 @@ pub(crate) fn switch_stopped(
 ) -> Message {
     let running = aterm_v(running);
     let (title, detail) = match (target, routine) {
+        // THE STAND-DOWN'S OWN REASON (round six, finding 43): a routine
+        // stand-down is a busy machine, a hold spent on a video take or a
+        // hung-up pane, or every session closing as often as it is typing —
+        // "you were typing" blamed the person for all of them and dropped
+        // the reason the attempt carried.
         (Some(version), true) => (
             format!("Waiting to install {}", aterm_v(version)),
-            format!("you were typing, so {running} kept running; it {TRIES_AGAIN}"),
+            format!("{running} kept running: {why}; it {TRIES_AGAIN}"),
         ),
         (Some(version), false) => (
             format!("Couldn't install {}", aterm_v(version)),
@@ -941,7 +970,7 @@ pub(crate) fn switch_stopped(
         ),
         (None, true) => (
             "Waiting to reload aterm".to_string(),
-            format!("you were typing, so aterm kept running; it {TRIES_AGAIN}"),
+            format!("aterm kept running: {why}; it {TRIES_AGAIN}"),
         ),
         (None, false) => (
             "Couldn't reload aterm".to_string(),
@@ -1157,6 +1186,30 @@ pub(crate) fn checker_stalled_body(
     format!(
         "the update check stopped answering {minutes} min ago while {doing}; {then}. Run \
          `aterm ctl update status` for details."
+    )
+}
+
+/// A SIBLING HOLDS THE MACHINE'S UPDATE CHECK (round four of the 2026-09 update
+/// robustness work, plan item 14): the body of the warning the window's watchdog
+/// raises under [`CHECKER_STALLED_TITLE`] when this process's check loop has
+/// found `checker.lock` held past its bound `cycles` times in a row by a holder
+/// that showed no progress (`aterm_update::checker_watch::CHECKER_UNGATED_AFTER`
+/// or more). A holder still checking — a long download included — rewrites the
+/// lock as it works and is never counted, so the sentence is not said of one.
+///
+/// Whose words, and why these: the check that stopped is ANOTHER aterm's — one
+/// stopped (a `SIGSTOP`, a ctrl-z of a terminal session running one) or hung
+/// while holding the lock every aterm on the machine checks under — and until
+/// round four every other aterm waited on it for good, so the machine stopped
+/// checking with no notice. This aterm now checks without waiting for it, and
+/// the sentence says both halves: what is stuck, and that updates go on. It
+/// asks nothing of the person (grep_guard B12): the status line names the streak
+/// (`checker_deferred=`), and the log names the holder's pid.
+pub(crate) fn checker_lock_held_body(cycles: u64) -> String {
+    format!(
+        "another aterm has held the update check's lock through the last {cycles} checks \
+         without finishing — it may be stopped or hung. This aterm checks for updates \
+         without waiting for it. Run `aterm ctl update status` for details."
     )
 }
 
@@ -2438,11 +2491,11 @@ mod tests {
             switch_started(None, "0.78.0").title,
             "Reloading aterm in place"
         );
-        let waiting = switch_stopped(Some("0.79.0"), "0.78.0", true, "typing");
+        let waiting = switch_stopped(Some("0.79.0"), "0.78.0", true, "the machine is busy");
         assert_eq!(waiting.title, "Waiting to install aterm v0.79.0");
         assert_eq!(
             waiting.detail.join(" "),
-            "you were typing, so aterm v0.78.0 kept running; it tries again by itself"
+            "aterm v0.78.0 kept running: the machine is busy; it tries again by itself"
         );
         assert_eq!(waiting.severity, Severity::Info);
         let not = switch_stopped(Some("0.79.0"), "0.78.0", false, "the proof timed out");

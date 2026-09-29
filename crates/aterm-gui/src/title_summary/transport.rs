@@ -319,7 +319,6 @@ pub(super) fn build_client(
                 client.with_connector(std::sync::Arc::new(AttestedManagedConnector {
                     socket,
                     process,
-                    timeout: settings.timeout,
                 })),
             );
         }
@@ -382,7 +381,6 @@ impl aterm_http::Guard for RequestWriteAuthority {
 struct AttestedManagedConnector {
     socket: std::net::SocketAddr,
     process: ManagedProcessIdentity,
-    timeout: Duration,
 }
 
 #[cfg(target_os = "macos")]
@@ -391,12 +389,20 @@ impl aterm_http::Connect for AttestedManagedConnector {
         &self,
         _host: &str,
         _port: u16,
-        _deadline: aterm_http::Deadline,
+        deadline: aterm_http::Deadline,
     ) -> std::io::Result<std::net::TcpStream> {
+        // The REMAINING budget, not the configured timeout. `Connect` documents
+        // this parameter as "respecting `deadline`", and it is one global budget
+        // for the whole request — a connect that starts with most of it already
+        // spent must not get a fresh full timeout, or the managed path would run
+        // past the deadline before a single request byte moved. `TcpConnector`
+        // already re-derives it per address; this is the trait's other
+        // implementor catching up.
+        let budget = deadline.remaining_or_timeout()?;
         // The socket address is PINNED at agent-construction time, so the name
         // in the URL never selects the peer — that is what makes the attestation
         // below meaningful.
-        let stream = std::net::TcpStream::connect_timeout(&self.socket, self.timeout)?;
+        let stream = std::net::TcpStream::connect_timeout(&self.socket, budget)?;
         stream.set_nodelay(true)?;
         attest_managed_server_stream(&stream, self.process)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;

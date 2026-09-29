@@ -327,7 +327,7 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
         cpu_b_cached, cpu_b_fresh,
         "CPU damaged path must repaint the moved cat with no ghosting"
     );
-    let mut gpu2 = aterm_gpu::GpuRenderer::new(18.0, theme).expect("GPU was available above");
+    let mut gpu2 = common::independent_gpu(18.0, theme);
     let mut win2 = aterm_gpu::WindowGpu::new();
     let gpu_b_fresh = gpu2.render_input(&mut win2, &in_b, None).pixels;
     assert_eq!(

@@ -1,23 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLAUDE CODE LIGHTS, host side: a row of lights at the right end of
-//! aterm's Claude Code footer (`crate::claude_footer`) — the permission mode
-//! and fast mode (owner direction, 2026-09-24). What each light means, where
-//! it is read from and which of Claude's own inputs flips it are decided in
-//! `aterm_agent::harness::lights`; this module puts them on the glass and
-//! carries the gestures.
+//! THE CLAUDE CODE LIGHTS, host side: a few lights in the rule under Claude
+//! Code's input box, left of aterm's footer facts (`crate::claude_footer`) —
+//! the permission mode and fast mode (owner directions, 2026-09-24 and
+//! 2026-09-28). What each light means, where it is read from and which of
+//! Claude's own inputs flips it are decided in `aterm_agent::harness::lights`;
+//! this module puts them on the glass and carries the gestures.
 //!
 //! * DEVIATIONS ONLY: a light is drawn — as a labelled chip, `⏸ plan`,
 //!   `○ fast` — only while it shows what the owner does not
 //!   expect (`lights::deviates`), while a toggle of it is in flight, a
 //!   refusal or a just-switched notice for it is on show, or the pointer or
 //!   the keyboard selection is on it. At rest, everything as expected,
-//!   nothing is drawn: `claude_lights_block` is `None` and the footer has
-//!   the pane's whole row. The mode chip takes the place of Claude's own
-//!   mode pill (a pane too narrow for the chip keeps the pill).
+//!   nothing is drawn: `claude_lights_block` is `None` and the rule carries
+//!   the facts alone. The chips never replace or cover Claude's own mode
+//!   pill, which stays on Claude's row under the rule, whole: the mode chip
+//!   is aterm's own click and keyboard target, in aterm's span of the rule.
+//!   A rule too narrow for the chips beside the model draws none (the model
+//!   gives way last, `footer::fit_rule`).
 //! * HOVER a chip: its title and state replace nothing — they appear just
-//!   left of the chips. CLICK it: it toggles.
+//!   right of the chips, where the rule has room: a hover's, a selection's or
+//!   a toggle's title is the first thing a narrow rule gives up, short then
+//!   gone, before any of the facts, while a REASON — where a mode return
+//!   stopped, a refusal — outranks the branch and the path, never the model
+//!   or the effort (`footer::fit_rule`). CLICK it: it toggles.
 //! * `ctrl+shift+tab` (macOS; elsewhere it is aterm's `prev_tab`) REVEALS
 //!   every known light of the focused pane and selects the next (Claude
 //!   keeps its own shift+tab); while one is selected, Return or Space toggles
@@ -348,10 +355,10 @@ struct LightHit {
 pub(crate) struct WindowLights {
     /// One per painted CELL of every drawn chip: the whole chip is the target.
     hits: Vec<LightHit>,
-    /// The sessions whose footer row this frame painted — chip or none —
-    /// with the cells its chips may take there. The keyboard's way to a
-    /// light at rest needs the row on the glass AND room on it for the chip
-    /// it selects.
+    /// The sessions whose composer rule this frame found on the glass —
+    /// chip or none — with the cells its chips may take there. The
+    /// keyboard's way to a light at rest needs the rule on the glass AND room
+    /// in it for the chip it selects.
     footers: Vec<(u64, usize)>,
     hover: Option<(u64, Light)>,
     selected: Option<(u64, Light)>,
@@ -448,7 +455,7 @@ impl WindowLights {
         h.finish() | 1
     }
 
-    /// Forget every painted light and footer row; the painter records this
+    /// Forget every painted light and footer rule; the painter records this
     /// frame's — before any key is read again, so a selection standing from
     /// here on has been through a painted frame.
     pub(crate) fn clear_hits(&mut self) {
@@ -822,6 +829,7 @@ impl WindowLights {
         let dim = dim_of(blank);
         let mut title = Vec::new();
         let mut short_title = Vec::new();
+        let reason = titled.is_some_and(|light| says_why(&s, light, refused, now));
         if let Some(light) = titled {
             let what = what_of(
                 &s,
@@ -869,16 +877,35 @@ impl WindowLights {
             }
             cols.push((start..cells.len(), light));
         }
-        if !cells.is_empty() {
-            cells.push(blank);
-        }
         Block {
             title,
             short_title,
+            reason,
             lights: cells,
             cols,
         }
     }
+}
+
+/// Whether `light`'s title ([`what_of`]) says WHY — the refusal on show
+/// (where a mode return stopped is one), or what Claude said of a switch —
+/// rather than the toggle in flight or the state the pointer or the
+/// selection shows. A reason outranks the branch and the path in the rule;
+/// the rest gives way before any fact (`footer::fit_rule`).
+fn says_why(
+    s: &SessionLights,
+    light: Light,
+    refused: Option<(Light, Refusal, Instant)>,
+    now: Instant,
+) -> bool {
+    if refused.is_some_and(|(l, _, _)| l == light) {
+        return true;
+    }
+    if s.pending.as_ref().is_some_and(|p| p.light == light) {
+        return false;
+    }
+    s.notice
+        .is_some_and(|(l, until, said)| l == light && until > now && said.is_some())
 }
 
 /// Whether the keyboard's reveal draws and walks `light` in a session that
@@ -1120,16 +1147,36 @@ pub(crate) struct Block {
     pub(crate) title: Vec<RenderCell>,
     /// `what` alone, for a pane with no room for the whole title.
     pub(crate) short_title: Vec<RenderCell>,
-    /// The chips, one blank apart, and one blank of margin after them.
+    /// The title is a REASON ([`says_why`]), which outranks the branch and
+    /// the path in the rule; any other title gives way before every fact.
+    pub(crate) reason: bool,
+    /// The chips, one blank apart (the rule's layout pads the block).
     pub(crate) lights: Vec<RenderCell>,
     cols: Vec<(std::ops::Range<usize>, Light)>,
 }
 
+#[cfg(test)]
 impl Block {
-    /// Whether `light`'s chip is drawn — the mode chip takes the place of
-    /// Claude's own pill on the row (`crate::claude_footer`).
+    /// Whether `light`'s chip is drawn.
     pub(crate) fn shows(&self, light: Light) -> bool {
         self.cols.iter().any(|(_, l)| *l == light)
+    }
+
+    /// A block of `lights` (the chips' cells, as one fast chip) and its
+    /// titles, for the rule's layout tests (`claude_footer`).
+    pub(crate) fn of_chips(
+        lights: Vec<RenderCell>,
+        title: Vec<RenderCell>,
+        short_title: Vec<RenderCell>,
+        reason: bool,
+    ) -> Block {
+        Block {
+            cols: vec![(0..lights.len(), Light::Fast)],
+            title,
+            short_title,
+            reason,
+            lights,
+        }
     }
 }
 
@@ -1157,11 +1204,12 @@ impl App {
         }
     }
 
-    /// The light block to paint at the end of `session`'s footer row, in
-    /// `room` cells — `None` when no chip is drawn: at rest the footer has
-    /// the whole row. Short of room, the keyboard's reveal goes first, so a
-    /// chip drawn at rest (a deviation, the selection itself) stays; a pane
-    /// too narrow even for those draws none.
+    /// The light block to paint in `session`'s composer rule, its chips in
+    /// `room` cells (`footer::chips_room`) — `None` when no chip is drawn:
+    /// at rest the rule carries the facts alone. Short of room, the
+    /// keyboard's reveal goes first, so a chip drawn at rest (a deviation,
+    /// the selection itself) stays; a rule too narrow even for those draws
+    /// none.
     pub(crate) fn claude_lights_block(
         &self,
         wid: WindowId,
@@ -1190,8 +1238,8 @@ impl App {
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .claude_footer()
-                    .map(|facts| (facts.version.clone(), facts.model.clone()))
+                    .claude_footer_shown()
+                    .map(|facts| (facts.version, facts.model))
             })
             .unwrap_or_default()
     }
@@ -1221,8 +1269,9 @@ impl App {
         }
     }
 
-    /// `session`'s footer row reached the glass this frame (chip or none),
-    /// with `room` cells for its chips.
+    /// `session`'s composer rule is on the glass this frame (chip or none,
+    /// facts or none), with `room` cells for its chips — the keyboard's
+    /// chord is the lights' there, even with no room for a chip.
     pub(crate) fn note_claude_footer_row(&mut self, wid: WindowId, session: u64, room: usize) {
         if let Some(ws) = self.windows.get_mut(&wid)
             && !ws.claude_lights.footers.iter().any(|(s, _)| *s == session)
@@ -2192,7 +2241,7 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
-        // The pane's footer row is on the glass, with this much room for its
+        // The pane's footer rule is on the glass, with this much room for its
         // chips: its lights can be revealed there, drawn at rest or not.
         let room = ws
             .claude_lights
@@ -2270,7 +2319,7 @@ impl App {
                 w.request_redraw();
             }
         };
-        // The chord is the lights' wherever the pane's footer row is on the
+        // The chord is the lights' wherever the pane's footer rule is on the
         // glass — even with no chip to select for want of room: passed on,
         // it would reach Claude as shift+tab, and cycle its mode.
         if select_chord && room.is_some() {
@@ -3034,7 +3083,7 @@ mod tests {
         observe(&mut w, &screen(&bare, PLAN, ""));
         let block = w.block(7, blank(), &expect, now, true);
         let text: String = block.lights.iter().map(|c| c.ch).collect();
-        assert_eq!(text, "\u{23F8} plan \u{25CB} fast ");
+        assert_eq!(text, "\u{23F8} plan \u{25CB} fast");
         assert_eq!(block.cols, vec![(0..6, Light::Mode), (7..13, Light::Fast)]);
         assert!(block.title.is_empty(), "nothing asked for a title");
         assert_eq!(block.lights[0].fg, blank().fg, "plan, in the row's ink");
@@ -3198,6 +3247,25 @@ mod gesture_tests {
         (app, wid, session, reader)
     }
 
+    /// [`app`] in a 120-column pane: room for a light's WHOLE title beside
+    /// the owner's whole facts. A hover's or a selection's title gives way
+    /// first in a narrower rule (`footer::fit_rule`), so a test about what
+    /// such a title SAYS runs here; a reason shows at 80 columns too.
+    fn wide_app() -> (App, WindowId, u64, UnixStream) {
+        let (mut app, wid, session, reader) = app();
+        assert!(app.apply_term_resize(wid, 24, 120));
+        (app, wid, session, reader)
+    }
+
+    /// The pane's columns.
+    fn cols(app: &App, session: u64) -> usize {
+        let term = app.pool.get(session).expect("session").term.clone();
+        usize::from(term_lock(&term).cols())
+    }
+
+    /// The owner's whole facts, as [`publish_facts`] publishes them.
+    const WHOLE_FACTS: &str = "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main \u{2500}";
+
     /// Wait (bounded) for the light's initial paste to leave the ordered
     /// writer, so the follow-up reaches the real write instead of waiting
     /// behind it. The bytes arrive before the writer retires its slot.
@@ -3227,8 +3295,7 @@ mod gesture_tests {
                 effort: Some("xhigh".into()),
                 path: Some("~/aterm".into()),
                 branch: Some("main".into()),
-                repo_read_denied: None,
-                version: None,
+                ..FooterFacts::default()
             }),
         ));
     }
@@ -3238,13 +3305,14 @@ mod gesture_tests {
         term_lock(&term).process(bytes);
     }
 
-    /// Claude Code's bottom block on the 24x80 engine: a transcript row, the
-    /// composer between its two rules with an EMPTY draft and the cursor at
-    /// its caret (row 21, column 2), and `mode` on the last row — with
-    /// bracketed paste ON, as Claude Code always has it, so a pasted command
-    /// reaches the PTY framed ([`PASTED`]).
+    /// Claude Code's bottom block on the 24-row engine (80 columns unless a
+    /// test widened it, [`wide_app`]): a transcript row, the composer between
+    /// its two pane-wide rules with an EMPTY draft and the cursor at its
+    /// caret (row 21, column 2), and `mode` on the last row — with bracketed
+    /// paste ON, as Claude Code always has it, so a pasted command reaches the
+    /// PTY framed ([`PASTED`]).
     fn draw_claude(app: &App, session: u64, mode: &str) {
-        let rule = "\u{2500}".repeat(80);
+        let rule = "\u{2500}".repeat(cols(app, session));
         let screen = format!(
             "\x1b[?2004h\x1b[2J\x1b[19;1H\u{25CF} done\x1b[21;1H{rule}\x1b[22;1H\u{276F} \
              \x1b[23;1H{rule}\x1b[24;1H{mode}\x1b[22;3H"
@@ -3257,7 +3325,7 @@ mod gesture_tests {
 
     /// Claude turns fast mode on: `↯` on the composer's top rule.
     fn set_fast(app: &App, session: u64) {
-        let rule = "\u{2500}".repeat(70);
+        let rule = "\u{2500}".repeat(cols(app, session) - 10);
         feed(
             app,
             session,
@@ -3265,9 +3333,16 @@ mod gesture_tests {
         );
     }
 
-    /// The frame row of the pane's footer (its last row).
+    /// The frame row of the pane's footer: the composer's bottom rule, which
+    /// the facts and the lights are written into.
     fn footer_row(app: &App, wid: WindowId) -> usize {
-        app.windows[&wid].input_scratch.cells.len() - usize::from(app.windows[&wid].rows) + 23
+        app.windows[&wid].input_scratch.cells.len() - usize::from(app.windows[&wid].rows) + 22
+    }
+
+    /// The frame row of Claude's own mode row (the pane's last row), which
+    /// the footer never writes.
+    fn mode_row(app: &App, wid: WindowId) -> usize {
+        footer_row(app, wid) + 1
     }
 
     /// Claude answers a press: the mode row reads `mode`, the cursor back at
@@ -3366,6 +3441,59 @@ mod gesture_tests {
         got
     }
 
+    /// THE CHIPS NEVER TOUCH OTHER INK (main's 35d8c4ca7, a real render on
+    /// 2.1.284, 2026-09-28): in auto mode Claude right-aligns `◐ medium ·
+    /// /effort` on its mode row, and the chips then drawn on that row beside
+    /// it read `/effort○ fast`. The chips are in the composer's bottom rule
+    /// now, and Claude's row stays Claude's — so the MEASURED screen, drawn at
+    /// its own 144 columns, keeps the tail exactly where Claude put it, and
+    /// every chip in the rule has a blank cell on each side: never glued to a
+    /// rule glyph, another chip, a title or a fact. In manual mode too, where
+    /// two chips stand side by side. CONTROL: the rule's own glyphs are ink a
+    /// chip must not touch, and they are there.
+    #[test]
+    fn the_effort_tail_stays_on_claudes_row_and_every_chip_stands_clear_in_the_rule() {
+        use aterm_phase::prompt::fixtures::{FOOTER_AUTO_EFFORT_HINT_MEASURED, screen};
+        let measured = screen(FOOTER_AUTO_EFFORT_HINT_MEASURED)
+            .into_iter()
+            .find(|r| r.contains("auto mode on") && r.contains("/effort"))
+            .expect("the measured mode row");
+        let measured = measured.trim_end().to_string();
+        for mode in [measured.as_str(), MANUAL] {
+            let (mut app, wid, session, _reader) = app();
+            assert!(app.apply_term_resize(wid, 24, 144));
+            publish_facts(&app, session);
+            draw_claude(&app, session, mode);
+            frame(&mut app, wid);
+            let claude = row_text(&app, wid, mode_row(&app, wid));
+            assert_eq!(claude.trim_end(), mode, "Claude's row is whole");
+            let hits = &app.windows[&wid].claude_lights.hits;
+            assert!(!hits.is_empty(), "{mode:?}: a chip is drawn");
+            let rule = footer_row(&app, wid);
+            let text: Vec<char> = app.windows[&wid].input_scratch.cells[rule]
+                .iter()
+                .map(|c| c.ch)
+                .collect();
+            assert!(text.contains(&'\u{2500}'), "control: the rule's glyphs");
+            for light in [Light::Mode, Light::Fast] {
+                let cols: Vec<usize> = hits
+                    .iter()
+                    .filter(|h| h.light == light)
+                    .map(|h| {
+                        assert_eq!(h.frame_row, rule, "the chip is in the rule");
+                        h.col
+                    })
+                    .collect();
+                let (Some(&first), Some(&last)) = (cols.iter().min(), cols.iter().max()) else {
+                    continue;
+                };
+                let row: String = text.iter().collect();
+                assert_eq!(text[first - 1], ' ', "{light:?} before: {row:?}");
+                assert_eq!(text[last + 1], ' ', "{light:?} after: {row:?}");
+            }
+        }
+    }
+
     /// A CLICK ON THE MODE LIGHT in manual mode: exactly one shift+tab
     /// reaches the PTY; the light shows `◐` until Claude's screen answers; an
     /// answer that is not yet an expected mode is pressed through from the
@@ -3394,9 +3522,10 @@ mod gesture_tests {
             );
             assert_eq!(cell_at(&app, wid, mode).ch, '\u{23F8}', "{text:?}");
             assert!(text.contains("\u{23F8} manual \u{25CB} fast"), "{text:?}");
+            let claude = row_text(&app, wid, mode_row(&app, wid));
             assert!(
-                !text.contains("manual mode on"),
-                "the chip names the mode: the pill gives way: {text:?}"
+                claude.contains("\u{23F8} manual mode on"),
+                "the chip never takes the pill's place: Claude's row is whole: {claude:?}"
             );
             assert_eq!(cell_at(&app, wid, fast).ch, '\u{25CB}', "{text:?}");
             assert!(pty(&mut reader, 0).is_empty(), "a frame types nothing");
@@ -3441,8 +3570,8 @@ mod gesture_tests {
             assert_eq!(cell_at(&app, wid, mode).ch, '\u{25D0}');
             let text = row_text(&app, wid, mode.0);
             assert!(
-                text.contains("Permission mode: switching\u{2026}"),
-                "{text:?}"
+                text.contains("switching\u{2026}") && text.contains(WHOLE_FACTS),
+                "the title, short in an 80-column pane, beside the whole facts: {text:?}"
             );
             assert_ne!(
                 app.windows[&wid].claude_lights.fingerprint(Instant::now()),
@@ -3489,8 +3618,8 @@ mod gesture_tests {
             );
             let text = row_text(&app, wid, mode.0);
             assert!(
-                text.contains("Permission mode: bypass"),
-                "the hover's title: {text:?}"
+                text.contains("\u{25CB} fast  bypass ") && text.contains(WHOLE_FACTS),
+                "the hover's title, short in an 80-column pane beside the whole facts: {text:?}"
             );
             // A click on the chip while it says so presses nothing.
             click(&mut app, wid, Light::Mode);
@@ -3533,11 +3662,13 @@ mod gesture_tests {
 
     /// AT REST NOTHING IS DRAWN (owner, 2026-09-27: "I don't want to show the
     /// state of parameters that I always expect to be on"): bypass or auto,
-    /// fast on — the footer row is the footer alone, no chip, no
-    /// pill, nothing to hit, while the row is still known to be on the glass
-    /// (the keyboard's way to the lights). Control: fast off draws its chip.
+    /// fast on — the rule carries the facts alone, no chip, nothing to hit,
+    /// while the rule is still known to be on the glass (the keyboard's way
+    /// to the lights); and Claude's own row under it, its pill and hint,
+    /// is exactly as Claude drew it (owner, 2026-09-28). Control: fast off
+    /// draws its chip.
     #[test]
-    fn at_rest_the_row_is_the_footer_alone() {
+    fn at_rest_the_rule_carries_the_facts_alone() {
         for mode in [BYPASS, AUTO] {
             let (mut app, wid, session, _reader) = app();
             publish_facts(&app, session);
@@ -3553,9 +3684,12 @@ mod gesture_tests {
             );
             let text = row_text(&app, wid, footer_row(&app, wid));
             assert!(text.contains("\u{25C6} Opus 5.5 xhigh"), "{text:?}");
-            for gone in ["bypass", "auto mode", "\u{25CB}", "\u{25CF}", "\u{23F5}"] {
+            for gone in ["\u{25CB}", "\u{25CF}", "\u{23F5}"] {
                 assert!(!text.contains(gone), "{gone:?} in {text:?}");
             }
+            // Claude's own row is whole: its pill, its hint.
+            let claude = row_text(&app, wid, mode_row(&app, wid));
+            assert_eq!(claude.trim_end(), mode, "Claude's row, as drawn");
             // Control: fast mode off asks for fast mode.
             draw_claude(&app, session, mode);
             frame(&mut app, wid);
@@ -3659,7 +3793,7 @@ mod gesture_tests {
             app.windows.get_mut(&wid).expect("window").mods = mods;
         }
 
-        let (mut app, wid, session, mut reader) = app();
+        let (mut app, wid, session, mut reader) = wide_app();
         publish_facts(&app, session);
         draw_claude(&app, session, PLAN);
         frame(&mut app, wid);
@@ -3756,10 +3890,10 @@ mod gesture_tests {
 
     /// REGRESSION (review 2026-09-25): in the default 80-column pane a
     /// PENDING mode toggle's title (`Permission mode: switching…  `) never
-    /// pushes the lights off the row — only the lights must fit; the title
-    /// comes along where it fits too, and beside three lights it does (the
-    /// reason-only fallback is held by the stop in accept edits below, whose
-    /// title does not).
+    /// pushes the lights out of the rule — and never the facts either: the
+    /// transient title gives way FIRST (`footer::fit_rule`), so the facts
+    /// stay whole and the title comes short (`switching…`); the chip it names
+    /// does not move.
     #[test]
     fn a_pending_mode_toggle_keeps_its_lights_in_an_80_column_pane() {
         let (mut app, wid, session, mut reader) = app();
@@ -3780,50 +3914,84 @@ mod gesture_tests {
         );
         let text = row_text(&app, wid, approve.0);
         assert!(
-            text.contains("Permission mode: switching\u{2026}"),
-            "room for the whole title beside three lights: {text:?}"
+            text.contains(WHOLE_FACTS),
+            "the facts stay whole while the toggle is in flight: {text:?}"
+        );
+        assert!(
+            text.contains("switching\u{2026}") && !text.contains("Permission mode"),
+            "the title gives way first: short, beside the lights: {text:?}"
+        );
+        assert_eq!(
+            hit(&app, wid, Light::Mode),
+            approve,
+            "the chip stays under the pointer while its title comes: {text:?}"
         );
     }
 
     /// A title too long for the pane comes as the reason alone, the chip
-    /// beside it: a return stopped in accept edits, in the default
-    /// 80-column pane, says where it stopped without its light's name.
-    /// Control: the chips are all there.
+    /// beside it: a return stopped in accept edits, in the default 80-column
+    /// pane, says where it stopped without its light's name. The REASON
+    /// outranks the branch and the path (`footer::fit_rule`): it takes their
+    /// room, never the model's or the effort's. In a 120-column pane it
+    /// comes whole, beside the whole facts. Control: the chips are all there.
     #[test]
     fn a_stop_too_long_to_title_in_full_says_the_reason_alone() {
-        let (mut app, wid, session, mut reader) = app();
-        publish_facts(&app, session);
-        draw_claude(&app, session, MANUAL);
-        frame(&mut app, wid);
-        click(&mut app, wid, Light::Mode);
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-        redraw_mode_row(&app, session, ACCEPT);
-        app.on_claude_footer_changed(session);
-        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
-        past_deadline(&mut app, wid, session);
-        app.on_claude_footer_changed(session);
-        frame(&mut app, wid);
-        let chip = hit(&app, wid, Light::Mode);
-        let text = row_text(&app, wid, chip.0);
-        assert!(
-            text.contains("stopped in accept edits mode") && !text.contains("Permission mode"),
-            "no room for the whole title: the reason alone: {text:?}"
-        );
-        assert!(
-            text.contains("\u{23F5}\u{23F5} accept edits \u{25CB} fast"),
-            "control: the chips: {text:?}"
-        );
+        for cols in [80_u16, 120] {
+            let (mut app, wid, session, mut reader) = app();
+            if cols != 80 {
+                assert!(app.apply_term_resize(wid, 24, cols));
+            }
+            publish_facts(&app, session);
+            draw_claude(&app, session, MANUAL);
+            frame(&mut app, wid);
+            click(&mut app, wid, Light::Mode);
+            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
+            redraw_mode_row(&app, session, ACCEPT);
+            app.on_claude_footer_changed(session);
+            assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
+            past_deadline(&mut app, wid, session);
+            app.on_claude_footer_changed(session);
+            frame(&mut app, wid);
+            let chip = hit(&app, wid, Light::Mode);
+            let text = row_text(&app, wid, chip.0);
+            assert!(
+                text.contains("stopped in accept edits mode"),
+                "{cols}: the reason: {text:?}"
+            );
+            assert!(
+                text.contains("\u{25C6} Opus 5.5 xhigh"),
+                "{cols}: never the model's or the effort's room: {text:?}"
+            );
+            if cols == 80 {
+                assert!(
+                    !text.contains("Permission mode") && !text.contains("\u{2387} main"),
+                    "no room for the whole title: the reason alone, in the branch's \
+                     and the path's room: {text:?}"
+                );
+            } else {
+                assert!(
+                    text.contains("Permission mode: stopped in accept edits mode")
+                        && text.contains(WHOLE_FACTS),
+                    "{cols}: the whole title beside the whole facts: {text:?}"
+                );
+            }
+            assert!(
+                text.contains("\u{23F5}\u{23F5} accept edits \u{25CB} fast"),
+                "{cols}: control: the chips: {text:?}"
+            );
+        }
     }
 
     /// DON'T ASK GOES FORWARD TOO (the review of 2026-09-27: its chip and
     /// the manual promised a click back, and the click refused): Claude's
     /// shift+tab leads from don't ask on to manual, and from there forward —
     /// four presses to bypass, each on Claude's answer, and none from there.
-    /// The chip takes the pill's place and its title says what a click does.
+    /// The chip names the mode in aterm's span of the rule — Claude's own
+    /// pill stays on its row — and its title says what a click does.
     #[test]
     fn a_mode_light_in_dont_ask_mode_presses_forward_to_bypass() {
         const DONT_ASK: &str = "  \u{23F5}\u{23F5} don't ask on (shift+tab to cycle)";
-        let (mut app, wid, session, mut reader) = app();
+        let (mut app, wid, session, mut reader) = wide_app();
         publish_facts(&app, session);
         draw_claude(&app, session, DONT_ASK);
         frame(&mut app, wid);
@@ -3834,7 +4002,12 @@ mod gesture_tests {
         let text = row_text(&app, wid, chip.0);
         assert!(
             text.contains("\u{23F5}\u{23F5} don't ask") && !text.contains("don't ask on"),
-            "the chip, not the pill: {text:?}"
+            "the chip, in the rule: {text:?}"
+        );
+        let claude = row_text(&app, wid, mode_row(&app, wid));
+        assert!(
+            claude.contains("\u{23F5}\u{23F5} don't ask on"),
+            "and Claude's own pill, whole: {claude:?}"
         );
         assert!(
             text.contains("click for bypass or auto"),
@@ -3935,11 +4108,15 @@ mod gesture_tests {
         }
         let (mut app, wid, session, mut reader) = app();
         let other = app.split_active_stub_tab(wid);
-        let cols = usize::from(term_lock(&app.pool.get(session).unwrap().term).cols());
+        let (rows, cols) = {
+            let terminal = term_lock(&app.pool.get(session).unwrap().term);
+            (terminal.rows(), usize::from(terminal.cols()))
+        };
         publish_facts(&app, session);
         let rule = "\u{2500}".repeat(cols);
+        let (top_rule, prompt, bottom_rule) = (rows - 3, rows - 2, rows - 1);
         feed(&app, session, format!(
-            "\x1b[2J\x1b[21;1H{rule}\x1b[22;1H\u{276F} \x1b[23;1H{rule}\x1b[24;1H  \u{23F5}\u{23F5} bypass permissions on\x1b[22;3H"
+            "\x1b[2J\x1b[{top_rule};1H{rule}\x1b[{prompt};1H\u{276F} \x1b[{bottom_rule};1H{rule}\x1b[{rows};1H  \u{23F5}\u{23F5} bypass permissions on\x1b[{prompt};3H"
         ).as_bytes());
         frame(&mut app, wid);
         let strip =
@@ -3955,11 +4132,11 @@ mod gesture_tests {
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
         tap(&mut app, wid, NamedKey::Tab, KeyCode::Tab, "\t");
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-        // In the half-width pane only fast's chip fits alone (the mode's,
-        // selected, would need fast's beside it): that is the one selected.
+        // The half-width pane's rule has room for the revealed chips beside
+        // the model: the first light, the mode's, is the one selected.
         assert_eq!(
             app.windows[&wid].claude_lights.selected,
-            Some((session, Light::Fast))
+            Some((session, Light::Mode))
         );
         click(&mut app, wid, (strip + 5, other_col));
         assert_eq!(app.focused_session_id(wid), Some(other));
@@ -4560,6 +4737,7 @@ mod gesture_tests {
             .unwrap_or_else(|p| p.into_inner()) = Some(crate::Lease::Turn {
             id: 7,
             driver: None,
+            typing: true,
         });
         echo_draft(&app, session, "/fast on");
         app.on_claude_footer_changed(session);
@@ -4862,6 +5040,7 @@ mod gesture_tests {
             Some(crate::Lease::Turn {
                 id: 41,
                 driver: None,
+                typing: true,
             }),
         );
         click(&mut app, wid, Light::Fast);
@@ -5660,6 +5839,7 @@ mod gesture_tests {
             Some(crate::Lease::Turn {
                 id: 41,
                 driver: None,
+                typing: true,
             }),
         );
         click(&mut app, wid, Light::Fast);

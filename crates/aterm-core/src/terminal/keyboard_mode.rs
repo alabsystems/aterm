@@ -469,6 +469,47 @@ mod shift_enter_e2e_tests {
     }
 
     #[test]
+    fn conpty_9001_sends_escape_as_a_record_so_it_survives_the_first_chord() {
+        // conhost stops flushing a lone ESC once it has read one win32 record
+        // — aterm's first Shift+Enter — and from then on the Escape key never
+        // reached `ReadKey` in that tab (measured 2026-09-27: 6 s idle gave
+        // nothing, the next `a` arrived as Alt+A). Walk the negotiation and pin
+        // the bytes conhost now receives, through the lock-free word the GUI
+        // seam encodes from.
+        let key = |term: &Terminal, key: Key, mods: Modifiers| {
+            encode_key_with_layout(
+                &key,
+                mods,
+                term.mode_mirror().keyboard_mode(),
+                KeyEventType::Press,
+                None,
+            )
+        };
+        let esc = || Key::Named(NamedKey::Escape);
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        assert_eq!(
+            key(&term, esc(), Modifiers::empty()),
+            b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_"
+        );
+        // Ctrl+[ and Alt+[ dangle the same way and go the same way.
+        assert_eq!(
+            key(&term, Key::Character('['), Modifiers::CTRL),
+            b"\x1b[219;26;27;1;8;1_\x1b[219;26;27;0;8;1_"
+        );
+        assert_eq!(
+            key(&term, Key::Character('['), Modifiers::ALT),
+            b"\x1b[219;26;91;1;2;1_\x1b[219;26;91;0;2;1_"
+        );
+        // Alt+a still reads as Alt+A after the switch: legacy bytes.
+        assert_eq!(key(&term, Key::Character('a'), Modifiers::ALT), b"\x1ba");
+        // DECRST 9001 restores the legacy ESC byte for byte.
+        term.process(b"\x1b[?9001l");
+        assert_eq!(key(&term, esc(), Modifiers::empty()), b"\x1b");
+        assert_eq!(key(&term, Key::Character('['), Modifiers::ALT), b"\x1b[");
+    }
+
+    #[test]
     fn conpty_9001_is_reported_by_decrqm_and_cleared_by_ris() {
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[?9001$p");

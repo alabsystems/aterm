@@ -7,8 +7,7 @@
 //! This is the parser-side PTY boundary: every byte slice coming out of the
 //! parser's state machine flows through here before reaching an `ActionSink`
 //! method, tagging it at the type level as `Pty`-origin data (Phase 1 of
-//! #7877; see `designs/2026-04-19-provenance-framework.md` §Phase 1 and
-//! Appendix A).
+//! #7877).
 //!
 //! # Why this is the only `unsafe` in `aterm-provenance`
 //!

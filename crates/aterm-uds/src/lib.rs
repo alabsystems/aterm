@@ -50,13 +50,30 @@ pub mod win;
 #[cfg(windows)]
 pub use win::{CtlListener, CtlStream};
 
+/// A kernel witness of another process's death, with its `wait(2)` status (the
+/// PTY keeper's death classifier; lifted from the seamless handoff).
+pub mod exitwatch;
 pub mod fdpass;
+/// Whether a connected stream's peer has closed entirely (a lane's hangup check).
+pub mod hangup;
+/// Which live processes of this uid hold a descriptor for one device (the PTY
+/// keeper's holder scan).
+pub mod holders;
 pub mod latest;
 /// Unix-only: the descriptor a throwaway `--headless` instance watches so it ends
 /// with the process that started it — both ends. See [`lifeline`].
 #[cfg(unix)]
 pub mod lifeline;
+/// Who holds a file's owner lock (the PTY keeper reads a dead window's crash
+/// marker with it).
+#[cfg(unix)]
+pub mod ownerlock;
+/// The kernel's record of a socket peer: its uid and (Darwin) audit token.
+pub mod peer;
 pub mod process;
+/// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: a child that inherits
+/// nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
+pub mod pspawn;
 pub mod rand;
 /// trust-mc proofs for [`rand::hex_encode`] (compiled only under `cfg(kani)`).
 mod rand_kani_proofs;

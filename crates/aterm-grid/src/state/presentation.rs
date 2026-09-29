@@ -334,6 +334,75 @@ impl SelectionDamage {
     }
 }
 
+/// What the most recent resize did to this grid's rows, one count per arm of
+/// `Grid::adjust_row_count`: the numbers behind
+/// [`GridPresentationState::last_resize_row_shift`], for EVERY arm rather than
+/// only the one a selection follows.
+///
+/// Rows-only resizes (every window-height drag, chrome-row change and font zoom
+/// that keeps the width) run the arms in this order. A shrink first TRIMS
+/// trailing blank rows below the cursor, which moves nothing. It then DEMOTES
+/// top rows into ring history, which moves every surviving row UP by that
+/// count. Last comes the BOTTOM-PUSH corner, which rotates bottom rows into
+/// history when the cursor sits too high to demote. A grow REVEALS retained
+/// history at the top, which moves every row DOWN by that count, and APPENDS
+/// blank rows at the bottom for the rest.
+///
+/// The counts say what left or entered the VIEWPORT, not what was kept. On a
+/// grid with no retention (the alternate screen is built with
+/// `max_scrollback = 0`), demoted and pushed rows are evicted by the retention
+/// cap in the same call. The grid's resize undo keeps them (`stashed`) while
+/// nothing draws, so a grow back hands them back (`restored_top`, counted in
+/// `revealed`, and `restored_bottom`) and the net-zero flap is an identity, as
+/// it is on a retaining grid. Once anything is drawn between the halves the
+/// undo is gone, the grow finds nothing to reveal and appends blanks, and the
+/// screen stays shifted up by the demote count (the app, having drawn, has
+/// seen the smaller size and repaints).
+///
+/// Every resize overwrites the whole record. On a WIDTH change `reflowed` says
+/// whether the column rewrap ran, and `pushed`/`revealed`/`appended` then count
+/// rows after that rewrap: the rewrap moves content by itself, so
+/// `revealed - demoted` is a displacement only when `reflowed` is false.
+///
+/// `Copy` and allocation-free: written with plain field stores from the resize
+/// arms, drained by the host through `Grid::take_last_resize_shape`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResizeShape {
+    /// Trailing blank rows below the cursor dropped off the bottom by a shrink.
+    /// No row moved.
+    pub trimmed: u16,
+    /// Top viewport rows relabelled as the newest history by a shrink. Every
+    /// surviving row, and the cursor, moved UP by this count.
+    pub demoted: u16,
+    /// Bottom viewport rows that left the screen with nothing above them moving:
+    /// the rows-only BOTTOM-PUSH corner (rotated into history), or the rows a
+    /// width-change shrink drained off the bottom.
+    pub pushed: u16,
+    /// Retained history lines relabelled as the top of the viewport by a grow.
+    /// Every pre-resize row, and the cursor, moved DOWN by this count.
+    pub revealed: u16,
+    /// Fresh blank rows added at the bottom by a grow. No row moved.
+    pub appended: u16,
+    /// Of `demoted + pushed`, the rows a shrink on a grid with no retention
+    /// kept in its resize undo instead of dropping, for a grow back with
+    /// nothing drawn in between to hand back (all of them or none).
+    pub stashed: u16,
+    /// Of `revealed`, the rows that came back from the resize undo: demoted by
+    /// an earlier shrink with nothing drawn since, now back where they were.
+    pub restored_top: u16,
+    /// Rows an earlier shrink pushed off the bottom, put back there by this
+    /// grow from the resize undo. Not counted in `appended`; no row moved.
+    pub restored_bottom: u16,
+    /// This grow handed back every row the resize undo held and landed on the
+    /// height its first shrink started from: the whole run of resizes since
+    /// then is an identity, and the grid's cursor picture was put back. The
+    /// host puts back what it keeps outside the grid (the selection).
+    pub undone: bool,
+    /// A width change ran the column rewrap (primary-screen reflow), which
+    /// renumbers rows wholesale.
+    pub reflowed: bool,
+}
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct GridPresentationState {
@@ -377,6 +446,11 @@ pub struct GridPresentationState {
     /// it. With the clear gone, uncompensated anchors sit `revealed` rows above their
     /// content, which is a WRONG-COPY path, not a cosmetic drift.
     pub last_resize_row_shift: u16,
+    /// What the most recent resize did to this grid's rows, every arm counted
+    /// (see [`ResizeShape`]). Overwritten by each resize; drained by
+    /// `Terminal`'s resize journal. Kept apart from `last_resize_row_shift`
+    /// so the selection custody that consumes that field is untouched.
+    pub last_resize_shape: ResizeShape,
     /// SELECTION CUSTODY Phase 4: whether this batch moved rows in a way that makes a
     /// HOST's cached grid coordinates untranslatable.
     ///
@@ -484,6 +558,7 @@ impl GridPresentationState {
             selection_damage: SelectionDamage::None,
             last_output_damage_abs: None,
             last_resize_row_shift: 0,
+            last_resize_shape: ResizeShape::default(),
             coordinates_invalidated: false,
             row_band_moves: RowBandMoves::default(),
             pending_absolute_row_update: None,
@@ -647,6 +722,12 @@ impl GridPresentationState {
     #[inline]
     pub(crate) fn take_last_resize_row_shift(&mut self) -> u16 {
         std::mem::take(&mut self.last_resize_row_shift)
+    }
+
+    /// Drain the most recent resize's full row accounting (see [`ResizeShape`]).
+    #[inline]
+    pub(crate) fn take_last_resize_shape(&mut self) -> ResizeShape {
+        std::mem::take(&mut self.last_resize_shape)
     }
 
     /// Record a logical-row insertion, coalescing the consecutive form emitted

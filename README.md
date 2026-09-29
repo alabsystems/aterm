@@ -41,24 +41,25 @@ The recommended install is one line:
 curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
 ```
 
-**The macOS app is a ~27 MB download. aterm opens immediately; the ALab toolchain installs itself
+**The macOS app is a ~40 MB download. aterm opens immediately; the ALab toolchain installs itself
 on first launch with live progress** — each program downloads individually and
 resumably, only the builds for your machine, visible end to end in the app.
 
-On macOS the script reads the release GitHub's `latest` names — the newest app
-release, which every cut points it at — from github.com's download host with no
-credential and no GitHub API request, checks the download's SHA-256 against
-the release manifest, verifies the app's Developer ID signature and
-notarization, puts `aterm.app` in `/Applications` (or `~/Applications`), and
-links the `aterm` command and its man pages under `~/.local`. `--no-toolchain`
-excludes the toolset, `--no-path` leaves your shell profile untouched,
-`--dry-run` prints the whole plan — elected release, asset, every destination,
-every edit — and writes nothing, and `--uninstall` reverses everything it
-installed. The toolset exclusion persists: `--no-toolchain` writes
-`[packages] auto_install = false` into `aterm.toml` (never over a value already
-there), so the app's first launch leaves the toolset alone too, and a machine
-that already runs the toolset keeps updating it but gets a new default-set
-member only when `aterm pkg install --default-set` is run (`aterm help pkg`).
+On macOS the script downloads the newest app release from github.com (no
+credential, no API request), checks its SHA-256 against the release manifest,
+verifies the app's Developer ID signature and notarization, puts `aterm.app` in
+`/Applications` (or `~/Applications`), and links the `aterm` command and its man
+pages under `~/.local`. `--no-toolchain` excludes the toolset, `--no-path` skips
+the installer's own PATH block, `--dry-run` prints the whole plan — elected
+release, asset, every destination, every edit — and writes nothing, and
+`--uninstall` reverses everything it installed. The toolset adds its own marked
+block to an existing `~/.zshrc`, `~/.bashrc`, `~/.bash_profile` or fish config;
+delete it and it stays deleted (`aterm pkg repair` puts it back). The toolset
+exclusion persists: `--no-toolchain` writes `[packages] auto_install = false`
+into `aterm.toml` (never over a value already there), so the app's first launch
+leaves the toolset alone too, and a machine that already runs the toolset keeps
+updating it but gets a new default-set member only when `aterm pkg install
+--default-set` is run (`aterm help pkg`).
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel), from the
@@ -66,31 +67,23 @@ public release channel at
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
 The channel carries two kinds of cut: **app releases** ship the containers
 below plus the signed `aterm-appcast.toml` manifest, and **source releases**
-(e.g. v0.62.0, v0.64.0) carry only a signed source manifest — the installer
-and the in-app updater elect the newest app release and skip source cuts.
+carry only a signed source manifest — the installer and the in-app updater elect
+the newest app release and skip source cuts.
 Every macOS app release is the same app in two containers:
 
-- **`aterm-X.Y.0.dmg` (~30 MB) — the download.** The signed, notarized app
+- **`aterm-X.Y.0.dmg` — the download.** The signed, notarized app
   alone, as a drag-install image: drag `aterm.app` into Applications.
-- **`aterm-X.Y.0-mac.zip` (~27 MB) — the same app, zipped.** The container the
+- **`aterm-X.Y.0-mac.zip` — the same app, zipped.** The container the
   in-app updater, the Homebrew cask, and `install.sh` consume.
 
-There is one image, not a family: the batteries-included seeded images, the
-Intel-only DMG, and `install.sh --batteries` were retired by owner decision on
-2026-08-26, and the flag now refuses. An air-gapped machine can still install the
-app from a DMG, but the toolchain comes from the network index — offline
-provisioning is not offered. Already-published releases keep the assets they
-shipped with: `aterm-<version>.dmg` is the ~1.07 GB seeded image in every
-release through **v0.63.0** (through v0.61.0 the lean image shipped beside it as
-`aterm-<version>-lite.dmg`). **v0.65.0 published the first lean
-`aterm-<version>.dmg`**, and every app release since carries the lean pair.
+An air-gapped Mac can install the app from the DMG; the toolchain always comes
+from the network.
 
 Every app release also carries the permanent names `aterm.dmg` and
 `aterm-mac.zip`, so `releases/latest/download/aterm.dmg` and
 `releases/latest/download/aterm-mac.zip` always fetch the newest app. Every
 container has a `.sha256` sidecar whose digest also appears in that release's
-`aterm-appcast.toml` (v0.63.0, cut by an older cutter, carries `aterm.dmg` but
-no `aterm-mac.zip`). With the sidecar beside the asset, and the app in place:
+`aterm-appcast.toml`. With the sidecar beside the asset, and the app in place:
 
 ```sh
 shasum -a 256 -c aterm-<version>.dmg.sha256
@@ -116,18 +109,10 @@ aterm --window
 aterm update status
 ```
 
-A downloaded raw file is not an automatically updating installation by itself;
-use the installer above. It checks that the executable can start on your
-userland before replacing an existing app. Distribution/glibc requirements
-depend on the native release build; the Ubuntu 24.04 development build was
-validated on this machine and requires glibc 2.39.
-
-**Publication status, checked 2026-09-15:** the public 0.86.0 appcast has no
-native Linux artifact. The historical 0.68.0 x86_64 tarball is checksum-only,
-not ARM64 and not an authenticated native-update fallback. The installer
-reports this absence; local implementation and tests do not publish a release.
-The authorized publisher must first include the native worker artifacts in the
-signed cut. `tools/install.sh --help` lists the Linux install and update options.
+A downloaded raw file does not update itself; use the installer, which checks
+that the executable starts on your system before replacing a copy, and says so
+when the channel has no Linux build for your architecture. On Linux, `aterm
+update --help` lists `enable`, `apply` and `rollback`.
 
 ### Homebrew
 
@@ -151,8 +136,8 @@ the background, verifies the new build, and swaps it in at a quiet moment —
 every window, tab, split, and live shell survives, and if the handoff cannot
 complete the update lands at the next launch. Settings ▸ Software Update shows
 what is staged plus the release notes; `aterm ctl update status` says the same
-on the command line, and `aterm update` is the headless lane for a machine with
-no window open. Settings ▸ Software Update ("Check for updates
+on the command line, and `aterm update` (status, check) works with no window
+open. Settings ▸ Software Update ("Check for updates
 automatically", `[update] enabled = false` in `aterm.toml`) stops the background
 checks — Check for Updates and `aterm update check` still check when asked;
 `[update] auto_apply = false` stages the build and leaves
@@ -162,23 +147,20 @@ launch).
 Enrolled Linux copies check while an ordinary window or interactive session is
 running, normally every thirty minutes with shared retry backoff. By default
 they replace only the on-disk executable; open windows and PTYs keep running
-their existing binary. A later GUI launch confirms the new version's trial
-health. `[update] auto_apply = false` leaves a verified
+their existing binary. The next start of the new build that comes up healthy (a
+window, `--headless`, or an interactive session) confirms it; a build whose window
+fails still rolls back. `[update] auto_apply = false` leaves a verified
 stage for explicit `aterm update apply`. `aterm update status` and Settings
 distinguish a Linux stage, an installed trial and a failed check; Linux does not
 pretend to use the macOS live-session handoff. `[update] enabled = false` disables
 background checks from the next launch; explicit checks and applies remain
 available. Locally built installations require explicit
 `aterm update enable`; that trusts the local baseline, not unsigned future
-updates. No update can arrive until an admissible signed native release exists.
+updates. Updates arrive only from a signed Linux release.
 
-On Windows there is no updater yet, and no `aterm.app`: nothing checks, stages
-or applies a build. To update a copy you built, run `git pull`, then
-`apps\aterm-win\build.ps1` and `apps\aterm-win\install.ps1` in your aterm
-checkout — for an MSIX install, `apps\aterm-win\msix\build-msix.ps1` after
-`build.ps1` instead of `install.ps1`. `aterm update status` and `aterm update
-check` say the same on a Windows machine. `apps/aterm-win/README.md` has the
-packaging detail and the known Windows limitations.
+On Windows there is no updater yet and no published build: nothing checks,
+stages or applies one. To update a copy you built, pull and rebuild it as in
+[Build from source](#build-from-source).
 
 ### Build from source
 
@@ -196,9 +178,9 @@ cargo build --locked -p aterm
 `./target/debug/aterm --version` should agree with `[workspace.package]
 version` in the root `Cargo.toml`. Build from the workspace — aterm's crates are
 not on crates.io, so there is nothing to `cargo install`. Linux and Windows
-build from source too and have in-tree build lanes and tests. The public source
-snapshot uses its stock compiler pin; private development and the native Linux
-release worker use the pinned Trust toolchain. A source build is a real aterm,
+build from source too. The public source snapshot uses its stock compiler pin;
+private development and the native Linux release worker use the pinned Trust
+toolchain. A source build is a real aterm,
 not a byte-identical signed release, and is not automatically enrolled for
 replacement. Linux release availability and enrollment are described above.
 
@@ -239,7 +221,7 @@ away.
 | **Observe** | Plain text, lossless styled cells, cursor, modes, shell command blocks, session status, a lifecycle timeline, and full-history search | Window and headless modes only |
 | **Drive** | Text, keys, paste, mouse, focus, resize, selection, clipboard, tabs, menu actions, and native Settings | Signals are a separate operation, never faked keystrokes |
 | **Coordinate** | Event-driven `await`, `ready`, `wait`, whole-turn settlement, and cooperative drive leases | `turn` waits for the screen to settle, not for the process to exit; `wait` needs OSC 133 marks |
-| **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, and `sessions` subscriptions, plus fleet-wide NDJSON | Gaps are marked, never hidden |
+| **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, `mail`, and `sessions` subscriptions, plus fleet-wide NDJSON | Gaps are marked, never hidden |
 | **Capture** | PNG frames, full-window artifacts with native chrome (macOS), bounded asciicast history, opt-in temporal replay, and GPU swapchain-tap video | Records what aterm rendered, not what the display showed |
 | **Measure** | Live render, frame, input, and application-present-return counters with percentiles and startup phases | Software-side counters; GPU completion and the display are outside |
 | **Extend** | Themes, typography, wallpaper, Trail Packs, Toy Packs, keybindings, and the Rust/C/WASM engine source | Path dependencies only — no crates.io, no API stability yet |
@@ -278,9 +260,10 @@ keystrokes do, and the person's keyboard never routes through the agent — so a
 human can type at any time, even mid-turn.
 
 Coding agents learn that aterm exists without anyone running anything: each
-session aterm opens detects the coding agents on the machine — Claude Code,
-Codex CLI, Gemini CLI, and OpenCode — and keeps a short primer current in each
-one's global context file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …).
+time an aterm window opens a session, it detects the coding agents on the
+machine — Claude Code, Codex CLI, Gemini CLI, and OpenCode — and keeps a short
+primer current in each one's global context file (`~/.claude/CLAUDE.md`,
+`~/.codex/AGENTS.md`, …).
 The aterm brief in that primer only activates when the agent finds itself inside
 aterm (its Rust note and peer-messaging note gate on the toolchain and the fabric
 instead). Claude Code also gets four bundled skills — `drive-aterm`,
@@ -339,8 +322,8 @@ From another shell, inspect and drive its active session:
 aterm ctl text                  # plain visible rows
 aterm ctl screen                # lossless styled-grid JSON
 aterm ctl status                # phase, outcome, and confidence for this session
-aterm ctl image frame.png       # the rendered client frame, written on the aterm host
-aterm ctl window shot.png       # the whole window, with its native chrome (macOS)
+aterm ctl image frame.png       # the rendered frame as PNG; the reply names where it was saved
+aterm ctl window shot.png       # the whole window with its native chrome (macOS), saved the same way
 aterm ctl turn 'git status'     # type, submit, settle, and return the screen
 aterm ctl wait                  # block until the running command completes (OSC 133)
 aterm ctl metrics               # live render and latency counters
@@ -366,10 +349,10 @@ aterm ctl "@$sid" close
 ```
 
 `turn` types, submits, verifies the submit landed, settles, and returns the
-screen plus a deterministic hash. `await` takes one of five predicates —
-`idle <ms>`, `seq [<n>]`, `match <re>`, `gone <re>` (no visible row matches:
-the inverse of `match`, for a turn whose end is a busy footer leaving), `block`
-— with an optional
+screen plus a deterministic hash. `await` waits on one predicate — `idle <ms>`,
+`seq [<n>]`, `match <re>`, `gone <re>` (no visible row matches: the inverse of
+`match`, for a turn whose end is a busy footer leaving), `block`, `agent <word>`,
+`inbox since=<id>`, `momentum <floor>` or `consent` — with an optional
 `timeout=<ms>`; `await seq` is level-triggered, so `await seq <n> timeout=0` is
 a cheap one-shot "did anything change?" check, and any timeout exits with code
 124 so a script can tell "not yet" from "failed".
@@ -382,15 +365,13 @@ socket.) `aterm ctl help`
 prints the short verb catalog from a running instance, `aterm ctl help <verb>`
 one verb's full entry, and `aterm help introspection` the full catalog
 anywhere. All of them are generated from the one typed verb table the server
-answers from, so they cannot drift. Coding agents are primed automatically:
-every session aterm opens installs the primer for each detected agent
-(`agents_auto_prime = false` in `aterm.toml` turns that off).
+answers from, so they cannot drift.
 
 ## Fun is a feature
 
 The default cursor is the **rainbow kitty pet**: a full-body cat that walks,
 runs, and pounces along your line, trailing a banded rainbow ribbon (with a
-glass-bell typing sound on macOS). It cheers a green build, sulks at a failed
+music-box typing sound on macOS). It cheers a green build, sulks at a failed
 one, and chases your mouse. Slowly stroke across its body to earn a chin lift,
 slow blink and purr, or click it for affection. Keep petting and its tail and
 body join in. A new kitty is generated every time aterm starts, and
@@ -417,9 +398,9 @@ its frames are byte-identical to the ones the v0.28 build emits — and it is
 offered as an option, never a default. `classic mono` is that same engine
 wearing v0.28's other face: one hue instead of the rolling spectrum, taken from
 the theme's cursor colour, so it follows `cursor_trail_color` and live OSC 12. Every trail has a signature typing sound on macOS, and
-Settings ▸ Cursor & Motion ▸ Sound picks any instrument — glass bell, droplet,
-typewriter, marimba, felt — regardless of the trail on screen, or leaves it on
-`auto` to follow it.
+Settings ▸ Cursor & Motion ▸ Sound ▸ Typing sound picks any instrument — music
+box, droplet, typewriter, marimba, felt — regardless of the trail on screen, or
+leaves it on Follow the trail.
 
 The rest of the roster:
 
@@ -488,12 +469,10 @@ OS appearance, and `~/.config/aterm/themes/*.conf` adds your own. Typography
 covers ligatures, OpenType features, variable-font weight, ordered fallback fonts,
 and bundled display faces.
 
-Accessibility is honest about its cost: a Linux build carries the AccessKit tree
-unconditionally, so a screen reader gets the grid and the Settings tree there by
-default. On macOS and Windows that tree left the default build in August 2026 —
-it was the largest third-party dependency surface aterm could retire — and stays
-available as a build feature (`a11y-accesskit`, or the aterm-owned
-NSAccessibility publisher `a11y-appkit` on macOS).
+A Linux build publishes the AccessKit tree, so a screen reader reads the grid and
+Settings. macOS releases and Windows builds ship without one; build it with
+`cargo build --locked -p aterm --features aterm-gui/a11y-accesskit` (or, on
+macOS, `aterm-gui/a11y-appkit`, aterm's own VoiceOver publisher).
 
 ## The ALab toolchain
 
@@ -515,10 +494,15 @@ aterm pkg list
 own verbs cannot be shadowed. On `$PATH` itself the managed tools come last, so
 a `ty` or `clean` you already had (Homebrew core has formulae with those names)
 keeps winning — `alab-<tool>` (`alab-ty`, `alab-clean`, …) always names ALab's
-copy, and `aterm pkg which <tool>` says which one runs. Settings ▸ Packages ▸
-Install ALab Tools Now (or `aterm pkg install --default-set`) fetches the whole
-set at once, and the windowed app keeps installed packages current on a six-hour
-loop.
+copy, and `aterm pkg which <tool>` says which one runs. Inside an aterm tab a
+few names run stubs first: `cargo`, `rustc` and `tlc` name ALab's counterpart,
+then run yours; `clippy`, `rustfmt`, `rustdoc` and `lean` run `tippy`,
+`trustfmt`, `trustdoc` and `clean`; `z3` refuses unless run by its path; and
+`claude` and `codex` run the managed Claude Code and Codex CLI the toolset
+installs. `aterm --no-reroute` restores every name but `claude` and `codex`
+(`aterm help reroute`). Settings ▸ Packages ▸ Install ALab Tools Now (or `aterm
+pkg install --default-set`) fetches the whole set at once, and the windowed app
+keeps installed packages current on a six-hour loop.
 
 Packages ride the same trust chain as the app updater (see
 [Security model](#security-model)): every download is verified before it is
@@ -599,7 +583,7 @@ it as privileged:
   OSC 52 clipboard reads — are opt-in and off by default (clipboard reads answer
   only under `allow_osc52_query = true`, and an authorized query is always
   answered rather than left hanging), and a multi-line paste into a shell without
-  bracketed paste asks first (macOS and Windows).
+  bracketed paste asks first.
 
 **Release trust** — for the macOS/Linux app updaters and the toolchain package index —
 is anchored by a **paper master key** that exists on no computer. It signs only a
@@ -679,30 +663,10 @@ stock Rust and carries the embedded exhaustive checker, the conformance,
 property, and fuzz tests, the CPU/GPU parity suites, and the differential oracle
 against `alacritty_terminal` (the `ay` bundles stay internal). These prove or
 test named, bounded contracts — not the whole emulator, renderer, or OS.
-Every gate is a local command — `tools/verify.sh` is the merge contract and
-runs the L0 temporal-safety gate as one of its unconditional stages, the
-release cutter re-runs those six obligations itself before it claims a build
-number, the full ladder runs by
-hand, and there is no hosted CI and no git hook — by the owner's decision,
-every gate runs inline in the tool being run. `tools/verify.sh` writes a receipt
-for a clean tree — into the repository's git common dir, which every worktree
-shares, filed under the commit and under its tree — naming the commit it
-verified, the compiler and spec checkers it ran, what failed, the machine's load
-around each stage and what that run discharged, never letting a weaker run's
-replace a whole-tree one. A run is
-judged against main's receipt for its base: a red main already has, failing the
-same way, is named as inherited rather than blocking (for up to 24 h), and
-`tools/verify.sh --baseline` records and publishes main's own. A narrowed run (`--changed`,
-`--scope`) vouches for nothing, because other crates' tests read files no
-dependency edge names. The work that measures the machine or the release
-artifact rather than correctness — the release build and the paint and spin
-matrices that judge it, the typing-pacing smoke — is a separate MEASURE tier
-(`tools/verify.sh --measure`), not part of the merge contract. The release
-cutter reads those receipts itself: it states in the cut's transcript how many
-commits the built commit sits above the newest one a whole-tree pass vouches
-for, and refuses to claim a build number unless a MEASURE run measured the
-tree it builds. So L0 is enforced by the merge contract and again,
-unconditionally, at the release cut.
+The development line gates every merge on a local verification run (there is
+no hosted CI), and the release cutter re-runs the temporal-safety checks before
+it claims a build number. Those gate scripts live in the development line, not
+in this snapshot; [CONTRIBUTING.md](CONTRIBUTING.md) says what you can run here.
 
 aterm makes no aggregate performance claim. The reproducible cross-engine
 measurements are engine-only and in-process — throughput via
@@ -741,13 +705,22 @@ meaning. The window watches the configuration and applies supported
 changes without a restart, and Settings ▸ Manual opens the file in the native
 editor.
 
-By default the windowed app talks to GitHub for at most two things — the app
-update check (eligible macOS or enrolled Linux installs) and the toolchain package update pass — and contains
-no telemetry. Descriptive tab titles use a local summarizer unless you opt into a
-remote provider. Ordinary interactive terminal sessions also run the eligible
-update/package checks. Noninteractive helpers and introspection harnesses do
-not start those background checks; explicit network commands still perform
-their requested work.
+By default the windowed app goes online for at most two things — the app update
+check (eligible macOS or enrolled Linux installs) and the toolchain package
+update pass (GitHub, plus downloads.claude.ai and releases.openai.com for Claude
+Code and Codex CLI) — and contains no telemetry. Descriptive tab titles use a
+local summarizer unless you opt into a remote provider. Ordinary interactive
+terminal sessions also run the eligible update/package checks. Noninteractive
+helpers and introspection harnesses do not start those background checks;
+explicit network commands still perform their requested work.
+
+On macOS aterm also changes two settings by default: it turns Universal Control
+off for this Mac, and renames cargo `target` folders under your home to
+`target.noindex` so Spotlight skips them (a `target` symlink or a
+`.cargo/config.toml` line keeps builds working). In `aterm.toml`, `[machine]`
+`universal_control = "leave"` and `spotlight_noindex = false` stop both
+(Settings ▸ Security); `aterm pkg machine` prints the line that turns Universal
+Control back on.
 
 ## Community and license
 

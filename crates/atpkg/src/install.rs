@@ -88,44 +88,30 @@ pub enum StageError {
     /// script, a symlinked Mach-O) ([`developer_id_gate`]). Deterministic for these bytes,
     /// which already matched their digest, so it is memoized like a digest refusal.
     SignerRefused(String),
+    /// The platform signer check did not FINISH: codesign was still reading a Mach-O when
+    /// its deadline ran out ([`developer_id_gate`]). No verdict on the bytes and no fault
+    /// of this machine's store — the program is DEFERRED: nothing is memoized, the verified
+    /// archive is kept for the next pass to re-stage without a download, and the vendor
+    /// lane reports it as a wait, not a failure (2026-09-26: codex 0.157.0's 238 MB binary
+    /// timed out under the window's utility clamp on 2026-09-25 and was posted as "Package
+    /// update failed" twice before a retry 21 s later verified it).
+    VerifyDeferred(String),
 }
 
-// Hand-rendered through `Formatter::write_str` + direct `Display::fmt` calls (no
-// `write!`): the `write!`/`format_args!` expansion embeds `fmt::Arguments`
-// construction (with inlined `unsafe`) that the strict Trust gate cannot lower and
-// fails closed on. Byte-identical output (`write!` with `{}` args performs exactly
-// these formatter writes in sequence; no width/fill flags are used).
 impl std::fmt::Display for StageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StageError::Io(e) => {
-                f.write_str("io: ")?;
-                std::fmt::Display::fmt(e, f)
-            }
+            StageError::Io(e) => write!(f, "io: {e}"),
             StageError::Sha256Mismatch { expected, got } => {
-                f.write_str("asset sha256 mismatch: expected ")?;
-                f.write_str(expected)?;
-                f.write_str(", got ")?;
-                f.write_str(got)
+                write!(f, "asset sha256 mismatch: expected {expected}, got {got}")
             }
-            StageError::Extract(e) => {
-                f.write_str("extract: ")?;
-                std::fmt::Display::fmt(e, f)
-            }
+            StageError::Extract(e) => write!(f, "extract: {e}"),
             StageError::TreeRootMismatch { expected, got } => {
-                f.write_str("tree_root mismatch: expected ")?;
-                f.write_str(expected)?;
-                f.write_str(", got ")?;
-                f.write_str(got)
+                write!(f, "tree_root mismatch: expected {expected}, got {got}")
             }
-            StageError::Payload(m) => {
-                f.write_str("payload: ")?;
-                f.write_str(m)
-            }
-            StageError::SignerRefused(m) => {
-                f.write_str("signer refused: ")?;
-                f.write_str(m)
-            }
+            StageError::Payload(m) => write!(f, "payload: {m}"),
+            StageError::SignerRefused(m) => write!(f, "signer refused: {m}"),
+            StageError::VerifyDeferred(m) => write!(f, "signature check deferred: {m}"),
         }
     }
 }
@@ -421,7 +407,10 @@ pub fn verify_and_stage(
 }
 
 /// How long [`developer_id_gate`] may spend verifying one tree, across every Mach-O in
-/// it: each codesign call is bounded on its own, and this bounds their number.
+/// it: each codesign call is bounded on its own, and this bounds their number. It grows by
+/// each file's size-scaled allowance above the 30 s floor
+/// ([`aterm_update_core::codesign::verify_timeout_for`]), so a tree of large binaries is
+/// not cut short by a budget sized for small ones (2026-09-26).
 const DEVELOPER_ID_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// A [`StageHooks::pre_swap`] gate for a darwin agent build: every Mach-O in the staged
@@ -434,8 +423,11 @@ const DEVELOPER_ID_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// codesign's verdict on these bytes ([`CodesignError::is_verdict`]) is
 /// [`StageError::SignerRefused`]; a team or tool name that is not one is a
 /// [`StageError::Payload`]; codesign failing to judge them (an unreadable file, an
-/// internal error, a timeout) is [`StageError::Io`] — a fact about this machine, retried
-/// rather than memoized.
+/// internal error) is [`StageError::Io`] — a fact about this machine, retried rather than
+/// memoized; and codesign not FINISHING by its deadline — which scales with the file's
+/// size ([`aterm_update_core::codesign::verify_timeout_for`]) — is
+/// [`StageError::VerifyDeferred`]: the program waits for the next pass, and no warning is
+/// raised for it (2026-09-26).
 ///
 /// [`CodesignError::is_verdict`]: aterm_update_core::codesign::CodesignError::is_verdict
 pub(crate) fn developer_id_gate(
@@ -481,7 +473,7 @@ fn check_developer_id(
     exposes: &[String],
     verify: VerifyOne<'_>,
 ) -> Result<(), StageError> {
-    use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT};
+    use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT, verify_timeout_for};
     if exposes.is_empty() {
         return Err(payload2(
             "developer id gate: no exposed tool to bind for team ",
@@ -523,9 +515,23 @@ fn check_developer_id(
         m.push_str(" is executable but not a Mach-O; it would run unverified");
         return Err(StageError::SignerRefused(m));
     }
-    let budget = std::time::Instant::now() + DEVELOPER_ID_BUDGET;
+    // Each file's deadline scales with its size: codesign's time is its read time, and the
+    // window's passes run it IO-throttled under the utility clamp. A fixed 30 s failed
+    // codex's 238 MB binary twice on 2026-09-25 (see `VERIFY_MIN_BYTES_PER_SEC`).
+    let allowance = |path: &Path| {
+        let len = std::fs::symlink_metadata(path).map_or(0, |m| m.len());
+        verify_timeout_for(len)
+    };
+    let extra = found
+        .iter()
+        .map(|p| allowance(p).saturating_sub(VERIFY_TIMEOUT))
+        .fold(
+            std::time::Duration::ZERO,
+            std::time::Duration::saturating_add,
+        );
+    let budget = std::time::Instant::now() + DEVELOPER_ID_BUDGET.saturating_add(extra);
     for path in &found {
-        let deadline = budget.min(std::time::Instant::now() + VERIFY_TIMEOUT);
+        let deadline = budget.min(std::time::Instant::now() + allowance(path));
         let rel = path.strip_prefix(tree).unwrap_or(path).to_string_lossy();
         let mut m = String::from(rel.as_ref());
         match verify(path, deadline) {
@@ -539,6 +545,12 @@ fn check_developer_id(
             }
             Err(e @ CodesignError::InvalidTeam(_)) => {
                 return Err(payload2("developer id gate: ", &e.to_string()));
+            }
+            // Not finishing is not a verdict and not a fault: the next pass asks again.
+            Err(e @ CodesignError::TimedOut) => {
+                m.push_str(": ");
+                m.push_str(&e.to_string());
+                return Err(StageError::VerifyDeferred(m));
             }
             Err(e) => {
                 m.push_str(": ");
@@ -648,12 +660,9 @@ pub(crate) fn stage_payload_modes(
     }
 }
 
-/// A [`StageError::Payload`] from `<head><detail>` (manual concat — see `lib.rs` on
-/// `format!`).
+/// A [`StageError::Payload`] from `<head><detail>`.
 fn payload2(head: &str, detail: &str) -> StageError {
-    let mut m = String::from(head);
-    m.push_str(detail);
-    StageError::Payload(m)
+    StageError::Payload(format!("{head}{detail}"))
 }
 
 /// The `raw-binary` lane: the download becomes `bin/<entry>` at mode `0755` — under the
@@ -797,7 +806,7 @@ fn apply_links(
         crate::extract::create_symlink(&rel_target, &link).map_err(StageError::Io)?;
         if let Some(tree) = tree.as_deref_mut() {
             let rel = crate::extract::rel_bytes_under(dest, &link).map_err(StageError::Extract)?;
-            let target_bytes = crate::call1(crate::platform::os_str_bytes, rel_target.as_os_str());
+            let target_bytes = crate::platform::os_str_bytes(rel_target.as_os_str());
             tree.record_symlink(rel, target_bytes);
         }
     }
@@ -811,14 +820,10 @@ fn apply_links(
 /// reclaims it, on every path.
 #[cfg(target_os = "macos")]
 fn dmg_mount_point(dest: &Path) -> Result<PathBuf, StageError> {
-    let name = crate::call1(std::path::Path::file_name, dest)
-        .and_then(|n| crate::call1(std::ffi::OsStr::to_str, n))
-        .ok_or_else(|| {
-            payload2(
-                "dmg stage dir has no name: ",
-                &crate::call1(std::path::Path::to_string_lossy, dest),
-            )
-        })?;
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| payload2("dmg stage dir has no name: ", &dest.to_string_lossy()))?;
     let mut mnt = String::from(name);
     mnt.push_str(".mnt");
     Ok(dest.with_file_name(mnt))
@@ -850,7 +855,7 @@ fn tool_failed(tool: &str, code: Option<i32>, stderr: &[u8]) -> StageError {
     m.push_str(" failed");
     if let Some(code) = code {
         m.push_str(" (exit ");
-        m.push_str(&crate::dec_u64(u64::from(code.unsigned_abs())));
+        m.push_str(&code.unsigned_abs().to_string());
         m.push(')');
     }
     let stderr = String::from_utf8_lossy(stderr);
@@ -1067,7 +1072,7 @@ impl Mount {
         }
         Err(payload2(
             "dmg image root must hold exactly one .app, found ",
-            &crate::dec_u64(apps.len() as u64),
+            &apps.len().to_string(),
         ))
     }
 
@@ -1135,7 +1140,7 @@ impl Mount {
         Err(last.unwrap_or_else(|| {
             payload2(
                 "hdiutil could not detach the image: ",
-                &crate::call1(std::path::Path::to_string_lossy, &self.image),
+                &self.image.to_string_lossy(),
             )
         }))
     }
@@ -1183,12 +1188,9 @@ fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
     crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
     let mount = Mount::attach(image, dest)?;
     let app = mount.single_app()?;
-    let name = crate::call1(std::path::Path::file_name, &app).ok_or_else(|| {
-        payload2(
-            "dmg bundle has no name: ",
-            &crate::call1(std::path::Path::to_string_lossy, &app),
-        )
-    })?;
+    let name = app
+        .file_name()
+        .ok_or_else(|| payload2("dmg bundle has no name: ", &app.to_string_lossy()))?;
     let out = dest.join(name);
     run_tool("ditto", &[app.as_os_str(), out.as_os_str()])?;
     // `ditto` laid the bundle VERBATIM, links included, with nothing of ours vetting
@@ -1232,7 +1234,7 @@ fn vet_copied_tree(root: &Path, dir: &Path) -> Result<(), StageError> {
         } else if !ft.is_file() {
             return Err(payload2(
                 "dmg bundle carries an entry that is not a file, directory or symlink: ",
-                &crate::call1(std::path::Path::to_string_lossy, &path),
+                &path.to_string_lossy(),
             ));
         }
     }
@@ -2380,6 +2382,41 @@ mod tests {
         std::os::unix::fs::symlink(target, p).unwrap();
     }
 
+    /// `hdiutil create` a UDZO image of `src` at `dmg`, the fixture every dmg test
+    /// stages from. It is setup, not the subject, and `hdiutil` fails transiently
+    /// under load the way `attach` does ([`ATTACH_ATTEMPTS`]): measured 2026-09-28,
+    /// a merge-contract run at load ~40 lost `hdiutil create in-root-link` with the
+    /// reason thrown away (`-quiet`, status only), and the same test passed 3 of 3
+    /// alone. So it tries as often as the stage's own attach does, removes a
+    /// partial image between tries, and a real failure panics with `hdiutil`'s own
+    /// last words.
+    #[cfg(target_os = "macos")]
+    fn hdiutil_create(src: &Path, volname: &str, dmg: &Path) {
+        let mut last = String::new();
+        for _ in 0..ATTACH_ATTEMPTS {
+            let _ = std::fs::remove_file(dmg);
+            let out = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["create", "-quiet", "-srcfolder"])
+                .arg(src)
+                .args(["-volname", volname, "-format", "UDZO"])
+                .arg(dmg)
+                .output()
+                .unwrap();
+            if out.status.success() {
+                return;
+            }
+            last = format!(
+                "{}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        panic!(
+            "hdiutil create {} failed {ATTACH_ATTEMPTS} times; the last: {last}",
+            dmg.display()
+        );
+    }
+
     /// The `gh` archive shape as tar bytes: a versioned top-level directory to strip,
     /// an executable, a plain file.
     #[cfg(unix)]
@@ -2993,14 +3030,7 @@ image-alias     : /tmp/stage/bar.dmg
         lay(&src, "README.txt", b"not copied", 0o644);
         lay_link(&src, "Applications", "/Applications");
         let dmg = d.join("foo.dmg");
-        let status = std::process::Command::new("/usr/bin/hdiutil")
-            .args(["create", "-quiet", "-srcfolder"])
-            .arg(&src)
-            .args(["-volname", "FooTest", "-format", "UDZO"])
-            .arg(&dmg)
-            .status()
-            .unwrap();
-        assert!(status.success(), "hdiutil create");
+        hdiutil_create(&src, "FooTest", &dmg);
 
         let replica = d.join("replica");
         lay(
@@ -3062,14 +3092,7 @@ image-alias     : /tmp/stage/bar.dmg
             }
             lay(&src2, "README.txt", b"r", 0o644);
             let dmg2 = d.join(format!("{label}.dmg"));
-            let status = std::process::Command::new("/usr/bin/hdiutil")
-                .args(["create", "-quiet", "-srcfolder"])
-                .arg(&src2)
-                .args(["-volname", "Bad", "-format", "UDZO"])
-                .arg(&dmg2)
-                .status()
-                .unwrap();
-            assert!(status.success(), "hdiutil create {label}");
+            hdiutil_create(&src2, "Bad", &dmg2);
             let art = vendor_artifact(&dmg2, "dmg", &expected);
             let build2 = d.join(format!("store/{label}/1"));
             let err = verify_and_stage(&art, &dmg2, &build2, &StageHooks::NONE).unwrap_err();
@@ -3097,14 +3120,7 @@ image-alias     : /tmp/stage/bar.dmg
             );
             lay_link(&src3, "Bad.app/Contents/Resources/escape", target);
             let dmg3 = d.join(format!("{label}.dmg"));
-            let status = std::process::Command::new("/usr/bin/hdiutil")
-                .args(["create", "-quiet", "-srcfolder"])
-                .arg(&src3)
-                .args(["-volname", "Link", "-format", "UDZO"])
-                .arg(&dmg3)
-                .status()
-                .unwrap();
-            assert!(status.success(), "hdiutil create {label}");
+            hdiutil_create(&src3, "Link", &dmg3);
             let replica3 = d.join(format!("replica-{label}"));
             lay(
                 &replica3,
@@ -3588,9 +3604,10 @@ image-alias     : /tmp/stage/bar.dmg
     }
 
     /// CODESIGN FAILING TO JUDGE IS NOT A VERDICT. Exit 1 for a file it could not read,
-    /// a timeout, or no codesign at all is [`StageError::Io`] — retried, never memoized
-    /// against the vendor's bytes — while a signature fault or another signer is a
-    /// [`StageError::SignerRefused`].
+    /// or no codesign at all is [`StageError::Io`] — retried, never memoized against the
+    /// vendor's bytes — a timeout is [`StageError::VerifyDeferred`]
+    /// (`a_codesign_timeout_defers_and_the_deadline_scales_with_the_file`), while a
+    /// signature fault or another signer is a [`StageError::SignerRefused`].
     #[cfg(unix)]
     #[test]
     fn codesign_failing_to_judge_is_io_and_only_a_verdict_refuses_the_signer() {
@@ -3607,7 +3624,6 @@ image-alias     : /tmp/stage/bar.dmg
                 code: Some(1),
                 stderr: "bin/claude: internal error in Code Signing subsystem\n".into(),
             },
-            || CodesignError::TimedOut,
             || CodesignError::Unsupported,
         ] {
             match answer(fault) {
@@ -3625,6 +3641,94 @@ image-alias     : /tmp/stage/bar.dmg
                 "a verdict"
             );
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A CODESIGN TIMEOUT DEFERS; IT NEVER FAILS AND NEVER REFUSES (2026-09-26). codex
+    /// 0.157.0's 238 MB binary ran past the fixed 30 s deadline twice on 2026-09-25 under
+    /// the window's utility clamp, became a [`StageError::Io`], and the pass exited 1 with
+    /// "Package update failed" — a retry 21 s later verified it. Now: a [`CodesignError::
+    /// TimedOut`] is [`StageError::VerifyDeferred`], naming the file; each file is given a
+    /// deadline scaled by its size (a sparse 238 MB file here is asked with at least
+    /// [`verify_timeout_for`] of it, a 64-byte one with the 30 s floor); and a real
+    /// signature refusal from the very same stub shape stays a fatal
+    /// [`StageError::SignerRefused`].
+    #[cfg(unix)]
+    #[test]
+    fn a_codesign_timeout_defers_and_the_deadline_scales_with_the_file() {
+        use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT, verify_timeout_for};
+        let d = tmp("devid-deferred");
+        lay(&d, "bin/codex", &thin_macho(), 0o755);
+        // codex's real size, sparse: only the header is written.
+        let big: u64 = 238_223_808;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join("bin/codex"))
+            .unwrap()
+            .set_len(big)
+            .unwrap();
+        let exposes = vec![String::from("codex")];
+        let timing_out = |_: &Path, _: std::time::Instant| Err(CodesignError::TimedOut);
+        match check_developer_id(&d, "2DC432GLL2", &exposes, &timing_out) {
+            Err(StageError::VerifyDeferred(m)) => {
+                assert!(m.starts_with("bin/"), "{m}");
+                assert!(m.contains("did not finish in time"), "{m}");
+            }
+            other => panic!("a timeout defers: {other:?}"),
+        }
+        // The deadline each file is asked with, one file per tree.
+        let deadline_for = |len: Option<u64>| {
+            let one = tmp("devid-deadline");
+            lay(&one, "bin/codex", &thin_macho(), 0o755);
+            if let Some(len) = len {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(one.join("bin/codex"))
+                    .unwrap()
+                    .set_len(len)
+                    .unwrap();
+            }
+            let given = std::cell::Cell::new(None);
+            let answer = |_: &Path, deadline: std::time::Instant| {
+                given.set(Some(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                ));
+                Ok(())
+            };
+            check_developer_id(&one, "2DC432GLL2", &exposes, &answer).unwrap();
+            let _ = std::fs::remove_dir_all(&one);
+            given.get().unwrap()
+        };
+        let slack = std::time::Duration::from_secs(5);
+        let large = deadline_for(Some(big));
+        assert!(
+            large + slack >= verify_timeout_for(big) && large <= verify_timeout_for(big),
+            "a 238 MB Mach-O gets its size-scaled deadline: {large:?}"
+        );
+        assert!(
+            large > VERIFY_TIMEOUT + slack,
+            "more than the fixed 30 s: {large:?}"
+        );
+        let small = deadline_for(None);
+        assert!(
+            small <= VERIFY_TIMEOUT && small + slack >= VERIFY_TIMEOUT,
+            "a small Mach-O keeps the 30 s floor: {small:?}"
+        );
+        // The control: a real signature refusal from the same stub shape stays fatal.
+        let refusing = |_: &Path, _: std::time::Instant| {
+            Err(CodesignError::Refused {
+                code: Some(3),
+                stderr: "test-requirement: code failed to satisfy specified code requirement(s)\n"
+                    .into(),
+            })
+        };
+        assert!(
+            matches!(
+                check_developer_id(&d, "2DC432GLL2", &exposes, &refusing),
+                Err(StageError::SignerRefused(_))
+            ),
+            "a refusal is still a refusal"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

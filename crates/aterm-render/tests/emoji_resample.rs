@@ -179,7 +179,7 @@ fn solid_image_survives_any_ratio() {
 /// checkerboard minified 4x into its footprint lands the identical uniform
 /// linear mid-grey (byte-identical to `resample_rgba`), not the old tap-skipping
 /// bilinear. The GPU image pass calls this same `decode_image_to_footprint`, so
-/// parity holds by construction. (`pixel_exact` placements — sixel, un-sized
+/// parity holds by construction. (`PixelExact` placements — sixel, un-sized
 /// Kitty — deliberately run NO resampler at all; that is
 /// `sixel_footprint_decode_is_pixel_exact` in `tests/inline_image.rs`.)
 #[test]
@@ -205,7 +205,8 @@ fn inline_image_footprint_uses_the_same_resampler() {
         },
         2,
         2,
-        false,
+        aterm_core::grid::extra::ImageScaling::Fit,
+        None,
     )
     .expect("raw RGBA resamples");
     assert_eq!(

@@ -143,10 +143,9 @@ pub(crate) fn baseline_path() -> std::path::PathBuf {
 /// debug build would itself read as a "regression" — which is, deliberately, what
 /// we want the gate to catch if someone ships one).
 pub(crate) fn measure() -> Result<PerfReport, String> {
-    // THE HOST DRIVER, never a bare `cargo` (crate::driver — the store's targo
-    // on a product-provisioned box, where `cargo` is not on PATH at all;
-    // measured 2026-09-18). The lane flag is the driver's to add.
-    let driver = crate::driver::cargo_driver();
+    // THE PINNED DRIVER (crate::driver), never a bare `cargo`; the lane flag
+    // is the driver's to add.
+    let driver = crate::driver::cargo_driver()?;
     let args = [
         "--release",
         "-q",
@@ -238,10 +237,9 @@ pub(crate) fn pathological_baseline_json(medians: &[(&str, f64)], ratio: f64) ->
 
 /// Run the release pathological harness and parse its per-corpus report.
 fn measure_pathological() -> Result<Vec<(&'static str, f64)>, String> {
-    // THE HOST DRIVER, never a bare `cargo` (crate::driver — the store's targo
-    // on a product-provisioned box, where `cargo` is not on PATH at all;
-    // measured 2026-09-18). The lane flag is the driver's to add.
-    let driver = crate::driver::cargo_driver();
+    // THE PINNED DRIVER (crate::driver), never a bare `cargo`; the lane flag
+    // is the driver's to add.
+    let driver = crate::driver::cargo_driver()?;
     let args = [
         "--release",
         "-q",
@@ -426,10 +424,9 @@ pub(crate) fn scroll_baseline_json(medians: &[(&str, f64)], ratio: f64) -> Strin
 
 /// Run the release scroll-scrub harness and parse its per-phase report.
 fn measure_scroll() -> Result<Vec<(&'static str, f64)>, String> {
-    // THE HOST DRIVER, never a bare `cargo` (crate::driver — the store's targo
-    // on a product-provisioned box, where `cargo` is not on PATH at all;
-    // measured 2026-09-18). The lane flag is the driver's to add.
-    let driver = crate::driver::cargo_driver();
+    // THE PINNED DRIVER (crate::driver), never a bare `cargo`; the lane flag
+    // is the driver's to add.
+    let driver = crate::driver::cargo_driver()?;
     let args = [
         "--release",
         "-q",
@@ -874,9 +871,8 @@ fn keyed_baseline_path(lane: &FloorLane) -> std::path::PathBuf {
 
 /// Run a lane's `aterm-bench` example and return its raw JSON line.
 fn measure_example_json(example: &str) -> Result<String, String> {
-    // Same host driver as the three harnesses above (crate::driver): the
-    // store's targo where there is no `cargo`, with the lane flag it needs.
-    let driver = crate::driver::cargo_driver();
+    // Same pinned driver as the three harnesses above (crate::driver).
+    let driver = crate::driver::cargo_driver()?;
     let args = ["--release", "-q", "-p", "aterm-bench", "--example", example];
     eprintln!("  $ {}", driver.display("run", &args));
     let out = driver
@@ -1293,10 +1289,24 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
         note_unmeasured("wasm (no node)");
         return true;
     }
+    // rustup BY PATH, found where gate.rs's cross gates find it: a box whose rustup
+    // sits in ~/.cargo/bin off PATH was told "no stable wasm32 target" here with the
+    // target installed (measured 2026-09-27, see `gate::find_rustup`).
+    let Some(rustup) = crate::gate::find_rustup() else {
+        eprintln!(
+            "  wasm: SKIP — no rustup on this box (looked {}); floors not evaluated on this box.",
+            crate::gate::RUSTUP_LOOKED
+        );
+        note_unmeasured("wasm (no rustup)");
+        return true;
+    };
     // Line-exact: `.contains()` would also read this target out of
     // `wasm32-unknown-unknown-nightly`, and would accept `wasm32-wasip1` for a
     // prefix search. Same rule as gate.rs's `toolchain_lists_target`.
-    let wasm_target = Command::new("rustup")
+    // STOCK EXCEPTION (Trust lacks a wasm32 std; measured 2026-09-28 `targo
+    // --unverified check --target wasm32-unknown-unknown -p aterm-wasm`:
+    // error[E0463] can't find crate for `core`): the wasm lane rides rustup stable.
+    let wasm_target = Command::new(&rustup)
         .args(["target", "list", "--installed", "--toolchain", "stable"])
         .output()
         .map(|o| {
@@ -1327,27 +1337,53 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
         return true;
     }
     // The FOURTH tool the harness needs, and the only one that had no probe: without
-    // it run.sh reaches its `cargo install wasm-bindgen-cli` bootstrap and fetches
+    // it run.sh reaches its `targo --unverified install wasm-bindgen-cli` bootstrap and fetches
     // from crates.io mid-gate, and because Command::output() blocks the operator is
     // only told after the fetch-and-compile finished — no probe, no prompt, no way to
     // decline. A missing build tool is a box fact: skip, like the other three.
+    //
+    // ASKED ON THE PATH run.sh GETS (`run_path`): the caller's, with rustup's
+    // directory APPENDED. run.sh asks `rustup which` for the wasm toolchain's drivers
+    // by name, so the rustup found above must be reachable there — and that directory
+    // is also `$CARGO_HOME/bin`, where a `cargo install`ed wasm-bindgen lands, so a
+    // probe on the bare PATH skipped a box whose harness would have found it.
+    // APPENDED, never prepended: a name an earlier entry answers keeps that answer,
+    // so the store's `cargo`/`rustc` stay ahead of rustup's proxies.
+    let mut path_dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(dir) = rustup.parent() {
+        path_dirs.push(dir.to_path_buf());
+    }
+    let run_path = std::env::join_paths(path_dirs).ok();
+    let with_run_path = |mut cmd: Command| {
+        if let Some(path) = &run_path {
+            cmd.env("PATH", path);
+        }
+        cmd
+    };
     let wb_version = WASM_BINDGEN_PIN;
-    let wasm_bindgen_ok = Command::new("wasm-bindgen")
+    let tooling = workspace_root().join(format!("target/tooling/wasm-bindgen-{wb_version}"));
+    let wasm_bindgen_ok = with_run_path(Command::new("wasm-bindgen"))
         .arg("--version")
         .output()
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(wb_version))
         .unwrap_or(false)
-        || workspace_root()
-            .join(format!(
-                "target/tooling/wasm-bindgen-{wb_version}/bin/wasm-bindgen"
-            ))
-            .exists();
+        || tooling.join("bin/wasm-bindgen").exists();
     if !wasm_bindgen_ok {
+        // THE REMEDY CLEARS THIS SKIP WHEREVER RUSTUP LIVES: the repo's own driver
+        // (`targo`, the Trust default), from a neutral cwd (inside the repo cargo
+        // reads `.cargo/config.toml`'s vendored source replacement), into the
+        // `--root` the probe above reads — a bare `install` lands in `$CARGO_HOME/bin`,
+        // which is on the probe's PATH only when rustup lives there too. Printed
+        // after a colon, never inside the sentence's parentheses: `((cd / && …))`
+        // pasted whole is shell ARITHMETIC.
         eprintln!(
-            "  wasm: SKIP — wasm-bindgen {wb_version} not found on PATH or in \
-             target/tooling; the harness would network-install it mid-gate \
-             (cargo +stable install wasm-bindgen-cli --version {wb_version} --locked); \
-             floors not evaluated on this box."
+            "  wasm: SKIP — wasm-bindgen {wb_version} not found on PATH, beside rustup or in \
+             target/tooling, and the harness would network-install it mid-gate; floors not \
+             evaluated on this box. Install it first with:  cd / && targo --unverified install \
+             wasm-bindgen-cli --version {wb_version} --locked --root '{t}'",
+            t = tooling.display()
         );
         note_unmeasured("wasm (no wasm-bindgen)");
         return true;
@@ -1367,7 +1403,7 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
         return true;
     }
     eprintln!("  $ tools/wasm-bench/run.sh");
-    let out = Command::new("bash")
+    let out = with_run_path(Command::new("bash"))
         .arg(&script)
         .current_dir(workspace_root())
         .output();

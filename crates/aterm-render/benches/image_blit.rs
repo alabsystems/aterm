@@ -42,7 +42,7 @@
 // image `Arc` stays cache-resident, which is exactly the regime the per-cell
 // cache traffic lives in.
 
-use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, WindowCpu};
@@ -107,6 +107,7 @@ fn with_images(input: &RenderInput, imgs: &[Arc<ImageData>], rows_per: usize) ->
                     image: imgs[idx].clone(),
                     cell_row: (r - idx * rows_per) as u16,
                     cell_col: c as u16,
+                    kitty: None,
                 },
             ));
         }
@@ -126,7 +127,8 @@ fn placement(cw: usize, ch: usize, rows_per: usize, seed: u32) -> Arc<ImageData>
         // `z=0`), which is the pass-2b blit path — not the `z<0` below-text tier.
         z_index: 0,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: ImageScaling::Fit,
+        source_rect: None,
     })
 }
 

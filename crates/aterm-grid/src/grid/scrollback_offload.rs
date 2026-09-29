@@ -132,8 +132,9 @@ impl DetachedReaderAim {
 /// `ring_lines` rewrap as a SEPARATE sequence (the ring phase) whose output
 /// returns to the ring at re-attach — the same seam the pre-RFL-1 design had,
 /// where the ring was rewrapped by the synchronous resize while the job
-/// rewrapped the store, so a soft-wrapped run straddling the lazy/ring boundary
-/// re-splits exactly as it always did.
+/// rewrapped the store, so under [`ResizePolicy::Native`] a soft-wrapped run
+/// straddling the lazy/ring boundary re-splits exactly as it always did. Under
+/// [`ResizePolicy::ConPty`] that run is handed to the ring phase whole.
 ///
 /// Two ways to run the rewrap, identical results:
 /// * [`reflow`](Self::reflow) — one shot, for a caller with a whole thread to
@@ -184,6 +185,11 @@ pub struct PendingScrollbackReflow {
     /// Input lines the steps have read so far (every read line is rewrapped
     /// by the step that completes its logical run).
     lines_read: usize,
+    /// The seam policy of the resize that detached this job. Under
+    /// [`ResizePolicy::ConPty`] a logical line straddling the store/ring seam
+    /// rewraps whole (see the Stream phase's exhaustion arm); under `Native`
+    /// it re-splits there as it did in 0.94.0, which that policy pins.
+    policy: ResizePolicy,
 }
 
 /// Where an incrementally-stepped rewrap currently is. Private: callers only
@@ -492,9 +498,23 @@ impl PendingScrollbackReflow {
                 }
 
                 if read == total_left {
-                    // Input exhausted: every carried run is complete by
-                    // definition — rewrap the remainder and push it straight
-                    // onto the store.
+                    // Input exhausted: every carried run is complete — unless
+                    // the newest one CONTINUES into the job-carried ring
+                    // history (its head left the ring for the store while its
+                    // tail is still ring-resident). Under ConPTY that run goes
+                    // to the ring phase whole: rewrapped here it would come
+                    // back as a head plus a tail line of its own — measured on
+                    // an 8-line ring, `col-test 26` (102 columns) split into
+                    // its 80-column head and a 22-column orphan at every widen.
+                    let straddling = if self.policy == ResizePolicy::ConPty
+                        && self.ring_lines.first().is_some_and(Line::is_wrapped)
+                    {
+                        let head = carry.iter().rposition(|line| !line.is_wrapped());
+                        carry.split_off(head.unwrap_or(0))
+                    } else {
+                        Vec::new()
+                    };
+                    // Rewrap the rest and push it straight onto the store.
                     let out =
                         super::scrollback_reflow::reflow_scrollback_lines(carry, self.new_cols);
                     carry.clear();
@@ -525,10 +545,12 @@ impl PendingScrollbackReflow {
                         }
                     }
                     // The ring history (RFL-1) rewraps next, as its own
-                    // budgeted phase.
+                    // budgeted phase, carrying the straddling run as the head
+                    // of its first logical line (the carry invariant: only
+                    // `carry[0]` is not a continuation).
                     self.phase = ReflowPhase::RingRewrap {
                         next_input: 0,
-                        carry: Vec::new(),
+                        carry: straddling,
                         out: Vec::new(),
                     };
                 } else {
@@ -812,6 +834,7 @@ impl Grid {
             clear_gen,
             phase,
             lifted_limits: None,
+            policy,
         })
     }
 
@@ -1068,6 +1091,9 @@ impl Grid {
             clear_gen,
             phase,
             lifted_limits: None,
+            // No ring history rides this job, so no run straddles a store/ring
+            // seam inside it and the policy decides nothing here.
+            policy: ResizePolicy::Native,
         })
     }
 
@@ -1289,17 +1315,31 @@ impl Grid {
     ///
     /// This was stated as a compiler obligation (`ensures
     /// !self.storage.scrollback_detached_for_reflow`, provable since trust
-    /// stage2 51bf8a270). The clause is WITHDRAWN because the public snapshot
-    /// cannot build it: the export replaces `rust-toolchain.toml` with a stock
-    /// pin (`publish/public-rust-toolchain.toml`, copied by
-    /// `publish/transforms.sh`), and stock rustc cannot PARSE `ensures` at all —
-    /// `#[cfg]` strips after parsing, so gating would not help. (It was first
-    /// withdrawn because an August trustc ICEd on it under `-Ztrust-verify=off`;
-    /// the promoted seal compiles it cleanly, and
-    /// `tools/test-trust-contract-probe.sh` pins that shape.)
+    /// stage2 51bf8a270; `tools/test-trust-contract-probe.sh` pins the shape, and
+    /// its copy proves on trustc 450403669). It was first withdrawn because an August
+    /// trustc ICEd on it under `-Ztrust-verify=off`, which is fixed. It stays
+    /// WITHDRAWN because stock rustc cannot PARSE `ensures` — `#[cfg]` strips after
+    /// parsing, so gating would not help — and stock rustc compiles this crate on
+    /// every lane the Trust sysroot cannot serve (it carries only its host std):
+    /// the public snapshot (the stock pin `publish/public-rust-toolchain.toml`),
+    /// the release's x86_64-apple-darwin compat slice (`RUSTUP_TOOLCHAIN=stable`
+    /// in aterm-release's `buildplan.rs`), and the cross cells of `xtask gate
+    /// cells`, `gate web` and `gate linux`. Measured 2026-09-27 with the clause
+    /// restored: the stock wasm32 cell stops at "expected one of `->`, `where`, or
+    /// `{`, found `ensures`", and xtask's
+    /// `a_foreign_cell_under_its_floor_fails_the_cells_verb` goes red. The
+    /// `#[cfg_attr(trust_verify, trust::ensures(..))]` respelling parses on both
+    /// compilers and needs no `trust` dependency, but it is not the same
+    /// obligation. Measured 2026-09-28 on trustc 450403669 with a two-line probe
+    /// of this shape (`pub fn clear(&mut self)` setting `self.flag = false`): the
+    /// native `ensures !self.flag` proves 2 of 2 obligations, one kernel-certified;
+    /// the attribute spelling proves 0 of 2 (2 unknown: "compiler contract
+    /// predicate `!self.flag` was not lowered into a typed verifier formula").
     ///
     /// The obligation is kept as debug assertions on both exits. RESTORE THE
-    /// CLAUSE once the public lane can parse contracts.
+    /// CLAUSE once every lane that compiles this crate parses contracts (a Trust
+    /// sysroot with std for those triples); the public export can then strip it
+    /// in `publish/transforms.sh`, which no other lane runs.
     pub fn abort_reflow_offload(&mut self) {
         if !self.storage.scrollback_detached_for_reflow {
             debug_assert!(
@@ -2549,5 +2589,45 @@ mod tests {
             "settled store must be wrapped at {w2} cols (max stored width {max_len})"
         );
         g.assert_invariants();
+    }
+
+    /// A line whose head scrolled past the ring (into the store's lazy
+    /// staging) while its continuation is still the ring's oldest row: a
+    /// ConPTY job rewraps it whole; a Native job re-splits it at the seam, as
+    /// 0.94.0 did (that policy is pinned byte for byte).
+    #[test]
+    fn conpty_job_rewraps_a_line_straddling_the_store_ring_seam_whole() {
+        for (policy, expected) in [
+            (
+                ResizePolicy::ConPty,
+                vec!["0123456789ABCDE", "s0", "s1", "s2"],
+            ),
+            (
+                ResizePolicy::Native,
+                vec!["0123456789", "ABCDE", "s0", "s1", "s2"],
+            ),
+        ] {
+            // 3 visible rows over a 4-row ring: the 15-char line (2 rows at
+            // 10 columns) and s0..s4 leave 5 history rows, so exactly its head
+            // leaves the ring.
+            let mut g = tiered_grid(3, 10, 4);
+            logical_line(&mut g, "0123456789ABCDE");
+            for i in 0..5 {
+                logical_line(&mut g, &format!("s{i}"));
+            }
+            assert_eq!(g.storage.ring_buffer_scrollback(), 4, "precondition");
+            assert_eq!(g.scrollback_lines(), 5, "precondition: the head left");
+
+            let pending = g
+                .resize_offloading_scrollback_with_policy(3, 20, policy)
+                .expect("a width change with a store offloads");
+            g.reattach_reflowed_scrollback(pending.reflow());
+            let history: Vec<String> = (0..g.scrollback_lines())
+                .filter_map(|i| g.get_history_line(i).map(|l| l.to_string()))
+                .map(|s| s.trim_end().to_string())
+                .collect();
+            assert_eq!(history, expected, "{policy:?}");
+            g.assert_invariants();
+        }
     }
 }

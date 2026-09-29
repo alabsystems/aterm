@@ -235,6 +235,204 @@ pub(crate) struct SessionRecord {
     /// `frozen_path`, so it survives every later handoff. `0` is not written.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub history_lost: u64,
+    /// THE STANDING HALT (additive, absent ⇒ none; the round-four plan, item
+    /// 3): `"<origin> <reason>"` (`fabric::render_hold`) of this session's
+    /// `hold`, either origin — `local` (the owner's) or `fleet` (the bridge's,
+    /// `fabric-lost` included).
+    ///
+    /// A hold is the one piece of fabric state whose LOSS is unsafe rather
+    /// than inconvenient: before this carry, every seamless update lifted
+    /// every halt in the process, with nobody asking and nothing said — an
+    /// automatic update could free a halted agent minutes after a human
+    /// stopped it. The successor re-seeds it before the adopted session is
+    /// registered (`SessionFabric::seed_hold`), so no control verb ever
+    /// reaches that session unhalted.
+    ///
+    /// Carried per record, like `topics`, so it survives every later handoff.
+    /// In neither proof digest: the successor re-validates the grammar and
+    /// FAILS CLOSED (`fabric::parse_hold`), and a value of the wrong TYPE
+    /// reads as an unreadable row ([`lenient_hold`]) rather than failing the
+    /// whole manifest — a bad value can over-halt one session, never lift a
+    /// halt and never cost the update. `None` is not written, so an older
+    /// reader sees the wire it always saw; a rollback to a build without the
+    /// field drops the halt, which is that build's behaviour and the reason
+    /// this lands from the first release that writes it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_hold"
+    )]
+    pub hold: Option<String>,
+    /// ANOTHER SUPERVISOR'S LEASE (additive, absent ⇒ none; the round-four
+    /// plan, item 9): `"<holder> <remaining_ms>"` of a live `meta set
+    /// supervisor <holder> ttl=` claim held by anyone but this process's own
+    /// in-GUI host (`SessionMeta::handoff_supervisor`).
+    ///
+    /// Before this carry the successor came up with no claim at all, its own
+    /// host claimed every agent session at Commit, and an external supervisor
+    /// renewing its lease a few seconds later was refused (`ERR busy
+    /// supervisor=aterm-harness@…`) and fell back to watching only: every
+    /// update took each externally supervised session away from its
+    /// supervisor. The successor seeds the lease before the session is
+    /// registered (`session_timeline::seed_carried_claims`), its holder's
+    /// next renewal renews it, and the successor's host parks behind it as
+    /// it would have in the parent. In neither proof digest; re-validated as
+    /// the verb validates it, and a row that does not read seeds nothing — at
+    /// worst the successor's host waits its grace ([`Self::claim_grace`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub supervisor: Option<String>,
+    /// THE PRODUCER VOUCHES FOR THE CLAIM (additive, absent ⇒ `false`; the
+    /// round-four plan, item 9): `true` when `supervisor` above is this
+    /// session's whole claim state — no claim but the producer's own host's,
+    /// or a lease carried there. `false` (not written) when the session was
+    /// claimed through a CONNECTION, which cannot cross (its holder claims
+    /// again from the successor), and — by absence — from every producer
+    /// before this field. See [`Self::claim_grace`].
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        deserialize_with = "lenient_flag"
+    )]
+    pub claim_known: bool,
+    /// THE KEYED ESCALATIONS (additive, absent ⇒ none; the round-four plan,
+    /// item 9): each attention owner's line, `"<owner> <pct-text>"`, in write
+    /// order (`SessionMeta::handoff_attention_owners`). The restore leaf
+    /// carries the bare entry alone, so an update used to erase every
+    /// supervisor's "needs you" from the menu bar with nobody having
+    /// answered it. Re-validated row by row on the way in
+    /// (`session_timeline::parse_carried_attention`); a row that does not
+    /// read is dropped, never the manifest.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_rows"
+    )]
+    pub attention_owners: Vec<String>,
+    /// WHERE THE PERSON WAS READING (additive, absent ⇒ at the bottom; round
+    /// five, item 18): how many lines above the live bottom the session's
+    /// view was scrolled at the park (`display_offset`), written only when it
+    /// was scrolled back — taken with the history head, under the lock the
+    /// checkpoint is taken under (`handoff_history::capture_head`), and stamped
+    /// here with the history carry (`handoff_history::stamp_manifest`). The
+    /// successor scrolls back to it once the history import has put the lines
+    /// back under it, clamped to the scrollback it holds, and only if nobody
+    /// moved the view in between (`handoff_history::run_imports`). `None` is
+    /// not written, so an older reader sees the wire it always saw; an older
+    /// producer never writes it and its sessions arrive at the bottom, as they
+    /// always did. In neither proof digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport_from_bottom: Option<u32>,
+}
+
+impl SessionRecord {
+    /// Whether the successor's in-GUI host must hold off this adopted
+    /// session for its ADOPTED-CLAIM GRACE (`harness_host::ADOPTED_CLAIM_GRACE`)
+    /// before it claims it (the round-four plan, item 9): unless the producer
+    /// vouched that nobody else held it ([`Self::claim_known`] with no
+    /// carried [`Self::supervisor`]).
+    ///
+    /// * A producer before the carry (no `claim_known`) says nothing about
+    ///   claims, so any external supervisor's lease was dropped: the grace is
+    ///   the time for its next renewal to arrive and claim first — the one
+    ///   fix that helps from the first update INTO this build.
+    /// * A connection-bound claim could not cross: its holder claims again.
+    /// * A carried lease is seeded, and the host parks behind it — but a
+    ///   holder that renewed after the park carries a remainder older than
+    ///   its lease, and one with a short `ttl=` may lapse before its renewal
+    ///   arrives. The grace covers both.
+    #[must_use]
+    pub(crate) fn claim_grace(&self) -> bool {
+        !self.claim_known || self.supervisor.is_some()
+    }
+}
+
+/// Read a carried one-line row; a value that is not a string reads as an
+/// unreadable row (`Some("")`, which its parser refuses), never an error that
+/// would fail the whole manifest and adopt nothing.
+fn lenient_row<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    lenient_hold(deserializer)
+}
+
+/// Read a carried list of rows, keeping the strings and dropping any element
+/// of another type — or the whole value when it is no list at all.
+fn lenient_rows<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Row {
+        Text(String),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Rows {
+        List(Vec<Row>),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Rows as serde::Deserialize>::deserialize(deserializer)? {
+            Rows::List(rows) => rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    Row::Text(text) => Some(text),
+                    Row::Unreadable(_) => None,
+                })
+                .collect(),
+            Rows::Unreadable(_) => Vec::new(),
+        },
+    )
+}
+
+/// Read a carried flag; anything but a boolean reads as `false` — the
+/// conservative reading for [`SessionRecord::claim_known`] (the successor's
+/// host then waits its grace) — never an error that fails the manifest.
+fn lenient_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Flag {
+        Bool(bool),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(matches!(
+        <Flag as serde::Deserialize>::deserialize(deserializer)?,
+        Flag::Bool(true)
+    ))
+}
+
+/// Read a carried hold row; a value that is not a string is an UNREADABLE row
+/// (`Some("")`, which `fabric::parse_hold` fails closed on), never an error.
+///
+/// Why: a strict field that failed would fail `SessionHandoff::from_toml`, and
+/// a manifest that does not parse adopts NOTHING — every shell stays behind on
+/// the old build, and the update is refused for a halt it could have kept.
+fn lenient_hold<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Row {
+        Text(String),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(Some(
+        match <Row as serde::Deserialize>::deserialize(deserializer)? {
+            Row::Text(row) => row,
+            Row::Unreadable(_) => String::new(),
+        },
+    ))
 }
 
 /// `skip_serializing_if` for a count whose absence reads as zero.
@@ -393,15 +591,63 @@ pub(crate) struct WindowCarry {
     /// itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_verified_unix_ms: Option<u64>,
+    /// THE LIVE FONT ZOOM (additive, absent ⇒ none; the round-four plan, item
+    /// 15): the glyph size the outgoing process drew at, in thousandths of a
+    /// physical px, when a person had zoomed it (Cmd-= / Cmd--) away from its
+    /// reset size. Written with [`Self::font_reset_px_milli`] as ONE pair, and
+    /// only while zoomed, so an unzoomed window's carry is the wire it always
+    /// was.
+    ///
+    /// Why: `rows`/`cols` above are the zoomed grid. A successor that sized
+    /// them at the config's font drew a smaller (or larger) window with
+    /// smaller text at every update, and the person zoomed again. With the
+    /// pair, the first window comes up at the same px, so text and frame stay
+    /// put. Integers because `WindowCarry` is `Eq` and TOML has no NaN to
+    /// refuse; the successor admits the pair only inside the zoom's own bounds
+    /// (`app_config::successor_font_px`) and otherwise falls back to the
+    /// config, today's behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_px_milli: Option<u32>,
+    /// The size Cmd-0 resets to in the outgoing process (`App::default_font_px`),
+    /// in thousandths of a physical px — the other half of the pair. Carried
+    /// rather than re-derived because a Retina display's reset size is the
+    /// auto-scaled one, which the successor derives only for an UNZOOMED
+    /// window: without it, Cmd-0 after an update reset to the zoom itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_reset_px_milli: Option<u32>,
+    /// WHAT THE OUTGOING PROCESS'S UPDATE-HEALTH WARNINGS SAID (additive,
+    /// absent ⇒ none; round six, finding 54): one entry per kind it announced
+    /// and no proof has answered since (`App::update_health_said`), so the
+    /// successor whose landing IS the proof records "aterm updates work again"
+    /// against it. Without it the record was written only for a warning row
+    /// still live under a carried progress row — never on the automatic lane
+    /// (which carries no progress row) nor after the row's 45 s fold. Empty is
+    /// not written, so a carry with nothing to heal is the wire it always was;
+    /// an older reader ignores the key (no `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub update_health_said: Vec<CarriedHealthSaid>,
 }
 
-/// The two message fields of a [`WindowCarry`] as one value — what
+/// One unanswered update-health warning a parent had said, as the handoff
+/// carries it: its kind by the row key (`update_words::HealthKind::key`), and
+/// the title and first line its record of healing is written against. A key
+/// this build does not know is skipped by the successor, never guessed.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CarriedHealthSaid {
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub line: String,
+}
+
+/// The message fields of a [`WindowCarry`] as one value — what
 /// `App::carried_messages` hands the two construction sites.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 #[cfg(any(unix, test))]
 pub(crate) struct MessagesCarry {
     pub messages: Vec<CarriedMessage>,
     pub next_message_id: u64,
+    pub update_health_said: Vec<CarriedHealthSaid>,
 }
 
 #[cfg(any(unix, test))]
@@ -410,6 +656,7 @@ impl From<&aterm_messages::Carry> for MessagesCarry {
         Self {
             messages: carry.live.iter().map(CarriedMessage::from).collect(),
             next_message_id: carry.next_id,
+            update_health_said: Vec::new(),
         }
     }
 }
@@ -609,6 +856,37 @@ pub(crate) struct SessionHandoff {
     /// reads as "predates". A plain scalar an older reader skips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outgoing_build: Option<u64>,
+    /// HELD PANES (additive, absent tolerated; round five, item 19): the final
+    /// screen of every pane kept open after its command exited (`--hold`),
+    /// which is NOT a handed session — it has no process and no descriptor, so
+    /// it is not in `sessions` (a record there with no PTY would make every
+    /// successor refuse the whole handoff: `seamless::validated_identities`
+    /// wants one descriptor per record). A SIDE LIST an older reader skips,
+    /// best-effort and outside every proof digest: the successor shows each
+    /// screen read-only in the pane its layout leaf names, or keeps the
+    /// "not carried" placeholder when it cannot (`seamless::take_held_panes`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<HeldPaneCarry>,
+}
+
+/// One held pane's final screen on the wire (round five, item 19): the
+/// outgoing pool id its layout leaf names, and its screen carried exactly as a
+/// handed session's is — the meta inline, the grids in `.h<id>.heldgrid` /
+/// `.h<id>.heldalt` sidecars beside the manifest (`seamless::write_outgoing`).
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HeldPaneCarry {
+    pub local_id: u64,
+    pub screen: ScreenCarry,
+    /// How the pane's command ended, when the outgoing process knew (round
+    /// six of the update audit, finding 49): its exit status, or the signal
+    /// that ended it — at most one of the two. ADDITIVE and outside every
+    /// digest, like the whole side list: an older reader ignores the keys, and
+    /// a successor that reads neither still shows the pane exited, with no
+    /// status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<u8>,
 }
 
 // ⚠ LOAD-BEARING WIRE FORMAT — DO NOT "CLEAN UP" THIS SERIALIZATION.
@@ -657,6 +935,11 @@ impl SessionHandoff {
             }));
         }
         connections.sort_by(|a, b| (&a.src, &a.dst, &a.op).cmp(&(&b.src, &b.dst, &b.op)));
+        // One clock and one name for every record's claim: a lease's remaining
+        // time is counted from here, and this process's own host's claim is
+        // left behind (its successor's host takes the session at Commit).
+        let now_us = crate::metrics::now_us();
+        let own_holder = crate::harness_host::holder();
         Self {
             schema: Self::SCHEMA,
             window: None,
@@ -669,18 +952,23 @@ impl SessionHandoff {
             // A dev build writes HEAD's committer epoch (`build.rs`), `0` only
             // without git — either way the field is there.
             outgoing_build: Some(crate::running_build_number()),
+            held: Vec::new(),
             sessions: handles
                 .into_iter()
                 .map(|h| {
                     // Project the operator metadata out of the shared ctx (the
                     // one copy; a leaf lock, taken after the store guard above
-                    // already dropped — never across a Terminal lock).
-                    let meta = h
-                        .ctx
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .sanitized();
+                    // already dropped — never across a Terminal lock) — and,
+                    // under the same hold, the claim and the keyed escalations
+                    // the handoff carries (round four, item 9).
+                    let (meta, (supervisor, claim_known), attention_owners) = {
+                        let live = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                        (
+                            live.sanitized(),
+                            live.handoff_supervisor(now_us, &own_holder),
+                            live.handoff_attention_owners(),
+                        )
+                    };
                     SessionRecord {
                         local_id: h.local_id,
                         sid: h.sid.as_str().to_string(),
@@ -722,6 +1010,19 @@ impl SessionHandoff {
                         history_dropped: 0,
                         history_withheld: false,
                         history_lost: store.history_lost(h.local_id),
+                        // The standing halt, off the one live copy — the
+                        // fabric's leaf lock, the same read `status` takes.
+                        hold: h
+                            .ctx
+                            .fabric
+                            .hold()
+                            .map(|hold| crate::fabric::render_hold(&hold)),
+                        supervisor,
+                        claim_known,
+                        attention_owners,
+                        // Stamped with the history carry, from the park's head
+                        // (`handoff_history::stamp_manifest`).
+                        viewport_from_bottom: None,
                     }
                 })
                 .collect(),
@@ -1336,6 +1637,13 @@ impl SessionStore {
         }
     }
 
+    /// The exit code [`Self::note_exit_code`] holds for `local_id` until its
+    /// deregister moves it onto the journal row. TEST-ONLY.
+    #[cfg(test)]
+    pub(crate) fn noted_exit_code(&self, local_id: u64) -> Option<i32> {
+        self.exit_codes.get(&local_id).copied()
+    }
+
     /// Deregister with NO attribution — the reason and actor are `Unknown`, except
     /// that a session whose shell already `Exited` is journalled as a shell exit
     /// (the store knows that much on its own). TEST-ONLY: every production close
@@ -1698,23 +2006,27 @@ impl crate::App {
     ///
     /// `None` is the honest `exit_code=-`: the child died by signal, is not this
     /// process's to reap (an adopted session), or had not yet become a zombie at
-    /// EITHER non-blocking look. That last one is a real window, not a
-    /// hypothetical: the reader reports EOF the instant the child's last pty
-    /// descriptor closes, and the kernel closes a dying process's descriptors
-    /// before it retires the process, so the classifier's `WNOHANG` probe at
-    /// `Wake::Exit` can find nothing to reap yet. This is the ONE bounded retry:
-    /// the same non-blocking probe again, a few statements later in the SAME
-    /// `Wake::Exit` dispatch (the classifier looks first, then the ledger), which
-    /// in practice closes the window; a child still not reapable by then writes
-    /// `-`, and the ledger says so rather than blocking the UI thread to find out.
+    /// EITHER look. That last one is a real window, not a hypothetical: the
+    /// reader reports EOF the instant the child's last pty descriptor closes,
+    /// and the kernel closes a dying process's descriptors before it retires
+    /// the process, so the classifier's `WNOHANG` probe at `Wake::Exit` can find
+    /// nothing to reap yet. The ledger then looks once more, a few statements
+    /// later in the SAME `Wake::Exit` dispatch (`ExitLook::Retry`), which in
+    /// practice closes the window; a child still not reapable by then writes
+    /// `-` rather than blocking the UI thread. The one bounded wait on this
+    /// path is the first look's, for a shell that may have failed at start
+    /// ([`crate::App::exit_status`]); its answer stands for the ledger too.
     fn shell_exit_code(&self, session: u64) -> Option<i32> {
+        use crate::app_tabs::ExitLook;
         use crate::session_status::{Outcome, Phase};
-        // `tab_status` on (the default): `note_session_exit` already reaped the
-        // child and published an EXACT lifecycle classification. Read the code
-        // back from it — a second `waitpid` would answer ECHILD for a pid that is
-        // no longer ours to wait for, and the classifier's answer is the same
-        // status, not a guess. Only an `Exited` phase is that answer; any other
-        // phase is a stale pre-exit observation and says nothing about the exit.
+        // `tab_status` on (the default): `note_session_exit` already made the
+        // first look and published an EXACT lifecycle classification. Read the
+        // code back from it — a second `waitpid` would answer ECHILD for a pid
+        // that is no longer ours to wait for, and the classifier's answer is the
+        // same status, not a guess. Only an `Exited` phase is that answer; any
+        // other phase is a stale pre-exit observation and says nothing about
+        // the exit.
+        let mut look = ExitLook::First;
         if let Some(status) = self.session_status.status(session)
             && matches!(status.phase, Phase::Exited)
         {
@@ -1723,34 +2035,19 @@ impl crate::App {
                 Outcome::Failure { exit_code } => return Some(exit_code),
                 // Killed by a signal: no code, and the child IS reaped.
                 Outcome::Signal { .. } => return None,
-                // The classifier's probe found nothing to reap (the window in
-                // the doc above). Fall through to the retry: `child_reaped` is
-                // still clear on this path, so the probe below is never a
-                // second `waitpid` on a pid that was already collected.
-                Outcome::None => {}
+                // The classifier's look found nothing to reap (the window in
+                // the doc above): this is the retry.
+                Outcome::None => look = ExitLook::Retry,
             }
         }
-        // `tab_status` off, or the classifier's probe came up empty: nobody has
-        // reaped yet, so the zombie — once it exists — still holds its status.
-        // Take it with the same reap-and-latch the classifier uses —
-        // `collect_exit_status` frees the pid, and a session that outlives the
-        // reap (`--hold`) must never `killpg` a number the kernel has reissued.
-        let pooled = self.pool.get(session)?;
-        if pooled
-            .child_reaped
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return None;
-        }
-        let collected = aterm_pty::collect_exit_status(pooled.pid);
-        if collected.is_some() {
-            pooled
-                .child_reaped
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        match collected {
-            Some(aterm_pty::ChildExit::Code(code)) => Some(code),
-            Some(aterm_pty::ChildExit::Signal(_)) | None => None,
+        // `tab_status` off (this is the first look), or the classifier came up
+        // empty. `exit_status` reads back what an earlier look kept, and
+        // otherwise reaps with the same reap-and-latch the classifier uses —
+        // the reap frees the pid, and a session that outlives it (`--hold`)
+        // must never `killpg` a number the kernel has reissued.
+        match self.exit_status(session, look)? {
+            aterm_pty::ChildExit::Code(code) => Some(code),
+            aterm_pty::ChildExit::Signal(_) => None,
         }
     }
 }
@@ -1806,6 +2103,8 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
         fabric: std::sync::Arc::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        generation_look: Default::default(),
+        reset_lane: Default::default(),
     });
     SessionHandle {
         sid,
@@ -1932,6 +2231,602 @@ title = \"zsh\"
         assert_eq!(store.frozen_path_tabs(), 0);
         store.register(handle(9, None));
         assert_eq!(store.frozen_path_tabs(), 1);
+    }
+
+    /// THE HALT CROSSES THE HANDOFF (the round-four plan, item 3). A local
+    /// hold (the owner's) and a fleet hold (the bridge's `fabric-lost`, the
+    /// one a dead broker leaves) are drawn into the handoff records, written
+    /// to TOML, read back, and seeded onto fresh sessions through the one seam
+    /// `spawn_session` uses — and each session is exactly as halted as before:
+    /// the same hold, the same `ERR halted` at the dispatch gate, the same
+    /// fleet fence against an Owner's `hold off`, and a timeline row that says
+    /// the halt was carried. An unheld session stays unheld and writes no key.
+    ///
+    /// FAILS WITHOUT THE FIX: the record has no hold and nothing re-seeds one,
+    /// so every adopted session comes back free — `fabric.hold()` is `None`
+    /// and a `send` goes through. (Measured: with the `from_store` line
+    /// projecting `None`, the first equality below fails.)
+    #[test]
+    fn session_handoff_carries_a_hold() {
+        use crate::fabric::{HOLD_DENIED, Hold, HoldIssuer, apply_hold_for_test, cmd_hold};
+        let local = Hold {
+            reason: "stop%20driving".to_string(),
+            origin: "local".to_string(),
+        };
+        let fleet = Hold {
+            reason: "fabric-lost".to_string(),
+            origin: "fleet".to_string(),
+        };
+        let mut store = SessionStore::default();
+        for (local_id, hold) in [(0, Some(&local)), (1, Some(&fleet)), (2, None)] {
+            let h = handle(local_id, None);
+            if let Some(hold) = hold {
+                assert!(apply_hold_for_test(&h.ctx, Some(hold.clone())));
+            }
+            store.register(h);
+        }
+        let manifest = SessionHandoff::from_store(&store);
+        let rows: Vec<Option<&str>> = manifest
+            .sessions
+            .iter()
+            .map(|r| r.hold.as_deref())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                Some("local stop%20driving"),
+                Some("fleet fabric-lost"),
+                None
+            ],
+            "every standing hold is drawn into its record, either origin"
+        );
+        let wire = manifest.to_toml().expect("serializes");
+        assert_eq!(
+            wire.matches("hold = ").count(),
+            2,
+            "no key for no hold: {wire}"
+        );
+        assert!(manifest.roundtrips());
+
+        let read = SessionHandoff::from_toml(&wire).expect("the successor reads it");
+        let adopted_store: Store = new_store();
+        for (rec, before) in read.sessions.iter().zip([Some(&local), Some(&fleet), None]) {
+            // A FRESH session, as the successor builds one, seeded by the
+            // spawn's own seam.
+            let fresh = handle(rec.local_id, None);
+            crate::spawn::seed_adopted_fabric(
+                &fresh.ctx.fabric,
+                &fresh.ctx.timeline,
+                &rec.topics,
+                rec.hold.as_deref(),
+            );
+            assert_eq!(fresh.ctx.fabric.hold().as_ref(), before, "{rec:?}");
+            let refused = crate::fabric::halt_refusal(&fresh.ctx, "send");
+            assert_eq!(
+                refused.is_some(),
+                before.is_some(),
+                "the dispatch gate answers exactly as it did before the update"
+            );
+            let carried_rows = fresh
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .filter(|e| e.kind == "hold" && e.payload.ends_with(" carried=1"))
+                .count();
+            assert_eq!(carried_rows, usize::from(before.is_some()), "{rec:?}");
+            adopted_store.write().unwrap().register(fresh);
+        }
+        // THE ORIGIN IS KEPT, so the fleet fence still stands: the owner may
+        // lift its own carried halt, never the fleet's.
+        let sid_of = |local_id: u64| {
+            adopted_store
+                .read()
+                .unwrap()
+                .by_local(local_id)
+                .map(|h| h.sid.as_str().to_string())
+                .expect("registered")
+        };
+        assert_eq!(
+            cmd_hold(
+                &adopted_store,
+                &format!("{} off", sid_of(1)),
+                HoldIssuer::Owner
+            ),
+            HOLD_DENIED,
+            "a carried FLEET hold is not the owner's to lift"
+        );
+        assert_eq!(
+            cmd_hold(
+                &adopted_store,
+                &format!("{} off", sid_of(0)),
+                HoldIssuer::Owner
+            ),
+            "OK hold=0\n",
+            "a carried LOCAL hold is, as it was"
+        );
+
+        // An older producer's record has no key: nothing is seeded.
+        let old = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-old\"\nstate = \"alive\"\ntitle = \"zsh\"\n",
+        )
+        .expect("an old manifest reads");
+        assert_eq!(old.sessions[0].hold, None);
+    }
+
+    /// A CARRIED HOLD THAT DOES NOT READ STILL HALTS (the round-four plan,
+    /// item 3). The manifest is a file on disk; a hold row outside the
+    /// grammar cannot be dropped the way a malformed topic row is, because
+    /// dropping it lifts the halt. It halts `reason=carried-unreadable` under
+    /// the stronger origin it could have meant — and a value of the wrong TOML
+    /// type costs neither the manifest (which would adopt nothing) nor the
+    /// halt.
+    ///
+    /// FAILS WITHOUT THE FIX: `parse_hold` does not exist (compile-red); a
+    /// strict `hold` field would fail the whole manifest on `hold = 5`.
+    #[test]
+    fn an_unreadable_carried_hold_fails_closed() {
+        use crate::fabric::{CARRIED_UNREADABLE, Hold, parse_hold, render_hold};
+        let held = |reason: &str, origin: &str| Hold {
+            reason: reason.to_string(),
+            origin: origin.to_string(),
+        };
+        for (row, want) in [
+            ("local stop%20now", held("stop%20now", "local")),
+            ("fleet fabric-lost", held("fabric-lost", "fleet")),
+            ("fleet -", held("-", "fleet")),
+            // Over-long and hostile reasons are rebuilt as a bridge's would be.
+            (
+                &*format!("local {}", "r".repeat(400)),
+                held(&"r".repeat(128), "local"),
+            ),
+            ("local a%2", held("a", "local")),
+            // Outside the grammar: halted anyway.
+            ("", held(CARRIED_UNREADABLE, "local")),
+            ("fleet", held(CARRIED_UNREADABLE, "fleet")),
+            ("fleet a b", held(CARRIED_UNREADABLE, "fleet")),
+            ("mars now", held(CARRIED_UNREADABLE, "local")),
+            ("local ", held(CARRIED_UNREADABLE, "local")),
+            (" fleet x", held(CARRIED_UNREADABLE, "local")),
+        ] {
+            assert_eq!(parse_hold(row), want, "{row:?}");
+        }
+        for hold in [held("stop%20now", "local"), held("fabric-lost", "fleet")] {
+            assert_eq!(parse_hold(&render_hold(&hold)), hold, "round trip");
+        }
+        // A value of the wrong TYPE: the manifest still reads, and the row is
+        // the unreadable one.
+        let odd = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-odd\"\nstate = \"alive\"\ntitle = \"zsh\"\nhold = 5\n",
+        )
+        .expect("a hold of the wrong type does not cost the manifest");
+        assert_eq!(odd.sessions[0].hold.as_deref(), Some(""));
+        assert_eq!(parse_hold(""), held(CARRIED_UNREADABLE, "local"));
+    }
+
+    /// ANOTHER SUPERVISOR'S LEASE AND EVERY KEYED ESCALATION CROSS THE
+    /// HANDOFF (the round-four plan, item 9). Five sessions, drawn into the
+    /// handoff records, written to TOML, read back and seeded onto fresh
+    /// sessions through the one seam `spawn_session` uses:
+    ///
+    /// * s0 is held by an external loop's `ttl=` lease and carries three
+    ///   escalations (the bare one, a supervisor's, a CI's) under the
+    ///   server's own stall line: the lease comes back with its remaining
+    ///   time, so the successor's host is refused and the holder renews; the
+    ///   three lines come back in order, so the CI's is the one shown; the
+    ///   server's is left to the successor's own input watch;
+    /// * s1 is claimed through a CONNECTION, which cannot cross: nothing is
+    ///   seeded and the record does not vouch for its claim;
+    /// * s2 is held by THIS process's own host — left behind, so the
+    ///   successor's host takes it at Commit instead of parking behind a dead
+    ///   process's lease;
+    /// * s3 is unclaimed, s4's lease has lapsed: both vouched for.
+    ///
+    /// The successor's host waits its grace on s0 and s1 and — a producer
+    /// from before the carry, which says nothing — on every session of an
+    /// old manifest. NEGATIVE CONTROLS: rows that do not read as the verbs
+    /// would read them seed nothing, and values of the wrong TOML type cost
+    /// neither the manifest nor the grace.
+    ///
+    /// FAILS WITHOUT THE FIX: the records have no lease and no escalations,
+    /// so every adopted session comes back unclaimed with its keyed lines
+    /// gone, and `claim_supervisor` for the successor's host succeeds on s0.
+    /// (Measured: with `handoff_supervisor` answering `(None, true)`, the
+    /// first record assertion fails.)
+    #[test]
+    fn a_ttl_claim_and_keyed_attention_cross_the_handoff() {
+        use crate::session_timeline::{
+            MetaEdit, claim_supervisor, parse_carried_attention, parse_carried_supervisor,
+            seed_carried_claims, write_attention_owned, write_server_attention,
+        };
+        let now = crate::metrics::now_us();
+        let mut store = SessionStore::default();
+        let s0 = handle(0, None);
+        claim_supervisor(&s0.ctx, "watch-bob", None, Some(now + 60_000_000), now).unwrap();
+        for (owner, text) in [
+            ("-", "check the build"),
+            ("supervisor", "claude box (Bash: rm -rf x) — needs you"),
+            ("ci@host", "red 100%"),
+        ] {
+            write_attention_owned(&s0.ctx, owner, MetaEdit::Set(text)).unwrap();
+        }
+        assert!(write_server_attention(
+            &s0.ctx,
+            crate::input_stall::SERVER_ATTENTION_OWNER,
+            Some("claude has not read 3 keys".to_string())
+        ));
+        store.register(s0);
+        let s1 = handle(1, None);
+        claim_supervisor(&s1.ctx, "relay-x", Some(7), None, now).unwrap();
+        store.register(s1);
+        let s2 = handle(2, None);
+        claim_supervisor(
+            &s2.ctx,
+            &crate::harness_host::holder(),
+            None,
+            Some(now + 90_000_000),
+            now,
+        )
+        .unwrap();
+        store.register(s2);
+        store.register(handle(3, None));
+        let s4 = handle(4, None);
+        claim_supervisor(&s4.ctx, "gone", None, Some(now.saturating_sub(1)), now).unwrap();
+        store.register(s4);
+
+        let manifest = SessionHandoff::from_store(&store);
+        let r = &manifest.sessions;
+        let (holder, ms) = r[0]
+            .supervisor
+            .as_deref()
+            .and_then(|row| row.split_once(' '))
+            .expect("s0's lease is carried");
+        let ms: u64 = ms.parse().unwrap();
+        assert_eq!(holder, "watch-bob");
+        assert!((50_000..=60_000).contains(&ms), "{ms}");
+        assert!(r[0].claim_known);
+        assert_eq!(
+            r[0].attention_owners,
+            [
+                "- check%20the%20build",
+                "supervisor claude%20box%20(Bash:%20rm%20-rf%20x)%20%E2%80%94%20needs%20you",
+                "ci@host red%20100%25",
+            ],
+            "every owner's line in write order, the server's own left behind"
+        );
+        let claims: Vec<(Option<&str>, bool, bool)> = r
+            .iter()
+            .map(|rec| {
+                (
+                    rec.supervisor.as_deref(),
+                    rec.claim_known,
+                    rec.claim_grace(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            claims[1..],
+            [
+                (None, false, true),
+                (None, true, false),
+                (None, true, false),
+                (None, true, false)
+            ],
+            "a connection's claim is unvouched; our own host's, none and a lapsed \
+             lease are vouched for"
+        );
+        assert!(r[0].claim_grace(), "a carried lease is waited on too");
+        let wire = manifest.to_toml().expect("serializes");
+        assert_eq!(wire.matches("\nsupervisor = ").count(), 1, "{wire}");
+        assert_eq!(wire.matches("\nclaim_known = true").count(), 4, "{wire}");
+        assert!(manifest.roundtrips());
+
+        // THE SUCCESSOR, a moment later.
+        let read = SessionHandoff::from_toml(&wire).expect("the successor reads it");
+        let later = now + 2_000_000;
+        let adopted: Vec<SessionHandle> = read
+            .sessions
+            .iter()
+            .map(|rec| {
+                let fresh = handle(rec.local_id, None);
+                seed_carried_claims(
+                    &fresh.ctx.meta,
+                    &fresh.ctx.timeline,
+                    rec.supervisor.as_deref(),
+                    &rec.attention_owners,
+                    later,
+                );
+                fresh
+            })
+            .collect();
+        {
+            let meta = adopted[0].ctx.meta.lock().unwrap();
+            assert_eq!(meta.live_supervisor(later), Some("watch-bob"));
+            let expiry = meta.supervisor_expiry().expect("a lease");
+            assert_eq!(
+                expiry,
+                later + ms * 1000,
+                "its remaining time, from the seed"
+            );
+            assert_eq!(meta.attention.as_deref(), Some("red 100%"));
+            assert_eq!(
+                meta.attention_owners.effective_owner(),
+                Some("ci@host"),
+                "the most recent line is the one shown, as before the update"
+            );
+            assert_eq!(
+                meta.attention_owners.get("supervisor"),
+                Some("claude box (Bash: rm -rf x) — needs you")
+            );
+            assert_eq!(meta.attention_owners.get("-"), Some("check the build"));
+            assert_eq!(
+                meta.attention_owners
+                    .get(crate::input_stall::SERVER_ATTENTION_OWNER),
+                None
+            );
+            assert_eq!(meta.driver_writes, 0, "a seed is no driver's write");
+        }
+        // The successor's host is refused as it was in the parent, and the
+        // holder's renewal renews.
+        assert_eq!(
+            claim_supervisor(
+                &adopted[0].ctx,
+                "aterm-harness@1",
+                None,
+                Some(later + 90_000_000),
+                later
+            ),
+            Err("watch-bob".to_string())
+        );
+        assert_eq!(
+            claim_supervisor(
+                &adopted[0].ctx,
+                "watch-bob",
+                None,
+                Some(later + 90_000_000),
+                later
+            ),
+            Ok(false)
+        );
+        let seeded_rows: Vec<String> = adopted[0]
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == "meta-change")
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(
+            seeded_rows,
+            [
+                "field=attention value=red%20100%25",
+                "field=supervisor value=watch-bob"
+            ]
+        );
+        for fresh in &adopted[1..] {
+            let meta = fresh.ctx.meta.lock().unwrap();
+            assert_eq!(meta.live_supervisor(later), None, "nothing else is seeded");
+            assert!(meta.attention_owners.is_empty());
+        }
+
+        // A producer from before the carry: nothing seeded, every session
+        // waited on.
+        let old = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-old\"\nstate = \"alive\"\ntitle = \"zsh\"\n",
+        )
+        .expect("an old manifest reads");
+        assert_eq!(old.sessions[0].supervisor, None);
+        assert!(old.sessions[0].attention_owners.is_empty());
+        assert!(old.sessions[0].claim_grace());
+
+        // NEGATIVE CONTROLS: rows the verbs would refuse seed nothing.
+        for (row, want) in [
+            ("watch-bob 5000", Some(("watch-bob", 5000))),
+            ("watch-bob 99999999", Some(("watch-bob", 600_000))),
+            ("watch-bob 0", None),
+            ("watch-bob -5", None),
+            ("watch-bob soon", None),
+            ("- 5000", None),
+            ("bad holder! 5000", None),
+            ("", None),
+            ("watch-bob", None),
+            (" watch-bob 5", None),
+        ] {
+            assert_eq!(parse_carried_supervisor(row), want, "{row:?}");
+        }
+        for (row, want) in [
+            ("ci red", Some(("ci", "red".to_string()))),
+            (
+                "ci x%1B%5B31mred%E2%80%AEx",
+                Some(("ci", "x[31mredx".to_string())),
+            ),
+            ("aterm stalled", None),
+            ("bad%20owner text", None),
+            ("ci ", None),
+            ("ci %0A%09", None),
+            ("ci", None),
+        ] {
+            assert_eq!(parse_carried_attention(row), want, "{row:?}");
+        }
+        let (long, bare) = (
+            format!("ci {}", "a".repeat(400)),
+            format!("- {}", "a".repeat(400)),
+        );
+        assert_eq!(
+            parse_carried_attention(&long).unwrap().1.len(),
+            crate::session_timeline::META_ATTENTION_KEYED_MAX
+        );
+        assert_eq!(
+            parse_carried_attention(&bare).unwrap().1.len(),
+            crate::session_timeline::META_ATTENTION_MAX
+        );
+        // Past the owners' bound, a new owner is refused as a live write is.
+        let crowded = handle(9, None);
+        let rows: Vec<String> = (0..12).map(|i| format!("owner{i} line{i}")).collect();
+        seed_carried_claims(&crowded.ctx.meta, &crowded.ctx.timeline, None, &rows, later);
+        assert_eq!(
+            crowded.ctx.meta.lock().unwrap().attention_owners.len(),
+            crate::session_timeline::ATTENTION_OWNERS_MAX - 1,
+            "the bare owner's slot is kept"
+        );
+        // Values of the wrong TYPE cost neither the manifest nor the grace.
+        let odd = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-odd\"\nstate = \"alive\"\n\
+             title = \"zsh\"\nsupervisor = 5\nclaim_known = \"yes\"\nattention_owners = [1, \"ci x\"]\n",
+        )
+        .expect("rows of the wrong type do not cost the manifest");
+        assert_eq!(odd.sessions[0].supervisor.as_deref(), Some(""));
+        assert!(!odd.sessions[0].claim_known);
+        assert_eq!(odd.sessions[0].attention_owners, ["ci x"]);
+        assert!(odd.sessions[0].claim_grace());
+        let not_a_list = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-odd\"\nstate = \"alive\"\n\
+             title = \"zsh\"\nattention_owners = \"ci x\"\nclaim_known = true\n",
+        )
+        .expect("a list that is no list does not cost the manifest");
+        assert!(not_a_list.sessions[0].attention_owners.is_empty());
+        assert!(!not_a_list.sessions[0].claim_grace());
+    }
+
+    /// TIER-1 for `HarnessHandoffClaim` (aterm-spec
+    /// `harness_handoff_claim_model`): every pre-Commit configuration the
+    /// machine has — no claim, an external lease, a connection's claim, the
+    /// outgoing host's own lease, each from this build or from one before the
+    /// carry — is driven through the REAL chain: the claim on a live session,
+    /// `from_store`, the TOML wire (an older producer's being this build's
+    /// wire without the three keys it never wrote), `from_toml`, the seed
+    /// `spawn_session` runs and the grace decision `main_entry` hands the
+    /// host. The incoming state — the claim the successor shows, the grace,
+    /// whether the successor's host could claim now — must be the model's
+    /// after `Commit`. NEGATIVE CONTROL: the successor before round four
+    /// (nothing seeded, no grace) is the mutant `CommitUncarried`, whose next
+    /// `HostClaims` breaks `NoTakeover` wherever an external holder was.
+    #[test]
+    fn the_real_claim_carry_conforms_to_the_handoff_claim_model() {
+        use crate::session_timeline::{claim_supervisor, seed_carried_claims};
+        let model = aterm_spec::derive::harness_handoff_claim_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let grace = model.consts.iter().find(|c| c.0 == "Grace").unwrap().1;
+        let new_keys = ["supervisor = ", "claim_known = ", "attention_owners = "];
+        let mut driven = 0;
+        for pre in ["", "ExternalLease", "ExternalConn", "HostHeld"] {
+            for older in [false, true] {
+                // The model's side.
+                let mut state = model.init_state();
+                let mut schedule: Vec<&str> = [pre].into_iter().filter(|a| !a.is_empty()).collect();
+                if older {
+                    schedule.push("OlderParent");
+                }
+                schedule.extend(["Park", "Commit"]);
+                for action in &schedule {
+                    assert!(model.fire(action, &mut state), "{action}: {state:?}");
+                }
+
+                // The real side: the claim as the outgoing instance held it.
+                let now = crate::metrics::now_us();
+                let live = handle(0, None);
+                match pre {
+                    "ExternalLease" => {
+                        claim_supervisor(&live.ctx, "watch-bob", None, Some(now + 60_000_000), now)
+                            .unwrap();
+                    }
+                    "ExternalConn" => {
+                        claim_supervisor(&live.ctx, "relay-x", Some(7), None, now).unwrap();
+                    }
+                    "HostHeld" => {
+                        claim_supervisor(
+                            &live.ctx,
+                            &crate::harness_host::holder(),
+                            None,
+                            Some(now + 90_000_000),
+                            now,
+                        )
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+                let mut store = SessionStore::default();
+                store.register(live);
+                let mut wire = SessionHandoff::from_store(&store)
+                    .to_toml()
+                    .expect("serializes");
+                if older {
+                    wire = wire
+                        .lines()
+                        .filter(|line| !new_keys.iter().any(|key| line.starts_with(key)))
+                        .map(|line| format!("{line}\n"))
+                        .collect();
+                }
+                let read = SessionHandoff::from_toml(&wire).expect("the successor reads it");
+                let rec = &read.sessions[0];
+                let fresh = handle(0, None);
+                let later = now + 1_000_000;
+                seed_carried_claims(
+                    &fresh.ctx.meta,
+                    &fresh.ctx.timeline,
+                    rec.supervisor.as_deref(),
+                    &rec.attention_owners,
+                    later,
+                );
+                let shown = fresh
+                    .ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .live_supervisor(later)
+                    .map(str::to_owned);
+                let server = match shown.as_deref() {
+                    None => 0,
+                    Some(holder) if holder == crate::harness_host::holder() => 2,
+                    Some(_) => 1,
+                };
+                let real_grace = if rec.claim_grace() { grace } else { 0 };
+                assert_eq!(
+                    (server, real_grace),
+                    (state["server"], state["grace"]),
+                    "{schedule:?}: the successor's state is the model's after Commit\n{wire}"
+                );
+                // The successor's host could claim right now exactly where the
+                // model's `HostClaims` is enabled.
+                let host_may = claim_supervisor(
+                    &fresh.ctx,
+                    "aterm-harness@2",
+                    None,
+                    Some(later + 90_000_000),
+                    later,
+                )
+                .is_ok()
+                    && !rec.claim_grace();
+                assert_eq!(
+                    host_may,
+                    model.action_enabled("HostClaims", &state),
+                    "{schedule:?}"
+                );
+
+                // NEGATIVE CONTROL: the successor before round four.
+                let mut shipped = buggy.init_state();
+                for action in schedule.iter().map(|a| {
+                    if *a == "Commit" {
+                        "CommitUncarried"
+                    } else {
+                        *a
+                    }
+                }) {
+                    assert!(buggy.fire(action, &mut shipped), "{action}: {shipped:?}");
+                }
+                assert_eq!((shipped["server"], shipped["grace"]), (0, 0));
+                assert!(buggy.fire("HostClaims", &mut shipped));
+                assert_eq!(
+                    buggy.check_invariant("NoTakeover", &shipped),
+                    matches!(pre, "" | "HostHeld"),
+                    "{schedule:?}: the old successor takes exactly the externally held sessions"
+                );
+                driven += 1;
+            }
+        }
+        assert_eq!(driven, 8, "every pre-Commit configuration of the machine");
     }
 
     /// THE IDENTITY CARRY (session identities, 2026-09-17): the handle's label

@@ -102,7 +102,8 @@ fn an_unlisted_principals_answer_is_not_demoted() {
 /// node held a cap to publish. A3 also pinned on the EXPLICIT-node arm, where
 /// the node segment is a string a session typed: `post` is owner-class, every
 /// in-session `aterm-ctl @self` is Owner (§8.1), and the table is durable with
-/// no operator undo (`aterm-link pin` is unimplemented). One message from a
+/// deleting the file as its only undo (`aterm-link pin` was cut unbuilt in
+/// 622e40af6). One message from a
 /// prompt-injected worker permanently made a peer's sid `ERR ambiguous` for
 /// every sender on the node.
 #[test]

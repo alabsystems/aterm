@@ -138,7 +138,10 @@ fn curl_bin() -> &'static str {
 
 // Skip: Vec growth (`extend`) — the audited-alloc class; capacity is
 // clamped (see below) and the argv is bounded by the caller's fixed flag
-// sets. Droppable when the T3 collect/extend layer lands.
+// sets. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed:
+// VIOLATIONS (3 of 5 obligations refuted, 2 unknown — the absent generic
+// callees). Needed from $HOME/trust, in a promoted seal: totality for generic
+// `extend`/`collect` (TRUST_100PCT_PLAN T3); then drop this.
 #[cfg_attr(trust_verify, trust::skip)]
 fn curl_argv(args: &[&str], url: &str, authenticated: bool) -> Vec<String> {
     // The capacity is a pre-size HINT only; clamp it so the `+ 7` and the resulting

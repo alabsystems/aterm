@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The usage view (design §5.2): the two JSON shapes Claude Code writes to
-//! disk, read into one per-account view; the one-line HUD; the
-//! `harness usage --json` document (schema 1).
+//! The usage view (design §5.2): Claude Code's transcript rows, read into one
+//! per-account view; the one-line HUD; the `harness usage --json` document
+//! (schema 1).
 //!
 //! Everything here is a pure function of its arguments. No clock is read
 //! (`as_of` and every `age_s` are injected), no environment, no network, no
 //! control socket. The one I/O surface is [`TranscriptUsage::fold_reader`],
 //! which takes a `BufRead` the caller opened.
 //!
-//! # The two inputs
-//!
-//! **The statusLine JSON** ([`parse_statusline`]) is what the vendor pipes into
-//! its `statusLine` command on stdin. The field names below are those the
-//! vendor's own help text documents (MEASURED 2026-09-17 against claude
-//! 2.1.274). Every field is optional and unknown fields are ignored, because
-//! the vendor ships roughly one build a day and a renamed key must degrade the
-//! HUD, not break it. Numbers are accepted as integer or float. The parser
-//! underneath is `aterm_json`, which bounds nesting at 128 and refuses a lone
-//! surrogate, so hostile input is an `Err`, never a panic.
+//! # The input
 //!
 //! **Transcript rows** ([`TranscriptUsage`]) are the lines of
 //! `~/.claude/projects/<slug>/<uuid>.jsonl`: one JSON object per line. An
@@ -39,12 +30,22 @@
 //! | [`SEEN_IDS_MAX`] | 4096 | ids are remembered in arrival order and the oldest forgotten past this; ~700× the measured 5-row repeat distance |
 //! | [`MAX_ID_BYTES`] | 128 | a longer `message.id` is treated as absent (summed, not deduped) so a hostile id cannot fill the set |
 //! | [`MAX_MODELS`] | 64 | past this many distinct model ids, further ones fold into `"(other)"` |
-//! | [`MAX_WINDOWS`] | 32 | rate-limit windows kept from one statusLine, in key order |
 //!
 //! # What is assumed
 //!
-//! A repeat whose usage DIFFERS from the first (never measured) keeps the first
-//! and counts the conflict; it is not summed and not overwritten. A row with
+//! A repeat whose usage DIFFERS from the one held RAISES each of the four
+//! counts to the largest seen for that id and sums only the difference — the
+//! message is still counted once. MEASURED 2026-09-25 over this box's
+//! `~/.claude/projects` (1,527 subagent `agent-*.jsonl` files, 24,723 ids):
+//! a SUBAGENT's message is streamed over several rows — first the
+//! message_start usage (`stop_reason: null`, output 4-9), then the final one
+//! (output in the hundreds or thousands; `stop_reason` set, or still `null` on
+//! 619 ids) — and on 18,760 differing repeats a count never went DOWN; input
+//! never differed, and a cache count once. Keeping the first row, as this
+//! fold did until then, left 93 % of subagent output uncounted (2,018,759 of
+//! 27,613,681 tokens); raising to the largest equals keeping the final row,
+//! even where that row's `stop_reason` is still null. Main transcripts showed
+//! no differing repeat at all (36 files, 4,607 ids). A row with
 //! usage but no id cannot be deduped: it is summed and counted, because for a
 //! spend figure an over-count is the direction that does not hide cost. A
 //! sidechain row (`isSidechain: true`) is real API spend and is summed, and
@@ -56,27 +57,31 @@
 //! # Honesty of "per model" (design §5.2)
 //!
 //! The windows (`five_hour`, `seven_day`, `spend_limit`, …) are per ACCOUNT:
-//! the vendor reports them account-wide. The per-model figures are SPEND —
+//! the vendor reports them account-wide. Nothing here fills them any more:
+//! their one reader, of the vendor's statusLine payload, had no producer once
+//! the `harness statusline` bridge retired (decision B) and was deleted
+//! 2026-09-27, and the view that held them went with it (the review of that
+//! day: tests of a path no producer reached read as coverage), so `harness
+//! usage` names none — `"windows":{}` in the JSON, kept for the schema, and
+//! the HUD's `?%`; the painted `/usage` panel's windows are `harness limits`'
+//! to print ([`usage_panel_windows`]). The per-model figures are SPEND —
 //! tokens and, with a caller-supplied [`PriceTable`], dollars — folded from the
 //! transcript. Nothing here carries a built-in price; the table is injected.
-//! The JSON says which is which by shape (`windows` beside `spend`), and the
-//! HUD labels the windows with the account, never with the model.
 //!
 //! STATUS: unit-tested against inline fixtures and the measured row shapes
-//! above. REACHED from the front door as of 2026-09-22 — `aterm harness
-//! usage [--json]` prints the view, and `aterm harness statusline` records
-//! the vendor's sample and prints [`hud_line`] for the vendor's own footer —
-//! which corrects the line that stood here saying it was wired to no verb.
-//! Still TARGET: no status BAR renders the HUD (design §5.2's `Lane::Harness`
-//! does not exist), and the Sheets sync of §5.2 is unwritten.
+//! above, and REACHED from the front door: `aterm harness usage [--json]`
+//! prints the view. As of 2026-09-27 the transcript fold
+//! ([`TranscriptUsage`]) also reaches the window's Claude Code footer — its
+//! `Σ` tokens and its limit wall ([`LimitNoticeRow`]) — through
+//! [`super::session_usage`], which folds it incrementally per file, subagent
+//! transcripts included; `harness usage` folds through the same code. No
+//! status bar renders the HUD (design §5.2's `Lane::Harness` does not exist),
+//! and the Sheets sync of §5.2 is unwritten.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fmt;
 use std::io::{self, BufRead};
 
 use aterm_json::{Map, Value};
-
-use super::source::Source;
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -87,12 +92,6 @@ use super::source::Source;
 /// stream, so memory stays bounded whatever the file holds. 16× the longest
 /// row MEASURED on this box (1,125,606 bytes).
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
-
-/// The longest statusLine document that is parsed. A real one is a few
-/// kilobytes (the vendor's shape holds a handful of strings and numbers);
-/// this cap is assumed, not measured, and exists only so a runaway writer
-/// cannot make the reader allocate without limit.
-pub const MAX_STATUSLINE_BYTES: usize = 1024 * 1024;
 
 /// How many `message.id`s [`TranscriptUsage`] remembers for dedupe. Ids are
 /// kept in arrival order; once more than this many are held, the oldest is
@@ -108,9 +107,6 @@ pub const MAX_ID_BYTES: usize = 128;
 /// into the `"(other)"` row.
 pub const MAX_MODELS: usize = 64;
 
-/// The most rate-limit windows kept from one statusLine, in key order.
-pub const MAX_WINDOWS: usize = 32;
-
 /// The HUD line's byte cap — the `meta set description` cap.
 pub const HUD_MAX_BYTES: usize = 1024;
 
@@ -119,39 +115,6 @@ pub const UNKNOWN_MODEL: &str = "unknown";
 
 /// The model key spend is filed under past [`MAX_MODELS`] distinct ids.
 pub const OTHER_MODEL: &str = "(other)";
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-/// Why a document could not be read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UsageError {
-    /// Not JSON, or JSON `aterm_json` refuses (nesting past 128, a lone
-    /// surrogate, trailing data, a control character in a string).
-    Json(String),
-    /// Well-formed JSON whose top level is not an object.
-    NotObject,
-    /// Longer than the cap named.
-    TooLong {
-        /// The document's length.
-        bytes: usize,
-        /// The cap it exceeded.
-        max: usize,
-    },
-}
-
-impl fmt::Display for UsageError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Json(why) => write!(f, "not JSON: {why}"),
-            Self::NotObject => f.write_str("top level is not an object"),
-            Self::TooLong { bytes, max } => write!(f, "{bytes} bytes exceeds the {max}-byte cap"),
-        }
-    }
-}
-
-impl std::error::Error for UsageError {}
 
 // ---------------------------------------------------------------------------
 // Numbers: integer or float, never a panic
@@ -171,22 +134,12 @@ fn num_u64(v: Option<&Value>) -> Option<u64> {
     Some(f as u64)
 }
 
-/// An epoch-seconds instant; a float is floored.
-fn num_i64(v: Option<&Value>) -> Option<i64> {
-    let f = num_f64(v)?;
-    Some(f as i64)
-}
-
-fn str_of(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str).map(str::to_owned)
-}
-
 // ---------------------------------------------------------------------------
-// The statusLine JSON
+// One request's tokens
 // ---------------------------------------------------------------------------
 
-/// One request's token counts — the vendor's `usage` object, in the statusLine
-/// (`context_window.current_usage`) and on every assistant transcript row.
+/// One request's token counts — the vendor's `usage` object on every
+/// assistant transcript row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenUsage {
     /// `input_tokens`.
@@ -219,200 +172,6 @@ impl TokenUsage {
     }
 }
 
-/// `model: {id, display_name}`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ModelRef {
-    /// `model.id`, e.g. `claude-fable-5-1`.
-    pub id: Option<String>,
-    /// `model.display_name`.
-    pub display_name: Option<String>,
-}
-
-/// `workspace: {current_dir, project_dir, …}`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Workspace {
-    /// `workspace.current_dir`.
-    pub current_dir: Option<String>,
-    /// `workspace.project_dir`.
-    pub project_dir: Option<String>,
-}
-
-/// `context_window: {…}`.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ContextWindow {
-    /// `total_input_tokens`.
-    pub total_input_tokens: Option<u64>,
-    /// `total_output_tokens`.
-    pub total_output_tokens: Option<u64>,
-    /// `context_window_size`.
-    pub context_window_size: Option<u64>,
-    /// `current_usage`, `null` before the first request.
-    pub current_usage: Option<TokenUsage>,
-    /// `used_percentage`, `null` before the first request.
-    pub used_percentage: Option<f64>,
-    /// `remaining_percentage`, `null` before the first request.
-    pub remaining_percentage: Option<f64>,
-}
-
-/// One rate-limit window as the statusLine reports it:
-/// `{used_percentage, resets_at}`.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RateWindow {
-    /// `used_percentage`, 0–100 for the time windows; `spend_limit` reads
-    /// above 100 once exceeded. Kept as reported, never clamped.
-    pub used_pct: Option<f64>,
-    /// `resets_at`, epoch seconds.
-    pub resets_at: Option<i64>,
-}
-
-/// The statusLine's `rate_limits` object. A window is present only while the
-/// API reports it, so this is a map keyed by the vendor's window name
-/// (`five_hour`, `seven_day`, `spend_limit`, and whatever else arrives).
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RateLimits {
-    /// Windows by name, at most [`MAX_WINDOWS`] of them in key order.
-    pub windows: BTreeMap<String, RateWindow>,
-}
-
-impl RateLimits {
-    /// The `five_hour` window.
-    pub fn five_hour(&self) -> Option<&RateWindow> {
-        self.windows.get("five_hour")
-    }
-
-    /// The `seven_day` window.
-    #[cfg(test)]
-    pub(crate) fn seven_day(&self) -> Option<&RateWindow> {
-        self.windows.get("seven_day")
-    }
-
-    /// The `spend_limit` window.
-    #[cfg(test)]
-    pub(crate) fn spend_limit(&self) -> Option<&RateWindow> {
-        self.windows.get("spend_limit")
-    }
-
-    fn from_object(obj: &Map) -> Self {
-        let windows = obj
-            .iter()
-            .filter_map(|(name, v)| {
-                let w = v.as_object()?;
-                Some((
-                    name.clone(),
-                    RateWindow {
-                        used_pct: num_f64(w.get("used_percentage")),
-                        resets_at: num_i64(w.get("resets_at")),
-                    },
-                ))
-            })
-            .take(MAX_WINDOWS)
-            .collect();
-        Self { windows }
-    }
-}
-
-/// The statusLine stdin JSON, every field optional.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct StatusLine {
-    /// `session_id`.
-    pub session_id: Option<String>,
-    /// `session_name`.
-    pub session_name: Option<String>,
-    /// `transcript_path`.
-    pub transcript_path: Option<String>,
-    /// `cwd`.
-    pub cwd: Option<String>,
-    /// `version` — the vendor build.
-    pub version: Option<String>,
-    /// `model`.
-    pub model: Option<ModelRef>,
-    /// `workspace`.
-    pub workspace: Option<Workspace>,
-    /// `context_window`.
-    pub context_window: Option<ContextWindow>,
-    /// `effort.level`.
-    pub effort_level: Option<String>,
-    /// `thinking.enabled`.
-    pub thinking_enabled: Option<bool>,
-    /// `rate_limits`; `None` when the key is absent or not an object.
-    pub rate_limits: Option<RateLimits>,
-}
-
-impl StatusLine {
-    /// `model.id`, the one string the HUD names the model by.
-    pub fn model_id(&self) -> Option<&str> {
-        self.model.as_ref().and_then(|m| m.id.as_deref())
-    }
-
-    fn from_object(obj: &Map) -> Self {
-        let model = obj
-            .get("model")
-            .and_then(Value::as_object)
-            .map(|m| ModelRef {
-                id: str_of(m.get("id")),
-                display_name: str_of(m.get("display_name")),
-            });
-        let workspace = obj
-            .get("workspace")
-            .and_then(Value::as_object)
-            .map(|w| Workspace {
-                current_dir: str_of(w.get("current_dir")),
-                project_dir: str_of(w.get("project_dir")),
-            });
-        let context_window = obj
-            .get("context_window")
-            .and_then(Value::as_object)
-            .map(|c| ContextWindow {
-                total_input_tokens: num_u64(c.get("total_input_tokens")),
-                total_output_tokens: num_u64(c.get("total_output_tokens")),
-                context_window_size: num_u64(c.get("context_window_size")),
-                current_usage: c
-                    .get("current_usage")
-                    .and_then(Value::as_object)
-                    .and_then(TokenUsage::from_object),
-                used_percentage: num_f64(c.get("used_percentage")),
-                remaining_percentage: num_f64(c.get("remaining_percentage")),
-            });
-        Self {
-            session_id: str_of(obj.get("session_id")),
-            session_name: str_of(obj.get("session_name")),
-            transcript_path: str_of(obj.get("transcript_path")),
-            cwd: str_of(obj.get("cwd")),
-            version: str_of(obj.get("version")),
-            model,
-            workspace,
-            context_window,
-            effort_level: obj
-                .get("effort")
-                .and_then(Value::as_object)
-                .and_then(|e| str_of(e.get("level"))),
-            thinking_enabled: obj
-                .get("thinking")
-                .and_then(Value::as_object)
-                .and_then(|t| t.get("enabled"))
-                .and_then(Value::as_bool),
-            rate_limits: obj
-                .get("rate_limits")
-                .and_then(Value::as_object)
-                .map(RateLimits::from_object),
-        }
-    }
-}
-
-/// Parse one statusLine document. Every field is optional, unknown fields are
-/// ignored, numbers may be integer or float. Hostile input is an `Err`.
-pub fn parse_statusline(json: &str) -> Result<StatusLine, UsageError> {
-    if json.len() > MAX_STATUSLINE_BYTES {
-        return Err(UsageError::TooLong {
-            bytes: json.len(),
-            max: MAX_STATUSLINE_BYTES,
-        });
-    }
-    let value: Value = aterm_json::from_str(json).map_err(|e| UsageError::Json(e.to_string()))?;
-    let obj = value.as_object().ok_or(UsageError::NotObject)?;
-    Ok(StatusLine::from_object(obj))
-}
-
 // ---------------------------------------------------------------------------
 // The transcript: spend per model, deduped by message.id
 // ---------------------------------------------------------------------------
@@ -441,8 +200,17 @@ impl ModelSpend {
         self.messages = self.messages.saturating_add(1);
     }
 
-    #[cfg(test)]
-    fn add_spend(&mut self, other: &Self) {
+    /// Add a message's token counts WITHOUT counting another message — the
+    /// growth a streamed repeat of one id brings.
+    fn add_tokens(&mut self, t: TokenUsage) {
+        self.input = self.input.saturating_add(t.input);
+        self.output = self.output.saturating_add(t.output);
+        self.cache_write = self.cache_write.saturating_add(t.cache_write);
+        self.cache_read = self.cache_read.saturating_add(t.cache_read);
+    }
+
+    /// Add another spend's totals — two files' folds of one session, summed.
+    pub(crate) fn add_spend(&mut self, other: &Self) {
         self.input = self.input.saturating_add(other.input);
         self.output = self.output.saturating_add(other.output);
         self.cache_write = self.cache_write.saturating_add(other.cache_write);
@@ -458,8 +226,10 @@ pub enum Fold {
     Summed,
     /// A repeat of an id already counted, with the same usage: folded away.
     Duplicate,
-    /// A repeat of an id already counted whose usage DIFFERED: the first was
-    /// kept, this one was not summed, and the conflict was counted.
+    /// A repeat of an id already counted whose usage DIFFERED — a streamed
+    /// message's later row: each count was raised to the largest seen for
+    /// the id and the difference summed (the message still counts once),
+    /// and the repeat was counted.
     Conflict,
     /// A row that is not an assistant row (user, progress, summary, …).
     NotAssistant,
@@ -473,36 +243,55 @@ pub enum Fold {
     Blank,
 }
 
-/// The bounded set of ids already counted, each with the usage first seen.
+/// The bounded set of ids already counted, each with the largest usage seen
+/// for it so far, count by count.
 #[derive(Debug, Clone, Default)]
 struct SeenIds {
     order: VecDeque<String>,
-    first: BTreeMap<String, TokenUsage>,
+    largest: BTreeMap<String, TokenUsage>,
 }
 
 enum Seen {
     New,
     Same,
-    Differs,
+    /// A differing repeat: how much each count grew past the largest held.
+    Differs(TokenUsage),
 }
 
 impl SeenIds {
     fn remember(&mut self, id: &str, usage: TokenUsage) -> Seen {
-        if let Some(first) = self.first.get(id) {
-            return if *first == usage {
-                Seen::Same
-            } else {
-                Seen::Differs
+        if let Some(held) = self.largest.get_mut(id) {
+            if *held == usage {
+                return Seen::Same;
+            }
+            let grown = TokenUsage {
+                input: held.input.max(usage.input),
+                output: held.output.max(usage.output),
+                cache_write: held.cache_write.max(usage.cache_write),
+                cache_read: held.cache_read.max(usage.cache_read),
             };
+            let delta = TokenUsage {
+                input: grown.input - held.input,
+                output: grown.output - held.output,
+                cache_write: grown.cache_write - held.cache_write,
+                cache_read: grown.cache_read - held.cache_read,
+            };
+            *held = grown;
+            return Seen::Differs(delta);
         }
-        self.first.insert(id.to_owned(), usage);
+        self.largest.insert(id.to_owned(), usage);
         self.order.push_back(id.to_owned());
-        while self.order.len() > SEEN_IDS_MAX {
+        self.shed(SEEN_IDS_MAX);
+        Seen::New
+    }
+
+    /// Forget all but the newest `keep` ids.
+    fn shed(&mut self, keep: usize) {
+        while self.order.len() > keep {
             if let Some(old) = self.order.pop_front() {
-                self.first.remove(&old);
+                self.largest.remove(&old);
             }
         }
-        Seen::New
     }
 }
 
@@ -512,6 +301,8 @@ impl SeenIds {
 pub struct TranscriptUsage {
     per_model: BTreeMap<String, ModelSpend>,
     seen: SeenIds,
+    /// The model the newest summed row named ([`Self::last_model`]).
+    last_model: Option<String>,
     /// Lines offered, of every kind.
     pub rows: u64,
     /// Lines that were not JSON, not an object, or not UTF-8.
@@ -527,10 +318,70 @@ pub struct TranscriptUsage {
     pub rows_without_id: u64,
     /// Repeats folded away (same id, same usage) plus conflicts.
     pub duplicates: u64,
-    /// Repeats whose usage differed from the first; the first was kept.
+    /// Repeats whose usage differed from the largest held for the id — a
+    /// streamed message's later rows; each raised the counts to the largest
+    /// seen and summed the difference.
     pub conflicting_repeats: u64,
     /// Assistant rows with `isSidechain: true`; summed like any other.
     pub sidechain_rows: u64,
+    /// The newest limit notice Claude Code wrote into the transcript, per
+    /// window it names ([`LimitNoticeRow`]).
+    limit_notices: BTreeMap<String, LimitNoticeRow>,
+    /// Unix seconds of the newest row the API SERVED ([`Self::served_at`]).
+    served_at: Option<i64>,
+}
+
+/// A limit notice as Claude Code WROTE it into the transcript: an assistant
+/// row with `isApiErrorMessage: true` whose text is the notice (`You've hit
+/// your session limit · resets 3pm (…)`), stamped with the row's own
+/// `timestamp` — the shape the login wall's row has
+/// (`upgrade::transcript_login_wall`), with `error: rate_limit`. MEASURED in
+/// the 2.1.283 bundle: a rejected rate limit becomes such a row, while the
+/// usage WARNING is only a UI notification and is never written. The row's
+/// time does not move when the conversation is re-rendered (a resume, a
+/// restart, a handoff): it is when the limit was hit, and the reset is placed
+/// from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitNoticeRow {
+    /// The reset the notice names, as its text prints it
+    /// (`aterm_phase::notice_reset`, the screen reader's own grammar).
+    pub reset_text: Option<String>,
+    /// Unix seconds of the row's `timestamp`.
+    pub at: i64,
+}
+
+/// Unix seconds of a transcript row's own `timestamp` (the workspace's
+/// RFC 3339 reader, which refuses an offset it would misread).
+fn row_time(obj: &Map) -> Option<i64> {
+    obj.get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(super::upgrade_models::parse_utc)
+        .and_then(|t| i64::try_from(t).ok())
+}
+
+/// The window a limit notice's text NAMES, reached: `session limit` /
+/// `5-hour limit` is `five_hour`, a weekly one `seven_day`; `None` for a
+/// notice that names none (`You've hit your limit` — the vendor prints it
+/// for a weekly wall too, MEASURED in the 2.1.278 bundle), and for any other
+/// wall. Which wall it is at all is `aterm_phase::classify_wall`'s answer,
+/// the screen reader's.
+#[must_use]
+pub fn notice_window(message: &str) -> Option<&'static str> {
+    let head = message.replace('\u{2019}', "'").to_ascii_lowercase();
+    let names = |phrases: &[&str]| phrases.iter().any(|p| head.contains(p));
+    match aterm_phase::classify_wall(message) {
+        Some(aterm_phase::WallKind::UsageSession)
+            if names(&["session limit", "5-hour limit", "five-hour limit"]) =>
+        {
+            Some("five_hour")
+        }
+        Some(aterm_phase::WallKind::UsageWeekly)
+            if names(&["weekly", "7-day limit", "seven-day limit"]) =>
+        {
+            Some("seven_day")
+        }
+        _ => None,
+    }
 }
 
 impl TranscriptUsage {
@@ -542,6 +393,15 @@ impl TranscriptUsage {
     /// Spend by model id, in key order.
     pub fn per_model(&self) -> &BTreeMap<String, ModelSpend> {
         &self.per_model
+    }
+
+    /// The model id the NEWEST summed row of the main chain named — the
+    /// session's model as its transcript last recorded it (a `/model` switch
+    /// shows from the first answer after it; a subagent's sidechain row names
+    /// its own; a row that names none — [`UNKNOWN_MODEL`], Claude Code's
+    /// `<synthetic>` — leaves it as it was). `None` before such a row.
+    pub fn last_model(&self) -> Option<&str> {
+        self.last_model.as_deref()
     }
 
     /// The sum over every model.
@@ -572,7 +432,7 @@ impl TranscriptUsage {
         if cannot_be_assistant(line) {
             return Fold::NotAssistant;
         }
-        let Ok(value) = aterm_json::from_str::<Value>(line) else {
+        let Ok(value) = super::transcript::usage(line) else {
             self.rows_unparsed = self.rows_unparsed.saturating_add(1);
             return Fold::Unparsed;
         };
@@ -583,8 +443,19 @@ impl TranscriptUsage {
         if obj.get("type").and_then(Value::as_str) != Some("assistant") {
             return Fold::NotAssistant;
         }
+        let api_error = obj.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
+        // Only the vendor's API-error rows need content for a limit notice.
+        // Ordinary usage rows keep tool payloads out of the materialized
+        // projection; the rare notice gets the text-block projection too.
+        if api_error
+            && let Ok(notice) = super::transcript::conversation(line)
+            && let Some(notice) = notice.as_object()
+        {
+            self.note_limit_notice(notice);
+        }
         self.assistant_rows = self.assistant_rows.saturating_add(1);
-        if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        let sidechain = obj.get("isSidechain").and_then(Value::as_bool) == Some(true);
+        if sidechain {
             self.sidechain_rows = self.sidechain_rows.saturating_add(1);
         }
         let usage = obj
@@ -608,25 +479,98 @@ impl TranscriptUsage {
             .and_then(|m| m.get("id"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty() && s.len() <= MAX_ID_BYTES);
+        // A response the API SERVED: the rule the login wall lifts by
+        // (`upgrade::LoginRow::Lifted`, a row of a real model id — Claude
+        // Code files its own rows under `<synthetic>`, which is none), not an
+        // API-error row, and — below — a message not already counted at
+        // these figures.
+        let served = !api_error && model != UNKNOWN_MODEL && super::upgrade::is_model_id(model);
         let Some(id) = id else {
             self.rows_without_id = self.rows_without_id.saturating_add(1);
-            self.add(model, usage);
+            self.add(model, usage, sidechain);
+            if served {
+                self.note_served(obj);
+            }
             return Fold::Summed;
         };
         match self.seen.remember(id, usage) {
             Seen::New => {
-                self.add(model, usage);
+                self.add(model, usage, sidechain);
+                if served {
+                    self.note_served(obj);
+                }
                 Fold::Summed
             }
             Seen::Same => {
                 self.duplicates = self.duplicates.saturating_add(1);
                 Fold::Duplicate
             }
-            Seen::Differs => {
+            Seen::Differs(growth) => {
                 self.duplicates = self.duplicates.saturating_add(1);
                 self.conflicting_repeats = self.conflicting_repeats.saturating_add(1);
+                let key = self.model_key(model).to_owned();
+                self.per_model.entry(key).or_default().add_tokens(growth);
+                // Only a message that GREW is a response served again: a
+                // repeat at or below the figures held is an old one.
+                if served && growth != TokenUsage::default() {
+                    self.note_served(obj);
+                }
                 Fold::Conflict
             }
+        }
+    }
+
+    /// Unix seconds of the newest response the API SERVED in this file: an
+    /// assistant row with usage from a real model (not Claude Code's own
+    /// `<synthetic>` rows, not `isApiErrorMessage`), whose message is new or
+    /// grew (a repeat at the same figures is not a new response). A limit
+    /// wall with a response served after its notice no longer blocks
+    /// (`/limit-reset`, extra usage, another account).
+    pub fn served_at(&self) -> Option<i64> {
+        self.served_at
+    }
+
+    fn note_served(&mut self, obj: &Map) {
+        if let Some(at) = row_time(obj) {
+            self.served_at = Some(self.served_at.map_or(at, |held| held.max(at)));
+        }
+    }
+
+    /// The newest limit notice written into the transcript, per window it
+    /// names (`five_hour`, `seven_day`).
+    pub fn limit_notices(&self) -> &BTreeMap<String, LimitNoticeRow> {
+        &self.limit_notices
+    }
+
+    /// Keep an API-error row that is a limit notice naming its window.
+    fn note_limit_notice(&mut self, obj: &Map) {
+        let message = obj.get("message").and_then(Value::as_object);
+        let text = match message.and_then(|m| m.get("content")) {
+            Some(Value::String(t)) => Some(t.as_str()),
+            Some(Value::Array(blocks)) => blocks.iter().find_map(|b| {
+                let b = b.as_object()?;
+                (b.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| b.get("text").and_then(Value::as_str))
+                    .flatten()
+            }),
+            _ => None,
+        };
+        let Some(text) = text else {
+            return;
+        };
+        let (Some(window), Some(at)) = (notice_window(text), row_time(obj)) else {
+            return;
+        };
+        let row = LimitNoticeRow {
+            reset_text: aterm_phase::notice_reset(text),
+            at,
+        };
+        if self
+            .limit_notices
+            .get(window)
+            .is_none_or(|held| held.at <= row.at)
+        {
+            self.limit_notices.insert(window.to_owned(), row);
         }
     }
 
@@ -640,8 +584,7 @@ impl TranscriptUsage {
             let buf = reader.fill_buf()?;
             if buf.is_empty() {
                 if overflow {
-                    self.rows = self.rows.saturating_add(1);
-                    self.rows_skipped_long = self.rows_skipped_long.saturating_add(1);
+                    self.note_long_line();
                 } else if !line.is_empty() {
                     self.fold_bytes(&line);
                 }
@@ -663,8 +606,7 @@ impl TranscriptUsage {
             reader.consume(used);
             if newline {
                 if overflow {
-                    self.rows = self.rows.saturating_add(1);
-                    self.rows_skipped_long = self.rows_skipped_long.saturating_add(1);
+                    self.note_long_line();
                     overflow = false;
                 } else {
                     self.fold_bytes(&line);
@@ -674,7 +616,9 @@ impl TranscriptUsage {
         }
     }
 
-    fn fold_bytes(&mut self, line: &[u8]) {
+    /// Fold one line's raw bytes: [`Self::fold_line`] when they are UTF-8,
+    /// else counted unparsed.
+    pub(crate) fn fold_bytes(&mut self, line: &[u8]) {
         match std::str::from_utf8(line) {
             Ok(s) => {
                 self.fold_line(s);
@@ -686,13 +630,84 @@ impl TranscriptUsage {
         }
     }
 
-    fn add(&mut self, model: &str, usage: TokenUsage) {
-        let key = if self.per_model.contains_key(model) || self.per_model.len() < MAX_MODELS {
+    /// Add another fold's spend and counters to this one — the files of one
+    /// session, summed for a view. The [`MAX_MODELS`] bound holds: a model
+    /// past it folds into [`OTHER_MODEL`]. The dedupe sets are not merged:
+    /// each file's ids were deduped within that file. Limit notices and the
+    /// served time are not summed: the limit wall is the main transcript's
+    /// own (`session_usage::SessionUsage::main`), and a subagent's notice is
+    /// not the session's.
+    pub(crate) fn absorb(&mut self, other: &Self) {
+        for (model, spend) in &other.per_model {
+            let key = self.model_key(model).to_owned();
+            self.per_model.entry(key).or_default().add_spend(spend);
+        }
+        for (mine, theirs) in [
+            (&mut self.rows, other.rows),
+            (&mut self.rows_unparsed, other.rows_unparsed),
+            (&mut self.rows_skipped_long, other.rows_skipped_long),
+            (&mut self.assistant_rows, other.assistant_rows),
+            (&mut self.rows_without_usage, other.rows_without_usage),
+            (&mut self.rows_without_id, other.rows_without_id),
+            (&mut self.duplicates, other.duplicates),
+            (&mut self.conflicting_repeats, other.conflicting_repeats),
+            (&mut self.sidechain_rows, other.sidechain_rows),
+        ] {
+            *mine = mine.saturating_add(theirs);
+        }
+        // The session's model is the first absorbed fold's that names one:
+        // `session_usage::SessionUsage::total_fold` absorbs the main transcript
+        // first, and a subagent's rows are sidechain rows, which name none.
+        if self.last_model.is_none() {
+            self.last_model.clone_from(&other.last_model);
+        }
+    }
+
+    /// Forget all but the newest `keep` message ids — for a FINISHED file,
+    /// whose totals are all a view needs: the few newest are kept so a
+    /// message still streaming when the file paused is raised, not counted
+    /// again, if the file grows once more.
+    pub(crate) fn shed_seen(&mut self, keep: usize) {
+        self.seen.shed(keep);
+        self.seen.order.shrink_to_fit();
+    }
+
+    /// How many message ids the dedupe set holds.
+    #[cfg(test)]
+    pub(crate) fn seen_ids(&self) -> usize {
+        self.seen.order.len()
+    }
+
+    /// Count one line longer than [`MAX_LINE_BYTES`] that a streaming reader
+    /// discarded without holding it.
+    pub(crate) fn note_long_line(&mut self) {
+        self.rows = self.rows.saturating_add(1);
+        self.rows_skipped_long = self.rows_skipped_long.saturating_add(1);
+    }
+
+    /// The key `model`'s spend is filed under: its own id while fewer than
+    /// [`MAX_MODELS`] are held (or it is one of them), else [`OTHER_MODEL`].
+    /// The one rule for every writer of `per_model`.
+    fn model_key<'a>(&self, model: &'a str) -> &'a str {
+        if self.per_model.contains_key(model) || self.per_model.len() < MAX_MODELS {
             model
         } else {
             OTHER_MODEL
-        };
-        self.per_model.entry(key.to_owned()).or_default().add(usage);
+        }
+    }
+
+    /// Sum one row's usage under `model`; a main-chain row (not a subagent's
+    /// `sidechain`) that names a model id also names the session's model
+    /// ([`Self::last_model`]) — Claude Code's own `<synthetic>` rows (an API
+    /// error, the usage-limit notice, `No response requested.`) carry usage
+    /// and an id but name no model, and never move it (the review of
+    /// 2026-09-27: right after a limit the HUD read `<synthetic>`).
+    fn add(&mut self, model: &str, usage: TokenUsage, sidechain: bool) {
+        if !sidechain && model != UNKNOWN_MODEL && super::upgrade::is_model_id(model) {
+            self.last_model = Some(model.to_owned());
+        }
+        let key = self.model_key(model).to_owned();
+        self.per_model.entry(key).or_default().add(usage);
     }
 }
 
@@ -805,20 +820,6 @@ impl PriceTable {
 // The view
 // ---------------------------------------------------------------------------
 
-/// One window of one account, as the view shows it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WindowView {
-    /// Percent used, as reported; `None` when unknown. Not clamped: the
-    /// `spend_limit` window reads above 100 once exceeded.
-    pub used_pct: Option<f64>,
-    /// Epoch seconds at which the window resets, when reported.
-    pub resets_at: Option<i64>,
-    /// Which input said so.
-    pub source: Source,
-    /// Seconds between that input's sample and `as_of`, when known.
-    pub age_s: Option<u64>,
-}
-
 /// Spend on one model, as the view shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpendView {
@@ -834,8 +835,7 @@ pub struct SpendView {
     pub usd: Option<f64>,
 }
 
-/// One account: its windows (account-wide), its spend (per model), the model
-/// its live session runs.
+/// One account: its spend (per model) and the model its live session runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountView {
     /// The owner's label for the account (`accounts.toml`).
@@ -844,11 +844,11 @@ pub struct AccountView {
     pub dir: Option<String>,
     /// Whether this is the account the live session runs under.
     pub active: bool,
-    /// Windows by the vendor's name.
-    pub windows: BTreeMap<String, WindowView>,
     /// Spend by model id.
     pub spend: BTreeMap<String, SpendView>,
-    /// The live session's model id, from the statusLine.
+    /// The session's model id: the one its transcript's newest summed row
+    /// names ([`TranscriptUsage::last_model`], taken by
+    /// [`Self::add_transcript`]).
     pub model: Option<String>,
 }
 
@@ -859,60 +859,19 @@ impl AccountView {
             label: label.into(),
             dir: None,
             active,
-            windows: BTreeMap::new(),
             spend: BTreeMap::new(),
             model: None,
         }
     }
 
-    /// Add a window, keeping the higher-authority source when the name is
-    /// already present; at equal authority the later one wins.
-    pub fn insert_window(&mut self, name: impl Into<String>, window: WindowView) {
-        let name = name.into();
-        let keep_existing = self
-            .windows
-            .get(&name)
-            .is_some_and(|have| have.source.figure_authority() > window.source.figure_authority());
-        if !keep_existing {
-            self.windows.insert(name, window);
-        }
-    }
-
-    /// Take the windows and the model from a statusLine sampled `age_s`
-    /// seconds before `as_of`.
-    pub fn add_statusline(&mut self, line: &StatusLine, age_s: u64) {
-        if let Some(id) = line.model_id() {
-            self.model = Some(id.to_owned());
-        }
-        for (name, w) in windows_from_statusline(line, age_s) {
-            self.insert_window(name, w);
-        }
-    }
-
-    /// Add one window read from the vendor's on-disk cache.
-    #[cfg(test)]
-    pub(crate) fn add_cache_window(
-        &mut self,
-        name: impl Into<String>,
-        used_pct: Option<f64>,
-        resets_at: Option<i64>,
-        age_s: Option<u64>,
-    ) {
-        self.insert_window(
-            name,
-            WindowView {
-                used_pct,
-                resets_at,
-                source: Source::Cache,
-                age_s,
-            },
-        );
-    }
-
-    /// Take the per-model spend from a transcript fold, priced by `prices`.
+    /// Take the per-model spend from a transcript fold, priced by `prices`,
+    /// and the model its newest summed row names.
     pub fn add_transcript(&mut self, usage: &TranscriptUsage, prices: &PriceTable) {
         for (model, s) in spend_from_transcript(usage, prices) {
             self.spend.insert(model, s);
+        }
+        if let Some(model) = usage.last_model() {
+            self.model = Some(model.to_owned());
         }
     }
 }
@@ -944,29 +903,6 @@ impl UsageView {
     }
 }
 
-/// The statusLine's windows as view windows, every one `source=statusline`.
-pub fn windows_from_statusline(line: &StatusLine, age_s: u64) -> BTreeMap<String, WindowView> {
-    line.rate_limits
-        .as_ref()
-        .map(|rl| {
-            rl.windows
-                .iter()
-                .map(|(name, w)| {
-                    (
-                        name.clone(),
-                        WindowView {
-                            used_pct: w.used_pct,
-                            resets_at: w.resets_at,
-                            source: Source::StatusLine,
-                            age_s: Some(age_s),
-                        },
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // The `/usage` panel, read off aterm's own grid (design §5.2 "source 0")
 // ---------------------------------------------------------------------------
@@ -975,7 +911,7 @@ pub fn windows_from_statusline(line: &StatusLine, age_s: u64) -> BTreeMap<String
 /// reset text is placed on a clock.
 ///
 /// This is the producer design §5.8.1 rank 1 always described and nothing
-/// built: [`Source::Grid`] was admissible and rankable, and no reader
+/// built: [`super::source::Source::Grid`] was admissible and rankable, and no reader
 /// could construct one. What the vendor prints was MEASURED twice against
 /// Claude Code 2.1.278 on 2026-09-22 — once by extracting the renderer from
 /// the installed binary, and once by driving a real session and reading the
@@ -991,7 +927,7 @@ pub fn windows_from_statusline(line: &StatusLine, age_s: u64) -> BTreeMap<String
 /// `/usage` panel, and this is its reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelWindow {
-    /// The statusLine / cache key this row names.
+    /// The window key this row names (the vendor's own: `five_hour`, …).
     pub name: String,
     /// The whole-number percent the vendor printed (`7% used` → 7). The
     /// vendor floors its own figure (`Math.floor(utilization)`, MEASURED), so
@@ -1262,22 +1198,6 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// `HH:MM` of an epoch instant in the zone `utc_offset_s` east of UTC.
-pub fn hhmm(epoch: i64, utc_offset_s: i64) -> String {
-    let s = epoch.saturating_add(utc_offset_s).rem_euclid(86_400);
-    format!("{:02}:{:02}", s / 3_600, (s % 3_600) / 60)
-}
-
-/// A short age: `12s`, `5m`, `3h`, `2d`.
-pub fn age_short(age_s: u64) -> String {
-    match age_s {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3_600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3_600),
-        s => format!("{}d", s / 86_400),
-    }
-}
-
 /// Cut a string to at most `max` bytes on a char boundary (the module-wide
 /// cut, not a copy of it).
 fn truncate_to(mut s: String, max: usize) -> String {
@@ -1289,23 +1209,14 @@ fn truncate_to(mut s: String, max: usize) -> String {
     s
 }
 
-fn pct_text(w: Option<&WindowView>) -> String {
-    match w.and_then(|w| w.used_pct) {
-        Some(p) => format!("{}%", p.round() as i64),
-        None => "?%".to_owned(),
-    }
-}
-
-/// The one-line HUD: `fable 62%/5h · 18%/7d · acct work · resets 15:45`.
+/// The one-line HUD: `fable ?%/5h · ?%/7d · acct work · resets ? · none`.
 ///
-/// The model is the shown account's live model family; the two percentages are
-/// that ACCOUNT's `five_hour` and `seven_day` windows (`?%` when unknown, never
-/// clamped); `resets` is the five-hour reset, else the seven-day one, in the
-/// zone `utc_offset_s` east of UTC (`?` when neither is known). When the
-/// windows shown did not come from the live statusLine the line ends with the
-/// source and its age (`· cache 1h`, `· none`), so a stale figure never reads
-/// as live. Cut to [`HUD_MAX_BYTES`] on a char boundary.
-pub fn hud_line(view: &UsageView, utc_offset_s: i64) -> String {
+/// The model is the shown account's live model family. The two windows'
+/// figures and the reset are `?` and their source `none`: no reader here
+/// knows a window (module doc) — `harness limits` prints the ones the
+/// vendor's `/usage` panel painted — and the line says so rather than
+/// inventing a number. Cut to [`HUD_MAX_BYTES`] on a char boundary.
+pub fn hud_line(view: &UsageView) -> String {
     let Some(acct) = view.shown() else {
         return "no account".to_owned();
     };
@@ -1315,31 +1226,13 @@ pub fn hud_line(view: &UsageView, utc_offset_s: i64) -> String {
         .map(model_short)
         .map(|m| sanitize(&m))
         .unwrap_or_else(|| "model?".to_owned());
-    let five = acct.windows.get("five_hour");
-    let seven = acct.windows.get("seven_day");
-    let resets = five
-        .and_then(|w| w.resets_at)
-        .or_else(|| seven.and_then(|w| w.resets_at))
-        .map_or_else(|| "?".to_owned(), |t| hhmm(t, utc_offset_s));
-    let mut line = format!(
-        "{model} {}/5h · {}/7d · acct {} · resets {resets}",
-        pct_text(five),
-        pct_text(seven),
-        sanitize(&acct.label)
-    );
-    match five.or(seven) {
-        Some(w) if w.source != Source::StatusLine => {
-            line.push_str(" · ");
-            line.push_str(w.source.as_str());
-            if let Some(age) = w.age_s {
-                line.push(' ');
-                line.push_str(&age_short(age));
-            }
-        }
-        Some(_) => {}
-        None => line.push_str(" · none"),
-    }
-    truncate_to(line, HUD_MAX_BYTES)
+    truncate_to(
+        format!(
+            "{model} ?%/5h · ?%/7d · acct {} · resets ? · none",
+            sanitize(&acct.label)
+        ),
+        HUD_MAX_BYTES,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,21 +1257,6 @@ fn opt_f64(v: Option<f64>) -> Value {
     v.filter(|f| f.is_finite()).map_or(Value::Null, Value::from)
 }
 
-fn opt_u64(v: Option<u64>) -> Value {
-    v.map_or(Value::Null, Value::from)
-}
-
-fn window_json(w: &WindowView) -> Value {
-    let mut o = Map::new();
-    o.insert("used_pct".to_owned(), opt_f64(w.used_pct));
-    if let Some(t) = w.resets_at {
-        o.insert("resets_at".to_owned(), Value::from(t));
-    }
-    o.insert("source".to_owned(), Value::from(w.source.as_str()));
-    o.insert("age_s".to_owned(), opt_u64(w.age_s));
-    Value::Object(o)
-}
-
 fn spend_json(s: &SpendView) -> Value {
     let mut o = Map::new();
     o.insert("in".to_owned(), Value::from(s.input));
@@ -1399,15 +1277,9 @@ fn account_json(a: &AccountView) -> Value {
         o.insert("dir".to_owned(), Value::from(dir.as_str()));
     }
     o.insert("active".to_owned(), Value::from(a.active));
-    o.insert(
-        "windows".to_owned(),
-        Value::Object(
-            a.windows
-                .iter()
-                .map(|(k, w)| (k.clone(), window_json(w)))
-                .collect(),
-        ),
-    );
+    // No window is known here (module doc); the key stays, empty, as every
+    // live run printed it.
+    o.insert("windows".to_owned(), Value::Object(Map::new()));
     o.insert(
         "spend".to_owned(),
         Value::Object(
@@ -1459,23 +1331,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // -- fixtures -----------------------------------------------------------
-
-    /// The vendor's statusLine shape (field names as its help text documents
-    /// them, 2.1.274), with integers and floats mixed on purpose.
-    const STATUSLINE: &str = r#"{
-      "session_id":"s-7f3","session_name":"wrapper","transcript_path":"/Users/_x/.claude/projects/p/s-7f3.jsonl",
-      "cwd":"/work/proj","model":{"id":"claude-fable-5-1","display_name":"Fable 5.1"},
-      "workspace":{"current_dir":"/work/proj","project_dir":"/work","added_dirs":[]},
-      "version":"2.1.274",
-      "context_window":{"total_input_tokens":1204000,"total_output_tokens":88000,"context_window_size":200000,
-        "current_usage":{"input_tokens":1500,"output_tokens":20,"cache_creation_input_tokens":300,"cache_read_input_tokens":90000},
-        "used_percentage":46.5,"remaining_percentage":53.5},
-      "effort":{"level":"high"},"thinking":{"enabled":true},
-      "rate_limits":{"five_hour":{"used_percentage":62,"resets_at":1789669500},
-                     "seven_day":{"used_percentage":18.4,"resets_at":1790000000.0},
-                     "spend_limit":{"used_percentage":140,"resets_at":1790500000}},
-      "prompt_cache":{"hits":3},"a_field_from_next_week":{"x":1}
-    }"#;
 
     /// The `/usage` panel exactly as Claude Code 2.1.278 painted it in a
     /// 120-column session, captured over aterm's control socket 2026-09-22.
@@ -1573,170 +1428,11 @@ mod tests {
         v
     }
 
+    /// An account with its model known.
     fn live_account() -> AccountView {
-        let line = parse_statusline(STATUSLINE).expect("fixture parses");
         let mut a = AccountView::new("work", true);
-        a.add_statusline(&line, 12);
+        a.model = Some("claude-fable-5-1".to_owned());
         a
-    }
-
-    // -- parse_statusline ---------------------------------------------------
-
-    #[test]
-    fn statusline_full_fixture_reads_every_documented_field() {
-        let s = parse_statusline(STATUSLINE).expect("parses");
-        assert_eq!(s.session_id.as_deref(), Some("s-7f3"));
-        assert_eq!(s.session_name.as_deref(), Some("wrapper"));
-        assert_eq!(s.cwd.as_deref(), Some("/work/proj"));
-        assert_eq!(s.version.as_deref(), Some("2.1.274"));
-        assert_eq!(s.model_id(), Some("claude-fable-5-1"));
-        assert_eq!(
-            s.model.as_ref().and_then(|m| m.display_name.as_deref()),
-            Some("Fable 5.1")
-        );
-        assert_eq!(
-            s.workspace.as_ref().and_then(|w| w.project_dir.as_deref()),
-            Some("/work")
-        );
-        let cw = s.context_window.as_ref().expect("context window");
-        assert_eq!(cw.total_input_tokens, Some(1_204_000));
-        assert_eq!(cw.context_window_size, Some(200_000));
-        assert_eq!(cw.used_percentage, Some(46.5));
-        assert_eq!(
-            cw.current_usage,
-            Some(TokenUsage {
-                input: 1500,
-                output: 20,
-                cache_write: 300,
-                cache_read: 90_000
-            })
-        );
-        assert_eq!(s.effort_level.as_deref(), Some("high"));
-        assert_eq!(s.thinking_enabled, Some(true));
-        let rl = s.rate_limits.as_ref().expect("rate limits");
-        assert_eq!(rl.five_hour().and_then(|w| w.used_pct), Some(62.0));
-        assert_eq!(
-            rl.five_hour().and_then(|w| w.resets_at),
-            Some(1_789_669_500)
-        );
-        // Float and integer are both numbers here.
-        assert_eq!(rl.seven_day().and_then(|w| w.used_pct), Some(18.4));
-        assert_eq!(
-            rl.seven_day().and_then(|w| w.resets_at),
-            Some(1_790_000_000)
-        );
-    }
-
-    #[test]
-    fn statusline_malformed_json_is_an_error_not_a_panic() {
-        for bad in [
-            "",
-            "{",
-            "{\"model\":}",
-            "not json at all",
-            "{\"a\":1} trailing",
-            "{\"s\":\"\\ud800\"}",
-        ] {
-            assert!(
-                matches!(parse_statusline(bad), Err(UsageError::Json(_))),
-                "{bad:?} should be a Json error"
-            );
-        }
-    }
-
-    #[test]
-    fn statusline_top_level_must_be_an_object() {
-        assert_eq!(parse_statusline("[1,2,3]"), Err(UsageError::NotObject));
-        assert_eq!(parse_statusline("42"), Err(UsageError::NotObject));
-        assert_eq!(parse_statusline("null"), Err(UsageError::NotObject));
-    }
-
-    #[test]
-    fn statusline_missing_rate_limits_reads_none_and_yields_no_windows() {
-        let s = parse_statusline(r#"{"model":{"id":"claude-opus-5"},"version":"2.1.274"}"#)
-            .expect("parses");
-        assert!(s.rate_limits.is_none());
-        assert!(windows_from_statusline(&s, 0).is_empty());
-        // `rate_limits` that is not an object reads the same as absent.
-        let s = parse_statusline(r#"{"rate_limits":"soon"}"#).expect("parses");
-        assert!(s.rate_limits.is_none());
-        // Present but empty: Some, with no windows — the API reported nothing.
-        let s = parse_statusline(r#"{"rate_limits":{}}"#).expect("parses");
-        assert!(s.rate_limits.as_ref().is_some_and(|r| r.windows.is_empty()));
-    }
-
-    #[test]
-    fn statusline_window_above_100_percent_is_kept_not_clamped() {
-        let s = parse_statusline(STATUSLINE).expect("parses");
-        let rl = s.rate_limits.as_ref().expect("rate limits");
-        assert_eq!(rl.spend_limit().and_then(|w| w.used_pct), Some(140.0));
-        let w = windows_from_statusline(&s, 5);
-        assert_eq!(w["spend_limit"].used_pct, Some(140.0));
-        assert_eq!(w["spend_limit"].source, Source::StatusLine);
-        assert_eq!(w["spend_limit"].age_s, Some(5));
-    }
-
-    #[test]
-    fn statusline_every_field_is_optional_and_wrong_types_read_as_absent() {
-        let s = parse_statusline("{}").expect("parses");
-        assert_eq!(s, StatusLine::default());
-        let s = parse_statusline(
-            r#"{"model":"claude-fable-5-1","context_window":[],"effort":{"level":7},
-                "thinking":{"enabled":"yes"},
-                "rate_limits":{"five_hour":{"used_percentage":"62","resets_at":null},
-                               "seven_day":17,"spend_limit":{"used_percentage":-3}}}"#,
-        )
-        .expect("parses");
-        assert!(s.model.is_none());
-        assert!(s.context_window.is_none());
-        assert!(s.effort_level.is_none());
-        assert!(s.thinking_enabled.is_none());
-        let rl = s.rate_limits.as_ref().expect("rate limits");
-        // A string percentage is not a number; the window itself still exists.
-        assert_eq!(rl.five_hour().map(|w| w.used_pct), Some(None));
-        assert!(rl.seven_day().is_none(), "a non-object window is dropped");
-        // A negative percentage is kept: it is what was reported.
-        assert_eq!(rl.spend_limit().and_then(|w| w.used_pct), Some(-3.0));
-    }
-
-    #[test]
-    fn statusline_unknown_windows_are_kept_and_the_count_is_bounded() {
-        let s = parse_statusline(
-            r#"{"rate_limits":{"seven_day_opus":{"used_percentage":null},"five_hour":{"used_percentage":1}}}"#,
-        )
-        .expect("parses");
-        let rl = s.rate_limits.as_ref().expect("rate limits");
-        assert_eq!(rl.windows.len(), 2);
-        assert_eq!(rl.windows["seven_day_opus"].used_pct, None);
-
-        let many: Vec<String> = (0..(MAX_WINDOWS + 10))
-            .map(|i| format!(r#""w{i:03}":{{"used_percentage":{i}}}"#))
-            .collect();
-        let doc = format!(r#"{{"rate_limits":{{{}}}}}"#, many.join(","));
-        let s = parse_statusline(&doc).expect("parses");
-        assert_eq!(
-            s.rate_limits.as_ref().map(|r| r.windows.len()),
-            Some(MAX_WINDOWS)
-        );
-    }
-
-    #[test]
-    fn statusline_hostile_nesting_and_size_are_errors() {
-        let deep = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
-        assert!(matches!(parse_statusline(&deep), Err(UsageError::Json(_))));
-        let deep_obj = format!("{}1{}", r#"{"a":"#.repeat(5_000), "}".repeat(5_000));
-        assert!(matches!(
-            parse_statusline(&deep_obj),
-            Err(UsageError::Json(_))
-        ));
-        let huge = format!(r#"{{"pad":"{}"}}"#, "x".repeat(MAX_STATUSLINE_BYTES));
-        assert!(matches!(
-            parse_statusline(&huge),
-            Err(UsageError::TooLong {
-                max: MAX_STATUSLINE_BYTES,
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -1749,7 +1445,6 @@ mod tests {
         assert_eq!(num_f64(v.get("f")), Some(62.7));
         assert_eq!(num_u64(v.get("f")), Some(62));
         assert_eq!(num_u64(v.get("neg")), None);
-        assert_eq!(num_i64(v.get("neg")), Some(-1));
         assert_eq!(num_u64(v.get("big")), Some(u64::MAX), "saturates");
         assert_eq!(num_f64(v.get("s")), None);
         assert_eq!(num_f64(v.get("n")), None);
@@ -1939,16 +1634,247 @@ mod tests {
         assert_eq!(t.rows, 4);
     }
 
+    /// A differing repeat raises each count to the largest seen for its id
+    /// and sums only the growth; the message counts once.
     #[test]
-    fn transcript_conflicting_repeat_keeps_the_first_and_counts_it() {
+    fn transcript_differing_repeat_raises_to_the_largest_and_counts_once() {
         let mut t = TranscriptUsage::new();
         let first = assistant_row("msg_c", "m", 100, 10);
-        let differs = assistant_row("msg_c", "m", 100, 999);
+        let grown = assistant_row("msg_c", "m", 100, 999);
+        let lower = assistant_row("msg_c", "m", 50, 20);
         assert_eq!(t.fold_line(&first), Fold::Summed);
-        assert_eq!(t.fold_line(&differs), Fold::Conflict);
-        assert_eq!(t.per_model()["m"].output, 10);
-        assert_eq!(t.conflicting_repeats, 1);
-        assert_eq!(t.duplicates, 1);
+        assert_eq!(t.fold_line(&grown), Fold::Conflict);
+        assert_eq!(t.fold_line(&lower), Fold::Conflict);
+        let m = t.per_model()["m"];
+        assert_eq!(m.output, 999, "the largest output, not the first");
+        assert_eq!(m.input, 100, "a lower count never lowers what is held");
+        assert_eq!(m.messages, 1);
+        assert_eq!(t.conflicting_repeats, 2);
+        assert_eq!(t.duplicates, 2);
+    }
+
+    /// THE MEASURED SUBAGENT SHAPE (2026-09-25, `agent-*.jsonl`): one message
+    /// streamed over three rows — `stop_reason` null with the message_start
+    /// output twice, then the final row. Its output is the final 349, once;
+    /// keeping the first row counted 8.
+    #[test]
+    fn a_streamed_subagent_message_counts_its_final_output_once() {
+        let row = |stop: &str, output: u64, block: &str| {
+            format!(
+                r#"{{"type":"assistant","isSidechain":true,"message":{{"id":"msg_011Cej","model":"claude-opus-5","role":"assistant","stop_reason":{stop},"content":[{{"type":"{block}"}}],"usage":{{"input_tokens":3,"output_tokens":{output},"cache_creation_input_tokens":1200,"cache_read_input_tokens":20000}}}}}}"#
+            )
+        };
+        let mut t = TranscriptUsage::new();
+        fold_all(
+            &mut t,
+            &[
+                &row("null", 8, "thinking"),
+                &row("null", 8, "tool_use"),
+                &row("\"tool_use\"", 349, "tool_use"),
+            ],
+        );
+        let m = t.per_model()["claude-opus-5"];
+        assert_eq!(m.output, 349);
+        assert_eq!(m.messages, 1);
+        assert_eq!((m.input, m.cache_write, m.cache_read), (3, 1200, 20_000));
+    }
+
+    /// A LIMIT NOTICE WRITTEN INTO THE TRANSCRIPT (the vendor's own row shape:
+    /// `model: <synthetic>`, `isApiErrorMessage: true`, the notice as its
+    /// text, its own `timestamp`) is kept per window it names, the newest
+    /// one — with the reset its text names. A notice that names no window,
+    /// an ordinary assistant row quoting the words, and an older row are not.
+    #[test]
+    fn a_limit_notice_row_is_kept_with_its_time() {
+        let notice = |text: &str, ts: &str, api_error: bool| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","isApiErrorMessage":{api_error},"error":"rate_limit","message":{{"id":"x-{ts}","model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":"{text}"}}],"usage":{{"input_tokens":0,"output_tokens":0}}}}}}"#
+            )
+        };
+        let mut t = TranscriptUsage::new();
+        fold_all(
+            &mut t,
+            &[
+                &notice(
+                    "You've hit your session limit · resets 3pm (America/Los_Angeles)",
+                    "2026-09-24T21:00:00.000Z",
+                    true,
+                ),
+                &notice(
+                    "You've hit your session limit · resets 1pm (America/Los_Angeles)",
+                    "2026-09-23T19:00:00Z",
+                    true,
+                ),
+                &notice(
+                    "You've hit your weekly limit · resets Oct 1 at 9am (UTC)",
+                    "2026-09-24T20:30:00Z",
+                    true,
+                ),
+                &notice(
+                    "You've hit your limit · resets 4pm",
+                    "2026-09-25T00:00:00Z",
+                    true,
+                ),
+                &notice(
+                    "You've hit your session limit · resets 5pm",
+                    "2026-09-25T00:00:00Z",
+                    false,
+                ),
+            ],
+        );
+        let rows = t.limit_notices();
+        assert_eq!(
+            rows.get("five_hour"),
+            Some(&LimitNoticeRow {
+                reset_text: Some("3pm (America/Los_Angeles)".into()),
+                at: 1_790_283_600,
+            }),
+            "the newest, not the later-written older one; not the quoted words"
+        );
+        assert_eq!(
+            rows.get("seven_day")
+                .map(|r| (r.reset_text.as_deref(), r.at)),
+            Some((Some("Oct 1 at 9am (UTC)"), 1_790_281_800)),
+        );
+        assert_eq!(rows.len(), 2, "a notice naming no window is not kept");
+        assert_eq!(t.served_at(), None, "a notice is no served response");
+        let mut summed = TranscriptUsage::new();
+        summed.absorb(&t);
+        assert!(
+            summed.limit_notices().is_empty(),
+            "a sum carries no wall: the footer reads the main file's own fold"
+        );
+    }
+
+    /// The selective parser still feeds the live footer wall, including when
+    /// flags and timestamps follow content or use escaped, duplicate keys.
+    #[test]
+    fn projected_usage_preserves_the_live_limit_wall_and_its_lift() {
+        let at = |minute: u32| format!("2026-09-28T12:{minute:02}:00Z");
+        let unix = |minute: u32| {
+            i64::try_from(super::super::upgrade_models::parse_utc(&at(minute)).unwrap()).unwrap()
+        };
+        let answer = |output: u64, minute: u32, api_error: bool| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m1","model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":{output}}}}},"timestamp":"{}","isApiErrorMessage":{api_error}}}"#,
+                at(minute)
+            )
+        };
+        for content in [
+            r#""You've hit your session limit · resets 3pm (UTC)""#,
+            r#"[{"type":"tool_result","text":"not the notice","content":{"output":"ignored"}},null,["nested"],{"type":"text","text":"You've hit your session limit · resets 3pm (UTC)"}]"#,
+        ] {
+            let mut t = TranscriptUsage::new();
+            assert_eq!(t.fold_line(&answer(5, 0, false)), Fold::Summed);
+            // The last spelling of each key wins, even when escaped and
+            // placed after the message whose text the notice reader needs.
+            let notice = format!(
+                r#"{{"type":"assistant","isApiErrorMessage":false,"timestamp":"2026-09-27T12:00:00Z","message":{{"id":"notice","model":"<synthetic>","content":{content}}},"isApiErrorMess\u0061ge":true,"tim\u0065stamp":"{}"}}"#,
+                at(1)
+            );
+            assert_eq!(t.fold_line(&notice), Fold::NoUsage);
+            assert_eq!(
+                t.limit_notices().get("five_hour"),
+                Some(&LimitNoticeRow {
+                    reset_text: Some("3pm (UTC)".into()),
+                    at: unix(1),
+                })
+            );
+            let wall = |t: &TranscriptUsage| {
+                super::super::session_usage::wall_of(
+                    t.limit_notices(),
+                    t.served_at(),
+                    unix(4),
+                    &|_, _| Some(0),
+                )
+            };
+            assert!(wall(&t).is_some(), "the new notice reaches the live wall");
+            assert_eq!(t.fold_line(&answer(5, 2, false)), Fold::Duplicate);
+            assert_eq!(t.fold_line(&answer(9, 3, true)), Fold::Conflict);
+            assert_eq!(t.served_at(), Some(unix(0)));
+            assert!(
+                wall(&t).is_some(),
+                "a repeated response or API-error row cannot lift the wall"
+            );
+            assert_eq!(t.fold_line(&answer(12, 4, false)), Fold::Conflict);
+            assert_eq!(t.served_at(), Some(unix(4)));
+            assert!(wall(&t).is_none(), "new served output lifts the wall");
+            let counts = t.per_model()["claude-opus-5-5"];
+            assert_eq!((counts.output, counts.messages), (12, 1));
+        }
+    }
+
+    /// THE SERVED TIME is the newest response the API served: a row with
+    /// usage whose message is new or grew, or has no id — not Claude Code's
+    /// own rows (`isApiErrorMessage`, `<synthetic>`), not a repeat at the
+    /// same figures, not a row without usage or without a model.
+    #[test]
+    fn the_served_time_is_the_newest_served_response() {
+        let at = |minute: u32| format!("2026-09-24T21:{minute:02}:00.000Z");
+        let row = |id: Option<&str>, model: &str, out: u64, minute: u32, api_error: bool| {
+            let id = id.map_or(String::new(), |id| format!("\"id\":\"{id}\","));
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","isApiErrorMessage":{api_error},"message":{{{id}"model":"{model}","usage":{{"input_tokens":1,"output_tokens":{out}}}}}}}"#,
+                at(minute)
+            )
+        };
+        let minute = |m: i64| 1_790_283_600 + m * 60;
+        let mut t = TranscriptUsage::new();
+        t.fold_line(&row(Some("n"), "<synthetic>", 0, 1, true));
+        assert_eq!(t.served_at(), None, "a limit notice");
+        t.fold_line(&row(Some("m1"), "claude-opus-5-5", 5, 2, false));
+        assert_eq!(t.served_at(), Some(minute(2)));
+        t.fold_line(&row(Some("m1"), "claude-opus-5-5", 5, 3, false));
+        assert_eq!(t.served_at(), Some(minute(2)), "the same figures again");
+        t.fold_line(&row(Some("m1"), "claude-opus-5-5", 9, 4, false));
+        assert_eq!(t.served_at(), Some(minute(4)), "the message grew");
+        t.fold_line(&row(Some("m1"), "claude-opus-5-5", 2, 30, false));
+        assert_eq!(
+            t.served_at(),
+            Some(minute(4)),
+            "a repeat BELOW the figures held grew nothing: not served"
+        );
+        t.fold_line(&row(None, "claude-opus-5-5", 1, 5, false));
+        assert_eq!(t.served_at(), Some(minute(5)), "a row with no id");
+        t.fold_line(&row(Some("s"), "<synthetic>", 3, 6, false));
+        t.fold_line(&row(Some("e"), "claude-opus-5-5", 3, 7, true));
+        t.fold_line(&format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"u","model":"claude-opus-5-5"}}}}"#,
+            at(8)
+        ));
+        t.fold_line(&format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"v","usage":{{"input_tokens":1}}}}}}"#,
+            at(9)
+        ));
+        assert_eq!(
+            t.served_at(),
+            Some(minute(5)),
+            "synthetic, an API error, no usage, no model: none served"
+        );
+        t.fold_line(&row(Some("m2"), "claude-opus-5-5", 1, 1, false));
+        assert_eq!(t.served_at(), Some(minute(5)), "the NEWEST time is kept");
+    }
+
+    /// Which window a notice NAMES: the screen's wall classes, narrowed to a
+    /// notice that says its window.
+    #[test]
+    fn a_notice_names_its_window_or_none() {
+        for (text, want) in [
+            (
+                "You've hit your session limit · resets 3pm",
+                Some("five_hour"),
+            ),
+            (
+                "You\u{2019}ve hit your weekly limit · resets Oct 1 at 9am",
+                Some("seven_day"),
+            ),
+            ("You've hit your limit · resets 4pm", None),
+            ("Approaching usage limit · resets 3pm", None),
+            ("Login expired · Please run /login", None),
+            ("the session limit is a thing", None),
+        ] {
+            assert_eq!(notice_window(text), want, "{text}");
+        }
     }
 
     #[test]
@@ -2153,36 +2079,105 @@ mod tests {
 
     // -- the view -----------------------------------------------------------
 
+    /// The account's model is the one its transcript's newest main-chain row
+    /// names: a `/model` switch shows from the first answer after it, and a
+    /// subagent's sidechain row on another model does not move it.
+    /// NEGATIVE CONTROL: a fold with no row that names a model names none.
     #[test]
-    fn account_window_authority_statusline_over_cache_over_transcript() {
-        let mut a = AccountView::new("work", true);
-        a.add_cache_window("five_hour", Some(5.0), None, Some(3600));
-        assert_eq!(a.windows["five_hour"].source, Source::Cache);
-        let line = parse_statusline(STATUSLINE).expect("parses");
-        a.add_statusline(&line, 12);
-        assert_eq!(a.windows["five_hour"].source, Source::StatusLine);
-        assert_eq!(a.windows["five_hour"].used_pct, Some(62.0));
-        assert_eq!(a.model.as_deref(), Some("claude-fable-5-1"));
-        // A later cache sample does not displace the live figure.
-        a.add_cache_window("five_hour", Some(99.0), None, Some(1));
-        assert_eq!(a.windows["five_hour"].used_pct, Some(62.0));
-        // But it does fill a window the statusLine did not carry.
-        a.add_cache_window("seven_day_opus", None, None, Some(3600));
-        assert_eq!(a.windows["seven_day_opus"].source, Source::Cache);
-        // A transcript-sourced window never displaces cache.
-        a.insert_window(
-            "seven_day_opus",
-            WindowView {
-                used_pct: Some(1.0),
-                resets_at: None,
-                source: Source::Transcript,
-                age_s: None,
-            },
+    fn the_account_model_is_the_newest_main_chain_row_of_its_transcript() {
+        let mut t = TranscriptUsage::new();
+        assert_eq!(t.last_model(), None);
+        let side = r#"{"type":"assistant","isSidechain":true,"message":{"id":"msg_s","model":"claude-haiku-4-5","usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        fold_all(
+            &mut t,
+            &[
+                &assistant_row("msg_a", "claude-opus-5", 10, 1),
+                &assistant_row("msg_b", "claude-fable-5-1", 10, 1),
+                side,
+            ],
         );
-        assert_eq!(a.windows["seven_day_opus"].source, Source::Cache);
-        // Equal authority: the later sample wins.
-        a.add_cache_window("seven_day_opus", Some(2.0), None, Some(10));
-        assert_eq!(a.windows["seven_day_opus"].used_pct, Some(2.0));
+        assert_eq!(t.last_model(), Some("claude-fable-5-1"));
+        let mut a = AccountView::new("work", true);
+        a.add_transcript(&t, &PriceTable::new());
+        assert_eq!(a.model.as_deref(), Some("claude-fable-5-1"));
+        // A row that names no model: nothing named.
+        let mut none = TranscriptUsage::new();
+        fold_all(
+            &mut none,
+            &[r#"{"type":"assistant","message":{"id":"msg_n","usage":{"input_tokens":1}}}"#],
+        );
+        assert_eq!(none.last_model(), None);
+        let mut a = AccountView::new("work", true);
+        a.add_transcript(&none, &PriceTable::new());
+        assert_eq!(a.model, None);
+    }
+
+    /// `harness usage` reads the session's SUM (`SessionUsage::total_fold`),
+    /// which absorbs the main transcript's fold and then each subagent's into
+    /// a fresh one: the sum names the main transcript's model, and a
+    /// subagent's file — sidechain rows on another model — does not move it.
+    /// FAILED before 2026-09-28 (the merge of the model rule with the
+    /// session sum): `absorb` carried spend and counters but no model, so the
+    /// view `harness usage` prints named none. NEGATIVE CONTROL: a sum of
+    /// folds that name no model names none.
+    #[test]
+    fn the_session_sum_names_the_main_transcripts_model() {
+        let mut main = TranscriptUsage::new();
+        fold_all(
+            &mut main,
+            &[&assistant_row("msg_a", "claude-fable-5-1", 10, 1)],
+        );
+        let side = assistant_row("msg_s", "claude-haiku-4-5", 1, 1)
+            .replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+        let mut sub = TranscriptUsage::new();
+        fold_all(&mut sub, &[&side]);
+        assert_eq!(sub.last_model(), None, "a sidechain row names no model");
+        let mut all = TranscriptUsage::new();
+        all.absorb(&main);
+        all.absorb(&sub);
+        assert_eq!(all.last_model(), Some("claude-fable-5-1"));
+        assert_eq!(all.per_model().len(), 2, "both files' spend is summed");
+        let mut a = AccountView::new("account", true);
+        a.add_transcript(&all, &PriceTable::new());
+        assert_eq!(a.model.as_deref(), Some("claude-fable-5-1"));
+        // NEGATIVE CONTROL: nothing named anywhere, nothing named in the sum.
+        let mut none = TranscriptUsage::new();
+        none.absorb(&sub);
+        none.absorb(&TranscriptUsage::new());
+        assert_eq!(none.last_model(), None);
+    }
+
+    /// THE REVIEW OF 2026-09-27: Claude Code's `<synthetic>` rows (an API
+    /// error, the usage-limit notice, `No response requested.`) carry usage
+    /// and an id on the main chain, and right after a limit — when `harness
+    /// usage` is read — the HUD named `<synthetic>`. A row that names no
+    /// model id leaves the session's model as it was. NEGATIVE CONTROL: a
+    /// real model after it moves it.
+    #[test]
+    fn a_synthetic_row_never_names_the_sessions_model() {
+        let synthetic = r#"{"type":"assistant","isSidechain":false,"message":{"id":"msg_x","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your limit"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+        let mut t = TranscriptUsage::new();
+        fold_all(
+            &mut t,
+            &[
+                &assistant_row("msg_a", "claude-fable-5-1", 10, 1),
+                synthetic,
+            ],
+        );
+        assert_eq!(t.last_model(), Some("claude-fable-5-1"));
+        let mut a = AccountView::new("account", true);
+        a.add_transcript(&t, &PriceTable::new());
+        assert_eq!(
+            hud_line(&view_with(a)),
+            "fable ?%/5h · ?%/7d · acct account · resets ? · none"
+        );
+        // Alone, it names nothing.
+        let mut only = TranscriptUsage::new();
+        fold_all(&mut only, &[synthetic]);
+        assert_eq!(only.last_model(), None);
+        // NEGATIVE CONTROL: a real model after it.
+        fold_all(&mut t, &[&assistant_row("msg_b", "claude-opus-5", 10, 1)]);
+        assert_eq!(t.last_model(), Some("claude-opus-5"));
     }
 
     #[test]
@@ -2199,57 +2194,19 @@ mod tests {
 
     // -- hud_line -----------------------------------------------------------
 
+    /// The HUD names the model family and the account, and says the
+    /// windows are unknown here (`?%`, `resets ?`, source `none`) rather
+    /// than inventing a number.
     #[test]
-    fn hud_line_happy_path_matches_the_design_shape() {
-        // 1789669500 is 2026-09-17 18:25:00 UTC; at +0 the line reads 18:25.
-        // (The design's example pairs that instant with "15:45"; the two do
-        // not agree in any whole-hour zone, so the instant is the fixture.)
+    fn hud_line_names_the_model_and_says_the_windows_are_unknown() {
+        assert_eq!(hud_line(&UsageView::new(0)), "no account");
         assert_eq!(
-            hud_line(&view_with(live_account()), 0),
-            "fable 62%/5h · 18%/7d · acct work · resets 18:25"
+            hud_line(&view_with(live_account())),
+            "fable ?%/5h · ?%/7d · acct work · resets ? · none"
         );
-    }
-
-    #[test]
-    fn hud_line_applies_the_utc_offset_and_wraps_midnight() {
-        let v = view_with(live_account());
-        assert_eq!(hhmm(1_789_669_500, 0), "18:25");
-        assert!(hud_line(&v, -7 * 3600).ends_with("resets 11:25"));
-        assert!(hud_line(&v, 6 * 3600).ends_with("resets 00:25"));
-        assert!(hud_line(&v, -19 * 3600).ends_with("resets 23:25"));
-        assert_eq!(hhmm(0, 0), "00:00");
-        assert_eq!(hhmm(-1, 0), "23:59", "before the epoch still wraps");
-        assert_eq!(hhmm(i64::MAX, i64::MAX), hhmm(i64::MAX, 0), "saturates");
-    }
-
-    #[test]
-    fn hud_line_says_unknown_rather_than_inventing_a_number() {
-        assert_eq!(hud_line(&UsageView::new(0), 0), "no account");
-        let a = AccountView::new("work", true);
         assert_eq!(
-            hud_line(&view_with(a), 0),
+            hud_line(&view_with(AccountView::new("work", true))),
             "model? ?%/5h · ?%/7d · acct work · resets ? · none"
-        );
-        // Only the seven-day window known, from cache: its reset is used and
-        // the source and age are named.
-        let mut a = AccountView::new("alt-1", false);
-        a.model = Some("claude-opus-5".to_owned());
-        a.add_cache_window("seven_day", Some(18.4), Some(1_790_000_000), Some(86_400));
-        assert_eq!(
-            hud_line(&view_with(a), 0),
-            "opus ?%/5h · 18%/7d · acct alt-1 · resets 14:13 · cache 1d"
-        );
-    }
-
-    #[test]
-    fn hud_line_keeps_a_window_above_100_and_rounds_halves_away() {
-        let mut a = AccountView::new("work", true);
-        a.model = Some("claude-fable-5-1".to_owned());
-        a.add_cache_window("five_hour", Some(250.0), Some(60), None);
-        a.add_cache_window("seven_day", Some(0.5), None, None);
-        assert_eq!(
-            hud_line(&view_with(a), 0),
-            "fable 250%/5h · 1%/7d · acct work · resets 00:01 · cache"
         );
     }
 
@@ -2257,7 +2214,7 @@ mod tests {
     fn hud_line_is_capped_at_1024_bytes_on_a_char_boundary() {
         let mut a = AccountView::new("é".repeat(700), true);
         a.model = Some("claude-fable-5-1".to_owned());
-        let line = hud_line(&view_with(a), 0);
+        let line = hud_line(&view_with(a));
         assert!(line.len() <= HUD_MAX_BYTES, "{}", line.len());
         assert!(
             line.len() > HUD_MAX_BYTES - 4,
@@ -2271,7 +2228,7 @@ mod tests {
         for label in ["日".repeat(400), "🙂".repeat(300)] {
             let mut a = AccountView::new(label, true);
             a.model = Some("m".to_owned());
-            let line = hud_line(&view_with(a), 0);
+            let line = hud_line(&view_with(a));
             assert!(line.len() <= HUD_MAX_BYTES);
             assert!(line.len() > HUD_MAX_BYTES - 5);
             assert!(std::str::from_utf8(line.as_bytes()).is_ok());
@@ -2285,7 +2242,7 @@ mod tests {
     fn hud_line_flattens_control_characters_in_labels_and_model_ids() {
         let mut a = AccountView::new("wo\nrk\x1b[31m", true);
         a.model = Some("claude-fa\tble-5-1".to_owned());
-        let line = hud_line(&view_with(a), 0);
+        let line = hud_line(&view_with(a));
         assert!(!line.contains('\n') && !line.contains('\x1b') && !line.contains('\t'));
         assert!(line.starts_with("fa ble ?%/5h"));
 
@@ -2294,7 +2251,7 @@ mod tests {
         // it into a one-line status field until 2026-09-22.
         assert!(!'\u{2028}'.is_control());
         let split = AccountView::new("wo\u{2028}rk", true);
-        let line = hud_line(&view_with(split), 0);
+        let line = hud_line(&view_with(split));
         assert!(!line.contains('\u{2028}'), "{line:?}");
         assert!(line.contains("wo rk"), "{line:?}");
     }
@@ -2312,10 +2269,6 @@ mod tests {
             "no family word: the id itself"
         );
         assert_eq!(model_short(""), "");
-        assert_eq!(age_short(12), "12s");
-        assert_eq!(age_short(300), "5m");
-        assert_eq!(age_short(3_600 * 3 + 59), "3h");
-        assert_eq!(age_short(86_400 * 2), "2d");
     }
 
     // -- usage_json ---------------------------------------------------------
@@ -2324,7 +2277,6 @@ mod tests {
     fn usage_json_is_schema_1_and_round_trips_through_the_parser() {
         let mut work = live_account();
         work.dir = Some("/Users/_x/.claude".to_owned());
-        work.add_cache_window("seven_day_opus", None, None, Some(3600));
         let mut t = TranscriptUsage::new();
         fold_all(
             &mut t,
@@ -2343,8 +2295,7 @@ mod tests {
             },
         );
         work.add_transcript(&t, &prices);
-        let mut alt = AccountView::new("alt-1", false);
-        alt.add_cache_window("five_hour", Some(5.0), None, Some(86_400));
+        let alt = AccountView::new("alt-1", false);
         let mut v = UsageView::new(1_789_650_000);
         v.accounts.push(work);
         v.accounts.push(alt);
@@ -2359,27 +2310,10 @@ mod tests {
         assert_eq!(w["label"].as_str(), Some("work"));
         assert_eq!(w["dir"].as_str(), Some("/Users/_x/.claude"));
         assert_eq!(w["active"].as_bool(), Some(true));
-        assert_eq!(w["model"].as_str(), Some("claude-fable-5-1"));
-        assert_eq!(w["windows"]["five_hour"]["used_pct"].as_f64(), Some(62.0));
-        assert_eq!(
-            w["windows"]["five_hour"]["resets_at"].as_i64(),
-            Some(1_789_669_500)
-        );
-        assert_eq!(
-            w["windows"]["five_hour"]["source"].as_str(),
-            Some("statusline")
-        );
-        assert_eq!(w["windows"]["five_hour"]["age_s"].as_u64(), Some(12));
-        assert_eq!(
-            w["windows"]["spend_limit"]["used_pct"].as_f64(),
-            Some(140.0)
-        );
-        assert!(w["windows"]["seven_day_opus"]["used_pct"].is_null());
-        assert!(w["windows"]["seven_day_opus"].get("resets_at").is_none());
-        assert_eq!(
-            w["windows"]["seven_day_opus"]["source"].as_str(),
-            Some("cache")
-        );
+        // The newest summed row of the transcript names the model.
+        assert_eq!(w["model"].as_str(), Some("claude-opus-5"));
+        // No window is known here: the key stays, empty.
+        assert!(w["windows"].as_object().is_some_and(Map::is_empty));
         let fable = &w["spend"]["claude-fable-5-1"];
         assert_eq!(fable["in"].as_u64(), Some(1_000_000));
         assert_eq!(fable["out"].as_u64(), Some(0));
@@ -2395,8 +2329,7 @@ mod tests {
         assert_eq!(a["active"].as_bool(), Some(false));
         assert!(a.get("model").is_none());
         assert!(a.get("dir").is_none());
-        assert_eq!(a["windows"]["five_hour"]["source"].as_str(), Some("cache"));
-        assert_eq!(a["windows"]["five_hour"]["age_s"].as_u64(), Some(86_400));
+        assert!(a["windows"].as_object().is_some_and(Map::is_empty));
         assert!(a["spend"].as_object().is_some_and(Map::is_empty));
         assert_eq!(j["sheet"]["enabled"].as_bool(), Some(false));
         assert!(j["sheet"]["last_sync"].is_null());
@@ -2444,7 +2377,7 @@ mod tests {
                     reset_text: Some(String::from("Sep 23 at 12pm (America/Los_Angeles)")),
                 },
                 PanelWindow {
-                    // The window the statusLine and the cache cannot carry.
+                    // A window only the panel carries.
                     name: String::from("seven_day_overage_included"),
                     used_pct: 100,
                     reset_text: Some(String::from("Sep 23 at 11:59am (America/Los_Angeles)")),

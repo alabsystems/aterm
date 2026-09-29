@@ -20,6 +20,7 @@ mod line_ops;
 mod pin_methods;
 pub mod reflow;
 mod reflow_pullback;
+mod resize_undo;
 mod scroll;
 pub mod scroll_convert;
 mod scroll_fill;

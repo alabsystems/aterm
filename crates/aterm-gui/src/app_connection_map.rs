@@ -847,6 +847,7 @@ mod tests {
         *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
             id: 42,
             driver: None,
+            typing: true,
         });
         app.connection_map_prepaint(wid);
         let lines = app.windows[&wid].connection_map().unwrap().controls_lines();

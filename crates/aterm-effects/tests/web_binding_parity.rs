@@ -4,8 +4,8 @@
 //! Drift guard for the duplicated web-binding modules.
 //!
 //! `aterm-wasm` (CPU/self-contained bundle) and `aterm-gpu-web` (WebGPU parity)
-//! each carry a copy of FIVE `#[wasm_bindgen]` surface modules — `effects_api`,
-//! `notifications_api`, `predict_api`, `scroll_input_api`,
+//! each carry a copy of SIX `#[wasm_bindgen]` surface modules — `effects_api`,
+//! `messages_api`, `notifications_api`, `predict_api`, `scroll_input_api`,
 //! `scrollback_tiers_api`. They deliberately are NOT single-sourced (a macro
 //! over `#[wasm_bindgen] impl` blocks degrades error locality and IDE
 //! navigation), so the ONLY thing keeping the copies honest is this test.
@@ -64,11 +64,28 @@ const NOT_DUPLICATED: &[&str] = &["lib.rs"];
 /// is therefore a deliberate, reviewable act.
 const KNOWN_DUPLICATED: &[&str] = &[
     "effects_api.rs",
+    // The message band (design ruling 340 of
+    // docs/DESIGN-unified-messages-2026-09-21.md): the GPU module's copy
+    // retired its CPU_ONLY_MODULES entry, 2026-09-28.
+    "messages_api.rs",
     "notifications_api.rs",
     "predict_api.rs",
     "scroll_input_api.rs",
     "scrollback_tiers_api.rs",
 ];
+
+/// `*_api.rs` binding modules that exist in `aterm-wasm` ONLY, each with the
+/// reason the GPU module has no copy — so the asymmetry is STATED, not an
+/// accident nobody saw. A FLOOR in both directions
+/// ([`every_cpu_only_web_binding_module_is_declared`]): a new CPU-only `*_api.rs`
+/// must be listed here (or mirrored), and an entry that gains a gpu-web copy —
+/// which the filename intersection then guards line for line — must leave.
+const CPU_ONLY_MODULES: &[(&str, &str)] = &[(
+    "dirty_band_present_api.rs",
+    "the RGBA band-scoped present (audit E3) expands the CPU rasterizer's \
+         framebuffer into the page's ImageData; the GPU module presents through \
+         WebGPU and has no RGBA framebuffer to scope.",
+)];
 
 /// One declared exception to parity: a source line that may appear in one copy
 /// and not the other, plus the reason that is legitimate rather than drift.
@@ -256,6 +273,37 @@ fn every_duplicated_web_binding_module_is_covered() {
 }
 
 #[test]
+fn every_cpu_only_web_binding_module_is_declared() {
+    let wasm = rs_file_names(&src_dir(WASM_CRATE));
+    let gpu = rs_file_names(&src_dir(GPU_WEB_CRATE));
+    for (module, why) in CPU_ONLY_MODULES {
+        assert!(
+            !why.is_empty(),
+            "{module}: a CPU-only module carries its reason"
+        );
+        assert!(
+            wasm.contains(*module),
+            "{module} is declared CPU-only but {WASM_CRATE} has no such file — remove the entry"
+        );
+        assert!(
+            !gpu.contains(*module),
+            "{module} now exists in {GPU_WEB_CRATE}: the filename intersection guards it line \
+             for line, so remove it from CPU_ONLY_MODULES"
+        );
+    }
+    let undeclared: Vec<&String> = wasm
+        .iter()
+        .filter(|n| n.ends_with("_api.rs") && !gpu.contains(*n))
+        .filter(|n| !CPU_ONLY_MODULES.iter().any(|(m, _)| m == n))
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "{undeclared:?} exist in {WASM_CRATE} only: mirror them into {GPU_WEB_CRATE} or \
+         declare them in CPU_ONLY_MODULES with the reason"
+    );
+}
+
+#[test]
 fn production_binding_surface_is_identical() {
     for module in duplicated_modules() {
         assert_parity(
@@ -302,6 +350,38 @@ fn effects_api_requires_output_streak_surface() {
         "set_output_streak_theme",
         "set_output_streak_reduced_motion",
         "note_output_streak_keystroke",
+    ] {
+        assert!(wasm.contains(symbol), "aterm-wasm missing {symbol}");
+        assert!(gpu.contains(symbol), "aterm-gpu-web missing {symbol}");
+    }
+}
+
+/// The message band's symbol floor, for the same reason as the two above:
+/// line parity proves the copies agree, never that they agree on the band.
+/// A symmetric deletion of an export from both would read as parallel.
+#[test]
+fn messages_api_requires_band_surface() {
+    let wasm = read_module(WASM_CRATE, "messages_api.rs");
+    let gpu = read_module(GPU_WEB_CRATE, "messages_api.rs");
+    for symbol in [
+        "pub fn notice(",
+        "pub fn messages_read(",
+        "pub fn messages_entry(",
+        "pub fn messages_page(",
+        "pub fn messages_tick(",
+        "pub fn messages_next_wake_ms(",
+        "pub fn set_band_motion(",
+        "pub fn set_band_visible(",
+        "pub fn set_details_view(",
+        "pub fn set_forced_colors(",
+        "pub fn band_hover(",
+        "pub fn band_press(",
+        "pub fn messages_log_since(",
+        "pub fn messages_quit(",
+        "pub fn messages_restore(",
+        "pub fn band_rows(",
+        "pub fn band_height_px(",
+        "pub fn grid_top_px(",
     ] {
         assert!(wasm.contains(symbol), "aterm-wasm missing {symbol}");
         assert!(gpu.contains(symbol), "aterm-gpu-web missing {symbol}");

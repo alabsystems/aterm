@@ -1756,6 +1756,130 @@ fn foreground_handback_a_one_shot_input_mode_is_handed_back_at_its_exit() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// THE MANUAL RESET (2026-09-26, `crate::manual_reset`): the `reset` verb's
+// function against the REAL reader.
+// ---------------------------------------------------------------------------
+
+/// The live session the 2026-09-26 audit found (window pid 6874, sid 0): the
+/// incident's modes in force under a zsh prompt, armed by the holder the
+/// reader has always seen — the shell, which never goes away.
+const STUCK_UNDER_THE_SHELL: &[u8] =
+    b"\x1b[?1049h\x1b[>5u\x1b[?1003h\x1b[?1006h\x1b[>4;2m\x1b[?25lpublication % ";
+
+static FG_RESET: AtomicI32 = AtomicI32::new(SHELL);
+fn probe_reset(_master: i32) -> i32 {
+    FG_RESET.load(Ordering::SeqCst)
+}
+static DEAD_RESET: Dead = Mutex::new(Vec::new());
+fn gone_reset(_master: i32, pgid: i32, _role: FgRole) -> bool {
+    is_dead(&DEAD_RESET, pgid)
+}
+
+/// `reset` hands back what the automatic handback never will, on the reader's
+/// parse stage: the reply names what moved, the timeline records `reason=manual
+/// source=ctl`, the `bytes` tap carries the synthesized bytes (the stream-order
+/// claim), the main screen is shown again rather than cleared, and the reader
+/// keeps reading. A second reset has nothing to send. With the reader PARKED
+/// (the update handoff) the lane is closed and the reset runs directly.
+///
+/// NEGATIVE CONTROL, in-line: before the reset, the same real reader with the
+/// same scripted probes has handed nothing back (`restored()` is empty and the
+/// evidence gate still reads the modes) — the state the live window sat in for
+/// 97 000 s.
+#[test]
+fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
+    let mut rig = Rig::attach(
+        9_261,
+        (probe_reset, &FG_RESET),
+        (gone_reset, &DEAD_RESET),
+        b"",
+    );
+    rig.write(b"history line\r\n", "history", |t| {
+        screen_has(t, "history line")
+    });
+    rig.write(STUCK_UNDER_THE_SHELL, "the stuck prompt", |t| {
+        t.program_owns_terminal() && screen_has(t, "publication %")
+    });
+    assert!(
+        rig.restored().is_empty(),
+        "precondition: nothing hands the shell's own modes back: {:?}",
+        rig.restored()
+    );
+
+    let tap = rig.session.ctx.byte_fanout.subscribe();
+    let term = rig.term();
+    let reply = crate::manual_reset::cmd_reset(rig.session.id, &term, &rig.session.ctx, "");
+    assert!(reply.starts_with("OK reset reverted="), "{reply:?}");
+    let reverted = reply
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("reverted="))
+        .expect("reverted=");
+    for name in [
+        "kitty-alt",
+        "alt",
+        "mouse",
+        "mouse-encoding",
+        "mok",
+        "cursor",
+    ] {
+        assert!(reverted.split(',').any(|r| r == name), "{name}: {reply:?}");
+    }
+    {
+        let t = term.lock().expect("terminal lock");
+        assert!(!t.program_owns_terminal(), "no program mode is left");
+        assert!(!t.is_alternate_screen());
+        assert!(
+            screen_has(&t, "history line"),
+            "the main screen is shown again, not cleared"
+        );
+    }
+    let events = rig.restored_n(1);
+    assert!(
+        events[0].starts_with(&format!(
+            "reason=manual source=ctl reverted={reverted} bytes="
+        )),
+        "{events:?}"
+    );
+    // The `bytes` tap got the synthesized bytes: they ride the stream.
+    let mut tapped = Vec::new();
+    wait_for("the reset's bytes on the tap", || {
+        let (bursts, _) = tap.drain();
+        for b in bursts {
+            tapped.extend_from_slice(&b);
+        }
+        tapped.windows(8).any(|w| w == b"\x1b[?1049l")
+    });
+
+    // The reader is alive and reading after it.
+    rig.write(b"after\r\n", "output after the reset", |t| {
+        screen_has(t, "after")
+    });
+    assert_eq!(
+        crate::manual_reset::cmd_reset(rig.session.id, &term, &rig.session.ctx, ""),
+        "OK reset reverted=- bytes=0\n",
+        "nothing is stuck any more"
+    );
+    assert_eq!(
+        crate::manual_reset::cmd_reset(rig.session.id, &term, &rig.session.ctx, "now"),
+        "ERR usage: reset [flush]\n"
+    );
+
+    // PARKED: no parse stage takes requests; the reset runs directly.
+    rig.write(b"\x1b[?1000h", "mouse armed again", |t| {
+        t.program_owns_terminal()
+    });
+    rig.park();
+    let reply = crate::manual_reset::cmd_reset(rig.session.id, &term, &rig.session.ctx, "");
+    assert!(reply.contains("reverted=mouse"), "{reply:?}");
+    assert!(!term.lock().expect("terminal lock").program_owns_terminal());
+    let events = rig.restored_n(3);
+    assert!(
+        events[2].starts_with("reason=manual source=ctl reverted=mouse"),
+        "{events:?}"
+    );
+}
+
 // ---- ForegroundHandbackOwnership (2026-09-27, the lane at load 59-65) ------
 //
 // Tier-1 for `aterm_spec::derive::foreground_handback_ownership_model`: who

@@ -67,6 +67,12 @@ pub struct VendorSpec {
     pub digest_docs: &'static [DocPin],
     /// `NAME=VALUE` entries the shims export; never taken from the index.
     pub shim_env: &'static [&'static str],
+    /// The arguments after the program's name that WARM a build this machine just landed
+    /// ([`crate::warm`]): one headless run that refreshes the vendor CLI's account-bound
+    /// caches (the served model catalog, feature flags) before the user's first launch,
+    /// and never starts a model turn. Empty: the program is never warmed. Compiled only,
+    /// never taken from the index — the rule [`Self::shim_env`] follows.
+    pub warm: &'static [&'static str],
     /// The oldest version installed: a frozen or replayed CDN cannot hand a new machine an
     /// old build. It is the version the final legacy pin names, so it is at or above every
     /// legacy pin up to [`Self::legacy_ceiling`].
@@ -145,6 +151,23 @@ pub const VENDORS: &[VendorSpec] = &[
         }],
         // Claude's own updater writes a copy under `~/.local` that this name never runs.
         shim_env: &["DISABLE_AUTOUPDATER=1"],
+        // Print mode reading stream-json from a stdin the warm never writes (measured on
+        // 2.1.280, 2026-09-23): the bootstrap, feature and model-catalog fetches run and
+        // no `/v1/messages` call, no transcript and no hook or MCP server does; the warm
+        // closes stdin and the CLI exits 0. Never `--bare` (it skips those very fetches)
+        // and never `--init-only` (it exits racing them).
+        warm: &[
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+        ],
         floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
     },
@@ -178,6 +201,10 @@ pub const VENDORS: &[VendorSpec] = &[
             },
         ],
         shim_env: &[],
+        // Lists the served models headless and rewrites `~/.codex/models_cache.json`, with
+        // no model turn (measured on 0.156.1, 2026-09-23). A debug subcommand: a release
+        // that drops it fails the warm, silently.
+        warm: &["debug", "models"],
         floor: floor(0, 156, 1),
         legacy_ceiling: LEGACY_CEILING,
     },
@@ -243,6 +270,31 @@ mod tests {
         }
     }
 
+    /// THE WARM NEVER STARTS A TURN (2026-09-23): claude's warm is print mode over a stdin
+    /// the warm never writes — never `--bare` or `--init-only`, which skip or race the
+    /// fetches it exists for — with no transcript and no hooks; and no warm argv carries a
+    /// free operand, which print mode would send as a prompt.
+    #[test]
+    fn the_warm_argv_refreshes_caches_and_never_prompts() {
+        let claude = spec("claude").unwrap().warm;
+        for present in ["-p", "--no-session-persistence", "--strict-mcp-config"] {
+            assert!(claude.contains(&present), "{present}");
+        }
+        assert!(claude.iter().any(|a| a.contains("disableAllHooks")));
+        for absent in ["--bare", "--init-only"] {
+            assert!(!claude.contains(&absent), "{absent}");
+        }
+        assert_eq!(spec("codex").unwrap().warm, &["debug", "models"]);
+        // Every operand is a flag or the value of the flag before it (codex's two words
+        // are its subcommand, not a prompt).
+        let takes_value = ["--input-format", "--output-format", "--settings"];
+        for (i, arg) in claude.iter().enumerate() {
+            assert!(
+                arg.starts_with('-') || (i > 0 && takes_value.contains(&claude[i - 1])),
+                "{arg:?} would be a prompt"
+            );
+        }
+    }
     #[test]
     fn every_pin_is_https_and_an_allowed_vendor_host() {
         for s in VENDORS {

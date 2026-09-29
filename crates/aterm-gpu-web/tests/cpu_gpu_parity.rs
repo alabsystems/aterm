@@ -23,9 +23,16 @@
 // system face. Gated: no GPU -> the test no-ops (like aterm-gpu's own parity
 // tests).
 
+use aterm_core::render::{HostRowPixels, RenderInput};
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{GpuContext, GpuRenderer, WindowGpu};
-use aterm_render::{Frame, Renderer, Theme};
+use aterm_messages::drive::{self, Commit, Lay, LookIn, View};
+use aterm_messages::ink::{AnsiHues, BandInks, BarBase, ThemeInks};
+use aterm_messages::paint::Geometry;
+use aterm_messages::wire::{self, NoticeRequest, WireGate};
+use aterm_messages::{Duration, Instant, Links, MessageCenter, MessageLog, WallStamp};
+use aterm_render::band::{self as band_frame, BandFrame};
+use aterm_render::{ChromeBleed, Frame, Renderer, Theme};
 
 /// The bundled deterministic monospace face, injected into BOTH renderers the way
 /// the web crates inject a font fetched in JS — so parity can't drift on a missing
@@ -160,5 +167,192 @@ fn web_cpu_gpu_rgba8_parity() {
     assert!(
         red_seen,
         "expected red glyph pixels on the GPU frame (non-empty render)"
+    );
+}
+
+/// The chrome pad the band frame is drawn with (px per edge), so the band's
+/// bleed has gutters to reach.
+const PAD: usize = 6;
+
+/// A packed `0x00RRGGBB` colour as sRGB bytes.
+fn bytes(c: u32) -> [u8; 3] {
+    [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+}
+
+/// The web modules' band frame (`messages_api`'s sequencing, through the
+/// engine's driver): a held warning and a 50 % bar, settled and committed
+/// after the bar's grace, laid out with links withheld, painted in the still
+/// look over the theme's inks, and composed above `input` with every window
+/// stream translated. Returns the frame's bleed.
+fn compose_web_band(input: &mut RenderInput, cols: usize, cell: (usize, usize)) -> ChromeBleed {
+    let theme = web_theme();
+    let t0 = Instant::now();
+    let mut center = MessageCenter::new(MessageLog::default(), t0);
+    let mut gate = WireGate::default();
+    let wall = WallStamp {
+        unix_ms: 1_790_000_000_000,
+    };
+    for line in [
+        "post ci sev=warn hold=60 Disk nearly full -- 2 GB left",
+        "progress p pct=50 Downloading assets",
+    ] {
+        let req = NoticeRequest::parse(line).expect("a notice line");
+        let applied = wire::apply(&mut center, &mut gate, req, wall, t0);
+        assert!(applied.reply.starts_with("OK"), "{}", applied.reply);
+    }
+    let now = t0 + Duration::from_millis(2500);
+    let rows = u16::try_from(input.rows).expect("rows");
+    let _ = drive::settle_and_commit(
+        &mut center,
+        Commit {
+            now,
+            frozen: false,
+            afford: drive::afford([rows], 0),
+            reserved: 0,
+        },
+    );
+    assert_eq!(center.committed_rows(), 2, "two band rows");
+    let palette = aterm_types::ColorPalette::new();
+    let hue = |i: u8| {
+        let c = palette.get(i);
+        [c.r, c.g, c.b]
+    };
+    let inks = BandInks::derive(
+        ThemeInks {
+            bg: bytes(theme.bg),
+            fg: bytes(theme.fg),
+            cursor: bytes(theme.cursor),
+        },
+        Some(AnsiHues {
+            blue: hue(4),
+            cyan: hue(6),
+        }),
+        BarBase::Blend,
+    );
+    let lay = Lay {
+        cols,
+        links: Links::Withheld,
+        home: || None,
+    };
+    let look = drive::look(LookIn {
+        motion_allowed: false,
+        on_screen: true,
+        frozen: false,
+        forced: false,
+    });
+    let (cell_w, cell_h) = cell;
+    let geom = Geometry {
+        win_w: cols * cell_w + 2 * PAD,
+        cells_x: PAD,
+        cell_w,
+    };
+    let mut view = View::default();
+    let _ = view.prepare(&center, &lay, now, look);
+    let resolved = view
+        .paint(&center, cols, None, geom, false, &|| inks)
+        .expect("the band paints");
+    let (painted, edges, rasters) = band_frame::rows(resolved);
+    let mut pool = Vec::new();
+    let n = band_frame::compose_band(
+        input,
+        None,
+        &painted,
+        &rasters,
+        2,
+        &inks,
+        false,
+        BandFrame {
+            cols,
+            cell_w,
+            cell_h,
+            pad: PAD,
+            lo: 0,
+            frame_w: cols * cell_w + 2 * PAD,
+            grid_top: PAD,
+        },
+        &mut pool,
+        HostRowPixels::Translate,
+    );
+    assert_eq!(n, 2);
+    assert!(
+        !input.chrome_rasters.is_empty(),
+        "the bar's meter is drawn at pixel resolution"
+    );
+    input.grid_top_row += n;
+    input.grid_bot_row += n;
+    band_frame::band_bleed(&inks, 0, n, band_frame::band_row_edges(0, n, &edges))
+}
+
+/// THE BAND ON BOTH WEB RENDERERS (design ruling 340): the message band's
+/// frame — two rows reserved above the grid, a warning and a metered bar
+/// with its pixel-resolution raster, the gutters bled to the frame's edges —
+/// drawn by aterm-gpu-web's GPU path (a native `GpuContext`, the bundled
+/// face) and by aterm-wasm's CPU rasterizer lands within the same tolerance
+/// as the grid alone. The frame is two rows taller than the band-less one,
+/// and the band's rows are not the theme's background (the negative
+/// control: a frame whose band failed to draw would compare equal to the
+/// grid alone there). No GPU: the test says SKIP and passes.
+#[test]
+fn web_band_frame_cpu_gpu_rgba8_parity() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: no GPU: {e}");
+            return;
+        }
+    };
+    let mut gpu_face =
+        Renderer::from_bytes(FONT, PX, web_theme()).expect("bundled font loads (gpu face)");
+    gpu_face.set_pad(PAD);
+    let mut gpu = match GpuRenderer::from_parts(ctx, gpu_face, None, web_theme()) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: gpu renderer unavailable: {e}");
+            return;
+        }
+    };
+    let mut cpu =
+        Renderer::from_bytes(FONT, PX, web_theme()).expect("bundled font loads (cpu face)");
+    cpu.set_pad(PAD);
+
+    let mut win = WindowGpu::new();
+    let (mut term, rows, cols) = demo_term();
+    let plain = cpu.render_input(&term.cell_frame(rows, cols));
+    let mut input = term.cell_frame(rows, cols);
+    let bleed = compose_web_band(&mut input, cols, cpu.cell_size());
+    cpu.set_chrome_bleed(Some(bleed));
+    gpu.set_chrome_bleed(Some(bleed));
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+
+    let (_, ch) = cpu.cell_size();
+    assert_eq!(
+        (cpu_frame.width, cpu_frame.height),
+        (plain.width, plain.height + 2 * ch),
+        "the frame grows by the band's two rows"
+    );
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height),
+        "web CPU/GPU band frame dimensions differ"
+    );
+    let cpu_rgba = to_rgba8(&cpu_frame);
+    let gpu_rgba = to_rgba8(&gpu_frame);
+    let delta = max_byte_delta(&cpu_rgba, &gpu_rgba);
+    eprintln!(
+        "web CPU/GPU band frame RGBA8 max byte delta = {delta} ({}x{})",
+        cpu_frame.width, cpu_frame.height
+    );
+    assert!(
+        delta <= 8,
+        "web CPU/GPU band frame diverges: max byte delta {delta} > 8"
+    );
+    // The band rows carry ink: pixels there that are not the theme's bg.
+    let bg = web_theme().bg & 0x00FF_FFFF;
+    let band = &gpu_frame.pixels[PAD * gpu_frame.width..(PAD + 2 * ch) * gpu_frame.width];
+    let inked = band.iter().filter(|&&p| p & 0x00FF_FFFF != bg).count();
+    assert!(
+        inked > band.len() / 20,
+        "the GPU drew the band: {inked} inked pixels"
     );
 }

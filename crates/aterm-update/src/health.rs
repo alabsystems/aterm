@@ -314,6 +314,32 @@ pub struct Health {
     pub handoff_park_at: String,
 }
 
+/// The longest error text the ledger stores, in characters.
+const MAX_STORED_ERROR_CHARS: usize = 400;
+
+/// `error` cut to [`MAX_STORED_ERROR_CHARS`] — WITHOUT CUTTING OFF WHAT IT IS
+/// (round seven, H1 open problem 101). A passing refusal carries its key
+/// ([`crate::PASSING_REFUSAL_KEY`]) at the END of its text, and every reader that
+/// tells a moment from a verdict reads it off the stored string: the persistent
+/// notice's "staging could not finish … nothing is known against the build" arm
+/// among them. A DMG whose four `hdiutil attach` attempts each ran past their limit
+/// joins into one ~456-character refusal; cut at 400 it lost the key, and the
+/// notice then said the build "will not verify or install". Such a text keeps its
+/// head and its key, with the cut marked.
+fn capped_error(error: &str) -> String {
+    if error.chars().count() <= MAX_STORED_ERROR_CHARS {
+        return error.to_string();
+    }
+    if !crate::is_passing_refusal(error) {
+        return error.chars().take(MAX_STORED_ERROR_CHARS).collect();
+    }
+    let tail = format!(" \u{2026} ({})", crate::PASSING_REFUSAL_KEY);
+    let head = MAX_STORED_ERROR_CHARS.saturating_sub(tail.chars().count());
+    let mut kept: String = error.chars().take(head).collect();
+    kept.push_str(&tail);
+    kept
+}
+
 impl Health {
     /// Read the ledger; absent/corrupt ⇒ healthy default (observability, not a gate).
     /// Non-UTF-8 IS a corrupt ledger, deliberately folded to the healthy default.
@@ -523,8 +549,9 @@ impl Health {
             h.failing_since = now.clone();
         }
         h.last_failure_at = now;
-        // Cap the stored error so a pathological message can't bloat the ledger.
-        h.last_error = error.chars().take(400).collect();
+        // Cap the stored error so a pathological message can't bloat the ledger —
+        // keeping what it SAYS it is ([`capped_error`]).
+        h.last_error = capped_error(error);
         if matches!(kind, "pipeline" | "manifest" | "stage") {
             h.last_diagnosis_error = h.last_error.clone();
         }
@@ -684,7 +711,7 @@ impl Health {
         Self::advance_failure_streak(&mut h, "apply", reason);
         // Mirror the reason into the apply-owned slot so a later acquisition-lane
         // failure cannot overwrite the description of a still-standing apply streak.
-        h.last_apply_error = reason.chars().take(400).collect();
+        h.last_apply_error = capped_error(reason);
         h.last_apply_failure_at = crate::install::now_rfc3339();
         h.last_apply_failure_build = current_build;
         // A DIFFERENT ARTIFACT STARTS ITS OWN COUNT. Carrying the previous target's
@@ -761,7 +788,7 @@ impl Health {
     pub fn record_apply_refusal(path: &Path, current_build: u64, reason: &str) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
-        h.last_apply_refusal = reason.chars().take(400).collect();
+        h.last_apply_refusal = capped_error(reason);
         h.last_apply_refusal_at = crate::install::now_rfc3339();
         h.last_apply_refusal_build = current_build;
         h.write(path);
@@ -860,6 +887,21 @@ impl Health {
             None => false,
         };
         if changed {
+            h.write(path);
+        }
+        h
+    }
+
+    /// Drop the pending clock for `build`, which was WITHDRAWN — quarantined or
+    /// yanked, and so never going to be applied (round six, finding 40; the caller
+    /// judges that) — and return the ledger. A clock another observation has since
+    /// re-keyed to a different build is left alone.
+    pub fn forget_pending_update(path: &Path, build: u64) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if h.pending_build == build {
+            h.pending_build = 0;
+            h.pending_since = String::new();
             h.write(path);
         }
         h
@@ -1541,6 +1583,54 @@ mod tests {
         let long = "e".repeat(2000);
         let h = Health::record_failure(&p, "pipeline", &long);
         assert_eq!(h.last_error.len(), 400, "stored error text is capped");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// A PASSING REFUSAL LONGER THAN THE CAP IS STILL A PASSING REFUSAL WHEN STORED
+    /// (round seven, H1 open problem 101). `Mounted::attach` joins its four
+    /// timed-out `hdiutil attach` attempts into one message and marks it passing once,
+    /// at the end — about 456 characters, measured. Cut at 400 characters the key was
+    /// gone, and once the stage streak reached `PERSISTENT_AFTER` the notice said
+    /// "updates download but will not verify or install" about a build nothing was
+    /// known against.
+    #[test]
+    fn a_long_passing_refusal_keeps_its_key_in_the_ledger() {
+        let p = tmp("long-passing");
+        let attempt = "hdiutil attach did not finish within 120s; treating as a failure";
+        let error = crate::verify::mark_passing(format!(
+            "hdiutil attach failed after 4 attempts (/Users//someone/Library/Application \
+             Support/aterm/Updates/download/aterm-0.93.0.dmg, 52428800 bytes): {}",
+            [attempt; 4].join(" | ")
+        ));
+        assert!(error.chars().count() > 400, "{}", error.len());
+        assert!(crate::is_passing_refusal(&error));
+        for _ in 0..crate::PERSISTENT_AFTER {
+            Health::record_failure(&p, "stage", &error);
+        }
+        let h = Health::read(&p);
+        assert!(h.last_error.chars().count() <= 400, "still capped");
+        assert!(
+            h.last_error
+                .starts_with("hdiutil attach failed after 4 attempts")
+        );
+        assert!(crate::is_passing_refusal(&h.last_error), "{}", h.last_error);
+        let (_, body) = crate::persistent_failure_notice("stage", h.stage_failures, &h, 1);
+        assert!(
+            body.contains("could not finish") && !body.contains("will not verify"),
+            "{body}"
+        );
+        // A network blip on top of the standing stage streak overwrites `last_error`;
+        // the notice describes the STAGE streak by the stage class's own reason.
+        let h = Health::record_failure(&p, "network", "could not resolve the host");
+        assert!(h.stage_failures >= crate::PERSISTENT_AFTER, "{h:?}");
+        let (_, body) = crate::persistent_failure_notice("stage", h.stage_failures, &h, 1);
+        assert!(
+            body.contains("could not finish") && body.contains("hdiutil"),
+            "{body}"
+        );
+        // The apply lane's slots keep it the same way.
+        let h = Health::record_apply_failure(&p, 1, 2, &error);
+        assert!(crate::is_passing_refusal(&h.last_apply_error));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 

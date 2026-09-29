@@ -470,9 +470,9 @@ fn sixel_image_decodes_to_expected_raster_and_is_placed() {
 #[test]
 fn sixel_placement_is_pixel_exact_not_scaled_to_its_footprint() {
     // SIXEL NAMES PIXELS. The footprint is DERIVED from the raster by rounding
-    // each axis up to whole cells, so the placement must carry `pixel_exact`:
+    // each axis up to whole cells, so the placement must be `PixelExact`:
     // draw the raster 1:1 from the footprint's top-left and leave the rounded-up
-    // remainder unpainted. Without the flag the renderer applied the iTerm2
+    // remainder unpainted. Without it the renderer applied the iTerm2
     // OSC 1337 policy — scale to fill the footprint, aspect preserved, centred —
     // which magnified every raster whose size was not a cell multiple (measured
     // on a live window at cell 9x17: a 40x12 plot drawn 45x14, a 4x6 sprite
@@ -482,8 +482,9 @@ fn sixel_placement_is_pixel_exact_not_scaled_to_its_footprint() {
     s.feed(SIXEL_4X6);
     let row = s.images_row(0);
     assert_eq!(row.len(), 1, "one image cell on row 0");
-    assert!(
-        row[0].1.image.pixel_exact,
+    assert_eq!(
+        row[0].1.image.scaling,
+        aterm_core::grid::extra::ImageScaling::PixelExact,
         "a sixel placement must be pixel-exact (1:1, top-left anchored), not \
          scaled out to fill its rounded-up cell footprint"
     );

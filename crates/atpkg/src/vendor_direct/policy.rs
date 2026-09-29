@@ -155,7 +155,7 @@ impl Policy {
         for (program, set) in &self.legacy {
             out.entry(program.clone())
                 .or_default()
-                .extend(set.iter().map(|b| crate::dec_u64(*b)));
+                .extend(set.iter().map(|b| b.to_string()));
         }
         out
     }
@@ -320,7 +320,6 @@ mod tests {
             yanked: yanked.iter().map(|s| (*s).to_string()).collect(),
             pin: BTreeMap::new(),
             pin_by_target: BTreeMap::new(),
-            meta: BTreeMap::new(),
         }
     }
 

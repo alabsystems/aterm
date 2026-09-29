@@ -9,15 +9,17 @@
 //! Drives the shipping `deliver_then_relay` (the whole of `connect_and_relay`
 //! but its relay stage) against a real child socket, and projects:
 //!
-//! * `delivered` — the child ACTUALLY READ the forwarded first line (observed on
-//!   the child's side of the socket, not inferred from the forwarder);
+//! * `delivered` — the child ACTUALLY READ the forwarded verb (observed on the
+//!   child's side of the socket, not inferred from the forwarder; the verb is
+//!   the request line after the connect probe the child answers first);
 //! * `reported_err` — the call returned `Err`, which is exactly when
 //!   `try_proxy_forward` writes `ERR forward` to the client.
 //!
-//! Three real runs: the real relay (delivered, no error), a relay stage that
+//! Four real runs: the real relay (delivered, no error), a relay stage that
 //! fails AFTER delivery (the `try_clone`-under-fd-exhaustion shape, injected at
-//! the seam because it cannot be staged in a shared test process), and a dial
-//! with no listener (reported, never delivered).
+//! the seam because it cannot be staged in a shared test process), a dial
+//! with no listener, and a child that never accepts (both reported, never
+//! delivered).
 //!
 //! NEGATIVE CONTROL: from the real delivered state, reporting the relay failure
 //! is rejected by the committed model and admitted by `Buggy = 1`.
@@ -32,6 +34,13 @@ use aterm_spec::{interp, verify};
 use super::*;
 
 type State = BTreeMap<&'static str, i64>;
+
+/// The connect-probe bound for runs whose child answers at once, and how long
+/// a run waits for the child's read. Both wait for something that MUST happen
+/// (the child is serving): hang detectors, never latency budgets, so a loaded
+/// machine cannot turn a delivered verb into a false `delivered = 0`. The
+/// unanswered-probe run passes its own short bound.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn state(delivered: bool, reported_err: bool) -> State {
     [
@@ -53,8 +62,9 @@ fn conforms(prev: &State, next: &State, action: &str) -> (bool, String) {
     )
 }
 
-/// A throwaway child listener that reports the first line it READS, then
-/// answers and hangs up.
+/// A throwaway child listener that answers the forward's connect probe,
+/// reports the request line it READS next (the verb), then answers and hangs
+/// up.
 struct Child {
     sock: String,
     read: mpsc::Receiver<String>,
@@ -69,9 +79,14 @@ fn child() -> Child {
     let (tx, read) = mpsc::channel();
     let thread = std::thread::spawn(move || {
         let (mut conn, _) = listener.accept().expect("accept");
-        let mut first = String::new();
-        let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut first);
-        let _ = tx.send(first);
+        let mut reader = BufReader::new(conn.try_clone().unwrap());
+        let mut probe = String::new();
+        let _ = reader.read_line(&mut probe);
+        assert_eq!(probe, PROBE, "the forward proves the child serves first");
+        let _ = conn.write_all(b"OK version=child\n");
+        let mut verb = String::new();
+        let _ = reader.read_line(&mut verb);
+        let _ = tx.send(verb);
         let _ = conn.write_all(b"OK\n");
         let _ = conn.shutdown(std::net::Shutdown::Both);
     });
@@ -84,13 +99,17 @@ fn child() -> Child {
 }
 
 const LINE: &str = "TOKEN abcd @. screen\n";
+/// What the child reads first: the handshake with the connect probe.
+const PROBE: &str = "TOKEN abcd version\n";
+/// What the child reads next: the forwarded verb.
+const VERB: &str = "@. screen\n";
 
-/// Did the child read exactly the forwarded line? Waits for the child's read,
-/// bounded, so an undelivered line projects as `false` rather than hanging.
+/// Did the child read exactly the forwarded verb? Waits for the child's read,
+/// bounded, so an undelivered verb projects as `false` rather than hanging.
+/// (The child reports whatever line it read, EOF included, as soon as it
+/// reads it, so only a verb that never comes waits out [`PATIENCE`].)
 fn child_read(c: &Child) -> bool {
-    c.read
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .is_ok_and(|line| line == LINE)
+    c.read.recv_timeout(PATIENCE).is_ok_and(|line| line == VERB)
 }
 
 #[test]
@@ -126,7 +145,7 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     let c = child();
     let (_client_app, client_relay) = CtlStream::pair().expect("pair");
     let mut at_relay = None;
-    let result = deliver_then_relay(&c.sock, LINE, &client_relay, &[], |_, _| {
+    let result = deliver_then_relay(&c.sock, LINE, &client_relay, &[], PATIENCE, |_, _| {
         at_relay = Some(state(child_read(&c), false));
         Err(std::io::Error::from_raw_os_error(libc::EMFILE))
     });
@@ -156,6 +175,27 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
         ok,
         "dial failure: {init:?} -> {after:?} is not DialFail\n{why}"
     );
+
+    // 4. A child that never accepts (a wedged listener): the connect probe
+    //    goes unanswered, nothing is delivered, and that failure IS reported.
+    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let wedged = dir.path().join("wedged.sock");
+    let _listener = aterm_uds::CtlListener::bind(&wedged).expect("bind, never accept");
+    let (_client_app, client_relay) = CtlStream::pair().expect("pair");
+    let result = deliver_then_relay(
+        &wedged.to_string_lossy(),
+        LINE,
+        &client_relay,
+        &[],
+        std::time::Duration::from_millis(300),
+        |_, _| Ok(()),
+    );
+    let after = state(false, result.is_err());
+    let (ok, why) = conforms(&init, &after, "DialFail");
+    assert!(
+        ok,
+        "an unaccepted forward: {init:?} -> {after:?} is not DialFail\n{why}"
+    );
 }
 
 /// The defect from a REAL delivered state: the relay failure reported as ERR.
@@ -165,7 +205,7 @@ fn an_error_reported_after_delivery_is_the_buggy_step() {
     let c = child();
     let (_client_app, client_relay) = CtlStream::pair().expect("pair");
     let mut delivered = None;
-    let _ = deliver_then_relay(&c.sock, LINE, &client_relay, &[], |_, _| {
+    let _ = deliver_then_relay(&c.sock, LINE, &client_relay, &[], PATIENCE, |_, _| {
         delivered = Some(state(child_read(&c), false));
         Ok(())
     });

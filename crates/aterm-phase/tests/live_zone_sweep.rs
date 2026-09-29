@@ -104,20 +104,67 @@ fn blank(r: &str) -> bool {
     r.trim().is_empty()
 }
 
+/// Whether the last `ZONE_ROWS` rows of `rows` hold a GAP: a run of blank
+/// rows as long as `live_zone_start` counts as one row (four).
+/// The screens whose reading the gap gained: the fullscreen launch (its
+/// banner is in the zone: `fresh`) and the measured tall pane (the error is
+/// in the zone: a wall).
+const GAINS: [&str; 2] = [
+    "claude-2.1.283-launch-repl-ready.txt",
+    "claude-2.1.284-api-error-tall-pane-measured.txt",
+];
+
+fn has_gap(rows: &[String]) -> bool {
+    let tail = &rows[rows.len().saturating_sub(ZONE_ROWS)..];
+    tail.windows(4).any(|w| w.iter().all(|r| blank(r)))
+}
+
 #[test]
 fn a_screen_drawn_to_its_last_row_has_the_zone_the_last_40_rows_gave() {
-    let mut drawn_to_bottom = 0;
+    let (mut drawn_to_bottom, mut gapped, mut gains) = (0, Vec::new(), 0);
     for (name, rows) in screens() {
         if rows.last().is_some_and(|r| !blank(r)) {
             drawn_to_bottom += 1;
-            assert_eq!(
-                live_zone_start(&rows, ZONE_ROWS),
-                rows.len().saturating_sub(ZONE_ROWS),
-                "{name}"
-            );
+            let last40 = rows.len().saturating_sub(ZONE_ROWS);
+            let start = live_zone_start(&rows, ZONE_ROWS);
+            if has_gap(&rows) {
+                // A blank GAP counts as one row: the zone reaches above the
+                // last 40 rows (a tall pane's short transcript, the
+                // fullscreen launch's banner) — never below them.
+                assert!(start <= last40, "{name}");
+                // What the reader says of the screen — phase, authority,
+                // wall, freshness — is what it said on the last 40 rows,
+                // but for the two gains the gap was cut for.
+                let old = &rows[last40..];
+                let key = |z: &[String]| {
+                    let r = aterm_phase::read(Some("claude"), z, None);
+                    (
+                        format!("{:?}", r.phase),
+                        r.phase_authoritative,
+                        r.wall.map(|w| w.kind),
+                        r.fresh,
+                    )
+                };
+                if key(old) != key(&rows[start..]) {
+                    assert!(
+                        GAINS.iter().any(|g| name.ends_with(g)),
+                        "{name}: {:?} became {:?}",
+                        key(old),
+                        key(&rows[start..])
+                    );
+                    gains += 1;
+                }
+                gapped.push(name);
+            } else {
+                assert_eq!(start, last40, "{name}");
+            }
         }
     }
     assert!(drawn_to_bottom > 50, "only {drawn_to_bottom} such screens");
+    // The measured tall pane and the fullscreen launch are among them, so
+    // this is not vacuous.
+    assert!(!gapped.is_empty(), "no screen with a gap swept");
+    assert_eq!(gains, GAINS.len(), "each gain seen once: {gapped:#?}");
 }
 
 #[test]

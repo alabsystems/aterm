@@ -477,9 +477,47 @@ impl SearchState {
         }
     }
 
+    /// The find panel's answer as a screen reader hears it (`match 2 of 7`,
+    /// `no matches (stale)`, `bad regex`), with every qualifier the panel
+    /// paints spelled out. `None` for an empty query, where the panel paints
+    /// no verdict either: a field nobody has typed into has found nothing yet.
+    #[cfg(any(a11y_tree, test))]
+    pub(crate) fn spoken_status(&self) -> Option<String> {
+        let spelled = match (self.truncated, self.results_dirty) {
+            (true, true) => " (partial history, stale)",
+            (true, false) => " (partial history)",
+            (false, true) => " (stale)",
+            (false, false) => "",
+        };
+        if self.regex_error {
+            Some("bad regex".to_string())
+        } else if self.query.is_empty() {
+            None
+        } else if self.matches.is_empty() && self.history_away {
+            // Ruling 237: the painter's long form, at every width.
+            Some(HISTORY_AWAY_NONE.to_string())
+        } else if self.matches.is_empty() {
+            Some(format!("no matches{spelled}"))
+        } else {
+            Some(format!(
+                "match {} of {}{}",
+                self.current + 1,
+                self.matches.len(),
+                match (self.history_away, self.results_dirty) {
+                    (true, true) => " (partial history, rewrapping, stale)",
+                    (true, false) => " (partial history, rewrapping)",
+                    (false, _) => spelled,
+                }
+            ))
+        }
+    }
+
     pub(crate) fn window_title(&self) -> String {
         if self.query.is_empty() {
             "aterm — find:".to_string()
+        } else if self.regex_error {
+            // The panel's own word: an invalid pattern is not a miss.
+            format!("aterm — find: {} (bad regex)", self.query)
         } else if self.matches.is_empty() && self.history_away {
             // Ruling 237: the history is away, not empty of the text.
             format!("aterm — find: {} ({HISTORY_AWAY_NONE})", self.query)
@@ -2271,6 +2309,15 @@ mod tests {
 
         let search = seeded();
         assert_eq!(search.window_title(), "aterm — find: foo (1/3)");
+        // An invalid pattern says so, as the panel does, even while the
+        // history is away for a rewrap.
+        let bad = SearchState {
+            query: "(".to_string(),
+            regex_error: true,
+            history_away: true,
+            ..Default::default()
+        };
+        assert_eq!(bad.window_title(), "aterm — find: ( (bad regex)");
         assert_eq!(
             window_title_authority(true, true),
             WindowTitleAuthority::CloseWarning,
@@ -2286,6 +2333,51 @@ mod tests {
             WindowTitleAuthority::Canonical,
             "closing search then restores the composed title"
         );
+    }
+
+    /// What a screen reader hears carries the same qualifiers the panel
+    /// paints: a count older than the screen is announced as stale.
+    #[test]
+    fn the_spoken_status_says_what_the_panel_paints() {
+        let mut search = seeded();
+        assert_eq!(search.spoken_status().as_deref(), Some("match 1 of 3"));
+        // Hits on the screen while the history is away for a rewrap: the panel
+        // paints `1/3+ (rewrapping)`, and `1/3+… (rewrapping)` once a torn
+        // rerun kept the old count.
+        let away = SearchState {
+            history_away: true,
+            truncated: true,
+            ..seeded()
+        };
+        assert_eq!(
+            away.spoken_status().as_deref(),
+            Some("match 1 of 3 (partial history, rewrapping)")
+        );
+        let torn = SearchState {
+            results_dirty: true,
+            ..away
+        };
+        assert_eq!(
+            torn.spoken_status().as_deref(),
+            Some("match 1 of 3 (partial history, rewrapping, stale)")
+        );
+        search.results_dirty = true;
+        assert_eq!(
+            search.spoken_status().as_deref(),
+            Some("match 1 of 3 (stale)")
+        );
+        search.truncated = true;
+        assert_eq!(
+            search.spoken_status().as_deref(),
+            Some("match 1 of 3 (partial history, stale)")
+        );
+        search.matches.clear();
+        assert_eq!(
+            search.spoken_status().as_deref(),
+            Some("no matches (partial history, stale)")
+        );
+        search.query.clear();
+        assert_eq!(search.spoken_status(), None);
     }
 
     fn set_query(app: &mut App, wid: WindowId, query: &str) {

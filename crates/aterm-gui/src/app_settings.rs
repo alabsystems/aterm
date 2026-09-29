@@ -1362,40 +1362,7 @@ impl App {
             .query
             .get(..search.cursor)
             .map_or_else(|| search.query.chars().count(), |head| head.chars().count());
-        // FOLLOW THE PAINTER, including where it says nothing. `status_seg` returns
-        // None for an empty query — a field nobody has typed into has found neither
-        // everything nor nothing — so announcing "no matches" there would have a reader
-        // hear a verdict the glass never gives. And the partial-history marker rides the
-        // COUNT form too, not just the empty one: a count drawn from an index that did
-        // not reach the whole history is a floor, and a reader is owed that qualifier for
-        // the same reason the painter keeps its `+` at every width.
-        let mut status: Vec<String> = Vec::new();
-        if search.regex_error {
-            status.push("bad regex".to_string());
-        } else if search.query.is_empty() {
-        } else if search.matches.is_empty() && search.history_away {
-            // Ruling 237: the painter's long form, at every width.
-            status.push(crate::app_search::HISTORY_AWAY_NONE.to_string());
-        } else if search.matches.is_empty() {
-            status.push(if search.truncated {
-                "no matches (partial history)".to_string()
-            } else {
-                "no matches".to_string()
-            });
-        } else {
-            status.push(format!(
-                "match {} of {}{}",
-                search.current + 1,
-                search.matches.len(),
-                if search.history_away {
-                    " (partial history, rewrapping)"
-                } else if search.truncated {
-                    " (partial history)"
-                } else {
-                    ""
-                }
-            ));
-        }
+        let mut status: Vec<String> = search.spoken_status().into_iter().collect();
         if search.case_sensitive {
             status.push("case sensitive".to_string());
         }
@@ -1986,7 +1953,6 @@ mod tests {
         Rainbow,
         Droplet,
         BeamRod,
-        Fireball,
         Comet,
         Phaser,
         Trail,
@@ -1994,11 +1960,10 @@ mod tests {
         WordDecoration,
     }
 
-    const CURSOR_DEPENDENTS: [CursorDependent; 9] = [
+    const CURSOR_DEPENDENTS: [CursorDependent; 8] = [
         CursorDependent::Rainbow,
         CursorDependent::Droplet,
         CursorDependent::BeamRod,
-        CursorDependent::Fireball,
         CursorDependent::Comet,
         CursorDependent::Phaser,
         CursorDependent::Trail,
@@ -2026,7 +1991,7 @@ mod tests {
         let mut quads = Vec::new();
         match effect {
             CursorDependent::Rainbow => {
-                ws.cursor_rainbow.tick(
+                ws.cursor_fx.rainbow.tick(
                     cur,
                     now,
                     1.0,
@@ -2045,10 +2010,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_rainbow.is_active());
+                assert!(ws.cursor_fx.rainbow.is_active());
             }
             CursorDependent::Droplet => {
-                ws.cursor_droplet.tick(
+                ws.cursor_fx.droplet.tick(
                     cur,
                     now,
                     1.0,
@@ -2059,10 +2024,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_droplet.is_active());
+                assert!(ws.cursor_fx.droplet.is_active());
             }
             CursorDependent::BeamRod => {
-                ws.cursor_beamrod.tick(
+                ws.cursor_fx.beamrod.tick(
                     cur,
                     now,
                     1.0,
@@ -2077,24 +2042,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_beamrod.is_active());
-            }
-            CursorDependent::Fireball => {
-                ws.cursor_fireball.tick(
-                    cur,
-                    now,
-                    1.0,
-                    geom,
-                    &crate::cursor_fireball::FireballConfig {
-                        enabled: true,
-                        intensity: 1.0,
-                    },
-                    &mut quads,
-                );
-                assert!(ws.cursor_fireball.is_active());
+                assert!(ws.cursor_fx.beamrod.is_active());
             }
             CursorDependent::Comet => {
-                ws.cursor_comet.tick(
+                ws.cursor_fx.comet.tick(
                     cur,
                     now,
                     1.0,
@@ -2107,10 +2058,10 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_comet.is_active());
+                assert!(ws.cursor_fx.comet.is_active());
             }
             CursorDependent::Phaser => {
-                ws.cursor_phaser.tick(
+                ws.cursor_fx.phaser.tick(
                     cur,
                     now,
                     0.25,
@@ -2126,7 +2077,7 @@ mod tests {
                     },
                     &mut quads,
                 );
-                assert!(ws.cursor_phaser.is_active());
+                assert!(ws.cursor_fx.phaser.is_active());
             }
             CursorDependent::Trail => {
                 let cfg = crate::cursor_trail::TrailConfig {
@@ -2138,13 +2089,13 @@ mod tests {
                     warmth: 0.0,
                 };
                 let mut cells = Vec::new();
-                ws.cursor_trail.tick(Some((2, 1)), now, &cfg, &mut cells);
+                ws.cursor_fx.trail.tick(Some((2, 1)), now, &cfg, &mut cells);
                 // The scripted three-cell preview hop is a deliberate generic
                 // gesture, not a one-glyph echo (which correctly takes the
                 // large-delta re-anchor path).
-                ws.cursor_trail.note_synthetic_move(now);
-                ws.cursor_trail.tick(cur, now, &cfg, &mut cells);
-                assert!(ws.cursor_trail.is_active());
+                ws.cursor_fx.trail.note_synthetic_move(now);
+                ws.cursor_fx.trail.tick(cur, now, &cfg, &mut cells);
+                assert!(ws.cursor_fx.trail.is_active());
             }
             CursorDependent::Cat => {
                 ws.cursor_cat
@@ -2221,12 +2172,11 @@ mod tests {
         );
         // These latches deliberately survive the switch. The canonical-front
         // gate, not destructive state loss, is what makes them scheduler-inert.
-        assert!(ws.cursor_rainbow.is_active());
-        assert!(ws.cursor_droplet.is_active());
-        assert!(ws.cursor_beamrod.is_active());
-        assert!(ws.cursor_fireball.is_active());
-        assert!(ws.cursor_comet.is_active());
-        assert!(ws.cursor_phaser.is_active());
+        assert!(ws.cursor_fx.rainbow.is_active());
+        assert!(ws.cursor_fx.droplet.is_active());
+        assert!(ws.cursor_fx.beamrod.is_active());
+        assert!(ws.cursor_fx.comet.is_active());
+        assert!(ws.cursor_fx.phaser.is_active());
         assert!(ws.cursor_cat.is_active());
         assert!(ws.word_decos.is_active(now));
         assert!(!ws.cursor_fx_active(now, true));
@@ -2259,7 +2209,7 @@ mod tests {
             assert!(dependents, "{effect:?} must request frame cadence");
             assert_eq!(
                 ws.cursor_fx_active(now, true),
-                ws.cursor_glow.is_active() || dependents,
+                ws.cursor_fx.glow.is_active() || dependents,
                 "activity/cadence equality drifted for {effect:?}"
             );
             assert!(
@@ -2287,7 +2237,7 @@ mod tests {
             "ordinary sync kept the same terminal"
         );
         assert!(
-            ws.cursor_trail.is_active(),
+            ws.cursor_fx.trail.is_active(),
             "ordinary sync must not wipe live effects"
         );
         assert!(ws.cursor_fx_active(now, true));
@@ -3271,17 +3221,19 @@ mod tests {
         let mut trail = Vec::new();
         {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow);
-            ws.cursor_trail
+            ws.cursor_fx
+                .trail
                 .tick(Some((0, 0)), now, &trail_cfg, &mut trail);
-            ws.cursor_glow.note_synthetic_move(now);
-            ws.cursor_trail.note_synthetic_move(now);
+            ws.cursor_fx.glow.note_synthetic_move(now);
+            ws.cursor_fx.trail.note_synthetic_move(now);
             // The synthetic note licenses the move it is about to make: the
             // engines' own predicate, since `move_candidate_pending` retired
             // with the admission-scoreboard rework.
-            assert!(ws.cursor_glow.move_licensed(now));
-            assert!(ws.cursor_trail.move_licensed(now));
+            assert!(ws.cursor_fx.glow.move_licensed(now));
+            assert!(ws.cursor_fx.trail.move_licensed(now));
         }
 
         let winit_id = winit::window::WindowId::from(17u64);
@@ -3298,16 +3250,18 @@ mod tests {
         let ws = app.windows.get_mut(&wid).unwrap();
         // …and an a11y action that targets no live node revokes that licence,
         // so the move it would have decorated draws nothing.
-        assert!(!ws.cursor_glow.move_licensed(now));
-        assert!(!ws.cursor_trail.move_licensed(now));
+        assert!(!ws.cursor_fx.glow.move_licensed(now));
+        assert!(!ws.cursor_fx.trail.move_licensed(now));
         let moved = now + Duration::from_millis(1);
         assert_eq!(
-            ws.cursor_glow
+            ws.cursor_fx
+                .glow
                 .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow),
             0
         );
         assert_eq!(
-            ws.cursor_trail
+            ws.cursor_fx
+                .trail
                 .tick(Some((0, 1)), moved, &trail_cfg, &mut trail),
             0
         );

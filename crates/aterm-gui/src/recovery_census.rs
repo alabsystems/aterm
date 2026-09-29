@@ -350,7 +350,7 @@ fn panic_report_time(path: &Path) -> Option<u64> {
     at.split(['.', ' ', '\n']).next()?.parse().ok()
 }
 
-/// The signal number a non-empty marker's banner names (`aterm: fatal signal N — …`).
+/// The signal number a non-empty marker's banner names (`aterm: fatal signal N`).
 fn marker_signal(path: &Path) -> Option<u8> {
     use std::io::Read as _;
     let file = std::fs::File::open(path).ok()?;
@@ -755,13 +755,27 @@ mod tests {
         with_previous(&s);
         s.file(
             &format!("{}.seen", marker(4242, BORN)),
-            "aterm: fatal signal 11 \u{2014} crash marker written\n",
+            "aterm: fatal signal 11\n",
         );
         let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
         assert_eq!(row.prev.class, EndClass::Signal(11));
         // The fixture was written now, so its mtime is now: the uptime is exact.
         assert_eq!(row.prev.uptime.map(|u| u.at_least), Some(false));
         assert_eq!(row.prev.stall, Tri::Unknown, "no log lines: not known");
+    }
+
+    /// A marker written before the banner lost its ` — crash marker written` tail
+    /// still names its signal.
+    #[test]
+    fn a_marker_in_the_older_banner_form_still_names_its_signal() {
+        let s = Scratch::new("signal-old");
+        with_previous(&s);
+        s.file(
+            &format!("{}.seen", marker(4242, BORN)),
+            "aterm: fatal signal 6 \u{2014} crash marker written\n",
+        );
+        let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
+        assert_eq!(row.prev.class, EndClass::Signal(6));
     }
 
     #[test]
@@ -777,7 +791,7 @@ mod tests {
         );
         s.file(
             &format!("{}.seen", marker(4242, BORN)),
-            "aterm: fatal signal 6 \u{2014} crash marker written\n",
+            "aterm: fatal signal 6\n",
         );
         let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
         assert_eq!(row.prev.class, EndClass::Panic);
@@ -862,7 +876,7 @@ mod tests {
                 "crash-marker-888-{}-other.log.seen",
                 u128::from(BORN) * 1_000_000_000 + 7
             ),
-            "aterm: fatal signal 11 \u{2014} crash marker written\n",
+            "aterm: fatal signal 11\n",
         );
         let row = census_row(&s.0, &me(5000), LaunchKind::Cold, BORN + 5000, &NOBODY);
         assert_eq!(

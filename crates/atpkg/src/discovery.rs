@@ -38,14 +38,7 @@ impl IndexRepo {
     /// `<owner>/<repo>` — the slug the index's release download URLs are built from.
     #[must_use]
     pub fn slug(&self) -> String {
-        // Manual concat of the previous `format!("{}/{}", self.owner, self.repo)`
-        // — byte-identical: the `format!` expansion embeds `fmt::Arguments`
-        // construction (with inlined `unsafe`) that the strict Trust gate cannot
-        // lower and fails closed on.
-        let mut s = self.owner.clone();
-        s.push('/');
-        s.push_str(&self.repo);
-        s
+        format!("{}/{}", self.owner, self.repo)
     }
 }
 

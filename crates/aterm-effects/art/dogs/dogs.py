@@ -3,7 +3,7 @@
 glyph-asset TOML in the exact cat-head schema (see art/glyphs/README.md).
 
 Run from this directory:  python3 dogs.py
-Then regenerate the drawlist:  cargo run -q -p aterm-effects --example gen_dog_glyphs
+Then regenerate the drawlist:  targo --unverified run -q -p aterm-effects --example gen_dog_glyphs
 """
 
 import math

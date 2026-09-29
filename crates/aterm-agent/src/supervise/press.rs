@@ -121,16 +121,21 @@ impl<C: Ctl> Session<'_, C> {
     /// fenced on (the loop's decision read, then each read inside this
     /// answer), and for a tab's first key, written after the wait below, a
     /// `status` read just before it; a person who keyed meanwhile gets
-    /// [`Press::Yielded`], and nothing more is sent. What is left is one
-    /// round trip: a person's key written between that read and the write,
-    /// and not yet read by Claude Code. A server fence on the PTY's input
-    /// count (`key if-input=`) would close it outright; it is not built
-    /// (deferred, R3b). The derived model `SupervisorQuestionAnswer`
-    /// (aterm-spec `supervisor_question_answer_model`, Tier-1 bound in
+    /// [`Press::Yielded`], and nothing more is sent. The one round trip left
+    /// — a person's key written between that read and the write, not yet
+    /// read by Claude Code — is the SERVER's to close (R3b, built
+    /// 2026-09-27): each key also names the read's person count (`key
+    /// if-human=<its "human_seq">`), checked under the same lock as the
+    /// screen fences, and a person who keyed since is `OK skipped
+    /// reason=person`: [`Press::Yielded`], nothing written. A host that
+    /// sends no count gets no person fence (the round trip stays, as
+    /// before). The derived model `SupervisorQuestionAnswer` (aterm-spec
+    /// `supervisor_question_answer_model`, Tier-1 bound in
     /// `run_engine_tests.rs`) proves the keys land where they were decided
-    /// under exactly these guards, and names that round trip — and the
-    /// retry's premise, a key read by Claude Code before the screen held
-    /// still 2 s after it — as the two assumptions it rests on.
+    /// under exactly these guards — the person fence a mechanism of it
+    /// (`PersonFence`) — and names the retry's premise, a key read by
+    /// Claude Code before the screen held still 2 s after it, as the one
+    /// assumption it rests on.
     ///
     /// * **Never unfenced.** A host that does not name `if-gen=` in `help
     ///   key`, or a read that carried no generation, is
@@ -294,10 +299,11 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// One question key, `key if-gen=<now's generation> if=<guard> <key>`:
-    /// [`Keyed::Written`] with the server's seq, or why not — a skip
-    /// (`reason=changed`: [`Press::Changed`]; no row matched:
-    /// [`Press::Skipped`]), or a refusal ([`Self::refused_press`]).
+    /// One question key, `key [if-human=<now's person count>] if-gen=<now's
+    /// generation> if=<guard> <key>`: [`Keyed::Written`] with the server's
+    /// seq, or why not — a skip (`reason=person`, a person keyed since the
+    /// read: [`Press::Yielded`]; `reason=changed`: [`Press::Changed`]; no row
+    /// matched: [`Press::Skipped`]), or a refusal ([`Self::refused_press`]).
     fn question_key(&mut self, guard: &str, key: &str, now: &Screen) -> Result<Keyed, Fail> {
         debug_assert!(
             matches!(key, "up" | "down" | "enter"),
@@ -310,6 +316,10 @@ impl<C: Ctl> Session<'_, C> {
             }));
         };
         let args = super::super::policy::key_args(guard, key, Some(generation));
+        let args = match now.human_seq {
+            Some(n) => format!("if-human={n} {args}"),
+            None => args,
+        };
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));
         let r = self.call(&words)?;
@@ -317,7 +327,9 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(Keyed::Not(p));
         }
         let at = r.seq().unwrap_or(now.seq);
-        Ok(if r.skipped_changed() {
+        Ok(if r.skipped_person() {
+            Keyed::Not(Pressing::Done(Press::Yielded { seq: at }))
+        } else if r.skipped_changed() {
             Keyed::Not(Pressing::Done(Press::Changed { seq: at }))
         } else if r.skipped() {
             Keyed::Not(Pressing::Done(Press::Skipped { seq: at }))
@@ -521,23 +533,28 @@ impl<C: Ctl> Session<'_, C> {
         Ok(Pressing::Done(pressed))
     }
 
-    /// The choice on an UNNUMBERED dialog (the folder-trust dialog, and
-    /// under full power any unnumbered box — the `Tool use` box whose vendor
-    /// default is `No`, Codex's folder gate;
+    /// The choice on a dialog answered by its FOCUS (the folder-trust
+    /// dialog, unnumbered; under full power any unnumbered box — the `Tool
+    /// use` box whose vendor default is `No`, Codex's folder gate; the
+    /// usage-limit dialog, whose wait row is reached with the arrows and
+    /// confirmed with Enter, never by a digit —
     /// [`Choice::Focus`](super::super::policy::approval::Choice::Focus)):
     /// move the focus `steps` options — each arrow fenced on the generation
     /// of the read that showed the dialog as judged (`key if-gen=<g>
     /// if=<the judged row> down`), the screen read again once it has moved
     /// and held still (`await seq`, then `await idle`) — then,
     /// once a fresh read by the session's reader shows the SAME dialog
-    /// (kind, and its folder or subject) with the focus on the option
-    /// labelled `label`, press
-    /// Enter fenced on THAT read's generation and guarded on the focused row
+    /// (kind, and its folder, subject or wait row) with the focus on the
+    /// option labelled `label`, press
+    /// `key` — Enter, or the key a Codex effort box applies the focused
+    /// effort to this conversation with (`s`) — fenced on THAT read's
+    /// generation and guarded on the focused row
     /// itself, `❯` and all: the Enter lands only while the focus is where
     /// the read saw it. Never without the generation fence (a host or a read
     /// without it: [`Pressing::Unconfirmed`]), never by the fallback's
     /// unguarded keys, and never Esc (the trust dialog's cancel EXITS Claude
-    /// Code). A focus that did not land where it was sent, or a dialog that
+    /// Code; the usage-limit dialog's cancels the wait). A focus that did not
+    /// land where it was sent, or a dialog that
     /// changed under the moves, is [`Pressing::Unconfirmed`]: the box is the
     /// manager's under the safe rules, and at full power read and tried again
     /// ([`Session::press_missed`]). A move of any distance within the box's
@@ -547,6 +564,7 @@ impl<C: Ctl> Session<'_, C> {
         prompt: &PromptV2,
         steps: i32,
         label: &str,
+        key: &str,
         guard: &str,
         seen: &Screen,
     ) -> Result<Pressing, Fail> {
@@ -626,7 +644,7 @@ impl<C: Ctl> Session<'_, C> {
             return unconfirmed("the read carried no screen generation to fence on");
         };
         let enter_guard = super::super::policy::row_guard(&now.rows[focused.row]);
-        let args = super::super::policy::key_args(&enter_guard, "enter", Some(&generation));
+        let args = super::super::policy::key_args(&enter_guard, key, Some(&generation));
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));
         let r = self.call(&words)?;
@@ -787,19 +805,29 @@ impl<C: Ctl> Session<'_, C> {
                 step: step.clone(),
                 unseen: 0,
             });
+            // The person fence (R3b): a person who keyed since this read
+            // skips the keystroke, `OK skipped reason=person`.
+            let person = now.human_seq.map(|n| format!("if-human={n}"));
             let (r, sent) = match &step {
                 DeclineStep::Type { guard } => {
                     let fence = format!("if-gen={generation}");
                     let guard = format!("if={guard}");
-                    let r = self.call(&["send", &fence, &guard, "--", text])?;
+                    let mut words: Vec<&str> = vec!["send"];
+                    words.extend(person.as_deref());
+                    words.extend([fence.as_str(), guard.as_str(), "--", text]);
+                    let r = self.call(&words)?;
                     (r, format!("{fence} {guard} (send)"))
                 }
                 DeclineStep::Move { down, guard } => {
                     let key = if *down { "down" } else { "up" };
-                    self.fenced_key(guard, key, &generation)?
+                    self.fenced_key(guard, key, &generation, person.as_deref())?
                 }
-                DeclineStep::Amend { guard } => self.fenced_key(guard, "tab", &generation)?,
-                DeclineStep::Submit { guard } => self.fenced_key(guard, "enter", &generation)?,
+                DeclineStep::Amend { guard } => {
+                    self.fenced_key(guard, "tab", &generation, person.as_deref())?
+                }
+                DeclineStep::Submit { guard } => {
+                    self.fenced_key(guard, "enter", &generation, person.as_deref())?
+                }
             };
             if let Some(p) = self.refused_press(&r, &sent)? {
                 if !matches!(p, Pressing::Lost { .. }) {
@@ -810,7 +838,9 @@ impl<C: Ctl> Session<'_, C> {
             let at = r.seq().unwrap_or(now.seq);
             if r.skipped() {
                 self.decline.pending = None;
-                return Ok(Pressing::Done(if r.skipped_changed() {
+                return Ok(Pressing::Done(if r.skipped_person() {
+                    Press::Yielded { seq: at }
+                } else if r.skipped_changed() {
                     Press::Changed { seq: at }
                 } else {
                     Press::Skipped { seq: at }
@@ -829,15 +859,20 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// `key if-gen=<generation> if=<guard> <key>`: the server's reply, and
-    /// the arguments as sent (for a refusal's reason).
+    /// `key [if-human=<n>] if-gen=<generation> if=<guard> <key>`: the
+    /// server's reply, and the arguments as sent (for a refusal's reason).
     fn fenced_key(
         &mut self,
         guard: &str,
         key: &str,
         generation: &str,
+        person: Option<&str>,
     ) -> Result<(CtlReply, String), Fail> {
         let args = super::super::policy::key_args(guard, key, Some(generation));
+        let args = match person {
+            Some(fence) => format!("{fence} {args}"),
+            None => args,
+        };
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));
         let r = self.call(&words)?;

@@ -103,7 +103,7 @@ fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String
     {
         return None;
     }
-    let b = crate::dec_u64(build);
+    let b = build.to_string();
     // `atpkg-<program>-<build>` / `pkg-<program>-<build>.toml`
     let mut tag = String::from("atpkg-");
     tag.push_str(program);
@@ -226,7 +226,7 @@ const FIRST_INDEX_SEARCH_LIMIT: u64 = 1 << 20;
 /// `atpkg-index-<build>` — the index publisher's tag (`tools/atpkg-index.sh`).
 fn index_tag(build: u64) -> String {
     let mut tag = String::from("atpkg-index-");
-    tag.push_str(&crate::dec_u64(build));
+    tag.push_str(&build.to_string());
     tag
 }
 
@@ -430,13 +430,9 @@ impl GithubFetcher {
         self
     }
 
-    /// `<owner>/<repo>` under this fetcher's account (manual concat — `format!` expands to
-    /// `fmt::Arguments` construction the strict Trust gate cannot lower).
+    /// `<owner>/<repo>` under this fetcher's account.
     fn slug_of(&self, repo: &str) -> String {
-        let mut slug = self.owner.clone();
-        slug.push('/');
-        slug.push_str(repo);
-        slug
+        format!("{}/{repo}", self.owner)
     }
 
     /// The `<owner>/<repo>` slug `program`'s release fetches go to: the config
@@ -487,7 +483,7 @@ impl GithubFetcher {
                 let mut msg = String::from("index discovery on ");
                 msg.push_str(slug);
                 msg.push_str(" found no end within ");
-                msg.push_str(&crate::dec_u64(u64::from(WALK_HEAD_BUDGET)));
+                msg.push_str(&WALK_HEAD_BUDGET.to_string());
                 msg.push_str(" HEADs");
                 return Err(msg);
             }
@@ -513,7 +509,7 @@ impl GithubFetcher {
                     let mut msg = String::from("HEAD ");
                     msg.push_str(&url);
                     msg.push_str(" answered ");
-                    msg.push_str(&crate::dec_u64(u64::from(code)));
+                    msg.push_str(&code.to_string());
                     msg.push_str(", not GitHub's redirect to a release asset");
                     Err(msg)
                 }

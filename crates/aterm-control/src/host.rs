@@ -125,6 +125,14 @@ pub trait ChangeWait {
     /// wake, `false` on timeout. A spurious/coalesced wake is fine — every
     /// caller re-reads the state it is waiting on.
     fn wait(&self, timeout: Duration) -> bool;
+
+    /// Whether the client that asked for this wait has hung up, so nobody can
+    /// read its answer. A host that serves a socket checks its connection (and
+    /// parks in slices short enough to notice); the default — no connection —
+    /// is never gone. Waiting verbs give their lane back when this is `true`.
+    fn caller_gone(&self) -> bool {
+        false
+    }
 }
 
 /// A host of one or more terminal sessions, addressed by process-local sid.

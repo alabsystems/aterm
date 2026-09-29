@@ -364,6 +364,10 @@ const MAX_SUBMODULES: usize = 64;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerEnv {
     process: ProcArgs,
+    /// The worker's pid — the session's foreground process group's leader —
+    /// where it was read from the kernel ([`Self::with_pid`]): what the files
+    /// its job holds open are read by.
+    pid: Option<u32>,
 }
 
 /// Variables the probe does not pass on to its own git. `GIT_CONFIG` names
@@ -378,7 +382,20 @@ impl WorkerEnv {
     /// The worker process `process`.
     #[must_use]
     pub fn new(process: ProcArgs) -> Self {
-        Self { process }
+        Self { process, pid: None }
+    }
+
+    /// The same worker, known as process `pid`.
+    #[must_use]
+    pub fn with_pid(mut self, pid: u32) -> Self {
+        self.pid = Some(pid);
+        self
+    }
+
+    /// The worker's pid, where it was read.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// A worker known only by its environment `vars` (`KEY=value`).
@@ -388,6 +405,12 @@ impl WorkerEnv {
             env: vars,
             ..ProcArgs::default()
         })
+    }
+
+    /// The worker's argv, `argv[0]` first (empty where it was not read).
+    #[must_use]
+    pub fn argv(&self) -> &[String] {
+        &self.process.argv
     }
 
     /// The value of `key`, as `getenv` answers it: the first entry.
@@ -507,6 +530,20 @@ impl WorkerEnv {
     /// does not parse ([`read_settings`]), since its `env` could say
     /// anything. A file that is not there sets nothing.
     pub fn settings_env(&self, launch: &Path) -> Result<(), String> {
+        self.settings_env_where(launch, git_relevant, "a git read")
+    }
+
+    /// [`Self::settings_env`] for the variables `relevant` names, the
+    /// escalation's reason about `subject` (`a git read`): the same settings
+    /// files, read the same way — the shell-startup check
+    /// ([`super::shell_startup`]) asks it for the variables that choose the
+    /// Bash tool's shell and what that shell reads before a command.
+    pub fn settings_env_where(
+        &self,
+        launch: &Path,
+        relevant: fn(&str) -> bool,
+        subject: &str,
+    ) -> Result<(), String> {
         let mut sources: Vec<(String, Result<Option<String>, String>)> = Vec::new();
         for managed in MANAGED_SETTINGS {
             sources.push((managed.to_string(), read_settings(Path::new(managed))));
@@ -540,7 +577,7 @@ impl WorkerEnv {
         for (source, text) in sources {
             let unread = |why: &str| {
                 format!(
-                    "a git read whose Bash tool's settings ({source}) {why}: its `env` is unknown"
+                    "{subject} whose Bash tool's settings ({source}) {why}: its `env` is unknown"
                 )
             };
             let Some(text) = text.map_err(|why| unread(&why))? else {
@@ -556,9 +593,9 @@ impl WorkerEnv {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| value.to_string());
-                if git_relevant(key) && self.var(key) != Some(value.as_str()) {
+                if relevant(key) && self.var(key) != Some(value.as_str()) {
                     return Err(format!(
-                        "a git read whose Bash tool gets `{key}` from Claude Code's settings \
+                        "{subject} whose Bash tool gets `{key}` from Claude Code's settings \
                          ({source}), not the environment this check reads"
                     ));
                 }

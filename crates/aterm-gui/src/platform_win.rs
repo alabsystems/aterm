@@ -2218,8 +2218,9 @@ impl AppRt for AppRtWindows {
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
+        own_alerts: Arc<AtomicBool>,
     ) -> SyncSender<NotifyMsg> {
-        crate::notify::spawn_delivery(suppress, silent)
+        crate::notify::spawn_delivery(suppress, silent, own_alerts)
     }
 
     /// Delegate to the shared menu module — `None` on Windows BY DESIGN:

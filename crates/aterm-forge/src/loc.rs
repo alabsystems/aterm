@@ -813,7 +813,7 @@ mod tests {
             grown.is_empty(),
             "cell `{}` has grown past its measured baseline: {grown:?}. A deliberate \
              addition re-measures the row in measured.rs AND ratchets \
-             tools/forge-budget.tsv (`cargo forge budget --allow-regress`), with the \
+             tools/forge-budget.tsv (`targo --unverified forge budget --allow-regress`), with the \
              reason in the commit",
             row.cell
         );

@@ -665,6 +665,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         });
         SessionHandle {
             sid,

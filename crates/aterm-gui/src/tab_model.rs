@@ -640,9 +640,35 @@ impl SplitPath {
 pub(crate) struct VisibleLeaf {
     pub(crate) path: SplitPath,
     pub(crate) view: ViewId,
+    /// Host-owned subtab title row, outside the content's coordinate space.
+    pub(crate) header: Option<LogicalRect>,
     pub(crate) rect: LogicalRect,
     pub(crate) sizing: LeafSizing,
     pub(crate) focused: bool,
+}
+
+impl VisibleLeaf {
+    /// The complete pane allocation, including its optional subtab header.
+    #[must_use]
+    pub(crate) fn outer_rect(&self) -> LogicalRect {
+        self.header.map_or(self.rect, |header| {
+            LogicalRect::new(
+                self.rect.origin.x,
+                header.origin.y,
+                self.rect.size.width,
+                header.size.height + self.rect.size.height,
+            )
+        })
+    }
+}
+
+/// A split pane reserves one cell row for its title, provided one content row
+/// remains. Shared with the terminal compatibility layout so its blits and the
+/// canonical plan's sizing, input and accessibility agree on the same inset.
+#[must_use]
+pub(crate) fn pane_header_rect(rect: LogicalRect) -> Option<LogicalRect> {
+    (rect.size.height >= 2.0 && rect.size.width > 0.0)
+        .then(|| LogicalRect::new(rect.origin.x, rect.origin.y, rect.size.width, 1.0))
 }
 
 /// One visible divider, including the bounds needed to turn a pointer back into
@@ -670,6 +696,23 @@ pub(crate) struct VisibleLeafPlan {
 }
 
 impl VisibleLeafPlan {
+    /// Reserve host chrome only when siblings are visible. Single panes and
+    /// zoomed panes keep their full content area. Reapplying is harmless.
+    pub(crate) fn reserve_pane_headers(&mut self) {
+        if self.leaves.len() <= 1 {
+            return;
+        }
+        for leaf in &mut self.leaves {
+            if leaf.header.is_none()
+                && let Some(header) = pane_header_rect(leaf.rect)
+            {
+                leaf.rect.origin.y += header.size.height;
+                leaf.rect.size.height -= header.size.height;
+                leaf.header = Some(header);
+            }
+        }
+    }
+
     #[must_use]
     pub(crate) fn leaf(&self, view: ViewId) -> Option<&VisibleLeaf> {
         self.leaves.iter().find(|leaf| leaf.view == view)
@@ -677,7 +720,16 @@ impl VisibleLeafPlan {
 
     #[must_use]
     pub(crate) fn leaf_at(&self, point: LogicalPoint) -> Option<&VisibleLeaf> {
-        self.leaves.iter().find(|leaf| leaf.rect.contains(point))
+        self.leaves
+            .iter()
+            .find(|leaf| leaf.outer_rect().contains(point))
+    }
+
+    #[must_use]
+    pub(crate) fn header_at(&self, point: LogicalPoint) -> Option<&VisibleLeaf> {
+        self.leaves
+            .iter()
+            .find(|leaf| leaf.header.is_some_and(|header| header.contains(point)))
     }
 
     #[must_use]
@@ -1132,6 +1184,7 @@ fn plan_into(
         SplitTree::Leaf(view) => leaves.push(VisibleLeaf {
             path: path.clone(),
             view: *view,
+            header: None,
             rect: bounds,
             sizing: sizing(*view).sanitized(),
             focused: *view == focus,
@@ -1532,6 +1585,7 @@ impl Tab {
                 leaves: vec![VisibleLeaf {
                     path: SplitPath::root(),
                     view: self.focus,
+                    header: None,
                     rect: bounds,
                     sizing: leaf_sizing,
                     focused: true,
@@ -1622,7 +1676,9 @@ impl Tab {
         if plan.zoomed || plan.leaves.len() <= 1 {
             return false;
         }
-        let Some(current) = plan.leaf(self.focus).map(|leaf| leaf.rect) else {
+        // Focus navigation follows the pane allocation, including its header;
+        // shrinking a content area must not change which sibling is adjacent.
+        let Some(current) = plan.leaf(self.focus).map(VisibleLeaf::outer_rect) else {
             return false;
         };
         let cur_right = current.origin.x + current.size.width;
@@ -1633,7 +1689,7 @@ impl Tab {
             if leaf.view == self.focus {
                 continue;
             }
-            let rect = leaf.rect;
+            let rect = leaf.outer_rect();
             let right = rect.origin.x + rect.size.width;
             let bottom = rect.origin.y + rect.size.height;
             let (on_side, distance, shared, offset) = match direction {
@@ -2017,6 +2073,127 @@ mod tests {
         }
         assert!(plan.leaf(second_terminal).is_some_and(|leaf| leaf.focused));
         assert!(tab.invariant_holds(&store));
+    }
+
+    #[test]
+    fn pane_headers_reserve_content_and_hit_their_own_leaf_in_nested_splits() {
+        let (_, views) = view_store_with(3);
+        let mut tab = Tab::new(
+            TabId::from_stored(1),
+            views[0],
+            TabPresentation::terminal("shell"),
+        );
+        assert!(tab.split_focused(SplitAxis::Horizontal, views[1]));
+        assert!(tab.split_focused(SplitAxis::Vertical, views[2]));
+        let mut plan = tab.visible_plan(LogicalRect::new(0.0, 0.0, 80.0, 24.0), 1.0, |_| {
+            LeafSizing::new(LogicalSize::new(2.0, 1.0), LogicalSize::new(80.0, 24.0))
+        });
+        let before = plan.clone();
+        plan.reserve_pane_headers();
+        assert_eq!(
+            plan.dividers, before.dividers,
+            "headers never move split handles"
+        );
+        for (leaf, original) in plan.leaves.iter().zip(&before.leaves) {
+            let header = leaf.header.expect("roomy split has a title row");
+            assert_eq!(leaf.outer_rect(), original.rect);
+            assert_eq!(header.size.height, 1.0);
+            assert_eq!(leaf.rect.origin.y, original.rect.origin.y + 1.0);
+            assert_eq!(leaf.rect.size.height, original.rect.size.height - 1.0);
+            let header_point = LogicalPoint {
+                x: header.origin.x,
+                y: header.origin.y,
+            };
+            assert_eq!(
+                plan.header_at(header_point).map(|hit| hit.view),
+                Some(leaf.view)
+            );
+            assert_eq!(
+                plan.leaf_at(header_point).map(|hit| hit.view),
+                Some(leaf.view)
+            );
+            assert!(
+                !leaf.rect.contains(header_point),
+                "chrome is outside terminal input"
+            );
+            assert!(
+                plan.header_at(leaf.rect.origin).is_none(),
+                "first content row is not chrome"
+            );
+        }
+        for divider in &plan.dividers {
+            assert!(plan.header_at(divider.rect.origin).is_none());
+            assert!(plan.leaf_at(divider.rect.origin).is_none());
+        }
+        for leaf in &plan.leaves {
+            for direction in [
+                FocusDirection::Left,
+                FocusDirection::Right,
+                FocusDirection::Up,
+                FocusDirection::Down,
+            ] {
+                let mut undecorated = tab.clone();
+                let mut decorated = tab.clone();
+                undecorated.focus = leaf.view;
+                decorated.focus = leaf.view;
+                assert_eq!(
+                    decorated.focus_neighbor(direction, &plan),
+                    undecorated.focus_neighbor(direction, &before),
+                    "title rows must not change keyboard focus navigation"
+                );
+                assert_eq!(decorated.focus, undecorated.focus);
+            }
+        }
+        let once = plan.clone();
+        plan.reserve_pane_headers();
+        assert_eq!(
+            plan, once,
+            "reserving twice never steals a second content row"
+        );
+    }
+
+    #[test]
+    fn pane_headers_disappear_for_single_zoomed_and_one_row_leaves() {
+        let (_, views) = view_store_with(2);
+        let mut tab = Tab::new(
+            TabId::from_stored(1),
+            views[0],
+            TabPresentation::terminal("shell"),
+        );
+        let plan_for = |tab: &Tab, rows| {
+            let mut plan = tab.visible_plan(LogicalRect::new(0.0, 0.0, 80.0, rows), 1.0, |_| {
+                LeafSizing::new(LogicalSize::new(2.0, 1.0), LogicalSize::new(80.0, 24.0))
+            });
+            plan.reserve_pane_headers();
+            plan
+        };
+        let single = plan_for(&tab, 24.0);
+        assert!(single.leaves[0].header.is_none());
+        assert_eq!(single.leaves[0].rect, single.bounds);
+        assert!(tab.split_focused(SplitAxis::Horizontal, views[1]));
+        let tiny = plan_for(&tab, 1.0);
+        assert!(tiny.leaves.iter().all(|leaf| leaf.header.is_none()));
+        assert!(tiny.leaves.iter().all(|leaf| leaf.rect.size.height == 1.0));
+        let just_fits = plan_for(&tab, 2.0);
+        assert!(just_fits.leaves.iter().all(|leaf| leaf.header.is_some()));
+        assert!(
+            just_fits
+                .leaves
+                .iter()
+                .all(|leaf| leaf.rect.size.height == 1.0)
+        );
+        tab.zoomed = true;
+        let zoomed = plan_for(&tab, 24.0);
+        assert_eq!(zoomed.leaves.len(), 1);
+        assert!(zoomed.leaves[0].header.is_none());
+        assert_eq!(zoomed.leaves[0].rect, zoomed.bounds);
+        tab.zoomed = false;
+        assert!(
+            plan_for(&tab, 24.0)
+                .leaves
+                .iter()
+                .all(|leaf| leaf.header.is_some())
+        );
     }
 
     #[test]

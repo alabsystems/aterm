@@ -71,6 +71,9 @@ pub fn our_uid() -> u32 {
     0
 }
 
+/// No process groups on Windows: the caller's `Child::kill` is the whole of it.
+pub fn kill_process_group(_leader: u32) {}
+
 /// Best-effort private-dir predicate: `true`. POSIX owner/mode bits do not apply;
 /// confidentiality rests on the per-user `%LOCALAPPDATA%` profile ACL.
 #[must_use]
@@ -426,7 +429,7 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
         tmp_name.push_str("shim");
     }
     tmp_name.push_str(".tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    tmp_name.push_str(&std::process::id().to_string());
     let tmp = parent.join(tmp_name);
     let _ = fs::remove_file(&tmp);
     fs::write(&tmp, bytes)?;

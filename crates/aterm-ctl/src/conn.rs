@@ -224,45 +224,49 @@ impl ConnWire {
     /// joined parts as one line, read the status, and — when the shared
     /// framing table says the verb streams `OK <n>` + n lines — the body rows.
     /// The same bounded-read plumbing as [`super::exchange`], without the
-    /// print-as-you-go: conn renders replies, it does not relay them.
+    /// print-as-you-go: conn renders replies, it does not relay them. A
+    /// [`CONN_DEADLINE`] that fires once connected is [`super::converse`]'s
+    /// `no reply from <sock> within 60s …` line (or, once the status line has
+    /// come, its `reply from <sock> stopped part-way: …`), not the OS's EAGAIN.
     fn request(&self, parts: &[String]) -> io::Result<Reply> {
         super::validate_request_parts(parts)?;
         let mut request = parts.join(" ");
         request.push('\n');
         let path = aterm_uds::latest::resolve(&self.path);
-        let stream = super::connect_stream(&path, self.origin)?;
-        stream.set_read_timeout(Some(CONN_DEADLINE))?;
-        stream.set_write_timeout(Some(CONN_DEADLINE))?;
-        super::send_request(&stream, super::read_token_for(&path).as_deref(), &request)?;
-        let mut reader = BufReader::new(&stream);
-        let mut status = String::new();
-        if super::read_bounded_line(&mut reader, &mut status)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "server closed the connection without responding",
-            ));
-        }
-        let status = status.trim_end_matches(['\r', '\n']).to_string();
-        let verb = super::forwarded_verb(parts).unwrap_or_default();
-        let mut lines = Vec::new();
-        if aterm_types::control_verbs::framing_of(&verb, &request)
-            == aterm_types::control_verbs::Framing::Lines
-            && let Some(tail) = status.strip_prefix("OK ")
-        {
-            let count =
-                super::stream_count(tail).ok_or_else(|| super::malformed_header_error(&status))?;
-            for _ in 0..count {
-                let mut line = String::new();
-                if super::read_bounded_line(&mut reader, &mut line)? == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "server hung up before the complete response",
-                    ));
-                }
-                lines.push(line.trim_end_matches(['\r', '\n']).to_string());
+        super::converse(&path, self.origin, Some(CONN_DEADLINE), |stream| {
+            stream.set_read_timeout(Some(CONN_DEADLINE))?;
+            stream.set_write_timeout(Some(CONN_DEADLINE))?;
+            super::send_request(&stream, super::read_token_for(&path).as_deref(), &request)?;
+            let mut reader = BufReader::new(&stream);
+            let mut status = String::new();
+            if super::read_status_line(&mut reader, &mut status)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed the connection without responding",
+                ));
             }
-        }
-        Ok(Reply { status, lines })
+            let status = status.trim_end_matches(['\r', '\n']).to_string();
+            let verb = super::forwarded_verb(parts).unwrap_or_default();
+            let mut lines = Vec::new();
+            if aterm_types::control_verbs::framing_of(&verb, &request)
+                == aterm_types::control_verbs::Framing::Lines
+                && let Some(tail) = status.strip_prefix("OK ")
+            {
+                let count = super::stream_count(tail)
+                    .ok_or_else(|| super::malformed_header_error(&status))?;
+                for _ in 0..count {
+                    let mut line = String::new();
+                    if super::read_bounded_line(&mut reader, &mut line)? == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "server hung up before the complete response",
+                        ));
+                    }
+                    lines.push(line.trim_end_matches(['\r', '\n']).to_string());
+                }
+            }
+            Ok(Reply { status, lines })
+        })
     }
 
     /// The instance's `sessions` listing, parsed — the sid⇄local-id⇄title

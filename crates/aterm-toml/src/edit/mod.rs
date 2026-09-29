@@ -14,7 +14,7 @@
 //!   leave every other line of `aterm.toml` exactly as it was found;
 //! * the config editor underlines diagnostics, which needs the byte span of the
 //!   offending token, not its value;
-//! * `cargo forge` rewrites `vendor/forge.toml` and asserts the round-trip does
+//! * `targo --unverified forge` rewrites `vendor/forge.toml` and asserts the round-trip does
 //!   not move a single byte.
 //!
 //! So this module parses into a tree that keeps the ORIGINAL text of every

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-forge` — the owned-fork production line for aterm's third-party
-//! surface, behind the `cargo forge` alias.
+//! surface, behind the `targo --unverified forge` alias.
 //!
 //! # Why this exists
 //!
@@ -105,7 +105,7 @@ pub struct Outcome {
 /// The honest limits of this tool, printed verbatim in every RED diagnostic so
 /// the report cannot over-claim.
 pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of forge):
-      - RESOLUTION, not compilation: the graph comes from `cargo tree --locked
+      - RESOLUTION, not compilation: the graph comes from `targo tree --locked
         --offline -e normal`, which is cargo's own resolver. Feature unification
         across the workspace is therefore accounted exactly, but a package that
         resolves is not proof that a given item inside it is reachable.

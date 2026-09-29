@@ -80,6 +80,13 @@ impl Staging {
         self.root.join("failed.toml")
     }
 
+    /// The crash-loop quarantine ledger (`quarantine.toml`): every artifact that was
+    /// swapped in, failed boot health and was reverted, kept apart from the timed
+    /// backoff memo in [`Self::failed`]; see `manifest::Quarantine`.
+    pub fn quarantine(&self) -> PathBuf {
+        self.root.join("quarantine.toml")
+    }
+
     /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written beside
     /// the boot sentinel at apply time so a LATER crash-loop revert — which no longer
     /// holds the ready marker — can poison exactly the build that crash-looped, so it

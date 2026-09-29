@@ -601,9 +601,9 @@ fn waiting_drivers_do_not_starve_a_fresh_client() {
     }
 }
 
-/// The busy reply is kept for a socket truly saturated with work, and it is
-/// prompt: two requests working on two lanes refuse a third client at once,
-/// and the lane a finished request frees admits again.
+/// The busy reply is kept for a socket truly saturated with work, and it does
+/// not wait for a lane: two requests working on two lanes refuse a third client
+/// while both still work, and the lane a finished request frees admits again.
 #[test]
 fn a_pool_saturated_with_work_still_refuses_promptly() {
     let rig = Rig::new(LaneLimits {
@@ -618,12 +618,32 @@ fn a_pool_saturated_with_work_still_refuses_promptly() {
         workers.push(driver);
         rig.settle("working", |c, f| f == (index + 1, 0) && c.rpc == index + 1);
     }
-    let started = Instant::now();
-    assert!(rig.dial().is_none(), "saturated with work: refused");
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "and at once"
+    // "Did not wait for a lane" is an ORDER: the admission is asked on a thread
+    // of its own while this one keeps both lanes working, so its answer arriving
+    // at all proves it did not wait for a lane to free — none can until
+    // `let_finish` below. The minute is a hang detector for an admission that
+    // parks the listener. What the order does NOT see is how long the refusal
+    // took: an admission that retried a bounded while (under the minute) and
+    // then refused would pass. That it does not is the code's shape — a
+    // `Slot::take` and one `try_submit`, no wait — and no clock here judges it.
+    // (It was a 500 ms stopwatch around a socketpair and two atomics, which a
+    // loaded box's scheduler could cross on a correct tree.)
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+    let lanes = Arc::clone(&rig.lanes);
+    let asker = std::thread::spawn(move || {
+        let (_client, server) = CtlStream::pair().expect("real control socket pair");
+        let _ = answer_tx.send(lanes.admit(server).is_ok());
+    });
+    let admitted = answer_rx
+        .recv_timeout(SETTLE * 6)
+        .expect("the saturated lanes parked the admission instead of refusing it");
+    assert!(!admitted, "saturated with work: refused");
+    assert_eq!(
+        rig.stub.in_flight(),
+        (2, 0),
+        "and refused while both lanes were still working"
     );
+    asker.join().expect("the admission thread");
     rig.stub.let_finish(false);
     rig.settle("one lane free", |c, _| c.rpc == 1);
     let mut next = rig.dial().expect("a freed lane admits again");

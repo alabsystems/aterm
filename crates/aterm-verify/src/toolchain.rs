@@ -133,7 +133,9 @@ pub fn pinned_channel(root: &Path) -> Option<String> {
 /// Channels that resolve to an ORDINARY rust release. For those the historical
 /// behaviour is correct — any cargo on PATH is the pinned one, near enough — so
 /// the check below passes them through rather than inventing a driver name that
-/// no upstream toolchain ships.
+/// no upstream toolchain ships. PUBLIC BOUNDARY: this crate ships in the public
+/// snapshot, whose export swaps in a stock pin (publish/transforms.sh); the dev
+/// tree pins `trust`, so this arm is never taken here.
 fn is_upstream_channel(channel: &str) -> bool {
     matches!(channel, "" | "stable" | "beta" | "nightly")
         || channel.starts_with("nightly-")
@@ -783,7 +785,7 @@ impl Toolchain {
              resolves on PATH, so cargo's [build] rustdoc = \"trustdoc\" \
              (.cargo/config.toml) has nothing to exec for the doctest lane. Fix: {} — the \
              store's stage2 carries trustdoc and shims it onto PATH; the gate then binds it \
-             directly, and `cargo ship provision` can link ~/.local/bin/trustdoc for direct \
+             directly, and `targo --unverified ship provision` can link ~/.local/bin/trustdoc for direct \
              cargo runs",
             self.trustdoc.display(),
             Self::INSTALL_REMEDY,

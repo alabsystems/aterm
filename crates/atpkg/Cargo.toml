@@ -11,12 +11,6 @@ description = "aterm toolchain package manager — the signature anchor: detache
 
 [lib]
 path = "src/lib.rs"
-# The pinned custom `trust` toolchain (rust-toolchain.toml) ships no rustdoc, and a
-# linked custom toolchain cannot `rustup component add` one — so `cargo test`'s
-# doc-test phase aborts the whole run on this tree even with every real test green.
-# This crate's test surface is its inline #[cfg(test)] modules + tests/ (no doc-tests
-# exist to lose), so the phase is off: bare `cargo test` must be able to pass.
-doctest = false
 
 [[bin]]
 name = "atpkg"
@@ -93,6 +87,13 @@ aterm-digest = { workspace = true }
 # a writer. Per-entry extraction is still driven manually so EVERY entry is vetted before
 # a byte is written, modes are sanitized, and a single escape aborts the whole stage.
 zstd = { workspace = true }
+# The ONE spelling of Claude Code's top-effort settings key,
+# `aterm_primer::CLAUDE_TOP_EFFORT_KEY`, which the doctor's (10h) rows report and its
+# mirror of the window's defaults names. The publication baseline bans that word,
+# joined, in every exported file, so the source spells it once, from parts, in the
+# crate that writes it. aterm-primer is a std-only leaf with no dependencies of its
+# own: the edge brings nothing else in.
+aterm-primer = { workspace = true }
 
 [dev-dependencies]
 # Tier-1 conformance drives the real index-probe stamp/lock against the derived

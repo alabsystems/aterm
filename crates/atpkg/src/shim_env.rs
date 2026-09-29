@@ -141,9 +141,9 @@ impl ShimEnv {
     pub fn admit(raw: &[String]) -> Result<Self, String> {
         if raw.len() > MAX_SHIM_ENV {
             let mut m = String::from("shim_env: ");
-            m.push_str(&crate::dec_u64(raw.len() as u64));
+            m.push_str(&raw.len().to_string());
             m.push_str(" entries, at most ");
-            m.push_str(&crate::dec_u64(MAX_SHIM_ENV as u64));
+            m.push_str(&MAX_SHIM_ENV.to_string());
             m.push_str(" allowed");
             return Err(m);
         }
@@ -254,7 +254,7 @@ impl ShimEnv {
 fn split_entry(entry: &str) -> Result<(&str, &str), String> {
     if entry.len() > MAX_ENTRY_BYTES {
         let mut why = String::from("longer than ");
-        why.push_str(&crate::dec_u64(MAX_ENTRY_BYTES as u64));
+        why.push_str(&MAX_ENTRY_BYTES.to_string());
         why.push_str(" bytes");
         return Err(refuse(entry, &why));
     }
@@ -317,8 +317,8 @@ fn refuse(entry: &str, why: &str) -> String {
 /// component (never, for a real build dir).
 #[must_use]
 pub(crate) fn sidecar_path(build_dir: &Path) -> Option<PathBuf> {
-    let name = crate::call1(std::path::Path::file_name, build_dir)?;
-    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let name = build_dir.file_name()?;
+    let name = name.to_str()?;
     let mut marker = String::from(name);
     marker.push_str(SIDECAR_SUFFIX);
     Some(build_dir.with_file_name(marker))
@@ -344,10 +344,10 @@ pub(crate) fn write_sidecar(build_dir: &Path, env: &ShimEnv) -> io::Result<()> {
     let parent = dest.parent().unwrap_or(build_dir);
     std::fs::create_dir_all(parent)?;
     let mut tmp_name = String::from(".shim-env.tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    tmp_name.push_str(&std::process::id().to_string());
     let tmp = parent.join(tmp_name);
     let _ = std::fs::remove_file(&tmp);
-    crate::call2(std::fs::write, &tmp, env.to_lines().as_bytes())?;
+    std::fs::write(&tmp, env.to_lines().as_bytes())?;
     if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);

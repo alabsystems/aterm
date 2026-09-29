@@ -82,7 +82,6 @@ pub fn decide(channel: &Channel, program: &str, installed: Option<u64>) -> Apply
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn channel(min_build: u64, pin: &[(&str, u64)], yanked: &[&str]) -> Channel {
         Channel {
@@ -93,7 +92,6 @@ mod tests {
             yanked: yanked.iter().map(|s| (*s).to_string()).collect(),
             pin: pin.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
             pin_by_target: Default::default(),
-            meta: BTreeMap::new(),
         }
     }
 

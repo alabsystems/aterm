@@ -103,6 +103,9 @@ pub(super) fn reset_common_fields(
             *grid = main_grid;
         }
     }
+    // A full reset replaces the screen: no resize undo may hand rows back into
+    // it (the erase below moves `content_gen`, which drops it too; this says so).
+    grid.drop_resize_undo();
     // Grid: reset scroll region and horizontal margins before erasing (#3925 Bug 3)
     grid.reset_scroll_region();
     grid.reset_horizontal_margins();

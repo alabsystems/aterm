@@ -34,18 +34,13 @@ use crate::{Wake, term_lock};
 /// spaces and the tail trimmed. THE single source for a screen row's text —
 /// `text`, `text --json`, and the pushed `subscribe screen` DELTA all route here
 /// so the polled and pushed faces stay byte-identical. Caller holds the term lock.
+///
+/// The body lives in `aterm_control::wire::visible_row`, beside
+/// [`visible_char`]: `cast drift` replays a recording through a fresh engine in
+/// that crate (and client-side, in the one binary, where no GUI links) and
+/// compares its rows with these, so the two must be one function.
 pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
-    let line = t.get_line_text(r as i32, None).unwrap_or_default();
-    let mut out: String = line.chars().map(visible_char).collect();
-    // Truncate in place instead of `trim_end().to_string()`: `trim_end` returns
-    // a PREFIX slice, so its length is always a char boundary and the bytes that
-    // survive are identical — but the old form allocated a second full row and
-    // memcpy'd into it. This runs once per screen row per `subscribe screen`
-    // push WITH THE TERMINAL LOCK HELD, so the copy stalled the PTY reader.
-    // (Two statements: `out.truncate(out.trim_end().len())` cannot borrow-check.)
-    let end = out.trim_end().len();
-    out.truncate(end);
-    out
+    aterm_control::wire::visible_row(t, r)
 }
 
 /// How many leading rows a reply keeps once its trailing all-blank rows are dropped:
@@ -634,12 +629,13 @@ fn read_dims(
     term: &Arc<Mutex<Terminal>>,
     session: u64,
     proxy: &EventLoopProxy<Wake>,
-) -> Result<DimsSnapshot, &'static str> {
+) -> Result<DimsSnapshot, control_media::MainHopError> {
     control_media::call_main(proxy, |reply| Wake::ReadDims {
         session,
         term: Arc::clone(term),
         reply,
     })?
+    .map_err(control_media::MainHopError::Reason)
 }
 
 /// Read the grid dimensions — and the scrollback loss counter, the one engine
@@ -1204,7 +1200,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_gpu_cell_pipeline_ms={} \
          effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
          effect_pipelines_built={} \
-         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}\n",
+         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}{}{}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1400,6 +1396,14 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // queue lost, and replays it had to repair — cumulative, so a real
         // drop is a number, not one more line beside a message on every update.
         crate::metrics::handoff_input_fields_text(),
+        // THE SUCCESSOR'S CLAIM TIMELINE (warm successor P0): on a boot that
+        // claimed a handoff, each boundary of its boot in ms after the claim,
+        // and the warm it did before its dial. `none` on every other launch.
+        crate::metrics::handoff_claim_fields_text(),
+        // THE CONTROL LISTENER (2026-09-25 incident): accepts, the last
+        // accept's age, the kernel queue it last read, rebinds of a wedged
+        // listening socket, and the lane-admission refusals.
+        crate::control_listener::fields_text(),
     )
 }
 
@@ -1893,7 +1897,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_gpu_cell_pipeline_ms\":{},\
          \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
          \"effect_pipelines_built\":\"{}\",\
-         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}}}",
+         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}{}{}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -2050,6 +2054,10 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         crate::strain_host::metrics_fields_json(),
         // Field-for-field twin of the text summary's handoff-input fragment.
         crate::metrics::handoff_input_fields_json(),
+        // Field-for-field twin of the text summary's claim-timeline fragment.
+        crate::metrics::handoff_claim_fields_json(),
+        // Field-for-field twin of the text summary's control-listener fragment.
+        crate::control_listener::fields_json(),
     ))
 }
 
@@ -2075,7 +2083,9 @@ pub(crate) fn cmd_lines(term: &Arc<Mutex<Terminal>>) -> String {
 /// to the archive whole, then the exit the dead app's reset would have been);
 /// this is the wire face plus the repaint the swap needs. Host-based like the
 /// selection verbs, so it is correct cross-session, and `OK left=<0|1>` states
-/// what happened rather than echoing the request.
+/// what happened rather than echoing the request. `left=1` is OUR screen only:
+/// under ConPTY conhost stays on the dead app's buffer, and only a console
+/// client writing `?1049l` moves it (measured 2026-09-27, in the doc named above).
 pub(crate) fn cmd_mainscreen(host: &impl aterm_control::SessionHost, sid: u64) -> String {
     let Some(left) = host.with_terminal_mut(sid, Terminal::leave_alternate_screen) else {
         return "ERR no such session\n".to_string();
@@ -4156,7 +4166,8 @@ pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String 
     let (lane, text) = (lane.to_string(), text.to_string());
     match control_media::call_main(proxy, |reply| Wake::AppNotice { lane, text, reply }) {
         Ok(Ok(crate::AppNoticeTaken::Recorded)) => "OK recorded\n".to_string(),
-        Ok(Err(error)) | Err(error) => format!("ERR {error}\n"),
+        Ok(Err(error)) => format!("ERR {error}\n"),
+        Err(error) => format!("ERR {error}\n"),
     }
 }
 
@@ -4323,7 +4334,7 @@ pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
 /// has keyed (`"human_ms":null`).
 #[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
-    cmd_text_json_read(term, args, None)
+    cmd_text_json_read(term, args, None, 0)
 }
 
 /// [`cmd_text_json_opt`] as the dispatch answers it: `human_ms` (2026-09-25)
@@ -4332,11 +4343,34 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> 
 /// right after `gen` — like `gen`, every reply carries it, and `trimmed` /
 /// `first` stay last. A supervisor reads it off the very read it decides a
 /// question dialog's key on, and keys nothing until a person has been quiet
-/// long enough (the critique of 2026-09-25, R1).
+/// long enough (the critique of 2026-09-25, R1). `human_seq` beside it is
+/// how many person gestures have reached the session
+/// ([`crate::human_input::HumanInputStamp::seq`]), read BEFORE the screen: a
+/// write fenced `if-human=<it>` is refused if a person keyed since (R3b,
+/// 2026-09-27).
+/// `text --json` as the session's own verb serves it: the read is noted as a
+/// LOOK at the session's screen generation first
+/// ([`crate::presence::GenerationLook`]: its `"gen"` is what an `if-gen=`
+/// fence names, and the presence row's pending fold waits its quiet past it,
+/// ruling 394), then [`cmd_text_json_read`] with the session's `human_ms`
+/// and `human_seq` — the count before the age, both before the screen, so a
+/// person's key after this is one the fence sees.
+pub(crate) fn cmd_text_json_looked(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &crate::SessionCtx,
+    args: TextArgs,
+) -> String {
+    let now_us = crate::metrics::now_us();
+    ctx.generation_look.note(now_us);
+    let human_seq = ctx.human_input.seq();
+    cmd_text_json_read(term, args, ctx.human_input.ms_since(now_us), human_seq)
+}
+
 pub(crate) fn cmd_text_json_read(
     term: &Arc<Mutex<Terminal>>,
     args: TextArgs,
     human_ms: Option<u64>,
+    human_seq: u64,
 ) -> String {
     // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
     // styled frame already uses. Every field is read inside the single hold, so the
@@ -4394,7 +4428,7 @@ pub(crate) fn cmd_text_json_read(
             out,
             "],\"cursor\":{{\"row\":{},\"col\":{},\"visible\":{vis},{}}},\
              \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq},\"gen\":\"{generation}\",\
-             \"human_ms\":{human}",
+             \"human_ms\":{human},\"human_seq\":{human_seq}",
             c.row,
             c.col,
             json_str_field("style", style),
@@ -6980,6 +7014,33 @@ mod tests {
         }
     }
 
+    /// THE SUCCESSOR'S CLAIM TIMELINE rides both forms (warm successor P0). A
+    /// test process claimed no handoff, so the fragment is the `none` / `null`
+    /// shape — and it is spliced WHOLE, so the text and JSON twins name the same
+    /// two fields.
+    #[test]
+    fn the_handoff_claim_timeline_rides_the_metrics_summary_in_both_forms() {
+        let fragment = crate::metrics::handoff_claim_fields_text();
+        assert_eq!(
+            fragment,
+            " handoff_claim_stamps=none handoff_warm_pre_dial_ms=none"
+        );
+        let text = super::cmd_metrics(None, "");
+        assert!(text.contains(&fragment), "{text}");
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+        for name in ["handoff_claim_stamps", "handoff_warm_pre_dial_ms"] {
+            assert!(
+                value.get(name).is_some_and(aterm_json::Value::is_null),
+                "{name}: {reply}"
+            );
+        }
+    }
+
     /// ITEM 6 wire shape. The per-owner ledger is a self-labelling field in
     /// both forms — an OBJECT in JSON, `owner:arms/past` pairs in text — so a
     /// reader never depends on position and a newly appended `DeadlineOwner`
@@ -7785,17 +7846,20 @@ mod trim_tests {
     #[test]
     fn text_json_carries_the_persons_stamp_after_gen() {
         let term = term_with(24, &numbered(22));
-        let never = super::cmd_text_json_read(&term, TextArgs::default(), None);
-        assert!(never.contains(",\"human_ms\":null}"), "{never}");
-        let keyed = super::cmd_text_json_read(&term, TextArgs::default(), Some(12_345));
+        let never = super::cmd_text_json_read(&term, TextArgs::default(), None, 0);
+        assert!(
+            never.contains(",\"human_ms\":null,\"human_seq\":0}"),
+            "{never}"
+        );
+        let keyed = super::cmd_text_json_read(&term, TextArgs::default(), Some(12_345), 3);
         let gen_at = keyed.find("\"gen\":").expect("gen");
         let human_at = keyed
-            .find(",\"human_ms\":12345}")
-            .expect("human_ms, closing");
+            .find(",\"human_ms\":12345,\"human_seq\":3}")
+            .expect("human_ms and human_seq, closing");
         assert!(gen_at < human_at, "{keyed}");
-        let shaped = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7));
+        let shaped = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7), 9);
         assert!(
-            shaped.ends_with(",\"human_ms\":7,\"trimmed\":2,\"first\":19}\n"),
+            shaped.ends_with(",\"human_ms\":7,\"human_seq\":9,\"trimmed\":2,\"first\":19}\n"),
             "{shaped}"
         );
         // NEGATIVE CONTROL: the test spelling is the never-keyed session.

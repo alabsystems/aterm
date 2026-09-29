@@ -747,7 +747,10 @@ impl Model {
     // Skip: `collect::<BTreeMap>` bottoms out at tree-node allocation (abort,
     // not panic, on OOM — but the toolchain cannot yet see through the
     // generic collect) and `&'static str` Ord (total). Audited-alloc class;
-    // verify-only. Revisit when the T3 collect layer lands.
+    // verify-only. Re-measured 2026-09-27 on seal 321aaeda7 with this skip
+    // removed: INCONCLUSIVE (its 1 obligation unknown). Needed from $HOME/trust,
+    // in a promoted seal: totality for generic `collect` (TRUST_100PCT_PLAN
+    // T3); then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn init_state(&self) -> BTreeMap<&'static str, i64> {
         self.vars.iter().map(|v| (v.name, v.init)).collect()
@@ -990,6 +993,8 @@ mod models_control_bind_retry;
 mod models_control_preparation;
 mod models_core;
 mod models_crash_journal;
+mod models_desktop_alert_debt;
+mod models_driver_geometry;
 mod models_effects;
 mod models_fabric_enable;
 mod models_fabric_outbox_wake;
@@ -998,14 +1003,18 @@ mod models_fx;
 mod models_glyphs;
 mod models_gui;
 mod models_harness;
+mod models_harness_goal;
 mod models_harness_host;
 mod models_input;
+mod models_keeper;
 mod models_lights;
+mod models_main_stall_refusal;
 mod models_misc;
 mod models_native;
 mod models_netprobe;
 mod models_notify_follow;
 mod models_operator;
+mod models_output_retention;
 mod models_paste_order;
 mod models_pet_observation_admission;
 mod models_program_queue;
@@ -1016,6 +1025,9 @@ mod models_rainbow_short_wrap;
 mod models_release;
 mod models_release_publish_once;
 mod models_render;
+mod models_rendezvous_grant;
+mod models_resize_render;
+mod models_resize_row_reuse;
 mod models_ribbon_follow;
 mod models_ribbon_release_restoration;
 mod models_ribbon_row_hold;
@@ -1034,9 +1046,11 @@ mod models_update_check_coordination;
 mod models_update_editor_carry;
 mod models_update_environment_repair;
 mod models_update_history_carry;
+mod models_update_parallel_attach;
 mod models_update_precommit_input;
 mod models_update_retired_intent;
 mod models_update_settings_draft_carry;
+mod models_update_successor_warm;
 mod models_update_web_cache;
 mod models_update_window_show;
 
@@ -1066,6 +1080,8 @@ pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
 pub use models_control_preparation::native_update_control_preparation_model;
 pub use models_core::*;
 pub use models_crash_journal::crash_journal_claim_model;
+pub use models_desktop_alert_debt::desktop_alert_debt_model;
+pub use models_driver_geometry::{driver_geometry_liveness, driver_geometry_model};
 pub use models_effects::*;
 pub use models_fabric_enable::*;
 pub use models_fabric_outbox_wake::{
@@ -1078,21 +1094,30 @@ pub use models_fx::*;
 pub use models_glyphs::*;
 pub use models_gui::*;
 pub use models_harness::*;
+pub use models_harness_goal::*;
 pub use models_harness_host::{
-    harness_exit_record_model, harness_relaunch_on_exit_model,
+    harness_codex_exit_witness_model, harness_exit_record_model, harness_handoff_claim_model,
+    harness_leave_model, harness_relaunch_on_exit_model, harness_restored_carry_model,
     harness_restored_first_attempt_model, harness_upgrade_look_model,
     harness_worker_lifecycle_model,
 };
 pub use models_input::input_unread_gate_model;
+pub use models_keeper::{
+    keeper_death_judgement_model, keeper_relaunch_brake_model, pty_keeper_custody_model,
+};
 pub use models_lights::*;
+pub use models_main_stall_refusal::main_thread_stall_refusal_model;
 pub use models_misc::*;
 pub use models_native::*;
 pub use models_netprobe::netprobe_shutdown_park_model;
 pub use models_notify_follow::notify_follow_checkpoint_model;
 pub use models_operator::*;
+pub use models_output_retention::output_retention_model;
 pub use models_paste_order::*;
 pub use models_pet_observation_admission::*;
-pub use models_program_queue::{claude_footer_watch_model, program_resolver_queue_model};
+pub use models_program_queue::{
+    claude_footer_model_model, claude_footer_watch_model, program_resolver_queue_model,
+};
 pub use models_program_resolution::program_resolution_retry_model;
 pub use models_rainbow_composer_newline::rainbow_composer_newline_gate_model;
 pub use models_rainbow_continuity::*;
@@ -1100,6 +1125,9 @@ pub use models_rainbow_short_wrap::rainbow_short_wrap_park_model;
 pub use models_release::*;
 pub use models_release_publish_once::release_publish_once_model;
 pub use models_render::*;
+pub use models_rendezvous_grant::native_update_rendezvous_grant_model;
+pub use models_resize_render::resize_render_model;
+pub use models_resize_row_reuse::resize_row_reuse_model;
 pub use models_ribbon_follow::*;
 pub use models_ribbon_release_restoration::*;
 pub use models_ribbon_row_hold::*;
@@ -1110,9 +1138,11 @@ pub use models_screen_generation::observation_screen_generation_model;
 pub use models_session::*;
 pub use models_subscribe_announcement::subscribe_announcement_order_model;
 pub use models_supervise::{
-    supervisor_claim_model, supervisor_decline_keys_model, supervisor_focus_choice_model,
-    supervisor_host_turn_end_model, supervisor_network_wall_model,
-    supervisor_question_answer_model, supervisor_turn_end_model,
+    supervisor_break_offer_model, supervisor_claim_model, supervisor_codex_rate_nudge_liveness,
+    supervisor_codex_rate_nudge_model, supervisor_decline_keys_model, supervisor_done_check_model,
+    supervisor_focus_choice_model, supervisor_host_turn_end_model, supervisor_network_wall_model,
+    supervisor_question_answer_model, supervisor_stall_remedy_model, supervisor_turn_end_model,
+    upgrade_attended_turn_end_model, upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
 };
 pub use models_title_summary::*;
 pub use models_typed_rekey::typed_rekey_model;
@@ -1126,11 +1156,15 @@ pub use models_update_check_coordination::{
 pub use models_update_editor_carry::native_update_editor_carry_model;
 pub use models_update_environment_repair::native_update_environment_repair_model;
 pub use models_update_history_carry::native_update_history_carry_model;
+pub use models_update_parallel_attach::{
+    native_update_successor_attach_liveness, native_update_successor_attach_model,
+};
 pub use models_update_precommit_input::native_update_precommit_input_model;
 pub use models_update_retired_intent::{
     native_update_failure_target_model, native_update_retired_intent_model,
 };
 pub use models_update_settings_draft_carry::native_update_settings_draft_carry_model;
+pub use models_update_successor_warm::native_update_successor_warm_before_claim_model;
 pub use models_update_web_cache::native_update_web_cache_model;
 pub use models_update_window_show::native_update_window_show_model;
 

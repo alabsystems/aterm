@@ -383,12 +383,386 @@ fn full_powers_unproven_names_the_breaker_once() {
     assert_eq!(unproven.matches("circuit breaker").count(), 1, "{unproven}");
 }
 
+/// A zsh snapshot's person's part, as 2.1.284 writes it, with `functions`
+/// and `options` ([`super::super::shell_startup`]).
+fn zsh_startup(functions: &str, options: &str) -> Result<ShellStartup, String> {
+    let text = format!(
+        "# Snapshot file\nunalias -a 2>/dev/null || true\n# Functions\n{functions}# Shell \
+         Options\nsetopt nohashdirs\nsetopt login\n{options}# Aliases\nalias -- \
+         run-help=man\n# Check for rg availability\nexport PATH='/usr/bin:/bin'\n"
+    );
+    let mut state = ShellStartup::default();
+    super::super::shell_startup::parse_snapshot(
+        super::super::shell_startup::Kind::Zsh,
+        &text,
+        "snapshot-zsh-1-a1b2c3.sh",
+        &mut state,
+    )
+    .map(|()| state)
+}
+
+/// THE SHELL THE LINE RUNS IN (audit §5's residual, measured on Claude Code
+/// 2.1.284): the rm proof and the read-only classifier model the shells'
+/// default options with no user function or alias. A startup that sets an
+/// option they do not assume (`setopt globsubst`: `N='~'; rm -rf $N` removes
+/// the home directory) proves no rm and reads nothing, naming the option; a
+/// function or alias fails the lines that name it; a startup not read is
+/// unknown. Full power still presses, the reason kept as unproven. NEGATIVE
+/// CONTROL: the same boxes under the defaults are approved.
+#[test]
+fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
+    let rm = rm_box("S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"");
+    let read = bash_box(&["git status --short"], Some("Show the status"));
+    let clean = zsh_startup("", "setopt autocd\n");
+    assert!(clean.is_ok(), "{clean:?}");
+    let with = |shell: &Result<ShellStartup, String>, base: ApprovalCtx| ApprovalCtx {
+        shell: shell.clone(),
+        ..base
+    };
+    assert_eq!(
+        approved(&on_screen(&rm, &with(&clean, bypass()))),
+        Some(RULE_RM_BREAKER)
+    );
+    assert_eq!(
+        approved(&on_screen(&read, &with(&clean, ctx()))),
+        Some(RULE_READ_ONLY)
+    );
+
+    let globsubst = zsh_startup("", "setopt globsubst\n");
+    let d = on_screen(&rm, &with(&globsubst, bypass()));
+    assert!(
+        reason(&d).starts_with("rm circuit breaker: ") && reason(&d).contains("`setopt globsubst`"),
+        "{d:?}"
+    );
+    let d = on_screen(&read, &with(&globsubst, ctx()));
+    assert!(reason(&d).contains("`setopt globsubst`"), "{d:?}");
+    let d = on_screen(
+        &rm,
+        &ApprovalCtx {
+            approve: Approve::All,
+            ..with(&globsubst, bypass())
+        },
+    );
+    let (rule, _, _, _, unproven) = approval(&d);
+    assert_eq!(rule, RULE_ALLOW_ONCE);
+    assert!(unproven.is_some_and(|u| u.contains("globsubst")), "{d:?}");
+
+    // A function `rm` fails the rm line, not the read; one named `git` the read.
+    let rm_fn = zsh_startup("rm () {\n\tcommand rm -i \"$@\"\n}\n", "");
+    let d = on_screen(&rm, &with(&rm_fn, bypass()));
+    assert!(reason(&d).contains("`rm` is a function"), "{d:?}");
+    assert_eq!(
+        approved(&on_screen(&read, &with(&rm_fn, ctx()))),
+        Some(RULE_READ_ONLY)
+    );
+    let git_fn = zsh_startup("git () {\n\tcommand git \"$@\"\n}\n", "");
+    let d = on_screen(&read, &with(&git_fn, ctx()));
+    assert!(reason(&d).contains("`git` is a function"), "{d:?}");
+
+    // zsh looks a function up after quote removal (measured on 5.9: `r\m`,
+    // `r''m` and `$'\x72m'` run a function `rm`). The line models approve no
+    // quoted spelling of a command's name — the classifier matches a head as
+    // written, a backslash or quote included, and the rm rule needs the rest
+    // of its line read-only — and [`ShellStartup::admits`] names the
+    // function for every spelling too, so neither alone is load-bearing.
+    for (line, rm) in [
+        ("S=/private/tmp/claude-502/x; r\\m -rf \"$S/t5\"", true),
+        ("S=/private/tmp/claude-502/x; r''m -rf \"$S/t5\"", true),
+        ("S=/private/tmp/claude-502/x; $'\\x72m' -rf \"$S/t5\"", true),
+        ("g''it status --short", false),
+        ("g\\it status --short", false),
+        ("'git' status --short", false),
+    ] {
+        let b = if rm {
+            rm_box(line)
+        } else {
+            bash_box(&[line], Some("Show the status"))
+        };
+        let base = || if rm { bypass() } else { ctx() };
+        let d = on_screen(&b, &with(&clean, base()));
+        assert!(
+            approved(&d).is_none(),
+            "the models read {line:?} as written: {d:?}"
+        );
+        let startup = if rm { &rm_fn } else { &git_fn };
+        let name = if rm { "rm" } else { "git" };
+        let state = startup.as_ref().expect("a startup");
+        let why = state.admits(line).expect_err(line);
+        assert!(why.contains(&format!("`{name}` is a function")), "{why}");
+        assert!(approved(&on_screen(&b, &with(startup, base()))).is_none());
+    }
+
+    // Not read: unknown, so nothing is proven or read-only.
+    let unread: Result<ShellStartup, String> = Err("not read".to_string());
+    assert!(reason(&on_screen(&rm, &with(&unread, bypass()))).contains("not read"));
+    assert!(reason(&on_screen(&read, &with(&unread, ctx()))).contains("not read"));
+}
+
 /// The 2.1.278 breaker from a workflow (aterm-phase's measured fixture): its
 /// loop and `set --` escalate.
 #[test]
 fn the_workflow_breaker_fixture_escalates() {
     let d = on_screen(&phase_fixtures::bash_multi_row_with_note(), &bypass());
     assert!(approved(&d).is_none(), "{d:?}");
+}
+
+/// THE AUDIT OF 2026-09-26, at the box: lines the proven rm rule APPROVED
+/// under `approve = "safe"` (bypass on) that reach `/etc` — a `$(mktemp
+/// -d)` that fails, zsh's `$=S`, `$_`, a `$PWD` the line assigns before a
+/// `cd`, a zsh modifier, an assignment bash makes in a background subshell,
+/// a prefix on `export`, a builtin's redirect whose glob qualifier assigns
+/// (zsh globs `echo hi < $~X` in the shell itself), `$TMPDIR` taken from
+/// the supervisor — or that set the variable to a number, so the rm
+/// removes a relative path in the Bash tool's working directory (zsh's
+/// `printf` takes `-%d` as its format and sets `S` from `S=5`; `echo hi
+/// {S}>/dev/null` stores a descriptor's number in `S`) — are
+/// escalated by the safe rules, naming why. zsh's
+/// `print -v`, which the read-only check already refused (`print` is no
+/// read), is escalated by the resolver's own reason too. Under the
+/// owner's default (full power, the ruling of 2026-09-24) nothing changes:
+/// the same box is pressed as the one-shot allow, its `unproven` the
+/// breaker's kind and the rm rule's reason. Negative controls: the owner's
+/// sound shapes — a literal path in scratch, a scratch variable bound first
+/// on the line, a guarded `mktemp` — stay PROVEN under both. The owner's
+/// `for`/`set --` loop is no shape this resolver follows, and never was:
+/// escalated by the rules, pressed by full power.
+#[test]
+fn the_audits_unsound_rm_approvals_escalate_and_full_power_still_presses_them() {
+    let default_bypass = ApprovalCtx {
+        bypass_mode: true,
+        ..full()
+    };
+    for (cmd, why) in [
+        ("D=$(mktemp -d); rm -rf \"$D/etc\"", "removes /etc"),
+        ("D=$(mktemp -d) && rm -rf $D/etc", "must be double-quoted"),
+        (
+            "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"$D/etc\"",
+            "removes /etc",
+        ),
+        (
+            "rm -rf \"$TMPDIR/probe\"",
+            "a value from the environment is not proven",
+        ),
+        ("S='y /etc'; rm -rf /tmp/x/$=S", "`$=S`"),
+        ("_=/tmp/x; rm -rf \"$_/etc\"", "_ is assigned"),
+        (
+            "PWD=/tmp/x; cd /usr; rm -rf \"$PWD/etc\"",
+            "PWD is assigned",
+        ),
+        ("S=/tmp/w/a; rm -rf \"$S:h:h\"", "zsh computes"),
+        ("S=/tmp/w/a && true & rm -rf \"$S/x\"", "$S is not assigned"),
+        (
+            "S=/tmp/w/a; S=/etc export T=$S; rm -rf \"$T/x\"",
+            "$T is not assigned",
+        ),
+        (
+            "S=/tmp/w/a; print -v S /etc; rm -rf \"$S/x\"",
+            "$S is not known after `print`",
+        ),
+        (
+            "S=/private/tmp/claude-502/w; X='/tmp/*(e:S=/etc:)'; echo hi < $~X; rm -rf \"$S/x\"",
+            "$S is not known after `echo`",
+        ),
+        (
+            "S=/private/tmp/claude-502/w; printf -%d S=5; rm -rf \"$S/x\"",
+            "$S is not known after `printf`",
+        ),
+        (
+            "S=/private/tmp/claude-502/w; echo hi {S}>/dev/null; rm -rf \"$S/x\"",
+            "$S is not known after `echo`",
+        ),
+    ] {
+        let rows = rm_box(cmd);
+        let d = on_screen(&rows, &bypass());
+        assert!(reason(&d).contains(why), "{cmd}: {d:?}");
+        let d = on_screen(&rows, &default_bypass);
+        let (rule, choice, _, _, unproven) = approval(&d);
+        assert_eq!(
+            (rule, choice),
+            (RULE_ALLOW_ONCE, &Choice::Digit(1)),
+            "{cmd}"
+        );
+        let unproven = unproven.expect("a full-power press says why it was unproven");
+        assert!(
+            unproven.starts_with("the rm circuit breaker (possibly-empty variable path)")
+                && unproven.contains(why),
+            "{cmd}: {unproven}"
+        );
+    }
+    for cmd in [
+        "rm -rf /private/tmp/claude-502/scratch/x",
+        "S=/private/tmp/claude-502/scratch && rm -rf $S/a $S/z",
+        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX) && rm -rf \"$D/etc\"",
+        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); rm -rf \"${D:?}/etc\"",
+        "D=$(mktemp -d) && rm -rf \"$D/etc\"",
+        "OUT=/private/tmp/claude-502/out; echo \"OUT=$OUT\"; rm -rf \"$OUT\"/*",
+    ] {
+        for c in [bypass(), default_bypass.clone()] {
+            let d = on_screen(&rm_box(cmd), &c);
+            assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{cmd}: {d:?}");
+        }
+    }
+    let owners_loop =
+        "S=/private/tmp/claude-502/scratch && for p in a z; do set -- $p; rm -rf $S/$1; done";
+    let d = on_screen(&rm_box(owners_loop), &bypass());
+    assert!(reason(&d).contains("compound command (`for`)"), "{d:?}");
+    let d = on_screen(&rm_box(owners_loop), &default_bypass);
+    assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{d:?}");
+}
+
+/// THE RECHECK (2026-09-27, high), at the box: an rm the resolver proves
+/// beside a command zsh's arithmetic runs a command substitution from
+/// (`printf %d 'path[$(…)]'`, `[ -t … ]`, measured) was pressed under
+/// `approve = "safe"`: the rest-of-line check took `printf` and `[` as
+/// reads. It escalates now, naming the arithmetic. Negative control: a
+/// number under the same format.
+#[test]
+fn an_rm_beside_zsh_arithmetic_that_runs_a_command_escalates() {
+    for cmd in [
+        "printf %d 'path[$(date)]'; rm -rf /private/tmp/claude-502/scratch/x",
+        "[ -t 'path[$(date)]' ]; rm -rf /private/tmp/claude-502/scratch/x",
+    ] {
+        let d = on_screen(&rm_box(cmd), &bypass());
+        assert!(
+            reason(&d).contains("rest of the line")
+                && reason(&d).contains("evaluates it as arithmetic"),
+            "{cmd}: {d:?}"
+        );
+    }
+    let cmd = "printf %d 5; rm -rf /private/tmp/claude-502/scratch/x";
+    let d = on_screen(&rm_box(cmd), &bypass());
+    assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{cmd}: {d:?}");
+}
+
+/// The guards `D=$(mktemp -d) || exit` and `: "${D:?}"` prove at the box
+/// (the review of 2026-09-26: the resolver proved them, and the rest-of-line
+/// classifier then refused `exit` and `:`). Negative controls: `exit` with
+/// two words (zsh does not exit on it), with a word that is not a number
+/// (zsh evaluates it as arithmetic, whose subscript can run a command:
+/// measured), a redirect on `:`, a substitution in its word — and under
+/// the default nothing changes (proven boxes keep their rule id).
+#[test]
+fn the_mktemp_guards_exit_and_colon_prove_at_the_box() {
+    let default_bypass = ApprovalCtx {
+        bypass_mode: true,
+        ..full()
+    };
+    for cmd in [
+        "D=$(mktemp -d) || exit 1; rm -rf \"$D/x\"",
+        "D=$(mktemp -d) || exit; rm -rf \"$D/x\"",
+        "D=$(mktemp -d); : \"${D:?}\"; rm -rf \"$D/x\"",
+        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX) || exit 1; rm -rf \"$D/x\"",
+        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); : \"${D:?}\"; rm -rf \"$D/x\"",
+    ] {
+        for c in [bypass(), default_bypass.clone()] {
+            let d = on_screen(&rm_box(cmd), &c);
+            assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{cmd}: {d:?}");
+        }
+    }
+    for (cmd, why) in [
+        ("D=$(mktemp -d) || exit 1 2; rm -rf \"$D/x\"", "removes /x"),
+        // Proven by the resolver; the classifier takes `exit` with one
+        // number or none, and nothing else, as a guard.
+        (
+            "D=$(mktemp -d) && rm -rf \"$D/x\"; exit 1 2",
+            "rest of the line",
+        ),
+        (
+            "D=$(mktemp -d) && rm -rf \"$D/x\"; exit foo",
+            "rest of the line",
+        ),
+        (
+            "D=$(mktemp -d) && rm -rf \"$D/x\"; exit 'a[1]'",
+            "rest of the line",
+        ),
+        (
+            "D=$(mktemp -d) || exit 1; : > /tmp/w/f; rm -rf \"$D/x\"",
+            "rest of the line",
+        ),
+        (
+            "D=$(mktemp -d) || exit 1; : \"$(touch /tmp/w/f)\"; rm -rf \"$D/x\"",
+            "rest of the line",
+        ),
+    ] {
+        let d = on_screen(&rm_box(cmd), &bypass());
+        assert!(reason(&d).contains(why), "{cmd}: {d:?}");
+        let d = on_screen(&rm_box(cmd), &default_bypass);
+        assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{cmd}: {d:?}");
+    }
+}
+
+/// THE AUDIT'S FOURTH, at the box, on a real link: `S=<scratch>/p; rm -rf
+/// "$S/out/x"` with `out -> /etc` removes `/etc/x`, and was approved by the
+/// lexical resolver. The scratch root is the session's `$TMPDIR` here (a
+/// temp dir of the test's own; nothing runs, the box is only decided).
+/// Negative controls: the link itself is removable (rm never follows the
+/// last component); full power still presses the box.
+#[cfg(unix)]
+#[test]
+fn an_rm_breaker_through_a_link_out_of_scratch_escalates() {
+    let base = std::env::temp_dir().join(format!("aterm-rm-box-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("p")).expect("dir");
+    std::os::unix::fs::symlink("/etc", base.join("p/out")).expect("link");
+    let tmp = base.to_string_lossy().trim_end_matches('/').to_string();
+    let default = ApprovalCtx {
+        bypass_mode: true,
+        ..ApprovalCtx::new(
+            PathBuf::from("/private/tmp/claude-502/scratch/work1"),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            Some(base.clone()),
+        )
+    };
+    let proven = ApprovalCtx {
+        approve: Approve::Safe,
+        ..default.clone()
+    };
+    // The box without its description row: this command row is too long
+    // for the geometry to prove the description is no wrap of it.
+    let rows = |cmd: &str| -> Vec<String> {
+        rm_box(cmd)
+            .into_iter()
+            .filter(|r| r != "   Remove directories tmp/a and tmp/b")
+            .collect()
+    };
+    let through = rows(&format!("S={tmp}/p; rm -rf \"$S/out/x\""));
+    let link = rows(&format!("S={tmp}/p; rm -rf \"$S/out\""));
+    let (d_through, d_link, d_default) = (
+        on_screen(&through, &proven),
+        on_screen(&link, &proven),
+        on_screen(&through, &default),
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        reason(&d_through).contains("leads through a symbolic link to"),
+        "{d_through:?}"
+    );
+    assert_eq!(approved(&d_link), Some(RULE_RM_BREAKER), "{d_link:?}");
+    assert_eq!(approved(&d_default), Some(RULE_ALLOW_ONCE), "{d_default:?}");
+}
+
+/// OWNER DECISION D9 at the box (b96c9f035): with the rule withheld (the
+/// loop leaves it no scratch root) a directory the line's own `mktemp -d`
+/// made is not proven either — the fresh-directory rule asks no root, and
+/// would otherwise have pressed it as proven. Negative control: the same
+/// boxes with the roots are proven.
+#[test]
+fn a_withheld_rm_rule_proves_no_fresh_directory() {
+    let withheld = ApprovalCtx {
+        scratch_roots: Vec::new(),
+        ..bypass()
+    };
+    for cmd in [
+        "D=$(mktemp -d) && rm -rf \"$D/x\"",
+        "D=$(mktemp -d w.XXXXXX) && rm -rf \"$D/x\"",
+        "D=$(mktemp -d); ls \"$D\"; rm -rf \"$D\"",
+    ] {
+        let d = on_screen(&rm_box(cmd), &withheld);
+        assert!(reason(&d).contains("withheld"), "{cmd}: {d:?}");
+        let d = on_screen(&rm_box(cmd), &bypass());
+        assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{cmd}: {d:?}");
+    }
 }
 
 // --- read-only Bash ---------------------------------------------------------
@@ -932,6 +1306,223 @@ fn a_trust_dialog_escalates_off_the_sessions_folder_or_its_roots() {
     assert!(approved(&d).is_none(), "{d:?}");
 }
 
+// --- the usage-limit dialog ------------------------------------------------
+
+const STOP: &str = "Stop and wait for limit to reset";
+const CREDITS: &str = "Switch to usage credits";
+
+/// The owner's screen of 2026-09-24 (aterm-phase's hand-built fixture, the
+/// reported rows verbatim): approved by [`RULE_LIMIT_WAIT`], the focus moved
+/// one down from the stop row onto the wait row BY ITS LABEL, guarded on the
+/// dialog's title row — and the same for every spelling of the row and
+/// wherever it sits, the focus moving up when it sits above.
+#[test]
+fn the_limit_options_dialog_chooses_the_wait_row_by_its_label() {
+    let rows = phase_fixtures::screen(phase_fixtures::LIMIT_OPTIONS_DIALOG);
+    let d = on_screen(&rows, &ctx());
+    let Decision::Approve {
+        rule_id,
+        choice,
+        guard,
+        subject,
+        unproven,
+    } = &d
+    else {
+        panic!("{d:?}");
+    };
+    let wait = "Wait here, then continue automatically at Sep 27 at 7pm";
+    assert_eq!(*unproven, None, "the rule proves the wait row");
+    assert_eq!(*rule_id, RULE_LIMIT_WAIT);
+    assert_eq!(
+        *choice,
+        Choice::Focus {
+            steps: 1,
+            label: wait.to_string()
+        }
+    );
+    assert_eq!(subject, wait);
+    let m = aterm_observe::row_matcher(guard).expect("compiles");
+    assert_eq!(
+        rows.iter().filter(|r| m.matches(r)).collect::<Vec<_>>(),
+        [" What do you want to do?"]
+    );
+    for wait in [
+        "Wait here, then continue automatically shortly",
+        "Wait here, then continue automatically when the limit resets",
+    ] {
+        for (labels, focus, steps) in [
+            (vec![STOP, wait, CREDITS], 0, 1),
+            (vec![wait, STOP, CREDITS], 0, 0),
+            (vec![wait, STOP, CREDITS], 2, -2),
+            (vec![CREDITS, "Upgrade your plan", STOP, wait], 0, 3),
+        ] {
+            let d = on_screen(
+                &phase_fixtures::limit_options_dialog(&labels, focus),
+                &ctx(),
+            );
+            assert_eq!(
+                d,
+                Decision::Approve {
+                    rule_id: RULE_LIMIT_WAIT,
+                    choice: Choice::Focus {
+                        steps,
+                        label: wait.to_string()
+                    },
+                    guard: guard.clone(),
+                    subject: wait.to_string(),
+                    unproven: None,
+                },
+                "{labels:?} focus {focus}"
+            );
+        }
+    }
+}
+
+/// Nothing but the wait row is ever chosen: with no wait row, with the
+/// armed wait's `Don’t continue automatically` in its place, or with only
+/// the stop, spend and upgrade rows, the dialog is escalated — at every
+/// level, full power with `model_fallback` set included; and `limit_wait`
+/// off, or a Codex session, escalates the dialog that would be answered.
+#[test]
+fn the_limit_options_dialog_without_a_wait_row_is_escalated() {
+    for labels in [
+        vec![STOP, CREDITS],
+        vec![STOP, "Don’t continue automatically", CREDITS],
+        vec![STOP, "Upgrade your plan"],
+        vec!["Add funds to continue with usage credits", STOP],
+        vec![CREDITS, STOP],
+    ] {
+        for c in [ctx(), full(), none(full())] {
+            let d = on_screen(&phase_fixtures::limit_options_dialog(&labels, 0), &c);
+            let why = reason(&d);
+            assert!(
+                why.starts_with(
+                    "a usage-limit dialog with no `Wait here, then continue automatically"
+                ),
+                "{labels:?} {:?}: {why}",
+                c.approve
+            );
+        }
+    }
+    let rows = phase_fixtures::screen(phase_fixtures::LIMIT_OPTIONS_DIALOG);
+    for c in [ctx(), full(), none(full())] {
+        let off = ApprovalCtx {
+            limit_wait: false,
+            ..c
+        };
+        assert!(
+            reason(&on_screen(&rows, &off)).contains("limit_wait is off"),
+            "{:?}",
+            off.approve
+        );
+    }
+    // The rule is Claude Code's: Codex's reader names no usage-limit dialog,
+    // so under the safe rules a Codex session's box is escalated, and no
+    // level presses it as the limit wait.
+    let d = decide_screen(Some("codex"), &rows, &ctx());
+    assert!(d.as_ref().is_none_or(|d| approved(d).is_none()), "{d:?}");
+    let d = decide_screen(Some("codex"), &rows, &full());
+    assert!(
+        d.as_ref()
+            .is_none_or(|d| approved(d) != Some(RULE_LIMIT_WAIT)),
+        "{d:?}"
+    );
+    // The defaults answer it.
+    assert!(full().limit_wait);
+}
+
+/// THE HAZARD this rule closes on main's full power: `Switch to usage
+/// credits` opens with `Switch to `, as the model-refusal pause's switch
+/// does, and full power pressed that switch while `[harness]
+/// model_fallback` was set — spending money on the very menu the wait
+/// belongs to. The dialog is decided FIRST by [`RULE_LIMIT_WAIT`], at every
+/// level, the question rule and full power never seeing it: the owner's
+/// screen, and every order of its rows, gets the wait row under full power
+/// with `model_fallback` set exactly as under the safe rules — never
+/// `Switch to usage credits` (a purchase now, [`buys`]), never `Stop and
+/// wait for limit to reset` (what full power's no-spend answer would take).
+#[test]
+fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() {
+    let fallback = full();
+    assert!(fallback.model_fallback && fallback.approve == Approve::All);
+    let rows = phase_fixtures::screen(phase_fixtures::LIMIT_OPTIONS_DIALOG);
+    let d = on_screen(&rows, &fallback);
+    let (rule, choice, _, subject, unproven) = approval(&d);
+    assert_eq!(rule, RULE_LIMIT_WAIT, "{d:?}");
+    assert_eq!(
+        choice,
+        &Choice::Focus {
+            steps: 1,
+            label: "Wait here, then continue automatically at Sep 27 at 7pm".to_string()
+        }
+    );
+    assert_eq!(
+        subject,
+        "Wait here, then continue automatically at Sep 27 at 7pm"
+    );
+    assert_eq!(unproven, None);
+    // The same at every level: no `approve` limits it, `limit_wait` alone.
+    assert_eq!(d, on_screen(&rows, &ctx()));
+    assert_eq!(d, on_screen(&rows, &none(full())));
+    let wait = "Wait here, then continue automatically when the limit resets";
+    for (labels, focus) in [
+        (vec![CREDITS, STOP, wait], 0),
+        (vec![CREDITS, wait, STOP], 0),
+        (vec![STOP, CREDITS, "Upgrade your plan", wait], 1),
+        (vec![wait, CREDITS], 1),
+    ] {
+        let d = on_screen(
+            &phase_fixtures::limit_options_dialog(&labels, focus),
+            &fallback,
+        );
+        let (rule, choice, _, _, _) = approval(&d);
+        assert_eq!(rule, RULE_LIMIT_WAIT, "{labels:?}: {d:?}");
+        let Choice::Focus { label, .. } = choice else {
+            panic!("{labels:?}: {d:?}");
+        };
+        assert_eq!(label, wait, "{labels:?}");
+    }
+    // `Switch to usage credits` is a purchase wherever it is drawn: on a
+    // dialog of no kind (the same rows under another title, the
+    // trial-expired dialog's question over spend rows) full power never
+    // presses it, with `model_fallback` set.
+    let mut other = phase_fixtures::limit_options_dialog(&[CREDITS, STOP], 0);
+    let t = other
+        .iter()
+        .position(|r| r.trim() == "What do you want to do?")
+        .expect("the title");
+    other[t] = " You've hit your limit".to_string();
+    for rows in [
+        other,
+        phase_fixtures::limit_options_dialog(&["Upgrade your plan", CREDITS], 0),
+        phase_fixtures::limit_options_dialog(&[CREDITS, "Upgrade your plan"], 0),
+    ] {
+        let d = on_screen(&rows, &fallback);
+        if let Decision::Approve { choice, .. } = &d {
+            let chosen = match choice {
+                Choice::Digit(n) => rows
+                    .iter()
+                    .find(|r| r.contains(&format!("{n}. ")))
+                    .cloned()
+                    .unwrap_or_default(),
+                Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => label.clone(),
+                Choice::Answer(_) => String::new(),
+            };
+            assert!(!chosen.contains(CREDITS), "{d:?}");
+        }
+        assert_ne!(approved(&d), Some(RULE_MODEL_SWITCH), "{d:?}");
+    }
+    let credits = aterm_phase::prompt::Opt {
+        n: Some(1),
+        label: CREDITS.to_string(),
+        role: aterm_phase::prompt::Role::Other,
+        focused: true,
+        row: 0,
+    };
+    assert!(buys(&credits));
+    assert!(!switches_model(&credits));
+}
+
 /// `[harness] trust_roots` as the config spells them: `~/` is home, a
 /// trailing `*` any suffix of the last component, and a spec that would
 /// widen (a `..`, a glob elsewhere, a relative path) is dropped.
@@ -986,7 +1577,10 @@ fn the_rest_of_an_rm_breaker_line_must_read() {
     }
     for line in [
         "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"",
+        // `"$D"` alone is `""` when the `mktemp` fails: unguarded, proven.
         "D=$(mktemp -d); ls \"$D\"; rm -rf \"$D\"",
+        "D=$(mktemp -d /private/tmp/claude-502/w.XXXXXX); ls \"$D\"; rm -rf \"$D\"",
+        "D=$(mktemp -d) && ls \"$D\" && rm -rf \"$D\"",
         "S=/tmp/w/a && Rm -rf \"$S/x\" 2>/dev/null",
     ] {
         let d = on_screen(&rm_box(line), &bypass());
@@ -999,6 +1593,25 @@ fn the_rest_of_an_rm_breaker_line_must_read() {
         &unknown,
     );
     assert!(reason(&d).contains("cwd unknown"), "{d:?}");
+}
+
+/// A redirect on a `mktemp` segment beside an rm (2026-09-28 review, high,
+/// pre-existing upstream): the rest of the line left the segment out, and
+/// the resolver judges only the rm's redirects, so the rule pressed a line
+/// that truncates `~/.zshrc`.
+#[test]
+fn a_write_redirect_on_mktemp_beside_an_rm_is_not_pressed() {
+    for line in [
+        "mktemp > /Users/_owner/.zshrc; rm -rf /private/tmp/claude-502/x/t5",
+        "mktemp -d > ~/.zshrc && rm -rf /private/tmp/claude-502/x/t5",
+        "rm -rf /private/tmp/claude-502/x/t5 2>/dev/null; mktemp > .git/HEAD",
+    ] {
+        let d = on_screen(&rm_box(line), &bypass());
+        assert!(reason(&d).contains("rest of the line"), "{line}: {d:?}");
+    }
+    let line = "mktemp -d >/dev/null 2>&1; rm -rf /private/tmp/claude-502/x/t5";
+    let d = on_screen(&rm_box(line), &bypass());
+    assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{line}: {d:?}");
 }
 
 // --- the context --------------------------------------------------------------
@@ -1507,6 +2120,10 @@ fn full_power_accepts_a_consent_and_never_buys() {
         ("Yes, re-enable and continue", true),
         ("Continue with usage credits", false),
         ("Turn on usage credits", true),
+        ("Switch to usage credits", true),
+        ("Usage credits", true),
+        ("Yes, usage credits for this turn", true),
+        ("Switch to Sonnet 4.5", false),
         ("Yes, allow edits to billing/upgrade.rs", false),
         ("Yes, and always allow access to credits/", false),
         ("Yes, buyer_report.py", false),
@@ -1547,6 +2164,14 @@ fn full_power_answers_codex_boxes_by_role() {
         ("patch", cx::BOX_PATCH, RULE_ALLOW_ONCE, &digit, ""),
         ("trust", cx::TRUST, RULE_TRUST_ANY, &enter, ""),
         ("plan", cx::PLAN, RULE_PLAN, &digit, ""),
+        // The rate-limit nudge with nothing read: its plain keep.
+        (
+            "nudge",
+            cx::RATE_NUDGE,
+            RULE_RATE_NUDGE_KEEP,
+            &Choice::Digit(2),
+            "",
+        ),
         (
             "question",
             cx::QUESTION,
@@ -3019,8 +3644,11 @@ fn a_plan_is_approved_on_its_least_power_yes() {
 /// render code): full power presses its `Switch to <fallback>` while
 /// `[harness] model_fallback` is set — the switch that setting approves for
 /// a model's limit — where it was escalated as a dialog of no kind (the
-/// philosophy review of 2026-09-25). NEGATIVE CONTROL: `model_fallback`
-/// written empty leaves the pause a person's, naming the switch.
+/// philosophy review of 2026-09-25). NEGATIVE CONTROLS: `model_fallback`
+/// written empty leaves the pause a person's, naming the switch; retitled,
+/// or with a third option, it is no refusal pause and its switch is never
+/// pressed (2026-09-28: `model-switch@v1` had pressed Codex's rate-limit
+/// nudge's `Switch to gpt-6-luna`); read by Codex's reader, never.
 #[test]
 fn the_session_paused_dialog_switches_to_the_fallback() {
     let rows = phase_fixtures::screen(phase_fixtures::SESSION_PAUSED);
@@ -3035,6 +3663,32 @@ fn the_session_paused_dialog_switches_to_the_fallback() {
     };
     let d = on_screen(&rows, &limited);
     assert!(reason(&d).contains("model_fallback is off"), "{d:?}");
+    // Retitled, or with a third option: no refusal pause.
+    let retitled: Vec<String> = rows
+        .iter()
+        .map(|r| r.replace("Session paused", "Session halted"))
+        .collect();
+    assert_ne!(
+        approved(&on_screen(&retitled, &full())),
+        Some(RULE_MODEL_SWITCH)
+    );
+    let at = rows
+        .iter()
+        .position(|r| r.contains("2. Edit prompt"))
+        .expect("the edit option");
+    let mut three = rows.clone();
+    three.insert(at + 1, "    3. Cancel".to_string());
+    assert_ne!(
+        approved(&on_screen(&three, &full())),
+        Some(RULE_MODEL_SWITCH)
+    );
+    // Codex's reader on the same rows: never a model switch.
+    let cx = decide_screen(Some("codex"), &rows, &full());
+    assert!(
+        cx.as_ref()
+            .is_none_or(|d| approved(d) != Some(RULE_MODEL_SWITCH)),
+        "{cx:?}"
+    );
 }
 
 // --- the decline (module header, "THE DECLINE") ------------------------------
@@ -3895,7 +4549,7 @@ fn the_owners_subagent_rm_box_is_escalated_under_the_owners_limits() {
 /// A fresh git repository in a scratch directory (removed by the caller),
 /// created hermetically: no system or global config.
 fn scratch_repo(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("aterm-approval-git-{tag}-{}", std::process::id()));
+    let dir = crate::supervise::test_scratch_path("approval-git", tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
     let dir = std::fs::canonicalize(&dir).expect("canonical");
@@ -4504,4 +5158,385 @@ fn full_power_confirms_the_model_switch_the_person_typed() {
         ),
         "subtitle is not the cost warning",
     );
+}
+
+// --- Codex's rate-limit nudge and the /model restore (2026-09-28) ------------
+
+/// The owner's Codex, as the incident's footer showed it before the switch.
+fn astra_ultra() -> super::super::turn_end::CodexSetting {
+    super::super::turn_end::CodexSetting {
+        model: "GPT-6-Astra".to_string(),
+        effort: Some("ultra".to_string()),
+    }
+}
+
+/// Full power with Codex's nudge read as `nudge` says.
+fn nudged(nudge: NudgeCtx) -> ApprovalCtx {
+    ApprovalCtx { nudge, ..full() }
+}
+
+fn near() -> LimitRead {
+    LimitRead::Near {
+        used: 99,
+        back_at: Some(1_791_082_750),
+    }
+}
+
+/// THE INCIDENT, REPLAYED (2026-09-27/28): Codex's `Approaching rate limits`
+/// is switched ONLY near its limit — 99% of the weekly window, the model it
+/// leaves read off the footer: `Switch to gpt-6-luna` under
+/// `rate-nudge-switch@v1`, by its digit. The stale nudge at 1% twenty minutes
+/// after the owner's usage reset, one whose reading is unknown, one while a
+/// switch is open, one whose model was never read and one offering the
+/// current model are answered `Keep current model` (`rate-nudge-keep@v1`,
+/// digit 2). NEGATIVE CONTROLS: `rate_nudge = false`, `approve = "safe"` and
+/// `"none"` hand it to a person; Claude Code's reader sees no such box; the
+/// old model-switch rule never answers it.
+#[test]
+fn codexs_rate_limit_nudge_switches_only_near_its_limit() {
+    use aterm_phase::codex::fixtures as cx;
+    let rows = phase_fixtures::screen(cx::RATE_NUDGE);
+    let live = NudgeCtx {
+        enabled: true,
+        open: false,
+        from: Some(astra_ultra()),
+        limits: near(),
+    };
+    let d = decide_screen(Some("codex"), &rows, &nudged(live.clone())).expect("the box");
+    let (rule, choice, guard, subject, unproven) = approval(&d);
+    assert_eq!(
+        (rule, choice),
+        (RULE_RATE_NUDGE_SWITCH, &Choice::Digit(1)),
+        "{d:?}"
+    );
+    assert_eq!(subject, "Approaching rate limits => Switch to gpt-6-luna");
+    assert_eq!(guard, row_guard("  Approaching rate limits"));
+    let why = unproven.expect("why");
+    assert!(
+        why.contains("99% used") && why.contains("GPT-6-Astra ultra"),
+        "{why}"
+    );
+    let keep = |n: NudgeCtx, because: &str| {
+        let d = decide_screen(Some("codex"), &rows, &nudged(n)).expect("the box");
+        let (rule, choice, _, subject, unproven) = approval(&d);
+        assert_eq!(
+            (rule, choice),
+            (RULE_RATE_NUDGE_KEEP, &Choice::Digit(2)),
+            "{d:?}"
+        );
+        assert!(subject.ends_with("=> Keep current model"), "{subject}");
+        assert!(
+            unproven.is_some_and(|u| u.contains(because)),
+            "{because}: {d:?}"
+        );
+    };
+    keep(
+        NudgeCtx {
+            limits: LimitRead::Far { used: 1 },
+            ..live.clone()
+        },
+        "1% used, far from its limit",
+    );
+    keep(
+        NudgeCtx {
+            limits: LimitRead::Unknown("no reading"),
+            ..live.clone()
+        },
+        "unread",
+    );
+    keep(
+        NudgeCtx {
+            open: true,
+            ..live.clone()
+        },
+        "open already",
+    );
+    keep(
+        NudgeCtx {
+            from: None,
+            ..live.clone()
+        },
+        "never read",
+    );
+    keep(
+        NudgeCtx {
+            from: Some(super::super::turn_end::CodexSetting {
+                model: "GPT-6-Luna".to_string(),
+                effort: Some("medium".to_string()),
+            }),
+            ..live.clone()
+        },
+        "the current one",
+    );
+    let off = NudgeCtx {
+        enabled: false,
+        ..live.clone()
+    };
+    let d = decide_screen(Some("codex"), &rows, &nudged(off)).expect("the box");
+    assert!(reason(&d).contains("rate_nudge is off"), "{d:?}");
+    for limited in [
+        ApprovalCtx {
+            approve: Approve::Safe,
+            ..nudged(live.clone())
+        },
+        none(nudged(live.clone())),
+    ] {
+        let d = decide_screen(Some("codex"), &rows, &limited).expect("the box");
+        assert_eq!(approved(&d), None, "{:?}: {d:?}", limited.approve);
+    }
+    assert!(
+        decide_screen(Some("claude"), &rows, &nudged(live.clone()))
+            .is_none_or(|d| approved(&d).is_none()),
+    );
+    // Its keep is missing: a person's, never the switch nor the never-again.
+    let no_keep: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.contains("2. Keep current model"))
+        .map(|r| r.replace("3. Keep current", "2. Keep current"))
+        .collect();
+    let d = decide_screen(Some("codex"), &no_keep, &nudged(live)).expect("the box");
+    assert!(reason(&d).contains("without exactly one"), "{d:?}");
+}
+
+/// PROPERTY: over every combination the loop can hand it, the nudge's
+/// `Keep current model (never show again)` — which writes Codex's own
+/// config — is never pressed, and the switch only near the limit with the
+/// model read and no switch open.
+#[test]
+fn the_nudges_never_show_again_is_never_pressed() {
+    let rows = phase_fixtures::screen(aterm_phase::codex::fixtures::RATE_NUDGE);
+    let limits = [
+        near(),
+        LimitRead::Near {
+            used: 90,
+            back_at: None,
+        },
+        LimitRead::Far { used: 89 },
+        LimitRead::Unknown("stale"),
+    ];
+    let froms = [None, Some(astra_ultra())];
+    for enabled in [true, false] {
+        for open in [true, false] {
+            for limits in &limits {
+                for from in &froms {
+                    for approve in [Approve::All, Approve::Safe, Approve::None] {
+                        let n = NudgeCtx {
+                            enabled,
+                            open,
+                            from: from.clone(),
+                            limits: limits.clone(),
+                        };
+                        let c = ApprovalCtx {
+                            approve,
+                            ..nudged(n.clone())
+                        };
+                        let d = decide_screen(Some("codex"), &rows, &c).expect("the box");
+                        if let Decision::Approve {
+                            choice, rule_id, ..
+                        } = &d
+                        {
+                            assert_ne!(choice, &Choice::Digit(3), "{n:?}");
+                            let switch = *rule_id == RULE_RATE_NUDGE_SWITCH;
+                            assert_eq!(
+                                switch,
+                                enabled
+                                    && !open
+                                    && limits.near()
+                                    && from.is_some()
+                                    && approve == Approve::All,
+                                "{n:?} {approve:?}: {d:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Codex's `Continue with …` is no consent (2026-09-28): `Continue with Luna
+/// Reserve` is a model change and `Continue with detected credentials` a
+/// sign-in — never pressed as the one-shot allow a Claude Code consent is.
+/// NEGATIVE CONTROL: the same box on Claude Code's screen is its consent.
+#[test]
+fn a_codex_continue_with_is_no_consent() {
+    for label in [
+        "Continue with Luna Reserve",
+        "Continue with detected credentials",
+    ] {
+        let rows = lines(&format!(
+            "• Your included usage is exhausted.\n\n  1:39 PM\n\n\n  Luna Reserve\n  Your \
+             included usage is exhausted. Choose an option below to continue.\n\n› 1. {label}\n  \
+             2. Not now\n\n  enter select · esc back"
+        ));
+        let d = decide_screen(Some("codex"), &rows, &full()).expect("a box");
+        assert_ne!(approved(&d), Some(RULE_ALLOW_ONCE), "{label}: {d:?}");
+    }
+}
+
+/// THE HARNESS'S OWN RESTORE drives Codex's `/model` picker (MEASURED on
+/// 0.158.0): to GPT-6-Astra ultra — the model box's `GPT-6-Astra (current)`
+/// by Enter, the effort box's `More reasoning…` by Enter, the advanced box's
+/// `Ultra` by `s` (this conversation) — and to GPT-6-Luna high — its row two
+/// down, then `High` by `s`. Never a digit on an effort box (a digit, like
+/// Enter, saves the default). NEGATIVE CONTROLS: a picker no restore opened
+/// is the person's; an effort box for another model, one with no `s`
+/// (session) key, and one with no such effort are escalated; Claude Code's
+/// reader never answers it.
+#[test]
+fn the_model_picker_is_answered_only_for_the_harness_restore() {
+    use super::super::turn_end::CodexSetting;
+    use aterm_phase::codex::fixtures as cx;
+    let to = |model: &str, effort: &str| ApprovalCtx {
+        model_restore: Some(CodexSetting {
+            model: model.to_string(),
+            effort: Some(effort.to_string()),
+        }),
+        ..full()
+    };
+    let pick = |fixture: &str, c: &ApprovalCtx| {
+        let rows = phase_fixtures::screen(fixture);
+        decide_screen(Some("codex"), &rows, c).expect("the picker")
+    };
+    let pressed = |d: &Decision| match d {
+        Decision::Approve {
+            rule_id, choice, ..
+        } => {
+            assert_eq!(*rule_id, RULE_MODEL_RESTORE_PICK, "{d:?}");
+            choice.clone()
+        }
+        other => panic!("expected a press, got {other:?}"),
+    };
+    let focus = |steps: i32, label: &str| Choice::Focus {
+        steps,
+        label: label.to_string(),
+    };
+    let session = |steps: i32, label: &str| Choice::FocusKey {
+        steps,
+        label: label.to_string(),
+        key: "s",
+    };
+    let astra = to("GPT-6-Astra", "ultra");
+    assert_eq!(
+        pressed(&pick(cx::MODEL_PICK, &astra)),
+        focus(0, "GPT-6-Astra (current)")
+    );
+    assert_eq!(
+        pressed(&pick(cx::EFFORT_PICK, &astra)),
+        focus(3, "More reasoning…")
+    );
+    assert_eq!(
+        pressed(&pick(cx::ADVANCED_PICK, &astra)),
+        session(1, "Ultra")
+    );
+    assert_eq!(
+        pressed(&pick(cx::ADVANCED_PICK_ULTRA, &astra)),
+        session(0, "Ultra")
+    );
+    let luna = to("gpt-6-luna", "high");
+    assert_eq!(
+        pressed(&pick(cx::MODEL_PICK, &luna)),
+        focus(2, "GPT-6-Luna")
+    );
+    assert_eq!(
+        pressed(&pick(cx::EFFORT_PICK_OTHER, &luna)),
+        session(1, "High")
+    );
+    assert_eq!(
+        pressed(&pick(cx::EFFORT_PICK, &to("GPT-6-Astra", "medium"))),
+        session(0, "Medium (default) (current)")
+    );
+    for xhigh in ["xhigh", "extra high"] {
+        assert_eq!(
+            pressed(&pick(cx::EFFORT_PICK, &to("GPT-6-Astra", xhigh))),
+            session(2, "Extra high")
+        );
+    }
+    // No restore in flight: the person's own `/model`.
+    assert!(reason(&pick(cx::MODEL_PICK, &full())).contains("the person's"));
+    // The effort box for another model than the restore's.
+    assert!(reason(&pick(cx::EFFORT_PICK, &luna)).contains("another model"));
+    // An effort box with no session key: Enter would save a default.
+    let rows: Vec<String> = phase_fixtures::screen(cx::EFFORT_PICK_OTHER)
+        .into_iter()
+        .map(|r| r.replace(" · s session", ""))
+        .collect();
+    let d = decide_screen(Some("codex"), &rows, &luna).expect("the picker");
+    assert!(reason(&d).contains("no this-conversation choice"), "{d:?}");
+    // An effort the box does not list.
+    assert!(reason(&pick(cx::EFFORT_PICK, &to("GPT-6-Astra", "minimal"))).contains("lists no"));
+    // Claude Code's reader on the same rows: no answer of this rule.
+    let rows = phase_fixtures::screen(cx::MODEL_PICK);
+    assert!(
+        decide_screen(Some("claude"), &rows, &astra)
+            .is_none_or(|d| approved(&d) != Some(RULE_MODEL_RESTORE_PICK))
+    );
+}
+
+/// THE PAUSED GOAL'S BOX IS ANSWERED ONLY FOR THE UPGRADE'S OWN RESUME (the
+/// owner's decision of 2026-09-28): with the live upgrade owing the goal its
+/// resume ([`ApprovalCtx::goal_resume`]) the focused `Resume goal` is pressed
+/// by the focus and Enter under `goal-resume@v1`, guarded on its own row.
+/// NEGATIVE CONTROLS: nothing owed — a person's own `codex resume` over their
+/// paused goal — is escalated, and so is the box with its focus moved to
+/// `Leave paused`; `Leave paused` is never pressed, under any approval
+/// setting.
+#[test]
+fn the_paused_goals_box_is_answered_only_for_the_upgrades_resume() {
+    use aterm_phase::codex::fixtures as cx;
+    let rows = phase_fixtures::screen(cx::GOAL_RESUME);
+    let owed = ApprovalCtx {
+        goal_resume: true,
+        ..full()
+    };
+    match decide_screen(Some("codex"), &rows, &owed).expect("the box") {
+        Decision::Approve {
+            rule_id,
+            choice,
+            guard,
+            ..
+        } => {
+            assert_eq!(rule_id, RULE_GOAL_RESUME);
+            assert_eq!(
+                choice,
+                Choice::Focus {
+                    steps: 0,
+                    label: "Resume goal".to_string()
+                }
+            );
+            let row = rows
+                .iter()
+                .find(|r| r.starts_with("› 1."))
+                .expect("the focused row");
+            assert_eq!(guard, row_guard(row));
+        }
+        other => panic!("expected the resume, got {other:?}"),
+    }
+    let escalated = |c: &ApprovalCtx, rows: &[String]| {
+        matches!(
+            decide_screen(Some("codex"), rows, c).expect("the box"),
+            Decision::Escalate { .. }
+        )
+    };
+    assert!(escalated(&full(), &rows), "nothing owed: the person's");
+    let moved: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.replacen("› 1. Resume goal", "  1. Resume goal", 1)
+                .replacen("  2. Leave paused", "› 2. Leave paused", 1)
+        })
+        .collect();
+    assert!(escalated(&owed, &moved), "a focus a person moved");
+    for c in [owed.clone(), full(), ctx()] {
+        for r in [&rows, &moved] {
+            if let Ok(Decision::Approve { choice, .. }) =
+                decide_screen(Some("codex"), r, &c).ok_or(())
+            {
+                assert!(
+                    !matches!(&choice, Choice::Focus { label, .. } if label == "Leave paused"),
+                    "{choice:?}"
+                );
+            }
+        }
+    }
 }

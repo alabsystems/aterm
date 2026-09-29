@@ -7,7 +7,7 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-description = "aterm-forge — the third-party surface survey, provenance notary and carve ledger behind `cargo forge`"
+description = "aterm-forge — the third-party surface survey, provenance notary and carve ledger behind `targo --unverified forge`"
 
 [[bin]]
 name = "aterm-forge"

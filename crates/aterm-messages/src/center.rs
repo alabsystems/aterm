@@ -621,10 +621,12 @@ enum Visual {
     Echo(usize),
 }
 
-/// What [`Settled::glass_changed`] compares.
+/// What [`Settled::glass_changed`] compares. Both row lists are bounded by
+/// the committed band height; keeping these small snapshots inline avoids
+/// allocating before and after every host settle.
 type GlassSignature = (
-    Vec<(MessageId, u32, bool)>,
-    Vec<(u16, MessageId, EchoKind)>,
+    [Option<(MessageId, u32, bool)>; MAX_ROWS as usize],
+    [Option<(u16, MessageId, EchoKind)>; MAX_ROWS as usize],
     Option<usize>,
     usize,
     Option<String>,
@@ -652,7 +654,25 @@ pub struct MessageCenter {
     /// Other work is measurably slowed (the strain engine's FELT, fed by the
     /// host): a row's PRIMARY load says its words too (ruling 246).
     slowing: bool,
+    /// Problems that left the glass UNFIXED in this process — folded by a
+    /// press that took the person to fix it, read, dismissed, run out, or
+    /// recorded as a repeat — whose reporter declared words for the fix
+    /// (ruling 367): a later fix under the key still closes their records as
+    /// fixed ([`Self::fix_closed`]). Bounded by [`UNFIXED_CAP`], oldest out.
+    unfixed: Vec<Unfixed>,
 }
+
+/// A closed record of a problem nobody has fixed yet ([`MessageCenter::unfixed`]).
+#[derive(Clone, Debug)]
+struct Unfixed {
+    id: MessageId,
+    key: String,
+    fixed: String,
+}
+
+/// How many unfixed records the center remembers: far more than the
+/// families any reporter keys (`config.` has ten).
+const UNFIXED_CAP: usize = 64;
 
 impl MessageCenter {
     /// A center over a (possibly replayed) log; ids continue from
@@ -671,6 +691,7 @@ impl MessageCenter {
             born: now,
             refresh: REFRESH_DEFAULT,
             slowing: false,
+            unfixed: Vec::new(),
         }
     }
 
@@ -742,6 +763,7 @@ impl MessageCenter {
                     mark: None,
                 },
             );
+            self.note_unfixed(id, &msg, &Retired::Recorded, None);
             return Posted {
                 id,
                 outcome: PostOutcome::New,
@@ -760,6 +782,12 @@ impl MessageCenter {
         let id = self.log.mint();
         self.log
             .record_posted(LogRecord::from_posted(id, stamp, &msg));
+        // A new row under the key says the problem as it stands now: the
+        // closed records before it are not the ones a fix closes (ruling 266:
+        // a problem that became another was not fixed).
+        if let Some(key) = msg.key.as_deref() {
+            self.unfixed.retain(|u| u.key != key);
+        }
         let mut entry = Live::new(id, msg, stamp, now);
         let superseded = entry.msg.key.as_deref().and_then(|key| {
             self.live
@@ -941,6 +969,7 @@ impl MessageCenter {
             },
         };
         let title = outcome.as_deref().unwrap_or(&row.msg.title);
+        self.note_unfixed(row.id, &row.msg, &how, echo);
         self.log.record_retired(
             row.id,
             how,
@@ -953,6 +982,103 @@ impl MessageCenter {
                 mark,
             },
         );
+    }
+
+    /// Remember `id` when it closed a problem UNFIXED (ruling 367): a
+    /// warning or error under a key, whose reporter declared words for the
+    /// fix, that left by a fold, a dismissal, going unseen, an eviction or
+    /// as a record — never by a supersede or a carry (its problem goes on
+    /// under the next row) and never an ask.
+    fn note_unfixed(
+        &mut self,
+        id: MessageId,
+        msg: &Message,
+        how: &Retired,
+        echo: Option<EchoKind>,
+    ) {
+        let closed_unfixed = matches!(
+            how,
+            Retired::Folded
+                | Retired::Dismissed
+                | Retired::Unseen
+                | Retired::Evicted
+                | Retired::Recorded
+        );
+        if !closed_unfixed
+            || msg.is_ask()
+            || msg.severity < Severity::Warn
+            || Ending::of(msg, how, echo) != Ending::Kept
+        {
+            return;
+        }
+        let (Some(key), Some(fixed)) = (msg.key.as_ref(), msg.finished.as_ref()) else {
+            return;
+        };
+        if self.unfixed.len() == UNFIXED_CAP {
+            self.unfixed.remove(0);
+        }
+        self.unfixed.push(Unfixed {
+            id,
+            key: key.clone(),
+            fixed: fixed.clone(),
+        });
+    }
+
+    /// THE FIX REACHES A CLOSED RECORD (ruling 367; day nine, D3): every
+    /// problem under a key starting with `prefix` that left the glass
+    /// unfixed in this process now reads fixed — its record takes the words
+    /// its reporter declared (`Misspelled setting fixed`) under `✓` Success,
+    /// its old title the first detail line, and a second `retired` line
+    /// (`resolved-ok`) goes to the log, so a relaunch replays it fixed too
+    /// and Problems stops counting it. Returns how many.
+    ///
+    /// Before: a config warning folded by `Open aterm.toml` or `Details` —
+    /// the press that sent the person to fix it — kept its `⚠` after the
+    /// fix and after a relaunch, while one fixed with its row still live read
+    /// fixed. Only this process's records: a previous launch's warnings are
+    /// what that launch saw, and nothing here knows they were ever fixed.
+    pub fn fix_closed(&mut self, prefix: &str, now: Instant) -> usize {
+        let (fix, keep): (Vec<Unfixed>, Vec<Unfixed>) = std::mem::take(&mut self.unfixed)
+            .into_iter()
+            .partition(|u| u.key.starts_with(prefix));
+        self.unfixed = keep;
+        let mut fixed = 0;
+        for u in fix {
+            let Some(rec) = self.log.get(u.id) else {
+                continue;
+            };
+            let (Some(unix), Some(at)) = (rec.retired_unix_ms, rec.retired_at) else {
+                continue;
+            };
+            let since = u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(0);
+            let detail: Vec<String> = std::iter::once(rec.title.clone())
+                .chain(rec.detail.iter().cloned())
+                .take(crate::DETAIL_LINES_CAP)
+                .collect();
+            let repeats = rec.repeats;
+            let ok = (
+                Severity::Success,
+                Glyph::or_fallback(severity_icon(Severity::Success)),
+            );
+            let mark = ((rec.severity, rec.glyph) != ok).then_some(ok);
+            self.log.record_retired(
+                u.id,
+                Retired::Resolved(Outcome::Ok),
+                unix.saturating_add(since),
+                now,
+                FinalWords {
+                    title: &u.fixed,
+                    detail: &detail,
+                    repeats,
+                    mark,
+                },
+            );
+            fixed += 1;
+        }
+        if fixed > 0 {
+            self.revision += 1;
+        }
+        fixed
     }
 
     // ---- lifecycle ---------------------------------------------------
@@ -1077,7 +1203,9 @@ impl MessageCenter {
     }
 
     /// Resolve every live row whose key starts with `prefix` (`config.` on
-    /// a clean reload, `privacy.` on policy-off). Returns how many.
+    /// a clean reload, `privacy.` on policy-off). Returns how many. An `Ok`
+    /// also closes as fixed the problems under the prefix that already left
+    /// the glass unfixed ([`Self::fix_closed`]), counted too.
     pub fn resolve_key_prefix(&mut self, prefix: &str, outcome: Outcome, now: Instant) -> usize {
         let ids: Vec<MessageId> = self
             .live
@@ -1088,7 +1216,12 @@ impl MessageCenter {
         for id in &ids {
             self.resolve(*id, outcome, now);
         }
-        ids.len()
+        let closed = if outcome == Outcome::Ok {
+            self.fix_closed(prefix, now)
+        } else {
+            0
+        };
+        ids.len() + closed
     }
 
     /// A person dismissed it.
@@ -1627,15 +1760,16 @@ impl MessageCenter {
     /// `+N` a single row's Details capsule carries, and the hidden progress
     /// row the overflow row names (ruling 259).
     fn glass_signature(&self) -> GlassSignature {
+        debug_assert!(self.glass.len() <= usize::from(MAX_ROWS));
+        debug_assert!(self.echoes.len() <= usize::from(MAX_ROWS));
         (
-            self.glass
-                .iter()
-                .map(|g| {
+            std::array::from_fn(|i| {
+                self.glass.get(i).map(|g| {
                     let row = self.by_id(*g);
                     (*g, row.revision, row.load_shown)
                 })
-                .collect(),
-            self.echoes.iter().map(|e| (e.slot, e.id, e.kind)).collect(),
+            }),
+            std::array::from_fn(|i| self.echoes.get(i).map(|e| (e.slot, e.id, e.kind))),
             self.overflow_hidden(),
             self.plus_hidden(),
             self.overflow_up()
@@ -2954,6 +3088,115 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Compare the bounded snapshot to the former owned-list projection
+    /// while real posts, completion echoes and shrink decisions change the
+    /// glass. Pairwise comparison also checks that no component is lost by
+    /// the new representation, rather than just comparing a quiet center.
+    #[test]
+    fn inline_glass_signatures_preserve_owned_snapshot_comparisons() {
+        #[allow(clippy::type_complexity)]
+        type Owned = (
+            Vec<(MessageId, u32, bool)>,
+            Vec<(u16, MessageId, EchoKind)>,
+            Option<usize>,
+            usize,
+            Option<String>,
+        );
+        fn owned(c: &MessageCenter) -> Owned {
+            (
+                c.glass
+                    .iter()
+                    .map(|id| {
+                        let row = c.by_id(*id);
+                        (*id, row.revision, row.load_shown)
+                    })
+                    .collect(),
+                c.echoes.iter().map(|e| (e.slot, e.id, e.kind)).collect(),
+                c.overflow_hidden(),
+                c.plus_hidden(),
+                c.overflow_up().then(|| c.hidden_progress_words()).flatten(),
+            )
+        }
+        let now = t0();
+        let mut c = fresh(now);
+        let mut states = Vec::new();
+        let mut record = |c: &MessageCenter| {
+            let expected = owned(c);
+            let inline = c.glass_signature();
+            assert_eq!(
+                inline.0.iter().copied().flatten().collect::<Vec<_>>(),
+                expected.0
+            );
+            assert_eq!(
+                inline.1.iter().copied().flatten().collect::<Vec<_>>(),
+                expected.1
+            );
+            states.push((expected, inline));
+        };
+        record(&c);
+        let ids: Vec<_> = (0..3)
+            .map(|i| {
+                c.post(
+                    busy(&format!("job {i}")).key(&format!("job.{i}")),
+                    stamp(i),
+                    now,
+                )
+                .id
+            })
+            .collect();
+        c.commit_rows(now, MAX_ROWS);
+        assert_eq!(c.glass.len(), usize::from(MAX_ROWS));
+        record(&c);
+        assert!(!c.settle(now, true).glass_changed, "same rows stay quiet");
+        record(&c);
+        for id in ids {
+            assert!(c.resolve(id, Outcome::Ok, now));
+            record(&c);
+        }
+        assert_eq!(c.echoes.len(), usize::from(MAX_ROWS));
+        let before = owned(&c);
+        let settled = c.settle(now + Duration::from_secs(5), true);
+        assert!(settled.glass_changed, "completed echoes leave the glass");
+        assert_eq!(settled.glass_changed, before != owned(&c));
+        record(&c);
+
+        for i in 0..4 {
+            c.post(
+                busy(&format!("next {i}")).key(&format!("next.{i}")),
+                stamp(i + 10),
+                now,
+            );
+        }
+        c.commit_rows(now, 2);
+        assert!(
+            c.hidden_progress_words().is_some(),
+            "overflow names hidden progress"
+        );
+        record(&c);
+        c.commit_rows(now, 1);
+        assert_eq!(c.plus_hidden(), 3, "one-row capsule counts the other rows");
+        record(&c);
+        c.commit_rows(now, MAX_ROWS);
+        record(&c);
+        let mut carry = c.carried();
+        for row in &mut carry.live {
+            row.on_glass = true;
+        }
+        let mut child = fresh(now);
+        child.seed_carried(&carry, stamp(20), now);
+        assert!(
+            child.glass.len() <= usize::from(MAX_ROWS),
+            "restore clamps excess glass claims"
+        );
+        record(&child);
+
+        for (before, inline_before) in &states {
+            for (after, inline_after) in &states {
+                assert_eq!(before == after, inline_before == inline_after);
+            }
+        }
     }
 
     /// Invariant 2: post MAX_LIVE+50 held rows: `live.len() == MAX_LIVE`,
@@ -4468,6 +4711,105 @@ mod tests {
         );
         assert!(!c.withdraw(meter, now + ms(2)), "already gone");
         assert_eq!(Retired::Withdrawn.as_word(), "withdrawn");
+    }
+
+    /// THE FIX REACHES A CLOSED RECORD (ruling 367; day nine, D3): a
+    /// config warning folded by the press that sent the person to fix it
+    /// (`Open aterm.toml`, `Details`), and a repeat of it recorded while it
+    /// was still broken, both read fixed once the fix lands — under `✓`,
+    /// the fix's words, the old title the first detail line — and a relaunch
+    /// replaying the log reads them fixed too. Controls: a warning with no
+    /// fix words, one under another prefix, and one a changed row took over
+    /// (ruling 266) keep their `⚠`; a second fix is a no-op.
+    #[test]
+    fn a_problem_folded_before_its_fix_still_closes_as_fixed() {
+        let now = t0();
+        let mut c = fresh(now);
+        let warn = |title: &str, key: &str| {
+            Message::new(tags::CONFIG, Severity::Warn, title)
+                .line("windw_padding \u{2192} window_padding")
+                .finished_as("Misspelled setting fixed")
+                .key(key)
+        };
+        let post = |c: &mut MessageCenter, m: Message, n: u64| c.post(m, stamp(n), now).id;
+        let folded = post(&mut c, warn("Misspelled setting", "config.ignored-keys"), 1);
+        let no_words = post(
+            &mut c,
+            Message::new(tags::CONFIG, Severity::Warn, "Font not found").key("config.fonts"),
+            2,
+        );
+        let elsewhere = post(&mut c, warn("Misspelled setting", "privacy.x"), 3);
+        let taken_over = post(
+            &mut c,
+            warn("Misspelled setting", "config.unaccepted-values"),
+            4,
+        );
+        c.commit_rows(now, 3);
+        for id in [folded, no_words, elsewhere, taken_over] {
+            assert!(c.mark_seen(id, now + ms(1)), "the press folds it");
+            assert_eq!(
+                c.log().get(id).unwrap().state,
+                LogState::Retired(Retired::Folded)
+            );
+        }
+        // Still broken on the next reload: a repeat is a record.
+        let repeat = post(
+            &mut c,
+            warn("Misspelled setting", "config.ignored-keys").hold(Hold::LogOnly),
+            5,
+        );
+        // The problem became another: a new row under that key.
+        let changed = post(
+            &mut c,
+            warn("2 misspelled settings", "config.unaccepted-values"),
+            6,
+        );
+        let fixed_at = now + ms(10);
+        assert_eq!(
+            c.resolve_key_prefix("config.", Outcome::Ok, fixed_at),
+            3,
+            "the changed row (live) and the folded warning and its repeat (closed)"
+        );
+        let words = |c: &MessageCenter, id| {
+            let rec = c.log().get(id).unwrap();
+            (
+                rec.title.clone(),
+                rec.detail.first().cloned(),
+                rec.severity,
+                rec.glyph.ch(),
+            )
+        };
+        let fixed = (
+            "Misspelled setting fixed".to_string(),
+            Some("Misspelled setting".to_string()),
+            Severity::Success,
+            '\u{2713}',
+        );
+        assert_eq!(words(&c, folded), fixed);
+        assert_eq!(words(&c, repeat), fixed);
+        assert_eq!(words(&c, changed).2, Severity::Success, "fixed while live");
+        for id in [no_words, elsewhere, taken_over] {
+            assert_eq!(words(&c, id).2, Severity::Warn, "{id:?} keeps its \u{26a0}");
+        }
+        assert_eq!(
+            c.log().get(folded).unwrap().state,
+            LogState::Retired(Retired::Resolved(Outcome::Ok))
+        );
+        assert_eq!(c.fix_closed("config.", fixed_at + ms(1)), 0, "once");
+        // The relaunch: the lines this process wrote, replayed.
+        let lines = c.log.drain_pending();
+        let mut replayed = MessageLog::empty();
+        replayed.replay_all(lines);
+        let rec = replayed
+            .records()
+            .find(|r| r.stamp == stamp(1))
+            .expect("the folded warning's record");
+        assert_eq!(
+            (rec.title.as_str(), rec.severity),
+            ("Misspelled setting fixed", Severity::Success)
+        );
+        let rec = replayed.records().find(|r| r.stamp == stamp(3)).unwrap();
+        assert_eq!(rec.severity, Severity::Warn, "the control replays unfixed");
     }
 
     /// THE LOG STATES THE OUTCOME, and only the one the reporter claimed

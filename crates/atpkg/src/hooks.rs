@@ -3612,10 +3612,17 @@ mod tests {
     /// measurement). Sourcing the generated hook inside aterm must leave the reroute dir
     /// FIRST and the agents dir SECOND, each once, keep every other entry — the empty one
     /// included — in order, append bin/ last, and change nothing on a second source.
-    /// bash is macOS's 3.2 when that is what `bash` is; zsh is skipped where it is absent.
+    ///
+    /// EVERY DIALECT a person's shell sources is executed where its shell exists: bash
+    /// (macOS's 3.2 when that is what `bash` is) must; zsh, fish and pwsh are skipped only
+    /// when the spawn itself finds no such program, and say so. The fish and pwsh arms were
+    /// cut from this test by a merge on 2026-09-27 and restored the same day; they last ran
+    /// on 2026-09-27 against fish 4.9.3 and PowerShell 7.6.6 on macOS 27 (arm64), from the
+    /// vendors' own release archives. Each shell runs with a scratch HOME/XDG root, so a
+    /// shell that writes first-run state (pwsh, fish) writes it under this test's temp dir.
     #[cfg(unix)]
     #[test]
-    fn posix_hook_moves_the_agents_dir_to_the_front_in_real_shells() {
+    fn every_hook_dialect_orders_path_in_its_real_shell() {
         let root = tmp("realsh");
         let agents = root.join("Application Support/pkg/agents");
         let reroute = root.join("Application Support/pkg/reroute");
@@ -3629,9 +3636,29 @@ mod tests {
         let inherited =
             format!("/Users//u/.local/bin:/usr/bin:/opt/homebrew/bin:{r}:{a}::/bin:{a}:{r}");
         let want = format!("{r}:{a}:/Users//u/.local/bin:/usr/bin:/opt/homebrew/bin::/bin:{b}");
-        for (shell, args, ext) in [
-            ("bash", &["--noprofile", "--norc", "-c"][..], "bash"),
-            ("zsh", &["-f", "-c"][..], "zsh"),
+        let posix_cmd =
+            "PATH=\"$ATPKG_TEST_PATH\"; . \"$ATPKG_TEST_HOOK\"; printf 'PATH=%s\\n' \"$PATH\"";
+        let fish_cmd = "set -gx PATH (string split -- : \"$ATPKG_TEST_PATH\"); \
+                        source \"$ATPKG_TEST_HOOK\"; printf 'PATH=%s\\n' (string join : $PATH)";
+        let pwsh_cmd = "$env:PATH = $env:ATPKG_TEST_PATH; . $env:ATPKG_TEST_HOOK; \
+                        [Console]::Out.Write('PATH=' + $env:PATH + [char]10)";
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        for (shell, args, ext, cmd) in [
+            (
+                "bash",
+                &["--noprofile", "--norc", "-c"][..],
+                "bash",
+                posix_cmd,
+            ),
+            ("zsh", &["-f", "-c"][..], "zsh", posix_cmd),
+            ("fish", &["--no-config", "-c"][..], "fish", fish_cmd),
+            (
+                "pwsh",
+                &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"][..],
+                "ps1",
+                pwsh_cmd,
+            ),
         ] {
             let hook = root.join(format!("hook.{ext}"));
             let body = &files.iter().find(|(n, _)| n.ends_with(ext)).unwrap().1;
@@ -3641,13 +3668,14 @@ mod tests {
             // PATH line, or the test fails with the shell's own words (review finding
             // 2026-09-10: a fatal zsh error used to read as "zsh not installed").
             match std::process::Command::new(shell)
-                .args(args)
-                .arg("true")
+                .arg("--version")
+                .env("HOME", &home)
                 .output()
             {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     assert_ne!(shell, "bash", "bash must be runnable on a unix host");
-                    continue; // zsh not installed here
+                    eprintln!("SKIP: {shell} is not installed; its hook dialect did not run");
+                    continue;
                 }
                 Err(error) => panic!("{shell}: cannot start: {error}"),
                 Ok(_) => {}
@@ -3655,7 +3683,14 @@ mod tests {
             let run = |path: &str| -> String {
                 let out = std::process::Command::new(shell)
                     .args(args)
-                    .arg("PATH=\"$ATPKG_TEST_PATH\"; . \"$ATPKG_TEST_HOOK\"; printf 'PATH=%s\\n' \"$PATH\"")
+                    .arg(cmd)
+                    // A scratch HOME and XDG root: pwsh and fish write first-run state.
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", home.join(".config"))
+                    .env("XDG_DATA_HOME", home.join(".local/share"))
+                    .env("XDG_CACHE_HOME", home.join(".cache"))
+                    .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
+                    .env("POWERSHELL_UPDATECHECK", "Off")
                     // Non-interactive bash sources $BASH_ENV even under --noprofile
                     // --norc; an inherited one would re-order PATH around the hook.
                     .env_remove("BASH_ENV")
@@ -3681,6 +3716,19 @@ mod tests {
                     .unwrap_or_else(|| panic!("{shell}: no PATH line: {stdout:?}"))
                     .to_owned()
             };
+            // fish SPELLS an empty PATH entry `.` (its path variables do, the moment the
+            // PATH is set — measured 2026-09-27, fish 4.9.3): the same directory, so the
+            // entry is still the user's and still in its place, in fish's spelling.
+            let spelled = |path: String| -> String {
+                if shell != "fish" {
+                    return path;
+                }
+                path.split(':')
+                    .map(|entry| if entry.is_empty() { "." } else { entry })
+                    .collect::<Vec<_>>()
+                    .join(":")
+            };
+            let want = spelled(want.clone());
             let got = run(&inherited);
             assert_eq!(
                 got, want,
@@ -3697,7 +3745,7 @@ mod tests {
                 (a.to_string(), format!("{r}:{a}:{b}")),
                 (r.to_string(), format!("{r}:{a}:{b}")),
             ] {
-                assert_eq!(run(&path), expect, "{shell}: {path:?}");
+                assert_eq!(run(&path), spelled(expect), "{shell}: {path:?}");
             }
         }
         let _ = fs::remove_dir_all(&root);
@@ -3708,8 +3756,9 @@ mod tests {
     /// a private `tmux -L` server started with aterm's markers fronts the agents dir in
     /// its panes; one started without them demotes it — even when an agents-first PATH
     /// was inherited. Skipped, and said, where tmux is not installed (it is not on the
-    /// machines this was written on: the arm was added unexecuted, and a Mac with tmux
-    /// is the first to run it). Each server is private to this test and killed after.
+    /// machines this was written on; it first RAN on 2026-09-27, against a tmux 3.5a
+    /// built into a scratch directory and put first on PATH — all three arms green).
+    /// Each server is private to this test and killed after.
     #[cfg(unix)]
     #[test]
     fn a_private_tmux_server_fronts_agents_only_when_born_with_the_markers() {

@@ -121,7 +121,7 @@ impl TerminalSearch {
     pub fn with_capacity(expected_lines: usize) -> Self {
         // Branch-duplicated construction: SearchIndex::with_capacity clamps
         // its internal map capacity hints far below this bound and its bloom
-        // filter saturates its size cap at BloomFilter::MAX_EFFECTIVE_CAPACITY,
+        // filter starts independently of the row count,
         // so both arms construct the IDENTICAL index for any input in the
         // first arm. The Trust L0 gate's allocation recognizer needs the
         // comparison to directly dominate the allocating call, hence the

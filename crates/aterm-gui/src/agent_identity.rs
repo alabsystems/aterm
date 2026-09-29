@@ -22,6 +22,16 @@
 //! The macOS keychain is the one login channel outside the dir: aterm never
 //! reads, names or deletes a keychain item it did not create.
 //!
+//! MEASURED 2026-09-27 (the isolation half; Claude Code 2.1.283, an isolated
+//! dev-seams instance on the owner's Mac with the real `HOME`): a tab from
+//! `spawn identity=probe` carried `CLAUDE_CONFIG_DIR=<idir>/.claude`, and `claude`
+//! there went through onboarding to `Select login method:` — it did NOT come up
+//! logged in as the owner. It wrote only under `<idir>/.claude`, and the login
+//! keychain still held one `Claude Code-credentials` item. The other half — a
+//! login completed under an identity leaves the default session's account alone —
+//! needs the owner to complete that login (`docs/AGENT-EXPERIENCE-2026-08-26.md`
+//! §7.3).
+//!
 //! THE SEAM. [`env`] rides `spawn_session`'s `env_add`, which
 //! `aterm_pty::build_child_env` applies AFTER the deny pass — so the parent's
 //! `CLAUDE_CONFIG_DIR` is dropped and the identity's survives, with no change

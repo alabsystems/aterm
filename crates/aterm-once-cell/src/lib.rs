@@ -58,7 +58,7 @@
 //!   wasm-bindgen 0.2.108 unsync::Lazy     wasm-cpu wasm-gpu   force, Deref
 //!   wasm-bindgen-futures unsync::Lazy     wasm-gpu         Deref
 //!
-//! DEV-ONLY (outside every `cargo forge` cell, but `cargo test` builds them)
+//! DEV-ONLY (outside every `targo --unverified forge` cell, but `cargo test` builds them)
 //!   criterion 0.5.1      sync::Lazy       5 statics
 //!   tempfile 3.27.0      sync::OnceCell   get_or_init, get
 //! ```

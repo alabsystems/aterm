@@ -803,7 +803,7 @@ fn the_manifest_rule_sees_a_renamed_dependency() {
 /// $ cargo check -p aterm-gui --all-targets   # with aterm-gui's 4 rows AND the
 ///                                            # `a11y-appkit` feature list deleted
 /// exit 0
-/// $ cargo forge survey --cell mac-arm
+/// $ targo --unverified forge survey --cell mac-arm
 /// mac-arm  116  69  47  563,759  24,865      # byte-identical to before
 /// ```
 ///

@@ -69,6 +69,15 @@
 //! ([`crate::differential::tools_differ`]). Every `RUST*` and `CARGO*`
 //! variable but a few inert ones is recorded, and a build script's native
 //! toolchain's ([`crate::differential::build_env_records`], fourth review).
+//! And so are the cargo config FILES its builds read (`build-config
+//! <role>=<git blob id> …` or `build-config none`, 2026-09-28,
+//! [`crate::build_config`]): the repository's own `.cargo/config.toml`, every
+//! ancestor directory's, `$CARGO_HOME`'s and what they include — a
+//! `rustflags` or a profile in any of them builds other code exactly as the
+//! variable would. Roles, not paths, so two checkouts with the same files
+//! agree; a receipt without the line (an older gate's, or a run whose config
+//! could not be read) serves no run as a base, and the release cutter's
+//! MEASURE check requires it to be the cut tree's own config and nothing else.
 //!
 //! WHAT FAILED, ITEMIZED (2026-09-26). A receipt lists every failure the run
 //! found — `failures <n>`, then one `fail <msg-hash> <since-commit>
@@ -80,7 +89,10 @@
 //! come first and the id last, because an id is free text (a doctest's name
 //! has spaces). A run judged against a base names it (`base <commit>`) and
 //! each failure it judged inherited (`inherited <id>`); a `--baseline` run on
-//! main says so (`baseline yes`). All additive: an older reader ignores them,
+//! main says so (`baseline yes`); a run judged against a NEAREST base (the
+//! opt-in `--nearest-base`, [`crate::nearest`]) says so too (`base-mode
+//! nearest <commit>`), and a run by the exact rule writes no such line. All
+//! additive: an older reader ignores them,
 //! and a receipt with no `failures` line predates the list, so it lists
 //! nothing a run could be judged against — never "main was green".
 //!
@@ -226,6 +238,14 @@ pub struct Receipt {
     /// none — 2026-09-27, third review: the same compiler under other flags
     /// builds other code. `None` in a receipt an older gate wrote.
     pub build_env: Option<String>,
+    /// The cargo config files the run's builds read — the repository's own,
+    /// every ancestor directory's, `$CARGO_HOME`'s and what they include — as
+    /// `<role>=<git blob id>` entries, or `none`
+    /// ([`crate::build_config::record`], 2026-09-28: a `rustflags` in
+    /// `~/.cargo/config.toml` builds other code exactly as `RUSTFLAGS` does).
+    /// `None` in a receipt an older gate wrote, and for a run whose config
+    /// files could not be read: such a receipt serves no run as a base.
+    pub build_config: Option<String>,
     /// Every failure the run found, itemized ([`crate::ladder::Finding`]):
     /// `None` in a receipt written before the list existed (no `failures`
     /// line), which therefore can never serve as a base.
@@ -233,6 +253,13 @@ pub struct Receipt {
     /// The commit whose receipt the run was judged against, when it was
     /// ([`crate::differential`]).
     pub base: Option<String>,
+    /// `Some(base)` when that base was a NEAREST one — an ancestor of the
+    /// merge-base, not the merge-base itself — judged by the opt-in
+    /// `--nearest-base` rule ([`crate::nearest`], 2026-09-28): `base-mode
+    /// nearest <commit>`. No line (`None`) under the exact rule, so a
+    /// default run's receipt is what it always was. A record for the reader;
+    /// the release cutter reads such a receipt exactly as any other.
+    pub base_nearest: Option<String>,
     /// The ids of the failures judged INHERITED from that base — red there
     /// with the same failure, inside the age cap. What `merge_contract`
     /// excused, named.
@@ -356,6 +383,9 @@ impl Receipt {
         if let Some(env) = &self.build_env {
             let _ = writeln!(s, "build-env {}", one_line(env));
         }
+        if let Some(config) = &self.build_config {
+            let _ = writeln!(s, "build-config {}", one_line(config));
+        }
         if let Some(failures) = &self.failures {
             let _ = writeln!(s, "failures {}", failures.len());
             for f in failures {
@@ -384,6 +414,9 @@ impl Receipt {
         }
         if let Some(base) = &self.base {
             let _ = writeln!(s, "base {}", one_line(base));
+        }
+        if let Some(nearest) = &self.base_nearest {
+            let _ = writeln!(s, "base-mode nearest {}", one_line(nearest));
         }
         for id in &self.inherited {
             let _ = writeln!(s, "inherited {}", one_line(id));
@@ -458,8 +491,13 @@ impl Receipt {
             toolchain: get.get("toolchain").cloned().unwrap_or_default(),
             checkers: get.get("checkers").cloned().unwrap_or_default(),
             build_env: get.get("build-env").cloned(),
+            build_config: get.get("build-config").cloned(),
             failures,
             base: get.get("base").cloned(),
+            base_nearest: get
+                .get("base-mode")
+                .and_then(|v| v.strip_prefix("nearest "))
+                .map(str::to_string),
             inherited,
             baseline: get.get("baseline").is_some_and(|v| v == "yes"),
             hidden,

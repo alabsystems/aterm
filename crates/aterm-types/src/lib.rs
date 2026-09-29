@@ -57,6 +57,12 @@ pub use time::duration_to_nanos;
 // the one workspace home (update, release, gui, and atpkg all stamp this shape).
 pub mod rfc3339;
 
+// Rust on this machine means the Trust toolchain: the stock names, their Trust
+// spellings, and the reader that finds a stock tool at command position — one
+// vocabulary for atpkg's reroute, `aterm pkg lane` (the reader a guard the owner
+// wires calls) and `aterm help rust` (owner ruling, 2026-09-23).
+pub mod rust_lane;
+
 pub mod app_inspection;
 mod color_palette;
 pub mod control_socket;
@@ -68,7 +74,7 @@ pub mod fs_restricted;
 mod inline_image;
 pub mod scheme;
 mod x11_colors;
-pub use inline_image::{ImageData, ImageFormat};
+pub use inline_image::{ImageData, ImageFormat, ImageScaling, SourceRect};
 // Re-export cursor style at crate root (was inline, extracted for file size).
 pub use cursor::CursorStyle;
 // Re-export color palette at crate root (extracted for file size, Part of #5332).

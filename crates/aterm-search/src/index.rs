@@ -198,15 +198,6 @@ pub struct SearchIndex {
     eviction_occurred: bool,
     /// Guards the one-time `aterm_log` warning emitted on first eviction.
     first_eviction_warned: bool,
-    /// Whether this index maintains the trigram postings and the bloom filter.
-    ///
-    /// `true` for every index built through the public constructors — the query
-    /// pipeline needs both. `false` only for the private columns-only index
-    /// ([`columns_only_with_max_cached_lines`](Self::columns_only_with_max_cached_lines))
-    /// the budgeted engine builds, which reads back nothing but `column_maps`.
-    /// Never mutated after construction; it is a mode, not state, so `clear`
-    /// and `release` leave it alone.
-    maintain_trigrams: bool,
 }
 
 /// Convert a line number to u32 for `SparseBitmap` storage.
@@ -215,6 +206,22 @@ pub struct SearchIndex {
 /// in u32 (max ~4B). Saturates at `u32::MAX` for defensive safety.
 fn line_as_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// The bloom filter represents the posting dictionary, not each occurrence in
+/// every row. Repeated output and unchanged screen refreshes must not inflate
+/// its insertion count, allocation, or rebuild work.
+fn insert_posting(
+    trigrams: &mut FxHashMap<[u8; 3], SparseBitmap>,
+    bloom: &mut BloomFilter,
+    trigram: [u8; 3],
+    line: u32,
+) {
+    let bitmap = trigrams.entry(trigram).or_default();
+    if bitmap.is_empty() {
+        bloom.insert_bytes(&trigram);
+    }
+    bitmap.insert(line);
 }
 
 /// Intersect a pre-sorted (ascending by len) slice of posting list references
@@ -485,7 +492,7 @@ impl SearchIndex {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            bloom: BloomFilter::with_capacity(100_000),
+            bloom: BloomFilter::with_capacity(1000),
             trigrams: FxHashMap::default(),
             lines: FxHashMap::default(),
             column_maps: FxHashMap::default(),
@@ -497,7 +504,6 @@ impl SearchIndex {
             lowest_retained_line: 0,
             eviction_occurred: false,
             first_eviction_warned: false,
-            maintain_trigrams: true,
         }
     }
 
@@ -529,6 +535,10 @@ impl SearchIndex {
     /// Create a new search index with expected capacity and an explicit cap.
     #[must_use]
     pub fn with_capacity_and_max(expected_lines: usize, max_cached_lines: usize) -> Self {
+        // An expected history can be much larger than the searchable suffix.
+        // Reserving for rows that capacity eviction will immediately discard
+        // otherwise pins the full history's hash tables for the cache lifetime.
+        let expected_lines = expected_lines.min(max_cached_lines.max(1));
         // Bound the map capacity HINTS so the Trust L0 gate can prove the
         // pre-allocations finite. Hints only affect pre-reservation, never
         // observable behavior: the maps grow on demand past the hint exactly
@@ -540,23 +550,10 @@ impl SearchIndex {
         } else {
             expected_lines
         };
-        // Branch-duplicated construction, equivalent to the previous
-        // `BloomFilter::with_capacity(expected_lines.max(1000))` on every
-        // input: the middle arm's cap already saturates the filter's internal
-        // MAX_BITS size cap, so it constructs the identical filter for any
-        // larger input. Spelled as a three-way branch on the raw parameter
-        // (no phi-merged clamp locals) because the Trust L0 gate's allocation
-        // recognizer needs the comparisons to directly dominate the
-        // allocating call with the count in the compared local itself.
-        let bloom = if expected_lines < 1000 {
-            BloomFilter::with_capacity(1000)
-        } else if expected_lines > BloomFilter::MAX_EFFECTIVE_CAPACITY {
-            BloomFilter::with_capacity(BloomFilter::MAX_EFFECTIVE_CAPACITY)
-        } else {
-            BloomFilter::with_capacity(expected_lines)
-        };
         Self {
-            bloom,
+            // Row count says nothing about trigram vocabulary. Start small;
+            // saturation grows the filter from the actual dictionary below.
+            bloom: BloomFilter::with_capacity(1000),
             trigrams: FxHashMap::with_capacity_and_hasher(line_hint / 10, FxBuildHasher),
             lines: FxHashMap::with_capacity_and_hasher(line_hint, FxBuildHasher),
             column_maps: FxHashMap::with_capacity_and_hasher(line_hint, FxBuildHasher),
@@ -568,43 +565,7 @@ impl SearchIndex {
             lowest_retained_line: 0,
             eviction_occurred: false,
             first_eviction_warned: false,
-            maintain_trigrams: true,
         }
-    }
-
-    /// A line/column-map cache with NO trigram postings and NO bloom filter.
-    ///
-    /// The budgeted engine ([`crate::BudgetedSearch`]) verifies every row it
-    /// feeds directly against that row's text and its cached [`ColumnMap`] — it
-    /// deliberately never re-enters the query pipeline (see the comment in
-    /// `BudgetedSearch::verify_row`). So every trigram insert, every bloom bit
-    /// and, worst, every `rebuild_bloom` sweep it paid was dead work — and the
-    /// sweep is O(all cached lines) landing inside a turn the caller sized for a
-    /// handful of rows, exactly the stall the budgeted API exists to prevent.
-    ///
-    /// Everything the budgeted engine *does* observe is untouched: `lines`,
-    /// `column_maps`, the `first_cached_line`/`line_count`/`next_line`
-    /// counters and the eviction schedule (including `lowest_retained_line`)
-    /// all run through the same code as a full index, so the watermark still
-    /// matches `final_evicted_prefix`'s closed form line for line.
-    ///
-    /// Deliberately NOT public: querying an index built this way returns EMPTY
-    /// results, because the postings the query pipeline consults do not exist.
-    /// The query entry points `debug_assert!` the flag so a future refactor
-    /// that queries such an index trips in tests instead of silently answering
-    /// nothing.
-    #[must_use]
-    pub(crate) fn columns_only_with_max_cached_lines(max_cached_lines: usize) -> Self {
-        // Start from the zero-capacity constructor: identical state to
-        // `with_max_cached_lines` (both leave every map at capacity 0) except
-        // that the filter it builds and we immediately discard is the ~1e4-bit
-        // floor rather than `new()`'s ~1e6-bit (~128 KB) default.
-        let mut index = Self::with_capacity_and_max(0, max_cached_lines);
-        index.maintain_trigrams = false;
-        // Nothing is ever inserted into or read from this filter;
-        // `with_size(0)` floors it at a single 64-bit word.
-        index.bloom = BloomFilter::with_size(0);
-        index
     }
 
     /// Index a line at a specific line number.
@@ -619,138 +580,61 @@ impl SearchIndex {
     pub(crate) fn index_line_cow(&mut self, line_num: usize, text: Cow<'_, str>) {
         let text_ref = text.as_ref();
 
-        // Remove old trigrams if this line was previously indexed.
-        // Use remove() to move the old String out (avoids clone).
-        //
-        // Re-indexing a row whose text is IDENTICAL is the common case on the
-        // interactive path: the GUI re-feeds the previously visible screen into
-        // a reused index on every search, and absolute row numbers are stable,
-        // so those rows arrive unchanged. For them the remove-then-reinsert
-        // below is the identity on the posting lists — an expensive identity,
-        // because `SparseBitmap::remove` and (for a row that is not past the
-        // list's tail) `SparseBitmap::insert` are both decode-modify-re-encode
-        // over the WHOLE list, twice per trigram occurrence. Detect that case
-        // and skip only the posting-list work. The skip is state-identical, not
-        // merely results-identical: removing then re-inserting the same row for
-        // the same trigrams restores the same membership set, and
-        // `rebuild_from_sorted`/`push_varint` produce a canonical minimal
-        // encoding, so the `deltas`/`first`/`last`/`count` left in place are
-        // byte-for-byte what the round trip would have rebuilt. (Every pruning
-        // path — `evict_oldest_lines`, `retain_history_from` — drops from
-        // `lines` and the postings under the same watermark, so a row still
-        // present in `lines` is still present in each of its posting lists.)
-        let mut replaced_old: Option<String> = None;
-        let unchanged = match self.lines.remove(&line_num) {
-            Some(old_text) if old_text == text_ref => {
-                // Put the owned String straight back: no reallocation here, and
-                // no `text.to_string()` below.
-                self.lines.insert(line_num, old_text);
-                true
-            }
-            Some(old_text) => {
-                // A GENUINELY changed row (SA-3): defer the posting work to the
-                // set-diff path below, which touches only the trigrams whose
-                // membership actually changes instead of round-tripping every
-                // posting list of BOTH texts (remove-all + insert-all was
-                // ~2 × row-trigrams full-list decode/re-encode cycles for an
-                // edit that typically shares almost all its trigrams — the
-                // echoed prompt line, a partial last row).
-                replaced_old = Some(old_text);
-                false
-            }
-            None => false,
-        };
+        // An unchanged row already contributes exactly these postings and
+        // columns. In particular it must not advance the bloom insertion count:
+        // refreshes of the visible screen used to trigger full-history rebuilds.
+        if self.lines.get(&line_num).is_some_and(|old| old == text_ref) {
+            return;
+        }
 
-        let bytes = text_ref.as_bytes();
         let line_u32 = line_as_u32(line_num);
-
-        // A columns-only index (the budgeted engine) keeps no postings and no
-        // bloom filter, so both passes below are pure waste for it — including
-        // the Unicode arm's fold into the scratch buffer. Everything after this
-        // block (the line/column-map cache, the counters, eviction) still runs
-        // identically for it.
-        if self.maintain_trigrams
-            && let Some(old_text) = replaced_old
-        {
+        if let Some(old_text) = self.lines.remove(&line_num) {
             self.reindex_changed_row_postings(line_u32, &old_text, text_ref);
-        } else if self.maintain_trigrams {
-            // Add all trigrams from this line (original case).
-            for window in bytes.windows(3) {
-                let trigram: [u8; 3] = [window[0], window[1], window[2]];
-                // The bloom insert is deliberately NOT skipped for an unchanged
-                // row. `bloom.item_count()` drives `is_saturated()` and
-                // therefore the `rebuild_bloom` cadence, which is observable
-                // (`bloom_is_saturated`, the lifecycle differential oracles),
-                // so it must see exactly the inserts it saw before. Hashing
-                // three bytes is trivial next to the posting-list round trip
-                // skipped below.
-                self.bloom.insert_bytes(&trigram);
-                if !unchanged {
-                    self.trigrams.entry(trigram).or_default().insert(line_u32);
-                }
+        } else {
+            for window in text_ref.as_bytes().windows(3) {
+                insert_posting(
+                    &mut self.trigrams,
+                    &mut self.bloom,
+                    [window[0], window[1], window[2]],
+                    line_u32,
+                );
             }
 
-            // Also insert Unicode-lowercased trigrams for case-insensitive
-            // bloom filter and posting-list acceleration (#7273, #7398, #7470).
-            // Uses full Unicode lowercasing so non-ASCII characters
-            // (e.g., Ä→ä, É→é) are indexed correctly.
-            //
-            // Skip this pass entirely when lowercasing cannot change any byte:
-            // for pure-ASCII text with no uppercase letter, `to_lowercase()` is
-            // the identity, so the lowered trigrams equal the original-case ones
-            // already inserted above. The predicate lives in `lower_need` and is
-            // shared with `reindex_changed_row_postings`/`rebuild_bloom` so insert/remove/
-            // rebuild stay symmetric by construction.
-            //
-            // Neither non-identity arm allocates per line any more: pure-ASCII
-            // text lowers per byte in place off the ORIGINAL window (lowering an
-            // ASCII string never changes its byte length, so the windows
-            // correspond one-to-one), and the Unicode arm folds into a reused
-            // scratch buffer. The old shape built a fresh capacity-less `String`
-            // per line — ~5 reallocations for an 80-column line — only to walk
-            // it once and drop it, on the per-line primitive every index build
-            // runs.
+            // The same fold as queries and changed-row maintenance. ASCII
+            // lowering needs no buffer; Unicode folds into reusable scratch.
             match lower_need(text_ref) {
                 LowerNeed::None => {}
                 LowerNeed::Ascii => {
-                    for window in bytes.windows(3) {
-                        let trigram: [u8; 3] = [
-                            window[0].to_ascii_lowercase(),
-                            window[1].to_ascii_lowercase(),
-                            window[2].to_ascii_lowercase(),
-                        ];
-                        // Bloom always, postings only when the row's text
-                        // changed (see the original-case pass above).
-                        self.bloom.insert_bytes(&trigram);
-                        if !unchanged {
-                            self.trigrams.entry(trigram).or_default().insert(line_u32);
-                        }
+                    for window in text_ref.as_bytes().windows(3) {
+                        insert_posting(
+                            &mut self.trigrams,
+                            &mut self.bloom,
+                            [
+                                window[0].to_ascii_lowercase(),
+                                window[1].to_ascii_lowercase(),
+                                window[2].to_ascii_lowercase(),
+                            ],
+                            line_u32,
+                        );
                     }
                 }
                 LowerNeed::Unicode => {
                     lower_fold_into(text_ref, &mut self.lower_scratch);
                     for window in self.lower_scratch.as_bytes().windows(3) {
-                        let trigram: [u8; 3] = [window[0], window[1], window[2]];
-                        // Bloom always, postings only when the row's text
-                        // changed (see the original-case pass above).
-                        self.bloom.insert_bytes(&trigram);
-                        if !unchanged {
-                            self.trigrams.entry(trigram).or_default().insert(line_u32);
-                        }
+                        insert_posting(
+                            &mut self.trigrams,
+                            &mut self.bloom,
+                            [window[0], window[1], window[2]],
+                            line_u32,
+                        );
                     }
                 }
             }
         }
 
-        // Cache the line content and precomputed column map (#7373). An
-        // unchanged row already has both: its `String` was put straight back
-        // above, and a `ColumnMap` is a pure function of the text, so the
-        // cached one is already the map this call would rebuild.
-        if !unchanged {
-            let column_map = ColumnMap::new(text_ref);
-            self.lines.insert(line_num, text.into_owned());
-            self.column_maps.insert(line_num, column_map);
-        }
+        let column_map = ColumnMap::new(text_ref);
+        self.lines.insert(line_num, text.into_owned());
+        self.column_maps.insert(line_num, column_map);
         self.first_cached_line = self.first_cached_line.min(line_num);
         self.line_count = self.line_count.max(line_num.saturating_add(1));
         self.next_line = self.next_line.max(line_num.saturating_add(1));
@@ -763,11 +647,8 @@ impl SearchIndex {
         // Rebuild bloom filter if saturated (#7243). When the estimated FPR
         // exceeds 50%, the bloom filter returns true for most queries, making
         // it useless as a negative filter. Rebuild from remaining cached lines
-        // to restore its effectiveness. A columns-only index has no filter to
-        // saturate (nothing is ever inserted, so `is_saturated()` is already
-        // constant-false) — the guard makes that explicit rather than paying an
-        // `exp()` + `powi(7)` per row to rediscover it.
-        if self.maintain_trigrams && self.bloom.is_saturated() {
+        // to restore its effectiveness.
+        if self.bloom.is_saturated() {
             self.rebuild_bloom();
         }
     }
@@ -838,15 +719,11 @@ impl SearchIndex {
     ///   gate also spares repeated windows the old path's per-duplicate
     ///   decode + binary-search no-op on non-tail rows.
     ///
-    /// The BLOOM inserts are NOT diffed: `bloom.item_count()` drives the
-    /// `is_saturated()` rebuild cadence, which is observable
-    /// (`bloom_is_saturated`, the lifecycle differential oracles), so every
-    /// new-text window is inserted exactly as before. Cost scales with the
-    /// EDIT's trigram delta, not the row's trigram count. Per changed trigram
-    /// the posting update is O(1) when this row is the list's newest entry
-    /// (the prompt-line edit: `insert` appends a gap, `remove` truncates one)
-    /// and O(list length) otherwise, because a varint stream is re-encoded
-    /// from the splice point.
+    /// Bloom insertion happens only when a trigram first enters the posting
+    /// dictionary. Shared keys are already represented; removed keys may leave
+    /// stale bits until the next rebuild, which permits only false positives.
+    /// Per changed posting the update is O(1) for the newest row and O(list
+    /// length) otherwise because a varint stream is re-encoded at a splice.
     ///
     /// [`index_line`]: Self::index_line
     /// [`lower_need`]: crate::grapheme::lower_need
@@ -856,13 +733,11 @@ impl SearchIndex {
         let mut new_seen: FxHashSet<[u8; 3]> =
             FxHashSet::with_capacity_and_hasher(bytes.len().saturating_mul(2), FxBuildHasher);
 
-        // Original-case pass: bloom ALWAYS (cadence parity — see above),
-        // postings only for trigrams the old text did not already contribute.
+        // Original-case pass: only newly contributed trigrams touch postings.
         for window in bytes.windows(3) {
             let trigram: [u8; 3] = [window[0], window[1], window[2]];
-            self.bloom.insert_bytes(&trigram);
             if new_seen.insert(trigram) && !old_set.contains(&trigram) {
-                self.trigrams.entry(trigram).or_default().insert(line_u32);
+                insert_posting(&mut self.trigrams, &mut self.bloom, trigram, line_u32);
             }
         }
         // Lowered pass, gated by the SHARED classifier (see `index_line`).
@@ -875,9 +750,8 @@ impl SearchIndex {
                         window[1].to_ascii_lowercase(),
                         window[2].to_ascii_lowercase(),
                     ];
-                    self.bloom.insert_bytes(&trigram);
                     if new_seen.insert(trigram) && !old_set.contains(&trigram) {
-                        self.trigrams.entry(trigram).or_default().insert(line_u32);
+                        insert_posting(&mut self.trigrams, &mut self.bloom, trigram, line_u32);
                     }
                 }
             }
@@ -888,9 +762,8 @@ impl SearchIndex {
                 // already uses.
                 for window in self.lower_scratch.as_bytes().windows(3) {
                     let trigram: [u8; 3] = [window[0], window[1], window[2]];
-                    self.bloom.insert_bytes(&trigram);
                     if new_seen.insert(trigram) && !old_set.contains(&trigram) {
-                        self.trigrams.entry(trigram).or_default().insert(line_u32);
+                        insert_posting(&mut self.trigrams, &mut self.bloom, trigram, line_u32);
                     }
                 }
             }
@@ -967,17 +840,11 @@ impl SearchIndex {
         // instead of the O(evicted·len) of one-at-a-time front removals (the
         // sortedvec container's front remove is a tail shift). See
         // SparseBitmap::drop_below and the eviction-identity oracle.
-        //
-        // Skipped wholesale by a columns-only index: it has no postings to trim.
-        // The watermark bookkeeping above is NOT skipped — it is what keeps the
-        // budgeted engine's eviction schedule identical to the batch one.
-        if self.maintain_trigrams {
-            let watermark = line_as_u32(self.lowest_retained_line);
-            self.trigrams.retain(|_, bitmap| {
-                bitmap.drop_below(watermark);
-                !bitmap.is_empty()
-            });
-        }
+        let watermark = line_as_u32(self.lowest_retained_line);
+        self.trigrams.retain(|_, bitmap| {
+            bitmap.drop_below(watermark);
+            !bitmap.is_empty()
+        });
 
         // Warn once: results are now potentially incomplete for the lifetime of
         // this index. Repeated eviction passes do not re-warn (avoids log spam).
@@ -992,89 +859,23 @@ impl SearchIndex {
             );
         }
 
-        // Rebuild bloom filter from remaining lines (#7270). A columns-only
-        // index has no filter to rebuild, and this sweep is O(all cached lines ×
-        // line length) — the one unbounded chunk of work that could land inside
-        // a single budgeted turn.
-        if self.maintain_trigrams {
-            self.rebuild_bloom();
-        }
+        // Rebuild bloom filter from remaining lines (#7270).
+        self.rebuild_bloom();
     }
 
-    /// Rebuild the bloom filter sized for the current trigram load.
-    ///
-    /// The bloom filter stores trigrams, not lines. Rebuilding it with only
-    /// `lines.len()` capacity badly underestimates the true insert volume for
-    /// wide scrollback lines and causes immediate re-saturation, which in turn
-    /// can trigger a rebuild on nearly every indexed line. Use the current
-    /// trigram insert count as the rebuild target so the resized filter tracks
-    /// actual load rather than line cardinality (#7243).
+    /// Rebuild from distinct live trigram keys. Walking cached rows would count
+    /// every repeated window and inflate both work and allocation by retained
+    /// history length, even when a whole build log repeats the same vocabulary.
     fn rebuild_bloom(&mut self) {
-        let capacity = self.bloom.item_count().max(self.lines.len()).max(1000);
-        // Branch-duplicated construction: BloomFilter::with_capacity
-        // saturates its size cap at MAX_EFFECTIVE_CAPACITY anyway, so both
-        // arms construct the IDENTICAL filter for any input in the first arm.
-        // The L0 gate's allocation recognizer needs the comparison to
-        // directly dominate the allocating call (a phi-merged clamp is not
-        // recognized), hence the duplication.
+        let capacity = self.trigrams.len().max(1000);
+        // Keep the allocation bound explicit for the Trust L0 gate.
         self.bloom = if capacity > BloomFilter::MAX_EFFECTIVE_CAPACITY {
             BloomFilter::with_capacity(BloomFilter::MAX_EFFECTIVE_CAPACITY)
         } else {
             BloomFilter::with_capacity(capacity)
         };
-        // Trigram extraction via `get` + let-else instead of `window[k]`
-        // indexing: windows(3) only ever yields 3-byte slices, so the
-        // `continue` is dead on every input — the panic-free spelling removes
-        // the slice-bounds obligations the L0 gate's transport consistently
-        // fails to carry for this function (index_line keeps the indexed
-        // shape, which proves there). Identical insert set.
-        for text in self.lines.values() {
-            // Insert original-case trigrams.
-            for window in text.as_bytes().windows(3) {
-                let (Some(&a), Some(&b), Some(&c)) = (window.first(), window.get(1), window.get(2))
-                else {
-                    continue;
-                };
-                self.bloom.insert_bytes(&[a, b, c]);
-            }
-            // Insert Unicode-lowercased trigrams for case-insensitive
-            // bloom filter acceleration (#7273, #7470).
-            //
-            // Mirrors `index_line` through the shared `lower_need` classifier:
-            // skip the lowered pass when lowercasing is the identity so the
-            // rebuilt filter sees the same insert set the incremental path
-            // produced. Neither arm allocates — this loop runs over EVERY
-            // cached line (up to the 100k cap) on each rebuild, so a per-line
-            // throwaway `String` here was the same waste multiplied by the
-            // cache size.
-            match lower_need(text) {
-                LowerNeed::None => {}
-                LowerNeed::Ascii => {
-                    for window in text.as_bytes().windows(3) {
-                        let (Some(&a), Some(&b), Some(&c)) =
-                            (window.first(), window.get(1), window.get(2))
-                        else {
-                            continue;
-                        };
-                        self.bloom.insert_bytes(&[
-                            a.to_ascii_lowercase(),
-                            b.to_ascii_lowercase(),
-                            c.to_ascii_lowercase(),
-                        ]);
-                    }
-                }
-                LowerNeed::Unicode => {
-                    lower_fold_into(text, &mut self.lower_scratch);
-                    for window in self.lower_scratch.as_bytes().windows(3) {
-                        let (Some(&a), Some(&b), Some(&c)) =
-                            (window.first(), window.get(1), window.get(2))
-                        else {
-                            continue;
-                        };
-                        self.bloom.insert_bytes(&[a, b, c]);
-                    }
-                }
-            }
+        for trigram in self.trigrams.keys() {
+            self.bloom.insert_bytes(trigram);
         }
     }
 
@@ -1512,12 +1313,6 @@ impl SearchIndex {
         query: &'a str,
         from_line: usize,
     ) -> SearchMatchIterator<'a> {
-        // A columns-only index has no postings to consult, so querying it would
-        // silently answer "no matches". Trip loudly in tests instead.
-        debug_assert!(
-            self.maintain_trigrams,
-            "search_from_line on a columns-only index returns no matches"
-        );
         let bytes = query.as_bytes();
 
         let empty = || CandidateSource::Empty;
@@ -1565,11 +1360,6 @@ impl SearchIndex {
         query: &'a str,
         before_line: usize,
     ) -> SearchMatchReverseIterator<'a> {
-        // See `search_from_line`: a columns-only index cannot answer a query.
-        debug_assert!(
-            self.maintain_trigrams,
-            "search_before_line on a columns-only index returns no matches"
-        );
         let bytes = query.as_bytes();
 
         let empty = || CandidateSource::Empty;
@@ -1781,14 +1571,6 @@ impl SearchIndex {
         is_regex: bool,
         direction: SearchDirection,
     ) -> Result<SearchResults, SearchOptionsError> {
-        // A columns-only index keeps no postings and no bloom filter, so the
-        // trigram-accelerated arms below would report "no matches" rather than
-        // fail. Trip loudly in tests if one is ever queried (the budgeted engine
-        // verifies rows itself and must never reach here).
-        debug_assert!(
-            self.maintain_trigrams,
-            "search_results_opts on a columns-only index returns no matches"
-        );
         let matches =
             self.search_with_positions_opts_direction(query, case_sensitive, is_regex, direction)?;
         // A full result set indicates the per-query MAX_SEARCH_MATCHES cap was hit
@@ -2082,12 +1864,6 @@ impl SearchIndex {
         case_sensitive: bool,
         prev_lines: Option<&[u32]>,
     ) -> NarrowedSearch {
-        // A columns-only index cannot answer queries — mirror the batch
-        // entry points' loud tripwire.
-        debug_assert!(
-            self.maintain_trigrams,
-            "search_literal_narrowed on a columns-only index returns no matches"
-        );
         if query.is_empty() {
             // Batch parity: an empty query yields no matches; the honesty pair
             // is the index's own (search_results_opts_direction shape).
@@ -2513,6 +2289,10 @@ impl Default for SearchIndex {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "index_bloom_tests.rs"]
+mod index_bloom_tests;
 
 /// The regex **scan** budget, at the two entry points that take a pattern from
 /// the search box and run it over untrusted terminal content.

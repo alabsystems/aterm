@@ -2246,10 +2246,7 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
         }
         out.done(
             "instance",
-            &format!(
-                "arm {pid} (`aterm ctl --pid {pid} fabric attach {}`)",
-                argv.join(" ")
-            ),
+            &arm_command(pid, &inst.sock, argv),
             &format!("armed {pid}"),
         );
         if out.dry_run {
@@ -3609,24 +3606,50 @@ fn lift_hold_in(warning: &str) -> String {
     lift_hold(sid, pid.parse().unwrap_or(0), sock)
 }
 
-/// `aterm ctl <instance> hold <sid> off`: `--pid <pid>`, or `--sock <sock>`
-/// when that is what reaches the instance (`sock` is `Some`). A value a
-/// command line cannot carry as it is, or pid 0, stays a placeholder.
+/// What `on` says it does to one instance: the `fabric attach` it sends, spelled as a
+/// person would run it — by `--sock` when `--pid` does not reach the instance
+/// ([`aterm_ctl::pid_reaches`]), as `off` and doctor name it.
+fn arm_command(pid: u32, sock: &str, argv: &[String]) -> String {
+    let reach = instance_flag(pid, (!aterm_ctl::pid_reaches(pid, sock)).then_some(sock));
+    format!(
+        "arm {pid} (`aterm ctl {reach} fabric attach {}`)",
+        argv.join(" ")
+    )
+}
+
+/// `aterm ctl <instance> hold <sid> off`, the instance named by [`instance_flag`].
+/// A sid a command line cannot carry as it is stays a placeholder.
 fn lift_hold(sid: &str, pid: u32, sock: Option<&str>) -> String {
-    let plain = |t: &str, more: &[u8]| {
-        !t.is_empty()
-            && t.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') || more.contains(&b)
-            })
-    };
-    let sid = if plain(sid, b"") { sid } else { "<sid>" };
-    let instance = match sock {
-        Some(sock) if plain(sock, b"/+~@%,:=") => format!("--sock {sock}"),
+    let sid = if plain_arg(sid, b"") { sid } else { "<sid>" };
+    format!("`aterm ctl {} hold {sid} off`", instance_flag(pid, sock))
+}
+
+/// Whether `t` is a command-line word as it is: ASCII letters, digits, `-_.` and `more`.
+fn plain_arg(t: &str, more: &[u8]) -> bool {
+    !t.is_empty()
+        && t.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') || more.contains(&b)
+        })
+}
+
+/// How `aterm ctl` names an instance: `--pid <pid>`, or `--sock <sock>` when only its
+/// socket reaches it (`sock` is `Some`). A socket path with a space is single-quoted;
+/// one that cannot be quoted (a quote, a backslash, a control character), or pid 0,
+/// stays a placeholder.
+fn instance_flag(pid: u32, sock: Option<&str>) -> String {
+    match sock {
+        Some(sock) if plain_arg(sock, b"/+~@%,:=") => format!("--sock {sock}"),
+        Some(sock)
+            if !sock.is_empty()
+                && !sock.contains(['\'', '\\'])
+                && !sock.chars().any(char::is_control) =>
+        {
+            format!("--sock '{sock}'")
+        }
         Some(_) => "--sock <sock>".to_string(),
         None if pid != 0 => format!("--pid {pid}"),
         None => "--pid <pid>".to_string(),
-    };
-    format!("`aterm ctl {instance} hold {sid} off`")
+    }
 }
 
 /// `aterm fabric doctor`.
@@ -4536,9 +4559,25 @@ mod tests {
             fix_for("@s-a (instance 1, --sock /tmp/at.x/a.sock) is HELD (reason=x origin=local)"),
             "`aterm ctl --sock /tmp/at.x/a.sock hold s-a off`"
         );
+        // A socket path with a space is quoted, so the command still names it.
         assert_eq!(
             fix_for("@s-a (instance 0, --sock /tmp/a b.sock) is HELD (reason=x origin=local)"),
+            "`aterm ctl --sock '/tmp/a b.sock' hold s-a off`"
+        );
+        // One that cannot be quoted stays a placeholder.
+        assert_eq!(
+            fix_for("@s-a (instance 0, --sock /tmp/a'b.sock) is HELD (reason=x origin=local)"),
             "`aterm ctl --sock <sock> hold s-a off`"
+        );
+        // `on --dry-run` names an explicit-`--control-sock` instance the same way: by the
+        // socket `--pid` cannot reach.
+        assert_eq!(
+            arm_command(
+                4242,
+                "/tmp/at.x/a.sock",
+                &["--node".to_string(), "n1".to_string()]
+            ),
+            "arm 4242 (`aterm ctl --sock /tmp/at.x/a.sock fabric attach --node n1`)"
         );
         // A legacy graph entry's pid 0 reaches nothing by `--pid`.
         assert_eq!(

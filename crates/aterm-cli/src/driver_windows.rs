@@ -158,11 +158,18 @@ pub(crate) fn shell_is_executable(path: &str) -> bool {
 /// `shell: C:\WINDOWS\system32\cmd.exe (executable)` and from Git Bash it said
 /// `bash.exe` — the shell the CLI was typed into, never the one a tab gets.
 /// `aterm-pty`'s Windows spawn reads neither variable (`%SHELL%` is a POSIX
-/// path in MSYS shells; see its `windows::shell`), so the report is now the
-/// spawn's own resolver over the one input a CLI process can see: aterm.toml's
-/// `shell` (a window's per-launch `--shell` flag is invisible from here), and
-/// with none set the platform default applies — `pwsh`, then `powershell`,
-/// then `%COMSPEC%`, then `cmd.exe`.
+/// path in MSYS shells; see its `windows::shell`), so the report is the
+/// spawn's own answer.
+///
+/// INSIDE A TAB that answer is the tab's: the window hands every shell tab the
+/// program it runs ([`aterm_types::domain::ENV_TAB_SHELL`]), so a window
+/// started with `--shell cmd` reports cmd.exe as "this tab's shell". Measured
+/// 2026-09-27 on 0.95.0, before the hand-off: `aterm doctor` in such a tab
+/// named pwsh as "the window's shell" — a window's `--shell` flag is invisible
+/// to a CLI process. OUTSIDE a tab it is what a NEW window would run, from the
+/// spawn's resolver over the one input a CLI process can see: aterm.toml's
+/// `shell`, and with none set the platform default — `pwsh`, then
+/// `powershell`, then `%COMSPEC%`, then `cmd.exe`.
 pub(crate) struct WindowShell {
     /// The program `CreateProcessW` is handed: an absolute path when the name
     /// resolved (or was given as one), the bare name verbatim when it did not —
@@ -173,9 +180,12 @@ pub(crate) struct WindowShell {
     pub(crate) source: ShellSource,
 }
 
-/// Which input decided the window's shell.
+/// Which input decided the shell reported.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ShellSource {
+    /// The aterm tab this process runs in said which shell it runs
+    /// ([`aterm_types::domain::ENV_TAB_SHELL`]).
+    Tab,
     /// aterm.toml's top-level `shell` key, carrying its value.
     Config(String),
     /// Nothing named one: the platform default, plus what aterm.toml said —
@@ -205,10 +215,23 @@ pub(crate) enum ConfigShell {
 }
 
 impl WindowShell {
-    /// The live answer: the two inputs the window reads, over the spawn's
-    /// resolver.
+    /// The live answer: the tab's own shell when this process runs in an aterm
+    /// tab, else the two inputs a new window reads, over the spawn's resolver.
     pub(crate) fn resolve() -> Self {
-        Self::resolve_with(config_shell())
+        let tab = std::env::var(aterm_types::domain::ENV_TAB_SHELL).ok();
+        Self::from_tab(tab).unwrap_or_else(|| Self::resolve_with(config_shell()))
+    }
+
+    /// The tab's own shell, from the value its window handed it — `None` when
+    /// there is none (outside a tab, or in a `-e` session, which is handed
+    /// none) or it is empty.
+    pub(crate) fn from_tab(value: Option<String>) -> Option<Self> {
+        value
+            .filter(|program| !program.is_empty())
+            .map(|program| Self {
+                program,
+                source: ShellSource::Tab,
+            })
     }
 
     /// The testable half: `config` is what aterm.toml said. Precedence is the
@@ -234,17 +257,22 @@ impl WindowShell {
     /// `show-config`'s `shell_origin=` value: one token a script can switch on.
     pub(crate) fn origin_token(&self) -> String {
         match &self.source {
+            ShellSource::Tab => "tab".to_string(),
             ShellSource::Config(_) => "aterm.toml".to_string(),
             ShellSource::Default(origin, _) => format!("default:{}", default_word(*origin)),
         }
     }
 
-    /// `doctor`'s label after the verdict — a sentence naming the input, so the
-    /// row reads `shell: <program> (executable) — the window's shell, from …`.
+    /// `doctor`'s label after the verdict — a sentence naming whose shell it is
+    /// and the input that chose it, so the row reads `shell: <program>
+    /// (executable) — this tab's shell` in a tab and `— a new window's default
+    /// shell, from …` outside one: a window launched with `--shell` runs that
+    /// instead, and only its own tabs can say so.
     pub(crate) fn origin_sentence(&self) -> String {
         match &self.source {
+            ShellSource::Tab => "this tab's shell".to_string(),
             ShellSource::Config(v) => {
-                format!("the window's shell, from aterm.toml shell = \"{v}\"")
+                format!("a new window's default shell, from aterm.toml shell = \"{v}\"")
             }
             ShellSource::Default(origin, config) => {
                 let arm = match origin {
@@ -267,7 +295,7 @@ impl WindowShell {
                     }
                     ConfigShell::Absent | ConfigShell::Set(_) => String::new(),
                 };
-                format!("the window's shell, the platform default ({arm}){why}")
+                format!("a new window's default shell, the platform default ({arm}){why}")
             }
         }
     }
@@ -645,7 +673,7 @@ mod tests {
         assert_eq!(config.origin_token(), "aterm.toml");
         assert_eq!(
             config.origin_sentence(),
-            "the window's shell, from aterm.toml shell = \"cmd\""
+            "a new window's default shell, from aterm.toml shell = \"cmd\""
         );
 
         let missing =
@@ -693,7 +721,7 @@ mod tests {
         );
         assert!(
             dflt.origin_sentence()
-                .starts_with("the window's shell, the platform default ("),
+                .starts_with("a new window's default shell, the platform default ("),
             "{}",
             dflt.origin_sentence()
         );
@@ -705,5 +733,24 @@ mod tests {
             assert!(ends_with_exe(&dflt.program, "pwsh.exe"), "{}", dflt.program);
             assert!(shell_is_executable(&dflt.program));
         }
+    }
+
+    /// Inside an aterm tab the report is THAT TAB's shell, as its window handed
+    /// it over — a window started with `--shell cmd` said pwsh, "the window's
+    /// shell", on 0.95.0 (measured 2026-09-27) — and outside one (nothing
+    /// handed, or an empty value) it is a new window's default, as before.
+    #[test]
+    fn inside_a_tab_the_report_is_the_tabs_own_shell() {
+        let cmd = r"C:\Windows\system32\cmd.exe".to_string();
+        let tab = WindowShell::from_tab(Some(cmd.clone())).expect("a tab said its shell");
+        assert_eq!(tab.program, cmd);
+        assert_eq!(tab.source, ShellSource::Tab);
+        assert_eq!(tab.origin_token(), "tab");
+        assert_eq!(tab.origin_sentence(), "this tab's shell");
+        assert!(WindowShell::from_tab(None).is_none(), "outside a tab");
+        assert!(
+            WindowShell::from_tab(Some(String::new())).is_none(),
+            "an empty value says nothing"
+        );
     }
 }

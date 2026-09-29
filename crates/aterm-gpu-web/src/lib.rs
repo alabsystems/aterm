@@ -30,6 +30,7 @@
 use wasm_bindgen::prelude::*;
 
 mod effects_api;
+mod messages_api;
 mod notifications_api;
 mod predict_api;
 mod scroll_input_api;
@@ -218,6 +219,13 @@ pub struct AtermGpuTerminal {
     // wired at construction and drained by `take_notifications`. pub(crate)
     // so the notifications_api module reaches it (the effects-field posture).
     pub(crate) notifications: notifications_api::NotificationQueue,
+    // The MESSAGE BAND (the unified message engine's rows, composed above
+    // the grid through the renderer's `band` module — the same composition
+    // the native window and the CPU twin run). Empty until a `notice` posts
+    // a row; with no committed row a frame is byte-identical to a band-less
+    // build. pub(crate) so the messages_api module (and tests) reach it (the
+    // effects-field posture). Mirrors aterm-wasm.
+    pub(crate) band: messages_api::WebBand,
     // Sub-row scroll input accumulator (fractional/pixel wheel deltas): whole
     // rows flip into `scroll_display`, the residual presents as the M1b band
     // shift at render time. pub(crate) so the scroll_input_api module (and
@@ -471,18 +479,34 @@ impl AtermGpuTerminal {
         // consuming does not change the epoch VALUE — so the
         // `term.damage_epoch() == input.snapshot_seq` identity the effects
         // pipeline checks still holds.
+        // THE BAND'S UN-SPLICE (DMG-1), the twin's: take last frame's band rows
+        // off the kept scratch, so the refill may re-resolve only the damaged
+        // rows under a band. Refused (nothing changed) when nothing was
+        // prepended — the refill then takes its full arm, always sound.
+        let _ = self.band.undo(&mut self.frame_scratch, self.rows);
         self.refill_frame_scratch();
         let rows = self.rows;
         // Fill the overlay channels (aurora/trail/sparkle) for the host-advanced
         // instant; with every effect off this only clears the channels a reused
         // scratch may carry — byte-identical to the pre-effects present.
         let (cw, ch) = self.cpu.cell_size();
+        // The band's rows land above the grid AFTER `apply` (the compose
+        // below); the pipeline must read the page's pointer against the grid
+        // where this frame draws it, so it learns their height first.
+        self.hand_band_to_effects();
         self.effects
             .apply(&mut self.term, &mut self.frame_scratch, cw, ch);
-        // Present the banked sub-row scroll residual via the M1b band shift
-        // (the whole canvas frame is grid — no spliced chrome rows). Stamped
-        // every frame: the KEPT scratch would otherwise carry a stale shift.
+        // Present the banked sub-row scroll residual via the M1b band shift.
+        // The stamp sets the grid band to the whole frame `[0, rows)`;
+        // `compose_band_into_frame` below moves it down below any committed
+        // message-band rows. Stamped every frame: the KEPT scratch would
+        // otherwise carry a stale shift.
         self.scroll_input.stamp(&mut self.frame_scratch, rows, ch);
+        // THE MESSAGE BAND (the twin's order): its committed rows prepended
+        // above the grid, every window-space stream translated down with it,
+        // the grid band moved below them, their gutters handed to both faces.
+        // No committed row: nothing moves and the bleed stays `None`.
+        self.compose_band_into_frame();
         // Refresh the chrome-band spill export from this frame's snapshot —
         // BEFORE any GPU access: spill is CPU math over the emission streams
         // (present-independent), which keeps the exports coherent even when a
@@ -523,6 +547,60 @@ impl AtermGpuTerminal {
     /// callers (the mirrored `effects_api` mutators) simply buy one render.
     pub(crate) fn note_host_visual_change(&mut self) {
         self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
+    }
+
+    /// THE BAND'S HOST HOOKS (`messages_api`, the CPU twin's file line for
+    /// line): the CPU face's cell, pad and grid-top metrics — the face the
+    /// GPU renderer is built from, so both agree.
+    pub(crate) fn band_metrics(&self) -> messages_api::BandMetrics {
+        let (cell_w, cell_h) = self.cpu.cell_size();
+        messages_api::BandMetrics {
+            cell_w,
+            cell_h,
+            pad: self.cpu.pad(),
+            grid_top: self.cpu.grid_top(),
+        }
+    }
+
+    /// The band's gutters for the frame being composed: the CPU face's (the
+    /// spill band and the offscreen twin read it) and the live GPU
+    /// renderer's, whose own inner face `encode_frame` reads.
+    pub(crate) fn set_band_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
+        self.cpu.set_chrome_bleed(bleed);
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.renderer.set_chrome_bleed(bleed);
+        }
+    }
+
+    /// The rows the swapchain is sized for: the grid's and the band's above
+    /// it (the frame grows by the band, as the CPU twin's does).
+    fn surface_rows(&self) -> usize {
+        self.rows + self.band.committed()
+    }
+
+    /// The band changed: reopen the frame gate for one frame, and — when its
+    /// row count moved — size the swapchain to the taller or shorter frame
+    /// (a page with a fixed canvas re-grids on the tick's bit 1, and
+    /// [`Self::resize`] sizes it again from the same rows).
+    pub(crate) fn note_band_change(&mut self, rows_moved: bool) {
+        self.note_host_visual_change();
+        if rows_moved {
+            self.size_swapchain();
+        }
+    }
+
+    /// Size the live swapchain to the frame [`Self::build_frame`] composes:
+    /// [`Self::surface_rows`] (the grid's rows plus the band's) at the
+    /// renderer's pad and head. The ONE sizing site after init — `resize`,
+    /// `set_chrome` and a band row move all come here, so none of them can
+    /// size the surface a band shorter than the frame drawn into it.
+    fn size_swapchain(&mut self) {
+        let rows = self.surface_rows();
+        if let Some(gpu) = self.gpu.as_mut() {
+            let (w, h) = gpu.renderer.frame_size(rows, self.cols);
+            gpu.renderer
+                .resize_surface(&mut gpu.win, &mut gpu.surface, w as u32, h as u32);
+        }
     }
 
     /// Read one `(grapheme, is_wide)` display cell through the single-slot row
@@ -643,6 +721,7 @@ impl AtermGpuTerminal {
             theme_fg: fg & 0x00FF_FFFF,
             theme_bg: bg & 0x00FF_FFFF,
             notifications,
+            band: messages_api::WebBand::new(aterm_time::Instant::now(), fg, bg, cursor),
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
             pred_row_scratch: Vec::new(),
@@ -946,6 +1025,8 @@ impl AtermGpuTerminal {
     pub fn set_palette_color(&mut self, index: u8, r: u8, g: u8, b: u8) {
         self.note_host_visual_change(); // WF-1 gate
         self.term.set_palette_color_components(index, r, g, b);
+        // Slots 4 and 6 are the hues a near-grey cursor's band meter borrows.
+        self.band.set_palette_color(index, [r, g, b]);
     }
 
     /// Authorize OSC 52 clipboard *write* so the engine queues OSC 52 app-events
@@ -1184,6 +1265,8 @@ impl AtermGpuTerminal {
         apply_terminal_theme_colors(&mut self.term, fg, bg, cursor, selection);
         self.theme = theme;
         self.cpu.set_theme(theme);
+        // The band's inks derive from the theme (the next frame repaints it).
+        self.band.set_theme(fg, bg, cursor);
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.renderer.set_theme(theme);
             // Force the next present to repaint everything: the selection band,
@@ -1260,9 +1343,10 @@ impl AtermGpuTerminal {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.renderer.set_pad(pad as usize);
             gpu.renderer.set_head(head as usize);
-            let (w, h) = gpu.renderer.frame_size(self.rows, self.cols);
-            gpu.renderer
-                .resize_surface(&mut gpu.win, &mut gpu.surface, w as u32, h as u32);
+        }
+        // The padded frame holds the band's rows too.
+        self.size_swapchain();
+        if let Some(gpu) = self.gpu.as_mut() {
             gpu.win.invalidate_present();
         }
     }
@@ -1438,11 +1522,8 @@ impl AtermGpuTerminal {
         // The prediction coordinate space just changed: drop in-flight guesses
         // rather than ghost-paint them at stale coords (the native resize rule).
         self.predict.reset();
-        if let Some(gpu) = self.gpu.as_mut() {
-            let (w, h) = gpu.renderer.frame_size(self.rows, self.cols);
-            gpu.renderer
-                .resize_surface(&mut gpu.win, &mut gpu.surface, w as u32, h as u32);
-        }
+        // The swapchain holds the band's rows too (the frame grows by them).
+        self.size_swapchain();
     }
 
     /// Advance a deferred width-change scrollback rewrap (stashed by
@@ -2931,7 +3012,7 @@ impl AtermGpuTerminal {
         // Configure the already-created canvas swapchain (NON-sRGB format, sized
         // to the grid) on the renderer's adapter/device. Reuses aterm-gpu's
         // `configure_window_surface` (same format selection as native).
-        let (w, h) = renderer.frame_size(self.rows, self.cols);
+        let (w, h) = renderer.frame_size(self.surface_rows(), self.cols);
         let surface = renderer
             .configure_window_surface(surface_raw, w as u32, h as u32)
             .map_err(|e| format!("configure canvas surface failed: {e}"))?;
@@ -3155,6 +3236,12 @@ impl AtermGpuTerminal {
             theme_fg: theme.fg & 0x00FF_FFFF,
             theme_bg: theme.bg & 0x00FF_FFFF,
             notifications,
+            band: messages_api::WebBand::new(
+                aterm_time::Instant::now(),
+                theme.fg,
+                theme.bg,
+                theme.cursor,
+            ),
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
             pred_row_scratch: Vec::new(),
@@ -4302,6 +4389,16 @@ mod tests {
         // diagnostic reports how far the drain actually got, so a REAL
         // regression (light that never retires) reads differently from a
         // budget that has gone tight again.
+        //
+        // THE CARET'S BODY IS HELD OUT of this half. Since the web runs the
+        // native cursor step (2026-09-27) the `water` style also draws its
+        // block body — the droplet bead — at the caret wherever the program
+        // put it, and on the top row that bead reaches the head band exactly
+        // as it does in the native window. That is the caret, not light the
+        // leap threw, so Serious Mode's body gate stands the bodies (and the
+        // momentum halo the first half's typing warmed) down here, and the
+        // claim below is about the aurora alone, verbatim.
+        t.effects.set_serious(true);
         t.process(b"\x1b[1;30Hz");
         const DRAIN_FRAMES: usize = 125; // 2 s at the 16 ms step above
         let mut drained_at = None;
@@ -4374,6 +4471,65 @@ mod tests {
         assert_eq!(h, 24 * ch + 16 + 24, "frame gains 2*pad + head in height");
         t.set_chrome(0, 0);
         assert_eq!(t.cpu.frame_size(24, 80), (80 * cw, 24 * ch));
+    }
+
+    /// THE SWAPCHAIN HOLDS THE BAND (ruling 340): the frame `build_frame`
+    /// composes is the grid's rows plus the band's, so every live sizing of
+    /// the canvas surface must count them. Round 28's review found
+    /// `set_chrome` sizing it from `self.rows` alone — with a committed band
+    /// the surface came out a band short of the frame drawn into it. A
+    /// headless test has no canvas surface to measure, so this is LEXICAL
+    /// over the production source: one `resize_surface` call, inside
+    /// `size_swapchain`, which sizes from `surface_rows()`; `resize`,
+    /// `set_chrome` and `note_band_change` reach it; and init's own sizing
+    /// passes `surface_rows()` too. Negative control run by hand: the old
+    /// `frame_size(self.rows, …)` in `set_chrome` fails it.
+    #[test]
+    fn every_swapchain_sizing_counts_the_band_rows() {
+        let src = include_str!("lib.rs");
+        let cut = src
+            .find(concat!(
+                "#[cfg(all(test, not(target_arch = \"wasm32\")))]\n",
+                "mod tests {"
+            ))
+            .expect("the test module");
+        let prod = &src[..cut];
+        let body = |sig: &str| -> &str {
+            let at = prod.find(sig).unwrap_or_else(|| panic!("{sig} is gone"));
+            let rest = &prod[at..];
+            &rest[..rest.find("\n    }\n").expect("the fn's end")]
+        };
+        assert_eq!(
+            prod.matches(".resize_surface(").count(),
+            1,
+            "one live sizing site"
+        );
+        let helper = body("fn size_swapchain(");
+        assert!(
+            helper.contains("let rows = self.surface_rows();"),
+            "{helper}"
+        );
+        assert!(helper.contains("frame_size(rows, self.cols)"), "{helper}");
+        assert!(helper.contains(".resize_surface("), "{helper}");
+        for sig in [
+            "pub fn resize(",
+            "pub fn set_chrome(",
+            "fn note_band_change(",
+        ] {
+            assert!(body(sig).contains("self.size_swapchain();"), "{sig}");
+        }
+        let sizings: Vec<&str> = prod
+            .lines()
+            .filter(|l| l.contains(".frame_size(") && !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(sizings.len(), 2, "the helper and init: {sizings:?}");
+        for line in sizings {
+            assert!(
+                line.contains("frame_size(rows, self.cols)")
+                    || line.contains("frame_size(self.surface_rows(), self.cols)"),
+                "a sizing that forgets the band: {line}"
+            );
+        }
     }
 
     /// Defaults OFF leave every overlay channel of the snapshot empty — the

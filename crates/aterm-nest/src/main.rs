@@ -21,7 +21,9 @@
 //!   aterm-nest --depth 3 -- claude -p "say hi"
 //!
 //! It prints the deepest terminal's visible output for the command, then tears the
-//! stack down (`--keep` leaves it running and prints the per-level sockets).
+//! stack down (`--keep` leaves it running and prints the per-level sockets). A
+//! command that has not finished within [`COMMAND_TIMEOUT_SECS`] is reported as
+//! such, with the screen so far, and the run exits [`TIMEOUT_EXIT`].
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +33,12 @@ use std::time::{Duration, Instant};
 use aterm_uds::CtlStream;
 
 const DONE: &str = "__ATERM_NEST_DONE__";
+
+/// How long the deepest level is given to finish the command.
+const COMMAND_TIMEOUT_SECS: u64 = 180;
+
+/// The exit code for a command that did not finish in time — `timeout(1)`'s.
+const TIMEOUT_EXIT: i32 = 124;
 
 struct Args {
     depth: usize,
@@ -49,7 +57,10 @@ fn usage() -> ! {
          --depth N   number of nested aterm levels (default 1, max 8)\n\
          --keep      leave the stack running; print each level's socket\n\
          --gui PATH  path to the aterm-gui binary (default: sibling of this binary,\n\
-                     then $ATERM_NEST_GUI, then `aterm-gui` on PATH)"
+                     then $ATERM_NEST_GUI, then `aterm-gui` on PATH)\n\
+         \n\
+         <command> gets 180 s; if it has not finished by then, the screen so far is\n\
+         printed and aterm-nest exits 124."
     );
     std::process::exit(2);
 }
@@ -814,20 +825,26 @@ fn run(args: &Args) -> io::Result<i32> {
     fenced.push_str(DONE);
     type_line(&deepest, &fenced)?;
 
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + Duration::from_secs(COMMAND_TIMEOUT_SECS);
     let mut last = String::new();
-    loop {
+    let finished = loop {
         std::thread::sleep(Duration::from_millis(500));
         last = verb_stream(&deepest, "text").unwrap_or(last);
-        // The sentinel also appears in the COMMAND ECHO (`...; echo __DONE__`), so
-        // wait for it on its OWN line — the echo's output — not just anywhere.
-        if last.lines().any(|l| l.trim() == DONE) || Instant::now() > deadline {
-            break;
+        if finished_on(&last) {
+            break true;
         }
-    }
+        if Instant::now() > deadline {
+            break false;
+        }
+    };
 
     // Print the command's output: the visible lines AFTER the command echo and
-    // BEFORE the sentinel.
+    // BEFORE the sentinel. Unfinished, the screen so far, under a line that says
+    // so: before, a hung command printed its screen and exited 0, which reads
+    // exactly like a command that finished.
+    if !finished {
+        eprint_line(&timeout_notice(&cmd));
+    }
     print_output(&last, &cmd);
 
     if args.keep {
@@ -855,7 +872,52 @@ fn run(args: &Args) -> io::Result<i32> {
         let _ = root.wait();
         let _ = std::fs::remove_dir_all(&rundir);
     }
-    Ok(0)
+    Ok(exit_code(finished))
+}
+
+/// Did the fenced command finish? The sentinel also appears in the COMMAND ECHO
+/// (`...; echo __DONE__`), so it counts only on its OWN line — the echo's output.
+fn finished_on(screen: &str) -> bool {
+    screen.lines().any(|l| l.trim() == DONE)
+}
+
+/// The run's exit code: 0 once the command finished, [`TIMEOUT_EXIT`] when it
+/// did not.
+fn exit_code(finished: bool) -> i32 {
+    if finished { 0 } else { TIMEOUT_EXIT }
+}
+
+/// The line printed before the screen of a command that did not finish:
+/// "aterm-nest: `{cmd}` did not finish within 180 s; screen so far:", built
+/// without `fmt::Arguments` like every other line here.
+fn timeout_notice(cmd: &str) -> String {
+    let mut msg = String::new();
+    msg.push_str("aterm-nest: `");
+    msg.push_str(cmd);
+    msg.push_str("` did not finish within ");
+    push_decimal(&mut msg, COMMAND_TIMEOUT_SECS);
+    msg.push_str(" s; screen so far:");
+    msg
+}
+
+/// Append `v` in decimal without routing through `fmt::Arguments`.
+fn push_decimal(s: &mut String, v: u64) {
+    let mut digits = [0u8; 20];
+    let mut n = 0usize;
+    let mut v = v;
+    loop {
+        if let Some(slot) = digits.get_mut(n) {
+            *slot = b'0' + (v % 10) as u8;
+        }
+        n += 1;
+        v /= 10;
+        if v == 0 || n >= digits.len() {
+            break;
+        }
+    }
+    for d in digits.iter().take(n).rev() {
+        s.push(char::from(*d));
+    }
 }
 
 /// The command's output region: the lines strictly between the (last) command echo
@@ -947,6 +1009,27 @@ mod tests {
         let cmd = "echo hi";
         let screen = format!("user% {cmd}; echo {DONE}\nhi\n{DONE}\nuser% \n");
         assert_eq!(output_region(&screen, cmd), vec!["hi"]);
+    }
+
+    /// A command that never printed the sentinel on its own line has not
+    /// finished — the echo of `cmd; echo DONE` carries the word too — and an
+    /// unfinished run says so and exits non-zero instead of passing for done.
+    #[test]
+    fn an_unfinished_command_is_reported_and_exits_nonzero() {
+        let echo_only = format!("user% sleep 999; echo {DONE}\n");
+        assert!(!finished_on(&echo_only));
+        assert!(finished_on(&format!("{echo_only}{DONE}\nuser% \n")));
+        assert_eq!(exit_code(true), 0);
+        assert_eq!(exit_code(false), 124);
+        let mut rendered = String::new();
+        push_decimal(&mut rendered, 0);
+        push_decimal(&mut rendered, 7);
+        push_decimal(&mut rendered, u64::MAX);
+        assert_eq!(rendered, format!("07{}", u64::MAX));
+        assert_eq!(
+            timeout_notice("sleep 999"),
+            "aterm-nest: `sleep 999` did not finish within 180 s; screen so far:"
+        );
     }
 
     #[test]

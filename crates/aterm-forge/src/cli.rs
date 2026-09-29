@@ -12,22 +12,22 @@ pub const USAGE: &str = "\
 cargo forge — aterm's third-party surface: survey, notarize, ratchet.
 
 USAGE
-  cargo forge survey [--cell NAME]... [--top N] [--json PATH]
+  targo --unverified forge survey [--cell NAME]... [--top N] [--json PATH]
         Emit the inventory: packages, LOC, unsafe tokens, build scripts,
         proc macros, duplicate versions, and dominator cost per package.
         Read-only. Needs no compiler. This is the answer to \"what are all
         the third-party dependencies of aterm?\", per target.
 
-  cargo forge blame <name>[@<version>] [--cell NAME]
+  targo --unverified forge blame <name>[@<version>] [--cell NAME]
         Why is this package here? Prints every path from the root to it and
         its dominator cost in each cell.
 
-  cargo forge budget [--update] [--allow-regress \"<reason>\"]
+  targo --unverified forge budget [--update] [--allow-regress \"<reason>\"]
         Compare the live surface against tools/forge-budget.tsv. --update may
         only LOWER a ceiling; raising one needs a reason of >= 80 characters,
-        which is written into the file and reprinted on every run thereafter.
+        which is written into the file's 4th column.
 
-  cargo forge attest
+  targo --unverified forge attest
         Provenance and license obligations over vendor/: patch agreement,
         [workspace] stubs, .cargo_vcs_info.json, Cargo.toml.orig, licenses,
         NOTICE, Apache-only pristine diffs when available, and fork markers.
@@ -35,18 +35,26 @@ USAGE
         .gitmodules entry, a clean checkout at exactly the pinned commit, and
         Cargo metadata resolving its crates from there outside the workspace.
 
-  cargo forge check [--cell NAME]...
+  targo --unverified forge check [--cell NAME]...
         THE GATE VERB. attest + patch-liveness + census cross-check, with no
         compilation and no network. Wired as `xtask gate forge`.
+        What it does not prove: [OB-11] scores path forks forward only (each
+        needs a reviewed row; the reverse is attest [OB-1] and the census scan
+        set). [OB-16] proves the `[source]` fragment agrees with Cargo.lock and,
+        where a cargo cache exists, that mirrored index rows are upstream's own
+        bytes (without one, only the lock's edges, which carry no features). It
+        does not prove the tarballs are upstream's, that any build used a
+        mirror, or any bundle or signature, and it runs no network, so yank
+        status is outside it.
 
-  cargo forge mirror emit --out DIR
+  targo --unverified forge mirror emit --out DIR
         The Lane 1 generator: walk Cargo.lock's registry-sourced entries,
         verify each cached .crate against the lock checksum (refusing by name
         on mismatch), and emit a cargo `local-registry` — index/ JSON rows
         plus .crate copies. Missing cache files come back as a fetch list and
         a RED exit, never a silent skip.
 
-  cargo forge mirror verify --dir DIR
+  targo --unverified forge mirror verify --dir DIR
         Re-hash every .crate in an emitted mirror against its index row AND
         Cargo.lock, both directions (missing + stray). Any drift is named and
         the exit is nonzero. Also judges each row's CONTENT, which no checksum
@@ -55,14 +63,14 @@ USAGE
         The verdict prints how many rows it could anchor and says plainly what
         an unanchored row does not prove.
 
-  cargo forge mirror bundle --dir DIR --out FILE
+  targo --unverified forge mirror bundle --dir DIR --out FILE
         Pack a VERIFIED mirror into one deterministic, uncompressed bundle: a
         manifest holding every package name/version/cksum, each entry's
         sha256, the payload digest and the lock digest it was emitted from,
         then the bytes. Byte-identical on a second run from the same input.
         Refuses to bundle a mirror that does not verify. Never signs.
 
-  cargo forge mirror check-bundle --file FILE
+  targo --unverified forge mirror check-bundle --file FILE
         Verify a bundle WITHOUT unpacking: header, manifest digest, structural
         rules, payload digest, every entry digest, every package cksum, every
         index row, and (when run in a workspace) whether it was built for THIS
@@ -72,7 +80,7 @@ USAGE
         signed atpkg pkg manifest pinning it, outside this tool, once
         delivery ships (deferred; none exists today).
 
-  cargo forge mirror unbundle --file FILE --out DIR [--force]
+  targo --unverified forge mirror unbundle --file FILE --out DIR [--force]
         check-bundle, then extract — re-hashing every entry as it is written
         and stat'ing every path afterwards, so the count it reports is the
         filesystem's. Judges row CONTENT with the same two anchors check-bundle
@@ -85,10 +93,10 @@ USAGE
         fails part-way can still leave a partial tree; the failure says how
         many files landed.
 
-  cargo forge mirror config [--write]
+  targo --unverified forge mirror config [--write]
         Print the shippable `[source]` fragment for this lock; --write puts it
         at tools/cargo-mirror-config.toml. Flips NO default: cargo does not
-        read that path. `cargo forge check` [OB-16] fails if the file and
+        read that path. `targo --unverified forge check` [OB-16] fails if the file and
         Cargo.lock disagree about what is mirrored.
 
 OPTIONS
@@ -170,7 +178,7 @@ impl ParseError {
     /// instead is a bug report addressed to nobody.
     pub fn message(&self) -> String {
         match self {
-            Self::NoVerb => "no verb given — try `cargo forge survey`".into(),
+            Self::NoVerb => "no verb given — try `targo --unverified forge survey`".into(),
             Self::UnknownVerb(v) => {
                 format!(
                     "unknown verb `{v}` — expected survey, blame, budget, attest, check or mirror"

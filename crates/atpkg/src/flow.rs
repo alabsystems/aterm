@@ -451,9 +451,6 @@ pub enum FlowError {
     VendorUnreachable(String),
 }
 
-// Hand-rendered through `Formatter::write_str` + direct `Display::fmt`/`Debug::fmt`
-// calls (no `write!`) — Trust-gate lowering workaround, see `lib.rs`. Byte-identical
-// to the `write!` forms (no width/fill flags are used).
 impl std::fmt::Display for FlowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -463,96 +460,51 @@ impl std::fmt::Display for FlowError {
                 // the windowed app's 6-hour loop, and this Display reaches foreground
                 // CLI verbs where nothing retries anything. The CLI edge appends the
                 // honest per-verb re-run instead (`print_unreachable_followup`).
-                f.write_str("could not reach the toolchain index: ")?;
-                f.write_str(why)
+                write!(f, "could not reach the toolchain index: {why}")
             }
             FlowError::NotReachable(p, roster) => {
-                f.write_str(p)?;
                 // The grep-stable phrase, verbatim; the roster rides in a parenthesis.
-                f.write_str(" is not named in the signed index")?;
-                if roster.is_empty() {
-                    return Ok(());
-                }
-                f.write_str(" (it names: ")?;
+                write!(f, "{p} is not named in the signed index")?;
                 // Whole roster when it is short; first 12 otherwise — the point is a
                 // usable answer, not a wall.
-                if roster.len() <= 12 {
-                    f.write_str(&roster.join(", "))?;
-                } else {
-                    f.write_str(&roster[..12].join(", "))?;
-                    f.write_str(", …")?;
+                match roster.len() {
+                    0 => Ok(()),
+                    1..=12 => write!(f, " (it names: {})", roster.join(", ")),
+                    _ => write!(f, " (it names: {}, …)", roster[..12].join(", ")),
                 }
-                f.write_str(")")
             }
-            FlowError::NoChannel(c) => {
-                f.write_str("no channel ")?;
-                std::fmt::Debug::fmt(c, f)?;
-                f.write_str(" in the index")
-            }
-            FlowError::NotPinned(p) => {
-                f.write_str(p)?;
-                f.write_str(" is not pinned in the channel")
-            }
+            FlowError::NoChannel(c) => write!(f, "no channel {c:?} in the index"),
+            FlowError::NotPinned(p) => write!(f, "{p} is not pinned in the channel"),
             FlowError::Stale => f.write_str("the signed index's freshness window has lapsed"),
-            FlowError::Tombstoned(p) => {
-                f.write_str(p)?;
-                f.write_str("'s pinned build is yanked/below floor")
-            }
-            FlowError::PkgFetch(e) => {
-                f.write_str("fetch manifest: ")?;
-                f.write_str(e)
-            }
+            FlowError::Tombstoned(p) => write!(f, "{p}'s pinned build is yanked/below floor"),
+            FlowError::PkgFetch(e) => write!(f, "fetch manifest: {e}"),
             FlowError::PkgVerify => f.write_str("manifest signature did not verify"),
             FlowError::PkgParse => f.write_str("manifest malformed or newer schema"),
-            FlowError::RetiredKind(why) => {
-                f.write_str("manifest refused: ")?;
-                f.write_str(why)
-            }
-            FlowError::ShimEnv(why) => {
-                f.write_str("manifest refused: ")?;
-                f.write_str(why)
-            }
+            FlowError::RetiredKind(why) => write!(f, "manifest refused: {why}"),
+            FlowError::ShimEnv(why) => write!(f, "manifest refused: {why}"),
             FlowError::Mismatch => f.write_str("manifest program/build did not match the request"),
-            FlowError::NoArtifact(t) => {
-                f.write_str("no artifact for target ")?;
-                f.write_str(t)
-            }
-            FlowError::UnsupportedKind(k) => {
-                f.write_str("artifact kind ")?;
-                std::fmt::Debug::fmt(k, f)?;
-                f.write_str(" is not installable by `atpkg install`")
-            }
-            FlowError::AppBundleRefused(p) => {
-                f.write_str(p)?;
-                f.write_str(" updates itself, not through atpkg (`aterm update status`)")
-            }
-            FlowError::VendorRefused(why) => {
-                f.write_str("artifact row refused: ")?;
-                f.write_str(why)
-            }
-            FlowError::RequiresRetired(p) => {
-                f.write_str(p)?;
-                f.write_str(
-                    "'s signed index row names `requires`, a relation this client no longer \
-                     honours — refused rather than installed out of order",
-                )
-            }
-            FlowError::Download(e) => {
-                f.write_str("download: ")?;
-                f.write_str(e)
-            }
-            FlowError::Stage(e) => {
-                f.write_str("stage: ")?;
-                std::fmt::Display::fmt(e, f)
-            }
+            FlowError::NoArtifact(t) => write!(f, "no artifact for target {t}"),
+            FlowError::UnsupportedKind(k) => write!(
+                f,
+                "artifact kind {k:?} is not installable by `atpkg install`"
+            ),
+            FlowError::AppBundleRefused(p) => write!(
+                f,
+                "{p} updates itself, not through atpkg (`aterm update status`)"
+            ),
+            FlowError::VendorRefused(why) => write!(f, "artifact row refused: {why}"),
+            FlowError::RequiresRetired(p) => write!(
+                f,
+                "{p}'s signed index row names `requires`, a relation this client no longer \
+                 honours — refused rather than installed out of order"
+            ),
+            FlowError::Download(e) => write!(f, "download: {e}"),
+            FlowError::Stage(e) => write!(f, "stage: {e}"),
             // No head: the recorded sentence already names the program, the build, the
             // original stage failure and the way out — a "stage: " prefix would read as
             // if this pass had staged something, and it staged nothing.
             FlowError::StageRefused(m) => f.write_str(m),
-            FlowError::Activate(e) => {
-                f.write_str("activate: ")?;
-                f.write_str(e)
-            }
+            FlowError::Activate(e) => write!(f, "activate: {e}"),
             FlowError::Rollback(m) => {
                 // No "rollback: " head: the one CLI edge already prints
                 // "atpkg: rollback <p> failed:", and the doubled word read like two
@@ -562,19 +514,16 @@ impl std::fmt::Display for FlowError {
             FlowError::InsufficientDisk {
                 required,
                 available,
-            } => {
-                f.write_str("insufficient disk: need ")?;
-                f.write_str(&crate::cost::human_bytes(*required))?;
-                f.write_str(" free (have ")?;
-                f.write_str(&crate::cost::human_bytes(*available))?;
-                f.write_str(")")
-            }
-            FlowError::Linked(p) => {
-                f.write_str(p)?;
-                f.write_str(" is dev-linked; run `aterm pkg unlink ")?;
-                f.write_str(p)?;
-                f.write_str("` to release it")
-            }
+            } => write!(
+                f,
+                "insufficient disk: need {} free (have {})",
+                crate::cost::human_bytes(*required),
+                crate::cost::human_bytes(*available)
+            ),
+            FlowError::Linked(p) => write!(
+                f,
+                "{p} is dev-linked; run `aterm pkg unlink {p}` to release it"
+            ),
             FlowError::Vendor(line) | FlowError::VendorUnreachable(line) => f.write_str(line),
         }
     }
@@ -2954,12 +2903,12 @@ fn digest_refusal_note(
             .saturating_add(3599)
             .div_euclid(3600)
             .max(1);
-        how.push_str(&crate::dec_u64(u64::from(memo.attempts)));
+        how.push_str(&memo.attempts.to_string());
         how.push_str(" attempts over the identical signed digests, not refetching ");
         how.push_str(&crate::cost::human_bytes(artifact.size));
         how.push_str(" to reach the same verdict; retried when the pin or its signed digests ");
         how.push_str("change, or in about ");
-        how.push_str(&crate::dec_u64(u64::try_from(hours).unwrap_or(0)));
+        how.push_str(&u64::try_from(hours).unwrap_or(0).to_string());
         how.push_str("h, or now: ");
     }
     how.push_str("aterm pkg install ");

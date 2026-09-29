@@ -5,7 +5,7 @@
 //! BYTE, for every `.toml` file in this repository.
 //!
 //! Comment and formatting preservation is the entire contract of the document
-//! half — `cargo forge` asserts that rewriting `vendor/forge.toml` does not
+//! half — `targo --unverified forge` asserts that rewriting `vendor/forge.toml` does not
 //! move a single byte, and the Preferences window promises a user that saving a
 //! font size will not reflow their config. Anything less than byte equality on
 //! an unmodified document breaks both.
@@ -107,7 +107,7 @@ fn formatting_details_survive() {
 }
 
 /// The oracle round-trips these too. Agreeing with `toml_edit` here is what
-/// makes the swap safe for `cargo forge`, whose own test asserts byte equality
+/// makes the swap safe for `targo --unverified forge`, whose own test asserts byte equality
 /// through the crate being replaced.
 #[test]
 fn the_oracle_round_trips_the_same_corpus() {

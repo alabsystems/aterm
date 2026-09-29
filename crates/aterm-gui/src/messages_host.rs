@@ -51,14 +51,30 @@
 //! the origin/main merge (upstream dbf97ecff + ac7942234, the design's
 //! rulings of 2026-09-23): one first-run row, every other toolchain word a
 //! [`Hold::LogOnly`] record ([`App::record_message`]).
+//!
+//! # The Settings ▸ Messages page
+//!
+//! The page's MODEL is the engine's (`aterm_messages::page`, design ruling
+//! 382): the projection, its words, the tag order, the filter, the day clock
+//! and the feedback line for a press. This host builds the projection with
+//! one call ([`App::messages_state`]) and answers the page's seam with
+//! [`PageDesk`] — its wall clock, its log folder and writer, its UTC offset,
+//! the staged build, a log file's `symlink_metadata`, the agent upgrades'
+//! view and the reporters' sentence count
+//! ([`crate::message_reporters::sentence_lines`]). It re-exports the
+//! engine's `MessagesState`, `MessageView` and `tag_words` under the names
+//! they had here (ruling 385), and for its tests `MessageActionView` and
+//! `TAG_ORDER`; publishing the projection to Settings and
+//! performing a page's press stay here, and the page's layout is
+//! `native_settings`'.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use aterm_messages::page::{self, act_feedback};
 use aterm_messages::{
-    ActionIndex, Carry, Decision, EchoKind, HOLD_ROUTE, Hold, Intent, Live, LogRecord, MAX_ROWS,
-    Message, MessageId, Outcome, PROGRESS_GRACE, Restatement, Retired, Severity, WallStamp, wire,
-    words,
+    ActionIndex, Carry, Decision, EchoKind, HOLD_ROUTE, Hold, Intent, Message, MessageId, Outcome,
+    PROGRESS_GRACE, Restatement, Severity, WallStamp, drive, wire,
 };
 
 use crate::message_reporters::{PANE_FULL_DISK_ACCESS, log_did_not_open};
@@ -68,503 +84,100 @@ use crate::toolchain_words::{self, HookDialect, SnapshotWords};
 use crate::update_words;
 use crate::{App, WindowId};
 
-/// The tag chips' fixed order on Settings ▸ Messages (design §4.3): the
-/// families a person acts on first, then the ambient ones. Every word of the
-/// reporter vocabulary is here (`tags_chips_cover_the_vocabulary` pins it); a
-/// tag this build does not know — a line another build wrote into the same
-/// log — follows them in first-seen order rather than vanishing.
-pub(crate) const TAG_ORDER: [&str; 14] = [
-    "crash",
-    "config",
-    "update",
-    "toolchain",
-    "packages",
-    "privacy",
-    "session",
-    "window",
-    "render",
-    "a11y",
-    "fabric",
-    "harness",
-    "system",
-    "script",
-];
+// THE PAGE'S MODEL IS THE ENGINE'S (design ruling 382): the projection, its
+// words, the tag order, the filter, the day clock and the feedback line live
+// in `aterm_messages::page`, under the names they had here (ruling 385), so
+// the Settings page and its tests read on; the host answers the page's seam
+// ([`PageDesk`]).
+#[cfg(test)]
+pub(crate) use aterm_messages::page::{MessageActionView, TAG_ORDER};
+pub(crate) use aterm_messages::page::{MessageView, MessagesState, tag_words};
 
-/// THE SHARED PROJECTION behind Settings ▸ Messages (design §4.2): built
-/// ONCE by the host ([`App::messages_state`]) from the same [`LogRecord`]s
-/// the `messages` verb prints — the Packages page's "screen == introspection"
-/// rule — and handed to the Settings controller whole
-/// (`SettingsApp::replace_messages`). The page never reaches the center.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MessagesState {
-    /// The center's revision the projection was built at.
-    pub(crate) revision: u64,
-    /// The wall clock at the build, for the relative times.
-    pub(crate) now_unix_ms: u64,
-    /// Every record in the ring, NEWEST FIRST — at most `LOG_CAP`.
-    pub(crate) entries: Vec<MessageView>,
-    /// `(tag, count)` for every tag PRESENT, in [`TAG_ORDER`] then first-seen
-    /// order — the page's filter chips.
-    pub(crate) tags: Vec<(String, usize)>,
-    /// The folder the log files live in (`aterm.log`, `messages.log`,
-    /// `packages.log`, the crash reports) — what the page NAMES off macOS,
-    /// where there is no NSWorkspace to show it; the host opens it itself
-    /// (`AppEffect::OpenLogFolder`, never a path from the view). `None` with
-    /// no log dir.
-    pub(crate) log_folder: Option<String>,
-    /// Whether these messages are SAVED — `messages.log` has a writer. A page
-    /// over an in-memory ring only (a read-only log dir, a full disk) says so:
-    /// the person must not believe the record survives a quit.
-    pub(crate) saved: bool,
-    /// The reader's local clock's offset from UTC, in seconds — what an
-    /// expanded entry's meta line reads its time on (`Today 12:53:49 PM`,
-    /// design ruling 262); 0 where the host cannot say. Copy keeps UTC.
-    pub(crate) utc_offset_s: i64,
-}
-
-impl MessagesState {
-    /// The projection before the host has published one: nothing, revision 0
-    /// (every real revision is higher, so the first publish always lands).
-    pub(crate) fn empty() -> Self {
-        Self {
-            revision: 0,
-            now_unix_ms: 0,
-            entries: Vec::new(),
-            tags: Vec::new(),
-            log_folder: None,
-            saved: true,
-            utc_offset_s: 0,
-        }
-    }
-
-    /// The entry with this id, if the ring still holds it.
-    pub(crate) fn entry(&self, id: u64) -> Option<&MessageView> {
-        self.entries.iter().find(|e| e.id == id)
-    }
-}
-
-/// One record as the page shows it: the live row's CURRENT words while it is
-/// live (a restatement is never logged, so the record's own words would be
-/// its first ones), the record's final words once retired — the same choice
-/// `wire::message_row` makes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MessageView {
-    /// The raw message id.
-    pub(crate) id: u64,
-    /// The wall clock at ingress.
-    pub(crate) at_unix_ms: u64,
-    /// The reporter family.
-    pub(crate) tag: String,
-    /// The wire word: `success` / `info` / `warn` / `error`.
-    pub(crate) severity: &'static str,
-    /// The glyph the band paints at column 1.
-    pub(crate) glyph: char,
-    /// The title.
-    pub(crate) title: String,
-    /// The detail lines, pre-split, UNWRAPPED — the page wraps them to its
-    /// own measure.
-    pub(crate) detail: Vec<String>,
-    /// The `state=` word the `messages` verb prints ([`wire::state_word`]):
-    /// `live` / `held` / `folded` / `stale` / `unseen` / `superseded` /
-    /// `resolved-ok` / `resolved-warn` / `dismissed` / `answered` /
-    /// `evicted` / `carried` / `withdrawn` / `recorded` (a record, never on
-    /// the band).
-    pub(crate) state: &'static str,
-    /// The band row (0 = topmost) while it is on the glass.
-    pub(crate) on_glass: Option<u8>,
-    /// Duplicate posts folded into this record (1 = posted once).
-    pub(crate) repeats: u32,
-    /// The wall clock it retired at, when it has.
-    pub(crate) retired_unix_ms: Option<u64>,
-    /// The id of the post that superseded it, when that is how it left.
-    pub(crate) superseded_by: Option<u64>,
-    /// The capsule a person answered a decision row with.
-    pub(crate) answer: Option<String>,
-    /// The authored intents, re-offered from the page.
-    pub(crate) actions: Vec<MessageActionView>,
-    /// How many leading `detail` lines are the plain sentence for a person
-    /// — the cause and the next step — above the technical lines (at least
-    /// one; ruling 314: [`crate::message_reporters::sentence_lines`]).
-    pub(crate) sentences: usize,
-}
-
-/// One authored intent as the page offers it: a button by index, enabled only
-/// while pressing it would still do the thing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MessageActionView {
-    /// The `ActionIndex` a press names.
-    pub(crate) index: u8,
-    /// The full capsule label (`Intent::label`).
-    pub(crate) label: &'static str,
-    /// Whether a press can still be performed (design §4.2): a decision
-    /// (`Not now`, `Install`) only while the row is live; `Install now` only
-    /// while that build is still the staged one; `Open log` only while the
-    /// file is there as a regular file — the performer's own test, so a
-    /// capsule is not offered where the press would be refused; every
-    /// navigation always.
-    pub(crate) still_actionable: bool,
-}
-
-impl MessageView {
-    /// Warn or Error: the "Problems" chip's set (ruling 264).
-    pub(crate) fn alarm(&self) -> bool {
-        matches!(self.severity, "warn" | "error")
-    }
-
-    /// The state in PLAIN words for the expanded row's meta line (the owner's
-    /// rule of 2026-09-23 — no internal jargon; design ruling 66): what the
-    /// row is doing, and — once it has left — how long it stood: `showing
-    /// now`, `waiting to show`, `shown for 2 min`, `recorded` (never on the
-    /// band), `replaced by a newer
-    /// message after 40 s`, `answered: Not now`, `took 40 s` (delivered
-    /// or fixed), `lasted 40 s` (ended with no outcome), `ended with a problem
-    /// after 3 h`. The wire keeps its own words ([`MessageView::state`], `copy_text`).
-    pub(crate) fn state_words(&self) -> String {
-        let span = self
-            .retired_unix_ms
-            .map(|at| span_words(at.saturating_sub(self.at_unix_ms)));
-        let after = |words: &str| match &span {
-            Some(span) => format!("{words} after {span}"),
-            None => words.to_string(),
-        };
-        match self.state {
-            "live" | "held" => match self.on_glass {
-                Some(_) => "showing now".to_string(),
-                None => "waiting to show".to_string(),
-            },
-            // A record (`Hold::LogOnly`) retires at the instant it is posted:
-            // it was written down, never shown. A row that folded stood on the
-            // band for its hold, never zero.
-            "folded" if self.retired_unix_ms == Some(self.at_unix_ms) => self.record_words(),
-            "folded" => match &span {
-                Some(span) => format!("shown for {span}"),
-                None => "shown".to_string(),
-            },
-            // A row THIS process retired for going silent blames its
-            // reporter; a record replayed open from a process that is gone
-            // (killed or crashed — it wrote no ending, and a replayed record
-            // carries no retirement time) does not (ruling 267).
-            "stale" if self.retired_unix_ms.is_none() => {
-                "still open when aterm stopped".to_string()
-            }
-            "stale" => after("stopped reporting"),
-            // Cut off by a graceful quit (ruling 267): the reporter did not
-            // end it, aterm did.
-            "quit" => after("still open when aterm quit"),
-            "unseen" => "not shown \u{2014} too many at once".to_string(),
-            "superseded" => "replaced".to_string(),
-            // The outcome the echo showed, never "cleared" over a failure
-            // (ruling 93: `resolve(Warn)` is failed or refused; audit
-            // 2026-09-24). Work that was delivered or a problem that was
-            // fixed (its record now reads ✓ Success, ruling 265) TOOK its
-            // span; anything else withdrawn LASTED it — never the wire's
-            // `withdrawn`, nor `done` under a fixed warning.
-            "resolved-ok" | "withdrawn" => match (&span, self.severity) {
-                (Some(span), "success") => format!("took {span}"),
-                (Some(span), _) => format!("lasted {span}"),
-                (None, "success") => "finished".to_string(),
-                (None, _) => "ended".to_string(),
-            },
-            "resolved-warn" => after("ended with a problem"),
-            "dismissed" => "dismissed".to_string(),
-            "answered" => match &self.answer {
-                Some(label) => format!("answered: {label}"),
-                None => "answered".to_string(),
-            },
-            // A record (`Retired::Recorded`, the log's `how=folded rec=1`) was
-            // never on the band: "shown for 0 s" would say it had been (design
-            // §10.11, ruling 149 — one word, main's).
-            "recorded" => self.record_words(),
-            "evicted" => "dropped \u{2014} too many at once".to_string(),
-            "carried" => "carried over to the updated aterm".to_string(),
-            other => after(other),
-        }
-    }
-
-    /// A RECORD's state words (design ruling 262, keeping ruling 149): a record
-    /// that stands for something that WAS on the band — the strain episode's,
-    /// whose own row stood on the glass — says how long it was shown (`shown for
-    /// 41 s`, the line its reporter wrote); every other record was written
-    /// down and never shown: `recorded`.
-    pub(crate) fn record_words(&self) -> String {
-        self.shown_line()
-            .map_or_else(|| "recorded".to_string(), str::to_string)
-    }
-
-    /// The `shown for …` line a record carries, when it has one.
-    pub(crate) fn shown_line(&self) -> Option<&str> {
-        self.detail
-            .iter()
-            .map(String::as_str)
-            .find(|line| line.starts_with("shown for "))
-    }
-
-    /// The severity in plain words for the meta line: `Error`, `Warning`,
-    /// `Info`, `Done` (the wire's `error` / `warn` / `info` / `success`).
-    pub(crate) fn severity_words(&self) -> &'static str {
-        match self.severity {
-            "error" => "Error",
-            "warn" => "Warning",
-            "success" => "Done",
-            _ => "Info",
-        }
-    }
-
-    /// What Copy puts on the clipboard: the title, then `<stamp> · <tag> ·
-    /// <sev>`, then every detail line — byte for byte `words::copy_text` of
-    /// the record (`copy_text_of_a_view_is_the_engines`), built here because
-    /// the page holds views, not records.
-    pub(crate) fn copy_text(&self) -> String {
-        let mut out = self.title.clone();
-        out.push('\n');
-        out.push_str(&words::stamp_words(self.at_unix_ms));
-        out.push_str(" \u{00b7} ");
-        out.push_str(&self.tag);
-        out.push_str(" \u{00b7} ");
-        out.push_str(self.severity);
-        for line in &self.detail {
-            out.push('\n');
-            out.push_str(line);
-        }
-        out
-    }
-}
-
-/// A tag's chip and meta name in plain words (design ruling 66): `Updates`,
-/// `ALab tools`, `Display` — the wire and the chips' action keys keep the tag
-/// itself. A tag this build does not know reads as itself.
-pub(crate) fn tag_words(tag: &str) -> std::borrow::Cow<'_, str> {
-    std::borrow::Cow::Borrowed(match tag {
-        "crash" => "Crashes",
-        "config" => "Config",
-        "update" => "Updates",
-        "toolchain" => "ALab tools",
-        // One chip for the ALab lane's two tags, one for the agents' two
-        // (design ruling 262): the wire keeps each tag.
-        "packages" => "ALab tools",
-        "privacy" => "Privacy",
-        "session" => "Sessions",
-        "window" => "Windows",
-        "render" => "Display",
-        "a11y" => "Accessibility",
-        "fabric" => "Agents",
-        "harness" => "Agents",
-        "system" => "System",
-        // A script's row that named no tag (ruling 265).
-        "script" => "Scripts",
-        other => return script_tag_words(other),
-    })
-}
-
-/// A script's own tag as a chip's words (design ruling 265): capitalized like
-/// every chip beside it — `search` → `Search`, `deploy` → `Deploy` — and a
-/// two-letter tag is an initialism, `ci` → `CI`. The wire and Copy keep the
-/// tag as the script wrote it.
-fn script_tag_words(tag: &str) -> std::borrow::Cow<'_, str> {
-    let mut chars = tag.chars();
-    match chars.next() {
-        _ if tag.chars().count() <= 2 => std::borrow::Cow::Owned(tag.to_uppercase()),
-        Some(first) if first.is_lowercase() => {
-            std::borrow::Cow::Owned(first.to_uppercase().chain(chars).collect())
-        }
-        _ => std::borrow::Cow::Borrowed(tag),
-    }
-}
-
-/// A span in words: `40 s`, `2 min`, `3 h`, `2 d`.
-fn span_words(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 {
-        format!("{secs} s")
-    } else if secs < 3600 {
-        format!("{} min", secs / 60)
-    } else if secs < 86_400 {
-        format!("{} h", secs / 3600)
-    } else {
-        format!("{} d", secs / 86_400)
-    }
-}
-
-/// Whether pressing `intent` from the page would still do the thing (the
-/// rule on [`MessageActionView::still_actionable`]). `staged` is the build
-/// the updater holds ready right now, if any. `Open log` asks
-/// `symlink_metadata`, as [`admissible_log_path`] does at press time — a
-/// symlink planted in the log dir is refused there, so it is not offered
-/// here (the rest of that test needs the log dir, which is a directory
-/// probe per view; the press re-validates the whole rule).
-fn still_actionable(
-    intent: &Intent,
-    live: bool,
+/// THE PAGE'S HOST SEAM on this host ([`page::Host`], design ruling 382):
+/// what only the App knows about one projection. The staged build and the
+/// upgrade clock are read ONCE, as the desk is made for a build, so every
+/// `Install now` and every upgrade word of one projection is judged against
+/// the same facts; the rest is read when the engine asks.
+struct PageDesk<'a> {
+    app: &'a App,
+    /// The build the updater holds staged and ready, if any.
     staged: Option<u64>,
-    upgrades: &crate::upgrade_host::UpgradeView,
-) -> bool {
-    match intent {
-        // An upgrade's word is for the build its row named: offered while
-        // the tab's upgrade still moves to it and takes that word — from a
-        // retired row or the waiting record too (the owner may change their
-        // mind); the press re-checks under the harness's lock.
-        Intent::AgentUpgrade { tab, to, word } => {
-            upgrades.offers(tab, to, *word, crate::upgrade_host::now_s())
-        }
-        // A stop is for the paste still on its way: its row is live exactly
-        // as long as the paste is watched; a strain row's tab is the one it
-        // named while it was up.
-        Intent::NotNow { .. } | Intent::StopPaste { .. } | Intent::ShowTab { .. } => live,
-        Intent::ApplyUpdate { build } => staged == Some(*build),
-        Intent::OpenPath { path } => {
-            std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
-        }
-        Intent::Details
-        | Intent::OpenSettings { .. }
-        | Intent::OpenConfigEditor { .. }
-        | Intent::OpenSystemPane { .. }
-        | Intent::NewWindow => true,
-    }
+    /// The upgrade clock (`upgrade_host::now_s`) at the build.
+    upgrade_now_s: u64,
 }
 
-/// THE MARK OF WORK CUT OFF (ruling 317, day eight E5): a row still moving
-/// when aterm stopped (`stale`, replayed open from a process that is gone) or
-/// quit (`quit`) is no longer in flight, so its record does not wear the
-/// working mark it was posted with — `↻ Rendering the video` read, in the
-/// log, as work still under way. Its severity's own mark stands in; every
-/// other mark, and every other state, is kept.
-fn cut_off_mark(
-    glyph: aterm_messages::Glyph,
-    severity: aterm_messages::Severity,
-    state: &str,
-) -> aterm_messages::Glyph {
-    const IN_FLIGHT: [char; 5] = ['\u{21bb}', '\u{21e3}', '\u{2191}', '\u{2296}', '\u{2026}'];
-    if matches!(state, "stale" | "quit") && IN_FLIGHT.contains(&glyph.ch()) {
-        severity.default_glyph()
-    } else {
-        glyph
-    }
-}
-
-/// Whether `intent` is a word for a tab whose upgrade this instance no longer
-/// has at all (ruling 315): the host hands over the upgrade rows of its live
-/// tabs, so none for the intent's tab means its session ended here — a tab id
-/// never comes back — or its move is over. Either way the word is moot.
-fn session_gone(intent: &Intent, upgrades: &crate::upgrade_host::UpgradeView) -> bool {
-    matches!(intent, Intent::AgentUpgrade { tab, .. } if upgrades.row_for(tab).is_none())
-}
-
-/// One record's view (the `wire::message_row` choice of words: the live row's
-/// while it is live, the record's once retired).
-fn message_view(
-    rec: &LogRecord,
-    live: Option<&Live>,
-    on_glass: Option<u8>,
-    staged: Option<u64>,
-    upgrades: &crate::upgrade_host::UpgradeView,
-) -> MessageView {
-    let (severity, glyph, title, detail, actions, repeats) = match live {
-        Some(l) => (
-            l.msg.severity,
-            l.msg.glyph,
-            &l.msg.title,
-            &l.msg.detail,
-            &l.msg.actions,
-            l.repeats,
-        ),
-        None => (
-            rec.severity,
-            rec.glyph,
-            &rec.title,
-            &rec.detail,
-            &rec.actions,
-            rec.repeats,
-        ),
-    };
-    let (superseded_by, answer) = match rec.retired() {
-        Some(Retired::Superseded { by }) => (Some(by.raw()), None),
-        Some(Retired::Answered { label }) => (None, Some(label.clone())),
-        _ => (None, None),
-    };
-    let state = wire::state_word(rec, live);
-    MessageView {
-        id: rec.id.raw(),
-        at_unix_ms: rec.stamp.unix_ms,
-        tag: rec.tag.as_str().to_string(),
-        severity: severity.as_str(),
-        glyph: cut_off_mark(glyph, severity, state).ch(),
-        title: title.clone(),
-        detail: detail.clone(),
-        state,
-        on_glass,
-        repeats,
-        retired_unix_ms: rec.retired_unix_ms,
-        superseded_by,
-        answer,
-        sentences: crate::message_reporters::sentence_lines(rec.key.as_deref(), detail),
-        actions: actions
-            .iter()
-            .enumerate()
-            // AN INTENT WHOSE MOMENT HAS PASSED IS NOT OFFERED (design ruling
-            // 265): `Stop paste` on a paste that finished, `Not now` on an
-            // answered ask, `Show tab 2` on a strain episode that folded
-            // could never be pressed again, and a dead Primary drawn in the
-            // accent read as the thing to do. An intent that can come back
-            // (`Install now`, `Open log`) stays, disabled while it cannot.
-            .filter(|(_, intent)| live.is_some() || rec.still_offers(intent))
-            // A WORD FOR A SESSION THAT IS GONE is not offered either (ruling
-            // 315, day eight E3): `Upgrade now` / `Not today` on a record
-            // whose tab's session no longer runs here stood drawn, disabled,
-            // three relaunches later. A session never comes back under its
-            // id, so the word never can; one whose upgrade still stands but
-            // moved to another build stays, disabled while it cannot.
-            .filter(|(_, intent)| live.is_some() || !session_gone(intent, upgrades))
-            .filter_map(|(k, intent)| {
-                Some(MessageActionView {
-                    index: u8::try_from(k).ok()?,
-                    label: intent.label(),
-                    still_actionable: still_actionable(intent, live.is_some(), staged, upgrades),
-                })
+impl<'a> PageDesk<'a> {
+    /// The desk for one projection of `app`'s center.
+    fn of(app: &'a App) -> Self {
+        let staged = app
+            .staged_update_ready()
+            .then(|| {
+                app.native_updater_service
+                    .snapshot()
+                    .staged
+                    .as_ref()
+                    .map(|s| s.build)
             })
-            .collect(),
+            .flatten();
+        Self {
+            app,
+            staged,
+            upgrade_now_s: crate::upgrade_host::now_s(),
+        }
     }
 }
 
-/// The page's feedback line for an act the host performed (`performed`) or
-/// refused: what happened, in the words a person would use. `applies`: an
-/// `Install now` press that really installs (`update_bar_press_applies`);
-/// otherwise the press opened Software Update, and says so (audit
-/// 2026-09-24: "Installing the update" was said over a page that opened, and
-/// over a press that failed).
-fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
-    match (intent, performed) {
-        (Intent::Details, true) => "Opened".to_string(),
-        (Intent::Details, false) => "Could not open the entry".to_string(),
-        (Intent::OpenSettings { .. }, true) => {
-            format!("Opened Settings \u{25b8} {}", intent.label())
-        }
-        (Intent::OpenSettings { .. }, false) => "Could not open Settings".to_string(),
-        (Intent::OpenConfigEditor { .. }, true) => "Opened aterm.toml".to_string(),
-        (Intent::OpenConfigEditor { .. }, false) => "Could not open aterm.toml".to_string(),
-        (Intent::OpenPath { .. }, true) => "Opened the log".to_string(),
-        (Intent::OpenPath { .. }, false) => "Could not open the log".to_string(),
-        (Intent::OpenSystemPane { .. }, true) => "Opened System Settings".to_string(),
-        (Intent::OpenSystemPane { .. }, false) => "System Settings did not open".to_string(),
-        (Intent::ApplyUpdate { .. }, true) if applies => "Installing the update".to_string(),
-        (Intent::ApplyUpdate { .. }, true) => {
-            "Opened Settings \u{25b8} Software Update".to_string()
-        }
-        (Intent::ApplyUpdate { .. }, false) if applies => "Could not start the install".to_string(),
-        (Intent::ApplyUpdate { .. }, false) => "Could not open Settings".to_string(),
-        (Intent::NotNow { .. }, _) => "Not now recorded".to_string(),
-        (Intent::NewWindow, true) => "Opened a new window".to_string(),
-        (Intent::NewWindow, false) => "Could not open a window".to_string(),
-        (Intent::StopPaste { .. }, true) => "Stopped the paste".to_string(),
-        (Intent::StopPaste { .. }, false) => "The paste had already finished".to_string(),
-        (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
-        (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
-        // Written off this thread: what it did lands on the page as a record.
-        // Queued, not done (ruling 270): what it did lands as the pressed
-        // entry's own words, or as a row if the harness refuses it.
-        (Intent::AgentUpgrade { .. }, true) => {
-            format!("Sent {}; what it did shows in this log", intent.label())
-        }
-        (Intent::AgentUpgrade { .. }, false) => "The upgrade no longer takes that word".to_string(),
+impl page::Host for PageDesk<'_> {
+    fn now_unix_ms(&self) -> u64 {
+        wall_stamp_now().unix_ms
+    }
+
+    fn log_folder(&self) -> Option<String> {
+        self.app
+            .messages_log
+            .as_ref()
+            .and_then(crate::messages_store::Writer::folder)
+            .map(|dir| dir.display().to_string())
+    }
+
+    fn saved(&self) -> bool {
+        self.app.messages_log.is_some()
+    }
+
+    fn utc_offset_s(&self) -> i64 {
+        crate::presence::local_offset_s().unwrap_or(0)
+    }
+
+    fn staged_build(&self) -> Option<u64> {
+        self.staged
+    }
+
+    /// `symlink_metadata`, as [`admissible_log_path`] does at press time: a
+    /// symlink planted in the log dir is refused there, so it is not offered
+    /// here (the rest of that test needs the log dir, which is a directory
+    /// probe per view; the press re-validates the whole rule).
+    fn is_regular_file(&self, path: &str) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+    }
+
+    fn upgrade_takes(&self, tab: &str, to: &str, word: aterm_messages::UpgradeWord) -> bool {
+        self.app
+            .upgrade_view
+            .offers(tab, to, word, self.upgrade_now_s)
+    }
+
+    fn upgrade_stands(&self, tab: &str) -> bool {
+        self.app.upgrade_view.row_for(tab).is_some()
+    }
+
+    /// Every navigation, from any record: `App::perform_message_act`
+    /// resolves a press by the entry's id in the ring, live or retired.
+    fn performs_navigation(&self) -> bool {
+        true
+    }
+
+    fn sentence_lines(&self, key: Option<&str>, detail: &[String]) -> usize {
+        crate::message_reporters::sentence_lines(key, detail)
     }
 }
 
@@ -578,6 +191,14 @@ thread_local! {
     /// The repaints `notice` asked for at once (`Paint::Now`) ON THIS THREAD —
     /// the flood test's count (design ruling 170).
     static WIRE_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The update-health desktop banners `App::post_update_health_banner`
+    /// would have posted ON THIS THREAD, as `(title, banner)` (test-only).
+    pub(crate) static UPDATE_HEALTH_BANNERS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// How many window re-grids the message band has paid for ON THIS THREAD
@@ -866,20 +487,27 @@ impl App {
     /// * a family in `rederived` that the reload found FIXED is remembered as
     ///   fixed (`App::config_cleared`), so the same words coming back after
     ///   the fix — a problem broken again — raise their row again, whether or
-    ///   not its row was still on the glass when the fix landed.
+    ///   not its row was still on the glass when the fix landed; and every
+    ///   record of it that left the glass unfixed in this process — folded by
+    ///   the press that sent the person to fix it, read, run out — now reads
+    ///   fixed (`MessageCenter::fix_closed`, ruling 367).
     fn replace_config_set(
         &mut self,
         scope: &[String],
         rederived: &std::collections::BTreeSet<String>,
         msgs: Vec<Message>,
     ) {
+        let now = Instant::now();
+        let mut resolved = 0usize;
         for key in rederived {
             if !msgs.iter().any(|m| m.key.as_deref() == Some(key.as_str())) {
                 self.config_cleared.insert(key.clone());
+                // FIXED, whether or not its row was still up (ruling 367):
+                // a warning folded by the `Open aterm.toml` or `Details`
+                // press that sent the person to fix it closes as fixed too.
+                resolved += self.messages.fix_closed(key, now);
             }
         }
-        let now = Instant::now();
-        let mut resolved = 0usize;
         for key in scope {
             let Some(id) = self.messages.live_by_key(key).map(|l| l.id) else {
                 continue;
@@ -1081,30 +709,40 @@ impl App {
     /// freeze), commit the row count, drain the log. `true` when the GLASS
     /// changed — a row folded, arrived or re-worded, or the count moved — so
     /// the caller repaints exactly then (the bars' `settle || sync` answer).
+    ///
+    /// The step is the engine's (`aterm_messages::drive`, design ruling 336):
+    /// this host gives it the instant, the handoff freeze, what its windows
+    /// afford and the rows its geometry reserves, re-grids between the two
+    /// halves, and hands the drained lines to its writer.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
-        let frozen = self.message_holds_frozen();
-        let settled = self.messages.settle(now, !frozen);
-        let committed = self.sync_message_band_rows(now);
-        if !self.message_persist_frozen() {
-            self.persist_messages();
-        }
+        let commit = self.band_commit(now);
+        let step = drive::settle_and_commit(&mut self.messages, commit);
+        let committed = self.regrid_message_band(step.regrid);
         // A `notice progress` restate the wire's pacing held back (ruling 170):
         // its one paced paint falls due here, however many lines arrived.
-        let wire = self.wire_gate.take_due(now);
-        settled.glass_changed || committed || wire
+        let persist = !self.message_persist_frozen();
+        let (lines, wire) =
+            drive::drain_and_pace(&mut self.messages, &mut self.wire_gate, now, persist);
+        self.append_message_lines(&lines);
+        step.glass_changed || committed || wire
     }
 
-    /// Drain the center's pending log lines to the writer. With no writer (a
-    /// test App, or a log dir that could not be opened) the lines are dropped
-    /// here, so the pending queue never fills and reports a `Dropped` count
-    /// for a file that does not exist.
+    /// Drain the center's pending log lines to the writer.
     fn persist_messages(&mut self) {
         let lines = self.messages.drain_shelved_for_persist();
+        self.append_message_lines(&lines);
+    }
+
+    /// Hand drained log lines to the writer. With no writer (a test App, or a
+    /// log dir that could not be opened) the lines are dropped here, so the
+    /// pending queue never fills and reports a `Dropped` count for a file
+    /// that does not exist.
+    fn append_message_lines(&self, lines: &[(aterm_messages::LogLine, aterm_messages::Shelf)]) {
         if lines.is_empty() {
             return;
         }
         if let Some(writer) = &self.messages_log {
-            writer.append(&lines);
+            writer.append(lines);
         }
     }
 
@@ -1200,26 +838,40 @@ impl App {
     /// geometry takes the center's count whether or not `commit_rows` moved
     /// it this step, so a carried row is never presented into a row the
     /// window does not own.
+    ///
+    /// The commit and the convergence are the engine's (`drive::commit`); the
+    /// window set it measures and the re-grid are this host's.
     pub(crate) fn sync_message_band_rows(&mut self, now: Instant) -> bool {
-        if self.message_holds_frozen() {
-            return false;
+        let commit = self.band_commit(now);
+        let regrid = drive::commit(&mut self.messages, commit);
+        self.regrid_message_band(regrid)
+    }
+
+    /// What this host's step commits against: the instant, the handoff
+    /// freeze, the rows every window WITH GLASS affords (a headless window
+    /// has none to spare, so it never clamps) and the rows its geometry
+    /// reserves.
+    fn band_commit(&self, now: Instant) -> drive::Commit {
+        drive::Commit {
+            now,
+            frozen: self.message_holds_frozen(),
+            afford: drive::afford(
+                self.windows
+                    .values()
+                    .filter(|ws| ws.os_window.is_some())
+                    .map(|ws| ws.rows),
+                self.message_band_rows,
+            ),
+            reserved: self.message_band_rows,
         }
-        let afford = self
-            .windows
-            .values()
-            .filter(|ws| ws.os_window.is_some())
-            .map(|ws| {
-                ws.rows
-                    .saturating_add(self.message_band_rows)
-                    .saturating_sub(1)
-            })
-            .min()
-            .unwrap_or(MAX_ROWS);
-        let moved = self.messages.commit_rows(now, afford);
-        let rows = self.messages.committed_rows();
-        if moved.is_none() && rows == self.message_band_rows {
+    }
+
+    /// Take the row count the engine committed into the window geometry and
+    /// re-grid every window. `true` when there was one to take.
+    fn regrid_message_band(&mut self, regrid: Option<u16>) -> bool {
+        let Some(rows) = regrid else {
             return false;
-        }
+        };
         self.message_band_rows = rows;
         #[cfg(test)]
         PTY_RESIZES_FOR_MESSAGES.with(|c| c.set(c.get() + 1));
@@ -1244,24 +896,66 @@ impl App {
     /// in). `None` with nothing armed: an idle band never wakes the loop
     /// (FL-1).
     pub(crate) fn messages_deadline(&self) -> Option<Instant> {
-        let settle = self.messages.deadline(!self.message_holds_frozen());
-        let publish = self.messages_publish_due_at();
-        // The wire's one paced paint (ruling 170); `None` when idle (FL-1).
-        let wire = self.wire_gate.due();
-        [settle, publish, wire].into_iter().flatten().min()
+        // The engine's state deadline (holds, echoes, patience, the wire's
+        // one paced paint, ruling 170) and this host's own publish; `None`
+        // when idle (FL-1).
+        let state =
+            drive::state_deadline(&self.messages, &self.wire_gate, self.message_holds_frozen());
+        [state, self.messages_publish_due_at()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Post what the pre-App inbox holds (every park; one atomic load when
-    /// empty), each with the stamp it was queued under.
+    /// empty), each with the stamp it was queued under — and the folders
+    /// fresh shells could not start in ([`Self::fold_folder_faults`]).
     pub(crate) fn drain_message_inbox(&mut self) {
         let queued = crate::message_inbox::take_queued();
-        if queued.is_empty() {
+        let folders = crate::spawn_folder::take_noted();
+        if queued.is_empty() && folders.is_empty() {
             return;
         }
         for m in queued {
             self.post_unsynced(m.message, m.stamp);
         }
+        if !folders.is_empty() {
+            self.fold_folder_faults(&folders);
+        }
         self.sync_messages();
+    }
+
+    /// Shells that started in the home folder because their folder was not
+    /// there, or could not be entered (audit #7 finding 48): ONE row per fault
+    /// naming every such folder while it is up, so a restore that meets three
+    /// gone folders is one row naming three, and a New Tab from a gone folder
+    /// a minute later joins it. Once the row has gone, the next folder starts
+    /// a fresh list. A row carried across an update arrives with no list
+    /// behind it, so its folders are read back from the row first.
+    fn fold_folder_faults(&mut self, fresh: &[(String, crate::spawn_folder::Fault)]) {
+        for fault in crate::spawn_folder::Fault::ALL {
+            let mut dirs = fresh
+                .iter()
+                .filter(|(_, why)| *why == fault)
+                .map(|(dir, _)| dir.clone())
+                .peekable();
+            if dirs.peek().is_none() {
+                continue;
+            }
+            let key = crate::message_reporters::folder_row_key(fault);
+            let named = self.folder_rows.of(fault);
+            match self.messages.live_by_key(key) {
+                None => *named = crate::spawn_folder::Named::default(),
+                Some(live) if named.dirs.is_empty() => {
+                    *named =
+                        crate::message_reporters::folder_row_named(&live.msg).unwrap_or_default();
+                }
+                Some(_) => {}
+            }
+            dirs.for_each(|dir| named.add(dir));
+            let row = crate::message_reporters::folder_row(fault, named);
+            self.post_unsynced(row, wall_stamp_now());
+        }
     }
 
     /// Perform one plain-data intent the engine returned for row `id` in
@@ -1409,6 +1103,9 @@ impl App {
             // `Stop paste` (ruling 231): the rest of the paste is dropped, the
             // input after it goes through, and the row fades.
             Intent::StopPaste { session } => self.stop_paste(session),
+            // `End sessions` on the PTY keeper's recovery row: every shell
+            // this launch reattached is hung up (`keeper_link`).
+            Intent::EndRecovered => self.end_recovered_sessions() > 0,
             // The strain row's navigation (rulings 243 and 247): the tab the
             // title names, in the window it is in — the band is app-wide, so
             // the press may come from another window's band — raised.
@@ -1425,6 +1122,12 @@ impl App {
                 self.upgrade_view
                     .offers(&tab, &to, word, crate::upgrade_host::now_s())
                     && self.send_upgrade_word(crate::upgrade_host::WordAsk { tab, to, word })
+            }
+            // THE OWNER'S WORD ON AN AGENT'S ONE ROW (2026-09-28): the word
+            // for each tab the row named that still takes it, and the row
+            // answered once (`upgrade_host`).
+            Intent::AgentUpgradeTabs { word, moves } => {
+                self.send_upgrade_group_word(id, word, &moves)
             }
         }
     }
@@ -1597,76 +1300,16 @@ impl App {
         applied.reply
     }
 
-    /// THE PROJECTION, built once from the ring (design §4.2): every record
-    /// newest first, the live rows in their current words, the band row each
-    /// is on, and whether each authored intent can still be pressed — the
-    /// staged build read once for every `Install now`, the crash log's file
-    /// stat'd per `Open log` (a few records at most; the publish runs at
-    /// 2 Hz at the most). Tag counts in the chips' order.
+    /// THE PROJECTION, built once from the ring (design §4.2) by the engine
+    /// ([`MessagesState::of`], design ruling 382) over this App's facts
+    /// ([`PageDesk`]): every record newest first, the live rows in their
+    /// current words, the band row each is on, and whether each authored
+    /// intent can still be pressed — the staged build read once for every
+    /// `Install now`, the crash log's file stat'd per `Open log` (a few
+    /// records at most; the publish runs at 2 Hz at the most). Tag counts in
+    /// the chips' order.
     pub(crate) fn messages_state(&self) -> MessagesState {
-        let now_unix_ms = wall_stamp_now().unix_ms;
-        // The band row each live row is on, echoes counted (design §10.5 M2).
-        let glass: Vec<(MessageId, u8)> = self
-            .messages
-            .on_glass()
-            .filter_map(|l| {
-                let row = self.messages.glass_position(l.id)?;
-                u8::try_from(row).ok().map(|row| (l.id, row))
-            })
-            .collect();
-        let staged = self
-            .staged_update_ready()
-            .then(|| {
-                self.native_updater_service
-                    .snapshot()
-                    .staged
-                    .as_ref()
-                    .map(|s| s.build)
-            })
-            .flatten();
-        let log = self.messages.log();
-        let mut entries = Vec::with_capacity(log.len());
-        let mut counts: Vec<(String, usize)> = Vec::new();
-        for rec in log.records().rev() {
-            let live = self.messages.live(rec.id);
-            let on_glass = glass
-                .iter()
-                .find(|(id, _)| *id == rec.id)
-                .map(|(_, row)| *row);
-            let view = message_view(rec, live, on_glass, staged, &self.upgrade_view);
-            match counts.iter_mut().find(|(tag, _)| *tag == view.tag) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((view.tag.clone(), 1)),
-            }
-            entries.push(view);
-        }
-        let mut tags: Vec<(String, usize)> = TAG_ORDER
-            .iter()
-            .filter_map(|tag| {
-                counts
-                    .iter()
-                    .find(|(seen, _)| seen == tag)
-                    .map(|(_, n)| ((*tag).to_string(), *n))
-            })
-            .collect();
-        tags.extend(
-            counts
-                .into_iter()
-                .filter(|(tag, _)| !TAG_ORDER.contains(&tag.as_str())),
-        );
-        MessagesState {
-            revision: self.messages.revision(),
-            now_unix_ms,
-            entries,
-            tags,
-            log_folder: self
-                .messages_log
-                .as_ref()
-                .and_then(crate::messages_store::Writer::folder)
-                .map(|dir| dir.display().to_string()),
-            saved: self.messages_log.is_some(),
-            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
-        }
+        MessagesState::of(&self.messages, &PageDesk::of(self))
     }
 }
 
@@ -2331,7 +1974,15 @@ impl App {
         }
         self.update_health_latched.push(kind);
         aterm_log::warn!("update-health: {title}: {body}");
-        self.retire_update_installing();
+        // AN ATTEMPT STILL IN FLIGHT KEEPS ITS ROW AND ITS RIM (round six,
+        // finding 44): a warning that lands while the successor boots or holds
+        // for its park is not that attempt's refusal — the install goes on to
+        // Commit, and the rim is the only explanation of the frozen frame the
+        // park is about to show. The attempt's own completion retires them if
+        // it does not take over (`reduce_returned_handoff_completion`).
+        if !self.update_handoff_in_flight() {
+            self.retire_update_installing();
+        }
         let msg = update_words::health_warning(kind, title, body);
         // The same warning an older build raised under the family key (a
         // carried row) is this one said again: it leaves for its successor.
@@ -2357,6 +2008,47 @@ impl App {
         true
     }
 
+    /// THE OS BANNER an update-health ANNOUNCEMENT owes (the caller has just
+    /// had [`Self::note_update_health`] or [`Self::note_update_health_as`]
+    /// return `true`): off the UI thread — `notify::deliver` blocks on a
+    /// notifier subprocess — and in the banner's words
+    /// ([`update_words::health_notification_body`]). No focus suppression:
+    /// updater health belongs to no tab. Every producer of the announcement
+    /// (`Wake::UpdateHealth`, the checker watchdog, the automatic lane's
+    /// convergence) comes through here, so ONE check holds `desktop_alerts`:
+    /// off (the default) posts nothing, and the band row, Settings ▸ Software
+    /// Update and `messages.log` still say it. `true` when a banner was posted.
+    /// Under `cfg(test)` the banner is recorded ([`UPDATE_HEALTH_BANNERS`])
+    /// instead, so no test ever posts to the desktop of whoever runs the suite.
+    pub(crate) fn post_update_health_banner(&self, title: &str, body: &str) -> bool {
+        if !self.config.desktop_alerts_or_default() {
+            aterm_log::info!("update-health: desktop banner not posted: desktop_alerts is off");
+            return false;
+        }
+        #[cfg(test)]
+        {
+            let banner = update_words::health_notification_body(body);
+            UPDATE_HEALTH_BANNERS
+                .with(|posted| posted.borrow_mut().push((title.to_string(), banner)));
+            true
+        }
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            let banner = update_words::health_notification_body(body);
+            let title = title.to_string();
+            std::thread::spawn(move || {
+                crate::notify::deliver(Some(&title), &banner, false);
+            });
+            true
+        }
+        // No desktop banner for update health here (it never had one off macOS).
+        #[cfg(all(not(target_os = "macos"), not(test)))]
+        {
+            let _ = (title, body);
+            false
+        }
+    }
+
     /// THE LEDGER HEALED as far as `proof` can tell: the health warning
     /// ([`update_words::KEY_HEALTH`]), if it is still up, is over — resolved
     /// with the outcome it stood for (a warning) — and, once per announced
@@ -2372,11 +2064,11 @@ impl App {
     /// not answer stays up (and remembered), for the proof that does.
     pub(crate) fn heal_update_health(&mut self, proof: HealthProof) {
         self.update_health_latched
-            .retain(|kind| proof < HealthProof::needed_for(*kind));
-        for id in self.live_update_health(|kind| proof >= HealthProof::needed_for(kind)) {
+            .retain(|kind| !proof.answers(*kind));
+        for id in self.live_update_health(|kind| proof.answers(kind)) {
             self.resolve_message(id, Outcome::Warn);
         }
-        self.record_update_health_healed(|kind| proof >= HealthProof::needed_for(kind));
+        self.record_update_health_healed(|kind| proof.answers(kind));
     }
 
     /// What a health warning of this kind said, kept for its record of healing
@@ -2483,14 +2175,9 @@ impl App {
     /// nag (review 2026-09-24) — the Version menu and Software Update still
     /// offer it. A posture that has just become a decision (a lane that
     /// stopped) raises it again.
-    pub(crate) fn ensure_staged_decision(&mut self, build: u64) {
-        let posture = self.apply_posture_for(build);
-        self.ensure_staged_decision_in(build, posture);
-    }
-
-    /// [`Self::ensure_staged_decision`] under an explicit `posture` — the
-    /// seam its tests drive, since a headless App's own posture is always
-    /// the handoff-off record.
+    ///
+    /// `posture` is the caller's `apply_posture_for(build)` — or a test's,
+    /// since a headless App's own posture is always the handoff-off record.
     pub(crate) fn ensure_staged_decision_in(
         &mut self,
         build: u64,
@@ -2607,8 +2294,8 @@ impl App {
 
     /// THE SWITCH THAT DID NOT HAPPEN, on record ([`update_words::switch_stopped`]):
     /// an attempt [`Self::record_update_switch_started`] wrote down ended with
-    /// this process still running — refused, failed, or stood down because the
-    /// terminal was in use (`routine`) — so the record never leaves an
+    /// this process still running — refused, failed, or stood down to try again
+    /// by itself (`routine`, in `why`'s words) — so the record never leaves an
     /// "Installing" that was not. Nothing for an attempt that never reached the
     /// record.
     #[cfg(unix)]
@@ -2651,20 +2338,6 @@ pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
     ws.os_window.as_deref().is_some_and(|w| !minimized(w)) && !ws.occluded
 }
 
-/// A deadline belongs to the last prepared frame, its time-free layout and
-/// the message inputs behind its estimator. The GUI reads this on both the
-/// event sweep and the park; neither read should rescan future cell surfaces
-/// while the frame and its sources have not changed.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BandMotionDeadlineMemo {
-    layout_fp: u64,
-    motion_input_epoch: u64,
-    cols: usize,
-    look: aterm_messages::Look,
-    frame_at: Instant,
-    next: Option<Instant>,
-}
-
 impl App {
     /// How window `wid`'s band draws motion (design ruling 140, the gating
     /// UNION of the two sides): MOVING while its effect policy animates
@@ -2673,7 +2346,8 @@ impl App {
     /// band is on screen, and no handoff freezes the band
     /// ([`Self::message_holds_frozen`]: the screen is parked, and the rows are
     /// the committed ones — main's busy-frame rule); STILL otherwise. GRADED
-    /// unless an OS High Contrast palette owns the chrome.
+    /// unless an OS High Contrast palette owns the chrome. The rule is the
+    /// engine's (`drive::look`); the readings are this host's.
     pub(crate) fn band_look(&self, wid: WindowId) -> aterm_messages::Look {
         use crate::motion::{MotionEffect, SeriousEffect};
         let (focused, on_screen) = self
@@ -2681,110 +2355,18 @@ impl App {
             .get(&wid)
             .map_or((false, false), |ws| (ws.focused, band_on_screen(ws)));
         let effect = MotionEffect::BandProgress;
-        let moving = on_screen
-            && !self.message_holds_frozen()
-            && self
-                .effect_policy(effect, self.motion_focus(wid, focused))
-                .animate(effect)
+        let motion_allowed = self
+            .effect_policy(effect, self.motion_focus(wid, focused))
+            .animate(effect)
             && self
                 .serious_mode_policy()
                 .allows(SeriousEffect::BandProgress);
-        aterm_messages::Look {
-            pace: if moving {
-                aterm_messages::Pace::Moving
-            } else {
-                aterm_messages::Pace::Still
-            },
-            graded: crate::chrome_band::forced_chrome().is_none(),
-        }
-    }
-
-    /// Window `wid`'s band layout at its width, from its cache when the
-    /// center has not moved since; `None` with no committed row.
-    fn band_layout_now(
-        &self,
-        wid: WindowId,
-    ) -> Option<std::borrow::Cow<'_, aterm_messages::Presentation>> {
-        let ws = self.windows.get(&wid)?;
-        let cols = usize::from(ws.cols);
-        let fp = self.messages.fingerprint(cols);
-        if fp == 0 {
-            return None;
-        }
-        match &ws.band_layout {
-            Some((f, c, p)) if *f == fp && *c == cols => Some(std::borrow::Cow::Borrowed(p)),
-            _ => Some(std::borrow::Cow::Owned(self.band_presentation(cols))),
-        }
-    }
-
-    fn compute_band_motion_deadline(
-        &self,
-        wid: WindowId,
-        p: &aterm_messages::Presentation,
-        from: Instant,
-        look: aterm_messages::Look,
-    ) -> Option<Instant> {
-        #[cfg(not(test))]
-        let _ = wid;
-        #[cfg(test)]
-        if let Some(ws) = self.windows.get(&wid) {
-            ws.band_motion_deadline_computations
-                .set(ws.band_motion_deadline_computations.get() + 1);
-            ws.band_motion_deadline_last_from.set(Some(from));
-        }
-        self.messages.motion_deadline(p, from, look)
-    }
-
-    /// Find the next visible change from the frame on glass. Its costly bar
-    /// scan is memoized only when that frame and its look were prepared; a
-    /// newly posted row without a frame still takes the ordinary wake path.
-    fn band_motion_next_for(
-        &self,
-        wid: WindowId,
-        now: Instant,
-        look: aterm_messages::Look,
-    ) -> Option<Instant> {
-        let ws = self.windows.get(&wid)?;
-        let cols = usize::from(ws.cols);
-        let layout_fp = self.messages.fingerprint(cols);
-        if layout_fp == 0 {
-            return None;
-        }
-        let motion_input_epoch = self.messages.motion_input_epoch();
-        let prepared = ws.band_motion.is_some()
-            && ws.band_motion_look == Some(look)
-            && matches!(&ws.band_layout, Some((f, c, _)) if *f == layout_fp && *c == cols);
-        // A frame in another look or at another layout cannot be the time
-        // origin of this view's next change. Start the unprepared query at
-        // the current event/park instant, as the uncached host did.
-        let frame_at = if prepared {
-            ws.band_motion.as_ref().map_or(now, |m| m.at)
-        } else {
-            now
-        };
-        if prepared
-            && let Some(memo) = ws.band_motion_next.get()
-            && memo.layout_fp == layout_fp
-            && memo.motion_input_epoch == motion_input_epoch
-            && memo.cols == cols
-            && memo.look == look
-            && memo.frame_at == frame_at
-        {
-            return memo.next;
-        }
-        let p = self.band_layout_now(wid)?;
-        let next = self.compute_band_motion_deadline(wid, &p, frame_at, look);
-        if prepared {
-            ws.band_motion_next.set(Some(BandMotionDeadlineMemo {
-                layout_fp,
-                motion_input_epoch,
-                cols,
-                look,
-                frame_at,
-                next,
-            }));
-        }
-        next
+        drive::look(drive::LookIn {
+            motion_allowed,
+            on_screen,
+            frozen: self.message_holds_frozen(),
+            forced: crate::chrome_band::forced_chrome().is_some(),
+        })
     }
 
     /// The next instant any ON-SCREEN window's band needs a motion frame (or a
@@ -2795,27 +2377,27 @@ impl App {
     /// handoff freezes the band: the frame on glass STAYS where it is — the
     /// screen is parked, and not even a move to the still form repaints it
     /// (main's freeze rule) — so the loop never arms a wake it would not act
-    /// on.
+    /// on. The fold is the engine's (`drive::motion_deadline_over`: each
+    /// view's memoised next change from its prepared frame, never in the
+    /// past); which windows are on screen, and each one's look, are this
+    /// host's.
     pub(crate) fn band_motion_deadline(&self, now: Instant) -> Option<Instant> {
-        if self.message_band_rows == 0 || self.message_holds_frozen() {
-            return None;
-        }
-        self.windows
-            .iter()
-            .filter(|(_, ws)| band_on_screen(ws))
-            .filter_map(|(wid, _)| {
-                let look = self.band_look(*wid);
-                let next = self.band_motion_next_for(*wid, now, look)?;
-                if next > now {
-                    return Some(next);
-                }
-                // A due frame may still be queued in winit. Never re-arm its
-                // already-past instant; the next grid instant is the park's
-                // safe deadline until the queued redraw prepares a new frame.
-                let p = self.band_layout_now(*wid)?;
-                self.compute_band_motion_deadline(*wid, &p, now, look)
-            })
-            .min()
+        drive::motion_deadline_over(
+            &self.messages,
+            self.message_band_rows,
+            self.message_holds_frozen(),
+            now,
+            self.windows
+                .iter()
+                .filter(|(_, ws)| band_on_screen(ws))
+                .map(|(wid, ws)| {
+                    (
+                        &ws.band,
+                        crate::message_band::band_lay(usize::from(ws.cols)),
+                        self.band_look(*wid),
+                    )
+                }),
+        )
     }
 
     /// The on-screen windows whose band is due a new motion frame at `now`:
@@ -2825,25 +2407,26 @@ impl App {
     /// load-shed latch or a recording changed it — so the move to (or from)
     /// the still form never depends on each of those triggers asking for its
     /// own redraw. Nothing while a handoff freezes the band (the frame stays,
-    /// [`Self::band_motion_deadline`]).
+    /// [`Self::band_motion_deadline`]). The rule is the engine's
+    /// (`drive::due_views`).
     pub(crate) fn band_motion_due(&self, now: Instant) -> Vec<WindowId> {
-        if self.message_band_rows == 0 || self.message_holds_frozen() {
-            return Vec::new();
-        }
-        self.windows
-            .iter()
-            .filter(|(_, ws)| band_on_screen(ws))
-            .filter_map(|(wid, ws)| {
-                let look = self.band_look(*wid);
-                if ws.band_motion.is_some() && ws.band_motion_look != Some(look) {
-                    return (self.messages.fingerprint(usize::from(ws.cols)) != 0).then_some(*wid);
-                }
-                let due = self
-                    .band_motion_next_for(*wid, now, look)
-                    .is_some_and(|d| d <= now || ws.band_motion.is_none());
-                due.then_some(*wid)
-            })
-            .collect()
+        drive::due_views(
+            &self.messages,
+            self.message_band_rows,
+            self.message_holds_frozen(),
+            now,
+            self.windows
+                .iter()
+                .filter(|(_, ws)| band_on_screen(ws))
+                .map(|(wid, ws)| {
+                    (
+                        *wid,
+                        &ws.band,
+                        crate::message_band::band_lay(usize::from(ws.cols)),
+                        self.band_look(*wid),
+                    )
+                }),
+        )
     }
 
     /// Prepare window `wid`'s band motion frame for a present at `now` in the
@@ -2857,51 +2440,19 @@ impl App {
 
     /// [`Self::prepare_band_motion`] in an explicit look — the capture
     /// harness's injected instant and look (design §10.12), so a capture is a
-    /// pure function of the center's state and that instant.
+    /// pure function of the center's state and that instant. The frame is the
+    /// engine's (`drive::View::prepare`).
     pub(crate) fn prepare_band_motion_with(
         &mut self,
         wid: WindowId,
         now: Instant,
         look: aterm_messages::Look,
     ) -> u64 {
-        let Some(cols) = self.windows.get(&wid).map(|ws| usize::from(ws.cols)) else {
-            return 0;
-        };
-        let fp = self.messages.fingerprint(cols);
-        if fp == 0 {
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.band_motion = None;
-                ws.band_motion_fp = 0;
-                ws.band_motion_look = None;
-                ws.band_motion_next.set(None);
-            }
-            return 0;
-        }
-        let stale = self
-            .windows
-            .get(&wid)
-            .is_none_or(|ws| !matches!(&ws.band_layout, Some((f, c, _)) if *f == fp && *c == cols));
-        let fresh = stale.then(|| self.band_presentation(cols));
-        let messages = &self.messages;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
-        if let Some(p) = fresh {
-            ws.band_layout = Some((fp, cols, p));
-        }
-        let Some((_, _, p)) = &ws.band_layout else {
-            return 0;
-        };
-        let motion = messages.motion(p, now, look);
-        let mfp = motion.fingerprint();
-        ws.band_motion = Some(motion);
-        ws.band_motion_fp = mfp;
-        ws.band_motion_look = Some(look);
-        // A content-only redraw can prepare the SAME 33 ms band frame again.
-        // The memo's frame/source/look key keeps that answer valid, so leave
-        // it in place; a genuinely new frame misses that key on the next
-        // event/park query and computes its own deadline.
-        mfp
+        let lay = crate::message_band::band_lay(usize::from(ws.cols));
+        ws.band.prepare(&self.messages, &lay, now, look)
     }
 }
 
@@ -2914,7 +2465,19 @@ impl App {
     /// the center's [`Carry`] in the manifest's own plain-data shape.
     #[cfg(any(unix, test))]
     pub(crate) fn carried_messages(&self) -> crate::session_store::MessagesCarry {
-        crate::session_store::MessagesCarry::from(&self.messages.carried())
+        let mut carry = crate::session_store::MessagesCarry::from(&self.messages.carried());
+        carry.update_health_said = self
+            .update_health_said
+            .iter()
+            .map(
+                |(kind, title, line)| crate::session_store::CarriedHealthSaid {
+                    kind: kind.key().to_string(),
+                    title: title.clone(),
+                    line: line.clone(),
+                },
+            )
+            .collect();
+        carry
     }
 
     /// THE SUCCESSOR'S FIRST FRAMES, before Commit: re-seed the rows the
@@ -2934,6 +2497,17 @@ impl App {
         finishing: Option<&str>,
     ) {
         let now = Instant::now();
+        // WHAT THE PARENT'S WARNINGS SAID, whether or not their rows still
+        // stand (round six, finding 54): the landing at Commit is the proof,
+        // and it is this process's to record — the parent `_exit`s at Commit.
+        // A plain restart (`finishing` None) carries nothing it could heal.
+        if finishing.is_some() {
+            for said in &carry.update_health_said {
+                if let Some(kind) = update_words::HealthKind::of_key(&said.kind) {
+                    self.remember_update_health_said((kind, said.title.clone(), said.line.clone()));
+                }
+            }
+        }
         let carried: Carry = carry.message_carry();
         if carried.is_empty() {
             return;
@@ -3037,19 +2611,30 @@ impl HealthProof {
         if class.is_empty() {
             Self::Installed
         } else {
-            Self::needed_for(update_words::HealthKind::of_class(class))
+            Self::needed_for(update_words::HealthKind::of_class(class)).unwrap_or(Self::Installed)
         }
     }
 
     /// The proof a warning of `kind` needs before it may leave and its healing
     /// be recorded. The check half and the watchdog's stall need the least:
     /// the lane's old rule, "a check that downloads is a check that works".
-    fn needed_for(kind: update_words::HealthKind) -> Self {
+    /// `None` for a warning no proof of this process's own answers: another
+    /// aterm holding the update check's lock (round six, finding 53) is healed
+    /// only by its streak ending, by the watchdog that said it.
+    fn needed_for(kind: update_words::HealthKind) -> Option<Self> {
         match kind {
-            update_words::HealthKind::Install => Self::Installed,
-            update_words::HealthKind::Download => Self::Downloaded,
-            update_words::HealthKind::Check | update_words::HealthKind::Stalled => Self::Checked,
+            update_words::HealthKind::Install => Some(Self::Installed),
+            update_words::HealthKind::Download => Some(Self::Downloaded),
+            update_words::HealthKind::Check | update_words::HealthKind::Stalled => {
+                Some(Self::Checked)
+            }
+            update_words::HealthKind::LockHeld => None,
         }
+    }
+
+    /// Whether this proof answers a warning of `kind` ([`Self::needed_for`]).
+    fn answers(self, kind: update_words::HealthKind) -> bool {
+        Self::needed_for(kind).is_some_and(|needed| self >= needed)
     }
 }
 
@@ -3059,7 +2644,9 @@ mod tests {
     use crate::update_words::LiveHealth as _;
     #[cfg(unix)]
     use aterm_messages::HOLD_SUCCESS;
-    use aterm_messages::{HOLD_GESTURE, LogState, Meter, Severity, tags};
+    use aterm_messages::{
+        HOLD_GESTURE, LogRecord, LogState, MAX_ROWS, Meter, Retired, Severity, tags, words,
+    };
 
     fn warn(title: &str) -> Message {
         Message::new(tags::CONFIG, Severity::Warn, title).line("why")
@@ -3230,6 +2817,107 @@ mod tests {
             1,
             "an empty inbox posts nothing"
         );
+    }
+
+    /// The start that fell back to the home folder for `dir`, said as
+    /// `spawn_session` says it once the shell is up.
+    fn fell_back(dir: &str, fault: crate::spawn_folder::Fault) {
+        crate::spawn_folder::StartFolder {
+            cwd: Some("/Users//me".into()),
+            fell_back: Some((dir.into(), fault)),
+        }
+        .say();
+    }
+
+    /// AUDIT #7 FINDING 48 — the folders fresh shells could not start in fold
+    /// into ONE row per fault at the park: a restore that meets two gone
+    /// folders is one row naming both, a New Tab from a third while that row
+    /// is up joins it, a folder that could not be entered is its own row, and
+    /// once the person has dismissed a row the next folder is a fresh row
+    /// naming only itself.
+    #[test]
+    fn folders_that_were_not_found_fold_into_one_row_while_it_is_up() {
+        use crate::spawn_folder::Fault;
+        let _lane = crate::message_inbox::lane_test_guard();
+        let _ = crate::message_inbox::take_queued();
+        let _ = crate::spawn_folder::take_noted();
+        let mut app = App::headless_for_test();
+        let key = crate::message_reporters::KEY_FOLDER_NOT_FOUND;
+        let rows = |app: &App, key: &str| {
+            app.messages
+                .live_rows()
+                .filter(|l| l.msg.key.as_deref() == Some(key))
+                .count()
+        };
+        fell_back("/work/a", Fault::Missing);
+        fell_back("/work/b", Fault::Missing);
+        app.drain_message_inbox();
+        assert_eq!(rows(&app, key), 1, "one row for the restore");
+        let live = app.messages.live_by_key(key).expect("the row");
+        assert_eq!(live.msg.title, "Couldn't find 2 folders");
+        assert_eq!(
+            live.msg.detail,
+            ["opened in your home folder instead", "/work/a", "/work/b"]
+        );
+
+        fell_back("/work/c", Fault::Missing);
+        fell_back("/srv/locked", Fault::Shut);
+        app.drain_message_inbox();
+        assert_eq!(rows(&app, key), 1, "still one row");
+        let live = app.messages.live_by_key(key).expect("the row");
+        assert_eq!(live.msg.title, "Couldn't find 3 folders");
+        assert_eq!(&live.msg.detail[1..], ["/work/a", "/work/b", "/work/c"]);
+        let shut = crate::message_reporters::KEY_FOLDER_NOT_OPENED;
+        assert_eq!(rows(&app, shut), 1, "a folder not entered: its own row");
+        let live = app.messages.live_by_key(shut).expect("the row");
+        assert_eq!(live.msg.title, "Couldn't open the folder");
+
+        let id = app.messages.live_by_key(key).expect("the row").id;
+        assert!(app.messages.dismiss(id, Instant::now()));
+        fell_back("/work/d", Fault::Missing);
+        app.drain_message_inbox();
+        assert_eq!(
+            app.messages
+                .live_by_key(key)
+                .expect("a fresh row")
+                .msg
+                .detail,
+            ["opened in your home folder instead of /work/d"]
+        );
+    }
+
+    /// A ROW CARRIED ACROSS AN UPDATE KEEPS ITS FOLDERS: the successor's list
+    /// starts empty while the carried row is up, and the next folder joins
+    /// the folders that row named instead of replacing them. The negative
+    /// control is the same folder with no row up: a fresh row naming it alone.
+    #[test]
+    fn a_carried_folder_row_keeps_its_folders_when_the_next_one_joins() {
+        use crate::spawn_folder::{Fault, Named};
+        let _lane = crate::message_inbox::lane_test_guard();
+        let _ = crate::message_inbox::take_queued();
+        let _ = crate::spawn_folder::take_noted();
+        let key = crate::message_reporters::KEY_FOLDER_NOT_FOUND;
+
+        let mut fresh = App::headless_for_test();
+        fell_back("/work/c", Fault::Missing);
+        fresh.drain_message_inbox();
+        let live = fresh.messages.live_by_key(key).expect("the row");
+        assert_eq!(live.msg.title, "Couldn't find the folder", "no row was up");
+
+        let mut app = App::headless_for_test();
+        let carried = crate::message_reporters::folder_row(
+            Fault::Missing,
+            &Named {
+                dirs: vec!["/work/a".into(), "/work/b".into()],
+                unnamed: 0,
+            },
+        );
+        app.post_unsynced(carried, wall_stamp_now());
+        fell_back("/work/c", Fault::Missing);
+        app.drain_message_inbox();
+        let live = app.messages.live_by_key(key).expect("the row");
+        assert_eq!(live.msg.title, "Couldn't find 3 folders");
+        assert_eq!(&live.msg.detail[1..], ["/work/a", "/work/b", "/work/c"]);
     }
 
     /// A reload's set REPLACES the config rows: the old family rows are
@@ -3851,25 +3539,19 @@ mod tests {
         let mut log = aterm_messages::MessageLog::empty();
         log.replay(aterm_messages::LogLine::Posted(dead));
         let replayed = log.records().next().expect("replayed");
-        let view = message_view(replayed, None, None, None, &Default::default());
+        let view = MessageView::of(replayed, None, None, &PageDesk::of(&app));
         assert_eq!(view.state, "stale");
         assert_eq!(view.state_words(), "still open when aterm stopped");
         assert_eq!(view.glyph, '\u{2139}', "the replayed open record's mark");
         // Control: the same record while live keeps its working mark, and a
-        // mark that is not a working one is kept when cut off.
-        assert_eq!(
-            cut_off_mark(replayed.glyph, Severity::Info, "live").ch(),
-            '\u{21bb}'
-        );
-        assert_eq!(
-            cut_off_mark(Severity::Warn.default_glyph(), Severity::Warn, "stale").ch(),
-            '\u{26a0}'
-        );
+        // mark that is not a working one is kept when cut off — the mark's
+        // own law, moved with it to the engine (design ruling 382):
+        // `aterm_messages::page_tests::a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter`.
         // A row this process retired Stale keeps its words.
         let mut silent = replayed.clone();
         silent.retired_unix_ms = Some(61_000);
         assert_eq!(
-            message_view(&silent, None, None, None, &Default::default()).state_words(),
+            MessageView::of(&silent, None, None, &PageDesk::of(&app)).state_words(),
             "stopped reporting after 1 min"
         );
     }
@@ -4075,10 +3757,8 @@ mod tests {
         assert_eq!(tag_words("ci"), "CI");
         assert_eq!(tag_words("Deploy"), "Deploy");
         assert_eq!(tag_words("crash"), "Crashes");
-        assert_eq!(span_words(40_000), "40 s");
-        assert_eq!(span_words(150_000), "2 min");
-        assert_eq!(span_words(7_200_000), "2 h");
-        assert_eq!(span_words(200_000_000), "2 d");
+        // The span words are the engine's own law, moved with it (design
+        // ruling 382): `aterm_messages::page_tests::tags_chips_cover_the_vocabulary`.
     }
 
     /// THE PAGE'S PRESS (`perform_message_act`): a live row's button goes
@@ -4795,6 +4475,17 @@ mod tests {
                 .any(|l| l.msg.title == "Couldn't open the log"),
             "the refusal is a row"
         );
+    }
+
+    /// An instant past the grace of every row posted so far. Read AFTER the
+    /// post, never before it: `post` stamps the row with its own
+    /// `Instant::now()`, so a clock read ahead of the call falls inside the
+    /// grace whenever the thread is descheduled between the two for longer
+    /// than the margin (a loaded parallel run failed
+    /// `a_heavy_routine_row_folds_once_at_the_childs_exit_across_sub_passes`
+    /// that way, 2026-09-28).
+    fn past_the_grace() -> Instant {
+        Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10)
     }
 
     /// A classified `progress.json` read of a "net" pass started at `started`:
@@ -5780,6 +5471,7 @@ mod tests {
             layout_digest: [0; 32],
             screen_digest: [0; 32],
             activity_epoch: 0,
+            hold_serials: 0,
             cancel,
             #[cfg(unix)]
             arbiter: crate::HandoffAttemptArbiter::new(),
@@ -5804,6 +5496,9 @@ mod tests {
             messages: carried.messages,
             next_message_id: carried.next_message_id,
             update_verified_unix_ms: None,
+            font_px_milli: None,
+            font_reset_px_milli: None,
+            update_health_said: carried.update_health_said,
         }
     }
 
@@ -6325,13 +6020,12 @@ mod tests {
                 app.note_update_check_asked(true);
             }
             let regrids = message_regrids();
-            let t0 = Instant::now();
             app.note_update_progress(&aterm_update::Progress::Downloading {
                 version: "9.9.9".into(),
                 bytes_done: 10_000_000,
                 bytes_total: 74_000_000,
             });
-            let t = t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10);
+            let t = past_the_grace();
             app.settle_messages(t);
             assert_eq!(app.message_band_rows, u16::from(asked), "asked={asked}");
             assert_eq!(message_regrids(), regrids + u64::from(asked));
@@ -6431,9 +6125,7 @@ mod tests {
                 bytes_done: 10_000_000,
                 bytes_total: 74_000_000,
             });
-            app.settle_messages(
-                Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10),
-            );
+            app.settle_messages(past_the_grace());
             assert_eq!(app.message_band_rows, 1, "revealed");
             app.note_update_progress(&progress);
             assert_eq!(app.messages.live_rows().count(), 0, "{progress:?}");
@@ -6551,7 +6243,6 @@ mod tests {
         );
         app.settle_messages(Instant::now() + PROGRESS_GRACE * 2);
         assert_eq!(message_regrids(), regrids);
-        let t0 = Instant::now();
         app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
         let live = app
             .messages
@@ -6561,7 +6252,7 @@ mod tests {
         assert_eq!(live.msg.title, "Updating ALab tools");
         assert_eq!(app.message_band_rows, 0, "inside its grace, off the glass");
         assert_eq!(message_regrids(), regrids);
-        app.settle_messages(t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10));
+        app.settle_messages(past_the_grace());
         assert_eq!(app.message_band_rows, 1, "revealed once the work lasted");
         assert_eq!(message_regrids(), regrids + 1);
         app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
@@ -6599,13 +6290,12 @@ mod tests {
 
         let mut app = App::headless_for_test();
         let regrids = message_regrids();
-        let t0 = Instant::now();
         app.person_pass(PersonPass::Began(PackagesVerb::Check));
         let live = app.messages.live_rows().next().expect("the Check's row");
         assert_eq!(live.msg.title, "Checking ALab tools");
         assert!(live.msg.meter.as_ref().is_some_and(|m| m.busy), "busy");
         assert_eq!(attention(&live.msg), Ok(Attention::Progress));
-        let mut t = t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10);
+        let mut t = past_the_grace();
         app.settle_messages(t);
         assert_eq!(app.message_band_rows, 1, "the wait lasted: revealed");
         // The plan lands: a LIGHT pass paints, because a person waits.
@@ -6708,7 +6398,6 @@ mod tests {
                 .expect("the person's row")
         };
         let run = |app: &mut App, own_pass_plans: bool| {
-            let t0 = Instant::now();
             app.person_pass(PersonPass::Began(PackagesVerb::Check));
             app.person_pass(PersonPass::Waiting);
             // The holder (pid 7) plans a light pass: the queued row shows it.
@@ -6748,7 +6437,7 @@ mod tests {
                 assert_eq!(row(app).0, "Updating ALab tools", "its own plan paints");
                 assert!(row(app).1.is_some());
             }
-            app.settle_messages(t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10));
+            app.settle_messages(past_the_grace());
             app.person_pass(PersonPass::Ended(EchoKind::Complete));
             let echo = app.messages.echoes().first().expect("the echo");
             assert_eq!(echo.kind, EchoKind::Complete);
@@ -6859,9 +6548,8 @@ mod tests {
     fn a_heavy_routine_row_folds_once_at_the_childs_exit_across_sub_passes() {
         let mut app = App::headless_for_test();
         let regrids = message_regrids();
-        let t0 = Instant::now();
         app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
-        let mut t = t0 + PROGRESS_GRACE + std::time::Duration::from_millis(10);
+        let mut t = past_the_grace();
         app.settle_messages(t);
         assert_eq!(app.message_band_rows, 1);
         // The vendor sub-pass answers and ends; the ALab set's reads follow.
@@ -7089,8 +6777,9 @@ mod tests {
         let fp1 = app.prepare_band_motion(WindowId(0), now + std::time::Duration::from_secs(3));
         assert_eq!(fp0, fp1, "the still form does not move with time");
         let motion = app.windows[&WindowId(0)]
-            .band_motion
-            .clone()
+            .band
+            .motion()
+            .cloned()
             .expect("prepared");
         assert_eq!(
             motion.rows[0].anim,
@@ -7356,7 +7045,7 @@ mod tests {
                 .is_empty(),
             "frozen: nothing due, even in another look"
         );
-        assert_eq!(app.windows[&wid].band_motion_fp, fp, "frozen where it is");
+        assert_eq!(app.windows[&wid].band.motion_fp(), fp, "frozen where it is");
         app.incoming_handoff_pending = false;
         // Queued behind three Warn rows: a row the band does not show does
         // not move.
@@ -7845,6 +7534,70 @@ mod tests {
         );
     }
 
+    /// THE HEALING IS RECORDED ON THE AUTOMATIC LANE AND AFTER THE FOLD TOO
+    /// (round six, finding 54): what the parent's warning said crosses the
+    /// handoff as its own field, so the successor's landing records "aterm
+    /// updates work again" when no progress row was carried (the automatic
+    /// lane posts none) and when the warning row had already folded — and the
+    /// field survives the manifest's own encoding.
+    #[test]
+    fn the_landing_records_the_healing_with_no_progress_row_and_after_the_fold() {
+        let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
+        let healed = |successor: &App| {
+            successor
+                .messages
+                .log()
+                .records()
+                .filter(|r| r.title == "aterm updates work again")
+                .map(|r| r.detail.join(" "))
+                .collect::<Vec<_>>()
+        };
+        let through_the_wire = |carry: &crate::session_store::WindowCarry| {
+            let text = aterm_toml::to_string(carry).expect("encodes");
+            aterm_toml::from_str::<crate::session_store::WindowCarry>(&text).expect("decodes")
+        };
+        // The automatic lane: no progress row, the warning still up.
+        let mut parent = App::headless_for_test();
+        assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
+        let carry = through_the_wire(&window_carry(
+            parent.message_band_rows,
+            parent.carried_messages(),
+        ));
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, Some("0.76.0"));
+        successor.post_update_landed("0.76.0", 7, 0);
+        assert_eq!(
+            healed(&successor),
+            vec!["after \"Couldn't install updates\", since Sep 14".to_string()]
+        );
+        assert!(successor.messages.live_health().is_none());
+        // The warning folded before the carry: an explicit row, no warning row.
+        let mut parent = App::headless_for_test();
+        parent.post_message(update_words::installing("0.76.0"));
+        assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
+        for id in parent.live_update_health(|_| true) {
+            parent.resolve_message(id, Outcome::Warn);
+        }
+        let carry = through_the_wire(&window_carry(
+            parent.message_band_rows,
+            parent.carried_messages(),
+        ));
+        assert!(!carry.update_health_said.is_empty());
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, Some("0.76.0"));
+        successor.post_update_landed("0.76.0", 7, 0);
+        assert_eq!(healed(&successor).len(), 1, "once");
+        // A plain restart remembers nothing; a carry with nothing to heal
+        // writes no key (the wire it always was).
+        let mut plain = App::headless_for_test();
+        plain.seed_carried_messages(&carry, None);
+        plain.post_update_landed("0.76.0", 7, 0);
+        assert!(healed(&plain).is_empty());
+        let quiet = window_carry(0, App::headless_for_test().carried_messages());
+        let text = aterm_toml::to_string(&quiet).expect("encodes");
+        assert!(!text.contains("update_health_said"), "{text}");
+    }
+
     /// THE HEAL IS KEYED BY KIND, AND AN OLDER BUILD'S WORDS STILL HEAL (design
     /// ruling 311). The health titles took the family grammar (`Couldn't
     /// download updates`), so nothing may match them word for word any more:
@@ -8236,6 +7989,13 @@ mod tests {
             repaint: false,
             fg_holder: 0,
             history: crate::handoff_history::AdoptedHistory::default(),
+            hold: None,
+            title: String::new(),
+            supervisor: None,
+            attention_owners: Vec::new(),
+            claim_grace: false,
+            outgoing_build: None,
+            keeper: None,
         }];
         assert!(
             app.post_managed_current(

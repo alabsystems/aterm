@@ -41,6 +41,15 @@ pub const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum number of per-program rows admitted from one status snapshot.
 pub const MAX_STATUS_PROGRAMS: usize = 2048;
 
+/// The clause an update pass that did NOT reach the signed index appends to its `outcome`
+/// — `<outcome> (index from cache — <why>)` — naming the recorded cause (a rate limit, a
+/// 5xx, a captive portal). ONE spelling for the writer (atpkg's `record_index_freshness`)
+/// and its reader (the window's pass report, which reads it to say such a pass ran on a
+/// stale index instead of posting "Package update failed" with no reason: 2026-09-24
+/// 20:35:33Z, `exit=1`, "index from cache — GitHub rate limit hit (HTTP 403)",
+/// messages.log id=4 "atpkg ended without saying what happened"; fixed 2026-09-26).
+pub const INDEX_FROM_CACHE_CLAUSE: &str = "(index from cache \u{2014} ";
+
 /// One program's last-known state, for `status.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgramStatus {
@@ -140,6 +149,23 @@ pub struct Status {
     /// 2026-09-24). Zero before then; an older binary carries it through unmoved.
     #[serde(default)]
     pub pass_seq: u64,
+    /// The [`Self::pass_seq`] of the last full pass that ended `failed` for ONE reason
+    /// only: its index came from the §14 cache (the listing was refused — a rate limit, a
+    /// 5xx — and some host answered, so not offline) while no member failed. Such a pass
+    /// exits 1 with NOTHING on stderr; its cause is only [`INDEX_FROM_CACHE_CLAUSE`] in
+    /// [`Self::outcome`]. Zero, or any value but the current `pass_seq`, means the last
+    /// pass was not that (the fact belongs to one pass end, and every pass end rewrites
+    /// it — an older binary that bumps `pass_seq` without knowing this key leaves it
+    /// naming an earlier pass, which reads as "not that", the safe side).
+    ///
+    /// Why it is recorded (2026-09-26): a `--wait-lock` child that queued behind such a
+    /// pass stands down and must exit "as that pass would have said it to the window"
+    /// ([`crate::cli`]'s stand-down). The outcome text alone cannot say whether the
+    /// holder ALSO failed a member (its failure sentence and the cache clause share the
+    /// one `outcome`), and the window read a stood-down stale-index pass as "Package
+    /// update failed". [`stale_index_only_end`] reads it.
+    #[serde(default)]
+    pub stale_index_only_pass_seq: u64,
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
@@ -228,6 +254,22 @@ pub fn stamp_pass_end_with_index(
     outcome: aterm_update_core::pkg_check::PassOutcome,
     attempted_index_build: u64,
 ) -> io::Result<()> {
+    stamp_pass_end_recorded(layout, now, outcome, attempted_index_build, false)
+}
+
+/// [`stamp_pass_end_with_index`], also recording whether this pass failed ONLY because its
+/// index came from the cache (`stale_index_only`, [`Status::stale_index_only_pass_seq`]) —
+/// in the same write as the end it describes, so no reader sees one without the other.
+///
+/// # Errors
+/// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
+pub fn stamp_pass_end_recorded(
+    layout: &Layout,
+    now: &str,
+    outcome: aterm_update_core::pkg_check::PassOutcome,
+    attempted_index_build: u64,
+    stale_index_only: bool,
+) -> io::Result<()> {
     let mut status = seed_for_rewrite(layout)?;
     status.last_pass = outcome.word().to_string();
     // Older binaries write whole-second `last_pass_at` and preserve unknown
@@ -241,10 +283,26 @@ pub fn stamp_pass_end_with_index(
         .map(|stamp| format!("{stamp}.000000000Z"));
     status.last_pass_at = witness_at.clone().unwrap_or_else(|| now.to_string());
     status.pass_seq = status.pass_seq.saturating_add(1);
+    status.stale_index_only_pass_seq =
+        if stale_index_only && outcome == aterm_update_core::pkg_check::PassOutcome::Failed {
+            status.pass_seq
+        } else {
+            0
+        };
     status.last_pass_attempted_index_build = attempted_index_build;
     status.last_pass_attempted_at = witness_at.unwrap_or_default();
     status.updated_at = now.to_string();
     write(layout, &status)
+}
+
+/// Whether `status`'s last recorded full pass ended `failed` ONLY because its index came
+/// from the cache — no member failed, nothing said on stderr
+/// ([`Status::stale_index_only_pass_seq`] naming the current [`Status::pass_seq`]). Pure.
+#[must_use]
+pub fn stale_index_only_end(status: &Status) -> bool {
+    status.pass_seq > 0
+        && status.stale_index_only_pass_seq == status.pass_seq
+        && status.last_pass == aterm_update_core::pkg_check::PassOutcome::Failed.word()
 }
 
 /// THE MACHINE-WIDE STAMPS every lane schedules a full pass on — the window's gate and walk,
@@ -278,16 +336,7 @@ impl Status {
     /// # Errors
     /// The serializer's message, prefixed, when the map cannot be rendered.
     pub fn to_toml(&self) -> Result<String, String> {
-        aterm_toml::to_string(self).map_err(|e| {
-            // Manual concat of the previous `format!("serialize status: {e}")` —
-            // byte-identical (`{e}` is `Display`, which is what `to_string`
-            // renders): the `format!` expansion embeds `fmt::Arguments`
-            // construction (with inlined `unsafe`) that the strict Trust gate
-            // cannot lower and fails closed on.
-            let mut m = String::from("serialize status: ");
-            m.push_str(&e.to_string());
-            m
-        })
+        aterm_toml::to_string(self).map_err(|e| format!("serialize status: {e}"))
     }
 }
 
@@ -336,6 +385,7 @@ fn only_stamps_differ(a: &Status, b: &Status) -> bool {
         last_pass_attempted_index_build: 0,
         last_pass_attempted_at: String::new(),
         pass_seq: 0,
+        stale_index_only_pass_seq: 0,
         ..s.clone()
     };
     unstamped(a) == unstamped(b)
@@ -370,11 +420,7 @@ fn render(status: &Status) -> io::Result<String> {
 /// nothing sweeps `status.toml.tmp-*`, so a full disk would strand one per pass.
 fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
     let dest = layout.status();
-    // Manual rendering of `format!("status.toml.tmp-{}", pid)`: the `format!` expansion
-    // embeds `fmt::Arguments` construction the strict Trust gate cannot lower.
-    let mut tmp_name = String::from("status.toml.tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = dest.with_file_name(tmp_name);
+    let tmp = dest.with_file_name(format!("status.toml.tmp-{}", std::process::id()));
     let written = (|| {
         use std::io::Write as _;
         let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
@@ -536,15 +582,13 @@ fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
 /// `status.toml.corrupt-<unix>`, or `…-<unix>-<pid>` when a record was already kept aside
 /// in the same second.
 fn corrupt_path(layout: &Layout, unix: u64) -> PathBuf {
-    let mut name = String::from("status.toml.corrupt-");
-    name.push_str(&crate::dec_u64(unix));
-    let first = layout.prefix.join(&name);
+    let first = layout.prefix.join(format!("status.toml.corrupt-{unix}"));
     if std::fs::symlink_metadata(&first).is_err() {
         return first;
     }
-    name.push('-');
-    name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    layout.prefix.join(name)
+    layout
+        .prefix
+        .join(format!("status.toml.corrupt-{unix}-{}", std::process::id()))
 }
 
 /// The record the store describes when the written one is lost: a row per active program
@@ -890,6 +934,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 3,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };
@@ -1266,6 +1311,7 @@ mod tests {
             last_pass_attempted_index_build: 0,
             last_pass_attempted_at: String::new(),
             pass_seq: 3,
+            stale_index_only_pass_seq: 0,
             programs,
             extra: Default::default(),
         };

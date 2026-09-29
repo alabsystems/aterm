@@ -277,20 +277,52 @@ fn temp_path(staging: &Staging) -> PathBuf {
 /// moments later, which used to erase the one sentence that explained where the
 /// stage went (2026-08-19 round-2 audit). Set by the event, cleared at the start of
 /// the next check.
+#[cfg(not(test))]
 static CHECK_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+// Under test the note is per THREAD: the harness runs tests concurrently on its own
+// threads, and a test that retires a revoked stage (which sets the note) otherwise
+// leaks "held: staged … signed by machine …" onto another test's status line —
+// measured 2026-09-29 as an intermittent failure of
+// `a_stage_that_already_covers_the_candidate_records_the_staged_decision`.
+#[cfg(test)]
+thread_local! {
+    static CHECK_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(not(test))]
+fn store_check_note(note: Option<String>) {
+    *CHECK_NOTE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = note;
+}
+
+#[cfg(test)]
+fn store_check_note(note: Option<String>) {
+    CHECK_NOTE.with(|slot| *slot.borrow_mut() = note);
+}
+
+#[cfg(not(test))]
+fn check_note() -> Option<String> {
+    CHECK_NOTE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[cfg(test)]
+fn check_note() -> Option<String> {
+    CHECK_NOTE.with(|slot| slot.borrow().clone())
+}
 
 /// Attach `note` to every status record until [`clear_check_note`].
 pub(crate) fn set_check_note(note: String) {
-    *CHECK_NOTE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+    store_check_note(Some(note));
 }
 
 /// Forget the current check note and the delivery facts (the next check starts clean).
 pub(crate) fn clear_check_note() {
-    *CHECK_NOTE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    store_check_note(None);
     clear_delivery();
 }
 
@@ -299,11 +331,8 @@ pub(crate) fn clear_check_note() {
 pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
     let ready = crate::manifest::Ready::read_publishable(staging);
     let noted;
-    let outcome = match CHECK_NOTE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_deref()
-    {
+    let note = check_note();
+    let outcome = match note.as_deref() {
         Some(note) if !outcome.contains(note) => {
             noted = format!("{outcome} · {note}");
             noted.as_str()

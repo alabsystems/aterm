@@ -16,8 +16,42 @@ use std::time::{Duration, Instant};
 /// Absolute, so no `PATH` entry can stand in for Apple's tool.
 pub const CODESIGN: &str = "/usr/bin/codesign";
 
-/// The ceiling on one verification when the caller brings no deadline of its own.
+/// The ceiling on one verification when the caller brings no deadline of its own — and
+/// the floor [`verify_timeout_for`] scales up from.
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The slowest read rate a size-scaled verification ([`verify_timeout_for`]) is given time
+/// for: 2 MiB/s. codesign `--verify --strict` hashes every page of the file, so its time
+/// is its READ time, and under atpkg's `taskpolicy -c utility` clamp (the window spawns
+/// every pass as `qos::Role::Background`, and codesign inherits the clamp) those reads are
+/// IO-throttled behind whatever else the disk is doing. Evidence (2026-09-26, the owner's
+/// Mac at a load average of ~90 from parallel `targo` builds): the installed codex
+/// 0.157.0 binary (238 MB) verified in 1.98 s unclamped and in 453 s under `taskpolicy -c
+/// utility` (`sample` mid-run: `scanFileData` → `FileDesc::read`, i.e. throttled
+/// reads, 2.3 s of CPU in all); its 65 MB helper in 0.66 s unclamped and 130–215 s
+/// clamped (116 s with `taskpolicy -d important` inside the clamp — the disk policy
+/// does not escape it). The
+/// fixed 30 s ceiling this replaces failed codex twice on 2026-09-25 (02:42:55Z,
+/// 02:48:29Z) and let it through 21 s later — a race against the disk, not a verdict.
+/// So no deadline is long enough on a saturated machine: this rate covers a moderately
+/// busy one, and what a deadline still cannot cover is DEFERRED by the caller, never
+/// failed (atpkg's `StageError::VerifyDeferred`).
+pub const VERIFY_MIN_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
+
+/// The most time [`verify_timeout_for`] gives one file, however large: a verification
+/// holds the store lock, and one that has not finished in ten minutes is deferred to the
+/// next pass rather than waited on.
+pub const VERIFY_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+
+/// The deadline one verification of a `len`-byte file is given: [`VERIFY_TIMEOUT`] plus
+/// one second per [`VERIFY_MIN_BYTES_PER_SEC`], capped at [`VERIFY_TIMEOUT_MAX`]. A small
+/// file keeps the historical 30 s; codex's 238 MB binary gets 143 s.
+#[must_use]
+pub fn verify_timeout_for(len: u64) -> Duration {
+    VERIFY_TIMEOUT
+        .saturating_add(Duration::from_secs(len / VERIFY_MIN_BYTES_PER_SEC))
+        .min(VERIFY_TIMEOUT_MAX)
+}
 
 /// The first child-exit poll, doubled up to [`POLL_MAX`]: codesign on one binary takes
 /// tens of milliseconds, and a fixed tick would round every call up to it.
@@ -40,7 +74,10 @@ pub enum CodesignError {
     Spawn(std::io::Error),
     /// Waiting for codesign failed.
     Wait(std::io::Error),
-    /// codesign did not finish by the deadline; it was killed and reaped.
+    /// codesign did not finish by the deadline; it was killed and reaped. Never a pass,
+    /// and never a verdict on the bytes ([`Self::is_verdict`]): what a caller does with it
+    /// is its own policy — the app updater refuses the update, atpkg's Developer ID gate
+    /// defers the program to its next pass (`StageError::VerifyDeferred`, 2026-09-26).
     TimedOut,
     /// codesign ran and refused. `code` is its exit status (`None` when a signal ended
     /// it): 1 is a signature that does not verify, 3 a valid signature that fails the
@@ -55,10 +92,7 @@ impl std::fmt::Display for CodesignError {
             Self::Unsupported => f.write_str("codesign exists only on macOS"),
             Self::Spawn(e) => write!(f, "spawn {CODESIGN}: {e}"),
             Self::Wait(e) => write!(f, "wait for {CODESIGN}: {e}"),
-            Self::TimedOut => write!(
-                f,
-                "{CODESIGN} did not finish in time; treating as a rejection"
-            ),
+            Self::TimedOut => write!(f, "{CODESIGN} did not finish in time"),
             Self::Refused { code, stderr } => {
                 match code {
                     Some(code) => write!(f, "{CODESIGN} refused (exit {code})")?,
@@ -371,6 +405,25 @@ mod tests {
             assert!(!unreadable.is_verdict(), "{unreadable}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE DEADLINE SCALES WITH THE FILE (2026-09-26): a small file keeps the historical
+    /// 30 s, codex's 238 MB binary gets 143 s rather than the 30 s that failed it twice on
+    /// 2026-09-25, and nothing is given more than the ten-minute cap.
+    #[test]
+    fn the_verify_deadline_scales_with_the_file_and_is_capped() {
+        assert_eq!(verify_timeout_for(0), VERIFY_TIMEOUT);
+        assert_eq!(verify_timeout_for(64 * 1024), VERIFY_TIMEOUT);
+        assert_eq!(
+            verify_timeout_for(238_223_808),
+            Duration::from_secs(30 + 113)
+        );
+        assert!(verify_timeout_for(238_223_808) > VERIFY_TIMEOUT);
+        assert_eq!(verify_timeout_for(u64::MAX), VERIFY_TIMEOUT_MAX);
+        assert_eq!(
+            verify_timeout_for(10 * 1024 * 1024 * 1024),
+            VERIFY_TIMEOUT_MAX
+        );
     }
 
     /// A deadline already spent kills and reaps the child rather than waiting on it.

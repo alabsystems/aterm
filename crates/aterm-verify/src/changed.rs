@@ -241,23 +241,15 @@ pub fn select(
     }
     let names = members.names();
 
-    let mut widened: Option<String> = None;
-    let mut seeds: BTreeSet<String> = BTreeSet::new();
-    for p in paths {
-        if replans_everything(p) && widened.is_none() {
-            widened = Some(format!(
-                "{p} changed, which can change how every crate is built"
-            ));
-        }
-        if let Some(name) = owning_member(p, manifests, &names) {
-            seeds.insert(name.to_string());
-        }
-    }
+    let (seeds, replanned) = seeds(paths, manifests, &names);
     // Already decided to widen: the cone below would cost a `targo tree --invert`
     // per seed crate and change nothing.
-    if let Some(why) = widened.take() {
-        return Selection::Widened(why);
+    if let Some(p) = replanned {
+        return Selection::Widened(format!(
+            "{p} changed, which can change how every crate is built"
+        ));
     }
+    let mut widened: Option<String> = None;
 
     let mut cone: BTreeSet<String> = seeds.clone();
     for seed in &seeds {
@@ -285,6 +277,184 @@ pub fn select(
         crates,
         any_lib,
     }
+}
+
+/// The SEED half of [`select`], on its own: the workspace members whose own
+/// files changed, and the first [`REPLANNING_PATHS`] entry among the paths, if
+/// any. No reverse cone — for the one stage that must act on exactly what a
+/// change touched (the Trust advisory lane: a library's obligations come from
+/// its own MIR, and the lane excludes every dependency unit).
+#[must_use]
+pub fn seeds(
+    paths: &[String],
+    manifests: &Manifests,
+    members: &BTreeSet<String>,
+) -> (BTreeSet<String>, Option<String>) {
+    let mut replanned: Option<String> = None;
+    let mut seeds: BTreeSet<String> = BTreeSet::new();
+    for p in paths {
+        if replans_everything(p) && replanned.is_none() {
+            replanned = Some(p.clone());
+        }
+        if let Some(name) = owning_member(p, manifests, members) {
+            seeds.insert(name.to_string());
+        }
+    }
+    (seeds, replanned)
+}
+
+/// What a change touched, library by library — [`touched_since`]'s answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Touched {
+    /// The ref the diff was taken against, as given.
+    pub base: String,
+    /// The merge-base commit the diff started from.
+    pub merge_base: String,
+    /// Seed members with a library target and the ADMITTED vendored forks
+    /// whose files changed ([`forks_touched`]), sorted: what the Trust lane
+    /// verifies (a bin-only seed has nothing the library lane verifies).
+    pub libraries: Vec<String>,
+    /// The first changed path that re-plans every unit, if any.
+    pub replanned: Option<String>,
+}
+
+/// The members whose OWN files changed since the merge-base of HEAD and
+/// `base` — working tree and untracked files included, exactly the paths
+/// `--changed` diffs — the libraries among them, plus every admitted vendored
+/// fork the change touched ([`forks_touched`]). `Err` names what could not be
+/// read; the caller decides what that costs (this never widens).
+///
+/// # Errors
+/// No targo, not a git checkout, no merge-base, an unlistable diff, or a
+/// member table `targo tree` would not give.
+pub fn touched_since(
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+    base: &str,
+) -> Result<Touched, String> {
+    if !tools.have_targo() {
+        return Err("targo is absent, so the workspace members cannot be read".to_string());
+    }
+    let (merge_base, paths) = changed_paths(root, path_env, base)?;
+    let members = read_members(root, tools, path_env);
+    if members.is_empty() {
+        return Err("`targo tree` returned no workspace members".to_string());
+    }
+    let manifests = manifests_near(root, &paths);
+    let (seeds, replanned) = seeds(&paths, &manifests, &members.names());
+    let mut libraries: BTreeSet<String> = seeds
+        .into_iter()
+        .filter(|name| members.0.iter().any(|m| &m.name == name && m.has_lib))
+        .collect();
+    libraries.extend(forks_touched(&paths, &admitted_forks(root)));
+    Ok(Touched {
+        base: base.to_string(),
+        merge_base,
+        libraries: libraries.into_iter().collect(),
+        replanned,
+    })
+}
+
+/// The Trust lane's fork roster, relative to the repository root.
+pub const FORK_ROSTER: &str = "tools/trust-gate-forks.tsv";
+
+/// The ADMITTED vendored forks — `admitted` rows of [`FORK_ROSTER`], which the
+/// Trust lane verifies beside the workspace members — each with the directory
+/// of the manifest under `vendor/` that declares it. A fork the roster admits
+/// and no manifest declares is left out: the lane itself reports it
+/// (`FORK-VANISHED`), and a diff cannot touch what is not there.
+#[must_use]
+pub fn admitted_forks(root: &Path) -> Vec<(String, String)> {
+    let Ok(roster) = std::fs::read_to_string(root.join(FORK_ROSTER)) else {
+        return Vec::new();
+    };
+    let admitted: BTreeSet<&str> = roster
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let name = f.next()?.trim();
+            (f.next()?.trim() == "admitted" && !name.is_empty()).then_some(name)
+        })
+        .collect();
+    let mut found = Vec::new();
+    vendor_manifests(root, "vendor", 0, &mut found);
+    found
+        .into_iter()
+        .filter(|(name, _)| admitted.contains(name.as_str()))
+        .collect()
+}
+
+/// Every `(package, dir)` a `Cargo.toml` declares under `dir`, four levels deep
+/// (vendor/astream/crates/<crate> is the deepest fork), skipping build output.
+fn vendor_manifests(root: &Path, dir: &str, depth: usize, out: &mut Vec<(String, String)>) {
+    if let Some(name) = std::fs::read_to_string(root.join(dir).join("Cargo.toml"))
+        .ok()
+        .and_then(|t| manifest_package_name(&t))
+    {
+        out.push((name, dir.to_string()));
+    }
+    if depth >= 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+        return;
+    };
+    let mut subdirs: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.') && n != "target" && !n.starts_with("target-"))
+        .collect();
+    subdirs.sort();
+    for sub in subdirs {
+        vendor_manifests(root, &format!("{dir}/{sub}"), depth + 1, out);
+    }
+}
+
+/// The forks among `forks` a change to `paths` touched: a path inside a fork's
+/// directory, or a path that CONTAINS it — a submodule bump lists only its
+/// gitlink (`vendor/astream`), never the files of the crates beneath it.
+#[must_use]
+pub fn forks_touched(paths: &[String], forks: &[(String, String)]) -> BTreeSet<String> {
+    forks
+        .iter()
+        .filter(|(_, dir)| {
+            paths.iter().any(|p| {
+                let p = p.trim_end_matches('/');
+                p == dir
+                    || p.strip_prefix(dir.as_str())
+                        .is_some_and(|r| r.starts_with('/'))
+                    || dir.strip_prefix(p).is_some_and(|r| r.starts_with('/'))
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Every workspace member with a library target, by name, plus the admitted
+/// forks — the libraries the Trust lane can hold to a floor. `None` when
+/// `targo tree` answered nothing, so a caller cannot mistake an unread table
+/// for an empty workspace.
+#[must_use]
+pub fn gated_libraries(
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+) -> Option<BTreeSet<String>> {
+    let members = read_members(root, tools, path_env);
+    if members.is_empty() {
+        return None;
+    }
+    let mut names: BTreeSet<String> = members
+        .0
+        .iter()
+        .filter(|m| m.has_lib)
+        .map(|m| m.name.clone())
+        .collect();
+    names.extend(admitted_forks(root).into_iter().map(|(name, _)| name));
+    Some(names)
 }
 
 /// The `change scope` stage: the scope the rest of the run uses, and the ladder
@@ -341,34 +511,49 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
             "targo is absent, so the dependency graph cannot be read".to_string(),
         );
     }
+    let paths = match changed_paths(root, path_env, base) {
+        Ok((_, paths)) => paths,
+        Err(why) => return Selection::Widened(why),
+    };
+    let members = read_members(root, tools, path_env);
+    let manifests = manifests_near(root, &paths);
+    select(&paths, &manifests, &members, &|c| {
+        invert(root, tools, path_env, c)
+    })
+}
+
+/// The merge-base of HEAD and `base`, and every path changed since it: tracked
+/// changes INCLUDING the working tree (the `--changed` tier exists to be run
+/// BEFORE the commit), untracked non-ignored files, and the edits an
+/// assume-unchanged or skip-worktree flag hides. `Err` says which read failed.
+fn changed_paths(
+    root: &Path,
+    path_env: &OsStr,
+    base: &str,
+) -> Result<(String, Vec<String>), String> {
     let git = |args: &[&str]| stdout_of(Command::new("git").args(args), root, path_env);
     if git(&["rev-parse", "--git-dir"]).is_none() {
-        return Selection::Widened(
-            "this is not a git checkout, so there is no diff to scope by".to_string(),
-        );
+        return Err("this is not a git checkout, so there is no diff to scope by".to_string());
     }
-    let merge_base = git(&["merge-base", "HEAD", base])
+    let Some(mb) = git(&["merge-base", "HEAD", base])
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let Some(mb) = merge_base else {
-        return Selection::Widened(format!("no merge-base between HEAD and '{base}'"));
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(format!("no merge-base between HEAD and '{base}'"));
     };
-
-    // Tracked changes since the merge-base INCLUDING the working tree (this tier
-    // exists to be run BEFORE the commit), plus untracked non-ignored files.
     let (Some(tracked), Some(untracked)) = (
         git(&["diff", "--name-only", &mb]),
         git(&["ls-files", "--others", "--exclude-standard"]),
     ) else {
-        return Selection::Widened("git could not list the changed files".to_string());
+        return Err("git could not list the changed files".to_string());
     };
     // Plus every edit an assume-unchanged or skip-worktree flag hides from `git
     // diff` (2026-09-13, review of batch B, round 3): without them a flagged
     // crate's edit selected 0 crates, built nothing, and went VERIFY: PASS.
     let Some(hidden) = crate::identity::flag_hidden_edits(root, path_env) else {
-        return Selection::Widened("git could not list the index-flagged edits".to_string());
+        return Err("git could not list the index-flagged edits".to_string());
     };
-    let paths: Vec<String> = tracked
+    let paths = tracked
         .lines()
         .chain(untracked.lines())
         .filter(|l| !l.is_empty())
@@ -377,12 +562,7 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
         .collect::<BTreeSet<String>>()
         .into_iter()
         .collect();
-
-    let members = read_members(root, tools, path_env);
-    let manifests = manifests_near(root, &paths);
-    select(&paths, &manifests, &members, &|c| {
-        invert(root, tools, path_env, c)
-    })
+    Ok((mb, paths))
 }
 
 /// A child's stdout on success, `None` on any failure — stdout ONLY, because a
@@ -559,6 +739,110 @@ pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE SEED HALF, on its own: the owners of the changed paths and the first
+    /// re-planning path — no reverse cone, no widening, and a non-member manifest
+    /// still owns its subtree.
+    #[test]
+    fn seeds_are_the_owners_of_the_changed_paths_and_nothing_downstream() {
+        let manifests: Manifests = [
+            ("crates/aterm-grid", Some("aterm-grid")),
+            ("crates/aterm-gui", Some("aterm-gui")),
+            (
+                "crates/aterm-scrollback/fuzz",
+                Some("aterm-scrollback-fuzz"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let members: BTreeSet<String> = ["aterm-grid", "aterm-gui", "aterm-scrollback"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let paths: Vec<String> = [
+            "crates/aterm-grid/src/lib.rs",
+            "crates/aterm-scrollback/fuzz/src/main.rs",
+            "docs/x.md",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let (owners, replanned) = seeds(&paths, &manifests, &members);
+        assert_eq!(owners.into_iter().collect::<Vec<_>>(), ["aterm-grid"]);
+        assert_eq!(replanned.as_deref(), Some("Cargo.lock"));
+        let (none, clean) = seeds(&["docs/x.md".to_string()], &manifests, &members);
+        assert!(none.is_empty() && clean.is_none());
+    }
+
+    /// AN ADMITTED FORK IS A LIBRARY THE LANE VERIFIES (2026-09-27, review):
+    /// a change inside its directory touches it, and so does a submodule bump,
+    /// which lists only the gitlink ABOVE the crates. Negative controls: a
+    /// sibling directory sharing a prefix, and an unrelated path, touch nothing.
+    #[test]
+    fn a_fork_is_touched_by_its_files_and_by_the_gitlink_above_it() {
+        let forks = vec![
+            ("smol_str".to_string(), "vendor/smol_str".to_string()),
+            (
+                "astream-wire".to_string(),
+                "vendor/astream/crates/astream-wire".to_string(),
+            ),
+        ];
+        let touched = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(ToString::to_string).collect();
+            forks_touched(&paths, &forks)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(touched(&["vendor/smol_str/src/lib.rs"]), ["smol_str"]);
+        assert_eq!(touched(&["vendor/astream"]), ["astream-wire"]);
+        assert_eq!(
+            touched(&["vendor/astream/crates/astream-wire/src/frame.rs"]),
+            ["astream-wire"]
+        );
+        assert!(touched(&["vendor/smol_str_extra/src/lib.rs"]).is_empty());
+        assert!(touched(&["vendor/astream-other", "crates/aterm-grid/src/lib.rs"]).is_empty());
+    }
+
+    /// The roster's `admitted` rows, each found by the manifest that declares
+    /// it anywhere under `vendor/` (four levels: vendor/astream/crates/<crate>);
+    /// a `queued` fork is not the lane's.
+    #[test]
+    fn admitted_forks_are_the_rosters_admitted_rows_found_under_vendor() {
+        let tmp = std::env::temp_dir().join(format!("aterm-verify-forks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let manifest = |dir: &str, name: &str| {
+            std::fs::create_dir_all(tmp.join(dir)).expect("mkdir");
+            std::fs::write(
+                tmp.join(dir).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n"),
+            )
+            .expect("manifest");
+        };
+        manifest("vendor/smol_str", "smol_str");
+        manifest("vendor/astream/crates/astream-wire", "astream-wire");
+        manifest("vendor/winit", "winit");
+        std::fs::create_dir_all(tmp.join("tools")).expect("tools");
+        std::fs::write(
+            tmp.join(FORK_ROSTER),
+            "# name\tstatus\tnote\nsmol_str\tadmitted\tx\nastream-wire\tadmitted\tx\n\
+             winit\tqueued\tx\nghost\tadmitted\tno manifest\n",
+        )
+        .expect("roster");
+        let got = admitted_forks(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            got,
+            [
+                (
+                    "astream-wire".to_string(),
+                    "vendor/astream/crates/astream-wire".to_string()
+                ),
+                ("smol_str".to_string(), "vendor/smol_str".to_string()),
+            ]
+        );
+    }
 
     fn members(names: &[&str]) -> Members {
         Members::new(

@@ -178,6 +178,17 @@ pub(crate) fn own_marker_nanos() -> Option<u128> {
     imp::own_marker_nanos()
 }
 
+/// Where this process's crash marker is — its directory and the start it is
+/// named with — while it is still linked (`None` before the install armed one,
+/// and after the clean exit released it). The PTY keeper is told this at HELLO
+/// (`keeper_link`), and after this window's death reads the marker's absence
+/// as its exit path having run (§5.4 row 3's cross-check).
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn own_marker_place() -> Option<(std::path::PathBuf, u128)> {
+    imp::own_marker_place()
+}
+
 /// The handoff candidate this process was is now the daily driver — its Commit
 /// arrived: re-name its marker as [`MarkerOwner::App`]. A no-op unless the launch
 /// armed [`Arming::AppAfterCommit`], and after the first call. `true` exactly when
@@ -671,11 +682,11 @@ mod imp {
 
     /// Static, pre-built banner halves written around the formatted signal
     /// number. Keeping these as `&[u8]` constants means the handler does no
-    /// string work at signal time — it just `write(2)`s known bytes. The
-    /// suffix's leading byte is a space; `\u{2014}` is the em dash (UTF-8
-    /// `E2 80 94`).
+    /// string work at signal time — it just `write(2)`s known bytes. The same
+    /// line goes to stderr and to the marker, whether or not a marker was
+    /// opened, so it states only the signal.
     const BANNER_PREFIX: &[u8] = b"aterm: fatal signal ";
-    const BANNER_SUFFIX: &[u8] = " \u{2014} crash marker written\n".as_bytes();
+    const BANNER_SUFFIX: &[u8] = b"\n";
 
     /// fd of the pre-opened crash-marker file, or `-1` when none was opened
     /// (no writable private dir at install time). `AtomicI32` so the handler
@@ -710,6 +721,21 @@ mod imp {
             0 => None,
             nanos => Some(u128::from(nanos)),
         }
+    }
+
+    /// See [`super::own_marker_place`].
+    pub(super) fn own_marker_place() -> Option<(std::path::PathBuf, u128)> {
+        let nanos = own_marker_nanos()?;
+        let current = MARKER_PATH.load(Ordering::SeqCst);
+        if current.is_null() {
+            return None;
+        }
+        use std::os::unix::ffi::OsStrExt as _;
+        // SAFETY: a non-null MARKER_PATH is a leaked, never-freed CString
+        // (`publish_marker_path`).
+        let current = unsafe { std::ffi::CStr::from_ptr(current) };
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(current.to_bytes()));
+        Some((path.parent()?.to_path_buf(), nanos))
     }
 
     /// Park `path` in [`MARKER_PATH`] (leaking the string: it must outlive every
@@ -1048,15 +1074,7 @@ mod imp {
         #[test]
         fn banner_bytes_are_the_expected_marker_text() {
             assert_eq!(BANNER_PREFIX, b"aterm: fatal signal ");
-            // Suffix is a leading space + em dash (U+2014, UTF-8 E2 80 94) +
-            // text + newline.
-            assert_eq!(
-                BANNER_SUFFIX,
-                &[
-                    b' ', 0xE2, 0x80, 0x94, b' ', b'c', b'r', b'a', b's', b'h', b' ', b'm', b'a',
-                    b'r', b'k', b'e', b'r', b' ', b'w', b'r', b'i', b't', b't', b'e', b'n', b'\n',
-                ]
-            );
+            assert_eq!(BANNER_SUFFIX, b"\n");
             // The assembled banner around a sample signal number reads
             // correctly end to end.
             let mut buf = [0u8; U32_MAX_DIGITS];
@@ -1066,13 +1084,7 @@ mod imp {
             line.extend_from_slice(num);
             line.extend_from_slice(BANNER_SUFFIX);
             let text = String::from_utf8(line).unwrap();
-            assert_eq!(
-                text,
-                format!(
-                    "aterm: fatal signal {} \u{2014} crash marker written\n",
-                    libc::SIGSEGV
-                )
-            );
+            assert_eq!(text, format!("aterm: fatal signal {}\n", libc::SIGSEGV));
         }
 
         #[test]
@@ -1452,11 +1464,15 @@ mod exit_gate {
 
     #[test]
     fn no_clean_exit_path_leaves_its_marker_behind() {
-        // (file, bare `_exit` sites it may keep): the two forked children, and
-        // `clean_exit_now` itself.
+        // (file, bare `_exit` sites it may keep): the forked children — two
+        // of them in the harness host's test fixture of a shell's job
+        // (`harness_host::tests::pty_job`), one the rendezvous listener
+        // fixture in a test — and `clean_exit_now` itself.
         let allowed = [
             ("spawn.rs", 1usize),
             ("app_update_handoff.rs", 1),
+            ("harness_host.rs", 2),
+            ("handoff_rendezvous.rs", 1),
             ("crash_signal.rs", 1),
         ];
         let mut files = Vec::new();
@@ -1563,12 +1579,14 @@ mod imp_windows {
     /// Static, pre-built banner fragments written around the hex fields, so the
     /// filter does no string work at exception time (same shape as the unix
     /// banner; `\u{2014}` is the em dash, UTF-8 `E2 80 94`). The assembled line
-    /// is `PREFIX <code> AT <pc> [AV_OP <op> AV_AT <addr>] SUFFIX`.
+    /// is `PREFIX <code> AT <pc> [AV_OP <op> AV_AT <addr>] SUFFIX`. The same
+    /// line goes to stderr and to the marker, whether or not a marker was
+    /// opened, so it states only the exception.
     const BANNER_PREFIX: &[u8] = b"aterm: fatal exception 0x";
     const BANNER_AT: &[u8] = b" at 0x";
     const BANNER_AV_OP: &[u8] = " \u{2014} access violation ".as_bytes();
     const BANNER_AV_AT: &[u8] = b" @ 0x";
-    const BANNER_SUFFIX: &[u8] = " \u{2014} crash marker written\n".as_bytes();
+    const BANNER_SUFFIX: &[u8] = b"\n";
 
     /// Raw HANDLE of the pre-opened crash-marker file, or `-1` when none was
     /// opened (no writable log dir at install time). `AtomicIsize` so the
@@ -1843,7 +1861,7 @@ mod imp_windows {
             line.extend_from_slice(BANNER_SUFFIX);
             assert_eq!(
                 String::from_utf8(line).unwrap(),
-                "aterm: fatal exception 0x80000003 at 0x7FF612345678ABCD \u{2014} crash marker written\n"
+                "aterm: fatal exception 0x80000003 at 0x7FF612345678ABCD\n"
             );
 
             // Access-violation assembly threads the op + faulting address in.
@@ -1864,7 +1882,7 @@ mod imp_windows {
             line.extend_from_slice(BANNER_SUFFIX);
             assert_eq!(
                 String::from_utf8(line).unwrap(),
-                "aterm: fatal exception 0xC0000005 at 0x00007FF600000100 \u{2014} access violation writing @ 0x0000000000000000 \u{2014} crash marker written\n"
+                "aterm: fatal exception 0xC0000005 at 0x00007FF600000100 \u{2014} access violation writing @ 0x0000000000000000\n"
             );
         }
 
@@ -1973,11 +1991,7 @@ mod clean_exit_tests {
         let clean = dir.join("crash-signal-1-1.log");
         let crashed = dir.join("crash-signal-2-2.log");
         std::fs::write(&clean, b"").unwrap();
-        std::fs::write(
-            &crashed,
-            "aterm: fatal signal 11 \u{2014} crash marker written\n",
-        )
-        .unwrap();
+        std::fs::write(&crashed, "aterm: fatal signal 11\n").unwrap();
 
         assert!(remove_marker_if_empty(&clean), "an empty marker is removed");
         assert!(!clean.exists(), "gone at once, not merely delete-pending");

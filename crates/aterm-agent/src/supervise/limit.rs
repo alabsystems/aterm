@@ -48,7 +48,9 @@
 //! `/usr/share/zoneinfo` has, since an unknown `TZ` reads as UTC in silence
 //! (measured: `TZ=Nonsense/Zone date +%z` prints `+0000`). A zone the machine
 //! does not know, or none named, is the local zone: Claude Code prints the
-//! notice in the user's own.
+//! notice in the user's own. A caller that must be right across a DST change
+//! (the Claude Code footer's limit wall) places with [`reset_in_zone`] and
+//! [`offset_at`], the one reader of a zone's offset AT an instant.
 
 use std::path::Path;
 use std::time::Duration;
@@ -77,6 +79,13 @@ pub enum ResetSpec {
 /// today's is 19 hours gone (24 − 5), and `3am` read at 3:30pm is twelve and
 /// a half hours passed, not eleven and a half ahead.
 const SAME_DAY: i64 = 19 * 3600;
+
+/// The furthest ahead a session limit's bare clock time can be, in REAL
+/// time: its five-hour window (24 h − [`SAME_DAY`]). [`reset_in_zone`]
+/// takes it as `ahead_max`; `i64::MAX` there reads a bare clock time as its
+/// next occurrence instead (a weekly reset under a day away, printed with no
+/// date).
+pub const SESSION_AHEAD_MAX: i64 = 86_400 - SAME_DAY;
 
 /// What `continuing shortly` is read as: a minute from the read. Claude Code
 /// says it when its retry is imminent; by then the worker is read working
@@ -129,6 +138,18 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
             if !(1..=31).contains(&d) {
                 return None;
             }
+            // A reset in another calendar year names it (`Jan 2, 2027 at
+            // 9am`, MEASURED: 2.1.283's formatter adds the year when it
+            // differs): the year is not the clock. `reset_at` already puts
+            // the date in the year nearest now.
+            let time = match time {
+                [year, rest @ ..]
+                    if year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    rest
+                }
+                t => t,
+            };
             (Some((m, d)), time)
         }
         time => (None, time),
@@ -251,36 +272,76 @@ pub fn reset_at(
     local_offset_s: i64,
     zone_offset: fn(&str) -> Option<i64>,
 ) -> i64 {
-    match spec {
-        ResetSpec::In(span) => now.saturating_add(i64::try_from(span.as_secs()).unwrap_or(0)),
+    let offset = match spec {
+        ResetSpec::At { zone, .. } => zone
+            .as_deref()
+            .and_then(zone_offset)
+            .unwrap_or(local_offset_s),
+        ResetSpec::In(_) => 0,
+    };
+    reset_in_zone(spec, now, SESSION_AHEAD_MAX, &|_| Some(offset)).unwrap_or(now)
+}
+
+/// The reset as Unix seconds, placed in REAL time: `offset_at(t)` is the
+/// notice's zone's offset from UTC at the instant `t` (daylight saving's
+/// offset THEN, not today's), and a clock time lands where that zone's clock
+/// shows it — each candidate day placed with the offset that holds on it. A
+/// span is added to `now`; a dated clock time is the nearest of last year's,
+/// this year's and next year's; a bare clock time is today's while it is
+/// ahead, else tomorrow's when tomorrow's is less than `ahead_max` seconds
+/// ahead in real time ([`SESSION_AHEAD_MAX`] for a session limit — so
+/// across a daylight-saving jump a `4am` five hours ahead is still
+/// tomorrow's), else today's, passed. `None` when an offset cannot be read.
+///
+/// With a constant offset, `ahead_max = SESSION_AHEAD_MAX` is exactly
+/// [`reset_at`]'s rule (it delegates here): tomorrow's is under five hours
+/// ahead exactly when today's is more than [`SAME_DAY`] gone.
+pub fn reset_in_zone(
+    spec: &ResetSpec,
+    now: i64,
+    ahead_max: i64,
+    offset_at: &dyn Fn(i64) -> Option<i64>,
+) -> Option<i64> {
+    let (date, hour, minute) = match spec {
+        ResetSpec::In(span) => {
+            return Some(now.saturating_add(i64::try_from(span.as_secs()).unwrap_or(0)));
+        }
         ResetSpec::At {
-            date,
-            hour,
-            minute,
-            zone,
-        } => {
-            let offset = zone
-                .as_deref()
-                .and_then(zone_offset)
-                .unwrap_or(local_offset_s);
-            let local_now = now + offset;
-            let (y, m, d) = civil(local_now.div_euclid(86_400));
-            let clock = i64::from(*hour) * 3600 + i64::from(*minute) * 60;
-            match date {
-                Some((month, day)) => [y - 1, y, y + 1]
-                    .into_iter()
-                    .map(|year| days_from_civil(year, *month, *day) * 86_400 + clock - offset)
-                    .min_by_key(|at| (at - now).abs())
-                    .unwrap_or(now),
-                None => {
-                    let today = days_from_civil(y, m, d) * 86_400 + clock - offset;
-                    if today > now || now - today <= SAME_DAY {
-                        today
-                    } else {
-                        today + 86_400
-                    }
+            date, hour, minute, ..
+        } => (date, hour, minute),
+    };
+    let clock = i64::from(*hour) * 3600 + i64::from(*minute) * 60;
+    let now_offset = offset_at(now)?;
+    let (y, m, d) = civil((now + now_offset).div_euclid(86_400));
+    // The instant the zone's clock reads `clock` on civil day `day`: placed
+    // with the offset at a first guess, then with the offset THERE.
+    let place = |day: i64| -> Option<i64> {
+        let local = day * 86_400 + clock;
+        Some(local - offset_at(local - now_offset)?)
+    };
+    match date {
+        Some((month, day)) => {
+            let mut best: Option<i64> = None;
+            for year in [y - 1, y, y + 1] {
+                let at = place(days_from_civil(year, *month, *day))?;
+                if best.is_none_or(|b| (at - now).abs() < (b - now).abs()) {
+                    best = Some(at);
                 }
             }
+            best
+        }
+        None => {
+            let today_day = days_from_civil(y, m, d);
+            let today = place(today_day)?;
+            if today > now {
+                return Some(today);
+            }
+            let tomorrow = place(today_day + 1)?;
+            Some(if tomorrow - now < ahead_max {
+                tomorrow
+            } else {
+                today
+            })
         }
     }
 }
@@ -324,22 +385,53 @@ pub fn tz_offset_s() -> i64 {
 /// `TZ` reads as UTC in silence). `None` for one it has not, or a name with
 /// characters no zone has.
 pub fn zone_offset_s(zone: &str) -> Option<i64> {
+    offset_at(Some(zone), unix_now())
+}
+
+/// A zone's offset from UTC AT the instant `unix`, in seconds — the offset
+/// daylight saving gave that instant, not today's: `date -r <unix> +%z`
+/// (BSD) / `date -d @<unix> +%z` (GNU). `zone` names the zone (`TZ=<zone>`,
+/// asked only for one [`zone_offset_s`] would ask about); `None` is the
+/// local clock's own. The workspace's ONE reader of an offset at an instant
+/// (aterm-gui's `presence::local_offset_at` is this with no zone). A
+/// subprocess per call: a caller on a hot path caches. `None` where `date`
+/// cannot say, or off Unix.
+pub fn offset_at(zone: Option<&str>, unix: i64) -> Option<i64> {
+    if !cfg!(unix) || zone.is_some_and(|z| !zone_known(z)) {
+        return None;
+    }
+    let mut date = std::process::Command::new("date");
+    if let Some(zone) = zone {
+        date.env("TZ", zone);
+    }
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    )) {
+        date.arg("-r").arg(unix.to_string());
+    } else {
+        date.arg("-d").arg(format!("@{unix}"));
+    }
+    let out = date
+        .arg("+%z")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    parse_zone(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// Whether `zone` is a plain zone name `/usr/share/zoneinfo` has.
+fn zone_known(zone: &str) -> bool {
     let plain = !zone.is_empty()
         && !zone.contains("..")
         && !zone.starts_with('/')
         && zone
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'));
-    if !plain || !Path::new("/usr/share/zoneinfo").join(zone).is_file() {
-        return None;
-    }
-    let out = std::process::Command::new("date")
-        .env("TZ", zone)
-        .arg("+%z")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    parse_zone(String::from_utf8_lossy(&out.stdout).trim())
+    plain && Path::new("/usr/share/zoneinfo").join(zone).is_file()
 }
 
 /// `+hhmm` / `-hh:mm` as seconds.
@@ -432,6 +524,35 @@ mod tests {
 
     fn at(text: &str) -> i64 {
         reset_at(&parse_reset(text).expect(text), NOW, PDT, zones)
+    }
+
+    /// A reset in the next calendar year names the year (2.1.283's formatter
+    /// adds it when the year differs): read as the date and clock, the year
+    /// left to `reset_at`, which places the date in the year nearest now.
+    #[test]
+    fn a_reset_that_names_its_year_parses() {
+        for text in [
+            "Jan 2, 2027 at 9am (America/Los_Angeles)",
+            "Jan 2, 2027, 9am (UTC)",
+        ] {
+            assert!(
+                matches!(
+                    parse_reset(text),
+                    Some(ResetSpec::At {
+                        date: Some((1, 2)),
+                        hour: 9,
+                        minute: 0,
+                        ..
+                    })
+                ),
+                "{text}: {:?}",
+                parse_reset(text)
+            );
+        }
+        // Read on 2026-12-30 12:00 UTC, it is next year's Jan 2.
+        let dec30 = 1_798_632_000;
+        let spec = parse_reset("Jan 2, 2027 at 9am (UTC)").expect("parses");
+        assert_eq!(reset_at(&spec, dec30, 0, zones), 1_798_880_400);
     }
 
     /// Both spellings the real notices carry, with the zone read.
@@ -669,6 +790,145 @@ mod tests {
         );
         // 24-hour spelling.
         assert_eq!(parse_clock("23:00"), Some((23, 0)));
+    }
+
+    /// THE PLACER BEFORE `reset_in_zone`, kept as the oracle: every caller
+    /// of `reset_at` (the supervisor's clock, `harness limits`, the band)
+    /// places exactly as it did, every five minutes of three days — the exact
+    /// edges among them — and every spelling: dated, bare, zoned, span.
+    #[test]
+    fn reset_at_places_as_it_always_did() {
+        fn before(spec: &ResetSpec, now: i64, local: i64) -> i64 {
+            match spec {
+                ResetSpec::In(span) => now + i64::try_from(span.as_secs()).unwrap(),
+                ResetSpec::At {
+                    date,
+                    hour,
+                    minute,
+                    zone,
+                } => {
+                    let offset = zone.as_deref().and_then(zones).unwrap_or(local);
+                    let (y, m, d) = civil((now + offset).div_euclid(86_400));
+                    let clock = i64::from(*hour) * 3600 + i64::from(*minute) * 60;
+                    match date {
+                        Some((month, day)) => [y - 1, y, y + 1]
+                            .into_iter()
+                            .map(|year| {
+                                days_from_civil(year, *month, *day) * 86_400 + clock - offset
+                            })
+                            .min_by_key(|at| (at - now).abs())
+                            .unwrap(),
+                        None => {
+                            let today = days_from_civil(y, m, d) * 86_400 + clock - offset;
+                            if today > now || now - today <= SAME_DAY {
+                                today
+                            } else {
+                                today + 86_400
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let texts = [
+            "3am",
+            "3pm (America/Los_Angeles)",
+            "11:30pm (America/New_York)",
+            "12am (UTC)",
+            "Sep 19 at 11am (America/Los_Angeles)",
+            "Jan 2 at 9am (UTC)",
+            "Dec 31 at 11pm",
+            "in 3h",
+        ];
+        for text in texts {
+            let spec = parse_reset(text).expect(text);
+            // Every five minutes — the rule's edges fall on the hour — and
+            // a few seconds past each.
+            for step in 0..(3 * 24 * 12 * 2) {
+                let now = NOW + 5 * 60 + (step / 2) * 300 + (step % 2) * 17;
+                for local in [PDT, 0, 5 * 3600 + 1800] {
+                    assert_eq!(
+                        reset_at(&spec, now, local, zones),
+                        before(&spec, now, local),
+                        "{text} at {now} local {local}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// America/Los_Angeles around its 2026 switches: PST until 2026-03-08
+    /// 10:00Z, PDT until 2026-11-01 09:00Z, PST after.
+    fn la_at(t: i64) -> Option<i64> {
+        Some(if (1_772_964_000..1_793_523_600).contains(&t) {
+            -7 * 3600
+        } else {
+            -8 * 3600
+        })
+    }
+
+    /// ACROSS A DAYLIGHT-SAVING JUMP a bare clock time lands where the
+    /// zone's clock shows it THEN, and the five-hour rule counts real hours.
+    /// Spring forward: `4am` written at 22:30 PST on Mar 7 is 4am PDT on Mar
+    /// 8 (11:00Z), four and a half hours ahead — not Mar 7's, 18.5 local
+    /// hours back. Fall back: `3am` written at 23:30 PDT on Oct 31 is 3am PST
+    /// (11:00Z), not 10:00Z.
+    #[test]
+    fn a_reset_across_a_dst_jump_is_placed_in_real_time() {
+        let four = parse_reset("4am (America/Los_Angeles)").unwrap();
+        let spring = 1_772_951_400; // 2026-03-08T06:30Z
+        assert_eq!(
+            reset_in_zone(&four, spring, SESSION_AHEAD_MAX, &la_at),
+            Some(1_772_967_600)
+        );
+        let three = parse_reset("3am (America/Los_Angeles)").unwrap();
+        let fall = 1_793_514_600; // 2026-11-01T06:30Z
+        assert_eq!(
+            reset_in_zone(&three, fall, SESSION_AHEAD_MAX, &la_at),
+            Some(1_793_530_800)
+        );
+        // A DATED reset on the far side of the jump, too.
+        let dated = parse_reset("Mar 8 at 9am (America/Los_Angeles)").unwrap();
+        assert_eq!(
+            reset_in_zone(&dated, spring, SESSION_AHEAD_MAX, &la_at),
+            Some(1_772_985_600)
+        );
+        // `ahead_max = i64::MAX` is the next occurrence: `9am` written at
+        // 14:00 is tomorrow's.
+        let nine = parse_reset("9am (UTC)").unwrap();
+        let day = NOW - NOW.rem_euclid(86_400);
+        assert_eq!(
+            reset_in_zone(&nine, day + 14 * 3600, i64::MAX, &|_| Some(0)),
+            Some(day + 86_400 + 9 * 3600)
+        );
+        assert_eq!(
+            reset_in_zone(&nine, day + 14 * 3600, SESSION_AHEAD_MAX, &|_| Some(0)),
+            Some(day + 9 * 3600),
+            "the session rule: today's, passed"
+        );
+        // An offset that cannot be read places nothing.
+        assert_eq!(reset_in_zone(&nine, day, i64::MAX, &|_| None), None);
+    }
+
+    /// `date` answers a zone's offset AT an instant, where the machine has
+    /// the zone; a name no zone has, or a path, is asked nothing.
+    #[test]
+    fn a_zones_offset_is_read_at_the_instant() {
+        if !Path::new("/usr/share/zoneinfo/America/Los_Angeles").is_file() {
+            return;
+        }
+        assert_eq!(
+            offset_at(Some("America/Los_Angeles"), 1_772_951_400),
+            Some(-8 * 3600)
+        );
+        assert_eq!(
+            offset_at(Some("America/Los_Angeles"), 1_772_967_600),
+            Some(-7 * 3600)
+        );
+        assert_eq!(offset_at(Some("UTC"), 1_772_967_600), Some(0));
+        assert_eq!(offset_at(Some("Mars/Olympus"), 0), None);
+        assert_eq!(offset_at(Some("../etc/passwd"), 0), None);
+        assert!(offset_at(None, 0).is_some(), "the local clock's own");
     }
 
     #[test]

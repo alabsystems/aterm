@@ -45,6 +45,25 @@
 //! `THAWED seq=<n> input=<w>` and forgets the point it handed over, so the
 //! point still showing is decided afresh: at full power, answered.
 //!
+//! **The remedy, taken when nobody is there** ([`Session::stall_remedy`];
+//! *decided 2026-09-27 under the owner's standing direction (D4)*, rule 1/3
+//! of the harness audit: full power, and nobody there to answer). A stall
+//! that has stood `[harness] stall_term_after_s` (ten minutes by default;
+//! `0` never — the remedy's own limit, apart from `relaunch`), `input=stalled`
+//! — a stopped job's `signal cont` stays a person's — with no person's hand
+//! within `human_grace_s` (`status human_ms=`) and no other hand on the
+//! session (`hand=-`: no lease, no turn), where the loop's host relaunches
+//! an agent the remedy ends ([`IdleHost::relaunches_after_stall`]: the
+//! window's host, under `[harness] relaunch`), gets `signal term`, ONCE an
+//! episode — said (`SIGNALLED seq=<n> signal=term …`, printed and journaled)
+//! — and the host's relaunch resumes the conversation. A program that
+//! outlives it (a Node program's SIGTERM listener never runs while its JS
+//! thread spins) is left to the server's own attention, whose remedy
+//! `signal kill` stays a person's: the ruling named the term, and no more
+//! (the review of 2026-09-27 took back an automatic kill a minute on).
+//! Until 2026-09-27 ending the process stayed a person's act, and a frozen
+//! worker with nobody at the machine stayed frozen.
+//!
 //! **Where it looks.** [`Session::stall_step`] runs after every step of the
 //! wait for the screen to move that did not latch ([`Session::wait_for_next`])
 //! — the wait the incident's loop sat in. [`Session::stall_look`] runs at the
@@ -91,6 +110,7 @@
 
 use super::escalate::status_field;
 use super::*;
+use crate::harness::resume::{AfterRestart, RELAUNCH_WORDS};
 
 /// A worker the server says is not reading its input: `status
 /// input=stalled|stopped` and the numbers beside it (`-`, or absent, is
@@ -108,13 +128,18 @@ pub(super) struct WorkerStall {
 }
 
 /// What one `status` read said of the worker's input: its `input=` word,
-/// the stall when that word is one, and the two fields the hold needs from
-/// the same read (`fabric=`, `program=`).
+/// the stall when that word is one, and the fields the hold and its remedy
+/// need from the same read (`fabric=`, `program=`, `human_ms=`, `hand=`).
 pub(super) struct StallRead {
     word: String,
     stall: Option<WorkerStall>,
     fabric: String,
     program: Option<String>,
+    /// `human_ms=`: how long ago a person gave the session input (`None`:
+    /// never, or a server that does not say).
+    human_ms: Option<u64>,
+    /// `hand=`: whose hand is on the session (`-` or absent: nobody's).
+    hand: Option<String>,
 }
 
 /// The mail word of an escalation whose own `status` read reported the
@@ -176,18 +201,26 @@ fn rss_text(mb: u64) -> String {
 /// The one mail an episode posts to the manager:
 ///
 /// ```text
-/// claude frozen: not reading input for 2m41s (1 B queued, rss 38.8 GB); pressing nothing until it reads again — restart it: signal term (signal kill if it survives), then claude --continue
+/// claude frozen: not reading input for 2m41s (1 B queued, rss 38.8 GB); pressing nothing until it reads again — restart it: signal term (signal kill if it survives), then claude --resume <its conversation>
+/// claude frozen: … — restart it: signal term (signal kill if it survives); aterm relaunches it on its conversation
 /// claude stopped with input queued for 41s (1 B queued); pressing nothing until it reads again — resume it: signal cont
 /// ```
 ///
 /// `program` names the worker (`status program=`, else Claude Code's
-/// `claude`); `resume` is the command that resumes its conversation after a
-/// restart ([`aterm_phase::resume_hint`]), `None` for a program with none.
+/// `claude`); `after` is what follows the restart
+/// ([`crate::harness::resume::AfterRestart`]): the line that resumes the
+/// worker's OWN conversation, read by the host from Claude Code's own record
+/// of it (`IdleHost::resume_command`), the host's own relaunch where it would
+/// make one (`IdleHost::relaunches_on_exit`), or nothing where neither is known. Never
+/// `claude --continue` (robustness backlog item 2, 2026-09-26): it resumes
+/// the directory's NEWEST conversation, and four live Claude Code processes
+/// shared one directory on the owner's Mac that day — a manager following
+/// the mail would have resumed a sibling tab's conversation.
 /// The restart names its fallback: a program can live through `signal term`
 /// — a Node program's SIGTERM listener never runs while its JS thread spins
 /// (whole-branch review, third round, 2026-09-25) — and then only `signal
 /// kill` ends it. The server keeps the stall published meanwhile.
-pub(super) fn frozen_mail_text(stall: &WorkerStall, program: &str, resume: Option<&str>) -> String {
+pub(super) fn frozen_mail_text(stall: &WorkerStall, program: &str, after: &AfterRestart) -> String {
     let waited = stall
         .wait_ms
         .map_or_else(String::new, |ms| format!(" for {}", wait_text(ms)));
@@ -208,7 +241,11 @@ pub(super) fn frozen_mail_text(stall: &WorkerStall, program: &str, resume: Optio
              again \u{2014} resume it: signal cont"
         );
     }
-    let resume = resume.map_or_else(String::new, |r| format!(", then {r}"));
+    let resume = match after {
+        AfterRestart::Unknown => String::new(),
+        AfterRestart::Command(line) => format!(", then {line}"),
+        AfterRestart::Relaunch => format!("; {RELAUNCH_WORDS}"),
+    };
     format!(
         "{program} frozen: not reading input{waited}{facts}; pressing nothing until it reads \
          again \u{2014} restart it: signal term (signal kill if it survives){resume}"
@@ -307,6 +344,25 @@ impl<C: Ctl> Session<'_, C> {
         Ok(true)
     }
 
+    /// What follows the stall's restart, for the mail
+    /// ([`frozen_mail_text`]): the host's own relaunch where it WOULD make one
+    /// ([`super::IdleHost::relaunches_on_exit`] — not merely
+    /// [`super::IdleHost::can_restart`]: a launch the relaunch refuses, such
+    /// as a flag its rewrite does not know, was promised a relaunch that
+    /// never came and given no command, resume-hint review 2026-09-26), else
+    /// the line the host read that resumes the worker's own conversation
+    /// ([`super::IdleHost::resume_command`]), else nothing — a loop with no
+    /// host (`drive watch`) reads no process and names no command.
+    fn after_restart(&self) -> AfterRestart {
+        match &self.stall_host {
+            Some(host) if host.relaunches_on_exit() => AfterRestart::Relaunch,
+            Some(host) => host
+                .resume_command()
+                .map_or(AfterRestart::Unknown, AfterRestart::Command),
+            None => AfterRestart::Unknown,
+        }
+    }
+
     /// One `status` read of the worker's input; `None` when the host does not
     /// measure it (no reply it could give, no field, `input=-`).
     pub(super) fn stall_probe(&mut self) -> Result<Option<StallRead>, Fail> {
@@ -323,6 +379,8 @@ impl<C: Ctl> Session<'_, C> {
             stall: worker_stall(&r.stdout),
             fabric: field("fabric").unwrap_or_else(|| "unknown".to_string()),
             program: field("program"),
+            human_ms: field("human_ms").and_then(|v| v.parse().ok()),
+            hand: field("hand"),
         }))
     }
 
@@ -338,13 +396,15 @@ impl<C: Ctl> Session<'_, C> {
         seq: u64,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        let Some(stall) = read.stall else {
+        let Some(stall) = read.stall.clone() else {
             return Ok(());
         };
+        let read_rest = read;
         self.stall_suspect = false;
         self.box_ask = None;
         self.adopted_box = false;
         self.turn_end_due = None;
+        self.stall_termed = false;
         let behind = self.claim.watching_behind().map(str::to_string);
         let (attention, mail) = if let Some(holder) = behind {
             let skipped = format!("skipped: another supervisor ({holder}) answers this session");
@@ -357,16 +417,17 @@ impl<C: Ctl> Session<'_, C> {
             }
             let mail = match self.manager.clone() {
                 None => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
-                Some(to) if read.fabric == "connected" => {
+                Some(to) if read_rest.fabric == "connected" => {
                     let rows = self.last.as_ref().map_or(&[][..], |s| s.rows.as_slice());
-                    let reader = aterm_phase::identify(read.program.as_deref(), rows).program();
-                    let program = read.program.as_deref().unwrap_or(reader.name());
-                    let text = frozen_mail_text(&stall, program, aterm_phase::resume_hint(reader));
+                    let reader =
+                        aterm_phase::identify(read_rest.program.as_deref(), rows).program();
+                    let program = read_rest.program.as_deref().unwrap_or(reader.name());
+                    let text = frozen_mail_text(&stall, program, &self.after_restart());
                     let to = format!("to={to}");
                     let r = self.call(&["post", &to, "kind=ask", "--wait=0", &text])?;
                     post_word(&r)
                 }
-                Some(_) => format!("skipped: no fabric (fabric={})", read.fabric),
+                Some(_) => format!("skipped: no fabric (fabric={})", read_rest.fabric),
             };
             (attention, mail)
         };
@@ -383,7 +444,7 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(host) = &self.stall_host {
             host.stalled(true);
         }
-        Ok(())
+        self.stall_remedy(&read_rest, seq, review)
     }
 
     /// The stall is over (`status` reads another word, or no longer measures
@@ -396,6 +457,7 @@ impl<C: Ctl> Session<'_, C> {
         state: &mut Looking,
         review: &mut dyn Review,
     ) {
+        self.stall_termed = false;
         if self.stalled.take().is_some() {
             review.note(&format!("THAWED seq={seq} input={}", or_dash(word)));
             state.handed = None;
@@ -403,6 +465,74 @@ impl<C: Ctl> Session<'_, C> {
                 host.stalled(false);
             }
         }
+    }
+
+    /// THE STALL'S REMEDY, TAKEN (module header): on the `status` read that
+    /// shows the held stall, `signal term` once it has stood `[harness]
+    /// stall_term_after_s` (`input_wait_ms`, the server's own measure of the
+    /// oldest unread byte; `0`: never), once an episode — only where the
+    /// loop's host relaunches the agent it ends, never under a person's hand
+    /// within the grace or another driver's (`hand=`), and never for a
+    /// stopped job. It is said, `SIGNALLED seq=<n> signal=term input=<w>
+    /// wait_ms=<ms> rss_mb=<n|-> reply=<the server's first line>`; a refused
+    /// one is said the same way and not counted, so the next read tries
+    /// again.
+    pub(super) fn stall_remedy(
+        &mut self,
+        read: &StallRead,
+        seq: u64,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        let Some(stall) = self.stalled.clone() else {
+            return Ok(());
+        };
+        let relaunched = self
+            .stall_host
+            .as_ref()
+            .is_some_and(|h| h.relaunches_after_stall());
+        let grace_ms = u64::from(self.stall_grace_s).saturating_mul(1000);
+        let hands_off = read.hand.as_deref().is_none_or(|h| h == "-")
+            && read.human_ms.is_none_or(|ms| ms >= grace_ms);
+        if stall.word != "stalled"
+            || !review.unattended()
+            || !relaunched
+            || !hands_off
+            || self.claim.watching_behind().is_some()
+        {
+            return Ok(());
+        }
+        let bound_ms = u64::from(self.stall_term_after_s).saturating_mul(1000);
+        if self.stall_termed || bound_ms == 0 || !stall.wait_ms.is_some_and(|ms| ms >= bound_ms) {
+            return Ok(());
+        }
+        let sig = "term";
+        let r = self.call(&["signal", sig])?;
+        if self.unserved(&r) {
+            return Err(Fail::Lost(format!("signal failed: {}", r.stderr.trim())));
+        }
+        let reply = if r.ok() {
+            r.stdout.lines().next().unwrap_or("OK").trim().to_string()
+        } else {
+            let e = r.stderr.trim();
+            if e.is_empty() {
+                r.stdout.trim().to_string()
+            } else {
+                e.to_string()
+            }
+        };
+        if r.ok() {
+            self.stall_termed = true;
+        }
+        let dash = || "-".to_string();
+        review
+            .say(&format!(
+                "SIGNALLED seq={seq} signal={sig} input={} wait_ms={} rss_mb={} reply={reply}",
+                stall.word,
+                stall.wait_ms.map_or_else(dash, |v| v.to_string()),
+                stall.rss_mb.map_or_else(dash, |v| v.to_string()),
+            ))
+            .map_err(Fail::Hard)?;
+        Ok(())
     }
 
     /// After a step of [`Self::wait_for_next`] that did not latch: a probe,
@@ -428,8 +558,10 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(self.stalled.is_some());
         }
         if self.stalled.is_some() {
-            // Held already: the numbers move, the episode does not.
-            self.stalled = read.stall;
+            // Held already: the numbers move, the episode does not — and the
+            // remedy is looked at again on them.
+            self.stalled.clone_from(&read.stall);
+            self.stall_remedy(&read, seq, review)?;
         } else {
             self.hold_for_stall(read, seq, review)?;
         }
@@ -454,7 +586,8 @@ impl<C: Ctl> Session<'_, C> {
         match read {
             Some(read) if read.stall.is_some() => {
                 if self.stalled.is_some() {
-                    self.stalled = read.stall;
+                    self.stalled.clone_from(&read.stall);
+                    self.stall_remedy(&read, seq, review)?;
                 } else {
                     self.hold_for_stall(read, seq, review)?;
                 }
@@ -514,14 +647,29 @@ mod tests {
     #[test]
     fn the_frozen_mail_names_the_wait_the_backlog_the_size_and_the_remedy() {
         let s = worker_stall(STALLED).expect("stall");
+        // The worker's OWN conversation, as the host read it (2026-09-26):
+        // never `claude --continue`, the directory's newest conversation.
+        let own = AfterRestart::Command(
+            "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f".to_string(),
+        );
         assert_eq!(
-            frozen_mail_text(&s, "claude", Some("claude --continue")),
+            frozen_mail_text(&s, "claude", &own),
             "claude frozen: not reading input for 2m41s (1 B queued, rss 38.8 GB); pressing \
              nothing until it reads again \u{2014} restart it: signal term (signal kill if it \
-             survives), then claude --continue"
+             survives), then claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
         );
-        // A program with no resume command: the restart alone.
-        let t = frozen_mail_text(&s, "vim", None);
+        // The host relaunches it itself: no command for the manager to run.
+        let hosted = frozen_mail_text(&s, "claude", &AfterRestart::Relaunch);
+        assert!(
+            hosted.ends_with(
+                "restart it: signal term (signal kill if it survives); aterm relaunches it on \
+                 its conversation"
+            ),
+            "{hosted}"
+        );
+        // A program with no resume command, or a Claude Code whose record
+        // was not read: the restart alone — never a guess.
+        let t = frozen_mail_text(&s, "vim", &AfterRestart::Unknown);
         assert!(
             t.ends_with("restart it: signal term (signal kill if it survives)"),
             "{t}"
@@ -534,7 +682,7 @@ mod tests {
             ..s.clone()
         };
         assert_eq!(
-            frozen_mail_text(&small, "claude", None),
+            frozen_mail_text(&small, "claude", &AfterRestart::Unknown),
             "claude frozen: not reading input (1 B queued, rss 12 MB); pressing nothing until \
              it reads again \u{2014} restart it: signal term (signal kill if it survives)"
         );
@@ -545,7 +693,7 @@ mod tests {
             ..s
         };
         assert_eq!(
-            frozen_mail_text(&stopped, "claude", Some("claude --continue")),
+            frozen_mail_text(&stopped, "claude", &own),
             "claude stopped with input queued for 41s (1 B queued); pressing nothing until it \
              reads again \u{2014} resume it: signal cont"
         );

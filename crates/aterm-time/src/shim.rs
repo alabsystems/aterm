@@ -7,10 +7,11 @@
 //! # This module is compiled on native too — under `cfg(test)`
 //!
 //! `wasm32-unknown-unknown` needs its own std and the Trust toolchain ships
-//! none, so `cargo xtask gate web` cross-compiles this crate on upstream
-//! stable. That proves it still COMPILES; it executes nothing. A
-//! browser-only module would therefore be code that no test on the machine
-//! writing it can reach — which is exactly how a clock ships broken.
+//! none, so the `wasm-cpu` and `wasm-gpu` cells of `xtask gate cells-foreign`
+//! (and `xtask gate cells`) type-check this crate on rustup's `stable`. That
+//! proves it still COMPILES; it executes nothing. A browser-only module
+//! would therefore be code that no test on the machine writing it can reach —
+//! which is exactly how a clock ships broken.
 //!
 //! So everything here except the two JS bindings and the `now()` calls that use
 //! them is target-independent, and the module is compiled into the NATIVE test

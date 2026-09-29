@@ -344,6 +344,86 @@ fn a_one_shot_run_is_read_wherever_its_flag_stands() {
     }
 }
 
+/// WHETHER AN EXIT WOULD BE RELAUNCHED ON ITS CONVERSATION, from the
+/// snapshot alone ([`resumes_on_exit`], resume-hint review 2026-09-26): the
+/// frozen remedy says "aterm relaunches it" only where the relaunch's own
+/// plan would be made, and names `claude --resume <id>` everywhere else.
+/// NEGATIVE CONTROLS, each a launch the relaunch refuses or waits on for
+/// ever while the remedy used to promise it: a flag the rewrite table does
+/// not know (`--permission-prompt-tool`, listed by Claude Code 2.1.283's
+/// `--help` and absent from the table — the relaunch says
+/// `argv:unknown-flag`, while the person's own command still resumes the
+/// conversation, bare), a `--worktree` launch (`argv:not-resumable`), a
+/// shell the line is not written for (nushell: no dialect), no
+/// conversation registered, and a one-shot `-p` run.
+#[test]
+fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
+    const ID: &str = "0badf00d-1111-2222-3333-444455556666";
+    let snap = |argv: &[&str]| Snapshot {
+        tab: "s-1".to_string(),
+        pid: 4242,
+        start: "Thu Sep 24 01:02:03 2026".to_string(),
+        shell: 4241,
+        program: PathBuf::from("/opt/claude"),
+        argv: words(argv),
+        session: Some(ID.to_string()),
+        cwd: "/w".to_string(),
+        version: Some("2.1.283".to_string()),
+        codex: None,
+        dialect: Some(upgrade::Dialect::Zsh),
+    };
+    let known = snap(&["/opt/claude", "--model", "opus"]);
+    assert!(resumes_on_exit(&known), "a launch the relaunch carries");
+    for dialect in [upgrade::Dialect::Bash, upgrade::Dialect::Fish] {
+        let other = Snapshot {
+            dialect: Some(dialect),
+            ..known.clone()
+        };
+        assert!(resumes_on_exit(&other), "{dialect:?}");
+    }
+
+    let unknown = ["/opt/claude", "--permission-prompt-tool", "mcp__x"];
+    assert!(
+        upgrade::rewrite_argv(&words(&unknown), ID).is_err(),
+        "the premise: the relaunch refuses this argv"
+    );
+    assert!(!resumes_on_exit(&snap(&unknown)), "argv:unknown-flag");
+    assert_eq!(
+        super::super::resume::command(&words(&unknown), ID).as_deref(),
+        Some("claude --resume 0badf00d-1111-2222-3333-444455556666"),
+        "the person's command still resumes the conversation"
+    );
+    assert!(
+        !resumes_on_exit(&snap(&["/opt/claude", "--worktree"])),
+        "argv:not-resumable"
+    );
+    assert!(
+        !resumes_on_exit(&snap(&["/opt/claude", "-p", "x"])),
+        "one-shot"
+    );
+    let nushell = Snapshot {
+        dialect: None,
+        ..known.clone()
+    };
+    assert!(
+        !resumes_on_exit(&nushell),
+        "no dialect: plan waits for ever"
+    );
+    let unregistered = Snapshot {
+        session: None,
+        ..known.clone()
+    };
+    assert!(!resumes_on_exit(&unregistered), "no conversation to resume");
+    let control = Snapshot {
+        cwd: "/w\nx".to_string(),
+        ..known
+    };
+    assert!(
+        !resumes_on_exit(&control),
+        "no line with a control character"
+    );
+}
+
 /// FOLLOWING the snapshot's agent: Claude's own record of the SAME process
 /// (pid and kernel start) moves its conversation, build and directory — an
 /// in-app `/clear` names a new conversation under the same pid. The tab's
@@ -366,6 +446,8 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
         session: Some("0badf00d-1111-2222-3333-444455556666".to_string()),
         cwd: "/w".to_string(),
         version: Some("2.1.281".to_string()),
+        codex: None,
+        dialect: Some(upgrade::Dialect::Zsh),
     };
     let record = |session: &str, at: &str| {
         std::fs::write(
@@ -834,6 +916,8 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
         Some(ExitLook {
             running: false,
             record: record.then(|| sf.clone()),
+            codex: false,
+            crashed: None,
         })
     };
     let steps =
@@ -892,6 +976,8 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             Some(ExitLook {
                 running: true,
                 record: Some(sf.clone()),
+                codex: false,
+                crashed: None,
             })
         },
         |_| {
@@ -909,6 +995,8 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             Some(ExitLook {
                 running: looks <= 3,
                 record: Some(sf.clone()),
+                codex: false,
+                crashed: None,
             })
         },
         |_| true,
@@ -1109,4 +1197,63 @@ fn a_pill_names_its_mode_flag() {
     assert_eq!(mode_flag(Mode::AcceptEdits), "acceptEdits");
     assert_eq!(mode_flag(Mode::DontAsk), "dontAsk");
     assert_eq!(mode_flag(Mode::Plan), "plan");
+}
+
+/// A CODEX look (2026-09-27) is decided on its shell's word: a crash is
+/// [`ExitRecord::Crashed`], its own exit or someone's signal
+/// [`ExitRecord::Removed`], at once; with no word yet it is looked at again
+/// up to [`EXIT_GONE`] — the shell writes it as it takes the terminal back —
+/// and then left [`ExitRecord::Unread`], never read as a removal.
+/// NEGATIVE CONTROL: the same silence from a Claude Code look (no record) is
+/// a removal at once — the rule the Codex look must not inherit.
+#[test]
+fn a_codex_exit_is_decided_on_its_shells_word() {
+    let look = |crashed: Option<bool>| {
+        Some(ExitLook {
+            running: false,
+            record: None,
+            codex: true,
+            crashed,
+        })
+    };
+    assert_eq!(
+        exit_record(|| look(Some(true)), |_| true),
+        ExitRecord::Crashed
+    );
+    assert_eq!(
+        exit_record(|| look(Some(false)), |_| true),
+        ExitRecord::Removed
+    );
+    let steps =
+        |d: Duration| usize::try_from(d.as_millis() / EXIT_LOOK.as_millis()).expect("small");
+    let mut waits = 0;
+    let left = exit_record(
+        || look(None),
+        |_| {
+            waits += 1;
+            true
+        },
+    );
+    assert_eq!((left, waits), (ExitRecord::Unread, steps(EXIT_GONE)));
+    // The word comes on the third look.
+    let mut n = 0;
+    let left = exit_record(
+        || {
+            n += 1;
+            look((n >= 3).then_some(true))
+        },
+        |_| true,
+    );
+    assert_eq!((left, n), (ExitRecord::Crashed, 3));
+    assert_eq!(ExitRecord::Crashed.word(), "crashed");
+    // NEGATIVE CONTROL: a Claude Code look with no record is a removal.
+    let claude = || {
+        Some(ExitLook {
+            running: false,
+            record: None,
+            codex: false,
+            crashed: None,
+        })
+    };
+    assert_eq!(exit_record(claude, |_| true), ExitRecord::Removed);
 }

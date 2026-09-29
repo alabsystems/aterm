@@ -97,6 +97,20 @@ impl Terminal {
         // fails HERE, on the next byte of output, in every debug/test build.
         #[cfg(debug_assertions)]
         self.debug_assert_mode_mirror_in_sync();
+        // THE RESIZE UNDO (`aterm_grid`'s `resize_undo`): a rows-only shrink of
+        // the alternate screen keeps the rows it took off for a grow back that
+        // nothing drew in front of. ANY output between the halves ends that:
+        // the app may have painted at the smaller size (its SIGWINCH repaint,
+        // which heals it), and a few mutation paths mark damage without moving
+        // `content_gen` (VS15/VS16 width fixes, OSC 1337), so the grid's own
+        // generation check is not the whole guard. Both grids: the parked one
+        // was resized too.
+        if !input.is_empty() {
+            self.grid.drop_resize_undo();
+            if let Some(parked) = self.alt_grid.as_mut() {
+                parked.drop_resize_undo();
+            }
+        }
         // Logical clocks for this batch: the single readings every downstream
         // time-dependent read observes. Set before the parser/post_process run.
         self.transient.process_now = clock.monotonic;
@@ -861,6 +875,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // the host setting the reload diffs against (see `ConfiguredModes`).
         configured_modes: _,
         content_scroll_state: _,
+        // The resize journal: written by the resize entry points, never by a VT
+        // dispatch — a handler that could write it could hide a resize.
+        resize_journal: _,
         parser: _,
         text_selection: _,
         // The OTHER screen's selection, parked across an alt switch. Session-only
@@ -868,6 +885,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // handler by design: the park/restore is a post_process decision (see
         // there), never a VT-dispatch one.
         parked_text_selection: _,
+        // The selection a grid resize undo will put back: resize-owned,
+        // session-only like the selection it copies.
+        resize_undo_selection: _,
         // PRESS CUSTODY: the last recorded custody transition. Session-only and
         // kept out of the handler on purpose — the transition is decided by the
         // press/mouse seams and by `process_at`'s three-site output protocol, never
@@ -875,6 +895,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         last_custody: _,
         last_custody_change: _,
         last_selection_taker: _,
+        reader_gestures: _,
         vi: _,
         sync_timeout_duration: _,
         clipboard_auth: _,

@@ -25,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aterm_session::input_backlog::InputBacklog;
-use aterm_session::sink::{BulkMeter, SinkWriter};
+use aterm_session::sink::{BulkMeter, Discard, SinkWriter};
 
 /// A pty pair with the slave raw (`VMIN = 1`, `VTIME = 0`, a key-at-a-time
 /// reader like every agent TUI) or canonical without echo.
@@ -414,7 +414,7 @@ fn a_discard_drops_a_parked_spill_and_the_next_key_still_arrives() {
     // thread the moment it needs to peek its chunk and park on the queue.
     thread::sleep(Duration::from_millis(200));
 
-    assert_eq!(sink.discard_unread_input(), Some(1114));
+    assert_eq!(sink.discard_unread_input(Discard::Restart), Some(1114));
     let empty = settle(&sink, |b| b.spilled.is_some());
     assert_eq!(empty.unread(), 0, "{empty:?}");
 
@@ -450,7 +450,7 @@ fn a_discard_ends_a_writer_parked_mid_frame() {
         "parked on the full queue: {parked:?}"
     );
 
-    assert_eq!(sink.discard_unread_input(), Some(1022));
+    assert_eq!(sink.discard_unread_input(Discard::Restart), Some(1022));
     let deadline = Instant::now() + Duration::from_secs(2);
     while !paster.is_finished() {
         assert!(
@@ -475,7 +475,50 @@ fn a_discard_off_a_tty_drops_nothing() {
     let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
     use std::os::fd::AsRawFd;
     let sink = SinkWriter::new(a.as_raw_fd());
-    assert_eq!(sink.discard_unread_input(), None);
+    assert_eq!(sink.discard_unread_input(Discard::Restart), None);
+    drop(sink);
+    drop((a, b));
+}
+
+/// A FLUSH IS NOT A RESTART (robustness review of the manual reset,
+/// 2026-09-26). `reset flush` and the drop before `signal term` empty the
+/// same queue and both move the discard epoch — a frame in flight belongs to
+/// the input that went, whichever drop took it. Only the restart's drop moves
+/// `restart_discards`, the count aterm-gui's input watch starts a published
+/// stall's restart grace on. Before the split a `reset flush` on a stalled
+/// program read as its restart signal, and five seconds later the program
+/// was named as having survived it, remedy `signal kill`, though no signal
+/// was ever sent. Off a tty nothing is dropped, and neither count moves.
+#[test]
+fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
+    let (master, slave) = pty_pair(true);
+    let sink = nonblocking_sink(master);
+    assert_eq!((sink.discards(), sink.restart_discards()), (0, 0));
+    assert_eq!(sink.write_frame_nonparking(b"ab").expect("write"), 2);
+    let _ = settle(&sink, |b| b.queued == 2);
+    assert_eq!(sink.discard_unread_input(Discard::Flush), Some(2));
+    assert_eq!(
+        (sink.discards(), sink.restart_discards()),
+        (1, 0),
+        "a flush is a discard, not a restart"
+    );
+    assert_eq!(sink.discard_unread_input(Discard::Restart), Some(0));
+    assert_eq!((sink.discards(), sink.restart_discards()), (2, 1));
+    // The read evidence counts from the LATEST drop, whichever it was.
+    assert_eq!(sink.discard_unread_input(Discard::Flush), Some(0));
+    assert_eq!(sink.write_frame_nonparking(b"x").expect("write"), 1);
+    let _ = settle(&sink, |b| b.queued == 1);
+    assert_eq!(read_exactly(slave, 1), b"x");
+    assert!(sink.read_since_discard(), "read after the flush");
+    assert_eq!((sink.discards(), sink.restart_discards()), (3, 1));
+    drop(sink);
+    close_pair(master, slave);
+
+    let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    use std::os::fd::AsRawFd;
+    let sink = SinkWriter::new(a.as_raw_fd());
+    assert_eq!(sink.discard_unread_input(Discard::Restart), None);
+    assert_eq!((sink.discards(), sink.restart_discards()), (0, 0));
     drop(sink);
     drop((a, b));
 }
@@ -496,7 +539,7 @@ fn a_read_after_a_discard_is_told_from_the_discard() {
     assert!(!sink.read_since_discard(), "no discard yet");
     assert_eq!(sink.write_frame_nonparking(b"ab").expect("write"), 2);
     let _ = settle(&sink, |b| b.queued == 2);
-    assert_eq!(sink.discard_unread_input(), Some(2));
+    assert_eq!(sink.discard_unread_input(Discard::Restart), Some(2));
     assert!(
         !sink.read_since_discard(),
         "nothing written since the discard"
@@ -511,14 +554,14 @@ fn a_read_after_a_discard_is_told_from_the_discard() {
     let _ = settle(&sink, |b| b.queued == 1);
     assert!(sink.read_since_discard(), "a byte behind the read keeps it");
 
-    assert_eq!(sink.discard_unread_input(), Some(1));
+    assert_eq!(sink.discard_unread_input(Discard::Restart), Some(1));
     assert!(!sink.read_since_discard(), "the next discard starts over");
     drop(sink);
     close_pair(master, slave);
 
     let (master, slave) = pty_pair(false);
     let sink = nonblocking_sink(master);
-    assert_eq!(sink.discard_unread_input(), Some(0));
+    assert_eq!(sink.discard_unread_input(Discard::Restart), Some(0));
     assert_eq!(sink.write_frame_nonparking(b"c").expect("write"), 1);
     let partial = settle(&sink, |b| b.canonical);
     assert_eq!(partial.queued, 0, "FIONREAD cannot see a partial line");
@@ -559,7 +602,7 @@ fn a_control_key_a_cbreak_driver_eats_is_not_a_read() {
     let sink = nonblocking_sink(master);
     assert_eq!(sink.write_frame_nonparking(b"a").expect("write"), 1);
     let _ = settle(&sink, |b| b.queued == 1);
-    assert_eq!(sink.discard_unread_input(), Some(1));
+    assert_eq!(sink.discard_unread_input(Discard::Restart), Some(1));
     for key in [0x03_u8, 0x0f, 0x13, 0x11] {
         assert_eq!(sink.write_frame_nonparking(&[key]).expect("write"), 1);
         let seen = settle(&sink, |b| b.queued == 0);

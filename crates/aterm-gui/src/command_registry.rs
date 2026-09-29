@@ -219,7 +219,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::NewWindowWithIdentity => spec("window.new_with_identity", S::App, A::Owner, C::Any),
         M::NewTabWithIdentity => spec("tab.new_with_identity", S::Window, A::Owner, C::Any),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
-        // THE FABRIC MENU (round 19, SPEC19 §9). Fleet… is the map's twin (the
+        // THE FABRIC MENU (round 19, SPEC19 §9). Fleet is the map's twin (the
         // Fabric menu's route to it) — Owner for the same aggregated disclosure
         // reason as `view.connections`.
         M::Fleet => spec("view.fleet", S::App, A::Owner, C::Any),
@@ -240,6 +240,10 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // Serious Mode class.
         M::TogglePresenceBand => spec("presence.band.toggle", S::Process, A::ConfigMutate, C::Any),
         M::TogglePresenceRim => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
+        // The manual reset (2026-09-26): the focused view's terminal back to
+        // its host defaults. Runtime engine state only — `LocalUi`, the class
+        // of the font zoom — and it needs a terminal leaf.
+        M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
     }
 }
 

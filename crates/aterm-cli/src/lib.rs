@@ -141,8 +141,9 @@ const HELP_HEAD: &str = concat!(
     "        --containment=<MODE>  the last containment flag given wins. An invalid\n",
     "                              value fails closed to containment.\n",
     "        --sandbox             Shorthand for --containment containment (the macOS\n",
-    "                              sandbox: no network, writes only to temp dirs, no\n",
-    "                              credential reads; refused where no OS sandbox exists).\n",
+    "                              sandbox: no network; writes only to temp dirs and\n",
+    "                              shell history; no access to credential stores or\n",
+    "                              private data; refused where no OS sandbox exists).\n",
     "        --no-sandbox          Shorthand for --containment user (no OS sandbox;\n",
     "                              full network/credential access — the default).\n",
     "        --no-reroute          Restore the upstream Rust names (cargo, rustc, …) in\n",
@@ -228,6 +229,11 @@ pub enum Verb {
     /// were deleted with the second harness stack (2026-09-23): `aterm drive`
     /// supervises; `upgrade` only restarts an agent onto a newer build.
     Harness,
+    /// `aterm keeper` — the PTY keeper (`start | stop | status | serve`): the
+    /// per-login holder of a custody copy of every terminal's master
+    /// (docs/DESIGN-pty-keeper-2026-09-26.md). Opt-in (P3): a window registers
+    /// with one only under `[keeper] enabled = true`.
+    Keeper,
     /// `aterm new-tab` — a tab, routed by `windowing_behavior` (S12 / design §5).
     NewTab,
     /// `aterm new-window` — a window, unconditionally (the `attach` escape hatch).
@@ -250,6 +256,7 @@ impl Verb {
         Verb::Update,
         Verb::Agents,
         Verb::Harness,
+        Verb::Keeper,
         Verb::NewTab,
         Verb::NewWindow,
         Verb::SplitPane,
@@ -269,6 +276,7 @@ impl Verb {
             Verb::Update => "update",
             Verb::Agents => "agents",
             Verb::Harness => "harness",
+            Verb::Keeper => "keeper",
             // Hyphenated, exactly like Windows Terminal's — the whole value of a
             // familiar grammar is that the words are the SAME words.
             Verb::NewTab => "new-tab",
@@ -305,6 +313,7 @@ impl Verb {
             | Verb::Update
             | Verb::Agents
             | Verb::Harness
+            | Verb::Keeper
             | Verb::NewTab
             | Verb::NewWindow
             | Verb::SplitPane => None,
@@ -336,7 +345,8 @@ impl Verb {
             | Verb::Ship
             | Verb::Update
             | Verb::Agents
-            | Verb::Harness => false,
+            | Verb::Harness
+            | Verb::Keeper => false,
         }
     }
 
@@ -354,6 +364,7 @@ impl Verb {
             Verb::Update => "aterm update [<cmd>]",
             Verb::Agents => "aterm agents [<cmd>]",
             Verb::Harness => "aterm harness <cmd>",
+            Verb::Keeper => "aterm keeper <cmd>",
             // The synopsis column is 26 wide (VERB_BLURB_COLUMN - 4) and the
             // rendering test pins the blurb to exactly column 30, so these read
             // `[-d dir]` rather than the `[-d <dir>]` the usage lines use: the
@@ -406,6 +417,10 @@ impl Verb {
                 "Claude Code's spend and limits, the disk, the approval ledger",
                 "(usage | limits | disk | ledger); `upgrade` moves a live Claude",
                 "Code onto a newer build. `aterm drive` supervises.",
+            ],
+            Verb::Keeper => &[
+                "The PTY keeper: hold every terminal's master so a crashed",
+                "window's shells live on (start | stop | status | serve). Opt-in.",
             ],
             Verb::NewTab => &[
                 "Open a terminal tab. Where it opens is the",
@@ -478,9 +493,10 @@ const HELP_TAIL: &str = concat!(
     "\n",
     "EXAMPLES:\n",
     "    aterm                              Start an interactive shell (mode: user).\n",
-    "    aterm --sandbox                    No network, writes only to temp dirs, no\n",
-    "                                       secret-dir reads (macOS; refused where\n",
-    "                                       there is no OS sandbox).\n",
+    "    aterm --sandbox                    No network; writes only to temp dirs and\n",
+    "                                       shell history; no access to credential\n",
+    "                                       stores or private data (macOS; refused\n",
+    "                                       where there is no OS sandbox).\n",
     "    aterm --containment safety         Capped limits, no OS sandbox.\n",
 );
 
@@ -553,8 +569,8 @@ fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
 /// `key=value` lines (one per line, scriptable). Reports the containment DEFAULT a
 /// launch with no containment flag takes, NOT an actuated mode — `show-config`
 /// never actuates or spawns. `shell=` is `$SHELL` on Unix and, on Windows, the
-/// shell a new WINDOW tab spawns (with `shell_origin=` naming the input that
-/// chose it).
+/// shell this tab runs when typed in an aterm tab, else the one a new window's
+/// tab spawns (with `shell_origin=` naming the input that chose it).
 fn show_config_report() -> String {
     let (rows, cols) = driver::host_winsize();
     let env = |k: &str| std::env::var(k).unwrap_or_default();
@@ -566,10 +582,11 @@ fn show_config_report() -> String {
     // nor `%COMSPEC%` first, and reporting them here named cmd.exe from inside
     // a pwsh 7 tab and bash.exe from Git Bash (measured 2026-09-22) — the shell
     // the CLI was typed into, never the one a tab gets. So the row is the shell
-    // a new WINDOW tab spawns, from the spawn's own resolver, and `shell_origin=`
-    // says which input chose it (aterm.toml | default:<arm>; the per-launch
-    // spelling is the window's own --shell flag, which no CLI process can see —
-    // the retired environment twin is not an input).
+    // THIS tab runs when there is one (`shell_origin=tab`: the window hands every
+    // shell tab its program, since its own --shell flag is invisible to a CLI
+    // process), else the one a new window's tab spawns, from the spawn's own
+    // resolver, and `shell_origin=` says which input chose it (tab | aterm.toml |
+    // default:<arm>; the retired environment twin is not an input).
     // Unix output is byte-identical.
     #[cfg(not(windows))]
     out.push_str(&format!("shell={}\n", or(env("SHELL"), "(unset)")));
@@ -602,12 +619,12 @@ fn explain_config_report() -> String {
     );
     out.push_str("Containment modes (least → most capability):\n");
     out.push_str(
-        "  containment  No network, writes only to temp dirs, no secret-dir reads (macOS;\n\
-         \x20              refused where there is no OS sandbox).\n",
+        "  containment  No network; writes only to temp dirs and shell history; no access to\n\
+         \x20              credential stores or private data (macOS; refused elsewhere).\n",
     );
     out.push_str("  safety       Capped limits, no OS sandbox.\n");
-    out.push_str("  user         Normal usage: standard safeguards (the default).\n");
-    out.push_str("  master       Full trust: developer mode.\n\n");
+    out.push_str("  user         No sandbox, no extra limits (the default).\n");
+    out.push_str("  master       Same as user.\n\n");
     out.push_str(
         "No environment variable changes what aterm does: every choice is a flag or an\n\
          aterm.toml key.\n",
@@ -730,9 +747,8 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20 auto_accept             RESERVED, and not implemented: aterm does not answer macOS\n\
      \x20                         consent dialogs. Granting Full Disk Access in Settings is the\n\
      \x20                         supported answer, and only a human can do it.\n\
-     \x20 Clearing a grant (`tccutil reset`) is offered as a command to run from the Settings\n\
-     \x20 panel; nothing in aterm runs it for you. No key in this section needs anything\n\
-     \x20 beyond saving the file.\n";
+     \x20 Settings \u{25b8} Security \u{25b8} Ask Again clears macOS's saved refusals for the folders it\n\
+     \x20 lists, after you confirm. No key in this section needs anything beyond saving the file.\n";
 
 /// `aterm list-fonts` — available font families (file stems), one per line, sorted
 /// and deduplicated for scriptable output. Data: [`aterm_render::list_fonts`].
@@ -1050,8 +1066,9 @@ fn doctor_report() -> (String, i32) {
             &recovery,
         )
     }
-    // Windows: the shell a new WINDOW tab spawns, from the spawn's own resolver
-    // over the window's inputs, and labelled as such — the row used to report
+    // Windows: this tab's shell inside an aterm tab, else the one a new window's
+    // tab spawns, from the spawn's own resolver over the window's inputs, and
+    // labelled as such — the row used to report
     // this process's `$SHELL`, then `%COMSPEC%`, and said `cmd.exe` from inside
     // a pwsh 7 tab and `bash.exe` from Git Bash (measured 2026-09-22): the shell
     // the CLI was typed into, which the spawn never reads. See
@@ -1192,8 +1209,8 @@ fn doctor_checks(
 
 /// [`doctor_checks`] with the `shell:` row labelled by WHERE the shell came from
 /// (`shell_origin`, appended after the fact as ` — <label>`). Windows passes
-/// `driver::WindowShell::origin_sentence`, so the row says it names the window's
-/// shell and which input chose it — a reader who sees `pwsh.exe` from inside a
+/// `driver::WindowShell::origin_sentence`, so the row says whose shell it names
+/// and which input chose it — a reader who sees `pwsh.exe` from inside a
 /// Git Bash tab must not have to guess whether doctor looked at `$SHELL`. `None`
 /// renders exactly the unlabelled row.
 #[allow(
@@ -1567,6 +1584,29 @@ pub fn set_running_build(build: u64) {
 
 fn running_build() -> Option<u64> {
     RUNNING_BUILD.get().copied()
+}
+
+/// What the one-binary launcher runs when the session's shell first speaks: the
+/// passthrough loop has written the shell's first output to the terminal. The launcher
+/// (`crates/aterm/src/main.rs`) confirms a replaced Linux executable's trial on it — a
+/// prompt on the screen is the session's proof of a healthy start, as the first frame is
+/// the window's (2026-09-28). First registration wins.
+static FIRST_SHELL_OUTPUT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the hook [`FIRST_SHELL_OUTPUT`] names; `false` when one is already set. It
+/// runs ONCE, on the passthrough loop itself (the unix driver), so it must not block:
+/// signal a thread, never do the work. Register it before [`session_main`] spawns the
+/// shell, or its first output can come first.
+pub fn on_first_shell_output(hook: fn()) -> bool {
+    FIRST_SHELL_OUTPUT.set(hook).is_ok()
+}
+
+/// The shell's first output reached the terminal: run the hook, if one is registered.
+#[cfg(unix)]
+fn first_shell_output() {
+    if let Some(hook) = FIRST_SHELL_OUTPUT.get() {
+        hook();
+    }
 }
 
 /// The `trusts:` line of [`version_text`].
@@ -2176,7 +2216,7 @@ pub fn session_main(quiet: bool) -> ! {
     let sandbox_wrap: Option<String> = match aterm_containment::decide_spawn(mode) {
         aterm_containment::SpawnDecision::Permit { sbpl, .. } => sbpl,
         aterm_containment::SpawnDecision::Deny { reason, .. } => {
-            eprintln!("aterm: containment mode {mode}: {reason}");
+            eprintln!("aterm: {reason}");
             std::process::exit(1);
         }
         _ => {
@@ -2285,7 +2325,7 @@ pub fn session_main(quiet: bool) -> ! {
         session_limits(mode), // by mode — NOT a blanket `shell_default()`; see its doc
     )
     .unwrap_or_else(|e| {
-        eprintln!("aterm: could not start the shell ({e})");
+        eprintln!("aterm: could not start the shell: {e}");
         std::process::exit(1);
     });
 
@@ -3799,7 +3839,7 @@ mod tests {
         let (labelled, code) = doctor_checks_with_origin(
             Some(r"C:\Program Files\PowerShell\7\pwsh.exe"),
             true,
-            Some("the window's shell, the platform default (pwsh on PATH)"),
+            Some("a new window's default shell, the platform default (pwsh on PATH)"),
             true,
             24,
             80,
@@ -3811,7 +3851,7 @@ mod tests {
         assert_eq!(mark_of(&labelled, "shell:"), "ok", "{labelled}");
         assert!(
             shell_row(&labelled).ends_with(
-                r" C:\Program Files\PowerShell\7\pwsh.exe (executable) — the window's shell, the platform default (pwsh on PATH)"
+                r" C:\Program Files\PowerShell\7\pwsh.exe (executable) — a new window's default shell, the platform default (pwsh on PATH)"
             ),
             "{labelled}"
         );
@@ -3821,7 +3861,7 @@ mod tests {
         let (failed, code) = doctor_checks_with_origin(
             Some("nosuch"),
             false,
-            Some("the window's shell, from aterm.toml shell = \"nosuch\""),
+            Some("a new window's default shell, from aterm.toml shell = \"nosuch\""),
             true,
             24,
             80,
@@ -3833,16 +3873,17 @@ mod tests {
         assert_eq!(mark_of(&failed, "shell:"), "FAIL", "{failed}");
         assert!(
             shell_row(&failed).ends_with(
-                " nosuch (not executable or missing) — the window's shell, from aterm.toml shell = \"nosuch\""
+                " nosuch (not executable or missing) — a new window's default shell, from aterm.toml shell = \"nosuch\""
             ),
             "{failed}"
         );
     }
 
-    /// Windows: the live `doctor` and `show-config` report the WINDOW's shell,
-    /// labelled, never this process's `$SHELL`/`%COMSPEC%` (measured 2026-09-22:
-    /// `cmd.exe` from inside a pwsh 7 tab, `bash.exe` from Git Bash — the shell
-    /// the CLI was typed into, which the spawn never reads).
+    /// Windows: the live `doctor` and `show-config` report the shell a tab of
+    /// the WINDOW runs — this tab's, inside one; a new window's default outside
+    /// — labelled, never this process's `$SHELL`/`%COMSPEC%` (measured
+    /// 2026-09-22: `cmd.exe` from inside a pwsh 7 tab, `bash.exe` from Git Bash
+    /// — the shell the CLI was typed into, which the spawn never reads).
     #[cfg(windows)]
     #[test]
     fn windows_doctor_and_show_config_report_the_windows_shell() {
@@ -3853,7 +3894,14 @@ mod tests {
             .find(|l| l.starts_with("shell: "))
             .expect("a shell row");
         assert!(shell_line.contains(&window_shell.program), "{shell_line}");
-        assert!(shell_line.contains("the window's shell"), "{shell_line}");
+        let in_a_tab = std::env::var_os(aterm_types::domain::ENV_TAB_SHELL)
+            .is_some_and(|program| !program.is_empty());
+        let whose = if in_a_tab {
+            "— this tab's shell"
+        } else {
+            "— a new window's default shell"
+        };
+        assert!(shell_line.contains(whose), "{shell_line}");
         assert!(
             shell_line.contains(&window_shell.origin_sentence()),
             "{shell_line}"

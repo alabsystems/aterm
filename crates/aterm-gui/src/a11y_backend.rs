@@ -77,19 +77,19 @@ pub(crate) fn reason_from_payload(payload: &str) -> &str {
         .trim()
 }
 
-/// The sentences the window shows, in reading order.
+/// The lines stderr prints: the band row's own words ([`a11y_publisher_dead`]'s
+/// title and detail), so one event reads one way on both surfaces — the loss,
+/// then the only retry (the publisher's `OnceLock`s mean a process gets one
+/// backend), then the reason.
 ///
-/// The LOSS comes first and in plain words, because it is the part that matters to
-/// someone who does not know what AT-SPI is: this window is invisible to a screen
-/// reader. The RETRY comes ahead of the reason because restarting really is the only
-/// one — the publisher's `OnceLock`s mean a process gets one backend — and because
-/// the band row shows its title whole and the detail beside it, so whatever must
-/// survive a narrow window has to be written early.
-pub(crate) fn notice_lines(reason: &str) -> [String; 2] {
-    [
-        "accessibility OFF \u{2014} no screen reader can see this window".to_string(),
-        format!("accessibility: restart aterm to retry \u{2014} {reason}"),
-    ]
+/// [`a11y_publisher_dead`]: crate::message_reporters::a11y_publisher_dead
+pub(crate) fn notice_lines(msg: &aterm_messages::Message) -> Vec<String> {
+    let mut detail = msg.detail.iter();
+    let head = match detail.next() {
+        Some(first) => format!("{} \u{2014} {first}", msg.title),
+        None => msg.title.clone(),
+    };
+    std::iter::once(head).chain(detail.cloned()).collect()
 }
 
 /// Report a dead accessibility publisher on every surface aterm has for it: the
@@ -104,14 +104,11 @@ pub(crate) fn notice_lines(reason: &str) -> [String; 2] {
 /// so the panic's own message and backtrace reach stderr exactly as before. This adds
 /// the surface a windowed launch has; it takes none away.
 pub(crate) fn report_failure(reason: &str, location: &str) {
-    let lines = notice_lines(reason);
-    for line in &lines {
+    let msg = crate::message_reporters::a11y_publisher_dead(reason, at_client_seen());
+    for line in notice_lines(&msg) {
         crate::logging::stderr_line!("aterm-gui: {line}");
     }
-    crate::message_inbox::queue_message(crate::message_reporters::a11y_publisher_dead(
-        reason,
-        at_client_seen(),
-    ));
+    crate::message_inbox::queue_message(msg);
     aterm_log::error!("accessibility publisher failed at {location}: {reason}");
 }
 
@@ -191,17 +188,23 @@ mod tests {
 
     #[test]
     fn the_notice_names_the_loss_before_the_jargon_and_offers_the_only_retry() {
-        let lines = notice_lines("Handshake(\"Server GUID mismatch\")");
-        assert!(
-            lines[0].contains("no screen reader can see this window"),
-            "the first line must state the loss in words that need no AT-SPI knowledge: {}",
-            lines[0]
+        let msg = crate::message_reporters::a11y_publisher_dead(
+            "Handshake(\"Server GUID mismatch\")",
+            true,
         );
-        assert!(
-            lines[1].starts_with("accessibility: restart aterm to retry"),
-            "the only retry there is must precede the reason, which the band ellipsizes: {}",
-            lines[1]
+        let lines = notice_lines(&msg);
+        // stderr says what the band says: the loss in words that need no
+        // AT-SPI knowledge, then the only retry, then the reason.
+        assert_eq!(
+            lines,
+            [
+                "Screen reader access lost \u{2014} restart aterm to retry".to_string(),
+                "Handshake(\"Server GUID mismatch\")".to_string(),
+            ]
         );
-        assert!(lines[1].contains("Server GUID mismatch"));
+        assert_eq!(
+            lines[0],
+            format!("{} \u{2014} {}", msg.title, msg.detail[0])
+        );
     }
 }

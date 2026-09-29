@@ -146,6 +146,11 @@ const ROWS: &[(&str, &str)] = &[
     // ---- W13, the titlebar snapshot ----
     ("NS_BITMAP_IMAGE_FILE_TYPE_PNG",         "NSBitmapImageFileTypePNG"),
     ("NS_COLOR_RENDERING_INTENT_PERCEPTUAL",  "NSColorRenderingIntentPerceptual"),
+    // ---- the App Nap opt-out (Foundation's, reached through Cocoa.h) ----
+    (
+        "NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP",
+        "NSActivityUserInitiatedAllowingIdleSystemSleep",
+    ),
 ];
 
 fn repo() -> PathBuf {

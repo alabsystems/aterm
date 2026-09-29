@@ -1941,8 +1941,7 @@ impl CursorGlow {
             // The comet's crown is the outer COMA — the faint gas envelope
             // around the nucleus. Slightly whitened off the base hue and kept
             // modest: the nucleus-cursor module draws the bright inner coma, so
-            // this halo is ambience, not the ball (the fire crown learned the
-            // same division of labour when the fireball took the head).
+            // this halo is ambience, not the ball.
             GlowStyle::Comet => (44.0, lerp_rgb(cfg.color, 0x00FF_FFFF, 0.30)),
             // Exhaustiveness only: the custom interpreter draws its own crown in
             // `emit_custom` (this `emit_crown` runs solely on the built-in emit

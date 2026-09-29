@@ -114,6 +114,7 @@
 //!    bash the same logic could only be exercised by running the gate inside a
 //!    git checkout with a Trust stage2 installed, which is to say: never.
 
+pub mod build_config;
 pub mod changed;
 pub mod checkers;
 pub mod cli;
@@ -125,6 +126,7 @@ pub mod identity;
 pub mod ladder;
 pub mod lease;
 pub mod libtest;
+pub mod nearest;
 pub mod plan;
 pub mod receipt;
 pub mod sched;
@@ -327,6 +329,10 @@ pub struct Ctx {
     /// commit of `origin/main` — and publishes its receipt for branches to be
     /// judged against ([`differential`]).
     pub baseline: bool,
+    /// `--nearest-base` (opt-in, off by default, pending the owner's
+    /// decision): a run whose merge-base has no receipt that serves may be
+    /// judged against its nearest ancestor's ([`nearest`]).
+    pub nearest_base: bool,
     /// `--test-jobs`: how many test binaries the test stage runs at once
     /// ([`testrun`]; [`testrun::DEFAULT_JOBS`] unless the flag says otherwise).
     pub test_jobs: u32,
@@ -478,6 +484,7 @@ impl Ctx {
             disk_free: None,
             progress_log: None,
             baseline: false,
+            nearest_base: false,
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: None,
             test_recorder: None,
@@ -521,6 +528,13 @@ impl Ctx {
         if let Some(n) = jobs {
             self.test_jobs = n.get();
         }
+        self
+    }
+
+    /// A `--nearest-base` run ([`Ctx::nearest_base`]).
+    #[must_use]
+    pub fn with_nearest_base(mut self, nearest_base: bool) -> Self {
+        self.nearest_base = nearest_base;
         self
     }
 
@@ -958,7 +972,17 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     // when nothing in it was red — so no red of it is ever inherited.
     let base_plan = head.map(|tree| {
         if ctx.mode.runs(plan::Tier::Land) {
-            differential::resolve(&caller, &tree.head, ctx.baseline, &tools)
+            differential::resolve_with(
+                &caller,
+                &tree.head,
+                ctx.baseline,
+                &tools,
+                if ctx.nearest_base {
+                    differential::BaseMode::Nearest
+                } else {
+                    differential::BaseMode::Exact
+                },
+            )
         } else {
             differential::Plan::Absolute {
                 why: MEASURE_IS_ABSOLUTE.to_string(),
@@ -1208,10 +1232,11 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
 
 /// The compiler, the spec checkers and the build environment this run used,
 /// as its receipt names them: `<stage2 bin dir> trustc <commit-hash>`
-/// (`unknown` when trustc named none), the checkers' summary, and the compile
+/// (`unknown` when trustc named none), the checkers' summary, the compile
 /// and test-run configuration every child inherits from this process
-/// ([`differential::build_env`]) — what a base must have been made by
-/// ([`differential::tools_differ`]).
+/// ([`differential::build_env`]) and the cargo config files its children
+/// read in the run's root ([`build_config::of_this_process`], 2026-09-28) —
+/// what a base must have been made by ([`differential::tools_differ`]).
 fn run_tools(ctx: &Ctx, tripwire: &identity::Tripwire) -> differential::Tools {
     differential::Tools {
         toolchain: format!(
@@ -1226,6 +1251,7 @@ fn run_tools(ctx: &Ctx, tripwire: &identity::Tripwire) -> differential::Tools {
             .map(checkers::Checkers::summary)
             .unwrap_or_default(),
         build_env: Some(differential::build_env(std::env::vars_os())),
+        build_config: build_config::of_this_process(&ctx.root),
     }
 }
 
@@ -1345,12 +1371,13 @@ fn write_receipt(
     let caller = ctx.caller_root();
     let tools = judged.tools.clone();
     // What the verdict excused, by id: every finding judged INHERITED.
-    let (base, inherited) = match judged.against {
+    let (base, inherited, base_nearest) = match judged.against {
         differential::Against::Base(base) => (
             Some(base.commit.clone()),
             differential::inherited_ids(tally, base),
+            base.nearest.as_ref().map(|_| base.commit.clone()),
         ),
-        differential::Against::Absolute(_) => (None, Vec::new()),
+        differential::Against::Absolute(_) => (None, Vec::new(), None),
     };
     let r = receipt::Receipt {
         head: tree.head.clone(),
@@ -1380,6 +1407,7 @@ fn write_receipt(
         toolchain: tools.toolchain,
         checkers: tools.checkers,
         build_env: tools.build_env,
+        build_config: tools.build_config,
         // NO LIST FROM A RUN THAT MOVED (2026-09-27): its verdict is COULD NOT
         // RUN, but a list would still serve as main's reds to judge a branch
         // against ([`differential::usable`]), with findings from bytes or tools
@@ -1388,6 +1416,7 @@ fn write_receipt(
             differential::recorded_failures(tally, judged.since_from, &tree.head, judged.now)
         }),
         base,
+        base_nearest,
         inherited,
         baseline: ctx.baseline,
         // The reds its since chain held that this run could not itemize — a

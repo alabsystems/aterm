@@ -603,13 +603,8 @@ pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &st
 ///
 /// `None` if `build_dir` has no final path component (never, for a real build dir).
 fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
-    // `call1` routing + manual concat (no `format!`): Trust-gate lowering
-    // workaround — see `lib.rs::call1`.
-    let name = crate::call1(std::path::Path::file_name, build_dir)?;
-    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
-    let mut marker = String::from(name);
-    marker.push_str(".ready");
-    Some(build_dir.with_file_name(marker))
+    let name = build_dir.file_name()?.to_str()?;
+    Some(build_dir.with_file_name(format!("{name}.ready")))
 }
 
 /// The key under which the readiness marker records WHICH SLICE installed the build.
@@ -706,12 +701,7 @@ const READY_OK_LINE: &str = "ok";
 /// time (a universal binary is two separately compiled binaries stitched together, so
 /// each slice reports its own), which is the only property the comparison needs.
 fn running_platform() -> String {
-    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
-    let mut s = String::new();
-    s.push_str(std::env::consts::ARCH);
-    s.push('-');
-    s.push_str(std::env::consts::OS);
-    s
+    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
 
 /// The platform a marker's text records, or `None` when it records none — which covers
@@ -775,17 +765,7 @@ fn bin_inventory(build_dir: &Path) -> Option<String> {
     }
     names.sort();
     names.dedup();
-    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
-    let mut out = String::from(READY_CONTENTS_BIN);
-    let mut first = true;
-    for name in &names {
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        out.push_str(name);
-    }
-    Some(out)
+    Some(format!("{READY_CONTENTS_BIN}{}", names.join(",")))
 }
 
 /// Whether the tree at `build_dir` still holds what its marker's `contents=` record
@@ -1015,17 +995,11 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;
     let parent = dest.parent().unwrap_or(build_dir);
-    // Manual (byte-identical) render of `format!(".ready.tmp-{pid}")`: Trust-gate
-    // lowering workaround — see `lib.rs::dec_u64`.
-    let mut tmp_name = String::from(".ready.tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = parent.join(tmp_name);
-    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
-    let mut body = String::from(READY_OK_LINE);
-    body.push('\n');
-    body.push_str(READY_PLATFORM_KEY);
-    body.push_str(&running_platform());
-    body.push('\n');
+    let tmp = parent.join(format!(".ready.tmp-{}", std::process::id()));
+    let mut body = format!(
+        "{READY_OK_LINE}\n{READY_PLATFORM_KEY}{}\n",
+        running_platform()
+    );
     // AND WHAT THIS MARKER IS VOUCHING FOR ([`READY_CONTENTS_KEY`]): the `bin/` inventory
     // as it stands right now, so a later reader can REFUTE the marker against the tree
     // instead of believing it. Derived here, from the tree, rather than passed in by the
@@ -1134,8 +1108,8 @@ const MAX_DECLARED_MODES_BYTES: usize = 16 * 1024 * 1024;
 /// `store/<program>/<build>.modes` for `build_dir`, or `None` for a path with no name.
 #[must_use]
 pub fn declared_modes_path(build_dir: &Path) -> Option<PathBuf> {
-    let name = crate::call1(std::path::Path::file_name, build_dir)?;
-    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let name = build_dir.file_name()?;
+    let name = name.to_str()?;
     let mut sidecar = String::from(name);
     sidecar.push_str(DECLARED_MODES_SUFFIX);
     Some(build_dir.with_file_name(sidecar))
@@ -1171,27 +1145,10 @@ pub fn write_declared_modes(
         body.push(0);
         // Octal, minimal digits — the very spelling the tree line carries (`0` for a
         // zero mode), so a record and a line never disagree on a number.
-        body.extend_from_slice(oct_mode_digits(*mode).as_bytes());
+        body.extend_from_slice(crate::tree::oct_mode(*mode).as_bytes());
         body.push(b'\n');
     }
     write_sidecar_durably(build_dir, DECLARED_MODES_SUFFIX, &body)
-}
-
-/// Minimal-digit octal of `mode & 0o7777`, `"0"` for zero — no `format!` (the strict
-/// Trust gate cannot lower its `fmt::Arguments` expansion), digit by constant shift.
-fn oct_mode_digits(mode: u32) -> String {
-    let mode = mode & 0o7777;
-    let mut out = String::new();
-    let mut started = false;
-    for shift in [9u32, 6, 3] {
-        let d = (mode.wrapping_shr(shift) & 0x7) as u8;
-        if started || d != 0 {
-            started = true;
-            out.push(char::from(b'0'.wrapping_add(d)));
-        }
-    }
-    out.push(char::from(b'0'.wrapping_add((mode & 0x7) as u8)));
-    out
 }
 
 /// The declared-mode record beside `build_dir`, for [`crate::tree::tree_root_declared`].
@@ -1409,8 +1366,8 @@ impl StageRefusal {
 /// build directory that never came to exist (which is the point: the stage it records
 /// FAILED).
 fn stage_refusal_path(build_dir: &Path) -> Option<PathBuf> {
-    let name = crate::call1(std::path::Path::file_name, build_dir)?;
-    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let name = build_dir.file_name()?;
+    let name = name.to_str()?;
     let mut marker = String::from(name);
     marker.push_str(STAGE_REFUSAL_SUFFIX);
     Some(build_dir.with_file_name(marker))
@@ -1520,20 +1477,16 @@ fn write_stage_refusal(
         .map_or(1, |prior| prior.attempts.saturating_add(1));
     let parent = dest.parent().unwrap_or(build_dir);
     std::fs::create_dir_all(parent)?;
-    // Manual (byte-identical) render, no `format!`: Trust-gate lowering workaround —
-    // see `lib.rs::dec_u64`.
-    let mut tmp_name = String::from(".refused.tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = parent.join(tmp_name);
+    let tmp = parent.join(format!(".refused.tmp-{}", std::process::id()));
     let mut body = String::from(STAGE_REFUSAL_HEADER);
     body.push_str("\nsha256=");
     body.push_str(sha256);
     body.push_str("\ntree_root=");
     body.push_str(tree_root);
     body.push_str("\nattempts=");
-    body.push_str(&crate::dec_u64(u64::from(attempts)));
+    body.push_str(&attempts.to_string());
     body.push_str("\nat=");
-    body.push_str(&crate::dec_u64(u64::try_from(now_unix).unwrap_or(0)));
+    body.push_str(&u64::try_from(now_unix).unwrap_or(0).to_string());
     // Only when set: a reader that predates them sees a digest memo, which fails open,
     // and a cooled-down memo's bytes are what they were.
     match kind {
@@ -1552,7 +1505,7 @@ fn write_stage_refusal(
         .collect();
     body.push_str(&one_line);
     body.push('\n');
-    crate::call2(std::fs::write, &tmp, body.as_bytes())?;
+    std::fs::write(&tmp, body.as_bytes())?;
     if let Err(e) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -1657,8 +1610,8 @@ pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
 
 /// `<build><suffix>` beside `build_dir`, or `None` for a path with no UTF-8 file name.
 pub(crate) fn sidecar_path(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
-    let name = crate::call1(std::path::Path::file_name, build_dir)?;
-    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let name = build_dir.file_name()?;
+    let name = name.to_str()?;
     let mut sidecar = String::from(name);
     sidecar.push_str(suffix);
     Some(build_dir.with_file_name(sidecar))
@@ -1680,7 +1633,7 @@ pub(crate) fn write_sidecar_durably(
     let parent = dest.parent().unwrap_or(build_dir);
     let mut tmp_name = String::from(suffix);
     tmp_name.push_str(".tmp-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    tmp_name.push_str(&std::process::id().to_string());
     let tmp = parent.join(tmp_name);
     let written = (|| {
         use std::io::Write as _;
@@ -1777,13 +1730,8 @@ pub(crate) fn superseded_dir(build_dir: &Path) -> Option<PathBuf> {
 /// apart even though the store lock already serializes them — a scratch name that
 /// collides is a scratch name that can be deleted out from under its owner.
 fn scratch_sibling(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
-    let name = crate::call1(std::path::Path::file_name, build_dir)?;
-    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
-    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
-    let mut scratch = String::from(name);
-    scratch.push_str(suffix);
-    scratch.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    Some(build_dir.with_file_name(scratch))
+    let name = build_dir.file_name()?.to_str()?;
+    Some(build_dir.with_file_name(format!("{name}{suffix}{}", std::process::id())))
 }
 
 /// Which of the two scratch shapes a stage produced.
@@ -1796,7 +1744,7 @@ pub(crate) enum Scratch {
 }
 
 /// A store build directory's name, parsed the way this manager writes one: a non-empty run
-/// of ASCII digits, no leading zero unless the name is exactly `0` ([`crate::dec_u64`]
+/// of ASCII digits, no leading zero unless the name is exactly `0` (`u64`'s `Display`
 /// renders nothing else). `u64::from_str` is looser — `+18` and `018` read back as 18 — and
 /// these names authorize `remove_dir_all` inside `store/<program>/`, a directory the user
 /// can also put things in.
@@ -2497,14 +2445,8 @@ pub struct ToolName(String);
 /// written against the methods degenerates to the identity on the hosts this repo is
 /// developed on and would hold for a wrong implementation too. The tests drive this with
 /// literal `.cmd`/`.exe`.
-///
-/// Built with `push_str`, not `format!` (byte-identical) — Trust-gate lowering
-/// workaround, see `lib.rs`.
 fn with_suffix(name: &str, suffix: &str) -> String {
-    let mut s = String::new();
-    s.push_str(name);
-    s.push_str(suffix);
-    s
+    format!("{name}{suffix}")
 }
 
 /// The inverse of [`with_suffix`], and total: a name that does NOT carry the suffix is
@@ -2627,12 +2569,8 @@ pub fn split_exposed(exposes: &[String]) -> (Vec<ToolName>, Vec<String>) {
 pub fn append_bin_to_path(inherited: Option<&OsStr>, bin_dir: &Path) -> OsString {
     // An absent OR empty inherited `PATH` means "no directories" — start empty so we never
     // emit a leading empty component (which Unix reads as the current directory).
-    // `OsStr::is_empty` via `call1`: Trust-gate span-attribution workaround — see
-    // `lib.rs::call1`.
     let mut dirs: Vec<PathBuf> = match inherited {
-        Some(p) if !crate::call1(std::ffi::OsStr::is_empty, p) => {
-            std::env::split_paths(p).collect()
-        }
+        Some(p) if !p.is_empty() => std::env::split_paths(p).collect(),
         _ => Vec::new(),
     };
     if !dirs.iter().any(|d| d == bin_dir) {
@@ -2804,9 +2742,7 @@ mod tests {
         ] {
             assert!(parse_declared_modes(bad).is_none(), "{bad:?}");
         }
-        assert_eq!(oct_mode_digits(0o755), "755");
-        assert_eq!(oct_mode_digits(0), "0");
-        assert_eq!(oct_mode_digits(0o4755), "4755");
+        assert_eq!(crate::tree::oct_mode(0o755), "755");
     }
 
     /// The refusal's PURE half: what it binds, and for how long. A memo binds only the
@@ -3688,7 +3624,7 @@ mod tests {
         let home = temp_home("unmarkall");
         let prog = home.join("store").join("trust");
         for n in [8590u64, 8595] {
-            let b = prog.join(crate::dec_u64(n));
+            let b = prog.join(n.to_string());
             std::fs::create_dir_all(b.join("bin")).unwrap();
             std::fs::write(b.join("bin").join("trustc"), b"x").unwrap();
             mark_build_ready(&b).unwrap();
@@ -3698,7 +3634,7 @@ mod tests {
         std::fs::write(prog.join("8595.provenance"), b"src\n").unwrap();
         unmark_program_builds(&prog);
         for n in [8590u64, 8595] {
-            let b = prog.join(crate::dec_u64(n));
+            let b = prog.join(n.to_string());
             assert!(!build_is_complete(&b), "build {n} must read as incomplete");
             assert!(
                 b.join("bin").join("trustc").is_file(),

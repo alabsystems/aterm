@@ -9,10 +9,10 @@
 //! the caller's event loop (the wasm render worker cannot answer input while
 //! it runs). [`BudgetedSearch`] splits that work into row-sized units the
 //! caller feeds incrementally: each `feed_row`
-//! indexes ONE row (via [`SearchIndex::index_line`] — the index's native
-//! incremental construction) and verifies matches on that row immediately, so
+//! verifies ONE row with the batch index's matching machinery, so
 //! a caller can stop after any number of rows, yield, and RESUME without
-//! rebuilding anything.
+//! rebuilding anything. The row text and its coordinate map are discarded
+//! after verification; only the bounded matches and scan progress survive.
 //!
 //! ## Results-equality contract
 //!
@@ -25,10 +25,11 @@
 //! literals, the same compiled/capped regex for regex mode), rows are fed in
 //! the same ascending absolute order the batch build indexes them, and the
 //! [`MAX_SEARCH_MATCHES`] cap is applied to exactly the final retained suffix.
-//! Rows that deterministic index eviction will discard are indexed but not
-//! verified, preventing a capped evicted prefix from starving newer retained
-//! matches. Pinned by the slicing-oracle tests below, including the combined
-//! cap-plus-eviction regime.
+//! Rows that deterministic index eviction would discard are consumed without
+//! verification, preventing a capped evicted prefix from starving newer retained
+//! matches. No index is retained: the same eviction schedule determines the
+//! searchable suffix up front. Pinned by the slicing-oracle tests below,
+//! including the combined cap-plus-eviction regime.
 //!
 //! ## Staleness
 //!
@@ -53,7 +54,7 @@ use crate::types::{SearchMatch, SearchResults};
 /// results are equal to one-shot results by construction (module docs).
 enum RowMatcher {
     /// Case-sensitive literal: verified with the batch forward iterator's own
-    /// scan ([`next_literal_match`]) run over the just-indexed row.
+    /// scan ([`next_literal_match`]) run over the supplied row.
     Literal,
     /// Case-insensitive literal: the batch path's per-line matcher.
     CaseInsensitive(CaseInsensitiveMatcher),
@@ -72,12 +73,9 @@ enum RowMatcher {
 /// [`SearchResults`] (partial until complete). See the module docs for the
 /// results-equality and staleness contracts.
 pub struct BudgetedSearch {
-    /// Incrementally built COLUMNS-ONLY index over the rows fed so far: the
-    /// per-row cached `ColumnMap` every verifier reads, the line cache, and the
-    /// eviction schedule that fixes the retained watermark. It maintains no
-    /// trigram postings and no bloom filter, because this engine never queries
-    /// it — every row is verified directly (see `verify_row`).
-    index: SearchIndex,
+    /// The batch index's cache cap, preserved for its first-eviction warning.
+    /// This engine retains no row cache of its own.
+    max_cached_lines: usize,
     /// The query string (verbatim; folding/compilation lives in `matcher`).
     query: String,
     /// Per-row verifier fixed at construction.
@@ -93,8 +91,8 @@ pub struct BudgetedSearch {
     /// `base_row + rows_fed`.
     rows_fed: usize,
     /// Window-relative first row that the completed index will retain. Rows
-    /// before this are still indexed (so eviction metadata stays identical to
-    /// one-shot) but deliberately not verified; see the equality contract.
+    /// before this are consumed but deliberately not verified; see the
+    /// equality contract.
     verify_from: usize,
     /// Final one-shot-compatible watermark, known from the deterministic
     /// eviction schedule before feeding begins. Zero means no eviction.
@@ -106,7 +104,7 @@ impl BudgetedSearch {
     /// row is absolute row `base_row`.
     ///
     /// Regex patterns are validated and compiled here (with the batch path's
-    /// size caps), so an invalid pattern fails before any indexing work.
+    /// size caps), so an invalid pattern fails before any row scanning.
     pub fn new(
         query: &str,
         case_sensitive: bool,
@@ -148,16 +146,7 @@ impl BudgetedSearch {
             0
         };
         Ok(Self {
-            // Columns-only: this engine reads back nothing but `column_maps`
-            // (`verify_row` deliberately bypasses the query pipeline), so the
-            // trigram postings and the bloom filter a full index maintains are
-            // dead weight here — and `rebuild_bloom`, which the default bloom
-            // reaches after a few thousand rows, is an O(all cached lines) sweep
-            // landing inside a turn the caller sized for a handful of rows. The
-            // line cache, the column maps and the eviction schedule (hence
-            // `lowest_retained_line`) are unchanged, so the results-equality
-            // contract with the one-shot path is untouched.
-            index: SearchIndex::columns_only_with_max_cached_lines(max_cached_lines),
+            max_cached_lines,
             query: query.to_string(),
             matcher,
             matches: Vec::new(),
@@ -169,7 +158,7 @@ impl BudgetedSearch {
         })
     }
 
-    /// Index and verify ONE row. Rows must be fed in ascending window order;
+    /// Consume and verify ONE row. Rows must be fed in ascending window order;
     /// this row is absolute `base_row + rows_fed()`. Feeding past the window
     /// is a no-op (the caller's completion check races nothing, so tolerate it
     /// rather than panic).
@@ -178,10 +167,10 @@ impl BudgetedSearch {
         self.feed_row_cow(Cow::Borrowed(text));
     }
 
-    /// Index and verify one owned row without copying its text into the cache.
+    /// Consume and verify one owned row without copying or retaining its text.
     ///
     /// This has the same ordering and completion contract as
-    /// `feed_row`, but moves `text` into the index.
+    /// `feed_row`; `text` is released before returning.
     pub fn feed_row_owned(&mut self, text: String) {
         self.feed_row_cow(Cow::Owned(text));
     }
@@ -192,8 +181,20 @@ impl BudgetedSearch {
         }
         let row_offset = self.rows_fed;
         let abs_row = self.base_row.saturating_add(row_offset);
-        self.index.index_line_cow(abs_row, text);
         self.rows_fed += 1;
+        // Preserve the batch index's once-per-search truncation diagnostic at
+        // its first eviction boundary, without building its unused row cache.
+        if self.verify_from > 0 && row_offset == self.max_cached_lines {
+            let lowest = self
+                .base_row
+                .saturating_add(final_evicted_prefix(self.rows_fed, self.max_cached_lines));
+            aterm_log::warn!(
+                "budgeted search exceeded {} cached-line comparison limit; \
+                 search results may be incomplete below line {}",
+                self.max_cached_lines,
+                lowest,
+            );
+        }
         if row_offset < self.verify_from {
             return;
         }
@@ -202,7 +203,7 @@ impl BudgetedSearch {
         // begins at the final retained suffix, later eviction can never remove
         // capped matches and expose an unverified hole.
         if self.matches.len() < MAX_SEARCH_MATCHES {
-            self.verify_row(abs_row);
+            self.verify_row(abs_row, &text);
         }
     }
 
@@ -239,8 +240,8 @@ impl BudgetedSearch {
         let evicted = self.verify_from > 0;
         let lowest = self.final_lowest_retained_line;
         let matches = if evicted {
-            // Matches were verified BEFORE their rows could be evicted; drop
-            // the ones the one-shot path can no longer see.
+            // Keep the one-shot watermark boundary explicit. Verification
+            // already skips the prefix its completed index would have evicted.
             self.matches
                 .iter()
                 .filter(|m| m.line >= lowest)
@@ -282,56 +283,23 @@ impl BudgetedSearch {
         SearchResults::new(self.matches[start..end].to_vec(), evicted || capped, lowest)
     }
 
-    /// Verify matches on the just-indexed row `abs_row`, appending to
+    /// Verify matches on the supplied row `abs_row`, appending to
     /// `self.matches` (ascending order preserved; capped).
-    fn verify_row(&mut self, abs_row: usize) {
-        let retained = self.index.lines.get(&abs_row);
-        debug_assert!(
-            retained.is_some(),
-            "the just-indexed row must survive newest-first eviction"
-        );
-        let Some(text) = retained.map(String::as_str) else {
+    fn verify_row(&mut self, abs_row: usize, text: &str) {
+        if self.query.is_empty() && !matches!(&self.matcher, RowMatcher::Regex(_)) {
             return;
-        };
+        }
+        let col_map = ColumnMap::new(text);
         match &mut self.matcher {
             RowMatcher::Literal => {
-                // Sweep THIS row with the batch path's own scan
-                // ([`next_literal_match`], shared with the forward match
-                // iterator) instead of re-entering the index query pipeline.
-                //
-                // `search_from_line(query, abs_row)` can only ever yield
-                // matches on `abs_row` — no higher row is indexed yet — but
-                // reaching that verdict decodes EVERY posting list of the query
-                // into a fresh `Vec<u32>` (`decode_smallest_first`), and those
-                // lists grow with every row fed, so verification was O(rows)
-                // per row: quadratic in window depth. A 3-trigram query over a
-                // 50k-line log with 20% hit density burned ~15k varint steps
-                // and 3 Vec allocations per row to confirm one ~80-byte sweep.
-                //
-                // Results are unchanged: the trigram/bloom prefilter it drops
-                // is a pure negative filter (no false negatives — this row's
-                // own trigrams were just inserted), and the iterator's verify
-                // IS this sweep. The two sibling arms below already verify
-                // against `text` + the cached column map this same way.
-                if self.query.is_empty() {
-                    // `search_from_line` short-circuits an empty query before
-                    // touching the row; the sweep below would walk the whole
-                    // row to produce nothing.
-                    return;
-                }
-                // `index_line` just cached this row's column map; reuse it.
-                let fallback;
-                let col_map = match self.index.column_maps.get(&abs_row) {
-                    Some(map) => map,
-                    None => {
-                        fallback = ColumnMap::new(text);
-                        &fallback
-                    }
-                };
+                // Use the batch forward iterator's own per-row verifier.
+                // Rebuilding postings for a row consumed exactly once would
+                // add work without improving this scan. All three arms use
+                // the same temporary coordinate map and retain only matches.
                 let searcher = crate::bytesearch::Searcher::new(self.query.as_bytes());
                 let mut next_byte = 0;
                 while let Some((found, resume)) =
-                    next_literal_match(abs_row, text, &searcher, col_map, next_byte)
+                    next_literal_match(abs_row, text, &searcher, &col_map, next_byte)
                 {
                     next_byte = resume;
                     self.matches.push(found);
@@ -341,30 +309,13 @@ impl BudgetedSearch {
                 }
             }
             RowMatcher::CaseInsensitive(matcher) => {
-                // `index_line` just cached this row's column map; reuse it.
-                let fallback;
-                let col_map = match self.index.column_maps.get(&abs_row) {
-                    Some(map) => map,
-                    None => {
-                        fallback = ColumnMap::new(text);
-                        &fallback
-                    }
-                };
                 let matches = &mut self.matches;
-                matcher.visit_matches(abs_row, text, col_map, |found| {
+                matcher.visit_matches(abs_row, text, &col_map, |found| {
                     matches.push(found);
                     matches.len() < MAX_SEARCH_MATCHES
                 });
             }
             RowMatcher::Regex(re) => {
-                let fallback;
-                let col_map = match self.index.column_maps.get(&abs_row) {
-                    Some(map) => map,
-                    None => {
-                        fallback = ColumnMap::new(text);
-                        &fallback
-                    }
-                };
                 for cap in re.find_iter(text) {
                     // Skip zero-length matches and byte spans that resolve to
                     // zero display columns — the batch forward path's rule.
@@ -446,23 +397,41 @@ mod tests {
     }
 
     #[test]
-    fn owned_feed_retains_the_callers_allocation() {
-        let mut row = String::with_capacity(128);
-        row.push_str("prefix needle suffix");
-        let allocation = row.as_ptr();
-        let capacity = row.capacity();
-
-        let mut search =
-            BudgetedSearch::new("needle", true, false, 7, 1).expect("budgeted construction");
-        search.feed_row_owned(row);
-
-        let retained = search.index.lines.get(&7).expect("owned row is retained");
-        assert_eq!(retained.as_ptr(), allocation);
-        assert_eq!(retained.capacity(), capacity);
-        assert_eq!(
-            search.results(),
-            one_shot(&["prefix needle suffix"], 7, "needle", true, false)
-        );
+    fn owned_feed_matches_borrowed_and_batch_unicode_coordinates() {
+        let rows = [
+            "e\u{301} 日本語 👩🏽‍💻 NEEDLE needle",
+            "\tΟΣ ος οσ\r\nneedle",
+            "tail e\u{301} 日本語 👩🏽‍💻",
+        ];
+        for (query, case_sensitive, is_regex) in [
+            ("needle", true, false),
+            ("οσ", false, false),
+            ("e\u{301}|日本語|👩🏽‍💻", true, true),
+            ("NEEDLE", false, true),
+            ("", true, false),
+            ("", false, true),
+        ] {
+            let mut owned = BudgetedSearch::new(query, case_sensitive, is_regex, 7, rows.len())
+                .expect("budgeted construction");
+            let mut borrowed = BudgetedSearch::new(query, case_sensitive, is_regex, 7, rows.len())
+                .expect("budgeted construction");
+            for row in rows {
+                // Excess capacity must not affect matching or be kept by the
+                // engine. Actual reclamation is checked by index_release_memory.
+                let mut text = String::with_capacity(4096);
+                text.push_str(row);
+                owned.feed_row_owned(text);
+                borrowed.feed_row(row);
+                assert_eq!(owned.results(), borrowed.results());
+                assert_eq!(owned.rows_fed(), borrowed.rows_fed());
+            }
+            assert!(owned.is_complete());
+            assert_eq!(
+                owned.results(),
+                one_shot(&rows, 7, query, case_sensitive, is_regex),
+                "query={query:?} cs={case_sensitive} rx={is_regex}"
+            );
+        }
     }
 
     /// The closed-form doomed-prefix calculation must stay identical to the
@@ -607,7 +576,7 @@ mod tests {
         }
     }
 
-    /// An invalid regex fails at construction, before any indexing work.
+    /// An invalid regex fails at construction, before any row scanning.
     #[test]
     fn invalid_regex_fails_at_construction() {
         let err = BudgetedSearch::new("f(oo", false, true, 0, 10);
@@ -643,7 +612,7 @@ mod tests {
         assert_eq!(done, one_shot(&rows, 0, "needle", false, false));
     }
 
-    /// Stable slices stay valid even while the underlying index crosses an
+    /// Stable slices stay valid even when the batch index would cross an
     /// eviction boundary: doomed-prefix rows are never emitted, and bounded
     /// range reads do not clone the full accumulated vector.
     #[test]

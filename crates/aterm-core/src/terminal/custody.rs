@@ -252,6 +252,32 @@ impl CustodyTransition {
         }
     }
 
+    /// Is this a gesture of the person reading the session — typing, a paste,
+    /// a scroll, a selection, a return to live — rather than output, a bare
+    /// modifier or a key release, none of which says where they want to be?
+    /// What [`Terminal::reader_gesture_count`] counts.
+    #[must_use]
+    pub fn is_reader_gesture(self) -> bool {
+        match self {
+            Self::UserScroll
+            | Self::UserScrollTowardLive
+            | Self::SnapToLive
+            | Self::UserSelect
+            | Self::UserClear
+            | Self::TypingPress
+            | Self::RepeatPress => true,
+            Self::InertPress
+            | Self::ReleaseEvent
+            | Self::OutputAtLive
+            | Self::OutputWhileReading
+            | Self::OutputDamagesTheSelectedRows
+            | Self::OutputDamagesTheSelectedRowsInPlace
+            | Self::OutputInvalidatesTheCoordinateSpace
+            | Self::OutputTookTheSelectionUnattributed
+            | Self::OutputTookTheSelectionUnattributedInPlace => false,
+        }
+    }
+
     /// Did this transition destroy a live highlight WITHOUT the user asking?
     ///
     /// The `custody` verb exists to answer "why did my selection disappear?", and the
@@ -314,6 +340,9 @@ impl Terminal {
     #[inline]
     pub(crate) fn note_custody_at(&mut self, transition: CustodyTransition, took: bool) {
         self.last_custody = Some(transition);
+        if transition.is_reader_gesture() {
+            self.reader_gestures = self.reader_gestures.wrapping_add(1);
+        }
         if took {
             self.last_custody_change = Some(transition);
         }
@@ -349,6 +378,17 @@ impl Terminal {
     #[inline]
     pub fn note_custody_took(&mut self, transition: CustodyTransition) {
         self.last_custody_change = Some(transition);
+    }
+
+    /// How many reader gestures ([`CustodyTransition::is_reader_gesture`]) this
+    /// session has recorded since it was created, plus every return to live
+    /// that found the view already there ([`Self::return_to_live`]). Only its
+    /// CHANGE means anything: a caller samples it, and a later sample that
+    /// differs says the person acted on the session in between.
+    #[must_use]
+    #[inline]
+    pub fn reader_gesture_count(&self) -> u64 {
+        self.reader_gestures
     }
 
     /// The last recorded custody transition, or `None` if nothing has moved custody

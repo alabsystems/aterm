@@ -208,6 +208,8 @@ use aterm_uds::CtlStream;
 pub mod census;
 mod conn;
 pub use conn::conn_main_entry;
+mod drift;
+pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 
 /// Usage synopsis — the one-line invocation shape, shared by `--help` and the
@@ -348,10 +350,15 @@ PUSH FRAMES (subscribe):
                                  JSON + a trailing newline — a lossless state delta.
       EVENT <local> <kind> ...   a lifecycle digest line — `turn <id> submitted=
                                  status= dur_ms=`, `block-complete <id> exit=<code|->`,
-                                 `meta`, `title`, `bell total=<n>`, the fabric kinds
-                                 (`inbox`, `inbox-seen`, `post`, `post-landed`, `hold`, `topic`),
-                                 `closing reason= by=`, then `exited`; the `sessions`
-                                 stream adds `EVENT * session-created|session-exited|fabric-retire`.
+                                 `meta`, `title`, `bell total=<n>`, `agent <word> rev=`
+                                 (the server's read of a claude/codex screen moved),
+                                 `human` (a person's key, click or scroll), the fabric kinds
+                                 (`inbox`, `inbox-seen`, `post`, `fetch`, `post-landed`,
+                                 `hold`, `topic`), `resize n= id= to= run=[ dropped=]` (grid
+                                 resizes, coalesced per wake), `render desync-risk …|healed …`
+                                 (see `resizes`), `closing reason= by=`, then `exited`; the
+                                 `sessions` stream adds
+                                 `EVENT * session-created|session-exited|fabric-retire`.
                                  `subscribe --help` prints the full contract.
       BYTES <local> <len>        then <len> RAW PTY bytes + a trailing newline.
       MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]   one per
@@ -3421,12 +3428,160 @@ fn is_timeout_error(e: &io::Error) -> bool {
     )
 }
 
+/// The words for a request the server never answered: the connect to `path`
+/// succeeded, then a read or write on the connection waited out the whole
+/// `deadline`. The OS says only `Resource temporarily unavailable (os error
+/// 35)` — EAGAIN, the shape a socket deadline takes ([`is_timeout_error`]) —
+/// which reads like a broken client, when what happened is a server that took
+/// the connection and said nothing (2026-09-28: a window that App Nap and a
+/// saturated Mac kept from running for three hours; every agent's `aterm ctl`
+/// failed that way). So the line names the socket and the wait, and says
+/// `timed out`, the words the supervisor's lost-request list reads
+/// (`CtlReply::lost` in aterm-agent's supervise/run.rs). The kind is kept, so
+/// the run still exits [`EXIT_TIMEOUT`].
+///
+/// Which line depends on where the deadline fired. Before any of the answer
+/// came (sending the request, or waiting for its status line: the error is
+/// [`Unanswered`]) it is `no reply from <sock> within <N>s (connected; the
+/// server did not answer)`. Anywhere after that, a body cut off in the middle
+/// or an acknowledgement nobody read, it is `reply from <sock> stopped
+/// part-way: nothing more within <N>s (connected; the server began its
+/// answer, then went quiet)`: saying "did not answer" there would be false.
+///
+/// Passed on unchanged: every other kind, an error already [`Worded`], and any
+/// error when no deadline was set (then no deadline can have fired).
+fn no_reply_error(e: io::Error, path: &str, deadline: Option<std::time::Duration>) -> io::Error {
+    let Some(deadline) = deadline else {
+        return e;
+    };
+    if !is_timeout_error(&e) || is_worded(&e) {
+        return e;
+    }
+    let mut msg = String::new();
+    if is_unanswered(&e) {
+        msg.push_str("no reply from ");
+        msg.push_str(path);
+        msg.push_str(" within ");
+        msg.push_str(&deadline_words(deadline));
+        msg.push_str(" (connected; the server did not answer) — the request timed out");
+    } else {
+        msg.push_str("reply from ");
+        msg.push_str(path);
+        msg.push_str(" stopped part-way: nothing more within ");
+        msg.push_str(&deadline_words(deadline));
+        msg.push_str(
+            " (connected; the server began its answer, then went quiet) — the request timed out",
+        );
+    }
+    io::Error::new(e.kind(), Worded(io::Error::other(msg)))
+}
+
+/// A deadline-kind error from BEFORE any of the answer came: sending the
+/// request ([`send_request`], and a `--stdin` payload), or waiting for its
+/// status line ([`read_status_line`]). [`no_reply_error`] says `no reply …
+/// (connected; the server did not answer)` only for this; its kind and words
+/// are the inner error's.
+#[derive(Debug)]
+struct Unanswered(io::Error);
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Unanswered {}
+
+/// Mark a deadline-kind `e` [`Unanswered`]; every other error, one already
+/// marked, and one already [`Worded`] come back as they came.
+fn unanswered(e: io::Error) -> io::Error {
+    if is_timeout_error(&e) && !is_worded(&e) && !is_unanswered(&e) {
+        io::Error::new(e.kind(), Unanswered(e))
+    } else {
+        e
+    }
+}
+
+fn is_unanswered(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Unanswered>())
+}
+
+/// Read the reply's status line, its first: [`read_bounded_line`], with a
+/// deadline that fires here marked [`Unanswered`] (nothing of the answer has
+/// come). Every conversation [`converse`] holds reads its status line through
+/// this, and its body lines through [`read_bounded_line`] itself.
+fn read_status_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
+    read_bounded_line(reader, line).map_err(unanswered)
+}
+
+/// A deadline as [`no_reply_error`] says it: whole seconds as `900s`, a
+/// remainder to a tenth (`12.5s`), under a second in milliseconds (`250ms`).
+/// `--timeout` takes whole seconds; the rest is the one retry after a
+/// hang-up, which runs on what the deadline had left (down to a 1 ms floor).
+fn deadline_words(d: std::time::Duration) -> String {
+    let mut words = String::new();
+    if d.subsec_nanos() == 0 {
+        words.push_str(&d.as_secs().to_string());
+        words.push('s');
+    } else if d.as_secs() == 0 {
+        words.push_str(&d.as_millis().max(1).to_string());
+        words.push_str("ms");
+    } else {
+        words.push_str(&d.as_secs().to_string());
+        words.push('.');
+        words.push_str(&(d.subsec_millis() / 100).to_string());
+        words.push('s');
+    }
+    words
+}
+
+/// A deadline-kind error whose words are final, which [`no_reply_error`]
+/// passes on as it is: its own line, a stdout or stderr write that would
+/// block (a non-blocking stdout or stderr another process left full is not
+/// the server's silence; [`StdoutSink`] and [`stderr_line`] mark it), and the
+/// successor's own exchange when a hang-up was asked again (it has worded its
+/// own). The kind is the inner error's (so the run still exits
+/// [`EXIT_TIMEOUT`]), and so are the words.
+#[derive(Debug)]
+struct Worded(io::Error);
+
+impl std::fmt::Display for Worded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Worded {}
+
+/// Mark a deadline-kind `e` [`Worded`]; every other error, and one already
+/// marked, comes back as it came.
+fn worded(e: io::Error) -> io::Error {
+    if is_timeout_error(&e) && !is_worded(&e) {
+        io::Error::new(e.kind(), Worded(e))
+    } else {
+        e
+    }
+}
+
+fn is_worded(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Worded>())
+}
+
 /// The whole client as a callable: `argv[1..]` in, process exit code out.
 /// The ONE `aterm` binary calls this in-process for `aterm ctl …` (and via
 /// the `aterm-ctl` argv0 compat alias); the thin `src/main.rs` bin wraps it
 /// for a standalone build. Everything below is unchanged from the binary era.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
-    match real_main(argv) {
+    main_entry_with(argv, LocalVerbs::NONE)
+}
+
+/// [`main_entry`] with the verbs the embedding binary can answer IN-PROCESS
+/// ([`LocalVerbs`]): the one `aterm` binary links the terminal engine and hands
+/// in the `cast drift` analyzer, so `aterm ctl cast drift` works against a
+/// server that predates the verb and offline over saved files. This crate stays
+/// dependency-free; the standalone `aterm-ctl` passes none.
+pub fn main_entry_with(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> ExitCode {
+    match real_main(argv, local) {
         Ok(code) => code,
         Err(e) => {
             // `aterm ctl help --full | head`: the reader closed stdout, so the
@@ -3492,17 +3647,26 @@ fn is_stdout_closed(e: &io::Error) -> bool {
 /// the one-line and line-framed printers, the discovery rows (`ls`, `instances`,
 /// `windows`), the completion scripts, the byte-body copy and the subscribe relay
 /// — writes through it, so `| head` ends each of them the same way
-/// (`every_stdout_writer_goes_through_the_sink`).
+/// (`every_stdout_writer_goes_through_the_sink`). A write that would block is
+/// [`Worded`], so a full non-blocking stdout keeps the OS's words and is never
+/// reported as the server's silence ([`no_reply_error`]).
 struct StdoutSink<W>(W);
 
 impl<W: Write> Write for StdoutSink<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf).map_err(stdout_closed)
+        self.0.write(buf).map_err(stdout_failure)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush().map_err(stdout_closed)
+        self.0.flush().map_err(stdout_failure)
     }
+}
+
+/// A stdout write's failure, marked for the readers that must tell it from the
+/// socket's: a broken pipe is [`StdoutClosed`] ([`stdout_closed`]), a write that
+/// would block is [`Worded`] ([`worded`]); every other failure is as it came.
+fn stdout_failure(e: io::Error) -> io::Error {
+    worded(stdout_closed(e))
 }
 
 /// The usage error for an invocation with no verb: `usage: <SYNOPSIS>`,
@@ -3600,25 +3764,134 @@ fn client_verb_entry(verb: &str) -> Option<Vec<String>> {
     Some(entry)
 }
 
-/// The client-side answer to `help <client verb>`; `None` for every other request,
-/// which goes to the server as before (`help`, `help text`, `help --full`, and a
-/// `help ls extra` the server rejects as `ERR usage`). Framed exactly as the
-/// server frames its own `help <verb>` — `OK <n>` + n rows — so the reply prints
-/// through the same shape the server's does and reads the same to a parser.
-fn client_help_reply(parts: &[String]) -> Option<String> {
+/// How a `help <verb>` request was asked, which decides who answers a protocol
+/// verb (a client verb is always answered here: the server has never heard of it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelpAsked {
+    /// `<verb> --help`, rewritten to `help <verb>` ([`help_request_rewrite`]): a
+    /// question about THIS client's command line, answered from the
+    /// `control_verbs` table it links, with no socket — the audit's Test G
+    /// (`docs/AUDIT-cli-per-verb-help-2026-08-31.md`): asking how a verb works
+    /// needs no running aterm, and a dead or missing socket must not turn the
+    /// question into a connect error.
+    ByFlag,
+    /// `help <verb>` typed as such: the server's question. Its `cmd_help` is
+    /// authoritative for its own build, which may be older or newer than this
+    /// client's, so the request goes to the socket as it always has.
+    ByVerb,
+}
+
+/// The client-side answer to `help <verb>`: a client verb from the CLIENT VERBS
+/// block whichever way it was asked, and — only when it was asked as `<verb>
+/// --help` ([`HelpAsked::ByFlag`]) — a protocol verb from the same
+/// `control_verbs` table the server answers from (`spec(verb).entry_lines()`,
+/// `aterm-gui`'s `cmd_help`). `None` for everything else, which goes to the
+/// server: an explicit `help <protocol verb>`, a bare `help`, `help --full`,
+/// `help --json`, an unknown name (a newer server can still describe a verb this
+/// client lacks) and a `help ls extra` the server rejects as `ERR usage`. Framed
+/// exactly as the server frames its own `help <verb>` — `OK <n>` + n rows — so
+/// the reply prints through the same shape and reads the same to a parser.
+fn client_help_reply(parts: &[String], asked: HelpAsked) -> Option<String> {
     let [verb, name] = parts else {
         return None;
     };
-    if verb != "help" || !CLIENT_HELP_VERBS.contains(&name.as_str()) {
+    if verb != "help" {
         return None;
     }
-    let lines = client_verb_entry(name)?;
+    let lines = if CLIENT_HELP_VERBS.contains(&name.as_str()) {
+        client_verb_entry(name)?
+    } else if asked == HelpAsked::ByFlag {
+        aterm_types::control_verbs::spec(name)?.entry_lines()
+    } else {
+        return None;
+    };
     let mut reply = format!("OK {}\n", lines.len());
     for line in lines {
         reply.push_str(&line);
         reply.push('\n');
     }
     Some(reply)
+}
+
+/// `help <verb>` for a verb THIS client's table knows. The server answers, and
+/// its entry is printed as it is — it describes the protocol that server
+/// speaks. What an older server cannot say is filled in from this client's own
+/// table: a verb it calls unknown gets this client's entry on stdout (with a
+/// note on stderr that the server will refuse the verb), and `help cast` from a
+/// server with no `cast drift` gets a note that this client computes it itself.
+/// Every other server refusal is printed as `exchange` prints one, a
+/// connection no instance accepted is named within [`ACCEPT_DEADLINE`], and a
+/// deadline that fires once served is [`converse`]'s line ([`converse_served`]).
+fn help_with_fallback(
+    path: &str,
+    origin: TargetOrigin,
+    name: &str,
+    deadline: Option<std::time::Duration>,
+    local: &LocalVerbs,
+) -> io::Result<ExitCode> {
+    converse_served(path, origin, deadline, |stream| {
+        help_on(stream, name, local)
+    })
+    .map(|served| served.unwrap_or_else(std::convert::identity))
+}
+
+/// [`help_with_fallback`] once served: `stream` is a connection
+/// [`converse_served`] proved accepted, authenticated and bounded by the
+/// caller's deadline, so the request goes out as it is ([`send_served`]).
+fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<ExitCode> {
+    if let Some(code) = send_served(&stream, format!("help {name}\n").as_bytes())? {
+        return Ok(code);
+    }
+    let mut reader = BufReader::new(&stream);
+    let mut status = String::new();
+    if read_status_line(&mut reader, &mut status)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed the connection without responding",
+        ));
+    }
+    let status = status.trim_end_matches(['\r', '\n']);
+    let Some(tail) = status.strip_prefix("OK ") else {
+        drain_refusal_tail(&mut reader)?;
+        if status.starts_with("ERR unknown verb")
+            && let Some(spec) = aterm_types::control_verbs::spec(name)
+        {
+            let rows = spec.entry_lines();
+            let mut reply = format!("OK {}\n", rows.len());
+            for row in rows {
+                reply.push_str(&row);
+                reply.push('\n');
+            }
+            print_framed_lines(&reply)?;
+            stderr_line(&format!(
+                "the aterm that answered predates `{name}` ({status}); the entry above is this \
+                 client's (aterm {}), and that aterm will refuse the verb",
+                aterm_types::version::APP_VERSION
+            ))?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        stderr_line(status)?;
+        return Ok(ExitCode::FAILURE);
+    };
+    let n = stream_count(tail).ok_or_else(|| malformed_header_error(status))?;
+    let rows = drift::read_lines(&mut reader, n)?;
+    let mut reply = format!("OK {}\n", rows.len());
+    for row in &rows {
+        reply.push_str(row);
+        reply.push('\n');
+    }
+    print_framed_lines(&reply)?;
+    if name == "cast"
+        && local.cast_drift.is_some()
+        && !rows.iter().any(|row| row.contains("cast drift"))
+    {
+        stderr_line(
+            "the aterm that answered predates `cast drift`; this client computes it itself \
+             (`aterm ctl cast drift`, its header ending computed=client) — this client's entry \
+             is in `aterm help introspection`",
+        )?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Print a line-framed reply (`OK <n>` + n rows) the way [`exchange`] prints a
@@ -3669,7 +3942,7 @@ fn utf8_args(argv: Vec<std::ffi::OsString>) -> io::Result<Vec<String>> {
 /// Returns the process exit code on a completed exchange (`SUCCESS` for `OK`,
 /// `FAILURE` for an `ERR`/unexpected status), or an [`io::Error`] for usage or
 /// connection problems (surfaced on stderr by [`main`]).
-fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
+fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<ExitCode> {
     // Flag parsing stops at the first positional argument: everything from the
     // verb onward is part of the request, so a literal "--sock" inside e.g. a
     // `send`/`search` payload is never mistaken for our own flag.
@@ -3781,13 +4054,17 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     // `--help` (AUDIT-cli-per-verb-help-2026-08-31.md, D-3 and D-7). Asking a
     // verb how it works must never do the thing.
     //
-    // The answer is the server's own `help <verb>` catalog row, which all 88
-    // verbs already have — so this wires an EXISTING declaration to the route
-    // every human and agent tries first. No new prose, one call site, and it
+    // The answer is the verb's `help <verb>` catalog row, which every verb
+    // already has — so this wires an EXISTING declaration to the route every
+    // human and agent tries first. It is answered from the table this client
+    // links, with no socket ([`HelpAsked::ByFlag`], audit Test G); an explicit
+    // `help <verb>` still asks the server. No new prose, one call site, and it
     // lands before the socket dial, before the `mux` report and before the
     // discovery verbs, so it covers the whole surface rather than a list
     // somebody remembered to update.
+    let mut help_asked = HelpAsked::ByVerb;
     if let Some(rewritten) = help_request_rewrite(&request_parts) {
+        help_asked = HelpAsked::ByFlag;
         // `send` and `paste` are the only two verbs whose argument is arbitrary
         // LITERAL text, so they are the only two where this interception can
         // take something a caller meant. Name the escape instead of leaving
@@ -3872,12 +4149,19 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         }
         return run_discovery(verb, sock.as_deref(), pid, nesting.as_ref());
     }
-    // `help <client verb>` is answered here as well, from the same CLIENT VERBS
-    // block `--help` prints — the server's `help` knows only the protocol table
-    // and would call `ls` an unknown verb. No socket is needed for it.
-    if let Some(reply) = client_help_reply(&request_parts) {
+    // `help <verb>` is answered here as well: a client verb from the same CLIENT
+    // VERBS block `--help` prints (the server's `help` knows only the protocol
+    // table and would call `ls` an unknown verb), and a protocol verb asked as
+    // `<verb> --help` from the table the server answers from. No socket is needed
+    // for either; an explicit `help <protocol verb>` goes to the server.
+    if let Some(reply) = client_help_reply(&request_parts, help_asked) {
         print_framed_lines(&reply)?;
         return Ok(ExitCode::SUCCESS);
+    }
+    // `cast drift --file <cast> [--screen <text>] [--until <t>]` replays saved
+    // files, so it is answered here too, before any socket (the `drift` module).
+    if let Some(code) = drift::offline_entry(&request_parts, &local)? {
+        return Ok(code);
     }
 
     // Where a successor may answer if an aterm self-update replaces the server
@@ -3951,6 +4235,38 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     // Reject line terminators before framing: the socket is newline-delimited,
     // so an embedded '\n'/'\r' would inject a second authenticated verb.
     validate_request_parts(&request_parts)?;
+
+    // `cast drift` asks the server, and computes the report here when the server
+    // predates the verb and this binary links the engine (the `drift` module) —
+    // `dial <name> [@<sid>] cast drift` too, its requests and its fallback's
+    // reads all through the relay.
+    {
+        let (selector, rest) = split_selector(&request_parts);
+        if drift::is_cast_drift(rest) {
+            let route = drift::Route {
+                dial: None,
+                selector,
+            };
+            return drift::live(&path, origin, route, &rest[2..], deadline, &local);
+        }
+        if let Some((name, selector, rest)) = drift::split_dial(&request_parts)
+            && drift::is_cast_drift(rest)
+        {
+            let route = drift::Route {
+                dial: Some(name),
+                selector,
+            };
+            return drift::live(&path, origin, route, &rest[2..], deadline, &local);
+        }
+    }
+    // `help <verb>` (and `<verb> --help`) asks the server, whose table is what it
+    // speaks, and says what an OLDER server cannot (`help_with_fallback`).
+    if let [help, name] = request_parts.as_slice()
+        && help == "help"
+        && aterm_types::control_verbs::spec(name).is_some()
+    {
+        return help_with_fallback(&path, origin, name, deadline, &local);
+    }
 
     // The wire never quotes (see `split_pattern_note`): say which pattern element
     // the join below is about to split into several tokens, BEFORE it is sent —
@@ -4193,34 +4509,38 @@ fn feed_bin_exchange(
     deadline: Option<std::time::Duration>,
 ) -> io::Result<ExitCode> {
     let path = &aterm_uds::latest::resolve(path);
-    let stream = connect_stream(path, origin)?;
-    stream.set_read_timeout(deadline)?;
-    stream.set_write_timeout(deadline)?;
-    // `AUTH <token>\n` (transparent) + `<prefix> <len>\n`, then the raw body.
-    let mut head = String::from(prefix);
-    head.push(' ');
-    head.push_str(&payload.len().to_string());
-    head.push('\n');
-    send_request(&stream, read_token_for(path).as_deref(), &head)?;
-    (&stream).write_all(payload)?;
-    (&stream).flush()?;
+    // `AUTH <token>\n` (transparent) + the connect probe ([`converse_served`]),
+    // then `<prefix> <len>\n` and the raw body — the body only once the
+    // instance has proved it is serving, so a dead queue cannot swallow it.
+    let served = converse_served(path, origin, deadline, |stream| {
+        let mut head = String::from(prefix);
+        head.push(' ');
+        head.push_str(&payload.len().to_string());
+        head.push('\n');
+        let mut frame = head.into_bytes();
+        frame.extend_from_slice(payload);
+        if let Some(code) = send_served(&stream, &frame)? {
+            return Ok(code);
+        }
 
-    let mut reader = BufReader::new(&stream);
-    let mut status_line = String::new();
-    if read_bounded_line(&mut reader, &mut status_line)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "server closed the connection without responding",
-        ));
-    }
-    let status_line = status_line.trim_end_matches(['\r', '\n']);
-    if status_line.split(' ').next() == Some("OK") {
-        print_stdout_line(status_line)?;
-        Ok(ExitCode::SUCCESS)
-    } else {
-        stderr_line(status_line)?;
-        Ok(ExitCode::FAILURE)
-    }
+        let mut reader = BufReader::new(&stream);
+        let mut status_line = String::new();
+        if read_status_line(&mut reader, &mut status_line)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server closed the connection without responding",
+            ));
+        }
+        let status_line = status_line.trim_end_matches(['\r', '\n']);
+        if status_line.split(' ').next() == Some("OK") {
+            print_stdout_line(status_line)?;
+            Ok(ExitCode::SUCCESS)
+        } else {
+            stderr_line(status_line)?;
+            Ok(ExitCode::FAILURE)
+        }
+    })?;
+    Ok(served.unwrap_or_else(std::convert::identity))
 }
 
 /// Reject request arguments that carry a line terminator. The control socket is
@@ -4344,14 +4664,32 @@ fn forwarded_verb(parts: &[String]) -> Option<String> {
 /// no help token follows the verb.
 ///
 /// Only an argument that IS `-h` or `--help` counts — never `--help=x`, never a
-/// token that merely contains it — and never a request whose verb is already
-/// `help`, so `help`, `help text` and `help --full` reach the server unchanged.
+/// token that merely contains it — and a request whose verb is already `help`
+/// is left alone, so `help`, `help text` and `help --full` are what they say.
+/// The one exception is `help --help` (or `help -h`) alone, which asks about
+/// `help` itself: it becomes `help help` rather than the server's `ERR usage`.
 /// The verb is found with [`forwarded_verb`], so a `@<sid>` selector and the
 /// `dial <name> <verb>` form are handled by the same rule as everything else.
 fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
+    let is_help_token = |a: &str| a == "-h" || a == "--help";
+    // `dial --help` / `dial <name> --help` name no remote verb: they ask about
+    // `dial` itself (without this they end in dial's missing-verb refusal).
+    if parts.first().map(String::as_str) == Some("dial")
+        && forwarded_verb(parts).is_none_or(|v| is_help_token(&v))
+        && parts.iter().skip(1).any(|a| is_help_token(a))
+    {
+        return Some(vec![String::from("help"), String::from("dial")]);
+    }
     let verb = forwarded_verb(parts)?;
     if verb == "help" {
-        return None;
+        let tail: Vec<&str> = parts
+            .iter()
+            .map(String::as_str)
+            .skip_while(|p| *p != "help")
+            .skip(1)
+            .collect();
+        return matches!(tail.as_slice(), ["-h"] | ["--help"])
+            .then(|| vec![String::from("help"), String::from("help")]);
     }
     parts
         .iter()
@@ -4785,10 +5123,331 @@ fn connect_stream(path: &str, origin: TargetOrigin) -> io::Result<CtlStream> {
     }
 }
 
+/// How long `aterm ctl` waits for an instance to ACCEPT its connection and
+/// start serving it — the connect phase, distinct from a verb's own runtime.
+///
+/// The server has never acknowledged `AUTH`, so a connection parked in a dead
+/// listen queue (2026-09-25: the owner's instance held thirteen never-accepted
+/// connections) looked exactly like a slow verb and sat out the whole
+/// [`EXCHANGE_DEADLINE`] — 900 s. Now every authenticated exchange first asks
+/// [`ACCEPT_PROBE`] and waits at most this long for its answer; only then is the
+/// real request sent, under the ordinary deadline. A healthy instance answers
+/// in milliseconds (the probe never touches the main thread), so the bound is
+/// generous for a loaded machine and still a sixtieth of the old stall. An
+/// explicit `--timeout` shorter than this bounds the connect phase too; an
+/// explicit `--timeout 0` (no deadline) is honored here as everywhere.
+const ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The accept probe: `version`, which every server generation answers for ANY
+/// authenticated scope, immediately, on the lane that took the connection, with
+/// one status line and no main-thread round trip. Using an existing verb keeps
+/// the protocol additive in both directions: an older server answers it like
+/// any request, and an older client never sends it. Its reply is consumed here
+/// and never printed.
+const ACCEPT_PROBE: &[u8] = b"version\n";
+
+/// How the connect phase ended ([`open_accepted`]).
+enum Acceptance {
+    /// Accepted, authenticated and being served: send the request.
+    Served(CtlStream),
+    /// The server answered the connect phase with a refusal — `ERR auth`, or
+    /// `ERR control server busy; retry` from a listener whose every lane is
+    /// taken. The line is the whole answer; the request was never sent.
+    Refused(String),
+    /// Nothing answered within the connect deadline: the connection is sitting
+    /// in a listen queue nobody is draining, or the process that would answer
+    /// is not running (stopped, App Nap, a saturated machine). The client
+    /// cannot tell which; either way the request was never sent.
+    NotAccepted(std::time::Duration),
+    /// The server closed (or reset) the connection without a word. A
+    /// supervised listener does exactly this to the connections queued in a
+    /// socket it is replacing, so it is worth one reconnect.
+    Dropped,
+}
+
+/// Whether an I/O error means the peer dropped the connection (as opposed to a
+/// deadline or a local fault).
+fn is_peer_drop(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// After a send failed because the server hung up (EPIPE/ECONNRESET), read the
+/// status line it may have left behind — a busy listener writes `ERR control
+/// server busy; retry` and closes WITHOUT reading, so the client's write is what
+/// fails, and reporting that as "Broken pipe" hid the actual answer.
+fn pending_status_line(stream: &CtlStream) -> Option<String> {
+    // Darwin answers EINVAL to SO_RCVTIMEO once an AF_UNIX peer has detached,
+    // while `recv` still yields every queued byte and then EOF. So a refused
+    // bound means "read without blocking", never "give up on the line".
+    // Windows' `CtlStream` stores its read timeout and refuses only a zero
+    // one, so it never reaches the fallback — and has no `set_nonblocking`.
+    if stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .is_err()
+    {
+        #[cfg(unix)]
+        stream.set_nonblocking(true).ok()?;
+        #[cfg(not(unix))]
+        return None;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match read_bounded_line(&mut reader, &mut line) {
+        Ok(n) if n > 0 => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+        _ => None,
+    }
+}
+
+/// What a server that already hung up on the connect phase left behind: its
+/// refusal line (`ERR control server busy; retry`, `ERR auth`), or nothing —
+/// a drop, which [`connect_served`] retries once.
+fn answer_left_behind(stream: &CtlStream) -> Acceptance {
+    match pending_status_line(stream) {
+        Some(line) => Acceptance::Refused(line),
+        None => Acceptance::Dropped,
+    }
+}
+
+/// Whether a refused socket timeout means the peer has already closed: Darwin
+/// answers EINVAL to SO_SNDTIMEO/SO_RCVTIMEO once an AF_UNIX peer has detached.
+/// Only an OS error counts — std's own refusal of a zero timeout, and the
+/// Windows stream's, carry no errno.
+fn peer_already_closed(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::InvalidInput && e.raw_os_error().is_some()
+}
+
+/// Connect to `path` and prove the connection was ACCEPTED and is being served
+/// before any request is sent: `AUTH` plus [`ACCEPT_PROBE`], then one reply line
+/// within [`ACCEPT_DEADLINE`] (or `deadline`, when shorter). With no token there
+/// is nothing to authenticate and nothing to probe — the request goes straight
+/// out, exactly as before. On `Served` the stream's timeouts are `deadline`.
+fn open_accepted(
+    path: &str,
+    origin: TargetOrigin,
+    token: Option<&str>,
+    deadline: Option<std::time::Duration>,
+) -> io::Result<Acceptance> {
+    let stream = connect_stream(path, origin)?;
+    // The connect phase's read bound: the probe's patience with a token; with
+    // none nothing is probed, and the caller's deadline applies from here.
+    let patience = match token {
+        Some(_) => deadline.map(|d| d.min(ACCEPT_DEADLINE)),
+        None => deadline,
+    };
+    // A listener can accept, answer and close before these run — a busy one
+    // does exactly that — and Darwin then refuses SO_SNDTIMEO/SO_RCVTIMEO with
+    // EINVAL. Its answer is still queued: read it, as a send the hang-up cut
+    // short does below, instead of reporting "Invalid argument".
+    if let Err(e) = stream
+        .set_write_timeout(deadline)
+        .and_then(|()| stream.set_read_timeout(patience))
+    {
+        if !peer_already_closed(&e) {
+            return Err(e);
+        }
+        return Ok(answer_left_behind(&stream));
+    }
+    let Some(token) = token else {
+        return Ok(Acceptance::Served(stream));
+    };
+    let mut hello = Vec::with_capacity(token.len() + 16);
+    hello.extend_from_slice(b"AUTH ");
+    hello.extend_from_slice(token.as_bytes());
+    hello.push(b'\n');
+    hello.extend_from_slice(ACCEPT_PROBE);
+    if let Err(e) = (&stream).write_all(&hello).and_then(|()| (&stream).flush()) {
+        if !is_peer_drop(&e) {
+            return Err(e);
+        }
+        return Ok(answer_left_behind(&stream));
+    }
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    match read_bounded_line(&mut reader, &mut line) {
+        Ok(0) => return Ok(Acceptance::Dropped),
+        Ok(_) => {}
+        Err(e) if is_timeout_error(&e) => {
+            return Ok(Acceptance::NotAccepted(patience.unwrap_or(ACCEPT_DEADLINE)));
+        }
+        Err(e) if is_peer_drop(&e) => return Ok(Acceptance::Dropped),
+        Err(e) => return Err(e),
+    }
+    // The server can have sent nothing past the probe's one line: the request
+    // it would answer next has not been written yet.
+    if !reader.buffer().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server answered past the connect probe",
+        ));
+    }
+    drop(reader);
+    let line = line.trim_end_matches(['\r', '\n']);
+    if is_connection_refusal(line) {
+        return Ok(Acceptance::Refused(line.to_string()));
+    }
+    // Any other answer — `OK …`, or an `ERR` a server gives `version` itself —
+    // proves the connection was accepted and is being served.
+    stream.set_read_timeout(deadline)?;
+    Ok(Acceptance::Served(stream))
+}
+
+/// Whether a connect-phase answer ends the CONNECTION rather than answering the
+/// probe: the token was refused (`ERR auth`, after which the server closes), or
+/// no lane could take it (`ERR control server busy; retry`).
+fn is_connection_refusal(line: &str) -> bool {
+    line == "ERR auth" || line.starts_with("ERR control server busy")
+}
+
+/// The one-line report for a connection no instance took a request on. It
+/// says what the client observed — nothing answered the connect probe — and
+/// both causes that look exactly alike from here, so the advice to restart is
+/// conditional on the process running: a stopped or napping one needs no
+/// restart.
+fn not_accepted_message(path: &str, waited: std::time::Duration) -> String {
+    let mut msg = String::from("no answer from ");
+    msg.push_str(path);
+    msg.push_str(" within ");
+    msg.push_str(&waited.as_secs().max(1).to_string());
+    msg.push_str(
+        "s: the instance took no request, so none was sent — its control listener is not \
+         taking connections, or the process is not running (stopped, App Nap, a saturated \
+         machine). Retry; if it persists while that aterm is running, restart it.",
+    );
+    msg
+}
+
+/// Run the connect phase ([`open_accepted`]) with ONE reconnect after a silent
+/// drop — a supervised listener resets the connections queued in a socket it
+/// replaces, and the retry lands on the fresh one. A drop carries no reply at
+/// all, so the request was never read and retrying cannot run it twice.
+/// `Ok(Err(code))` is a finished exchange (the refusal or the not-accepted
+/// report is already on stderr).
+fn connect_served(
+    path: &str,
+    origin: TargetOrigin,
+    token: Option<&str>,
+    deadline: Option<std::time::Duration>,
+) -> io::Result<Result<CtlStream, ExitCode>> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match open_accepted(path, origin, token, deadline)? {
+            Acceptance::Served(stream) => return Ok(Ok(stream)),
+            Acceptance::Refused(line) => {
+                stderr_line(&line)?;
+                return Ok(Err(ExitCode::FAILURE));
+            }
+            Acceptance::NotAccepted(waited) => {
+                stderr_line(&not_accepted_message(path, waited))?;
+                return Ok(Err(ExitCode::from(EXIT_UNREACHABLE)));
+            }
+            Acceptance::Dropped if attempt < 2 => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Acceptance::Dropped => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server closed the connection without responding",
+                ));
+            }
+        }
+    }
+}
+
+/// Send `bytes` on a served connection. A server that hung up mid-send may have
+/// left its reason behind (a refusal such as the busy reply): report THAT line and
+/// fail, rather than the bare "Broken pipe" the write produced. A deadline that
+/// fires here is [`Unanswered`], as in [`send_request`]: nothing of the answer
+/// can have come.
+fn send_served(stream: &CtlStream, bytes: &[u8]) -> io::Result<Option<ExitCode>> {
+    match (&*stream)
+        .write_all(bytes)
+        .and_then(|()| (&*stream).flush())
+    {
+        Ok(()) => Ok(None),
+        Err(e) if is_peer_drop(&e) => match pending_status_line(stream) {
+            Some(line) => {
+                stderr_line(&line)?;
+                Ok(Some(ExitCode::FAILURE))
+            }
+            None => Err(e),
+        },
+        Err(e) => Err(unanswered(e)),
+    }
+}
+
+/// Connect to `path` ([`connect_stream`]), then hold the conversation `talk`
+/// has on the connection, which runs under `deadline`. A connect failure keeps
+/// its `connect <path>: …` words; a deadline that fires once connected is
+/// [`no_reply_error`]'s line — the server took the connection and never
+/// answered, or stopped part-way through its answer — not the OS's bare
+/// `Resource temporarily unavailable`. Which of the two it says rests on the
+/// conversation marking what it sent and its status-line read
+/// ([`send_request`], [`read_status_line`]): a `talk` must read its status
+/// line through [`read_status_line`]. Every request this client sends after
+/// its own discovery talks through here or through [`converse_served`], which
+/// adds the connect phase in front: [`exchange`], the stdin payloads
+/// ([`feed_bin_exchange`]), `help <verb>` and `cast drift`'s probe take that
+/// one; `cast drift`'s client-side fetches and `aterm conn`'s requests this.
+fn converse<T>(
+    path: &str,
+    origin: TargetOrigin,
+    deadline: Option<std::time::Duration>,
+    talk: impl FnOnce(CtlStream) -> io::Result<T>,
+) -> io::Result<T> {
+    let stream = connect_stream(path, origin)?;
+    talk(stream).map_err(|e| no_reply_error(e, path, deadline))
+}
+
+/// [`converse`] behind `exchange`'s connect phase ([`connect_served`]): the
+/// connection is proved ACCEPTED and served — `AUTH` plus [`ACCEPT_PROBE`],
+/// answered within [`ACCEPT_DEADLINE`] — before `talk` sends a byte of its
+/// request. So a dead listen queue is reported as that in seconds, and a busy
+/// listener's refusal as itself, where either used to wait out `deadline`.
+/// `Ok(Err(code))` is a connect phase that finished the run (its line is
+/// already on stderr); a connect-phase error keeps its own words. Once served
+/// the stream's timeouts are `deadline`, and a deadline that fires inside
+/// `talk` is [`no_reply_error`]'s line, as in [`converse`]: the two phases
+/// name the two different silences. `talk` sends its request with
+/// [`send_served`] (the token went with the probe) and reads its status line
+/// through [`read_status_line`]. [`exchange`], the stdin payloads
+/// ([`feed_bin_exchange`]), `help <verb>` and `cast drift`'s probe talk
+/// through here.
+fn converse_served<T>(
+    path: &str,
+    origin: TargetOrigin,
+    deadline: Option<std::time::Duration>,
+    talk: impl FnOnce(CtlStream) -> io::Result<T>,
+) -> io::Result<Result<T, ExitCode>> {
+    let stream = match connect_served(path, origin, read_token_for(path).as_deref(), deadline)? {
+        Ok(stream) => stream,
+        Err(code) => return Ok(Err(code)),
+    };
+    talk(stream)
+        .map(Ok)
+        .map_err(|e| no_reply_error(e, path, deadline))
+}
+
 /// Send the transparent `AUTH <token>\n` line (when a token is readable) and
 /// the request line, then flush. The auth line is framed as raw bytes —
-/// exactly the bytes the old `format!("AUTH {token}\n")` produced.
-fn send_request(mut stream: &CtlStream, token: Option<&str>, request: &str) -> io::Result<()> {
+/// exactly the bytes the old `format!("AUTH {token}\n")` produced. A deadline
+/// that fires here is [`Unanswered`]: nothing of the answer can have come.
+fn send_request(stream: &CtlStream, token: Option<&str>, request: &str) -> io::Result<()> {
+    send_request_lines(stream, token, request).map_err(unanswered)
+}
+
+fn send_request_lines(
+    mut stream: &CtlStream,
+    token: Option<&str>,
+    request: &str,
+) -> io::Result<()> {
     if let Some(token) = token {
         let mut line = Vec::new();
         line.extend_from_slice(b"AUTH ");
@@ -4853,13 +5512,17 @@ fn acknowledge_artifact_reply(
 /// Write `"aterm-ctl: <msg>\n"` to stderr — the manual form of the previous
 /// `eprintln!("aterm-ctl: {msg}")`, byte-identical on success. (On a broken
 /// stderr this propagates the error instead of panicking; either way the
-/// process exits non-zero without completing.)
+/// process exits non-zero without completing.) A write that would block is
+/// [`Worded`], as [`StdoutSink`]'s is: a full non-blocking stderr keeps the
+/// OS's words and is never reported as the server's silence.
 fn stderr_line(msg: &str) -> io::Result<()> {
     let stderr = io::stderr();
     let mut err = stderr.lock();
-    err.write_all(b"aterm-ctl: ")?;
-    err.write_all(msg.as_bytes())?;
-    err.write_all(b"\n")
+    let mut line = Vec::new();
+    line.extend_from_slice(b"aterm-ctl: ");
+    line.extend_from_slice(msg.as_bytes());
+    line.push(b'\n');
+    err.write_all(&line).map_err(worded)
 }
 
 /// The stdout handle, with aterm-ctl's EXPLICIT process-signal policy:
@@ -5056,7 +5719,10 @@ fn receive_guarded_artifact_reply(
 /// or whatever `--timeout SECS` set — `None` disables it) and every reply line
 /// under the [`MAX_LINE_BYTES`] cap, so a wedged or regressed server surfaces as
 /// a clear error instead of an indefinite stall or an unboundedly growing String
-/// — the same defenses [`probe_lines`] applies to discovery.
+/// — the same defenses [`probe_lines`] applies to discovery. A deadline that
+/// fires once connected says so by name, the socket and the wait
+/// ([`converse`]'s `no reply from <sock> within <N>s …`, or `reply from <sock>
+/// stopped part-way: …` once the status line has come; exit 124 either way).
 ///
 /// `timeout_explicit` distinguishes a user-supplied `--timeout` from the default:
 /// it matters only for `subscribe`, whose default watches FOREVER but whose
@@ -5084,7 +5750,43 @@ fn exchange(
     // resolves it during connect) and a pointer FILE on Windows; resolve it
     // client-side so both platforms dial the live instance socket.
     let path = &aterm_uds::latest::resolve(path);
-    let stream = connect_stream(path, origin)?;
+    // The CONNECT phase has its own, much shorter bound ([`ACCEPT_DEADLINE`]):
+    // a connection no instance accepted is reported as that, in seconds
+    // ([`converse_served`]). On the stream it serves, every operation is
+    // bounded by `deadline`.
+    converse_served(path, origin, deadline, |stream| {
+        exchange_on(
+            stream,
+            path,
+            request,
+            verb,
+            frame_request,
+            deadline,
+            timeout_explicit,
+            redial,
+        )
+    })
+    .map(|served| served.unwrap_or_else(std::convert::identity))
+}
+
+/// [`exchange`] once served: `stream` is the connection to `path` that
+/// [`converse_served`] proved accepted and authenticated, its timeouts already
+/// `deadline`, and every error this returns is one it may put in words.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "exchange's own inputs, the connection in place of the origin; a wrapper \
+              struct would relocate the list, not simplify it"
+)]
+fn exchange_on(
+    stream: CtlStream,
+    path: &str,
+    request: &str,
+    verb: &str,
+    frame_request: &str,
+    deadline: Option<std::time::Duration>,
+    timeout_explicit: bool,
+    redial: &redial::Redial,
+) -> io::Result<ExitCode> {
     // WHO answered: the server's pid, so a hang-up can later tell "it ended the
     // exchange" (the same process still serves) from "it was replaced".
     let server = redial::server_pid(&stream);
@@ -5094,20 +5796,26 @@ fn exchange(
     // as a timeout error, never hang aterm-ctl forever. The default deadline is
     // [`EXCHANGE_DEADLINE`], not discovery's 2 s — it has to clear the blocking
     // verbs' 600 s server-side clamp; `--timeout` overrides it (0 => `None`).
-    stream.set_read_timeout(deadline)?;
-    stream.set_write_timeout(deadline)?;
+    // [`converse_served`] set both of the stream's timeouts to it.
     // When that deadline runs out, measured from the request: a server that goes
     // away under a blocking read does not extend it (`redial`'s rule — the wait
     // for a successor, and the one retry on it, spend what it has left).
     let started = std::time::Instant::now();
 
     // `&CtlStream` implements both `Read` and `Write`, so the two borrows can
-    // coexist: send the auth line + request, then buffer-read the response.
-    let sent = send_request(&stream, read_token_for(path).as_deref(), request);
+    // coexist: send the request (the connect phase authenticated it), then
+    // buffer-read the response. A send the server cut short with a reason (a refusal it left
+    // behind) is that answer; one cut short WITHOUT a word is a hang-up, which
+    // the read below judges like any other.
+    let sent = match send_served(&stream, request.as_bytes()) {
+        Ok(Some(code)) => return Ok(code),
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
 
     let mut reader = BufReader::new(&stream);
     let mut status_line = String::new();
-    let got = sent.and_then(|()| read_bounded_line(&mut reader, &mut status_line));
+    let got = sent.and_then(|()| read_status_line(&mut reader, &mut status_line));
     // A BLOCKING READ cut before its reply — the server went away under an
     // `await`, a `wait`, a `text` — is the self-update case: follow the successor
     // once, or say it could not be resumed. Anything else keeps its old error.
@@ -5132,6 +5840,8 @@ fn exchange(
                     d.saturating_sub(started.elapsed())
                         .max(std::time::Duration::from_millis(1))
                 });
+                // The successor's exchange words its own deadline (its socket,
+                // what was left); `worded` keeps this one's from re-wording it.
                 exchange(
                     next,
                     TargetOrigin::Pinned,
@@ -5142,6 +5852,7 @@ fn exchange(
                     timeout_explicit,
                     &redial::Redial::none(),
                 )
+                .map_err(worded)
             },
             got.err(),
         );
@@ -5312,8 +6023,31 @@ fn exchange(
         // is the next poll's `since=`, `screen_rows=` splits the archive from
         // the screen, `lost=`/`breaks=` say whether anything is missing — and
         // without it stdout is rows no reader can place (`aterm drive report`
-        // reads it from here).
-        if verb == "inbox" || verb == "offscreen" {
+        // reads it from here). `resizes` too: its header is the verdict and the
+        // audit (`render=`, `flaps=`, `unledgered=`, `lost=`) its rows sit under.
+        if drift::is_drift_request(verb, frame_request) {
+            // Every `cast drift`, relayed or not, is the `drift` module's (the
+            // dispatch above hands it over before any exchange); this arm is the
+            // backstop for a caller that reaches `exchange` with one anyway. A
+            // server that predates the verb answers the BARE cast — `OK <nbytes>`
+            // and a byte body, no `verdict=` — which read as `<n>` lines would
+            // print a byte count as a report and then hang or fail mid-body:
+            // read it off and refuse by name.
+            if !tail.split_whitespace().any(|t| t.starts_with("verdict=")) {
+                if let (1, Some(n)) = (tail.split_whitespace().count(), byte_count(tail)) {
+                    io::copy(&mut (&mut reader).take(n as u64), &mut io::sink())?;
+                }
+                return Err(io::Error::other(
+                    "the aterm this `dial` reached predates `cast drift` (it answered the bare \
+                     cast, not a report); ask it with a newer `aterm ctl` on its own machine, or \
+                     save its `cast` and `text` and run `aterm ctl cast drift --file <cast> \
+                     --screen <text>`",
+                ));
+            }
+            // `cast drift`'s header IS the verdict (`verdict=`, `culprit=`, …): it
+            // leads its rows on stdout, as the `drift` module prints it.
+            print_stdout_line(status_line)?;
+        } else if verb == "inbox" || verb == "offscreen" || verb == "resizes" {
             stderr_line(status_line)?;
         } else if count == 0 {
             let mut msg = String::from(status_line);
@@ -5524,12 +6258,24 @@ mod tests {
             "dial box @s-remote screen -h",
             // Past other arguments, not just adjacent to the verb.
             "search needle --json --help",
+            // `help --help` asks about `help` itself.
+            "help --help",
+            "help -h",
         ] {
             let verb = forwarded_verb(&p(req)).expect("probe has a verb");
             assert_eq!(
                 h(req),
                 Some(vec![String::from("help"), verb.clone()]),
                 "`{req}` must ask the catalog about `{verb}`, not run it"
+            );
+        }
+        // A `dial` that names no remote verb asks about `dial` itself — without
+        // this it ended in dial's missing-verb refusal.
+        for req in ["dial --help", "dial -h", "dial box --help"] {
+            assert_eq!(
+                h(req),
+                Some(vec![String::from("help"), String::from("dial")]),
+                "`{req}` asks about dial"
             );
         }
     }
@@ -5572,7 +6318,7 @@ mod tests {
             let req = vec![String::from(verb), String::from("--help")];
             let rewritten = help_request_rewrite(&req).expect("discovery verb rewrites");
             assert!(
-                client_help_reply(&rewritten).is_some(),
+                client_help_reply(&rewritten, HelpAsked::ByFlag).is_some(),
                 "`aterm ctl {verb} --help` rewrites to `{rewritten:?}`, which no \
                  client entry answers -- it would dial the socket and be told the \
                  verb does not exist"
@@ -5758,6 +6504,128 @@ mod tests {
             relayed, "dial myhost text\n",
             "client must relay the dial line verbatim"
         );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// `help <verb>` against an OLDER server: a verb it calls unknown is still
+    /// answered (this client's entry, exit 0), `help cast` from a server with
+    /// no `cast drift` is its own entry, and any other refusal stays one.
+    #[cfg(unix)]
+    #[test]
+    fn help_fills_what_an_older_server_cannot_say() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-oldhelp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("old.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind mock socket");
+        let srv = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                let (conn, _) = listener.accept().expect("accept");
+                let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+                let mut line = String::new();
+                r.read_line(&mut line).expect("request");
+                let reply = match line.trim_end() {
+                    "help resizes" => "ERR unknown verb 'resizes' (help lists them)\n".to_string(),
+                    "help cast" => {
+                        "OK 1\ncast  asciicast v2 recording (compact, sendable);\n".to_string()
+                    }
+                    _ => "ERR usage: help [<verb> | --full | --json]\n".to_string(),
+                };
+                let mut w = conn;
+                w.write_all(reply.as_bytes()).expect("reply");
+                w.flush().expect("flush");
+                seen.push(line.trim_end().to_string());
+            }
+            seen
+        });
+        let path = sock.to_str().expect("utf8 path").to_string();
+        let deadline = Some(std::time::Duration::from_secs(10));
+        let ask = |name: &str| {
+            help_with_fallback(
+                &path,
+                TargetOrigin::Pinned,
+                name,
+                deadline,
+                &LocalVerbs::NONE,
+            )
+            .expect("an exchange")
+        };
+        assert_eq!(ask("resizes"), ExitCode::SUCCESS, "this client's entry");
+        assert_eq!(ask("cast"), ExitCode::SUCCESS, "the server's entry");
+        assert_eq!(ask("status"), ExitCode::FAILURE, "a refusal stays one");
+        assert_eq!(
+            srv.join().expect("server"),
+            ["help resizes", "help cast", "help status"]
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// THE `exchange` BACKSTOP: `dial <name> cast drift` reaching `exchange`
+    /// against a remote that PREDATES the verb (the dispatcher hands every
+    /// `cast drift` to the `drift` module, which computes the report through
+    /// the relay; this arm is what any other caller gets). The remote answers
+    /// the bare cast (`OK <nbytes>` + an asciicast body, no `verdict=`). The
+    /// client must not print that byte count as a report and then read `<n>`
+    /// lines of a byte body (a hang while the relay holds the connection
+    /// open): it reads the body off and refuses by name, promptly, with
+    /// nothing on stdout.
+    #[cfg(unix)]
+    #[test]
+    fn dial_cast_drift_refuses_an_older_remotes_bare_cast() {
+        use std::io::{BufRead, Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+
+        const CAST: &str = "{\"version\": 2, \"width\": 20, \"height\": 8}\n\
+                            [0.1, \"o\", \"hi\"]\n[0.2, \"r\", \"20x7\"]\n";
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-dialdrift-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("old.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind mock socket");
+        // The relay keeps the connection open after its reply, as a live one
+        // does: a client reading lines of a byte body would wait forever.
+        let srv = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+            let mut first = String::new();
+            r.read_line(&mut first).expect("read request line");
+            let mut w = conn;
+            w.write_all(format!("OK {}\n{CAST}", CAST.len()).as_bytes())
+                .expect("write reply");
+            w.flush().expect("flush");
+            let mut sink = Vec::new();
+            let _ = r.read_to_end(&mut sink);
+            first
+        });
+        let sockpath = sock.to_str().expect("utf8 path").to_string();
+        let (tx, rx) = mpsc::channel();
+        let cli = std::thread::spawn(move || {
+            let res = exchange(
+                &sockpath,
+                TargetOrigin::Pinned,
+                "dial far cast drift\n",
+                "cast",
+                "cast drift",
+                Some(std::time::Duration::from_secs(30)),
+                false,
+                &redial::Redial::none(),
+            );
+            let _ = tx.send(res.map_err(|e| e.to_string()));
+        });
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the refusal must not wait for the connection to close");
+        let err = res.expect_err("an older remote's bare cast is refused");
+        assert!(err.contains("predates `cast drift`"), "{err}");
+        cli.join().expect("client thread");
+        assert_eq!(srv.join().expect("server thread"), "dial far cast drift\n");
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir(&dir);
     }
@@ -6628,6 +7496,237 @@ mod tests {
         assert!(!is_timeout_error(&io::Error::from(io::ErrorKind::NotFound)));
     }
 
+    /// A deadline that fires once connected names the socket and the wait
+    /// instead of the OS's `Resource temporarily unavailable (os error 35)`,
+    /// keeps its kind (so exit 124), and says `timed out` — the words the
+    /// supervisor's lost-request list reads (aterm-agent's `LOST`). Before any
+    /// of the answer came ([`Unanswered`]: the request's send, its status
+    /// line) the server did not answer; after that its reply stopped
+    /// part-way, and saying it did not answer would be false. It is worded
+    /// once: the successor's line, carried out of the first exchange after a
+    /// hang-up, is not worded again with the first socket. Every other kind,
+    /// and any error when no deadline was set, pass unchanged.
+    #[test]
+    fn a_deadline_once_connected_names_the_socket_and_the_wait() {
+        let path = "/d/aterm-7.sock";
+        let deadline = Some(std::time::Duration::from_secs(900));
+        let want = "no reply from /d/aterm-7.sock within 900s (connected; the server did not \
+                    answer) — the request timed out";
+        let part_way = "reply from /d/aterm-7.sock stopped part-way: nothing more within 900s \
+                        (connected; the server began its answer, then went quiet) — the \
+                        request timed out";
+        for line in [want, part_way] {
+            assert!(
+                line.contains("timed out"),
+                "the supervisor's LOST list reads it"
+            );
+        }
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            let marked = unanswered(io::Error::from(kind));
+            assert_eq!(marked.kind(), kind, "the mark keeps the kind");
+            assert_eq!(
+                unanswered(marked).to_string(),
+                io::Error::from(kind).to_string(),
+                "marked once, with the OS's words until it is worded"
+            );
+            let e = no_reply_error(unanswered(io::Error::from(kind)), path, deadline);
+            assert_eq!(e.to_string(), want, "{kind:?}");
+            assert_eq!(e.kind(), kind, "the kind is kept");
+            assert_eq!(exit_for(&e), ExitCode::from(EXIT_TIMEOUT));
+            let again = no_reply_error(e, "/d/aterm-8.sock", deadline);
+            assert_eq!(again.to_string(), want, "worded once");
+            assert_eq!(
+                worded(again).to_string(),
+                want,
+                "marking it again changes nothing"
+            );
+            let cut = no_reply_error(io::Error::from(kind), path, deadline);
+            assert_eq!(cut.to_string(), part_way, "after the status line: {kind:?}");
+            assert_eq!(cut.kind(), kind);
+            assert_eq!(exit_for(&cut), ExitCode::from(EXIT_TIMEOUT));
+            assert_eq!(
+                no_reply_error(cut, "/d/aterm-8.sock", deadline).to_string(),
+                part_way,
+                "worded once"
+            );
+        }
+        let hung_up = unanswered(io::Error::from(io::ErrorKind::ConnectionReset));
+        assert!(!is_unanswered(&hung_up), "only a deadline is marked");
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        let raw = reset.to_string();
+        let passed = no_reply_error(reset, path, deadline);
+        assert_eq!(
+            passed.to_string(),
+            raw,
+            "a reset is the server's hang-up, not silence"
+        );
+        assert_eq!(passed.kind(), io::ErrorKind::ConnectionReset);
+        let raw = io::Error::from(io::ErrorKind::WouldBlock).to_string();
+        let unbounded = no_reply_error(io::Error::from(io::ErrorKind::WouldBlock), path, None);
+        assert_eq!(unbounded.to_string(), raw, "no deadline set, none fired");
+    }
+
+    /// A full non-blocking stdout is not the server's silence: the sink marks
+    /// its would-block [`Worded`], so it keeps the OS's words (and its 124)
+    /// through [`no_reply_error`].
+    #[test]
+    fn a_stdout_that_would_block_keeps_the_os_words() {
+        struct Blocks;
+        impl Write for Blocks {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let raw = io::Error::from(io::ErrorKind::WouldBlock).to_string();
+        let blocked = StdoutSink(Blocks)
+            .write_all(b"x")
+            .expect_err("the sink fails");
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(blocked.to_string(), raw);
+        let passed = no_reply_error(
+            blocked,
+            "/d/aterm-7.sock",
+            Some(std::time::Duration::from_secs(900)),
+        );
+        assert_eq!(passed.to_string(), raw, "never the server's silence");
+        assert_eq!(exit_for(&passed), ExitCode::from(EXIT_TIMEOUT));
+    }
+
+    /// How the wait reads: whole seconds, a remainder to a tenth, and under a
+    /// second in milliseconds (the retry after a hang-up runs on what was
+    /// left, down to its 1 ms floor).
+    #[test]
+    fn a_deadline_reads_in_seconds_or_what_was_left() {
+        use std::time::Duration;
+        assert_eq!(deadline_words(Duration::from_secs(900)), "900s");
+        assert_eq!(deadline_words(Duration::from_secs(1)), "1s");
+        assert_eq!(deadline_words(Duration::from_millis(12_540)), "12.5s");
+        assert_eq!(deadline_words(Duration::from_millis(250)), "250ms");
+        assert_eq!(deadline_words(Duration::from_micros(10)), "1ms");
+    }
+
+    /// End to end over a socket that takes the connection and never answers
+    /// — the 2026-09-28 window, which App Nap and a saturated Mac kept from
+    /// running for three hours. A verb line and a stdin payload each end in
+    /// the named wait with exit 124, not the OS's EAGAIN.
+    ///
+    /// UNIX ONLY for the reason `dial_with_verb_reads_lines_reply_without_hanging`
+    /// gives: the listener standing in for the instance is a `UnixListener`.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_never_answers_is_a_named_wait_not_eagain() {
+        use std::io::{BufRead, Read};
+        use std::os::unix::net::UnixListener;
+
+        // A private dir holding ONLY the socket, so no token is read and the
+        // request line is the first line the mock sees.
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-silent-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("silent.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind mock socket");
+        // Take each connection, read what it sends, answer nothing: the
+        // connection ends when the client gives up and hangs up.
+        let srv = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().expect("accept");
+                let mut r = std::io::BufReader::new(conn);
+                let mut first = String::new();
+                r.read_line(&mut first).expect("request line");
+                let mut rest = Vec::new();
+                let _ = r.read_to_end(&mut rest);
+                seen.push(first);
+            }
+            seen
+        });
+        let path = sock.to_str().expect("utf8 path").to_string();
+        let deadline = Some(std::time::Duration::from_secs(1));
+        let want = format!(
+            "no reply from {path} within 1s (connected; the server did not answer) — the \
+             request timed out"
+        );
+        let e = exchange(
+            &path,
+            TargetOrigin::Pinned,
+            "text\n",
+            "text",
+            "text\n",
+            deadline,
+            false,
+            &redial::Redial::none(),
+        )
+        .expect_err("nothing answers the verb line");
+        assert_eq!(e.to_string(), want);
+        assert_eq!(exit_for(&e), ExitCode::from(EXIT_TIMEOUT));
+        let e = feed_bin_exchange(&path, TargetOrigin::Pinned, "feed-bin", b"x", deadline)
+            .expect_err("nothing answers the payload");
+        assert_eq!(e.to_string(), want);
+        assert_eq!(exit_for(&e), ExitCode::from(EXIT_TIMEOUT));
+        assert_eq!(srv.join().expect("server"), ["text\n", "feed-bin 1\n"]);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// End to end over a socket that answers `OK 2` and one row, then goes
+    /// quiet: the server DID answer, so the deadline on the missing row says
+    /// the reply stopped part-way, never that the server did not answer. Still
+    /// exit 124. `help <verb>` reads its whole body before printing any of it,
+    /// so the cut-off row prints nothing.
+    ///
+    /// UNIX ONLY, as `a_server_that_never_answers_is_a_named_wait_not_eagain`.
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_that_stops_part_way_says_so() {
+        use std::io::{BufRead, Read};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-partway-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("partway.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind mock socket");
+        // Read the request, answer its status line and the first of its two
+        // rows, then say nothing more until the client gives up and hangs up.
+        let srv = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut r = std::io::BufReader::new(conn);
+            let mut first = String::new();
+            r.read_line(&mut first).expect("request line");
+            r.get_mut()
+                .write_all(b"OK 2\nrow one\n")
+                .expect("the partial reply");
+            r.get_mut().flush().expect("flush");
+            let mut rest = Vec::new();
+            let _ = r.read_to_end(&mut rest);
+            first
+        });
+        let path = sock.to_str().expect("utf8 path").to_string();
+        let deadline = Some(std::time::Duration::from_secs(1));
+        let e = help_with_fallback(
+            &path,
+            TargetOrigin::Pinned,
+            "text",
+            deadline,
+            &LocalVerbs::NONE,
+        )
+        .expect_err("the second row never comes");
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "reply from {path} stopped part-way: nothing more within 1s (connected; the \
+                 server began its answer, then went quiet) — the request timed out"
+            )
+        );
+        assert_eq!(exit_for(&e), ExitCode::from(EXIT_TIMEOUT));
+        assert_eq!(srv.join().expect("server"), "help text\n");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     /// A SERVER-reported timeout maps to 124: a bare `OK timeout` (the blocking
     /// verbs) and a `turn` verdict carrying `status=timeout`. A settled turn, a
     /// normal reply, and any `ERR` line are NOT timeouts.
@@ -7084,8 +8183,11 @@ mod tests {
     #[test]
     fn an_unknown_option_before_the_verb_is_refused_by_the_client() {
         for argv in [&["--frob", "status"][..], &["-x", "status"][..]] {
-            let err = real_main(strings(argv).into_iter().map(Into::into).collect())
-                .expect_err("an unknown option is a usage error");
+            let err = real_main(
+                strings(argv).into_iter().map(Into::into).collect(),
+                LocalVerbs::NONE,
+            )
+            .expect_err("an unknown option is a usage error");
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             let want = format!("unknown option {} (aterm ctl --help lists them)", argv[0]);
             assert_eq!(err.to_string(), want);
@@ -7146,6 +8248,7 @@ mod tests {
         let files = [
             ("lib.rs", shipped(include_str!("lib.rs"))),
             ("conn.rs", shipped(include_str!("conn.rs"))),
+            ("drift.rs", shipped(include_str!("drift.rs"))),
         ];
         let mut writers = 0;
         for (file, src) in files {
@@ -7162,7 +8265,9 @@ mod tests {
         }
         assert!(writers >= 11, "the scan found {writers} stdout writers");
         for (file, entry) in [
-            (files[0].1, "pub fn main_entry("),
+            // `main_entry` is `main_entry_with` with no local verbs; the latter
+            // owns the error handling.
+            (files[0].1, "pub fn main_entry_with("),
             (files[0].1, "pub fn front_door_completions_entry("),
             (files[1].1, "pub fn conn_main_entry("),
         ] {
@@ -7186,8 +8291,13 @@ mod tests {
     fn help_for_a_client_verb_is_answered_from_the_client_block() {
         let help = help_text();
         for verb in CLIENT_HELP_VERBS {
-            let reply = client_help_reply(&strings(&["help", verb]))
+            let reply = client_help_reply(&strings(&["help", verb]), HelpAsked::ByVerb)
                 .unwrap_or_else(|| panic!("help {verb} is client-answered"));
+            assert_eq!(
+                client_help_reply(&strings(&["help", verb]), HelpAsked::ByFlag).as_ref(),
+                Some(&reply),
+                "{verb}: `{verb} --help` and `help {verb}` read the same block"
+            );
             let mut lines = reply.lines();
             let header = lines.next().expect("framed");
             let rows: Vec<&str> = lines.collect();
@@ -7216,13 +8326,13 @@ mod tests {
             }
         }
         // The specific reply an agent reading the F2 finding asked for.
-        let windows = client_help_reply(&strings(&["help", "windows"])).unwrap();
+        let windows = client_help_reply(&strings(&["help", "windows"]), HelpAsked::ByVerb).unwrap();
         assert!(
             windows.contains("<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]"),
             "{windows}"
         );
         assert!(windows.contains("could not say"), "{windows}");
-        let ls = client_help_reply(&strings(&["help", "ls"])).unwrap();
+        let ls = client_help_reply(&strings(&["help", "ls"]), HelpAsked::ByVerb).unwrap();
         assert!(ls.contains("detail=<pct|->"), "{ls}");
         // The identity column (session identities) sits before `path=`
         // (2026-09-22); the agent and owner columns follow, up to the self mark.
@@ -7236,17 +8346,22 @@ mod tests {
         assert!(!ls.contains("instances     one line per"), "{ls}");
     }
 
-    /// Everything that is not exactly `help <client verb>` still reaches the
-    /// server: a bare `help`, `help <table verb>`, `help --full`, an unknown
-    /// name (the server's `ERR unknown verb` is the right answer there), a
-    /// trailing argument (the server's `ERR usage`), and a selector form.
+    /// Everything but `help <client verb>` and a `<verb> --help` still reaches
+    /// the server: an explicit `help <protocol verb>` (the server's `cmd_help` is
+    /// authoritative for ITS build, which may differ from this client's), a bare
+    /// `help`, `help --full`, `help --json`, an unknown name (the server's `ERR
+    /// unknown verb` is the right answer there, and a newer server may know it),
+    /// a trailing argument (the server's `ERR usage`), and a selector form.
+    /// FAILED between 5ef621a9b and the review of 2026-09-27, which answered
+    /// `help text` and `help sessions` from the client's own table.
     #[test]
-    fn help_for_a_server_verb_still_reaches_the_server() {
+    fn help_for_an_unknown_or_catalog_form_still_reaches_the_server() {
         for parts in [
-            vec!["help"],
             vec!["help", "text"],
             vec!["help", "sessions"],
+            vec!["help"],
             vec!["help", "--full"],
+            vec!["help", "--json"],
             vec!["help", "nonesuch"],
             vec!["help", "ls", "extra"],
             vec!["@s-abc", "help", "ls"],
@@ -7254,11 +8369,16 @@ mod tests {
             vec!["text", "ls"],
         ] {
             assert_eq!(
-                client_help_reply(&strings(&parts)),
+                client_help_reply(&strings(&parts), HelpAsked::ByVerb),
                 None,
                 "{parts:?} is the server's to answer"
             );
         }
+        // Asked by the flag, an unknown name still goes to the server.
+        assert_eq!(
+            client_help_reply(&strings(&["help", "nonesuch"]), HelpAsked::ByFlag),
+            None
+        );
         // And every client verb the block documents is one the table lacks —
         // the reason the interception exists — while `help` itself is a table verb
         // framed as lines, the shape the client reply copies.
@@ -7272,6 +8392,40 @@ mod tests {
             aterm_types::control_verbs::framing_of("help", "help ls"),
             aterm_types::control_verbs::Framing::Lines
         );
+    }
+
+    /// `<verb> --help` for a protocol verb is answered from the table the client
+    /// links, framed as the server frames `help <verb>` (`aterm-gui`'s
+    /// `cmd_help`: `OK <n>` + the entry's rows) — for EVERY verb in the table, so
+    /// it needs no socket. FAILED before 2026-09-27: only the four client verbs
+    /// were answered here, and `aterm ctl --sock <dead> text --help` ended in a
+    /// connect error. This pins the framing and the source, not parity with a
+    /// server of another build — which is why only the flag form is answered here.
+    #[test]
+    fn help_for_every_protocol_verb_is_answered_from_the_shared_table() {
+        for verb in aterm_types::control_verbs::VERBS {
+            let reply = client_help_reply(&strings(&["help", verb.name]), HelpAsked::ByFlag)
+                .unwrap_or_else(|| panic!("help {} is client-answered", verb.name));
+            let rows = verb.entry_lines();
+            let mut expected = format!("OK {}\n", rows.len());
+            for row in &rows {
+                expected.push_str(row);
+                expected.push('\n');
+            }
+            assert_eq!(
+                reply, expected,
+                "{}: framed exactly as the server's",
+                verb.name
+            );
+            assert!(
+                reply
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|r| r.starts_with(verb.name)),
+                "{}: the first row names the verb",
+                verb.name
+            );
+        }
     }
 
     /// A verb the block does not document has no entry, and the parser reads an
@@ -9427,6 +10581,289 @@ mod tests {
         assert!(
             !is_timeout_error(&e),
             "a usage error exits FAILURE, not 124"
+        );
+    }
+
+    /// A private dir holding a socket named `name` and its token file — the
+    /// token is what makes the client authenticate, and so probe.
+    #[cfg(unix)]
+    fn tokened_socket_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("private dir");
+        std::fs::write(dir.join("mock.sock.token"), "deadbeef\n").expect("token");
+        dir
+    }
+
+    /// THE DEAD QUEUE (2026-09-25). A listener that never accepts: the client's
+    /// connect succeeds into the kernel queue and nothing ever answers. The old
+    /// client sat out its whole deadline (900 s by default) as if a verb were
+    /// slow; now the connect phase names the failure within its own bound and
+    /// exits [`EXIT_UNREACHABLE`], distinct from a timeout (124) or an `ERR` (1).
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_listen_queue_fails_fast_and_named() {
+        let dir = tokened_socket_dir("accept-deadq");
+        let sock = dir.join("mock.sock");
+        let _listener = aterm_uds::CtlListener::bind(&sock).expect("bind, never accept");
+        let path = sock.to_str().expect("utf8").to_string();
+        let started = std::time::Instant::now();
+        let outcome = exchange(
+            &path,
+            TargetOrigin::Pinned,
+            "text\n",
+            "text",
+            "text\n",
+            Some(std::time::Duration::from_millis(700)),
+            false,
+            &redial::Redial::none(),
+        )
+        .expect("a dead queue is a reported outcome, not an I/O error");
+        let waited = started.elapsed();
+        assert_eq!(outcome, ExitCode::from(EXIT_UNREACHABLE));
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the connect phase took {waited:?}"
+        );
+        let report = not_accepted_message(&path, std::time::Duration::from_secs(10));
+        assert!(
+            report.contains("the instance took no request"),
+            "the report names the failure: {report}"
+        );
+        assert!(
+            report.contains("the process is not running"),
+            "the report names both causes the client cannot tell apart: {report}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The 2026-09-28 window (App Nap and a saturated Mac kept it from running
+    /// for three hours) seen by a client that HAS a token: the instance takes
+    /// the connection and never answers. The connect phase ends it within its
+    /// own bound as the not-accepted report (exit [`EXIT_UNREACHABLE`]) — the
+    /// same as a dead queue, which it looks exactly like from here — and the
+    /// request itself was never sent. (Without a token nothing is probed:
+    /// `a_server_that_never_answers_is_a_named_wait_not_eagain`.)
+    #[cfg(unix)]
+    #[test]
+    fn a_tokened_server_that_takes_the_connection_and_never_answers_gets_no_request() {
+        use std::io::{BufRead, Read};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tokened_socket_dir("accept-silent");
+        let sock = dir.join("mock.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock socket");
+        // Take the connection, read everything the client sends, answer
+        // nothing: the connection ends when the client gives up.
+        let srv = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut r = std::io::BufReader::new(conn);
+            let mut first = String::new();
+            r.read_line(&mut first).expect("first line");
+            let mut rest = Vec::new();
+            let _ = r.read_to_end(&mut rest);
+            (first, String::from_utf8_lossy(&rest).into_owned())
+        });
+        let path = sock.to_str().expect("utf8").to_string();
+        let started = std::time::Instant::now();
+        let outcome = exchange(
+            &path,
+            TargetOrigin::Pinned,
+            "text\n",
+            "text",
+            "text\n",
+            Some(std::time::Duration::from_millis(700)),
+            false,
+            &redial::Redial::none(),
+        )
+        .expect("a silent instance is a reported outcome, not an I/O error");
+        let waited = started.elapsed();
+        assert_eq!(outcome, ExitCode::from(EXIT_UNREACHABLE));
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the connect phase took {waited:?}"
+        );
+        let (first, rest) = srv.join().expect("server");
+        assert_eq!(first, "AUTH deadbeef\n", "the client authenticates first");
+        assert_eq!(
+            rest.as_bytes(),
+            ACCEPT_PROBE,
+            "only the probe went out, never the request"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The dead queue again, through the two exchanges that open their own
+    /// connection rather than going through [`exchange`]: `help <verb>` (which
+    /// fills in what an older server cannot say) and `cast drift` (which asks
+    /// the server before computing client-side). Both take the same connect
+    /// phase, so both name the failure within its bound instead of sitting out
+    /// the caller's deadline.
+    #[cfg(unix)]
+    #[test]
+    fn help_and_cast_drift_fail_fast_on_a_dead_queue_too() {
+        let dir = tokened_socket_dir("accept-deadq-own");
+        let sock = dir.join("mock.sock");
+        let _listener = aterm_uds::CtlListener::bind(&sock).expect("bind, never accept");
+        let path = sock.to_str().expect("utf8").to_string();
+        let deadline = Some(std::time::Duration::from_millis(700));
+        let started = std::time::Instant::now();
+        let help = help_with_fallback(
+            &path,
+            TargetOrigin::Pinned,
+            "status",
+            deadline,
+            &LocalVerbs::NONE,
+        )
+        .expect("a dead queue is a reported outcome, not an I/O error");
+        let drift = drift::live(
+            &path,
+            TargetOrigin::Pinned,
+            drift::Route::default(),
+            &[],
+            deadline,
+            &LocalVerbs::NONE,
+        )
+        .expect("a dead queue is a reported outcome, not an I/O error");
+        let waited = started.elapsed();
+        assert_eq!(help, ExitCode::from(EXIT_UNREACHABLE), "help <verb>");
+        assert_eq!(drift, ExitCode::from(EXIT_UNREACHABLE), "cast drift");
+        assert!(
+            waited < std::time::Duration::from_secs(8),
+            "the two connect phases took {waited:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The connect phase proves acceptance BEFORE the request goes out: the
+    /// server sees `AUTH`, then the `version` probe, then the request, and the
+    /// probe's reply never reaches the caller's output. A server that answers
+    /// the probe with a refusal ends the exchange with that line.
+    #[cfg(unix)]
+    #[test]
+    fn the_connect_probe_precedes_the_request() {
+        use std::io::{BufRead, Write};
+        let dir = tokened_socket_dir("accept-probe");
+        let sock = dir.join("mock.sock");
+        let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+            let mut w = conn;
+            let mut lines = Vec::new();
+            for reply in [&b""[..], b"OK version=test\n", b"OK done\n"] {
+                let mut line = String::new();
+                r.read_line(&mut line).expect("a request line");
+                lines.push(line);
+                w.write_all(reply).expect("reply");
+            }
+            lines
+        });
+        let path = sock.to_str().expect("utf8").to_string();
+        let outcome = exchange(
+            &path,
+            TargetOrigin::Pinned,
+            "status\n",
+            "status",
+            "status\n",
+            Some(std::time::Duration::from_secs(5)),
+            false,
+            &redial::Redial::none(),
+        )
+        .expect("exchange");
+        assert_eq!(outcome, ExitCode::SUCCESS);
+        let lines = server.join().expect("server");
+        assert_eq!(lines, ["AUTH deadbeef\n", "version\n", "status\n"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// THE BUSY LISTENER. A server whose every lane is taken writes `ERR control
+    /// server busy; retry` and closes WITHOUT reading. The client used to report
+    /// the write that then failed ("Broken pipe", "Socket is not connected");
+    /// it must report the server's own line, and fail with an ordinary 1.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_reply_is_reported_as_busy() {
+        use std::io::Write;
+        const BUSY: &str = "ERR control server busy; retry";
+        // The exchange: the busy line arrives as the connect-phase answer.
+        let dir = tokened_socket_dir("accept-busy");
+        let sock = dir.join("mock.sock");
+        let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            conn.write_all(b"ERR control server busy; retry\n")
+                .expect("busy");
+        });
+        let path = sock.to_str().expect("utf8").to_string();
+        let outcome = open_accepted(
+            &path,
+            TargetOrigin::Pinned,
+            Some("deadbeef"),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .expect("open");
+        server.join().expect("server");
+        match outcome {
+            Acceptance::Refused(line) => assert_eq!(line, BUSY),
+            Acceptance::Served(_) => panic!("a busy server was read as serving"),
+            Acceptance::NotAccepted(w) => panic!("a busy server read as not accepting ({w:?})"),
+            Acceptance::Dropped => panic!("the busy line was lost"),
+        }
+
+        // The failed write: the server already answered and closed, so the
+        // client's send is what fails — and the line it left behind is read.
+        let (client, server_end) = CtlStream::pair().expect("pair");
+        (&server_end)
+            .write_all(b"ERR control server busy; retry\n")
+            .expect("busy");
+        drop(server_end);
+        let big = vec![b'x'; 1 << 20];
+        let sent = send_served(&client, &big).expect("a hang-up with a reason is not an error");
+        assert_eq!(sent, Some(ExitCode::FAILURE));
+        let (client, server_end) = CtlStream::pair().expect("pair");
+        drop(server_end);
+        assert!(
+            send_served(&client, &big).is_err(),
+            "negative control: a hang-up with no reason stays the I/O error"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// THE QUICKER BUSY LISTENER. It can accept, answer and close before the
+    /// client has set its connect-phase timeouts, and Darwin then refuses them
+    /// with EINVAL — asserted here on the platform where it happens. The
+    /// connect phase must still read the busy line it left, not fail with
+    /// "Invalid argument": `a_busy_reply_is_reported_as_busy` lost exactly that
+    /// race under load on 2026-09-28 (`open: Os { code: 22, .. }`).
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_answer_that_beat_the_timeouts_is_still_read() {
+        use std::io::Write;
+        const BUSY: &str = "ERR control server busy; retry";
+        let (client, server_end) = CtlStream::pair().expect("pair");
+        (&server_end)
+            .write_all(b"ERR control server busy; retry\n")
+            .expect("busy");
+        drop(server_end);
+        let set = client.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+        if let Err(e) = &set {
+            assert!(peer_already_closed(e), "an unexpected refusal: {e:?}");
+        }
+        #[cfg(target_os = "macos")]
+        assert!(
+            set.is_err(),
+            "Darwin set a timeout on a socket whose peer had closed"
+        );
+        match answer_left_behind(&client) {
+            Acceptance::Refused(line) => assert_eq!(line, BUSY),
+            Acceptance::Served(_) => panic!("a busy server was read as serving"),
+            Acceptance::NotAccepted(w) => panic!("a busy server read as not accepting ({w:?})"),
+            Acceptance::Dropped => panic!("the busy line was lost"),
+        }
+        assert!(
+            !peer_already_closed(&io::Error::new(io::ErrorKind::InvalidInput, "zero")),
+            "std's own zero-timeout refusal carries no errno and is not a hang-up"
         );
     }
 }

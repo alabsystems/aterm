@@ -30,6 +30,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use aterm_buffer::{BlobId, Event, EventLog, KeyframeId, Op, Seq, Ticks};
@@ -57,12 +58,235 @@ pub(crate) enum TemporalMsg {
     /// Engine reply bytes emitted to the PTY peer (`take_response()`). `Arc<[u8]>`
     /// so the reader's single allocation is shared with the sink write.
     Reply(Arc<[u8]>),
-    /// A geometry change (DECSET/window resize). Routed through this SAME FIFO —
-    /// enqueued UNDER `term_lock` at the engine resize, exactly like the reader's
-    /// per-chunk `RawIn` — so the writer thread APPENDS it to the spine in the order
-    /// the engine observed it, never ahead of already-processed input (B.2.3: reflow
-    /// is path-dependent, so a mid-print resize must replay in the right place).
+    /// A geometry change the engine applied (a window pass, the cross-session
+    /// `resize` verb). The resizing thread does not enqueue it: the READER does,
+    /// from the engine's resize journal, inside its next `term_lock` hold and
+    /// before that hold's `RawIn` ([`SpineMark::record`]), so the writer thread
+    /// APPENDS it to the spine in the order the engine applied it, never ahead of
+    /// already-processed input (B.2.3: reflow is path-dependent, so a mid-print
+    /// resize must replay in the right place). Until that hold it is PENDING
+    /// ([`SpineWatermark::pending`], `temporal status` `pending_resizes=`), and it
+    /// is stamped with that hold's tick, not its own.
     Resize { rows: u16, cols: u16 },
+    /// Resizes the engine applied that the spine will never hold: its journal
+    /// (`RESIZE_JOURNAL_CAP` deep) overran before a reader's hold read it —
+    /// between two holds, or while the session had no reader attached. Counted
+    /// ([`TemporalRecorder::lost_resizes`], `temporal status` `lost_resizes=`),
+    /// never silent: a replay across them lays the screen out without their row
+    /// moves.
+    ResizesLost(u64),
+}
+
+/// Where the spine's resizes are up to, SHARED by every reader a session has
+/// (2026-09-28): the engine lifetime and resize ordinal through which a reader
+/// has handed the spine every resize. The live reader's [`SpineMark`]
+/// publishes each advance here, and the session's next reader starts from it
+/// ([`SpineMark::attach`]), so a resize that landed while no reader was
+/// attached (a park, a deferred attach) is read from the engine's journal and
+/// recorded — past the journal's depth, counted in `lost_resizes=` — rather
+/// than skipped. `temporal` compares it with the live engine to say how many
+/// resizes the spine has not been handed yet ([`Self::pending`]).
+///
+/// Seeded with the keyframe the recording starts from ([`Self::seed`]). Two
+/// atomics that never tear: after the seed (at spawn, before any reader
+/// exists) the one writer is the live reader inside its `term_lock` hold, and
+/// every read that must agree with the engine is taken under that lock too
+/// (`temporal`) or after the writing reader was joined (the next attach). Held by the [`TemporalRecorder`] and handed out once per
+/// attach ([`TemporalRecorder::spine_watermark`]), so neither the reader nor
+/// `temporal` takes the recorder's lock inside `term_lock`.
+#[derive(Debug, Default)]
+pub(crate) struct SpineWatermark {
+    /// The engine's lifetime token (never 0 for a real engine); 0 before the seed.
+    lifetime: AtomicU64,
+    /// The resize ordinal every resize through which the spine was handed.
+    ordinal: AtomicU64,
+}
+
+impl SpineWatermark {
+    /// Start the watermark at `pre`: the engine the recording's keyframe was
+    /// checkpointed from, read in the same hold, so the first reader records
+    /// every resize after the keyframe and none it already holds.
+    pub(crate) fn seed(&self, pre: SpinePre) {
+        self.store((pre.lifetime, pre.ordinal));
+    }
+
+    fn load(&self) -> Option<(u64, u64)> {
+        let lifetime = self.lifetime.load(Ordering::Acquire);
+        (lifetime != 0).then(|| (lifetime, self.ordinal.load(Ordering::Acquire)))
+    }
+
+    fn store(&self, (lifetime, ordinal): (u64, u64)) {
+        self.ordinal.store(ordinal, Ordering::Release);
+        self.lifetime.store(lifetime, Ordering::Release);
+    }
+
+    /// Resizes `term` (the caller holds its lock) applied that no reader has
+    /// handed the spine yet. They wait for the reader's next hold — the
+    /// program's next output — which records them first; a replay at the
+    /// spine's end lacks them until then. Against another engine lifetime than
+    /// the watermark's (or none), every resize this engine applied.
+    #[must_use]
+    pub(crate) fn pending(&self, term: &Terminal) -> u64 {
+        match self.load() {
+            Some((lifetime, ordinal)) if lifetime == term.resize_lifetime() => {
+                term.resize_ordinal().saturating_sub(ordinal)
+            }
+            _ => term.resize_ordinal(),
+        }
+    }
+}
+
+/// One reader's RESIZE WATERMARK (2026-09-28, P4(c)): the engine lifetime and
+/// resize ordinal (`Terminal::resize_ordinal`) up to which the spine holds
+/// every resize. The reader builds one per attach from the session's
+/// [`SpineWatermark`] ([`attach`](Self::attach)) and records through it
+/// ([`SpineMark::record`]) inside the hold that processes each slice.
+///
+/// It replaced a `(rows, cols)` watermark, which saw a resize only as a
+/// geometry DIFFERENT from the last one recorded: a net-zero flap between two
+/// reads (64→63→64, the 2026-09-28 incident) left the geometry where it was,
+/// so the spine never held it, and a replay kept every alternate-screen row
+/// where the live engine had moved it. The engine's own resize journal names
+/// each resize, both halves of a flap included. That watermark also started
+/// over at every attach; this one starts where the previous reader stopped.
+#[derive(Debug, Default)]
+pub(crate) struct SpineMark {
+    /// `(lifetime, ordinal)` recorded up to; `None` when the session's
+    /// watermark was never seeded (the next record then records the live
+    /// geometry, as the old `(0, 0)` sentinel did).
+    at: Option<(u64, u64)>,
+    /// The session's watermark, which every advance of `at` is published to.
+    shared: Arc<SpineWatermark>,
+}
+
+/// What one reader hold read BEFORE processing its bytes: the engine's resize
+/// lifetime and ordinal and its geometry. The spine records the resizes up to
+/// here BEFORE the bytes, so a resize a slice's own bytes caused (none today:
+/// DECCOLM is flag-only, XTWINOPS-8 a host callback) would replay from the
+/// bytes, never twice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpinePre {
+    lifetime: u64,
+    ordinal: u64,
+    rows: u16,
+    cols: u16,
+}
+
+impl SpinePre {
+    /// Read `term` (the caller holds its lock) before processing a slice.
+    pub(crate) fn take(term: &Terminal) -> Self {
+        Self {
+            lifetime: term.resize_lifetime(),
+            ordinal: term.resize_ordinal(),
+            rows: term.rows(),
+            cols: term.cols(),
+        }
+    }
+}
+
+impl SpineMark {
+    /// A reader's mark, starting where the session's previous reader left the
+    /// spine (or where its keyframe seeded it). Built at attach, after the
+    /// previous reader and its writer were joined.
+    pub(crate) fn attach(shared: Arc<SpineWatermark>) -> Self {
+        Self {
+            at: shared.load(),
+            shared,
+        }
+    }
+
+    /// Move the watermark to `at`, and publish it when it moved.
+    fn advance(&mut self, at: (u64, u64)) {
+        if self.at != Some(at) {
+            self.at = Some(at);
+            self.shared.store(at);
+        }
+    }
+
+    /// Record one slice on the spine: every resize the engine applied since
+    /// this watermark and up to `pre` (each journalled report's geometry, in
+    /// order), then the slice's `bytes` as `RawIn`. The caller holds `term`'s
+    /// lock, the same hold `pre` was read in and the bytes were processed
+    /// under, so the spine's order is the engine's.
+    ///
+    /// * No watermark (the session's was never seeded), or one of another
+    ///   lifetime token (the engine was replaced): the live geometry `pre`
+    ///   names, once.
+    /// * A journal overrun (more than `RESIZE_JOURNAL_CAP` resizes since the
+    ///   watermark, a reader's absence included): the lost count rides the
+    ///   spine ([`TemporalMsg::ResizesLost`]), then the kept reports.
+    /// * A full queue: the resizes sent so far advance the watermark, the
+    ///   `RawIn` is SKIPPED, and the next slice sends the rest — input is never
+    ///   recorded at a geometry the spine does not yet hold (a bounded,
+    ///   self-healing gap, not a permanent desync).
+    ///
+    /// The journal is read (one small copy) only when the ordinal moved.
+    pub(crate) fn record(
+        &mut self,
+        tx: &std::sync::mpsc::SyncSender<TemporalMsg>,
+        pre: SpinePre,
+        term: &Terminal,
+        bytes: &[u8],
+    ) {
+        if !self.catch_up(tx, pre, term) {
+            return;
+        }
+        if tx.try_send(TemporalMsg::RawIn(Arc::from(bytes))).is_ok() {
+            // Past anything the bytes themselves applied (they replay it).
+            self.advance((term.resize_lifetime(), term.resize_ordinal()));
+        }
+    }
+
+    /// Bring the spine up to `pre`'s resize ordinal. `false`: a resize could
+    /// not be queued, so the caller must not queue input after it.
+    fn catch_up(
+        &mut self,
+        tx: &std::sync::mpsc::SyncSender<TemporalMsg>,
+        pre: SpinePre,
+        term: &Terminal,
+    ) -> bool {
+        let since = match self.at {
+            Some((lifetime, ordinal)) if lifetime == pre.lifetime && ordinal == pre.ordinal => {
+                return true;
+            }
+            Some((lifetime, ordinal)) if lifetime == pre.lifetime && ordinal < pre.ordinal => {
+                ordinal
+            }
+            _ => {
+                let resize = TemporalMsg::Resize {
+                    rows: pre.rows,
+                    cols: pre.cols,
+                };
+                if tx.try_send(resize).is_err() {
+                    return false;
+                }
+                self.advance((pre.lifetime, pre.ordinal));
+                return true;
+            }
+        };
+        let (reports, lost) = term.resize_journal_since(since);
+        if lost > 0 {
+            if tx.try_send(TemporalMsg::ResizesLost(lost)).is_err() {
+                return false;
+            }
+            // Counted once: the watermark moves past what the journal lost.
+            let first_kept = reports
+                .first()
+                .map_or(pre.ordinal, |r| r.ordinal.saturating_sub(1));
+            self.advance((pre.lifetime, first_kept));
+        }
+        for report in reports.iter().filter(|r| r.ordinal <= pre.ordinal) {
+            let resize = TemporalMsg::Resize {
+                rows: report.to.0,
+                cols: report.to.1,
+            };
+            if tx.try_send(resize).is_err() {
+                return false;
+            }
+            self.advance((pre.lifetime, report.ordinal));
+        }
+        true
+    }
 }
 
 /// A retained blob payload (the bytes behind a `RawIn`/`Reply` handle). Held in a
@@ -105,6 +329,14 @@ pub(crate) struct TemporalRecorder {
     /// Count of warm-tier events dropped past the budget (NEVER silent — the
     /// design's "no silent caps" rule).
     dropped_events: u64,
+    /// Resizes the live engine applied that the spine never held: its resize
+    /// journal overran between two reader holds ([`TemporalMsg::ResizesLost`]).
+    /// Disclosed by `temporal status` as `lost_resizes=`.
+    lost_resizes: u64,
+    /// Where the spine's resizes are up to, shared with the session's readers
+    /// ([`SpineWatermark`]): seeded with the first keyframe, advanced by the
+    /// live reader, the start of the next one.
+    spine: Arc<SpineWatermark>,
     /// Bytes of `RawIn` recorded since the last keyframe. When it crosses the
     /// re-keyframe interval the recorder mints a FRESH keyframe (by replaying to the
     /// current instant), so a recent `[keyframe..latest]` window always survives
@@ -121,6 +353,12 @@ pub(crate) struct TemporalRecorder {
     /// reveal history that the recorded conhost repaint then paints over: the
     /// replayed engine would lose lines the live one kept.
     resize_policy: ResizePolicy,
+    /// Set on an ADOPTED session's recorder (round five, item 17): the spine
+    /// starts at a seamless update — its t0 keyframe is the screen the update
+    /// restored, and nothing before it was recorded here. Reported by
+    /// [`status_tail`](Self::status_tail) beside `dropped_events=`, the
+    /// recorder's other gap.
+    handoff: Option<crate::session_timeline::HandoffGap>,
 }
 
 impl TemporalRecorder {
@@ -143,10 +381,29 @@ impl TemporalRecorder {
             used: 0,
             budget: budget.max(1),
             dropped_events: 0,
+            lost_resizes: 0,
+            spine: Arc::default(),
             bytes_since_keyframe: 0,
             epoch: Instant::now(), // CLOCK-EXEMPT: recorder timeline epoch, not engine state
             resize_policy: ResizePolicy::Native,
+            handoff: None,
         }
+    }
+
+    /// Mark this spine as one that starts at a seamless update
+    /// ([`crate::session_timeline::HandoffGap`]).
+    pub(crate) fn mark_handoff(&mut self, gap: crate::session_timeline::HandoffGap) {
+        self.handoff = Some(gap);
+    }
+
+    /// What `temporal status` appends after `dropped_events=`: ` carried=0
+    /// from_build=<n|->` for a spine that starts at a seamless update, and
+    /// nothing otherwise — a fresh session's status line is unchanged.
+    #[must_use]
+    pub(crate) fn status_tail(&self) -> String {
+        self.handoff
+            .map(|gap| format!(" {}", gap.payload()))
+            .unwrap_or_default()
     }
 
     /// Replay every recorded resize under `policy` — the one the live engine
@@ -385,6 +642,37 @@ impl TemporalRecorder {
     #[must_use]
     pub(crate) fn dropped_events(&self) -> u64 {
         self.dropped_events
+    }
+
+    /// Fold one message from the reader into the spine: the writer thread's
+    /// whole job, one call per message, in FIFO order.
+    pub(crate) fn apply(&mut self, msg: TemporalMsg) {
+        match msg {
+            // Hand the reader's SHARED allocation straight through (refcount
+            // move, no re-copy of the burst into the blob store).
+            TemporalMsg::RawIn(bytes) => self.record_raw_in_shared(bytes),
+            TemporalMsg::Reply(bytes) => self.record_reply_shared(bytes),
+            // Appended HERE, in FIFO order — the enqueue was ordered under
+            // `term_lock` relative to the reader's RawIn chunks.
+            TemporalMsg::Resize { rows, cols } => self.record_resize(rows, cols),
+            TemporalMsg::ResizesLost(n) => {
+                self.lost_resizes = self.lost_resizes.saturating_add(n);
+            }
+        }
+    }
+
+    /// Resizes the live engine applied that the spine never held.
+    #[must_use]
+    pub(crate) fn lost_resizes(&self) -> u64 {
+        self.lost_resizes
+    }
+
+    /// The session's spine watermark ([`SpineWatermark`]): taken once per
+    /// reader attach (and by `temporal`), so the reader publishes its progress
+    /// without this recorder's lock, which the writer thread contends.
+    #[must_use]
+    pub(crate) fn spine_watermark(&self) -> Arc<SpineWatermark> {
+        self.spine.clone()
     }
 
     /// The latest recorded instant on the live spine (the default replay target),
@@ -945,6 +1233,293 @@ mod tests {
             "re-keyframing minted fresh keyframes: {}",
             r.keyframe_count()
         );
+    }
+
+    // ---- THE RESIZE WATERMARK (P4(c)) --------------------------------------
+
+    /// A Claude-shaped alternate-screen frame: `L<r>` on every row and `E` in
+    /// its last column (`cols`), the cursor parked below the top, so a one-row
+    /// shrink DEMOTES the top row and a one-column shrink cuts every `E`.
+    fn alt_frame(rows: u16, cols: u16) -> Vec<u8> {
+        let mut f = String::from("\x1b[?1049h\x1b[2J");
+        for r in 0..rows {
+            f.push_str(&format!(
+                "\x1b[{row};1HL{r}\x1b[{row};{cols}HE",
+                row = r + 1
+            ));
+        }
+        f.push_str(&format!("\x1b[{};3H", rows - 2));
+        f.into_bytes()
+    }
+
+    /// The writer, naming what it folds: every queued message, in order.
+    fn drain_named(
+        rx: &std::sync::mpsc::Receiver<TemporalMsg>,
+        r: &mut TemporalRecorder,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(match &msg {
+                TemporalMsg::RawIn(_) => "in".to_string(),
+                TemporalMsg::Reply(_) => "reply".to_string(),
+                TemporalMsg::Resize { rows, cols } => format!("r:{rows}x{cols}"),
+                TemporalMsg::ResizesLost(n) => format!("lost:{n}"),
+            });
+            r.apply(msg);
+        }
+        out
+    }
+
+    /// One reader slice: read the engine before, process, record — the
+    /// reader's order inside one hold.
+    fn slice(
+        live: &mut Terminal,
+        mark: &mut SpineMark,
+        tx: &std::sync::mpsc::SyncSender<TemporalMsg>,
+        bytes: &[u8],
+    ) {
+        let pre = SpinePre::take(live);
+        live.process(bytes);
+        mark.record(tx, pre, live, bytes);
+    }
+
+    /// A recording started the way a session starts one: the keyframe and
+    /// the session's watermark seeded from the same engine reading.
+    fn seeded(live: &Terminal) -> TemporalRecorder {
+        let mut r = TemporalRecorder::new();
+        r.record_keyframe(live.checkpoint());
+        r.spine_watermark().seed(SpinePre::take(live));
+        r
+    }
+
+    /// The writer: every queued message, in order.
+    fn drain(rx: &std::sync::mpsc::Receiver<TemporalMsg>, r: &mut TemporalRecorder) -> usize {
+        let mut n = 0;
+        while let Ok(msg) = rx.try_recv() {
+            r.apply(msg);
+            n += 1;
+        }
+        n
+    }
+
+    /// A NET-ZERO FLAP BETWEEN TWO READS that the engine cannot undo: 20 ->
+    /// 19 -> 20 columns on the alternate screen cuts the last column for good
+    /// (the grid's resize undo serves a rows-only shrink, never a width
+    /// change) and leaves the geometry where it was. The spine holds both
+    /// halves (the engine's resize journal names them), so a replay reaches the
+    /// live, CUT screen. The old `(rows, cols)` watermark saw the same geometry
+    /// at both reads and recorded no resize: that spine replays to a screen
+    /// the session never showed.
+    ///
+    /// The incident's own flap (6 -> 5 -> 6 rows, nothing between the halves)
+    /// is now an identity — the engine hands the demoted row back — and the
+    /// spine still holds both halves, so the replay folds the same undo.
+    #[test]
+    fn a_net_zero_flap_between_two_reads_reaches_the_spine_and_the_replay() {
+        const ROWS: u16 = 6;
+        const COLS: u16 = 20;
+        let mut live = Terminal::new(ROWS, COLS);
+        let mut r = seeded(&live);
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        let frame = alt_frame(ROWS, COLS);
+        // A diff frame at an absolute row (no clear), after the flap.
+        let diff = b"\x1b[1;1HT1\x1b[K\x1b[4;3H";
+        slice(&mut live, &mut mark, &tx, &frame);
+        live.resize(ROWS, COLS - 1);
+        live.resize(ROWS, COLS);
+        slice(&mut live, &mut mark, &tx, diff);
+        drain(&rx, &mut r);
+        assert_eq!((live.rows(), live.cols()), (ROWS, COLS), "net zero");
+        assert_eq!(
+            live.row_text(1).unwrap_or_default().trim_end(),
+            "L1",
+            "the live screen lost its last column"
+        );
+        let replayed = r.replay_at(None).expect("replay");
+        assert_eq!(screen_of(&replayed), screen_of(&live));
+        assert_eq!(r.lost_resizes(), 0);
+
+        // The old watermark's spine: the same bytes, no resize (the geometry
+        // at both reads was 6x20).
+        let mut old = TemporalRecorder::new();
+        old.record_keyframe(Terminal::new(ROWS, COLS).checkpoint());
+        old.record_raw_in(&frame);
+        old.record_raw_in(diff);
+        let uncut = old.replay_at(None).expect("replay");
+        assert_ne!(screen_of(&uncut), screen_of(&live), "the flap it missed");
+
+        // The incident's flap: undone by the engine, and still on the spine.
+        let mut live = Terminal::new(ROWS, COLS);
+        let mut r = seeded(&live);
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        slice(&mut live, &mut mark, &tx, &frame);
+        let before = screen_of(&live);
+        live.resize(ROWS - 1, COLS);
+        live.resize(ROWS, COLS);
+        assert_eq!(screen_of(&live), before, "the engine undid the quiet flap");
+        slice(&mut live, &mut mark, &tx, diff);
+        assert_eq!(
+            drain_named(&rx, &mut r),
+            ["in", "r:5x20", "r:6x20", "in"],
+            "both halves reach the spine, before the output after them"
+        );
+        let replayed = r.replay_at(None).expect("replay");
+        assert_eq!(screen_of(&replayed), screen_of(&live));
+    }
+
+    /// More resizes between two reads than the engine's journal keeps: the
+    /// overrun is COUNTED (`lost_resizes`, once), the kept ones reach the
+    /// spine in order, and the replay ends at the live geometry.
+    #[test]
+    fn a_journal_overrun_is_counted_once_and_the_replay_ends_at_the_live_geometry() {
+        let mut live = Terminal::new(6, 20);
+        let mut r = seeded(&live);
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        let mut mark = SpineMark::attach(r.spine_watermark());
+        slice(&mut live, &mut mark, &tx, b"a\r\n");
+        let n = aterm_core::terminal::RESIZE_JOURNAL_CAP as u64 + 5;
+        for i in 0..n {
+            live.resize(6, 20 + u16::try_from(i % 7).unwrap_or(0) + 1);
+        }
+        slice(&mut live, &mut mark, &tx, b"b\r\n");
+        slice(&mut live, &mut mark, &tx, b"c\r\n");
+        drain(&rx, &mut r);
+        assert_eq!(r.lost_resizes(), 5, "counted once, not per slice");
+        let replayed = r.replay_at(None).expect("replay");
+        assert_eq!(
+            (replayed.rows(), replayed.cols()),
+            (live.rows(), live.cols())
+        );
+    }
+
+    /// A full queue: the resizes that fit advance the watermark, the slice's
+    /// input is NOT queued ahead of the rest, and the next slice sends the
+    /// rest first. Both halves of the flap reach the spine, each before any
+    /// input the engine processed after it. (An unseeded mark: its first
+    /// record is the live geometry.)
+    #[test]
+    fn a_full_queue_never_records_input_ahead_of_its_resizes() {
+        let mut live = Terminal::new(6, 20);
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
+        let mut mark = SpineMark::default();
+        let shape = |msg: &TemporalMsg| match msg {
+            TemporalMsg::RawIn(b) => format!("in:{}", String::from_utf8_lossy(b)),
+            TemporalMsg::Reply(_) => "reply".to_string(),
+            TemporalMsg::Resize { rows, cols } => format!("r:{rows}x{cols}"),
+            TemporalMsg::ResizesLost(n) => format!("lost:{n}"),
+        };
+        let mut seen = Vec::new();
+        slice(&mut live, &mut mark, &tx, b"1");
+        live.resize(5, 20);
+        live.resize(6, 20);
+        slice(&mut live, &mut mark, &tx, b"2");
+        while let Ok(msg) = rx.try_recv() {
+            seen.push(shape(&msg));
+        }
+        slice(&mut live, &mut mark, &tx, b"3");
+        while let Ok(msg) = rx.try_recv() {
+            seen.push(shape(&msg));
+        }
+        assert_eq!(
+            seen,
+            ["r:6x20", "in:1", "r:5x20", "r:6x20", "in:3"],
+            "slice 2's input was skipped, never queued before the grow"
+        );
+    }
+
+    /// A FLAP WHILE NO READER WAS ATTACHED (a park, a deferred attach): the
+    /// next reader starts where the session's last one left the spine, reads
+    /// both halves from the engine's journal, and the replay reaches the live,
+    /// CUT screen (a width flap, which the engine's resize undo does not
+    /// serve). The negative control is a reader that starts over, as each
+    /// reader's own watermark used to: it records only the live geometry,
+    /// which the flap left where it was, so its spine replays uncut.
+    #[test]
+    fn a_flap_while_no_reader_was_attached_reaches_the_next_reader() {
+        const ROWS: u16 = 6;
+        const COLS: u16 = 20;
+        let diff = b"\x1b[1;1HT1\x1b[K\x1b[4;3H";
+        for starts_over in [false, true] {
+            let mut live = Terminal::new(ROWS, COLS);
+            let mut r = seeded(&live);
+            let (tx, rx) = std::sync::mpsc::sync_channel(64);
+            let mut first = SpineMark::attach(r.spine_watermark());
+            slice(&mut live, &mut first, &tx, &alt_frame(ROWS, COLS));
+            drop(first); // the reader parks
+            live.resize(ROWS, COLS - 1);
+            live.resize(ROWS, COLS);
+            let mut next = if starts_over {
+                SpineMark::default()
+            } else {
+                SpineMark::attach(r.spine_watermark())
+            };
+            slice(&mut live, &mut next, &tx, diff);
+            drain(&rx, &mut r);
+            let replayed = r.replay_at(None).expect("replay");
+            assert_eq!(
+                screen_of(&replayed) == screen_of(&live),
+                !starts_over,
+                "a reader that starts over misses the flap (starts over: {starts_over})"
+            );
+            assert_eq!(r.lost_resizes(), 0);
+        }
+    }
+
+    /// More resizes while no reader was attached than the engine's journal
+    /// keeps: the next reader COUNTS the overrun (`lost_resizes`) instead of
+    /// starting over silently, and its replay ends at the live geometry.
+    #[test]
+    fn an_overrun_while_no_reader_was_attached_is_counted() {
+        let mut live = Terminal::new(6, 20);
+        let mut r = seeded(&live);
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        let mut first = SpineMark::attach(r.spine_watermark());
+        slice(&mut live, &mut first, &tx, b"a\r\n");
+        drop(first);
+        let n = aterm_core::terminal::RESIZE_JOURNAL_CAP as u64 + 3;
+        for i in 0..n {
+            live.resize(6, 21 + u16::try_from(i % 5).unwrap_or(0));
+        }
+        let mut next = SpineMark::attach(r.spine_watermark());
+        slice(&mut live, &mut next, &tx, b"b\r\n");
+        drain(&rx, &mut r);
+        assert_eq!(r.lost_resizes(), 3);
+        let replayed = r.replay_at(None).expect("replay");
+        assert_eq!(
+            (replayed.rows(), replayed.cols()),
+            (live.rows(), live.cols())
+        );
+    }
+
+    /// `pending`: the resizes the live engine applied that no reader has
+    /// handed the spine yet, which `temporal` discloses while a flap waits for
+    /// the program's next output. That output's hold hands both halves over.
+    #[test]
+    fn pending_counts_the_resizes_the_spine_has_not_been_handed() {
+        let mut live = Terminal::new(6, 20);
+        let r = seeded(&live);
+        let watermark = r.spine_watermark();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+        let mut mark = SpineMark::attach(watermark.clone());
+        slice(&mut live, &mut mark, &tx, b"a");
+        assert_eq!(watermark.pending(&live), 0);
+        live.resize(5, 20);
+        live.resize(6, 20);
+        assert_eq!(
+            watermark.pending(&live),
+            2,
+            "a net-zero flap, no output since"
+        );
+        slice(&mut live, &mut mark, &tx, b"b");
+        assert_eq!(
+            watermark.pending(&live),
+            0,
+            "the next hold handed both over"
+        );
+        // Never seeded (no recording): every resize this engine applied.
+        assert_eq!(SpineWatermark::default().pending(&live), 2);
     }
 
     #[test]

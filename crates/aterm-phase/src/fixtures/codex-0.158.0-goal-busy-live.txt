@@ -1,0 +1,65 @@
+# codex 0.158.0 · MEASURED 2026-09-28, `aterm ctl text` of a live 131x64 tab, read only (a goal-mode session, GPT-6-Astra ultra, `Pursuing goal`), cursor=60,2 (visible, on the placeholder), `cell 60 0` `»` bold, `cell 60 2` `A` dim · a goal turn running: its status row, the tip under it, and the INPUT LINE drawn `»` (U+00BB), not `›` · scrubbed: the transcript's words, paths and commit ids replaced by stand-ins of the same shape; every glyph, indent, wrap and row kept
+and keep the parser's tests green while you do it, then push the branch
+• Explored
+  └ Read parser-test.log
+    + Show details
+
+• Edited docs/parser/README.md (+3 -2)
+    100 +| `parser-test.log` | `-p parser --lib the_grammar_reads_back_every_token_the_lexer_wrote_out_for_it -- --test-threads 1
+         ` | 1 passed |
+        ⋮
+    + Show details
+
+• Failed (exit 1) set -e …
+  └ hint: the same ref. If you want to integrate the remote changes, use
+    hint: 'git pull' before pushing again.
+    hint: See the 'Note about fast-forwards' in 'git push --help' for details.
+    + Show details
+
+• Ran set -e …
+  └  .../src/grammar.rs                                   | 195 +++++++++
+     9 files changed, 896 insertions(+)
+    ## main...origin/main [ahead 1, behind 4]
+    + Show details
+
+• The parser check passed. A peer pushed another commit just before my final evidence push, so Git correctly refused the
+  push. I’m fetching and reviewing that addition before merging it; I won’t overwrite their work or force-push.
+
+• Ran set -e …
+  └  ## 2026-09-28 — `parser-coverage`: two grammar rules blocked at the front end; stale dead-action warnings dropped; an …
+
+     The [report](../../docs/parser/README.md)
+    + Show details
+
+• Edited docs/parser/README.md (+7 -0)
+    79 +After the source merge was pushed as `0123456789`, a peer published the
+    80 +grammar inventory through `89abcdef01`. The final push
+    81 +was correctly rejected until that work was pulled and merged too. Those four
+    + Show details
+
+• Ran set -e …
+  └ 1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a
+    1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a
+    0    0
+    + Show details
+
+• Ran set -e …
+  └ 2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b
+    2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b
+    0    0
+    + Show details
+
+• Ran set -e …
+  └ 3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c
+    3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c
+    0    0
+    + Show details
+
+• Working (27m 42s • esc to interrupt)
+  └ Tip: Run /review to get a code review of your current changes.
+
+
+» Ask Codex to do anything
+
+  GPT-6-Astra ultra · ~/project · Fix the parser · Main [default]                                      Pursuing goal (10d 2h 51m)
+  ← for agents · ? for shortcuts

@@ -59,6 +59,19 @@
 //!   row escalated "worker reports done".) `cfg.continue_per_hour` is the
 //!   owner's cap: `0`, the default, is none; past a written cap the point is
 //!   escalated.
+//! * **A worker that says it is done is asked once, then left**
+//!   ([`RULE_DONE_CHECK`]; *decided 2026-09-27 under the owner's standing
+//!   direction*). A point whose last words say DONE ([`says_done`]) gets,
+//!   past its back-off, the [`DONE_CHECK`] instead of the continuation or an
+//!   answer: *"If the task is finished and verified, reply DONE and stop;
+//!   otherwise continue"*. Its yield saying done again ENDS THE TASK: no act
+//!   of any kind is typed into the session — the taskless rule's no-act path
+//!   ([`TurnEndState::task_done`]) — until a person or an orchestrator types
+//!   (a turn of someone else's opens it again, whatever it ended on: one that
+//!   ended on a wall gets the wall's ladder). No limit key: the cost stops
+//!   by itself. Until then a done worker was nudged on the back-off for
+//!   good, and on a small model the nudges ended in invented work (the E2E's
+//!   C of 2026-09-26).
 //! * **No task, no turn end.** A session nobody has asked anything
 //!   ([`TurnEndReading::taskless`]: the launch card and no message, or its
 //!   host's word that no person or orchestrator has asked its conversation
@@ -73,7 +86,7 @@
 //!   WITH a task is continued as below even when that task is finished —
 //!   the same E2E's C, whose tester's prompt was answered, was continued,
 //!   answered and carried on until haiku invented work (`git init`, `/init`,
-//!   files and a commit): that hazard is open, not closed by this rule.
+//!   files and a commit): the done check below closes it.
 //! * **A person wins.** Nothing is typed within `cfg.human_grace_s` of a
 //!   person's last keystroke into the session ([`TurnEndReading::person`]:
 //!   the server's `human_ms=`, or the draft in the composer last changing,
@@ -156,6 +169,105 @@
 //! its remedy only where the restart cannot be made (no host restarts here,
 //! or `[harness] relaunch = false`).
 //!
+//! **CODEX: SAVE THEN WAIT** ([`WindDown`], the owner, 2026-09-28: the
+//! supervisor "should only use gpt-6-luna switch like that for codex to git
+//! commit and push work and then wait for the original model settings, not
+//! continue work in a sandbox"). The approval policy presses Codex's
+//! rate-limit nudge's `Switch to <cheaper model>` only when Codex's own usage
+//! reading shows the window at 90% or more (`rate-nudge-switch@v1`;
+//! otherwise it keeps the model); the press's intent is ledgered before its
+//! key and the switch opens once the box is seen leaving — and then this
+//! policy owns every point of the session until the switch closes, typing
+//! no continuation, no answer and no draft:
+//! 1. OWED: Codex's goal is stopped first — the loop's Esc on any turn
+//!    running on the cheaper model that is no person's (their hand in it
+//!    since the switch opened, or their grace while it lasts,
+//!    [`RunningTurn::person`] — a turn measured from the nudge's box on, so
+//!    a person's message that began the turn the box covered spares no goal
+//!    turn after it), the goal turn Codex starts under the box among them
+//!    ([`TurnEndState::goal_stop`], read at every busy read), else `/goal
+//!    pause` at a free point; at most [`GOAL_STOPS`] stops
+//!    a switch, then a person is told once, the note kept up while the goal
+//!    runs on — then, once the footer shows the cheaper model (one still
+//!    showing the thread's own model past the first point, with the thread's
+//!    own rollout not on the cheaper model since the switch opened either, is
+//!    the switch that did not land — and with a person's keystroke since the
+//!    opening, their `/model` — released; a footer that shows no model, or
+//!    lags a rollout on the cheaper one, for [`OWED_FOOTER_BOUND`] is said),
+//!    ONE instruction
+//!    ([`wind_down_text`], [`RULE_WIND_DOWN`]): commit the work in progress
+//!    on the current branch, push it plainly (one `git pull --no-rebase` on a
+//!    rejected push), never force, rebase, reset, stash or switch branches,
+//!    say what failed rather than work around it, stop, and answer with a
+//!    one-time marker line only when all of it is pushed;
+//! 2. WINDING: its turn runs; its answer's marker is the save — without it,
+//!    a person is told once, quoting the agent's last words. The turn is
+//!    BOUNDED (the owner's rule: the cheaper model only commits and pushes):
+//!    past [`WIND_DOWN_BOUND`] of busy work since the save was typed, the
+//!    loop's busy read stops it with ONE Esc ([`TurnEndState::goal_stop`]),
+//!    its interrupted point judges the marker all the same, and the switch
+//!    goes on to the restore and the hold — a save still running after that
+//!    Esc is said to a person, once;
+//! 3. RESTORE: `/model`, whose picker the approval policy drives to the
+//!    thread's own model and effort, for this conversation only
+//!    (`model-restore-pick@v1`) — only the harness's own picker: once it has
+//!    been gone for [`PICKER_SETTLE`] (never a frame between its boxes, read
+//!    or judged as an idle point — no `/model` is typed again inside the
+//!    settle), or a person has typed since, a picker is the person's
+//!    ([`TurnEndState::picker_seen`]) — seen back on the footer, two tries,
+//!    then the hand steps are said;
+//! 4. HOLDING: begun with ONE record for a person ([`WindEvent::Hold`]: the
+//!    model it waits on and the reset, in plain words); nothing typed until
+//!    the original window's reset (plus [`TurnEndTiming::reset_grace`];
+//!    [`TurnEndTiming::unknown_hold`] from the hold's start when nobody read
+//!    it, a start a restart carries), decided again at least every
+//!    [`TurnEndTiming::limits_every`] and ended early when Codex's usage
+//!    reading drops under its limit — a reading a held session no longer
+//!    writes, so an early reset is seen only when ANOTHER Codex session on
+//!    the account writes one (nothing is typed to ask, `/status` included);
+//!    then, under `resume_limits`, `/goal resume` when the harness paused
+//!    the goal, else — under `continue_policy` — a carry-on naming the model
+//!    ([`resume_text`]); with either key off, nothing is typed and a person
+//!    is told.
+//!
+//! A person's own message, `/model` or `/goal resume` releases the switch
+//! (no automatic resume after it; before the hold, the model is still put
+//! back) — during the hold, their `/model` to the cheaper model too (their
+//! keystroke since the hold began), which is never driven back — and the
+//! turn it starts is not stopped once a busy read has seen their hand in it
+//! (a keystroke since the switch opened, within the turn's own work plus
+//! [`PERSON_TURN_SLACK`]). What that does NOT cover, stated: a message a
+//! person sent before the switch that Codex queued and starts under the
+//! nudge's box is taken as Codex's own and stopped; the turn in flight when
+//! a restarted loop carried the switch on is theirs only with a keystroke
+//! within [`SEEDED_TURN_BOUND`] of the loop's first read of it; and a turn
+//! whose first busy read came more than the slack after their last
+//! keystroke is stopped once their grace has run out. A turn nobody here
+//! typed is a person's only with their hand in it
+//! ([`TurnEndReading::person_in_turn`]) wherever it could be Codex's goal or
+//! the harness's own: a goal seen running before the model is back or during
+//! the hold, and the turn in flight when a restarted loop carried the switch
+//! on (a keystroke since its last row, within [`SEEDED_TURN_BOUND`] of the
+//! loop's first read of it). A turn's end under a Codex BACKGROUND TERMINAL
+//! (`1 background terminal running` under an ended turn, which reads busy) —
+//! however it ended: idle, on a question, on a wall — is a point for the
+//! switch's own steps and nothing else (the loop's), and a switch that
+//! stands still through one for ten minutes is said once, naming what holds
+//! it — a person's typing or draft, the terminal, or this policy's own wait
+//! ([`TurnEndState::switch_hold`]) — and only said. Every edge and every note is a
+//! ledger row that a later loop carries on from ([`TurnEndState::seed_wind`];
+//! a wind-down in flight stays WINDING, so its end still judges the marker;
+//! the switch's opening and its press, the harness's last Esc while its
+//! point is fresh, the notes said and a press not yet seen landing — every
+//! row of it written as `intent` — ride along). Nothing of the switch — no
+//! save, no `/goal pause`, no `/model`, no resume — is typed into a thread
+//! that fell into a sandbox its launch bypassed. And beside the switch: a
+//! Codex whose footer says its goal is pursued is never continued — Codex
+//! starts its own next turn within milliseconds, and a continuation lands in
+//! it as a steer (all eleven of the incident's did); a Codex thread that fell
+//! into a sandbox is typed nothing; a goal Codex's hard usage wall stopped is
+//! resumed at the reset with `/goal resume`.
+//!
 //! **Never** while a box, the session survey or a wall's wait is up, on a
 //! non-authoritative reading (a shell, a Codex screen outside its box), or
 //! within a person's grace — a draft still changing is a person typing.
@@ -163,14 +275,25 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use aterm_phase::ApiCause;
+use aterm_phase::codex::CodexGoal;
 use aterm_phase::phase::{Phase, is_done_row, last_said_row, status_row};
 use aterm_phase::wall::WallKind;
+use aterm_phase::{ApiCause, Program};
 
+use super::super::codex_usage::LimitRead;
 use super::super::config::SupervisorConfig;
 
 /// A continuation typed at an ordinary turn end ([`decide_turn_end`]).
 pub const RULE_CONTINUE: &str = "continue@v1";
+/// The [`DONE_CHECK`] typed where the worker said it is done: its yield
+/// saying done again ends the task ([`TurnEndState::task_done`]).
+pub const RULE_DONE_CHECK: &str = "continue-done-check@v1";
+/// What a worker that says it is DONE ([`says_done`]) is typed in place of
+/// the continuation: words that let it stop (decided 2026-09-27 under the
+/// owner's standing direction). The reply it asks for, `DONE`, is itself a
+/// done report ([`says_done`]).
+pub const DONE_CHECK: &str =
+    "If the task is finished and verified, reply DONE and stop; otherwise continue.";
 /// The worker's own suggestion accepted.
 pub const RULE_SUGGESTION: &str = "continue-suggestion@v1";
 /// A continuation after an overload or an API error's wait (and the one
@@ -252,6 +375,10 @@ pub const RULE_ANSWER: &str = "answer@v1";
 pub const RULE_CONSENT: &str = "consent-accept@v1";
 /// The agent restarted in its tab for Claude Code's critical-memory banner.
 pub const RULE_MEMORY_RESTART: &str = "memory-restart@v1";
+/// Codex's save-then-wait switch ([`WindDown`]): the harness's own Esc or
+/// `/goal pause` that stops Codex's goal, and the instruction to commit and
+/// push the work and stop ([`wind_down_text`]).
+pub const RULE_WIND_DOWN: &str = "model-wind-down@v1";
 /// A turn the session's HOST typed — the live upgrade's notice, a relaunched
 /// agent's carry-on ([`TurnEndState::host_typed`]): awaited as this policy's
 /// own acts are, and its answer, short, is no short turn of the worker's.
@@ -326,10 +453,16 @@ pub const DONE_PHRASES: &[&str] = &[
     "anything else?",
 ];
 
-/// Whether the worker's last words say it is done ([`DONE_PHRASES`]).
+/// Whether the worker's last words say it is done ([`DONE_PHRASES`]), or
+/// ARE the one word [`DONE_CHECK`] asks for — `DONE` as written there,
+/// punctuation around it (`DONE.`, `**DONE**`) and nothing else. A
+/// title-case `Done.` stays what it always read as: a step reported.
 #[must_use]
 pub fn says_done(tail: Option<&str>) -> bool {
     tail.is_some_and(|t| {
+        if t.trim_matches(|c: char| !c.is_alphanumeric()) == "DONE" {
+            return true;
+        }
         let flat = t
             .to_lowercase()
             .replace('’', "'")
@@ -343,7 +476,10 @@ pub fn says_done(tail: Option<&str>) -> bool {
 /// The rules whose act's yield counts toward the short streak — never
 /// [`RULE_HOST_TURN`], the harness's own turn.
 fn is_continue_rule(rule: &str) -> bool {
-    rule == RULE_CONTINUE || rule == RULE_SUGGESTION || rule == RULE_ANSWER
+    rule == RULE_CONTINUE
+        || rule == RULE_SUGGESTION
+        || rule == RULE_ANSWER
+        || rule == RULE_DONE_CHECK
 }
 
 /// Claude Code's own `/model` aliases (2.1.280's binary: `["sonnet", "opus",
@@ -574,6 +710,17 @@ pub struct TurnEndTiming {
     /// job the relaunch cannot see yet); the last for every try after it —
     /// never given up on.
     pub restart_backoff: Vec<Duration>,
+    /// How long a save-then-wait hold whose reset nobody read lasts before
+    /// the session is resumed on its own model all the same ([`WindDown`]):
+    /// a model still at its limit then meets Codex's own wall, which names
+    /// its reset.
+    pub unknown_hold: Duration,
+    /// The longest a hold waits before it is decided again — the usage
+    /// reading looked at anew each time.
+    pub limits_every: Duration,
+    /// How long after the harness typed its `/model` the picker is answered
+    /// as its own restore ([`TurnEndState::restore_target`]).
+    pub restore_pick: Duration,
 }
 
 impl Default for TurnEndTiming {
@@ -593,6 +740,9 @@ impl Default for TurnEndTiming {
             window: min(60),
             take_within: Duration::from_secs(30),
             restart_backoff: vec![Duration::from_secs(10), min(1), min(5), min(10)],
+            unknown_hold: min(5 * 60),
+            limits_every: min(30),
+            restore_pick: min(2),
         }
     }
 }
@@ -647,6 +797,13 @@ pub struct TurnEndReading {
     /// ([`crate::supervise::IdleHost::can_restart`]): a restart the policy
     /// asks for can be made — the loop's to set, as [`Self::upgrading`] is.
     pub restartable: bool,
+    /// The line a person runs to resume the agent's OWN conversation
+    /// ([`crate::supervise::IdleHost::resume_command`]: `claude --resume
+    /// <id>`), named by the memory wall's escalation; `None` where no host
+    /// read one — then the escalation names no command rather than `claude
+    /// --continue`, which resumes the directory's newest conversation
+    /// (2026-09-26). The loop's to set, as [`Self::restartable`] is.
+    pub resume: Option<String>,
     /// The live upgrade owns the session's turn ends for now — the window's
     /// host says so from the upgrade's own state ([`crate::supervise::IdleHost::owns_turn_end`]:
     /// the agent answered READY and the restart is imminent), never from the
@@ -682,9 +839,58 @@ pub struct TurnEndReading {
     /// hands on a server that does not say. `None`: neither — read as no
     /// person.
     pub person: Option<Duration>,
+    /// The program whose reader read the screen.
+    pub program: Program,
+    /// Codex's goal as its footer names it ([`aterm_phase::codex::goal_state`]):
+    /// `Pursuing`, and Codex starts its own next turn — nothing is typed.
+    pub goal: Option<CodexGoal>,
+    /// Codex's thread's model and effort off its footer
+    /// ([`aterm_phase::codex::footer_model`]).
+    pub model_field: Option<CodexSetting>,
+    /// What Codex's own records say of its usage window — the loop's to set
+    /// ([`crate::supervise::codex_usage::look`]); unknown from the screen.
+    pub limits: LimitRead,
+    /// The sandbox a Codex thread fell into from its launch's bypass — the
+    /// loop's to set ([`crate::supervise::codex_usage::sandbox_fell`]):
+    /// nothing is typed into it.
+    pub sandbox_fell: Option<String>,
+    /// The model the session's own Codex thread ran its last turn on, by its
+    /// rollout's last `turn_context` (`gpt-6-luna`) — the loop's to set
+    /// ([`crate::supervise::codex_usage::CodexSeen::thread_model`]), and
+    /// while a save-then-wait switch is open only for a turn begun since its
+    /// press ([`WindDown::pressed_at`], within a second's slack:
+    /// [`crate::supervise::codex_usage::model_since`] — a turn on the cheaper
+    /// model before it says nothing of where the thread is now, while the
+    /// goal turn Codex runs under the nudge's box, begun between the press
+    /// and the box being seen leaving, does); unknown from the screen.
+    pub thread_model: Option<String>,
+    /// The LIVE UPGRADE holds Codex's goal paused for its move (the tab's
+    /// goal record, `harness::goal_hold`) — the loop's to set: a switch that
+    /// held the session over that pause resumes the goal at its reset with
+    /// `/goal resume`, never a carry-on typed over a goal left paused
+    /// ([`wind_down_act`]).
+    pub upgrade_goal: bool,
 }
 
 impl TurnEndReading {
+    /// A PERSON'S HAND IN THE TURN THAT ENDED HERE ([`Self::person`]): a
+    /// keystroke of theirs no older than the turn's own busy work (the loop's
+    /// [`RunningTurn::point`]) plus [`PERSON_TURN_SLACK`] — the message they
+    /// sent that began it, a steer typed into it, the Esc that stopped it.
+    /// What a turn nobody here typed
+    /// needs to be taken for a person's where the switch would otherwise
+    /// take it for the harness's own ([`WindDown::seeded`]) or for Codex's
+    /// goal ([`TurnEndState::observe`]).
+    #[must_use]
+    pub fn person_in_turn(&self) -> bool {
+        self.person.is_some_and(|ago| {
+            ago <= self
+                .worked
+                .unwrap_or_default()
+                .saturating_add(PERSON_TURN_SLACK)
+        })
+    }
+
     /// The reading of one screen: `aterm-phase`'s [`aterm_phase::Reading`]
     /// of `rows` by the session's program's reader (read with the cursor's
     /// column) — its composer, its interrupt — whether a draft is typed (the
@@ -737,11 +943,24 @@ impl TurnEndReading {
                 && last_said_row(rows).is_some_and(|r| r.trim_start().starts_with('❯')),
             interrupted: reading.interrupted,
             restartable: false,
+            resume: None,
             upgrading: false,
             taskless: reading.fresh,
             person: None,
             login_back: claude && aterm_phase::login_restored(rows),
             reach: Reach::Unknown,
+            program: reading.program,
+            goal: (reading.program == Program::Codex)
+                .then(|| aterm_phase::codex::goal_state(rows))
+                .flatten(),
+            model_field: (reading.program == Program::Codex)
+                .then(|| aterm_phase::codex::footer_model(rows))
+                .flatten()
+                .map(|(model, effort)| CodexSetting { model, effort }),
+            limits: LimitRead::default(),
+            sandbox_fell: None,
+            thread_model: None,
+            upgrade_goal: false,
         }
     }
 
@@ -758,6 +977,135 @@ impl TurnEndReading {
             && !self.survey
             && self.composer != Composer::Absent
             && (!self.pending_input || stale_input)
+    }
+}
+
+/// A PERSON'S KEYSTROKE IN THE TURN IN FLIGHT WHEN A LOOP CARRIED A SWITCH ON
+/// ([`WindDown::seeded_at`]: that turn began out of the loop's sight): typed
+/// since the switch's last row (`row`) AND no older than the turn's work the
+/// loop has seen (`worked`, from its first busy read) plus
+/// [`SEEDED_TURN_BOUND`] — the most of a turn in flight the loop is taken not
+/// to have seen. `person` is how long ago a person last typed, at `now`. A
+/// keystroke since the row but older than that (a hold's last row three days
+/// old, a keystroke a day ago) is no hand in the turn running now (the
+/// re-review of 2026-09-28: it let an escaped goal turn run unstopped and
+/// took its end for a person's `/goal resume`).
+#[must_use]
+pub fn seeded_hand(
+    person: Option<Duration>,
+    worked: Option<Duration>,
+    row: Instant,
+    now: Instant,
+) -> bool {
+    person.is_some_and(|ago| {
+        now.checked_sub(ago).is_some_and(|typed| typed >= row)
+            && ago <= worked.unwrap_or_default().saturating_add(SEEDED_TURN_BOUND)
+    })
+}
+
+/// THE TURN RUNNING NOW, as the loop's busy reads keep it — the busy-read
+/// twin of [`TurnEndReading::person_in_turn`], which judges a turn at its
+/// end. Its SPAN is its own work so far: from its first busy read after the
+/// last point ([`Self::point`]), a break the switch took as its point, or the
+/// rate-limit nudge's box ([`Self::boxed`]) — the box marks the end of the
+/// turn it covered, so whatever runs after it is a new turn (Codex's goal
+/// starts one under the box within milliseconds, measured) and never the
+/// covered one's continuation: carried across the box, the span made any
+/// keystroke of the covered turn — hours of a goal run — a person's hand in
+/// the goal turn Codex started on the cheaper model, which then ran unstopped
+/// and untold (the re-review of 2026-09-28). The loop's `Session` keeps one;
+/// the Tier-1 walk drives the same one along the model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunningTurn {
+    /// The first busy read of the turn running now.
+    since: Option<Instant>,
+    /// The span of the turn whose end the nudge's box covered, kept for the
+    /// first point after it when no busy read came since (that point IS the
+    /// covered turn's end, judged once the box is answered).
+    covered: Option<Instant>,
+    /// A busy read saw a person's hand IN this turn: theirs until its point.
+    person: bool,
+}
+
+impl RunningTurn {
+    /// A busy read of the worker's own turn at `now`: the span begins at
+    /// the first.
+    pub fn busy(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+    }
+
+    /// The first busy read of the turn running now, where one was seen.
+    #[must_use]
+    pub fn since(&self) -> Option<Instant> {
+        self.since
+    }
+
+    /// A busy read of it saw a person's hand in the turn running now.
+    #[must_use]
+    pub fn latched(&self) -> bool {
+        self.person
+    }
+
+    /// THE POINT that ends the turn (or a break under a Codex background
+    /// terminal the switch takes as its point), at `now`: the turn's work —
+    /// its own span, else, where no busy read came after the nudge's box,
+    /// the span of the turn the box covered (whose end this point is) — and
+    /// a fresh span for the next; a person's hand latched in it is spent.
+    pub fn point(&mut self, now: Instant) -> Option<Duration> {
+        let own = self.since.take();
+        let covered = self.covered.take();
+        self.person = false;
+        own.or(covered).map(|t| now.saturating_duration_since(t))
+    }
+
+    /// THE NUDGE'S BOX ANSWERED — its switch pressed (the save-then-wait
+    /// switch opens) or its keep: the turn it covered ended under it, so its
+    /// span is kept for that turn's point ([`Self::point`]) and whatever runs
+    /// now is measured from its own first busy read; a person's hand latched
+    /// before is none of it.
+    pub fn boxed(&mut self) {
+        if let Some(s) = self.since.take() {
+            self.covered.get_or_insert(s);
+        }
+        self.person = false;
+    }
+
+    /// WHETHER THE TURN RUNNING NOW IS A PERSON'S, at a busy read at `now`:
+    /// `typed` when a person last typed (the server's `human_ms`, a draft
+    /// that changed), `floor` the open switch's opening
+    /// ([`WindDown::opened_at`]: nothing typed before it is a hand in any
+    /// turn the switch stops — the turn the nudge's box covered was the last
+    /// it could begin), `seeded` the last row of a switch a loop carried on,
+    /// while the turn in flight at its start runs ([`WindDown::seeded_at`]),
+    /// `grace` `human_grace_s`.
+    ///
+    /// * A keystroke IN the turn — since the floor, and no older than the
+    ///   span so far plus [`PERSON_TURN_SLACK`] (the message that began it,
+    ///   however long it runs; a steer in it) or, for the seeded turn in
+    ///   flight, since its row within [`SEEDED_TURN_BOUND`]
+    ///   ([`seeded_hand`]) — makes it theirs, LATCHED until its point.
+    /// * A keystroke since the floor within the grace holds the stop while
+    ///   the grace lasts and latches nothing: typed just before a goal turn
+    ///   began, it is no hand in that turn once the grace has run out (the
+    ///   re-review of 2026-09-28: latched, it spared the whole turn).
+    pub fn person(
+        &mut self,
+        typed: Option<Instant>,
+        floor: Option<Instant>,
+        seeded: Option<Instant>,
+        grace: Duration,
+        now: Instant,
+    ) -> bool {
+        let typed = typed.filter(|t| floor.is_none_or(|f| *t >= f));
+        let ago = typed.map(|t| now.saturating_duration_since(t));
+        let busy_for = self
+            .since
+            .map(|s| now.saturating_duration_since(s))
+            .unwrap_or_default();
+        let in_turn = ago.is_some_and(|a| a <= busy_for.saturating_add(PERSON_TURN_SLACK))
+            || seeded.is_some_and(|row| seeded_hand(ago, Some(busy_for), row, now));
+        self.person |= in_turn;
+        self.person || ago.is_some_and(|a| a < grace)
     }
 }
 
@@ -880,6 +1228,387 @@ pub struct ModelSwitch {
     pub back_at: Option<Instant>,
 }
 
+/// A Codex thread's model and reasoning effort as its footer shows them
+/// (`GPT-6-Astra ultra`): the display name the `/model` picker lists, the
+/// effort lowercased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSetting {
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+impl CodexSetting {
+    /// `GPT-6-Astra ultra`.
+    #[must_use]
+    pub fn words(&self) -> String {
+        match &self.effort {
+            Some(e) => format!("{} {e}", self.model),
+            None => self.model.clone(),
+        }
+    }
+
+    /// The same model and effort, case and `extra high`/`xhigh` aside.
+    #[must_use]
+    pub fn same(&self, other: &CodexSetting) -> bool {
+        let e = |x: &Option<String>| {
+            x.as_deref().map(|e| {
+                let e = e.trim().to_lowercase();
+                if e == "extra high" {
+                    "xhigh".to_string()
+                } else {
+                    e
+                }
+            })
+        };
+        self.model.trim().eq_ignore_ascii_case(other.model.trim())
+            && e(&self.effort) == e(&other.effort)
+    }
+
+    /// Whether the thread runs `model` (a slug or a display name), whatever
+    /// its effort.
+    #[must_use]
+    pub fn runs(&self, model: &str) -> bool {
+        Self::slug_runs(&self.model, model)
+    }
+
+    /// Whether two names of a model — slugs (`gpt-6-luna`, a rollout's
+    /// `turn_context`) or display names (`GPT-6-Luna`, the footer) — name the
+    /// same one.
+    #[must_use]
+    pub fn slug_runs(a: &str, b: &str) -> bool {
+        let key = |m: &str| {
+            m.trim()
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("-")
+        };
+        key(a) == key(b)
+    }
+}
+
+/// Where a Codex save-then-wait switch stands ([`WindDown`], module header
+/// "SAVE THEN WAIT").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindPhase {
+    /// W1: the instruction to save the work is owed at the next free point
+    /// (Codex's goal stopped first).
+    Owed,
+    /// W2: the wind-down's own turn runs on the cheaper model.
+    Winding,
+    /// W3: the thread is owed its own model and effort back — then the hold
+    /// (`hold`), or nothing more (a person took the session over).
+    Restore { hold: bool },
+    /// W4: back on its own model, nothing typed until the window resets.
+    Holding { since: Instant },
+}
+
+impl WindPhase {
+    /// The ledger's word for it (`phase=<word>`).
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            WindPhase::Owed => "owed",
+            WindPhase::Winding => "winding",
+            WindPhase::Restore { hold: true } => "restore",
+            WindPhase::Restore { hold: false } => "restore-free",
+            WindPhase::Holding { .. } => "holding",
+        }
+    }
+}
+
+/// THE SAVE-THEN-WAIT SWITCH of a Codex session (module header): made by the
+/// approval policy's press of the rate-limit nudge's switch
+/// ([`TurnEndState::nudge_switched`]), wound down, restored and held here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindDown {
+    /// The thread's own model and effort before the switch.
+    pub from: CodexSetting,
+    /// The cheaper model the nudge's switch named.
+    pub to: String,
+    /// When the original model's window resets (`None`: nobody read it).
+    pub back_at: Option<Instant>,
+    pub phase: WindPhase,
+    /// The harness stopped Codex's goal (its Esc, or `/goal pause`): it owes
+    /// `/goal resume` at the reset.
+    pub goal_paused: bool,
+    /// `/goal pause` was typed (once).
+    pub pause_typed: bool,
+    /// The wind-down's answer carried the marker (`None`: not judged yet).
+    pub saved: Option<bool>,
+    /// The one-time line the wind-down answers with when all is saved
+    /// ([`crate::harness::upgrade::saved_marker`]).
+    pub marker: String,
+    /// `/model` restores typed.
+    pub restore_tries: u32,
+    /// When the last `/model` restore was typed.
+    pub restore_at: Option<Instant>,
+    /// The notes said already, by key: each is said once per switch.
+    pub said: Vec<&'static str>,
+    /// The first point judged after the switch ends the turn that ran BEFORE
+    /// it (the box was up over its end): no person's turn of the switch's.
+    pub pre: bool,
+    /// Carried on from a previous loop's rows ([`TurnEndState::seed_wind`]):
+    /// the turn that ends at the first point judged after it is the
+    /// harness's own — the wind-down's, the goal turn it was stopping —
+    /// unless the reading shows a person's hand in it
+    /// ([`TurnEndReading::person_in_turn`]).
+    pub seeded: bool,
+    /// The harness's stops of Codex's goal since the switch opened — its Esc
+    /// on a turn Codex ran by itself, its `/goal pause` — at most
+    /// [`GOAL_STOPS`] ([`TurnEndState::goal_stop`]).
+    pub stops: u32,
+    /// When the harness's last Esc went, until a point shows it took
+    /// ([`TurnEndState::goal_stop`] sends no second Esc into the same turn).
+    pub stop_at: Option<Instant>,
+    /// The harness's `/model` picker has been seen since its `/model` went
+    /// ([`TurnEndState::picker_seen`]).
+    pub restore_shown: bool,
+    /// When a read first showed the harness's picker gone again (`None`: up,
+    /// or not seen yet): its claim ends only once it has stayed gone
+    /// [`PICKER_SETTLE`] ([`TurnEndState::picker_seen`]).
+    pub picker_gone_at: Option<Instant>,
+    /// The press is only INTENDED (`phase=intent`, ledgered before its key):
+    /// a restarted loop carries it on without knowing whether the key went,
+    /// so the nudge still up is decided again, nothing of the switch is
+    /// stopped or typed until the footer shows the cheaper model
+    /// ([`TurnEndState::footer_seen`]), and a footer on the thread's own
+    /// model at a point closes it.
+    pub intent: bool,
+    /// Since when the points of an owed switch have waited on the footer —
+    /// one that shows no model, or the thread's own model while the thread's
+    /// rollout says its last turn ran the cheaper one: past
+    /// [`OWED_FOOTER_BOUND`] a person is told.
+    pub footer_since: Option<Instant>,
+    /// When a switch carried on from the ledger was last written
+    /// ([`TurnEndState::seed_wind`]), until the first point judged after it:
+    /// the turn in flight then began out of the loop's sight, and a person's
+    /// keystroke since that row — and within [`SEEDED_TURN_BOUND`] of the
+    /// loop's first read of the turn ([`seeded_hand`]) — is their hand in it,
+    /// at its end and at the loop's busy reads before it.
+    pub seeded_at: Option<Instant>,
+    /// When the switch OPENED (the nudge's box seen leaving, a press carried
+    /// as only intended; a switch carried on from the ledger, the opening
+    /// its rows name, else its last row's time): nothing a person typed
+    /// before it is their hand in any turn the switch reads
+    /// ([`RunningTurn::person`], [`TurnEndReading::person`] at an owed point
+    /// whose footer is back on the thread's own model). `None`: not known (a
+    /// pure caller's) — no floor.
+    pub opened_at: Option<Instant>,
+    /// When the nudge's switch was PRESSED — its intent ledgered, just
+    /// before the key went (`pressed=`): the thread's rollout counts for the
+    /// switch only for a turn begun since (the loop's
+    /// [`TurnEndReading::thread_model`], within a second's slack) — the goal
+    /// turn Codex runs on the cheaper model under the box begins between the
+    /// press and the box being seen leaving (the round-4 re-review: floored
+    /// at the opening, a footer lagging that turn read as the switch that did
+    /// not land). `None`: not known — [`Self::opened_at`] floors it.
+    pub pressed_at: Option<Instant>,
+    /// The save's busy work in its turns that ended on an API error or a
+    /// full context and were carried on (the turn running now is the loop's
+    /// span): with it, the save's work so far is measured against
+    /// [`WIND_DOWN_BOUND`] ([`TurnEndState::goal_stop`]). Not carried by the
+    /// ledger: a loop restarted mid-save counts the save's turn from its own
+    /// first busy read of it.
+    pub wound: Duration,
+    /// The harness's Esc went into the save's turn past [`WIND_DOWN_BOUND`]
+    /// (once a switch): a save still running after it is said to a person.
+    pub overran: bool,
+}
+
+impl WindDown {
+    /// A switch the nudge's press opens (module header), owing its
+    /// wind-down: `from` the thread's model and effort before it, `to` the
+    /// cheaper model, `back_at` the original window's reset (`None`: not
+    /// read), `marker` the line a saved wind-down answers with. Its first
+    /// point ends the turn the nudge's box covered ([`Self::pre`]).
+    #[must_use]
+    pub fn opened(
+        from: CodexSetting,
+        to: String,
+        back_at: Option<Instant>,
+        marker: String,
+    ) -> Self {
+        Self {
+            from,
+            to,
+            back_at,
+            phase: WindPhase::Owed,
+            goal_paused: false,
+            pause_typed: false,
+            saved: None,
+            marker,
+            restore_tries: 0,
+            restore_at: None,
+            said: Vec::new(),
+            pre: true,
+            seeded: false,
+            stops: 0,
+            stop_at: None,
+            restore_shown: false,
+            picker_gone_at: None,
+            intent: false,
+            footer_since: None,
+            seeded_at: None,
+            opened_at: None,
+            pressed_at: None,
+            wound: Duration::ZERO,
+            overran: false,
+        }
+    }
+}
+
+/// The ledger's word for where `w` stands (`phase=<word>`): `intent` for an
+/// owed switch whose press is only intended ([`WindDown::intent`]) — so
+/// every row written while it is (a note's, an edge's, an act's) is read
+/// back as the intent it is, never as a landed switch (the round-4
+/// re-review: a note's row said `owed`, and a restarted loop sent an Esc
+/// into Codex's goal turn on the thread's own model) — else its phase's
+/// ([`WindPhase::word`]).
+#[must_use]
+pub fn wind_phase_word(w: &WindDown) -> &'static str {
+    if w.intent && w.phase == WindPhase::Owed {
+        "intent"
+    } else {
+        w.phase.word()
+    }
+}
+
+/// How many `/model` restores are typed before the restore is handed to a
+/// person with its steps.
+pub const RESTORE_TRIES: u32 = 2;
+
+/// How many times the harness stops Codex's goal while a switch is open — its
+/// Esc on a turn Codex runs by itself (the first, on the goal turn under the
+/// nudge's box, among them), its `/goal pause` at a free point — before it
+/// stops trying and a person is told ([`TurnEndState::goal_stop`]).
+pub const GOAL_STOPS: u32 = 3;
+
+/// How far past a turn's own busy work a person's keystroke still counts as
+/// their hand in it ([`TurnEndReading::person_in_turn`],
+/// [`RunningTurn::person`]): the message typed and sent just before the
+/// turn began.
+pub const PERSON_TURN_SLACK: Duration = Duration::from_secs(30);
+
+/// The most of the turn in flight when a loop carried a switch on that the
+/// loop is taken not to have seen ([`seeded_hand`]): a loop restarts in
+/// seconds (the live upgrade's relaunch) and a goal turn is minutes of work,
+/// so a keystroke older than this before the loop's first read of the turn
+/// began none of it. A HEURISTIC bound: a person's own turn that had run
+/// longer than this out of sight is read as none of theirs.
+pub const SEEDED_TURN_BOUND: Duration = Duration::from_secs(30 * 60);
+
+/// The head of the note that Codex's goal runs on after every stop
+/// ([`TurnEndState::goal_told`]): the loop keeps the badge that carries it up
+/// past the goal's next turn.
+pub const GOAL_NOTE_HEAD: &str = "Codex's goal keeps running";
+
+/// How long the harness's `/model` picker must stay gone before its claim
+/// ends ([`TurnEndState::picker_seen`]): the restore passes through two or
+/// three boxes (the model, the effort, `More reasoning…`'s advanced one), and
+/// a frame between two of them is no picker left.
+pub const PICKER_SETTLE: Duration = Duration::from_secs(2);
+
+/// How long an owed switch's points may wait on the footer before a person
+/// is told: the save waits for the footer to show the cheaper model, and a
+/// footer the reader cannot place — or one back on the thread's own model
+/// while the thread's rollout says it ran the cheaper one — would hold it
+/// silently.
+pub const OWED_FOOTER_BOUND: Duration = Duration::from_secs(5 * 60);
+
+/// THE SAVE'S OWN TURN IS BOUNDED (the owner's rule, 2026-09-28: the cheaper
+/// model is there to commit and push the work, and only that — "not continue
+/// work"): past this much busy work since the save instruction was typed,
+/// the save's turn is no commit and push any longer, and the loop's busy
+/// read stops it with ONE Esc ([`TurnEndState::goal_stop`]); its
+/// interrupted point judges the marker (without it, a person is told), and
+/// the thread's own model is put back and held. A commit and a plain push —
+/// with one `git pull --no-rebase` on a rejected push, and a hook run
+/// between — is minutes of work; this leaves room for a slow hook or a large
+/// push. Without the bound only the cheaper model's obedience to `Then stop`
+/// ended the save's turn (the round-4 re-review).
+pub const WIND_DOWN_BOUND: Duration = Duration::from_secs(15 * 60);
+
+/// A note of the switch's that a restarted loop reads back as said
+/// ([`WindDown::said`], the ledger's `told=`): its key as the `'static` word
+/// the switch keeps, `None` for a word no note of this build's has.
+#[must_use]
+pub fn said_key(word: &str) -> Option<&'static str> {
+    [
+        "goal",
+        "unsaved",
+        "restore",
+        "draft",
+        "footer",
+        "background",
+        "winding",
+    ]
+    .into_iter()
+    .find(|k| *k == word)
+}
+
+/// What holds a save-then-wait switch still through a break under a Codex
+/// background terminal ([`TurnEndState::switch_stood_still`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoodBy {
+    /// A person typed within their grace: the switch's act waits for them.
+    Typing,
+    /// A draft stands in the composer: nothing is typed over it.
+    Draft,
+    /// Nothing of a person's: the terminal holds the session busy, and what
+    /// the switch typed there has not moved it.
+    Terminal,
+    /// The policy's own wait on the footer ([`TurnEndState::switch_hold`]):
+    /// an owed save waits for the footer to show the cheaper model — one
+    /// that shows none, or the thread's own model while its rollout says it
+    /// ran the cheaper one, or a press only intended not seen landing.
+    Footer,
+    /// The policy's own: the thread fell into a sandbox its launch bypassed,
+    /// and nothing of the switch is typed into it.
+    Sandbox,
+    /// The policy's own: its `/model` restores are spent
+    /// ([`RESTORE_TRIES`]), and the hand steps were said.
+    RestoreSpent,
+}
+
+/// What the harness does about a turn running while a switch is open
+/// ([`TurnEndState::goal_stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalStop {
+    /// Stop it: one Esc guarded on its status row.
+    Esc,
+    /// The stops are spent and it runs on: a person is told, once.
+    Tell,
+}
+
+/// What the save-then-wait machine hands its loop ([`TurnEndState::take_wind_events`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindEvent {
+    /// A switch edge no typed act made (the save judged, the model seen
+    /// back, a person's release, the end): ledgered `skipped` under `rule`,
+    /// `what`, with the switch as `wind` leaves it and its phase word.
+    Edge {
+        rule: &'static str,
+        what: String,
+        wind: WindDown,
+        phase: &'static str,
+    },
+    /// A typed act of the switch's: its ledger row carries the switch as it
+    /// stands after it (`phase`).
+    Typed { wind: WindDown, phase: &'static str },
+    /// Told to a person, once.
+    Note(String),
+    /// Codex's goal runs on after every stop was spent: told to a person
+    /// once, and KEPT UP while the switch stands and the goal runs — the
+    /// badge stays past the goal's next turn, and the session's host records
+    /// it where a person looks ([`crate::supervise::IdleHost::inform`]).
+    GoalNote(String),
+    /// THE HOLD BEGAN: the session is back on its own model and waits for
+    /// the window's reset — recorded for a person to see (an information,
+    /// no badge), the loop naming the reset on its clock.
+    Hold { wind: WindDown },
+}
+
 /// An act typed and its point not judged yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Awaited {
@@ -891,6 +1620,11 @@ struct Awaited {
     /// When a point after it first showed with no busy read since
     /// ([`TurnEndState::observe`]).
     unseen_since: Option<Instant>,
+    /// A read since it was typed saw the agent's LIVE TURN — its spinner or
+    /// its busy footer, never a break of its own background work
+    /// ([`TurnEndState::took`]): the agent took it, whether or not a point has
+    /// judged it yet ([`TurnEndState::act_untaken`]).
+    taken: bool,
 }
 
 impl Awaited {
@@ -931,6 +1665,21 @@ pub struct TurnEndState {
     /// The `❯` row on the screen is an act of this policy's the worker never
     /// took (judged so at its deadline): a point, though input waits.
     stale_input: bool,
+    /// Codex's save-then-wait switch, while one is open.
+    wind: Option<WindDown>,
+    /// The harness's own Esc stopped the turn now showing: its interrupt is
+    /// no person's.
+    own_interrupt: Option<Instant>,
+    /// What the switch hands the loop ([`Self::take_wind_events`]).
+    wind_events: Vec<WindEvent>,
+    /// Done reports in a row at the points this state saw ([`says_done`]):
+    /// `1`, the point is a done report and gets the [`DONE_CHECK`]; `2`, the
+    /// check's own yield said done again — THE TASK IS DONE
+    /// ([`Self::task_done`]) until someone else's turn.
+    done: u8,
+    /// The act awaited is the [`DONE_CHECK`] as this policy typed it (a draft
+    /// submitted in its place is someone's own words, never the check).
+    checking: bool,
 }
 
 impl Default for TurnEndState {
@@ -955,6 +1704,11 @@ impl TurnEndState {
             model: None,
             fallback_unmade: false,
             stale_input: false,
+            wind: None,
+            own_interrupt: None,
+            wind_events: Vec::new(),
+            done: 0,
+            checking: false,
         }
     }
 
@@ -1000,6 +1754,22 @@ impl TurnEndState {
         self.short
     }
 
+    /// Done reports in a row, the check's yield included (`0`, `1`, `2`: the
+    /// conformance walk's projection).
+    #[must_use]
+    pub fn done_reports(&self) -> u8 {
+        self.done
+    }
+
+    /// THE TASK IS DONE: the worker said so, was asked the [`DONE_CHECK`],
+    /// and said so again. Nothing is typed into the session
+    /// ([`decide_turn_end`]) until a turn of someone else's — a person's, an
+    /// orchestrator's — ends at a point this state sees.
+    #[must_use]
+    pub fn task_done(&self) -> bool {
+        self.done >= 2
+    }
+
     /// The back-off before the next act after the short streak: none after
     /// real work, else [`TurnEndTiming::short_backoff`] doubled for each
     /// short turn after the first, at most [`TurnEndTiming::
@@ -1025,6 +1795,39 @@ impl TurnEndState {
     #[must_use]
     pub fn act_in_flight(&self) -> bool {
         self.awaiting.is_some_and(|a| a.rule != RULE_HOST_TURN) || self.after.is_some()
+    }
+
+    /// An act of this policy's the agent has NOT TAKEN yet: typed, and no read
+    /// since has seen the agent's live turn ([`Self::took`]) — or a command's
+    /// continuation still owed. What holds back the host's step at a BREAK of
+    /// the agent's own background work (`Session::host_steps_in_background`),
+    /// where [`Self::act_in_flight`] held it until the act's POINT was judged:
+    /// a break reads busy, so the act was never judged there, and an agent
+    /// that orchestrates all day never reaches a true idle point — every break
+    /// after the loop's own `keep going` was withheld from the live upgrade for
+    /// hours (2026-09-28: s-d3346 from 14:52:45 and s-5c03a from 18:21:04, no
+    /// look at either until the owner came). The guard's own purpose stands:
+    /// no line of the host's is stacked on a continuation the agent has not
+    /// read. Once it has — a live turn seen — the act is under way, and the
+    /// break it leads to is the agent's own. The point that follows still
+    /// judges it as before ([`Self::observe`]); a host line typed at the
+    /// break ([`Self::host_typed`]) takes its place, and that point then
+    /// judges the harness's turn with the work since the act's first busy
+    /// read.
+    #[must_use]
+    pub fn act_untaken(&self) -> bool {
+        self.awaiting
+            .is_some_and(|a| a.rule != RULE_HOST_TURN && !a.taken)
+            || self.after.is_some()
+    }
+
+    /// A read saw the agent's LIVE TURN (its spinner, its busy footer — never
+    /// a break of its own background work): the act awaited, if any, was
+    /// taken ([`Self::act_untaken`]).
+    pub fn took(&mut self) {
+        if let Some(a) = &mut self.awaiting {
+            a.taken = true;
+        }
     }
 
     /// The model switch in force, if any.
@@ -1069,6 +1872,14 @@ impl TurnEndState {
     /// past the deadline judged NOT TAKEN: the same short yield, its row
     /// then a point the next act may go at ([`decide_turn_end`]), on the
     /// back-off. Anyone else's unanswered row is never a point.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SupervisorCodexRateNudge",
+            action = "TurnEnds",
+            project = "supervise_conformance_codex_rate_nudge::ph_of"
+        )
+    )]
     pub fn observe(&mut self, reading: &TurnEndReading, now: Instant) {
         if matches!(reading.phase, Phase::Busy | Phase::Prompt) {
             return;
@@ -1095,6 +1906,7 @@ impl TurnEndState {
             }
         }
         let min = self.timing.min_work;
+        let checked = std::mem::take(&mut self.checking);
         let awaited = self.awaiting.take().map(|a| a.rule);
         let done = says_done(reading.said_tail.as_deref());
         let streak = |short: u32, d: Duration, done: bool| {
@@ -1109,6 +1921,8 @@ impl TurnEndState {
             // back-off it runs on stand as the worker's turns left them (the
             // point it counts from too); answered with real work, the streak
             // ends — a carry-on's answer is the worker's own work resumed.
+            // …and its done reports stand as they were: a carry-on the agent
+            // had nothing to add to is not the worker asked again.
             (Some(RULE_HOST_TURN), worked) => {
                 let d = worked.unwrap_or_default();
                 if d >= min && !done {
@@ -1116,6 +1930,7 @@ impl TurnEndState {
                     self.point_worked = d;
                     self.point_at = Some(now);
                     self.short = 0;
+                    self.done = 0;
                 } else if self.point_at.is_none() {
                     self.point_at = Some(now);
                 }
@@ -1128,13 +1943,29 @@ impl TurnEndState {
                 if is_continue_rule(rule) {
                     self.short = streak(self.short, d, done);
                 }
+                // A done report after the check ends the task; after any
+                // other act of ours it is the first, and gets the check. An
+                // act never taken (its `❯` row still unanswered) said
+                // nothing: the reports stand.
+                if reading.wall.is_none() && !reading.pending_input {
+                    self.done = match (done, checked) {
+                        (false, _) => 0,
+                        (true, true) => 2,
+                        (true, false) => 1,
+                    };
+                }
             }
-            // A turn that ended on a wall is not the worker done: the wall's
-            // own ladder waits it out, and the streak is left as it was.
+            // Someone else's turn — a person's, an orchestrator's — is the
+            // task theirs again, whatever it ended on: its done report is a
+            // first one, and a turn that ended on a wall is not the worker
+            // done — the wall's own ladder waits it out (a done task left
+            // closed at a wall stranded it there: the review of 2026-09-27),
+            // and the streak is left as it was.
             (None, Some(d)) => {
                 self.followed = None;
                 self.point_worked = d;
                 self.point_at = Some(now);
+                self.done = u8::from(done && reading.wall.is_none());
                 if reading.wall.is_none() {
                     self.short = streak(self.short, d, false);
                 }
@@ -1145,6 +1976,7 @@ impl TurnEndState {
             (None, None) if self.point_at.is_none() && !reading.taskless => {
                 self.point_at = Some(now);
                 self.short = 1;
+                self.done = u8::from(done && reading.wall.is_none());
             }
             (None, None) => {}
         }
@@ -1183,6 +2015,13 @@ impl TurnEndState {
                 }
             }
         }
+        let ours_stopped = reading.interrupted && self.own_interrupt.is_some();
+        self.observe_wind(reading, awaited, ours_stopped, now);
+        // The harness's own Esc is the interrupt of the turn it stopped; a
+        // turn that ended otherwise since is anyone's.
+        if (reading.worked.is_some() && !reading.interrupted) || self.wind.is_none() {
+            self.own_interrupt = None;
+        }
     }
 
     /// Record an act the loop TYPED (a skipped or refused one is not): the
@@ -1197,6 +2036,9 @@ impl TurnEndState {
         let Some(rule) = action.rule_id() else {
             return;
         };
+        // The harness's own Esc excused the turn it stopped, no later one:
+        // its next act is typed now.
+        self.own_interrupt = None;
         self.acts.push_back(now);
         while self.acts.len() > 64 {
             self.acts.pop_front();
@@ -1206,7 +2048,15 @@ impl TurnEndState {
             command: matches!(action, TurnEndAction::TypeCommand { .. }),
             at: now,
             unseen_since: None,
+            taken: false,
         });
+        self.checking = matches!(
+            action,
+            TurnEndAction::Type {
+                rule_id: RULE_DONE_CHECK,
+                ..
+            }
+        );
         self.after = match action {
             TurnEndAction::TypeCommand {
                 then: Then::Continue,
@@ -1230,6 +2080,42 @@ impl TurnEndState {
                 t.ups += 1;
             }
         }
+        self.acted_wind(action, rule, now);
+    }
+
+    /// A typed act of the save-then-wait switch's ([`Self::acted`]): the
+    /// switch moves with it, and the act's ledger row carries it.
+    fn acted_wind(&mut self, action: &TurnEndAction, rule: &'static str, now: Instant) {
+        let Some(w) = &mut self.wind else {
+            return;
+        };
+        let command = matches!(action, TurnEndAction::TypeCommand { .. });
+        match rule {
+            RULE_WIND_DOWN if command => {
+                w.pause_typed = true;
+                w.goal_paused = true;
+                w.stops += 1;
+            }
+            RULE_WIND_DOWN => w.phase = WindPhase::Winding,
+            RULE_MODEL_RESTORE if command => {
+                w.restore_tries += 1;
+                w.restore_at = Some(now);
+            }
+            RULE_LIMIT_RESUME if matches!(w.phase, WindPhase::Holding { .. }) => {
+                let closed = w.clone();
+                self.wind = None;
+                self.own_interrupt = None;
+                self.wind_events.push(WindEvent::Typed {
+                    wind: closed,
+                    phase: "done",
+                });
+                return;
+            }
+            _ => return,
+        }
+        let phase = wind_phase_word(w);
+        let wind = w.clone();
+        self.wind_events.push(WindEvent::Typed { wind, phase });
     }
 
     /// Record a turn the session's HOST typed — the live upgrade's notice, a
@@ -1247,11 +2133,13 @@ impl TurnEndState {
     /// carry-on answer was otherwise backed off like the first point before
     /// it). No budget is spent: the owner's cap counts this policy's acts.
     pub fn host_typed(&mut self, now: Instant) {
+        self.checking = false;
         self.awaiting = Some(Awaited {
             rule: RULE_HOST_TURN,
             command: false,
             at: now,
             unseen_since: None,
+            taken: false,
         });
     }
 }
@@ -1288,6 +2176,904 @@ impl TurnEndState {
             }
             Restart::Model { .. } => self.fallback_unmade = true,
             Restart::ModelBack { .. } => self.model = None,
+        }
+    }
+}
+
+impl TurnEndState {
+    /// THE NUDGE'S SWITCH WAS PRESSED (the approval policy's
+    /// `rate-nudge-switch@v1`): the save-then-wait switch opens owing its
+    /// wind-down, `from` the thread's model and effort before it, `to` the
+    /// cheaper model, `back_at` the original window's reset (`None`: not
+    /// read), `marker` the line a saved wind-down answers with. A switch open
+    /// already is kept — the same nudge again is no new switch.
+    pub fn nudge_switched(
+        &mut self,
+        from: CodexSetting,
+        to: String,
+        back_at: Option<Instant>,
+        marker: String,
+    ) {
+        self.open_switch(WindDown::opened(from, to, back_at, marker));
+    }
+
+    /// The nudge's switch LANDED (the approval loop's press, the box seen
+    /// leaving): `wind` — [`WindDown::opened`], made before the key went —
+    /// opens owing its wind-down. A switch open already is kept — but one
+    /// only INTENDED ([`WindDown::intent`], a restarted loop's) gives way to
+    /// the press that decided the nudge again.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SupervisorCodexRateNudge",
+            action = "PressSwitch",
+            project = "supervise_conformance_codex_rate_nudge::ph_of"
+        )
+    )]
+    pub fn open_switch(&mut self, wind: WindDown) {
+        if self.wind.as_ref().is_some_and(|w| !w.intent) {
+            return;
+        }
+        self.after = None;
+        self.wind = Some(wind);
+    }
+
+    /// A switch is open that is more than a press's intent
+    /// ([`WindDown::intent`]): the nudge on the screen is kept. An intent a
+    /// restarted loop carried on leaves the nudge still up to be decided
+    /// again — its key may never have gone.
+    #[must_use]
+    pub fn switch_landed(&self) -> bool {
+        self.wind.as_ref().is_some_and(|w| !w.intent)
+    }
+
+    /// A Codex footer read (any read): an INTENDED switch whose footer shows
+    /// the cheaper model has landed ([`WindDown::intent`]); the rest of the
+    /// switch goes on from there.
+    pub fn footer_seen(&mut self, setting: &CodexSetting) {
+        if let Some(w) = &mut self.wind
+            && w.intent
+            && setting.runs(&w.to)
+        {
+            w.intent = false;
+        }
+    }
+
+    /// The harness's own Esc stopped Codex's goal turn right after the switch
+    /// (measured 2026-09-28: Esc aborts the turn and pauses the goal in the
+    /// same instant): the goal is the harness's to resume at the reset, and
+    /// the interrupt now showing is no person's.
+    ///
+    /// The save's own turn stopped past [`WIND_DOWN_BOUND`] (WINDING) is no
+    /// stop of the goal's: the goal was stopped before the save was typed,
+    /// and none of [`GOAL_STOPS`] is spent — the Esc is the one the bound
+    /// allows ([`WindDown::overran`]).
+    pub fn own_esc(&mut self, now: Instant) {
+        if let Some(w) = &mut self.wind {
+            if w.phase == WindPhase::Winding {
+                w.overran = true;
+            } else {
+                w.goal_paused = true;
+                w.stops += 1;
+            }
+            w.stop_at = Some(now);
+            self.own_interrupt = Some(now);
+            self.wind_events.push(WindEvent::Typed {
+                wind: w.clone(),
+                phase: wind_phase_word(w),
+            });
+        }
+    }
+
+    /// A save-then-wait switch is open (owed, winding down, restoring or
+    /// holding).
+    #[must_use]
+    pub fn switch_open(&self) -> bool {
+        self.wind.is_some()
+    }
+
+    /// The switch holds the session on its own model until the reset.
+    #[must_use]
+    pub fn holding(&self) -> bool {
+        self.wind
+            .as_ref()
+            .is_some_and(|w| matches!(w.phase, WindPhase::Holding { .. }))
+    }
+
+    /// The open switch, if any (the conformance walk's projection, the
+    /// ledger's reason).
+    #[must_use]
+    pub fn wind(&self) -> Option<&WindDown> {
+        self.wind.as_ref()
+    }
+
+    /// The model and effort the harness's own `/model` restore puts back,
+    /// while it is in flight — typed within [`TurnEndTiming::restore_pick`],
+    /// its picker not yet left and no person's keystroke since
+    /// ([`Self::picker_seen`]): the only picker the approval policy answers.
+    #[must_use]
+    pub fn restore_target(&self, now: Instant) -> Option<CodexSetting> {
+        let w = self.wind.as_ref()?;
+        let typed = w.restore_at?;
+        (matches!(w.phase, WindPhase::Restore { .. })
+            && now.saturating_duration_since(typed) < self.timing.restore_pick)
+            .then(|| w.from.clone())
+    }
+
+    /// A READ OF THE SCREEN while the harness's `/model` restore is in
+    /// flight: `shown` whether Codex's model picker is up (any of its boxes),
+    /// `person` how long ago a person last typed ([`TurnEndReading::person`]).
+    /// The harness's picker LEFT — seen, then gone on two reads at least
+    /// [`PICKER_SETTLE`] apart (a frame between the model, the effort and the
+    /// advanced box is no leaving), or gone at an idle point
+    /// ([`Self::observe`]) — or a person's keystroke since the `/model` went
+    /// ends the restore's claim on the picker ([`Self::restore_target`]): a
+    /// picker a person opens after that is theirs, not driven back to the
+    /// original model.
+    pub fn picker_seen(&mut self, shown: bool, person: Option<Duration>, now: Instant) {
+        let Some(w) = &mut self.wind else {
+            return;
+        };
+        let Some(at) = w.restore_at else {
+            return;
+        };
+        let persons =
+            person.is_some_and(|ago| now.checked_sub(ago).is_some_and(|typed| typed > at));
+        if persons {
+            w.restore_at = None;
+            w.restore_shown = false;
+            w.picker_gone_at = None;
+        } else if shown {
+            w.restore_shown = true;
+            w.picker_gone_at = None;
+        } else if w.restore_shown {
+            let gone = *w.picker_gone_at.get_or_insert(now);
+            if now >= later(gone, PICKER_SETTLE) {
+                w.restore_at = None;
+                w.restore_shown = false;
+                w.picker_gone_at = None;
+            }
+        }
+    }
+
+    /// WHAT THE HARNESS DOES ABOUT A TURN RUNNING while a switch is open
+    /// (the owner: nothing goes on on the cheaper model): `busy` the running
+    /// turn's busy work so far where the screen shows one running (its status
+    /// row, the reader's busy guard — not the footer's cached goal alone:
+    /// 0.158 draws a goal turn's composer as `»`, which reads no point — and
+    /// the loop's span of it, [`RunningTurn`]), `None` where none runs,
+    /// `goal` the footer's goal, `person` whether a person's hand is on the
+    /// session (their grace). While the wind-down is owed, or the model owed
+    /// back before the hold, ANY turn running — Codex's goal turn under the
+    /// nudge's box, one its goal started again by itself after a stop — is
+    /// stopped with one Esc ([`GoalStop::Esc`]); during the hold, a turn of
+    /// the goal the footer shows pursued; the save's own turn (WINDING) only
+    /// once its busy work since the save was typed ([`WindDown::wound`] and
+    /// `busy`) reaches [`WIND_DOWN_BOUND`] — ONE Esc a switch
+    /// ([`WindDown::overran`]), none of [`GOAL_STOPS`], and a save still
+    /// running after it is said to a person once ([`GoalStop::Tell`]). Never
+    /// a person's turn (`person`: their hand in the running turn since the
+    /// switch opened, or their grace while it lasts — the loop's
+    /// [`RunningTurn::person`]), never a switch only intended
+    /// ([`WindDown::intent`]: the key may never have gone, and the thread
+    /// then runs its own model), never twice into one turn (an Esc waits
+    /// [`TurnEndTiming::take_within`] for its point), and at most
+    /// [`GOAL_STOPS`] stops a switch (`/goal pause` counts): past them, a
+    /// person is told ONCE ([`GoalStop::Tell`], [`Self::goal_told`]).
+    #[must_use]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SupervisorCodexRateNudge",
+            action = "StopGoal",
+            project = "supervise_conformance_codex_rate_nudge::ph_of"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SupervisorCodexRateNudge",
+            action = "StopWindDown",
+            project = "supervise_conformance_codex_rate_nudge::ph_of"
+        )
+    )]
+    pub fn goal_stop(
+        &self,
+        busy: Option<Duration>,
+        goal: Option<CodexGoal>,
+        person: bool,
+        now: Instant,
+    ) -> Option<GoalStop> {
+        let w = self.wind.as_ref()?;
+        let worked = busy?;
+        if person || w.intent {
+            return None;
+        }
+        let stoppable = match w.phase {
+            WindPhase::Owed | WindPhase::Restore { hold: true } => true,
+            WindPhase::Holding { .. } => goal == Some(CodexGoal::Pursuing),
+            WindPhase::Winding => w.wound.saturating_add(worked) >= WIND_DOWN_BOUND,
+            WindPhase::Restore { hold: false } => false,
+        };
+        if !stoppable
+            || w.stop_at
+                .is_some_and(|t| now < later(t, self.timing.take_within))
+        {
+            return None;
+        }
+        if w.phase == WindPhase::Winding {
+            return if !w.overran {
+                Some(GoalStop::Esc)
+            } else if w.said.contains(&"winding") {
+                None
+            } else {
+                Some(GoalStop::Tell)
+            };
+        }
+        if w.stops < GOAL_STOPS {
+            Some(GoalStop::Esc)
+        } else if w.said.contains(&"goal") {
+            None
+        } else {
+            Some(GoalStop::Tell)
+        }
+    }
+
+    /// The stops are spent and Codex's goal runs on ([`GoalStop::Tell`]): a
+    /// person is told, once per switch — a note KEPT UP while the switch
+    /// stands and the goal runs ([`WindEvent::GoalNote`]). The save's own
+    /// turn still running after the harness's Esc past [`WIND_DOWN_BOUND`]:
+    /// a note of its own, once per switch.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SupervisorCodexRateNudge",
+            action = "Tell",
+            project = "supervise_conformance_codex_rate_nudge::ph_of"
+        )
+    )]
+    pub fn goal_told(&mut self) {
+        let Some(w) = &mut self.wind else {
+            return;
+        };
+        if w.phase == WindPhase::Winding {
+            let text = format!(
+                "{to} was switched in only to commit and push the work, but its turn has run past \
+                 {bound} min and aterm's Esc did not stop it: stop it by hand (Esc) — aterm then \
+                 puts the session back on {back} and waits for the limit to reset",
+                to = w.to,
+                bound = WIND_DOWN_BOUND.as_secs() / 60,
+                back = w.from.words()
+            );
+            self.wind_note("winding", text);
+            return;
+        }
+        if w.said.contains(&"goal") {
+            return;
+        }
+        w.said.push("goal");
+        let on = match w.phase {
+            WindPhase::Holding { .. } => w.from.words(),
+            _ => w.to.clone(),
+        };
+        self.wind_events.push(WindEvent::GoalNote(format!(
+            "{GOAL_NOTE_HEAD} on {on} after aterm stopped it {GOAL_STOPS} times; stop it by hand \
+             (Esc, then /goal pause) — aterm types nothing into it until it stops"
+        )));
+    }
+
+    /// A switch a previous loop on the session opened and did not close
+    /// (the approval ledger's rows, `approvals::open_wind_down`): carried on
+    /// from where it stood. The turn that ends at the first point after it —
+    /// the wind-down's own, the goal turn the harness was stopping — is the
+    /// harness's, never taken for a person's without their hand in it
+    /// ([`WindDown::seeded`]); a wind-down whose turn was running stays
+    /// WINDING, so its end still judges the marker; an interrupt the
+    /// harness's own last Esc made — its row the last one, carrying `esc=`
+    /// (`wind.stop_at`), in ANY phase, written within
+    /// [`TurnEndTiming::take_within`] of `now` — is no person's, and no
+    /// second Esc goes into that turn. An `esc=` older than that is SPENT:
+    /// its point came and went unwritten (a hold's Esc'd point writes no
+    /// row), and the interrupt a later loop sees is anyone's (the re-review
+    /// of 2026-09-28: a restart days into a hold took a person's own Esc for
+    /// the harness's). The notes said stay said (`told=`). A hold counts
+    /// from the start its row names (a restart never lengthens it). A switch
+    /// of this loop's own wins.
+    pub fn seed_wind(&mut self, mut wind: WindDown, now: Instant) {
+        if self.wind.is_some() {
+            return;
+        }
+        // The harness's last Esc, its row the last (`esc=`) and fresh: the
+        // interrupt the next point shows is its own in any phase, and the
+        // turn it stopped no person's without their hand in it.
+        let take = self.timing.take_within;
+        let esc = wind
+            .seeded_at
+            .or(wind.stop_at)
+            .is_some_and(|row| now < later(row, take))
+            && wind.stop_at.is_some();
+        if !esc {
+            wind.stop_at = None;
+        }
+        wind.seeded = esc || matches!(wind.phase, WindPhase::Owed | WindPhase::Winding);
+        wind.pre = false;
+        wind.restore_at = None;
+        wind.restore_shown = false;
+        wind.picker_gone_at = None;
+        wind.footer_since = None;
+        if esc || (wind.phase == WindPhase::Owed && wind.goal_paused && !wind.pause_typed) {
+            self.own_interrupt = Some(now);
+        }
+        self.wind = Some(wind);
+    }
+
+    /// What of THIS POLICY'S OWN holds the open switch at the point `r`
+    /// (the loop's stood-still note names it — the round-4 re-review: a hold
+    /// of the policy's was told as the terminal's, with a fix that fixed
+    /// nothing): a thread fallen into a sandbox ([`StoodBy::Sandbox`]), an
+    /// owed save whose footer does not show the cheaper model
+    /// ([`StoodBy::Footer`]), a restore whose tries are spent
+    /// ([`StoodBy::RestoreSpent`]). `None`: nothing of the policy's — what
+    /// holds it is a person's hand, a draft or the terminal.
+    #[must_use]
+    pub fn switch_hold(&self, r: &TurnEndReading) -> Option<StoodBy> {
+        let w = self.wind.as_ref()?;
+        if r.sandbox_fell.is_some() {
+            return Some(StoodBy::Sandbox);
+        }
+        match w.phase {
+            WindPhase::Owed
+                if w.intent || !r.model_field.as_ref().is_some_and(|m| m.runs(&w.to)) =>
+            {
+                Some(StoodBy::Footer)
+            }
+            WindPhase::Restore { .. } if w.restore_tries >= RESTORE_TRIES => {
+                Some(StoodBy::RestoreSpent)
+            }
+            _ => None,
+        }
+    }
+
+    /// The switch has stood still — owed its save, winding down, owed its
+    /// model back — through a long break under a Codex background terminal
+    /// (the loop's), held there by `by`: a person is told, once per switch,
+    /// what holds it — a person's typing or draft, the terminal, or the
+    /// policy's own wait ([`Self::switch_hold`]: the footer, a sandbox, the
+    /// restores spent), each with the fix that moves it. Before the save
+    /// (owed, winding) the note never advises putting the model back by hand
+    /// — the work is to be saved on the cheaper model first; after it, the
+    /// hand steps are named. A press only intended ([`WindDown::intent`]) is
+    /// never said to have put the session on the cheaper model.
+    pub fn switch_stood_still(&mut self, by: StoodBy) {
+        let Some(w) = &self.wind else {
+            return;
+        };
+        let what = match w.phase {
+            WindPhase::Owed => "the save instruction is still owed",
+            WindPhase::Winding => "the save's answer is still owed",
+            _ => "the thread's own model is still owed back",
+        };
+        let saved = !matches!(w.phase, WindPhase::Owed | WindPhase::Winding);
+        let by_hand = format!(
+            "switch the model back by hand (/model → {})",
+            w.from.words()
+        );
+        let held = match by {
+            StoodBy::Typing => "a person is typing into the session".to_string(),
+            StoodBy::Draft => "a draft stands in the composer".to_string(),
+            StoodBy::Terminal => {
+                "a Codex background terminal keeps the session busy after its turn ended"
+                    .to_string()
+            }
+            StoodBy::Footer => format!(
+                "Codex's footer has not shown {} since aterm pressed its switch",
+                w.to
+            ),
+            StoodBy::Sandbox => {
+                "the thread fell into a sandbox its launch bypassed, and aterm types nothing \
+                 into it"
+                    .to_string()
+            }
+            StoodBy::RestoreSpent => format!(
+                "aterm's /model did not put the thread back on {}",
+                w.from.words()
+            ),
+        };
+        let fix = match (by, saved) {
+            (StoodBy::Typing | StoodBy::Draft, false) => {
+                "send or clear it and aterm goes on with the save".to_string()
+            }
+            (StoodBy::Typing | StoodBy::Draft, true) => {
+                format!("send or clear it and aterm goes on, or {by_hand}")
+            }
+            (StoodBy::Terminal, false) => {
+                "stop the terminal (/ps, /stop) and aterm goes on with the save".to_string()
+            }
+            (StoodBy::Terminal, true) => format!("stop the terminal (/ps, /stop), or {by_hand}"),
+            (StoodBy::Footer, _) => format!(
+                "check the session's model (/model): once the footer shows {}, aterm goes on with \
+                 the save",
+                w.to
+            ),
+            (StoodBy::Sandbox, _) => {
+                "quit Codex and resume the thread with its launch flags (codex resume \
+                 --dangerously-bypass-approvals-and-sandbox <thread>)"
+                    .to_string()
+            }
+            (StoodBy::RestoreSpent, _) => by_hand,
+        };
+        let on = if by == StoodBy::Footer {
+            "aterm cannot tell whether the switch landed".to_string()
+        } else if w.intent && w.phase == WindPhase::Owed {
+            format!(
+                "aterm pressed the switch to {} but has not seen it land",
+                w.to
+            )
+        } else {
+            format!("the session stays on {} meanwhile", w.to)
+        };
+        let text = format!("{held}, and {what}: {on} — {fix}");
+        self.wind_note("background", text);
+    }
+
+    /// What the switch left for the loop to ledger and to say, oldest first.
+    pub fn take_wind_events(&mut self) -> Vec<WindEvent> {
+        std::mem::take(&mut self.wind_events)
+    }
+
+    /// A note, said once per switch under `key`.
+    fn wind_note(&mut self, key: &'static str, text: String) {
+        if let Some(w) = &mut self.wind
+            && !w.said.contains(&key)
+        {
+            w.said.push(key);
+            self.wind_events.push(WindEvent::Note(text));
+        }
+    }
+
+    /// An edge of the switch, ledgered (`skipped`) with the switch as it
+    /// stands — or, `closed`, as it stood when it closed with `phase`.
+    fn wind_edge(
+        &mut self,
+        rule: &'static str,
+        what: String,
+        closed: Option<(WindDown, &'static str)>,
+    ) {
+        let (wind, phase) = match closed {
+            Some(c) => c,
+            None => match &self.wind {
+                Some(w) => (w.clone(), wind_phase_word(w)),
+                None => return,
+            },
+        };
+        self.wind_events.push(WindEvent::Edge {
+            rule,
+            what,
+            wind,
+            phase,
+        });
+    }
+
+    /// The switch ends: a person took the session over (`released`) or the
+    /// session is back on its model and going on (`done`).
+    fn close_wind(&mut self, rule: &'static str, what: String, phase: &'static str) {
+        if let Some(w) = self.wind.take() {
+            self.wind_edge(rule, what, Some((w, phase)));
+        }
+    }
+
+    /// Fold a judged point into the open switch ([`Self::observe`]'s last
+    /// step): `awaited` the act the point follows (`None`: someone else's
+    /// turn — `worked` says one ran).
+    fn observe_wind(
+        &mut self,
+        reading: &TurnEndReading,
+        awaited: Option<&'static str>,
+        ours_stopped: bool,
+        now: Instant,
+    ) {
+        let Some(w) = self.wind.clone() else {
+            return;
+        };
+        // A point: the harness's last Esc has had its answer.
+        let (pre, seeded, seeded_at) = self.wind.as_mut().map_or((false, false, None), |w| {
+            w.stop_at = None;
+            (
+                std::mem::take(&mut w.pre),
+                std::mem::take(&mut w.seeded),
+                w.seeded_at.take(),
+            )
+        });
+        // A person's hand in the turn that ended here — for the turn in
+        // flight when a loop carried the switch on, a keystroke since the
+        // switch's last row within the bound of the turn's unseen start
+        // ([`seeded_hand`]).
+        let person = reading.person_in_turn()
+            || seeded_at.is_some_and(|row| seeded_hand(reading.person, reading.worked, row, now));
+        // A turn nobody here typed ran: a person's — or Codex's own goal
+        // turn while the goal is pursued, the goal turn the harness's own
+        // Esc just stopped, the turn whose end the nudge covered, or (the
+        // switch carried on from a previous loop) the turn the harness had in
+        // flight then, unless a person's hand shows in it.
+        let theirs = awaited.is_none()
+            && reading.worked.is_some()
+            && !ours_stopped
+            && !pre
+            && (!seeded || person);
+        let goal_runs = reading.goal == Some(CodexGoal::Pursuing);
+        // A PERSON'S `/model` before the hold: the footer shows neither the
+        // cheaper model the switch left it on nor its own model back — the
+        // session is theirs, and nothing of the switch goes on.
+        let persons_model = reading
+            .model_field
+            .as_ref()
+            .filter(|m| !m.runs(&w.to) && !m.runs(&w.from.model))
+            .filter(|_| !matches!(w.phase, WindPhase::Holding { .. }));
+        if let Some(m) = persons_model {
+            self.close_wind(
+                RULE_MODEL_RESTORE,
+                format!("a person switched the thread to {}", m.words()),
+                "released",
+            );
+            return;
+        }
+        // Codex's goal still pursued at a point while the switch holds the
+        // session, and every stop spent: a person is told, once
+        // ([`Self::goal_stop`]'s `Tell` at a busy read says the same).
+        let stoppable = matches!(
+            w.phase,
+            WindPhase::Owed | WindPhase::Restore { hold: true } | WindPhase::Holding { .. }
+        );
+        if stoppable && goal_runs && !person && w.stops >= GOAL_STOPS {
+            self.goal_told();
+        }
+        match w.phase {
+            WindPhase::Owed => {
+                // An intended press whose footer shows the cheaper model has
+                // landed ([`Self::footer_seen`]).
+                if let Some(m) = &reading.model_field {
+                    self.footer_seen(m);
+                }
+                // THE SWITCH THAT DID NOT LAND: the footer still shows the
+                // thread's own model at a point past the one the press's box
+                // covered (that one's footer may not have caught up) — the
+                // press missed, or a restart carried on a switch whose key
+                // never went — and the thread's own rollout does not say it
+                // ran the cheaper model since the press either (a footer
+                // that lags a turn already run there — the goal turn under
+                // the box among them). Nothing of it goes on. A PERSON'S
+                // keystroke since the switch opened, the footer on another
+                // model than the cheaper one: their `/model` put it there —
+                // the session is theirs.
+                let on_to = reading
+                    .thread_model
+                    .as_deref()
+                    .is_some_and(|t| CodexSetting::slug_runs(t, &w.to));
+                let persons_since = reading.person.is_some_and(|ago| {
+                    now.checked_sub(ago)
+                        .is_some_and(|t| w.opened_at.is_some_and(|o| t >= o))
+                });
+                let off_to = reading.model_field.as_ref().filter(|m| !m.runs(&w.to));
+                if !pre && let Some(m) = off_to {
+                    if !on_to || persons_since {
+                        let what = if on_to {
+                            format!("a person put the thread back on {}", m.words())
+                        } else {
+                            format!(
+                                "the thread is still on {}: the switch to {} did not land",
+                                m.words(),
+                                w.to
+                            )
+                        };
+                        self.close_wind(RULE_WIND_DOWN, what, "released");
+                        return;
+                    }
+                    // The rollout says the cheaper model, the footer the
+                    // thread's own: a lag — waited on, and past the bound
+                    // said (a stale thread read, or a `/model` back nobody
+                    // typed a keystroke for, would hold it silently).
+                    let since = self
+                        .wind
+                        .as_mut()
+                        .map_or(now, |wd| *wd.footer_since.get_or_insert(now));
+                    if now >= later(since, OWED_FOOTER_BOUND) {
+                        self.wind_note(
+                            "footer",
+                            format!(
+                                "{} is close to its usage limit and aterm pressed Codex's switch \
+                                 to {}, but the footer shows {} while the thread's last turn ran \
+                                 {}, so aterm cannot tell which model the session is on: it types \
+                                 nothing — check the session's model (/model)",
+                                w.from.model,
+                                w.to,
+                                m.words(),
+                                w.to
+                            ),
+                        );
+                    }
+                } else if reading.model_field.is_none() {
+                    // A footer that shows no model holds the save back (it
+                    // waits for the cheaper model to show): past the bound,
+                    // said.
+                    let since = self
+                        .wind
+                        .as_mut()
+                        .map_or(now, |wd| *wd.footer_since.get_or_insert(now));
+                    if now >= later(since, OWED_FOOTER_BOUND) {
+                        self.wind_note(
+                            "footer",
+                            format!(
+                                "{} is close to its usage limit and aterm pressed Codex's switch \
+                                 to {}, but the footer shows no model, so aterm cannot tell \
+                                 whether the switch landed: it types nothing — check the \
+                                 session's model (/model)",
+                                w.from.model, w.to
+                            ),
+                        );
+                    }
+                } else if let Some(wd) = &mut self.wind {
+                    wd.footer_since = None;
+                }
+                if theirs && (!goal_runs || person) {
+                    // A person's own message (their hand in the turn, or no
+                    // goal of Codex's that could have run it): the wind-down
+                    // is theirs to give; the model is still owed back.
+                    if let Some(w) = &mut self.wind {
+                        w.phase = WindPhase::Restore { hold: false };
+                        w.goal_paused = false;
+                    }
+                    self.wind_edge(
+                        RULE_WIND_DOWN,
+                        "a person took the session over before the wind-down".to_string(),
+                        None,
+                    );
+                } else if reading.composer == Composer::Typed
+                    && !self.wind.as_ref().is_some_and(|wd| wd.intent)
+                {
+                    // (A press only intended is not known to have put the
+                    // session on the cheaper model: its footer holds the save
+                    // first, and the footer's note says so.)
+                    self.wind_note(
+                        "draft",
+                        format!(
+                            "{} is close to its usage limit and the session is on {} to save the \
+                             work, but a draft stands in the composer: the save instruction \
+                             waits until it is sent or cleared",
+                            w.from.model, w.to
+                        ),
+                    );
+                }
+            }
+            WindPhase::Winding => {
+                // The wind-down's turn ended on an API error or a full
+                // context: not its end — the wall's own rule carries it on
+                // ([`wind_down_act`]), and the point after that is judged.
+                // Its busy work so far counts toward [`WIND_DOWN_BOUND`].
+                if matches!(
+                    reading.wall,
+                    Some(WallKind::ApiError { .. } | WallKind::Overloaded | WallKind::Context)
+                ) {
+                    if let Some(wd) = &mut self.wind {
+                        wd.wound = wd.wound.saturating_add(reading.worked.unwrap_or_default());
+                    }
+                    return;
+                }
+                // The wind-down's own point (or a person's steer in it) — or
+                // the one the harness's Esc made, the save's turn past its
+                // bound ([`Self::goal_stop`]): the marker judged there all
+                // the same.
+                let saved = reading.said_tail.as_deref().is_some_and(|t| {
+                    t.lines()
+                        .any(|l| l.trim().trim_matches('`') == w.marker.as_str())
+                });
+                let hit_wall = matches!(
+                    reading.wall,
+                    Some(
+                        WallKind::UsageSession
+                            | WallKind::UsageWeekly
+                            | WallKind::ModelBucket { .. }
+                    )
+                );
+                if let Some(wd) = &mut self.wind {
+                    wd.saved = Some(saved);
+                    wd.phase = WindPhase::Restore { hold: true };
+                    if hit_wall && let Some(r) = reading.reset_at {
+                        wd.back_at = Some(wd.back_at.map_or(r, |b| b.max(r)));
+                    }
+                }
+                // The note first, so the edge's row carries it as said.
+                if !saved {
+                    let said = reading
+                        .said_tail
+                        .as_deref()
+                        .map(|t| {
+                            let flat = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let cut: String = flat.chars().take(240).collect();
+                            format!(": its last words were \"{cut}\"")
+                        })
+                        .unwrap_or_default();
+                    let why = if hit_wall {
+                        format!(" — {} hit the usage limit too", w.to)
+                    } else if ours_stopped {
+                        format!(
+                            " — aterm stopped its turn after {} min of work, since it was switched \
+                             in only to commit and push",
+                            WIND_DOWN_BOUND.as_secs() / 60
+                        )
+                    } else {
+                        String::new()
+                    };
+                    self.wind_note(
+                        "unsaved",
+                        format!(
+                            "{} did not confirm that the work is committed and pushed{why}{said}. \
+                             aterm puts the session back on {} and waits for the limit to reset; \
+                             check the repository",
+                            w.to,
+                            w.from.words()
+                        ),
+                    );
+                }
+                let judged = if saved { "saved" } else { "not saved" };
+                self.wind_edge(
+                    RULE_WIND_DOWN,
+                    if ours_stopped {
+                        format!(
+                            "{judged}: its turn stopped past {} min",
+                            WIND_DOWN_BOUND.as_secs() / 60
+                        )
+                    } else {
+                        judged.to_string()
+                    },
+                    None,
+                );
+            }
+            WindPhase::Restore { hold } => {
+                // An idle point with the harness's picker seen and gone: the
+                // picker has left once it has been gone [`PICKER_SETTLE`]
+                // ([`Self::picker_seen`]) — an idle frame between its boxes,
+                // however long the loop's own settle, is no leaving (the
+                // re-review of 2026-09-28: `/model` typed again into the
+                // middle of the picker's chain).
+                if let Some(wd) = &mut self.wind
+                    && wd.restore_shown
+                {
+                    let gone = *wd.picker_gone_at.get_or_insert(now);
+                    if now >= later(gone, PICKER_SETTLE) {
+                        wd.restore_at = None;
+                        wd.restore_shown = false;
+                        wd.picker_gone_at = None;
+                    }
+                }
+                if reading
+                    .model_field
+                    .as_ref()
+                    .is_some_and(|m| m.same(&w.from))
+                {
+                    if hold {
+                        if let Some(wd) = &mut self.wind {
+                            wd.phase = WindPhase::Holding { since: now };
+                            wd.restore_at = None;
+                            wd.restore_shown = false;
+                        }
+                        self.wind_edge(
+                            RULE_MODEL_RESTORE,
+                            format!("back on {}", w.from.words()),
+                            None,
+                        );
+                        if let Some(wd) = &self.wind {
+                            self.wind_events.push(WindEvent::Hold { wind: wd.clone() });
+                        }
+                    } else {
+                        self.close_wind(
+                            RULE_MODEL_RESTORE,
+                            format!("back on {}; the session is the person's", w.from.words()),
+                            "done",
+                        );
+                    }
+                    return;
+                }
+                // Codex's goal runs again before the model is back: a
+                // person's `/goal resume` only with their hand in it — the
+                // session is theirs then, its model still owed back, nothing
+                // held after — otherwise the goal escaped its stop, and the
+                // harness stops it again ([`Self::goal_stop`], `/goal
+                // pause`).
+                if hold && goal_runs {
+                    if person {
+                        if let Some(wd) = &mut self.wind {
+                            wd.phase = WindPhase::Restore { hold: false };
+                            wd.goal_paused = false;
+                        }
+                        self.wind_edge(
+                            RULE_MODEL_RESTORE,
+                            "a person resumed Codex's goal; its model is still owed back"
+                                .to_string(),
+                            None,
+                        );
+                    }
+                    return;
+                }
+                if theirs && !goal_runs && hold {
+                    if let Some(wd) = &mut self.wind {
+                        wd.phase = WindPhase::Restore { hold: false };
+                        wd.goal_paused = false;
+                    }
+                    self.wind_edge(
+                        RULE_MODEL_RESTORE,
+                        "a person took the session over; its model is still owed back".to_string(),
+                        None,
+                    );
+                }
+                if w.restore_tries >= RESTORE_TRIES {
+                    let effort = w.from.effort.as_deref().map_or_else(String::new, |e| {
+                        let e = e.to_lowercase();
+                        if matches!(e.as_str(), "max" | "ultra") {
+                            format!(
+                                " → {} → {}",
+                                aterm_phase::anchor("codex.pick.more"),
+                                capitalized(&e)
+                            )
+                        } else {
+                            format!(" → {}", capitalized(&e))
+                        }
+                    });
+                    self.wind_note(
+                        "restore",
+                        format!(
+                            "aterm could not put the session back on {}: switch it by hand — \
+                             /model → {}{effort}, pressing s (this conversation) on the effort — \
+                             and it then waits for the limit to reset",
+                            w.from.words(),
+                            w.from.model
+                        ),
+                    );
+                }
+            }
+            WindPhase::Holding { since } => {
+                let moved = reading.model_field.as_ref().filter(|m| !m.same(&w.from));
+                // A person's keystroke since the hold began: a model the
+                // footer shows then is theirs, the cheaper one included.
+                let persons_since = person
+                    || reading
+                        .person
+                        .is_some_and(|ago| now.checked_sub(ago).is_some_and(|t| t >= since));
+                if goal_runs {
+                    // Codex's goal runs during the hold: a person's `/goal
+                    // resume` only with their hand in it — otherwise it
+                    // escaped its stop, and the harness stops it again.
+                    if person {
+                        self.close_wind(
+                            RULE_MODEL_RESTORE,
+                            "a person resumed Codex's goal during the hold".to_string(),
+                            "released",
+                        );
+                    }
+                } else if theirs {
+                    self.close_wind(
+                        RULE_MODEL_RESTORE,
+                        "a person's message ended the hold".to_string(),
+                        "released",
+                    );
+                } else if let Some(m) = moved {
+                    if m.runs(&w.to) && !persons_since {
+                        if let Some(wd) = &mut self.wind {
+                            wd.phase = WindPhase::Restore { hold: true };
+                        }
+                        self.wind_edge(
+                            RULE_MODEL_RESTORE,
+                            format!("the thread is on {} again; restored again", m.words()),
+                            None,
+                        );
+                    } else {
+                        self.close_wind(
+                            RULE_MODEL_RESTORE,
+                            format!("a person switched the thread to {}", m.words()),
+                            "released",
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -1688,6 +3474,13 @@ pub fn continuation_text(cfg: &SupervisorConfig, rules: Option<&str>) -> String 
     with_rules(&cfg.continue_text, rules)
 }
 
+/// What to type where the worker said it is done: [`DONE_CHECK`], with the
+/// standing rules when there are any.
+#[must_use]
+pub fn done_check_text(rules: Option<&str>) -> String {
+    with_rules(DONE_CHECK, rules)
+}
+
 /// What to type as an answer to a question for a person: `cfg.answer_text`,
 /// with the standing rules when there are any.
 #[must_use]
@@ -1747,7 +3540,7 @@ pub fn decide_turn_end(
     // it, owned or not: an owed act is an act in flight, which keeps the
     // host out too, so muted here it was paid by nobody and the agent sat
     // compacted for good (review of 2026-09-27).
-    if reading.upgrading {
+    if reading.upgrading && state.wind.is_none() {
         match reading.wall {
             None if state.after.is_none() => return TurnEndAction::Nothing,
             None => {}
@@ -1787,16 +3580,26 @@ pub fn decide_turn_end(
             };
         }
     }
-    // No task: nothing ended here, and nothing is typed — no continuation,
-    // no answer, no wall's act.
-    if !reading.at_point(state.stale_input) || reading.taskless {
+    // No task — none yet, or one the worker said was done after the done
+    // check: nothing ended here, and nothing is typed — no continuation, no
+    // answer, no wall's act. Except the save-then-wait switch's own steps:
+    // a switch the harness opened owns every point while it is open (below),
+    // so a done task never strands the thread on the cheaper model — the
+    // merge of 2026-09-29, as the live upgrade's gate above leaves an open
+    // switch its points.
+    if !reading.at_point(state.stale_input)
+        || reading.taskless
+        || (state.task_done() && state.wind.is_none())
+    {
         return TurnEndAction::Nothing;
     }
     // A person at the keyboard wins: hands off for the grace after their last
     // keystroke, and after a turn they stopped with Esc (itself a keystroke,
     // whether or not the server says so) from the point on.
     let grace = Duration::from_secs(u64::from(cfg.human_grace_s));
-    let held = match (reading.person, reading.interrupted) {
+    // The harness's own Esc (the save-then-wait switch's) is no person's.
+    let persons_esc = reading.interrupted && state.own_interrupt.is_none();
+    let held = match (reading.person, persons_esc) {
         (Some(ago), _) if ago < grace => Some((later(now, grace - ago), "a person is typing")),
         (_, true) => Some((
             later(state.point_at.unwrap_or(now), grace),
@@ -1809,6 +3612,11 @@ pub fn decide_turn_end(
             until,
             why: why.to_string(),
         };
+    }
+    // Codex's save-then-wait switch owns every point while it is open: no
+    // continuation, no answer and no draft sent on the cheaper model.
+    if let Some(act) = wind_down_act(state, reading, cfg, now) {
+        return act;
     }
     let act = act_at_point(state, reading, cfg, now);
     // A draft standing in the composer (the grace above has passed since it
@@ -1862,6 +3670,33 @@ fn act_at_point(
             rule_id: rule,
         })
     };
+    if reading.program == Program::Codex {
+        // A Codex thread its launch ran outside the sandbox, now running in
+        // one (`codex_usage::sandbox_fell`): it can neither commit nor push,
+        // and nothing typed into it goes on with its work — the loop says so
+        // once, with the fix.
+        if reading.sandbox_fell.is_some() {
+            return TurnEndAction::Nothing;
+        }
+        // Codex's goal runs its next turn by itself within milliseconds of
+        // a turn's end (measured): a continuation typed now lands in that
+        // turn as a steer (all eleven of 2026-09-27/28 did). A lost login
+        // and a usage or spend limit — where the goal goes on by itself no
+        // more — are still their walls' rules'.
+        let own_wall = matches!(
+            reading.wall,
+            Some(
+                WallKind::Auth
+                    | WallKind::UsageSession
+                    | WallKind::UsageWeekly
+                    | WallKind::Spend
+                    | WallKind::ModelBucket { .. }
+            )
+        );
+        if reading.goal == Some(CodexGoal::Pursuing) && !own_wall {
+            return TurnEndAction::Nothing;
+        }
+    }
     if let Some(kind) = reading.wall {
         return wall_action(
             state,
@@ -1901,7 +3736,7 @@ fn act_at_point(
         && t.attempts == 0
         && cfg.resume_limits
     {
-        return continue_as(RULE_LIMIT_RESUME);
+        return resume_limit(reading, &continue_as);
     }
     let cont = continue_policy(state, reading, cfg, now, &budgeted);
     // The bucket's reset has come: relaunched on the bucket's model first,
@@ -1926,6 +3761,14 @@ fn act_at_point(
 /// the turn continued (the worker's own suggestion first) once the short
 /// streak's back-off has passed; a question escalated only where the owner
 /// switched the answers off.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "SupervisorCodexRateNudge",
+        action = "Continue",
+        project = "supervise_conformance_codex_rate_nudge::ph_of"
+    )
+)]
 fn continue_policy(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -1952,12 +3795,17 @@ fn continue_policy(
             Said::Offer | Said::Plain => None,
         }
     };
+    // A done report gets the done check — a continuation's words that let
+    // the worker stop — whatever else it said: a done worker's "what's
+    // next?" answered with `answer_text` is how it invented work.
+    let done = state.done == 1 && !reading.interrupted;
     match &asked {
         Some(why) if !cfg.answer_questions => {
             return TurnEndAction::Escalate {
                 reason: format!("{why}; answer_questions is off"),
             };
         }
+        _ if done && !cfg.continue_policy => return TurnEndAction::Nothing,
         None if !cfg.continue_policy => return TurnEndAction::Nothing,
         _ => {}
     }
@@ -1978,6 +3826,12 @@ fn continue_policy(
                 },
             };
         }
+    }
+    if done {
+        return budgeted(TurnEndAction::Type {
+            text: done_check_text(reading.rules.as_deref()),
+            rule_id: RULE_DONE_CHECK,
+        });
     }
     if asked.is_some() {
         let rules = reading.rules.as_deref();
@@ -2037,6 +3891,23 @@ fn resume_at_reset(
         return TurnEndAction::WaitUntil {
             until: due,
             why: format!("{} resets", kind.name()),
+        };
+    }
+    resume_limit(reading, continue_as)
+}
+
+/// The act at a limit's reset: a Codex goal the wall stopped (`Goal hit
+/// usage limits (/goal resume)` on its footer) is resumed with `/goal
+/// resume`, which goes on with the goal itself; anything else is continued.
+fn resume_limit(
+    reading: &TurnEndReading,
+    continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+) -> TurnEndAction {
+    if reading.program == Program::Codex && reading.goal == Some(CodexGoal::UsageLimited) {
+        return TurnEndAction::TypeCommand {
+            command: GOAL_RESUME.to_string(),
+            rule_id: RULE_LIMIT_RESUME,
+            then: Then::Nothing,
         };
     }
     continue_as(RULE_LIMIT_RESUME)
@@ -2254,6 +4125,281 @@ fn wall_action(
     }
 }
 
+/// Codex's command that stops its goal from starting the next turn.
+pub const GOAL_PAUSE: &str = "/goal pause";
+/// Codex's command that goes on with a paused or limited goal.
+pub const GOAL_RESUME: &str = "/goal resume";
+/// Codex's model picker, which the restore drives (the approval policy's
+/// `model-restore-pick@v1`).
+pub const MODEL_PICKER: &str = "/model";
+
+/// `word` with its first letter upper-cased (`ultra` → `Ultra`).
+fn capitalized(word: &str) -> String {
+    let mut cs = word.chars();
+    cs.next()
+        .map(|c| c.to_uppercase().chain(cs).collect())
+        .unwrap_or_default()
+}
+
+/// THE INSTRUCTION THAT SAVES THE WORK, typed once on the cheaper model
+/// (the owner, 2026-09-28: the switch is "for codex to git commit and push
+/// work and then wait for the original model settings"): commit the work in
+/// progress on the current branch, push it plainly — one `git pull
+/// --no-rebase` on a rejected push, nothing more — never force, rebase,
+/// reset, stash or switch branches, say what failed rather than work around
+/// it, then stop; and answer with the one-time marker line only when all of
+/// it is committed and pushed. The standing rules ride with it.
+#[must_use]
+pub fn wind_down_text(w: &WindDown, rules: Option<&str>) -> String {
+    let text = format!(
+        "[aterm harness] {from} is close to its usage limit, so aterm switched this session to \
+         {to} for one job only: saving your work. Do not continue the task, do not start anything \
+         new, and do not resume the goal. In each repository you changed: 1) commit your work in \
+         progress on the current branch (stage only the files you changed; say in the message \
+         that it is work in progress; skip this if nothing changed); 2) push it with a plain `git \
+         push` (`git push -u origin HEAD` if the branch has no upstream). If the push is rejected \
+         because the remote has new commits, run `git pull --no-rebase` once and push again; if \
+         that needs any conflict resolution, stop instead. Never force-push, rebase, reset, stash \
+         or switch branches. If a commit or a push fails for any reason (sandbox, permissions, \
+         network, a hook, a conflict), do not work around it: say what failed. Then stop. Only if \
+         everything is committed and pushed, reply with {marker} on a line by itself. aterm will \
+         put this session back on {back} and tell you when to continue, once the limit resets.",
+        from = w.from.model,
+        to = w.to,
+        marker = w.marker,
+        back = w.from.words(),
+    );
+    with_rules(&text, rules)
+}
+
+/// What is typed at the reset when the harness did not pause Codex's goal:
+/// the window has reset and the session is back on its own model; carry on.
+#[must_use]
+pub fn resume_text(w: &WindDown, rules: Option<&str>) -> String {
+    with_rules(
+        &format!(
+            "[aterm harness] {model}'s usage limit has reset and this session is back on {back}. \
+             {CARRY_ON}",
+            model = w.from.model,
+            back = w.from.words()
+        ),
+        rules,
+    )
+}
+
+/// THE SAVE-THEN-WAIT SWITCH'S ACT at a free point (module header): `None`
+/// with no switch open, else the point is the switch's —
+///
+/// * NOTHING into a thread fallen into a sandbox its launch bypassed — no
+///   save instruction, no `/goal pause`, no `/model`, no resume (the owner:
+///   "not continue work in a sandbox"; the loop's sandbox note says it);
+/// * Codex's goal pursued while the switch holds the session (owed, the
+///   model owed back before the hold, holding): `/goal pause`, one of the
+///   [`GOAL_STOPS`] stops (the loop's Esc on a running goal turn is another,
+///   [`TurnEndState::goal_stop`]); its stops spent, nothing;
+/// * owed: the instruction that saves the work — once the footer shows the
+///   cheaper model (the press confirmed; one that shows the thread's own
+///   model is the switch that did not land, closed by
+///   [`TurnEndState::observe`]; a press only intended stops no goal before
+///   it shows), never over a draft;
+/// * winding down: nothing, but an API error or a full context the
+///   wind-down's own turn ended on, which its wall's rule answers (the
+///   save's turn running past [`WIND_DOWN_BOUND`] is stopped by the loop's
+///   busy read, [`TurnEndState::goal_stop`]);
+/// * restore owed: `/model` (the approval policy picks the original model
+///   and effort, for this conversation only) up to [`RESTORE_TRIES`] times,
+///   then nothing (the note names the hand steps); never over a draft;
+/// * holding: nothing until the reset — the original window's reset plus
+///   [`TurnEndTiming::reset_grace`], or [`TurnEndTiming::unknown_hold`]
+///   from the hold's start when nobody read it — decided again at least
+///   every [`TurnEndTiming::limits_every`], and sooner when the usage
+///   reading drops back under its limit; then, under `resume_limits`,
+///   `/goal resume` when the harness paused the goal, else — under
+///   `continue_policy` — [`resume_text`]; with either key off, nothing is
+///   typed and a person is told (escalated). Never over a draft.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "SupervisorCodexRateNudge",
+        action = "StopGoal",
+        project = "supervise_conformance_codex_rate_nudge::ph_of"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "SupervisorCodexRateNudge",
+        action = "TypeWindDown",
+        project = "supervise_conformance_codex_rate_nudge::ph_of"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "SupervisorCodexRateNudge",
+        action = "Restore",
+        project = "supervise_conformance_codex_rate_nudge::ph_of"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "SupervisorCodexRateNudge",
+        action = "Resume",
+        project = "supervise_conformance_codex_rate_nudge::ph_of"
+    )
+)]
+fn wind_down_act(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> Option<TurnEndAction> {
+    let w = state.wind.as_ref()?;
+    let t = &state.timing;
+    let draft = reading.composer == Composer::Typed;
+    let sandboxed = reading.sandbox_fell.is_some();
+    let goal_runs = reading.goal == Some(CodexGoal::Pursuing);
+    // Codex's goal stopped first, a stop of the switch's.
+    let pause = || {
+        if w.stops < GOAL_STOPS && !draft && !sandboxed {
+            TurnEndAction::TypeCommand {
+                command: GOAL_PAUSE.to_string(),
+                rule_id: RULE_WIND_DOWN,
+                then: Then::Nothing,
+            }
+        } else {
+            TurnEndAction::Nothing
+        }
+    };
+    Some(match w.phase {
+        WindPhase::Owed => {
+            let landed = reading.model_field.as_ref().is_some_and(|m| m.runs(&w.to));
+            if sandboxed {
+                TurnEndAction::Nothing
+            } else if goal_runs && (landed || !w.intent) {
+                // (An intent whose footer does not show the cheaper model may
+                // be a key that never went: the goal runs on the thread's
+                // own model, and nothing of the switch stops it.)
+                pause()
+            } else if !landed {
+                TurnEndAction::WaitUntil {
+                    until: later(now, t.take_within),
+                    why: format!("the footer to show {} before the work is saved", w.to),
+                }
+            } else if draft {
+                TurnEndAction::Nothing
+            } else {
+                TurnEndAction::Type {
+                    text: wind_down_text(w, reading.rules.as_deref()),
+                    rule_id: RULE_WIND_DOWN,
+                }
+            }
+        }
+        WindPhase::Winding => match reading.wall {
+            Some(WallKind::ApiError { .. } | WallKind::Overloaded | WallKind::Context) => {
+                return None;
+            }
+            _ => TurnEndAction::Nothing,
+        },
+        WindPhase::Restore { hold } => {
+            // The harness's picker left less than a settle ago: a frame
+            // between its boxes, never a point to type `/model` again at.
+            let settling = w
+                .picker_gone_at
+                .filter(|_| w.restore_shown)
+                .map(|gone| later(gone, PICKER_SETTLE))
+                .filter(|&until| now < until);
+            if sandboxed {
+                TurnEndAction::Nothing
+            } else if hold && goal_runs {
+                pause()
+            } else if w.restore_tries >= RESTORE_TRIES || draft {
+                TurnEndAction::Nothing
+            } else if let Some(until) = settling {
+                TurnEndAction::WaitUntil {
+                    until,
+                    why: "the /model picker's next box, or its leaving".to_string(),
+                }
+            } else {
+                TurnEndAction::TypeCommand {
+                    command: MODEL_PICKER.to_string(),
+                    rule_id: RULE_MODEL_RESTORE,
+                    then: Then::Nothing,
+                }
+            }
+        }
+        WindPhase::Holding { since } => {
+            if goal_runs {
+                return Some(pause());
+            }
+            let due = match w.back_at {
+                Some(b) => later(b, t.reset_grace),
+                None => later(since, t.unknown_hold),
+            };
+            let reset = matches!(reading.limits, LimitRead::Far { .. });
+            if now < due && !reset {
+                return Some(TurnEndAction::WaitUntil {
+                    until: due.min(later(now, t.limits_every)),
+                    why: format!(
+                        "holding on {} until its usage limit resets{}",
+                        w.from.words(),
+                        if w.back_at.is_none() {
+                            " (its reset unread: tried again after a bound)"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+            }
+            // A goal paused under the switch — by the switch, or by the live
+            // upgrade for its move, whose pause the switch then held the
+            // session over (the goal-pause review of 2026-09-28: the switch
+            // typed its carry-on at the reset while the upgrade's own resume
+            // waited on it, and a person told by the upgrade's row to resume
+            // the goal would have run it before the reset).
+            let goal_paused = w.goal_paused || reading.upgrade_goal;
+            let by_hand = if goal_paused {
+                "resume its goal with /goal resume"
+            } else {
+                "tell it to carry on"
+            };
+            if sandboxed || draft {
+                TurnEndAction::Nothing
+            } else if !cfg.resume_limits {
+                TurnEndAction::Escalate {
+                    reason: format!(
+                        "{}'s usage limit has reset and the session is back on {}, but \
+                         resume_limits is off: aterm types nothing — {by_hand}",
+                        w.from.model,
+                        w.from.words()
+                    ),
+                }
+            } else if goal_paused {
+                TurnEndAction::TypeCommand {
+                    command: GOAL_RESUME.to_string(),
+                    rule_id: RULE_LIMIT_RESUME,
+                    then: Then::Nothing,
+                }
+            } else if !cfg.continue_policy {
+                TurnEndAction::Escalate {
+                    reason: format!(
+                        "{}'s usage limit has reset and the session is back on {}, but \
+                         continue_policy is off: aterm types no carry-on — {by_hand}",
+                        w.from.model,
+                        w.from.words()
+                    ),
+                }
+            } else {
+                TurnEndAction::Type {
+                    text: resume_text(w, reading.rules.as_deref()),
+                    rule_id: RULE_LIMIT_RESUME,
+                }
+            }
+        }
+    })
+}
+
 /// Claude Code's critical-memory banner (2026-09-24: a worker at 38.8 GiB
 /// resident that read no input for 2h41m). Nothing typed into it is read
 /// and no reset ends it; the one remedy is a restart, and the banner names
@@ -2267,12 +4413,24 @@ fn wall_action(
 /// (`aterm-gui`'s `status_item`). `[harness] relaunch = false` limits it to
 /// the escalation with its remedy, and so does a loop no host restarts for
 /// (`drive watch`), which escalates the same `reason`.
+///
+/// The escalation's remedy names the agent's OWN conversation
+/// ([`TurnEndReading::resume`]: `claude --resume <id>`), or no command where
+/// none was read, and quotes only the banner's fact
+/// ([`aterm_phase::memory_banner_head`]) — never the vendor's own `claude
+/// --continue`, which resumes the directory's newest conversation, a sibling
+/// tab's where two share it (robustness backlog item 2, 2026-09-26).
 fn memory_restart(cfg: &SupervisorConfig, reading: &TurnEndReading) -> TurnEndAction {
-    let reason = format!(
-        "memory critical: restart it, then resume with {}: {}",
-        aterm_phase::resume_hint(aterm_phase::Program::Claude).unwrap_or("its resume command"),
-        reading.wall_message
-    );
+    let banner = aterm_phase::memory_banner_head(&reading.wall_message);
+    let reason = match reading.resume.as_deref() {
+        // The clause the escalation keeps whole or drops, never cuts
+        // ([`crate::harness::resume::never_cut`]).
+        Some(resume) => format!(
+            "memory critical: restart it{}{resume}: {banner}",
+            crate::harness::resume::THEN_RESUME_WITH
+        ),
+        None => format!("memory critical: restart it: {banner}"),
+    };
     if !cfg.relaunch {
         return TurnEndAction::Escalate {
             reason: format!("{reason} (relaunch is off)"),
@@ -2287,6 +4445,204 @@ fn memory_restart(cfg: &SupervisorConfig, reading: &TurnEndReading) -> TurnEndAc
         otherwise: Box::new(TurnEndAction::Escalate { reason }),
     }
 }
+
+/// THE WORLD AND THE MUTANTS of `SupervisorCodexRateNudge`
+/// (`aterm_spec::derive::supervisor_codex_rate_nudge_model`): its
+/// supervisor's actions are bound where the real deciders run — the press
+/// (`approval::rate_nudge`, [`TurnEndState::open_switch`]), the stops
+/// ([`TurnEndState::goal_stop`], [`TurnEndState::goal_told`]), a turn's end
+/// ([`TurnEndState::observe`]) and the free point's acts (`wind_down_act`,
+/// `continue_policy`); these are Codex's, the clock's and a person's steps,
+/// each one the Tier-1 bind (`tests/supervise_conformance_codex_rate_nudge.rs`)
+/// performs, and the `Buggy = 1` members, which no shipping code runs.
+/// Compiled only for proof and test builds: nothing calls it.
+#[cfg(any(test, feature = "spec-anchors"))]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "GoalTurn",
+        reason = "Codex starting its goal's next turn by itself: the vendor's step. The Tier-1 bind reads it busy under the footer's goal exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "GoalEnds",
+        reason = "Codex's goal achieved or cleared: the vendor's step. The Tier-1 bind drops the footer's goal exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "GoalEscapes",
+        reason = "A goal the harness paused resuming by itself: the vendor's step. The Tier-1 bind puts the footer's `Pursuing goal` back exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "Pend",
+        reason = "Codex deciding to show its rate-limit nudge at the turn's end: the vendor's step. The Tier-1 bind shows the box at the next end exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "WindDownRunsLong",
+        reason = "The save's own turn running past `WIND_DOWN_BOUND`: the cheaper model's step and the clock. The Tier-1 bind advances the walk's clock past the bound exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "Far",
+        reason = "Codex's usage reading dropping back under its limit: the vendor's records. The Tier-1 bind reads the window at 1% exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "NearAgain",
+        reason = "Codex's usage reading rising to its limit: the vendor's records. The Tier-1 bind reads the window at 99% exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "SandboxFalls",
+        reason = "A thread falling into a sandbox: the vendor's rollout. The Tier-1 bind reads the fall off the rollouts exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "PersonTurn",
+        reason = "A person's message starting a turn: a person's step. The Tier-1 bind stamps the keystroke on the walk's clock exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "PersonResumes",
+        reason = "A person's `/goal resume` during the hold: a person's step. The Tier-1 bind stamps the keystroke and the goal's turn exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "ContinueWhileSwitched",
+        reason = "Buggy=1 negative control only; a continuation typed while the switch is open (the day's `keep going` 8 s after the press), which `wind_down_act` owns every point against"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "SwitchKeepsGoal",
+        reason = "Buggy=1 negative control only; the switch pressed and Codex's goal left running on the cheaper model, which `goal_stop` stops"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "NudgeRewinds",
+        reason = "Buggy=1 negative control only; a stale nudge at the wind-down's end taken for a new switch, which `rate_nudge` keeps while one is open"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "HoldBeforeRestore",
+        reason = "Buggy=1 negative control only; held on the cheaper model and restored only at the reset, where `wind_down_act` restores first"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "ResumeOnCheap",
+        reason = "Buggy=1 negative control only; carried on on the cheaper model at the reset, which the restore phase never does"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "ForgetOnRestart",
+        reason = "Buggy=1 negative control only; a loop restart that reads no switch back, where the ledger rows are read back (`open_wind_down`)"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "PressAtFar",
+        reason = "Buggy=1 negative control only; the switch pressed at a stale nudge far from the limit (the 03:30Z press), which `rate_nudge` keeps"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "ContinueInSandbox",
+        reason = "Buggy=1 negative control only; a continuation typed into a thread fallen into a sandbox, which nothing types into"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "WindDownInSandbox",
+        reason = "Buggy=1 negative control only; the save instruction typed into a sandboxed thread, which `wind_down_act` never types"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "ContinueUnderGoal",
+        reason = "Buggy=1 negative control only; a continuation typed while Codex's goal runs its own turns, which the turn-end policy never types"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "StopPersonsTurn",
+        reason = "Buggy=1 negative control only; the busy read's Esc into a person's turn once their grace ran out, which `goal_stop` spares"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "CoveredHandSparesGoal",
+        reason = "Buggy=1 negative control only; the round-3 regression, a person's keystroke in the turn the nudge covered read as their hand in the goal turn under it, which `goal_stop` stops"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::spec_unmodeled(
+        machine = "SupervisorCodexRateNudge",
+        action = "WindDownRunsOn",
+        reason = "Buggy=1 negative control only; the save's own turn left running past its bound, which `goal_stop` stops with one Esc"
+    )
+)]
+#[doc(hidden)]
+pub fn codex_rate_nudge_environment() {}
 
 #[cfg(test)]
 #[path = "turn_end_tests.rs"]

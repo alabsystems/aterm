@@ -47,6 +47,55 @@ pub fn native_update_control_socket_handoff_model() -> Model {
     }
 }
 
+/// The successor's dial of the out-of-band handoff rendezvous (the macOS
+/// LaunchServices lane): the claim secret leaves the successor only toward the
+/// ATTESTED outgoing process. The launch environment names a PATH and the
+/// parental attestation names a PROCESS, and a path is not an identity, so the
+/// dialer presents the claim only when the kernel says the listener it reached
+/// is same-uid (`getpeereid`), IS the attested process (`LOCAL_PEERPID` read on
+/// the dialing end equals the attested pid), and that process is still the one
+/// attested (its birth witness still matches, so a recycled pid fails).
+///
+/// The three environment actions are the ways a listener can fail to be the
+/// parent. `PresentClaimUidOnly` (dead at `Buggy = 0`) is the shape that shipped
+/// until 2026-09-27: the uid gate alone, which any same-uid process listening at
+/// the published path passed. Tier-1 (`handoff_rendezvous`'s
+/// `claim_presentation_conformance`) drives the real gate over every fact
+/// combination with real attested processes.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_rendezvous_claim_model() -> Model {
+    crate::ty_model! {
+        NativeUpdateRendezvousClaim {
+            const Buggy = 0;
+            var same_uid = 1;
+            var is_parent = 1;
+            var parent_live = 1;
+            var presented = 0;
+
+            action ForeignUidListener when (presented == 0 && same_uid == 1) {
+                same_uid = 0;
+            }
+            action SameUidImpostor when (presented == 0 && is_parent == 1) {
+                is_parent = 0;
+            }
+            action ParentGone when (presented == 0 && parent_live == 1) {
+                parent_live = 0;
+            }
+            action PresentClaim when (
+                presented == 0 && same_uid == 1 && is_parent == 1 && parent_live == 1
+            ) {
+                presented = 1;
+            }
+            action PresentClaimUidOnly when (Buggy == 1 && presented == 0 && same_uid == 1) {
+                presented = 1;
+            }
+            invariant ClaimOnlyToTheAttestedParent:
+                presented == 0 || (same_uid == 1 && is_parent == 1 && parent_live == 1);
+        }
+    }
+}
+
 /// Admission and handoff policy for applying an already verified native update.
 ///
 /// A foreground terminal job is not dirty native UI state: the seamless handoff
@@ -652,7 +701,12 @@ pub fn native_update_auto_intent_model() -> Model {
 /// Every admitted park (`Park`, `ParkMissed`, `PhysicalFailure`, and the
 /// capture-refusal pair below) requires it ended, and `ParkedOnlyWhenTheLadderAdmits` records it; `WarmupEnds` is
 /// always enabled while it holds (the shipping hold is capped), so the ladder
-/// still always lands.
+/// still always lands. Since round four (plan item 7) `warmup` stands for
+/// either of the two holds of that kind the shipping facts name: the consent
+/// warm-up, and a cold restore's agents still being relaunched
+/// (`ActivityFacts::harness_restored_pending`, capped by the host's
+/// `RESTORED_HOLD` from its first relaunch, once per process) — the Tier-1
+/// bind projects their disjunction onto it.
 ///
 /// THE 2026-09-22/23 UPDATE AUDIT (plan P0-3): a park that fails
 /// DETERMINISTICALLY. `DeskRefuses` is the environment putting a session into
@@ -708,6 +762,21 @@ pub fn native_update_auto_intent_model() -> Model {
 /// refused release spent for good, so the machine waited for a still newer
 /// build or a person — and it is caught at the look it spent
 /// (`ANewerReleaseClearsAConvergedLatch`) and, as a livelock, by the liveness.
+///
+/// AND A PASSING MOMENT IS NEVER A VERDICT (round four of the 2026-09 update
+/// robustness work, plan item 2). `PassingFailure` is an admitted attempt that
+/// failed on a fact that changes by itself — the pre-park check's `codesign` ran
+/// out of the apply budget, a sibling held the apply lock past its wait, the
+/// kernel would not start a helper just then, or the successor's boot swap was
+/// deferred for one of those and it exited 75 (`passing`). The healthy lane
+/// latches it on the TRANSIENT schedule: a deadline comes, and `Converge` — the
+/// structural verdict with no deadline left — is never minted from it. The
+/// mutant `PassingFailureConverges` is what shipped: the cached verdict of that
+/// moment booked STRUCTURAL (two attempts, then a day's re-sample) or as the
+/// installed copy's (a person's, with no deadline at all), so a healthy build
+/// was held for a day or for good. `APassingFailureNeverConverges` catches it.
+/// The liveness below cannot: a converged latch with nothing newer is Law 2's
+/// rest, which is exactly why the verdict must never be minted from a moment.
 ///
 /// AND LAW 1 ITSELF IS CHECKED, not only its safety proxies (round three, plan
 /// P1-7): [`native_update_apply_ladder_liveness`] states "the staged build
@@ -771,6 +840,10 @@ pub fn native_update_apply_ladder_model() -> Model {
             // A refused retire's release waits out its retry deadline before
             // the lane offers it again (round three review).
             var retry = 0;
+            // THE FAILURE THAT LATCHED WAS A PASSING MOMENT (round four, plan
+            // item 2): a check that did not finish, a lock held past its wait,
+            // a successor that exited 75 because its swap was deferred.
+            var passing = 0;
             // The wall clock. Not guarded on the latch: the anchor keeps
             // counting while a physical-failure latch holds, and `reached` is
             // the high-water mark the phase may never fall below.
@@ -917,6 +990,35 @@ pub fn native_update_apply_ladder_model() -> Model {
                 latched = 1;
                 failures = 1;
             }
+            // A PASSING FAILURE of an admitted park (round four, plan item 2):
+            // the verification ran out of its budget, the apply lock was held
+            // past its wait, a helper could not be started just then, or the
+            // successor's swap was deferred for one of those (exit 75). The
+            // healthy lane latches it on the transient schedule — a deadline
+            // comes — and never converges it. Once, like `PhysicalFailure`.
+            action PassingFailure when (
+                landed == 0 && manual_only == 0 && latched == 0 && failures == 0 &&
+                warmup == 0 &&
+                (phase == Land ||
+                    (keys == 1 && (phase == 2 ||
+                        (phase == 1 && (focused == 0 || output == 1)) ||
+                        (phase == 0 && quiet == 1))))
+            ) {
+                latched = 1;
+                failures = 1;
+                passing = 1;
+            }
+            // THE MUTANT THAT SHIPPED until round four: the cached verdict of
+            // that moment booked STRUCTURAL (or as the installed copy's), so the
+            // latch converges with no ordinary deadline left — a healthy build
+            // held for the day's re-sample, or until a person reinstalls an app
+            // that was fine. Its own dead action.
+            action PassingFailureConverges when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 1 &&
+                passing == 1 && due == 0 && converged == 0
+            ) {
+                converged = 1;
+            }
             // The latch's deadline passes (its `retry_at`, 600 s out for the
             // first failure).
             action Due when (
@@ -954,7 +1056,7 @@ pub fn native_update_apply_ladder_model() -> Model {
             // latch the bundle swap re-keyed stands with no deadline left.
             action Converge when (
                 landed == 0 && manual_only == 0 && latched == 1 && swapped == 1 &&
-                due == 0 && converged == 0
+                due == 0 && converged == 0 && passing == 0
             ) {
                 converged = 1;
             }
@@ -1074,6 +1176,10 @@ pub fn native_update_apply_ladder_model() -> Model {
                 } else {
                     due <= 1
                 };
+            // A passing moment is never a verdict (round four, plan item 2):
+            // the latch it booked always has a deadline coming.
+            invariant APassingFailureNeverConverges:
+                if passing == 1 { converged == 0 } else { converged <= 1 };
             // A newer release behind a converged latch takes the activation's
             // place at the look (round three): the look that sees it clears the
             // latch by superseding, never by keeping it or retrying — and a
@@ -1113,13 +1219,14 @@ pub fn native_update_apply_ladder_model() -> Model {
 ///
 /// THE ENVIRONMENT IS NOT FAIR. Output, keystrokes, focus, the consent
 /// warm-up's start, the desk refusing or changing, a park missing its freeze
-/// budget, a physical failure, the bundle swap, the convergence verdict and a
-/// newer release are the world's: any of them may happen or not, forever, and
-/// every state may stutter. What the verdict ASSUMES, and nothing more:
+/// budget, a physical failure, a passing one (round four), the bundle swap, the
+/// convergence verdict and a newer release are the world's: any of them may
+/// happen or not, forever, and every state may stutter. What the verdict ASSUMES, and nothing more:
 ///
 /// * `Advance`, weakly fair — the wall clock moves while the Mac is awake;
 /// * `WarmupEnds`, weakly fair — the consent warm-up hold is capped
-///   (`[privacy] warmup_hold_ms`);
+///   (`[privacy] warmup_hold_ms`), and so is the restored agents' hold it
+///   also stands for (round four, plan item 7: `harness_host::RESTORED_HOLD`);
 /// * `Due`, weakly fair — a latch's `retry_at` comes;
 /// * `Lapse`, weakly fair — the lane acts on a due latch; nothing the
 ///   environment does disables it once it is enabled;
@@ -1146,7 +1253,9 @@ pub fn native_update_apply_ladder_model() -> Model {
 /// newer release left waiting behind a converged latch (`NewerReleaseIgnored`)
 /// and a refused retire that spent the release for good
 /// (`RefusedRetireSpendsTheRelease`) — livelocks, which only this property
-/// sees.
+/// sees. Not `PassingFailureConverges` (round four): the latch it converges
+/// with nothing newer staged IS the goal's rest, so this property is blind to it
+/// by construction, and `APassingFailureNeverConverges` carries its catch.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_apply_ladder_liveness() -> Liveness {
@@ -2481,6 +2590,17 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   convergence PROMISES the day's re-sample before any count is read, and a
 ///   count that rules it out withdraws the promise at once, said.
 ///
+/// * `TrialUnreadable` — the installed facts stop reporting N (round six,
+///   finding 55: a channel floor raised above N yanks it, and the facts worker
+///   drops a yanked bundle newer than the running build), so no count can be
+///   read and `room` is no reading at all (`TrialReadAgain` undoes it). A due
+///   look then asks for another observation and COUNTS (`looks`); at
+///   `UnreadLooks` looks in a row the re-sample is withdrawn and the hold
+///   said, as a count with no room would have it — never promised every 75 s
+///   forever (L5). The count is the host's (`AutoApplyStructuralVerdict::
+///   unmeasured_looks`, advanced only by an observation read since the last
+///   look); `structural_latch` itself answers `Unmeasured`.
+///
 /// A newer release outranks the day: a re-sample of N while a newer build
 /// waits would launch the older build for nothing. `AttemptFails` is the
 /// re-sample failing structurally again: the verdict stands, so it re-latches
@@ -2515,7 +2635,11 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   verdict about the bytes (`ResampleAtMostOnce`);
 /// * a digest-keyed latch, where a re-publish of N escapes it — which also
 ///   releases the latch with no event (`SameBuildStaysLatched`,
-///   `ReleasedOnlyByAnEvent`).
+///   `ReleasedOnlyByAnEvent`);
+/// * where the count cannot be read, THE PROMISE KEPT FOREVER (before round
+///   six): the look at the bound clears its count and keeps the re-sample
+///   owed, asking for nothing — the notice goes on promising a re-sample no
+///   reading will earn (`NoRetryPromisedPastTheBound`).
 ///
 /// Liveness — that a refused release is, in the end, retired over — is Law
 /// 1's, checked on the apply ladder ([`native_update_apply_ladder_liveness`],
@@ -2527,11 +2651,22 @@ pub fn native_update_structural_latch_model() -> Model {
     crate::ty_model! {
         NativeUpdateStructuralLatch {
             const Buggy = 0;
+            // How many due looks in a row may find the count unreadable before
+            // the lane stops waiting for it (the host's
+            // `STRUCTURAL_TRIAL_UNMEASURED_LOOKS`, asserted equal in the bind).
+            const UnreadLooks = 3;
             // 0 = the boot trial's room is not yet picked, 1 = running.
             var phase = 0;
             // One more launch of N keeps its boot trial under the revert
             // threshold (the sentinel's count, measured).
             var room = 0;
+            // The count can no longer be read: the installed facts stopped
+            // reporting N (a channel floor above it yanked it; round six,
+            // finding 55). `room` is then no reading at all.
+            var unread = 0;
+            // Due looks in a row that found the count unreadable, each asking
+            // for an observation to read it.
+            var looks = 0;
             // The structural latch on build N holds.
             var latched = 1;
             // An observation the lane has not yet decided on.
@@ -2574,6 +2709,16 @@ pub fn native_update_structural_latch_model() -> Model {
                 phase = 1;
                 pending = 1;
             }
+            // The installed facts stop reporting N — an observation, so a look.
+            action TrialUnreadable when (phase == 1 && unread == 0 && superseded == 0) {
+                unread = 1;
+                pending = 1;
+            }
+            // …and report it again: the count is read once more.
+            action TrialReadAgain when (phase == 1 && unread == 1) {
+                unread = 0;
+                pending = 1;
+            }
             action DayPasses when (phase == 1 && day == 0 && superseded == 0) {
                 day = 1;
                 pending = 1;
@@ -2586,7 +2731,11 @@ pub fn native_update_structural_latch_model() -> Model {
             // yet offered, and not waiting out a refusal's retry deadline; it
             // WAITS when a refusal's deadline has not passed. Either way it
             // outranks the day (`newer == 0 || newer_spent == 1` is "nothing
-            // newer is coming").
+            // newer is coming"). The trial's `room` is a reading only while
+            // `unread == 0`; a due look that finds no reading asks for another
+            // observation (`pending` stays set) and counts, and at
+            // `UnreadLooks` the re-sample is withdrawn and the hold said, as a
+            // count with no room would have it.
             action Decide when (phase == 1 && latched == 1 && pending == 1 && superseding == 0) {
                 superseding = if newer == 1 && newer_spent == 0 && backoff == 0 &&
                     (Buggy == 0 || day == 1) {
@@ -2595,41 +2744,45 @@ pub fn native_update_structural_latch_model() -> Model {
                     superseding
                 };
                 latched = if (Buggy == 0 && (newer == 0 || newer_spent == 1) &&
-                        day == 1 && owed == 1 && room == 1) ||
+                        day == 1 && owed == 1 && unread == 0 && room == 1) ||
                     (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
-                        day == 0 && room == 1) ||
+                        day == 0 && unread == 0 && room == 1) ||
                     (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
-                        day == 1 && owed == 1 && room == 0) {
+                        day == 1 && owed == 1 && unread == 0 && room == 0) {
                     0
                 } else {
                     1
                 };
                 booted_old = if Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
-                    day == 0 && room == 1 {
+                    day == 0 && unread == 0 && room == 1 {
                     1
                 } else {
                     booted_old
                 };
-                owed = if (Buggy == 0 && (newer == 0 || newer_spent == 1) &&
+                owed = if (Buggy == 0 && (newer == 0 || newer_spent == 1) && unread == 0 &&
                         ((day == 1 && owed == 1) || room == 0)) ||
+                    (Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
+                        owed == 1 && unread == 1 && looks == UnreadLooks) ||
                     (Buggy == 0 && newer == 1 && newer_spent == 0 && backoff == 1 &&
-                        room == 0) ||
+                        unread == 0 && room == 0) ||
                     (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
-                        day == 0 && room == 0) ||
+                        day == 0 && unread == 0 && room == 0) ||
                     (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
-                        day == 1 && owed == 1 && room == 0) {
+                        day == 1 && owed == 1 && unread == 0 && room == 0) {
                     0
                 } else {
                     owed
                 };
                 spent = if (Buggy == 0 && (newer == 0 || newer_spent == 1) && owed == 1 &&
-                        (day == 1 || room == 0)) ||
+                        unread == 0 && (day == 1 || room == 0)) ||
+                    (Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
+                        owed == 1 && unread == 1 && looks == UnreadLooks) ||
                     (Buggy == 0 && newer == 1 && newer_spent == 0 && backoff == 1 &&
-                        owed == 1 && room == 0) ||
+                        owed == 1 && unread == 0 && room == 0) ||
                     (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
-                        day == 0 && owed == 1 && room == 0) ||
+                        day == 0 && owed == 1 && unread == 0 && room == 0) ||
                     (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
-                        day == 1 && owed == 1 && room == 0) {
+                        day == 1 && owed == 1 && unread == 0 && room == 0) {
                     1
                 } else {
                     spent
@@ -2641,16 +2794,39 @@ pub fn native_update_structural_latch_model() -> Model {
                 };
                 // Every look without room says so while there is something to
                 // say: the promised re-sample withdrawn, or a due one held —
-                // and gap 14 said its hold of the newer release too.
+                // and gap 14 said its hold of the newer release too. A count
+                // that stayed unreadable to the bound is said as such.
                 said = if (Buggy == 0 && (newer == 0 || newer_spent == 1 || backoff == 1) &&
-                        owed == 1 && room == 0) ||
+                        owed == 1 && unread == 0 && room == 0) ||
+                    (Buggy == 0 && (newer == 0 || newer_spent == 1) && day == 1 &&
+                        owed == 1 && unread == 1 && looks == UnreadLooks) ||
                     (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
-                        day == 0 && room == 0) {
+                        day == 0 && unread == 0 && room == 0) {
                     1
                 } else {
                     said
                 };
-                pending = 0;
+                // Counted while the re-sample is due, nothing newer is coming
+                // and no count can be read; kept by a look that is not due;
+                // cleared by a reading, and by the bound's decision. `Buggy`'s
+                // look at the bound (THE PROMISE KEPT FOREVER, round six,
+                // finding 55): it clears the count and keeps the re-sample
+                // owed — the notice goes on promising it, and nothing asks.
+                looks = if (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
+                    unread == 1 && looks <= UnreadLooks - 1 {
+                    looks + 1
+                } else if unread == 1 &&
+                    ((newer == 1 && newer_spent == 0) || day == 0 || owed == 0) {
+                    looks
+                } else {
+                    0
+                };
+                pending = if (newer == 0 || newer_spent == 1) && day == 1 && owed == 1 &&
+                    unread == 1 && looks <= UnreadLooks - 1 {
+                    1
+                } else {
+                    0
+                };
             }
             // The retire landed: N's latch goes with N's bytes, and N is never
             // launched for it.
@@ -2708,7 +2884,7 @@ pub fn native_update_structural_latch_model() -> Model {
                 };
             // An earned attempt the trial cannot afford is said, not dropped.
             invariant ATrialHoldIsSaid:
-                if pending == 0 && phase == 1 && room == 0 && superseding == 0 &&
+                if pending == 0 && phase == 1 && unread == 0 && room == 0 && superseding == 0 &&
                     superseded == 0 && (day == 1 || newer == 1) {
                     said == 1
                 } else {
@@ -2717,8 +2893,19 @@ pub fn native_update_structural_latch_model() -> Model {
             // Once a count has been looked at, no retry is promised that the
             // trial cannot afford.
             invariant NoRetryPromisedPastTheTrial:
-                if pending == 0 && phase == 1 && room == 0 && superseding == 0 &&
-                    superseded == 0 {
+                if pending == 0 && phase == 1 && unread == 0 && room == 0 &&
+                    superseding == 0 && superseded == 0 {
+                    owed == 0
+                } else {
+                    owed <= 1
+                };
+            // A count that cannot be read is decided within the bound (round
+            // six, finding 55): once the lane has looked with the day due and
+            // nothing newer coming, no re-sample is promised that no reading
+            // will ever earn — it is held, and said (`Decide`'s bound arm).
+            invariant NoRetryPromisedPastTheBound:
+                if pending == 0 && latched == 1 && unread == 1 && day == 1 &&
+                    (newer == 0 || newer_spent == 1) && superseding == 0 {
                     owed == 0
                 } else {
                     owed <= 1

@@ -127,6 +127,13 @@ pub struct Args {
     /// `origin/main`, the whole tree — and publish the receipt for branches to
     /// be judged against ([`crate::differential`]).
     pub baseline: bool,
+    /// `--nearest-base` (2026-09-28): OPT-IN, off by default, pending the
+    /// owner's decision — when the merge-base has no receipt that serves, the
+    /// run may be judged against its nearest ancestor's, for the failed tests
+    /// whose blast radius did not change between the two
+    /// ([`crate::nearest`]). A flag, never an environment variable (the gate
+    /// reads no knob of its own from the environment, above).
+    pub nearest_base: bool,
     pub help: bool,
 }
 
@@ -165,6 +172,9 @@ pub enum ParseError {
     /// `--baseline` with `--measure`: a baseline is main's reds for the merge
     /// contract, and a `--measure` run runs no stage of it.
     BaselineMeasure,
+    /// `--nearest-base` with `--baseline` or `--measure`, which are judged by
+    /// the absolute rule and have no base to be near.
+    NearestBaseAbsolute(&'static str),
     Unknown(String),
 }
 
@@ -206,6 +216,10 @@ impl ParseError {
                                             contract; --measure runs the MEASURE tier alone, \
                                             which is not part of it"
                 .to_string(),
+            ParseError::NearestBaseAbsolute(other) => format!(
+                "verify: --nearest-base chooses the base a branch is judged against; a {other} \
+                 run is judged by the absolute rule and has none"
+            ),
             ParseError::Unknown(a) => format!("verify: unknown argument: {a}"),
         }
     }
@@ -231,6 +245,7 @@ where
             "--no-log" => out.no_log = true,
             "--skip-gui-smoke" => out.skip_gui_smoke = true,
             "--baseline" => out.baseline = true,
+            "--nearest-base" => out.nearest_base = true,
             "-h" | "--help" => out.help = true,
             "--scope" => {
                 let v = it.next().unwrap_or_default();
@@ -330,6 +345,12 @@ where
     if out.baseline && out.mode == Mode::Measure {
         return Err(ParseError::BaselineMeasure);
     }
+    if out.nearest_base && out.baseline {
+        return Err(ParseError::NearestBaseAbsolute("--baseline"));
+    }
+    if out.nearest_base && out.mode == Mode::Measure {
+        return Err(ParseError::NearestBaseAbsolute("--measure"));
+    }
     Ok(out)
 }
 
@@ -402,6 +423,7 @@ way for a reviewer (human or AI) to be wrong about it: run this.
                                     #   and lint to one crate (+ guards)
   tools/verify.sh --scope aterm-grid
   tools/verify.sh --baseline        # on a commit of main: record + publish main's reds
+  tools/verify.sh --nearest-base    # OPT-IN: judge against the nearest main receipt
 
 (no flag) : THE GATE, and the merge contract: the LAND tier — targo test
             --workspace and its doctests + the deadline tests (run alone) +
@@ -414,10 +436,11 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             rustup's `stable` with the four foreign std targets or is a SKIP
             that withholds the merge contract) + a headless control-socket
             smoke (the AI-first spine must never regress, so every gate run
-            proves the socket still answers) + the foreground handback lane,
-            which drives a private headless aterm. It does not run the MEASURE
-            tier, and its verdict names every stage it left out under `MEASURE
-            tier: not part of the merge contract` — never a silent skip.
+            proves the socket still answers) + the foreground handback and
+            render desync lanes, which each drive a private headless aterm.
+            It does not run the MEASURE tier, and its verdict names every
+            stage it left out under `MEASURE tier: not part of the merge
+            contract` — never a silent skip.
 --fast    : the default, spelled out. It changes nothing and nothing needs it;
             it is accepted so a script that types it keeps working.
 --measure : the MEASURE tier alone: the stages that measure the machine or the
@@ -489,6 +512,28 @@ JUDGED AGAINST MAIN: a run's reds are compared with main's receipt for its
             contract.
             A --measure run is judged by the absolute rule: nothing is
             inherited into the MEASURE tier.
+--nearest-base: OPT-IN, OFF BY DEFAULT, pending the owner's decision
+            (docs/PROCESS.md §7); without it the base is exactly the
+            merge-base, as above. With it, and only when the merge-base has no
+            receipt that serves the run, the run is judged against the NEWEST
+            main commit before it that has one, within 200 commits and 24 h
+            of committer time (else the absolute rule, saying so). Through such
+            a base a red is inherited only when it is a failed test of a crate
+            (`-p <crate>`) none of whose files — nor any file of a crate it
+            builds on (its path dependencies, dev and build included, read from
+            main's manifests at the merge-base, none in a submodule) —
+            changed between the two, when no Cargo.toml anywhere (features
+            unify across the workspace), Cargo.lock, the toolchain pin,
+            .cargo/, a [patch] path nor the gate itself changed, and when none
+            of those crates names a path outside its own directory (a lexical
+            scan: `../`, `.parent()`, `CARGO_MANIFEST_DIR`, `\"git\"`, a
+            symlink out, …). A whole-row red (lint, guards, a
+            suite, a build) is never inherited through it, and anything the
+            gate cannot read is NEW. The `verify: base` line names both commits
+            and how many crates qualify, the verdict says why each inherited
+            red qualified, and the receipt adds `base-mode nearest <commit>`;
+            the release cutter reads it as any other receipt. A usage error
+            with --baseline or --measure.
 
 --snapshot <dir>: every run verifies a SNAPSHOT — a git worktree at
             <root>-verify.noindex (or this dir) synced to this checkout's HEAD,
@@ -850,6 +895,32 @@ mod tests {
             usage().contains("N new, M\n            inherited (red on main since <sha>)"),
             "the help says what a judged verdict prints"
         );
+    }
+
+    /// `--nearest-base` is OPT-IN: off unless typed, a flag and never an
+    /// environment variable, and a usage error where there is no base to be
+    /// near (`--baseline`, `--measure`). The help says it is opt-in pending
+    /// the owner's decision.
+    #[test]
+    fn the_nearest_base_is_opt_in_and_only_where_a_base_is_resolved() {
+        assert!(!ok(&[]).nearest_base, "off unless asked");
+        assert!(ok(&["--nearest-base"]).nearest_base);
+        assert!(ok(&["--full", "--nearest-base"]).nearest_base);
+        assert!(ok(&["--nearest-base", "--changed"]).nearest_base);
+        for (args, other) in [
+            (vec!["--nearest-base", "--baseline"], "--baseline"),
+            (vec!["--measure", "--nearest-base"], "--measure"),
+        ] {
+            let err = parse(args.clone()).expect_err("no base to be near");
+            assert_eq!(err, ParseError::NearestBaseAbsolute(other), "{args:?}");
+            assert!(err.message().contains(other), "{}", err.message());
+        }
+        let help = usage();
+        assert!(
+            help.contains("--nearest-base: OPT-IN, OFF BY DEFAULT, pending the owner's decision"),
+            "{help}"
+        );
+        assert!(help.contains("within 200 commits and 24 h"), "{help}");
     }
 
     #[test]

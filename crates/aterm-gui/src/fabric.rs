@@ -68,8 +68,24 @@
 //! the sentence is WITHDRAWN rather than left standing as a promise the code
 //! does not keep. An operator whose bridge cannot come back (a deleted cap file,
 //! a `[fabric] command` that exits at startup) has exactly one recovery, and it
-//! is restarting `aterm-gui`. That is a real gap, recorded as one: building the
-//! lift is a change to the GUI modules, not to this one.
+//! is quitting and relaunching `aterm-gui`. That is a real gap, recorded as one:
+//! building the lift is a change to the GUI modules, not to this one.
+//!
+//! ## A seamless update is not a restart
+//!
+//! It CARRIES every standing hold, either origin, onto the adopted session
+//! ([`render_hold`] into the handoff record, [`parse_hold`] and
+//! [`SessionFabric::seed_hold`] in the successor, before the session can take
+//! a single control verb). Before that carry an automatic update lifted every
+//! halt in the process, silently, minutes after it was set (the round-four
+//! plan, item 3). A carried FLEET hold keeps the fleet's rule in the
+//! successor: its own bridge lifts it only from a broker's `Last` that shows
+//! no standing halt (`converge_hold`), so under a dead broker it stays exactly
+//! where it was. And a hold that moves after the park has drawn the manifest
+//! refuses the Commit ([`SessionFabric::hold_serial`]): the successor would
+//! not see it. From the instant the Commit reads that serial to its `_exit`,
+//! a hold transition waits instead ([`SessionFabric::fence_hold`]): nothing
+//! compares the serial again, so one answered in that stretch would be lost.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 #[cfg(any(unix, test))]
@@ -621,6 +637,15 @@ struct Inbox {
     dedup: VecDeque<u64>,
     dedup_set: HashSet<u64>,
     hold: Option<Hold>,
+    /// A seamless update is COMMITTING this session: its Commit has read the
+    /// hold serial it compares against the park's and is on its way to `_exit`
+    /// ([`SessionFabric::fence_hold`]). While it stands, a hold transition
+    /// waits ([`apply_hold`]) instead of landing: past that one comparison
+    /// nothing reads the serial again, so a halt answered `OK` here would be
+    /// lost with this process while the successor runs the session unhalted.
+    /// Cleared when the attempt stands down; never cleared on a Commit that
+    /// lands, because the process that set it is gone.
+    hold_fenced: bool,
     /// The `inbox get @<off>` reads parked for the bridge (`Pending`, listed on
     /// the `outbox` peek as `fetch sid= off=`) and the ones it answered
     /// (`Done`/`Failed`, kept so a second read of an immutable record costs no
@@ -870,6 +895,19 @@ pub(crate) struct SessionFabric {
     /// order and the second's `since=` is read. A session past the watch cap is
     /// polled instead, and read as its final set.
     topics: Mutex<std::collections::BTreeMap<String, TopicEntry>>,
+    /// How many times this session's hold has MOVED — set, replaced, lifted or
+    /// seeded by a handoff — bumped under the `inbox` guard that moves it.
+    ///
+    /// The seamless update's Commit reads it (`App::hold_serials`): the park
+    /// draws the handoff manifest, holds included, and then the successor
+    /// boots while this process's control thread is still serving. A `hold
+    /// on` answered in that window would land here and never reach the
+    /// successor — an update lifting a halt it had just acknowledged. A serial
+    /// that moved since the park refuses the Commit instead (the attempt is
+    /// retried, lossless). A counter rather than a comparison of holds, so a
+    /// hold set and lifted inside the window still counts as the change it
+    /// was.
+    hold_serial: std::sync::atomic::AtomicU64,
 }
 
 impl SessionFabric {
@@ -995,6 +1033,69 @@ impl SessionFabric {
     /// dispatch gate both take.
     pub(crate) fn hold(&self) -> Option<Hold> {
         self.lock().hold.clone()
+    }
+
+    /// How many times this session's hold has moved (see the field).
+    #[cfg(any(unix, test))]
+    pub(crate) fn hold_serial(&self) -> u64 {
+        self.hold_serial.load(Ordering::Acquire)
+    }
+
+    /// THE COMMIT'S READING OF THIS SESSION'S HOLD, and the fence that keeps
+    /// it true until the process exits: under the guard every hold transition
+    /// takes, mark the session committing and return its hold serial.
+    ///
+    /// Reading the serial and raising the fence under ONE guard is the whole
+    /// point. A `hold` that took the guard first has already bumped the serial
+    /// this returns, so the Commit sees it and stands down; one that takes it
+    /// after finds the fence and waits ([`apply_hold`]). Before the fence the
+    /// Commit compared the serial once and then ran the successor's
+    /// activation, the harness suspend and the identity markers before its
+    /// `_exit`, and a `hold on` answered `OK hold=1` inside that stretch
+    /// reached neither the manifest nor the successor (the round-four review).
+    #[cfg(unix)]
+    pub(crate) fn fence_hold(&self) -> u64 {
+        let mut inbox = self.lock();
+        inbox.hold_fenced = true;
+        self.hold_serial.load(Ordering::Acquire)
+    }
+
+    /// The attempt that fenced this session stood down: let the holds that
+    /// waited for it land ([`Self::fence_hold`]).
+    #[cfg(unix)]
+    pub(crate) fn lift_hold_fence(&self) {
+        let mut inbox = self.lock();
+        inbox.hold_fenced = false;
+        drop(inbox);
+        self.changed.notify_all();
+    }
+
+    /// Put back the hold a SEAMLESS UPDATE carried — the handoff's carry, and
+    /// nothing else ([`parse_hold`] already made it one).
+    ///
+    /// Called by `spawn_session` on the adopted session before
+    /// `register_session`, so before any control verb can resolve the session,
+    /// let alone drive it: there is no instant at which the adopted shell is
+    /// reachable unhalted. Recorded on the timeline under this guard, like
+    /// every hold transition, as `1 reason=… origin=… carried=1` — the
+    /// `carried=1` says the halt was not set in this process, which is the
+    /// question a reader of `events` after an update asks. Never refused: a
+    /// seed only ever halts, and the origin it carries is the origin the
+    /// fleet fence reads from here on.
+    pub(crate) fn seed_hold(
+        &self,
+        hold: Hold,
+        timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    ) {
+        let mut inbox = self.lock();
+        timeline.lock().unwrap_or_else(|p| p.into_inner()).record(
+            "hold",
+            format!("1 reason={} origin={} carried=1", hold.reason, hold.origin),
+        );
+        inbox.hold = Some(hold);
+        self.hold_serial.fetch_add(1, Ordering::AcqRel);
+        drop(inbox);
+        self.changed.notify_all();
     }
 
     /// **THE ROOM'S READ** (the resident pet, `kitty_pet` panel #9(e)) —
@@ -1440,7 +1541,7 @@ fn note_work_owed() {
     // read `stale` where it had established `connected`. Every other writer of
     // this struct already carries this guard; this one was the last without it.
     #[cfg(test)]
-    if link_write_is_foreign() {
+    if link_section_is_foreign() {
         return;
     }
     let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
@@ -1517,6 +1618,51 @@ pub(crate) fn fabric_state() -> &'static str {
         FABRIC_STALLED => "stalled",
         _ => "absent",
     }
+}
+
+/// [`fabric_state`] as an App's presence facts read it: the same token in
+/// production, where one process is one instance and so one App.
+///
+/// A TEST BINARY BREAKS THAT ONE-TO-ONE: every test builds its own App, and
+/// the link stays one `static`. A [`with_link_reset`] section holds an
+/// attached or lost bridge (`stalled`, `disconnected`) for its whole body, and
+/// either one is [`Link::Stalled`]/[`Link::Disconnected`] — `Level::Note`, a
+/// committed row — to any App that refreshed during it. So while a section is
+/// live on ANOTHER thread, an App reads `absent`: the state every section
+/// resets to on entry and on exit. The section's own thread reads the link
+/// itself.
+///
+/// The check and the read are ONE step: [`LINK_SECTION`]'s guard is held
+/// across the load, so no section can take ownership — and so none can attach
+/// — between "no foreign section" and the read (a check that released the
+/// guard first left that gap open to a preempted reader). No lock nests the
+/// other way: every writer checks and releases before it takes `LINK.link`,
+/// and a section sets and clears its owner under acquisitions of their own.
+/// What this cannot see is a test that moves the link WITHOUT a section; every
+/// test that attaches or loses a bridge takes one ([`with_link_reset`]).
+///
+/// Measured 2026-09-28: `presence_fp_is_zero_over_a_thousand_idle_frames`
+/// (which takes no section) read `presence_fp == 256` — a committed row — at
+/// its fresh stub window's first idle frame once in three parallel `-p
+/// aterm-gui --lib` runs;
+/// `review_r1_focus_alone_never_reads_another_sessions_story` had read
+/// `Note` for `Quiet` the same way on 2026-09-20 and was mended by taking a
+/// section. This keys the read, so no App reader has to remember to.
+///
+/// [`Link::Stalled`]: aterm_messages::presence::Link::Stalled
+/// [`Link::Disconnected`]: aterm_messages::presence::Link::Disconnected
+pub(crate) fn fabric_state_seen() -> &'static str {
+    #[cfg(test)]
+    {
+        let section = LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner());
+        if section.is_some_and(|owner| owner != std::thread::current().id()) {
+            return "absent";
+        }
+        // Read while the guard is still held: see the doc comment.
+        fabric_state()
+    }
+    #[cfg(not(test))]
+    fabric_state()
 }
 
 /// The link's three reported facts, as `status` and `fabric status` print them:
@@ -1646,7 +1792,7 @@ pub(crate) fn bridge_attached(generation: BridgeGeneration) {
 pub(crate) fn link_evidence(generation: Option<BridgeGeneration>) {
     // A SIBLING TEST'S `deliver` SPEAKS FOR NO BRIDGE (see [`LINK_SECTION`]).
     #[cfg(test)]
-    if link_write_is_foreign() {
+    if link_section_is_foreign() {
         return;
     }
     let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
@@ -1970,6 +2116,10 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
                 .map(|h| h.ctx.clone())
         };
         if let Some(ctx) = ctx {
+            // No bound on a committing update's fence: this halt is the one
+            // that must not be dropped, and the fence ends with the Commit —
+            // in `_exit`, which ends this sweep too, or in the attempt
+            // standing down, which lets it land.
             apply_hold(
                 &ctx,
                 Some(Hold {
@@ -1977,6 +2127,7 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
                     origin: "fleet".to_string(),
                 }),
                 HoldIssuer::Bridge,
+                None,
             );
             held += 1;
         }
@@ -2145,6 +2296,12 @@ pub(crate) fn is_pty_reaching(verb: &str) -> bool {
             | "resize"
             | "focus"
             | "signal"
+            // The manual reset (2026-09-26): it moves the session's terminal
+            // modes out from under whatever runs there, and `reset flush`
+            // drops its input queue — a driver's act on the session, which a
+            // halt stops. The HUMAN's escape hatch is the menu row, which is
+            // not a socket verb and is never halted (its `invoke` twin is).
+            | "reset"
             | "turn"
             | "close"
             | "invoke"
@@ -2377,6 +2534,20 @@ const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fl
 /// denied` of an edge token or a selector.
 pub(crate) const HOLD_DENIED: &str = "ERR denied: only the fleet sets or lifts a fleet hold\n";
 
+/// The answer to a `hold` that arrived while a seamless update was committing
+/// the session and waited [`HOLD_FENCE_WAIT`] without the update either
+/// landing or standing down. Nothing moved: `ERR busy` is the transient class
+/// a driver already retries, and the retry reaches whichever process then
+/// owns the session.
+pub(crate) const HOLD_BUSY: &str = "ERR busy update-committing\n";
+
+/// How long a `hold` verb waits for a committing update
+/// ([`SessionFabric::fence_hold`]) before it answers [`HOLD_BUSY`]. The fenced
+/// stretch is the successor's activation, the harness suspend, the identity
+/// markers and one pipe write — milliseconds; this is the bound for a Commit
+/// that is stuck, so a control connection never waits on one for good.
+pub(crate) const HOLD_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Who is issuing a `hold` — the whole of what the two owner-class scopes that
 /// may run it differ in. The dispatch maps `Scope::Bridge` to [`Self::Bridge`]
 /// and `Scope::Owner` to [`Self::Owner`]; an edge token never reaches the
@@ -2402,6 +2573,9 @@ enum Applied {
     /// An Owner-issued act met a standing `origin=fleet` hold and was refused
     /// without touching it. Never answered to [`HoldIssuer::Bridge`].
     FleetHeld,
+    /// A seamless update was committing the session for the whole of the wait
+    /// the caller allowed ([`SessionFabric::fence_hold`]); nothing moved.
+    Fenced,
 }
 
 /// Apply (or lift) a hold and record the transition. Records the timeline event
@@ -2415,8 +2589,42 @@ enum Applied {
 /// between an Owner's check and its write cannot be replaced or lifted by that
 /// write: whichever hold is there when the guard is taken is the one the rule
 /// sees.
-fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>, issuer: HoldIssuer) -> Applied {
+///
+/// AND SO IS THE COMMIT FENCE ([`SessionFabric::fence_hold`]): while a
+/// seamless update is committing the session, the transition waits on the
+/// session's condvar — for at most `fence_wait`, or until the fence lifts when
+/// that is `None` — and lands only once the attempt has stood down. An update
+/// that lands `_exit`s this process with the waiter still waiting, so no
+/// transition is ever acknowledged that the successor did not adopt. Past the
+/// wait it answers [`Applied::Fenced`] with nothing moved.
+fn apply_hold(
+    ctx: &SessionCtx,
+    hold: Option<Hold>,
+    issuer: HoldIssuer,
+    fence_wait: Option<std::time::Duration>,
+) -> Applied {
     let mut inbox = ctx.fabric.lock();
+    let deadline = fence_wait.map(|wait| std::time::Instant::now() + wait);
+    while inbox.hold_fenced {
+        inbox = match deadline {
+            None => ctx
+                .fabric
+                .changed
+                .wait(inbox)
+                .unwrap_or_else(|p| p.into_inner()),
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Applied::Fenced;
+                }
+                ctx.fabric
+                    .changed
+                    .wait_timeout(inbox, left)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            }
+        };
+    }
     if issuer == HoldIssuer::Owner && inbox.hold.as_ref().is_some_and(|h| h.origin != "local") {
         return Applied::FleetHeld;
     }
@@ -2427,6 +2635,7 @@ fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>, issuer: HoldIssuer) -> Appli
             None => (0, "-".to_string(), "local".to_string()),
         };
         inbox.hold = hold;
+        ctx.fabric.hold_serial.fetch_add(1, Ordering::AcqRel);
         ctx.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2469,10 +2678,12 @@ fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>, issuer: HoldIssuer) -> Appli
 static LINK_SECTION: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
 /// True when a [`with_link_reset`] section is live on ANOTHER thread, so this
-/// caller's write to the link would land inside someone else's measurement.
-/// Test-only; production has one bridge and one instance.
+/// caller's write to the link would land inside someone else's measurement —
+/// and an App's read of it ([`fabric_state_seen`]) would carry that
+/// measurement into a window that is not part of it. Test-only; production
+/// has one bridge and one instance.
 #[cfg(test)]
-fn link_write_is_foreign() -> bool {
+fn link_section_is_foreign() -> bool {
     LINK_SECTION
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2541,10 +2752,13 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
                 LINK_TESTS.try_lock().is_err(),
                 "the link reset ran outside the lock that serializes it"
             );
-            // Released BEFORE the reset and while the lock is still held, so no
-            // window exists in which the state is live and unowned.
-            *LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            // Reset FIRST, then released, both while the lock is still held,
+            // so no window exists in which the state is live and unowned: the
+            // other order let a sibling's read ([`fabric_state_seen`]) or write
+            // pass the foreign check between the release and the reset and
+            // meet this section's attached bridge.
             reset_now();
+            *LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
 
@@ -2581,7 +2795,7 @@ pub(crate) fn touched_contains(sid: &str) -> bool {
 /// Bridge-issued, so it is never refused; `true` when the state moved.
 #[cfg(test)]
 pub(crate) fn apply_hold_for_test(ctx: &SessionCtx, hold: Option<Hold>) -> bool {
-    apply_hold(ctx, hold, HoldIssuer::Bridge) == Applied::Changed
+    apply_hold(ctx, hold, HoldIssuer::Bridge, Some(HOLD_FENCE_WAIT)) == Applied::Changed
 }
 
 /// `hold <sid> on|off [reason=<pct>] [origin=fleet|local]` — the drive halt,
@@ -2608,7 +2822,25 @@ pub(crate) fn apply_hold_for_test(ctx: &SessionCtx, hold: Option<Hold>) -> bool 
 ///
 /// An Owner-issued act does NOT mark the session bridge-governed
 /// ([`note_bridge_touched`]): see that function for why.
+///
+/// A SEAMLESS UPDATE COMMITTING THE SESSION holds the answer back
+/// ([`SessionFabric::fence_hold`]) for up to [`HOLD_FENCE_WAIT`]: an attempt
+/// that stands down lets the act land and answers it as usual; one that lands
+/// takes this process with it, so the caller sees its connection close with
+/// no answer and its retry reaches the successor — never an `OK` for a halt
+/// the successor did not adopt. Past the wait it is [`HOLD_BUSY`].
 pub(crate) fn cmd_hold(store: &Store, rest: &str, issuer: HoldIssuer) -> String {
+    cmd_hold_within(store, rest, issuer, HOLD_FENCE_WAIT)
+}
+
+/// [`cmd_hold`] with the wait for a committing update as an argument, so a
+/// test can reach the [`HOLD_BUSY`] answer without sitting out the real bound.
+pub(crate) fn cmd_hold_within(
+    store: &Store,
+    rest: &str,
+    issuer: HoldIssuer,
+    fence_wait: std::time::Duration,
+) -> String {
     let mut toks = rest.split_whitespace();
     let (Some(sid), Some(state)) = (toks.next(), toks.next()) else {
         return HOLD_USAGE.to_string();
@@ -2657,8 +2889,10 @@ pub(crate) fn cmd_hold(store: &Store, rest: &str, issuer: HoldIssuer) -> String 
         reason: reason_token(&reason),
         origin,
     });
-    if apply_hold(&ctx, hold, issuer) == Applied::FleetHeld {
-        return HOLD_DENIED.to_string();
+    match apply_hold(&ctx, hold, issuer, Some(fence_wait)) {
+        Applied::FleetHeld => return HOLD_DENIED.to_string(),
+        Applied::Fenced => return HOLD_BUSY.to_string(),
+        Applied::Changed | Applied::Unchanged => {}
     }
     format!("OK hold={}\n", u8::from(on))
 }
@@ -3645,6 +3879,47 @@ pub(crate) fn parse_topics(rows: &[String]) -> Vec<(String, TopicEntry)> {
         .collect()
 }
 
+/// The reason [`parse_hold`] gives a carried hold it could not read.
+pub(crate) const CARRIED_UNREADABLE: &str = "carried-unreadable";
+
+/// The standing hold as the HANDOFF MANIFEST carries it
+/// (`SessionRecord::hold`): `"<origin> <reason>"`, both already wire tokens —
+/// the origin is `fleet` or `local` and the reason [`reason_token`]'s output,
+/// which holds no space.
+#[cfg(any(unix, test))]
+pub(crate) fn render_hold(hold: &Hold) -> String {
+    format!("{} {}", hold.origin, hold.reason)
+}
+
+/// The inverse of [`render_hold`], FAIL-CLOSED: every input is a hold.
+///
+/// The row comes from a file on disk that an older build, a rollback, or
+/// anything that can write the private state directory may have produced — and
+/// unlike a topic row ([`parse_topics`]), a hold row that does not read cannot
+/// be DROPPED, because dropping it lifts a halt. So a row outside the grammar
+/// halts the session anyway, `reason=carried-unreadable`, under the STRONGER
+/// origin the row could have meant: `fleet` when it says so first, else
+/// `local`. The reason is rebuilt by [`reason_token`] on the way in, as a
+/// bridge's would be. The worst a hostile row can do is halt a session, which
+/// the owner's `hold off` undoes for a local hold and a reconnecting bridge
+/// for a fleet one.
+pub(crate) fn parse_hold(row: &str) -> Hold {
+    let mut words = row.split(' ');
+    let origin = words.next().unwrap_or_default();
+    let reason = words.next().filter(|reason| !reason.is_empty());
+    let origin_word = if origin == "fleet" { "fleet" } else { "local" };
+    let reason = match reason {
+        Some(reason) if matches!(origin, "fleet" | "local") && words.next().is_none() => {
+            reason_token(reason)
+        }
+        _ => CARRIED_UNREADABLE.to_string(),
+    };
+    Hold {
+        reason,
+        origin: origin_word.to_string(),
+    }
+}
+
 /// Whether `s` is a `since=` token: `head`, or `@<decimal offset>`.
 fn valid_since(s: &str) -> bool {
     s == "head"
@@ -3994,14 +4269,14 @@ fn inbox_get_at(ctx: &SessionCtx, off: u64) -> String {
             return unfetched(&inbox, off, why);
         }
         let now = std::time::Instant::now();
-        if now >= deadline {
+        if now >= deadline || crate::control::caller_hung_up() {
             inbox.fetches.remove(i);
             return unfetched(&inbox, off, format!("ERR timeout off={off}\n"));
         }
         let (next, _) = ctx
             .fabric
             .changed
-            .wait_timeout(inbox, deadline - now)
+            .wait_timeout(inbox, crate::control::hangup_park(deadline - now))
             .unwrap_or_else(|p| p.into_inner());
         inbox = next;
     }
@@ -4496,6 +4771,11 @@ fn wait_landing(
         if wait_is_futile() {
             return Err(fabric_wait_refusal(id));
         }
+        // The caller hung up: nobody can read the verdict, so the lane goes
+        // back now. The post itself is untouched — it lands or not as it would.
+        if crate::control::caller_hung_up() {
+            return Err(crate::control::HUNG_UP_REPLY.to_string());
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             return Err(format!("ERR timeout id={id}\n"));
@@ -4506,7 +4786,7 @@ fn wait_landing(
         // above would start returning true, and the next turn of the loop
         // answers `ERR fabric stale id=<n> queued=1` instead of sitting out
         // the remaining minutes.
-        let mut park = deadline - now;
+        let mut park = crate::control::hangup_park(deadline - now);
         if let Some(until_stale) = stale_in().filter(|d| !d.is_zero()) {
             park = park.min(until_stale);
         }
@@ -4547,6 +4827,9 @@ fn wait_receipt(ctx: &SessionCtx, id: u64, off: u64, dup: &str, bound_ms: u64) -
         if wait_is_futile() {
             return format!("ERR fabric {} id={id} off={off}\n", fabric_state());
         }
+        if crate::control::caller_hung_up() {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             return format!("ERR timeout id={id} off={off}\n");
@@ -4558,7 +4841,7 @@ fn wait_receipt(ctx: &SessionCtx, id: u64, off: u64, dup: &str, bound_ms: u64) -
         // OF THE TWO — its bound is the sender's `dl=` plus a grace, up to
         // `WAIT_MAX_MS` — so sitting it out is the more expensive mistake, and
         // round 21 shipped the cap on the landing wait alone.
-        let mut park = deadline - now;
+        let mut park = crate::control::hangup_park(deadline - now);
         if let Some(until_stale) = stale_in().filter(|d| !d.is_zero()) {
             park = park.min(until_stale);
         }
@@ -4721,6 +5004,9 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
         if watch_hold && guard.hold.is_some() != hold_at_arm {
             return format!("OK inbox hold={}\n", u8::from(guard.hold.is_some()));
         }
+        if crate::control::caller_hung_up() {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             return "OK timeout\n".to_string();
@@ -4728,7 +5014,7 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
         let (next, _) = ctx
             .fabric
             .changed
-            .wait_timeout(guard, deadline - now)
+            .wait_timeout(guard, crate::control::hangup_park(deadline - now))
             .unwrap_or_else(|p| p.into_inner());
         guard = next;
     }
@@ -5032,6 +5318,75 @@ mod inbox_hold {
     /// `cmd_hold` as the local OWNER token issues it.
     fn owner_hold(store: &Store, rest: &str) -> String {
         cmd_hold(store, rest, HoldIssuer::Owner)
+    }
+
+    /// A COMMITTING UPDATE HOLDS EVERY HOLD BACK AND DROPS NONE (the
+    /// round-four review). While a session is fenced
+    /// ([`SessionFabric::fence_hold`]) a verb's act waits and, past its bound,
+    /// answers [`HOLD_BUSY`] with the serial unmoved; the bridge-lost sweep's
+    /// act (no bound) waits and LANDS the moment the attempt stands down —
+    /// the fail-closed halt is delayed by a Commit, never dropped by one.
+    ///
+    /// FAILS WITHOUT THE FIX: there was no fence, so the verb answered
+    /// `OK hold=1` and moved the serial the Commit had already compared.
+    #[cfg(unix)]
+    #[test]
+    fn a_committing_update_holds_every_hold_back_and_drops_none() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let serial = ctx.fabric.fence_hold();
+        assert_eq!(
+            cmd_hold_within(
+                &store,
+                &format!("{sid} on reason=stop"),
+                HoldIssuer::Owner,
+                std::time::Duration::from_millis(50),
+            ),
+            HOLD_BUSY
+        );
+        assert_eq!(ctx.fabric.hold(), None);
+        assert_eq!(ctx.fabric.hold_serial(), serial, "nothing moved");
+
+        let waiter = {
+            let ctx = std::sync::Arc::clone(&ctx);
+            std::thread::spawn(move || {
+                apply_hold(
+                    &ctx,
+                    Some(Hold {
+                        reason: "fabric-lost".to_string(),
+                        origin: "fleet".to_string(),
+                    }),
+                    HoldIssuer::Bridge,
+                    None,
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiter.is_finished(), "the sweep waits out the Commit");
+        assert_eq!(ctx.fabric.hold(), None);
+        ctx.fabric.lift_hold_fence();
+        assert_eq!(waiter.join().expect("the sweep"), Applied::Changed);
+        assert_eq!(
+            ctx.fabric.hold().map(|hold| hold.origin),
+            Some("fleet".to_string())
+        );
+        assert_ne!(ctx.fabric.hold_serial(), serial);
+        // Unfenced, the verb is answered at once again.
+        assert_eq!(owner_hold(&store, &format!("{sid} off")), HOLD_DENIED);
+    }
+
+    /// The `hold` verb's help states the commit fence as this build keeps it:
+    /// its bound and its answer.
+    #[test]
+    fn the_hold_help_states_the_commit_fence_as_it_is() {
+        let help = aterm_types::control_verbs::spec("hold")
+            .expect("the hold verb")
+            .help_line();
+        assert!(
+            help.contains(&format!("past {} s", HOLD_FENCE_WAIT.as_secs())),
+            "{help}"
+        );
+        assert!(help.contains(HOLD_BUSY.trim_end()), "{help}");
     }
 
     /// ONE PRINCIPAL GRAMMAR, AND IT IS §3.2's.
@@ -6534,7 +6889,7 @@ mod inbox_hold {
             );
             // The one refusal `apply_hold` answers to the Owner, stated as itself.
             assert_eq!(
-                apply_hold(&ctx, None, HoldIssuer::Owner),
+                apply_hold(&ctx, None, HoldIssuer::Owner, Some(HOLD_FENCE_WAIT)),
                 Applied::FleetHeld
             );
 

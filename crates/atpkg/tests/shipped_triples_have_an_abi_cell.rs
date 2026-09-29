@@ -18,7 +18,7 @@
 //! law 2 the cheap way to green law 1 on a future `aarch64-unknown-linux-musl` is a bare row,
 //! which ships a libc with no libc in it.
 //!
-//! `cargo xtask gate cells` really cross-compiles and stays the authority; this guard is pure
+//! `targo --unverified run -p xtask -- gate cells` really cross-compiles and stays the authority; this guard is pure
 //! `std`, reads only committed sources under `CARGO_MANIFEST_DIR`, and proves only that the
 //! escape list does not refuse a shipped triple outright.
 //!

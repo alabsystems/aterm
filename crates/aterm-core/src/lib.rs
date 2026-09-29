@@ -78,7 +78,7 @@
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 // Test code (compiled via --all-targets) is exempt from strict clippy.
-// Production code is still checked: `cargo clippy -p aterm-core --lib` enforces all + pedantic.
+// Production code is still checked: `targo tippy -p aterm-core --lib` enforces all + pedantic.
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
 #![allow(
     unexpected_cfgs,

@@ -4,6 +4,7 @@ description = "astream servable broker: durable exactly-once pub/sub, Filter-rou
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
@@ -40,8 +41,8 @@ retention = []
 
 [dependencies]
 astream-wire = { workspace = true }
-astream-cap = { path = "../astream-cap", optional = true }
-astream-aead = { path = "../astream-aead", optional = true }
+astream-cap = { path = "../astream-cap", version = "0.1.0", optional = true }
+astream-aead = { path = "../astream-aead", version = "0.1.0", optional = true }
 
 # Dev-only, and IN-TREE (not third-party): the cognition-routing test publishes a
 # REAL astream-agent CogRecord through the bus. astream-agent's own lib graph is

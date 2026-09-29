@@ -1,0 +1,41 @@
+# codex 0.158.0 · HAND-BUILT 2026-09-28: its last eight rows (the status row with its background-terminal tail, the `└ Tip:` row under it, the `»` composer drawn while a goal turn runs, and the two-row footer whose right side reads `Pursuing goal (10d 3h 2m)`) copied from a MEASURED read-only `aterm ctl text tail=30` of a live 0.158.0 tab (the thread's title and folder replaced at equal length); the transcript rows above them are neutral stand-ins
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Ran cargo test -p parser
+  └ test result: ok. 214 passed; 0 failed
+
+• Explored
+  └ Read lexer.rs, grammar.rs
+
+• Working (10m 57s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+  └ Tip: When goals are enabled, use /goal to set or inspect the objective for a long-running task.
+
+
+» Ask Codex to do anything
+
+  GPT-6-Astra ultra · ~/pj · Fix the parser bugs · Main [default]                                       Pursuing goal (10d 3h 2m)
+  ← for agents · ? for shortcuts

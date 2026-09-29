@@ -84,9 +84,11 @@ impl Terminal {
             window_callback: None,
             text_selection: crate::selection::TextSelection::new(),
             parked_text_selection: crate::selection::TextSelection::new(),
+            resize_undo_selection: None,
             last_custody: None,
             last_custody_change: None,
             last_selection_taker: None,
+            reader_gestures: 0,
             secure_keyboard_entry: false,
             vi: crate::vi_mode::ViMode::new(),
             sync_timeout_duration: std::time::Duration::from_secs(1),
@@ -110,6 +112,7 @@ impl Terminal {
             repaint_blink_epoch: 0,
             evidence_asserted: 0,
             content_scroll_state: super::ContentScrollState::default(),
+            resize_journal: super::resize_journal::ResizeJournal::default(),
         };
 
         terminal.sync_bidi_resolver_from_config();

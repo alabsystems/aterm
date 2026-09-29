@@ -1380,7 +1380,7 @@ fn selection_target(input: &RenderInput, pane: PetPane) -> Option<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+    use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
     use aterm_core::selection::{SelectionSide, SelectionType};
     use std::sync::Arc;
 
@@ -1555,10 +1555,12 @@ mod tests {
                     rows: 1,
                     z_index: -1,
                     band_lift_px: 0,
-                    pixel_exact: false,
+                    scaling: ImageScaling::Fit,
+                    source_rect: None,
                 }),
                 cell_row: 0,
                 cell_col: 0,
+                kitty: None,
             },
         )];
         let mut world = PetWorld::default();
@@ -2013,10 +2015,12 @@ mod tests {
                         rows: 1,
                         z_index: 0,
                         band_lift_px: 0,
-                        pixel_exact: false,
+                        scaling: ImageScaling::Fit,
+                        source_rect: None,
                     }),
                     cell_row: 0,
                     cell_col: u16::try_from(col).expect("test column"),
+                    kitty: None,
                 },
             )
         };
@@ -2222,10 +2226,12 @@ mod tests {
                                         rows: 1,
                                         z_index: 0,
                                         band_lift_px: 0,
-                                        pixel_exact: false,
+                                        scaling: ImageScaling::Fit,
+                                        source_rect: None,
                                     }),
                                     cell_row: 0,
                                     cell_col: u16::try_from(c.min(65535)).unwrap_or(0),
+                                    kitty: None,
                                 },
                             )
                         })

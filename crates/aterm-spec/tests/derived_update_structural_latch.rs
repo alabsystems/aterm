@@ -165,6 +165,62 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
     assert!(model.fire("ArmSameBuild", &mut same));
     assert_eq!((same["latched"], same["escaped"]), (1, 0));
 
+    // A count that cannot be read (round six, finding 55): the day's due
+    // looks each ask for an observation and count, and at the bound the
+    // re-sample is withdrawn and the hold said — with room or without, since
+    // `room` is then no reading. A reading that comes back clears the count.
+    for trial in ["TrialHasRoom", "TrialIsSpent"] {
+        let mut unread = model.init_state();
+        assert!(model.fire(trial, &mut unread));
+        assert!(model.fire("Decide", &mut unread));
+        assert!(model.fire("TrialUnreadable", &mut unread));
+        assert!(model.fire("Decide", &mut unread));
+        if trial == "TrialIsSpent" {
+            assert_eq!(unread["owed"], 0, "the first count already withdrew it");
+            continue;
+        }
+        assert_eq!(
+            (unread["looks"], unread["owed"]),
+            (0, 1),
+            "a look before the day counts nothing"
+        );
+        assert!(model.fire("DayPasses", &mut unread));
+        let bound = unread_looks(&model);
+        for look in 1..=bound {
+            assert!(model.fire("Decide", &mut unread));
+            assert_eq!(
+                (unread["looks"], unread["pending"], unread["owed"]),
+                (look, 1, 1),
+                "look {look}: counted, and another observation asked for"
+            );
+        }
+        let mut read_again = unread.clone();
+        assert!(model.fire("Decide", &mut unread));
+        assert_eq!(
+            (
+                unread["latched"],
+                unread["owed"],
+                unread["spent"],
+                unread["said"],
+                unread["looks"],
+                unread["pending"]
+            ),
+            (1, 0, 1, 1, 0, 0),
+            "at the bound: held, nothing promised, said"
+        );
+        assert!(model.fire("TrialReadAgain", &mut read_again));
+        assert!(model.fire("Decide", &mut read_again));
+        assert_eq!(
+            (
+                read_again["looks"],
+                read_again["latched"],
+                read_again["owed"]
+            ),
+            (0, 0, 0),
+            "a reading with room releases the re-sample and clears the count"
+        );
+    }
+
     // NEGATIVE CONTROL, one arc per mutant.
     let buggy = interp::with_buggy(&model, 1);
     // GAP 14'S OWN `Decide` (0.94.0), looking at the newer release before the
@@ -259,4 +315,30 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
     assert!(buggy.fire("ArmSameBuild", &mut escaped));
     assert!(!buggy.check_invariant("SameBuildStaysLatched", &escaped));
     assert!(!buggy.check_invariant("ReleasedOnlyByAnEvent", &escaped));
+    // THE PROMISE KEPT FOREVER: at the bound the unreadable count is
+    // forgotten, the re-sample still owed, and nothing asks again.
+    let mut forever = buggy.init_state();
+    assert!(buggy.fire("TrialHasRoom", &mut forever));
+    assert!(buggy.fire("Decide", &mut forever));
+    assert!(buggy.fire("TrialUnreadable", &mut forever));
+    assert!(buggy.fire("DayPasses", &mut forever));
+    for _ in 0..=unread_looks(&buggy) {
+        assert!(buggy.fire("Decide", &mut forever));
+    }
+    assert_eq!(
+        (forever["owed"], forever["pending"], forever["looks"]),
+        (1, 0, 0),
+        "the promise stands and nothing asks"
+    );
+    assert!(!buggy.check_invariant("NoRetryPromisedPastTheBound", &forever));
+}
+
+/// The model's `UnreadLooks` bound.
+fn unread_looks(model: &aterm_spec::derive::Model) -> i64 {
+    model
+        .consts
+        .iter()
+        .find(|(name, _)| *name == "UnreadLooks")
+        .map(|(_, value)| *value)
+        .expect("the model names its bound")
 }

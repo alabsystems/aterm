@@ -147,7 +147,13 @@ pub(crate) struct Config {
     /// momentum glow for typing faster that cools down"); set
     /// `cursor_momentum_glow = false` to opt out. Any style, any shape; it
     /// rides the cursor-effects lane, so `cursor_trail = false` (the effects
-    /// master) turns it off with everything else.
+    /// master) turns it off with everything else — which the frame step has
+    /// honoured since 2026-09-27 (before, a master-off window typed into fast
+    /// still lit it). So its effective default follows the master's:
+    /// [`DEFAULT_DECORATIVE_EFFECTS`], OFF on Windows. Decided 2026-09-27 under
+    /// the owner's standing direction: the glow is a cursor decoration like the
+    /// rest of the family, and Windows' minimal-fast default keeps it off until
+    /// `cursor_trail = true` turns the family on.
     pub(crate) cursor_momentum_glow: Option<bool>,
     /// Trail STYLE: `rainbow kitty pet` (DEFAULT — the smooth momentum-driven
     /// rainbow ribbon with the full-body cat that walks, runs and pounces along
@@ -818,6 +824,18 @@ pub(crate) struct Config {
     /// the row withdraws, the probe is never asked for another reading, and
     /// nothing is armed. Applied live.
     pub(crate) explain_heavy_load: Option<bool>,
+    /// DESKTOP ALERTS: whether aterm posts its OWN notices as operating-system
+    /// notifications — the escalation herald ("aterm · needs you", "agent
+    /// stopped", "program frozen"), the embedded operator ("aterm operator"),
+    /// the consent attention path and the update-health banner. Default OFF
+    /// (owner, 2026-09-28: "I don't know what these OSX alerts are from aterm
+    /// but they are annoying, disable them" — without `terminal-notifier`
+    /// macOS shows them as Script Editor's). Off, the notices still reach the
+    /// message band, the menu bar, the tab marks and `messages.log`; only the
+    /// desktop banner is withheld. Program notifications (OSC 9/99/777) are
+    /// `allow_notifications`'s, not this key's. Applied live
+    /// (`notify::spawn_delivery`'s `own_alerts`).
+    pub(crate) desktop_alerts: Option<bool>,
     /// Whether every FRESH session spawn also installs/updates the coding-agent
     /// primer (and the bundled skills) for every DETECTED agent — the same upsert
     /// `aterm agents install` performs, run by aterm itself on a detached thread
@@ -1094,8 +1112,9 @@ pub(crate) struct Config {
     /// See [`UpdateConfig`], crate `aterm-update`, and `docs/RELEASING.md`.
     pub(crate) update: Option<UpdateConfig>,
     /// Sparkle words (`[sparkle_words]`): decorate matched profanity words with a
-    /// randomized sparkle and cat/kitty words with a cat-paw. The retained Orca
-    /// config parses for compatibility but is suspended and has no runtime effect.
+    /// randomized sparkle and cat/kitty words with a cat-paw. A leftover
+    /// `[sparkle_words.orca]` table (the orca class was deleted 2026-09-27) is
+    /// ignored; the config editor reports it as compatibility-only.
     /// Absent ⇒ both live keyword toys are ON; set `enabled = false` to disable.
     /// See [`SparkleWordsConfig`].
     pub(crate) sparkle_words: Option<SparkleWordsConfig>,
@@ -1138,6 +1157,12 @@ pub(crate) struct Config {
     /// an edit; the GUI only displays and edits it.
     /// Absent ⇒ both on. See [`MachineConfig`].
     pub(crate) machine: Option<MachineConfig>,
+    /// THE PTY KEEPER (`[keeper]`, P3 of `docs/DESIGN-pty-keeper-2026-09-26.md`):
+    /// whether this window registers every terminal's master with the keeper,
+    /// so a crash, a kill or a Force Quit does not hang its shells up and the
+    /// next launch reattaches them. Absent ⇒ OFF (P3 is opt-in; P4 turns it on
+    /// by default). Read at launch. See [`KeeperConfig`].
+    pub(crate) keeper: Option<KeeperConfig>,
     /// The supervisor's `[harness]` policy, as the table's ONE reader takes it
     /// from the file's whole text ([`HarnessPolicy`]). Not deserialized: that
     /// reader also reads a `harness.<key>` written below another table's
@@ -1349,7 +1374,7 @@ pub(crate) struct SparkleWordsConfig {
     pub(crate) deny: Option<Vec<String>>,
     /// The non-feline Sparkle Words product settings. The historical table name is
     /// retained for config compatibility; its `enabled` key gates profanity,
-    /// emphasis, custom/Toy Pack words, and the suspended orca class together.
+    /// emphasis and custom/Toy Pack words together.
     pub(crate) profanity: Option<SparkleProfanityConfig>,
     /// The steady feline CAT-PAW sub-table.
     pub(crate) feline: Option<SparkleFelineConfig>,
@@ -1357,9 +1382,6 @@ pub(crate) struct SparkleWordsConfig {
     pub(crate) canine: Option<SparkleCanineConfig>,
     /// The typed KITTY-COMMAND sub-table (`sit`, `kitty jump`, `good kitty`).
     pub(crate) tricks: Option<SparkleTricksConfig>,
-    /// Retained compatibility-only Orca sub-table. It parses and round-trips,
-    /// but `ORCA_SUSPENDED` makes the whole subtree have no runtime effect.
-    pub(crate) orca: Option<SparkleOrcaConfig>,
     /// The animated glyph-ink shimmer sub-table (v2).
     pub(crate) ink: Option<SparkleInkConfig>,
     /// The emphasis / hype-word class sub-table (v2, ink-only).
@@ -1830,6 +1852,15 @@ impl ThemeCatalog {
             })
     }
 
+    /// Every custom theme the folder held, by name, with the reason it did
+    /// not load (`None` for one that loaded).
+    pub(crate) fn listing(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.entries.iter().map(|entry| match &entry.resolution {
+            ThemeAssetResolution::Ready(_) => (entry.name.as_str(), None),
+            ThemeAssetResolution::Invalid(reason) => (entry.name.as_str(), Some(&**reason)),
+        })
+    }
+
     /// Resolve a built-in or parsed user-theme entry, case-insensitively. No
     /// filesystem access is possible from this API. Case-fold collisions are
     /// rejected during admission, so picker, renderer, engine, and diagnostics
@@ -1852,10 +1883,12 @@ impl ThemeCatalog {
                 resolution: ThemeAssetResolution::Invalid(reason),
                 ..
             }) => Err(format!("{} is invalid ({reason})", source_id)),
-            None if self.truncated => Err(format!(
-                "not present in the bounded {MAX_USER_THEME_FILES}-theme active catalog"
-            )),
-            None => Err("not found in the active theme catalog".to_string()),
+            None if self.truncated => Err(
+                "no built-in or loaded custom theme by that name (the themes folder holds more \
+                 files than aterm loads)"
+                    .to_string(),
+            ),
+            None => Err("no built-in or loaded custom theme by that name".to_string()),
         }
     }
 
@@ -2298,8 +2331,8 @@ pub(crate) struct CursorGlowInputs {
 
 /// `[sparkle_words.ink]` — the animated glyph-ink shimmer (v2): matched words'
 /// glyphs recolor through a two-tone gradient with one traveling specular sweep,
-/// then settle to constant bytes. Applies to emphasis + profanity + feline
-/// (orca untouched); takes effect only when `sparkle_words.enabled` is on.
+/// then settle to constant bytes. Applies to emphasis + profanity + feline;
+/// takes effect only when `sparkle_words.enabled` is on.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleInkConfig {
@@ -2336,9 +2369,9 @@ pub(crate) struct SparkleEmphasisConfig {
 #[serde(default)]
 pub(crate) struct SparkleProfanityConfig {
     /// Enable the non-feline Sparkle Words toy. Default TRUE. This historical
-    /// location remains stable, but the switch also gates emphasis, custom/Toy
-    /// Pack words, and the suspended orca class so the Top Settings toggle is an
-    /// honest product-level off switch. Keyword Kitties remains independent.
+    /// location remains stable, but the switch also gates emphasis and
+    /// custom/Toy Pack words so the Top Settings toggle is an honest
+    /// product-level off switch. Keyword Kitties remains independent.
     pub(crate) enabled: Option<bool>,
     /// `"rainbow"` (the v3 default: animated rainbow ink, `supernova_chance`%
     /// of episodes escalate to the FUCK SUPER NOVA) | `"nova"` = the v2
@@ -2462,20 +2495,6 @@ pub(crate) struct SparkleTricksConfig {
     /// real `sit` or `play` program on their PATH. The line is still judged
     /// (the listener does not know the list); only the answer is withheld,
     /// and with it the exit-127 forgiveness a submitted pet-only line earns.
-    pub(crate) ignore_words: Option<Vec<String>>,
-}
-
-/// Compatibility shape for the suspended `[sparkle_words.orca]` feature. These
-/// fields remain deserializable so existing files survive unchanged; the
-/// runtime hard-gates the entire subtree with `ORCA_SUSPENDED`.
-#[derive(Default, Clone, PartialEq, serde::Deserialize)]
-#[serde(default)]
-pub(crate) struct SparkleOrcaConfig {
-    /// Historical enable bit. Parsed only; currently has no effect.
-    pub(crate) enabled: Option<bool>,
-    /// Historical extra words. Parsed only; currently has no effect.
-    pub(crate) extra_words: Option<Vec<String>>,
-    /// Historical deny words. Parsed only; currently has no effect.
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
@@ -2900,6 +2919,26 @@ pub(crate) struct RerouteConfig {
     pub(crate) announce: Option<bool>,
 }
 
+/// The `[keeper]` table — one key, `enabled` (default OFF in P3): the window
+/// registers each terminal with this build's PTY keeper (`aterm keeper start`
+/// runs one), and a launch after a crash reattaches the shells the keeper
+/// held. Off, nothing is registered, and no keeper is dialled.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct KeeperConfig {
+    pub(crate) enabled: Option<bool>,
+}
+
+impl Config {
+    /// Whether the PTY keeper is on (`[keeper] enabled`, default `false`).
+    pub(crate) fn keeper_enabled(&self) -> bool {
+        self.keeper
+            .as_ref()
+            .and_then(|keeper| keeper.enabled)
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct MachineConfig {
@@ -3295,8 +3334,8 @@ impl Config {
         themes: &ThemeCatalog,
     ) -> aterm_types::ColorScheme {
         // Resolves SILENTLY (unresolvable/malformed name → Default): both renderer
-        // and engine projections call this. The single diagnostic is emitted by
-        // `terminal_config_for_with_assets` from this exact admitted catalog.
+        // and engine projections call this. The diagnostic is [`theme_misses`],
+        // over this exact admitted catalog.
         match self.resolve_theme_name(appearance) {
             None => aterm_types::ColorScheme::default(),
             Some(name) => themes.resolve(&name).unwrap_or_default(),
@@ -3539,6 +3578,12 @@ impl Config {
         self.explain_heavy_load.unwrap_or(true)
     }
 
+    /// Whether aterm posts its own notices to the desktop. Opt-IN (default
+    /// off); see the field doc.
+    pub(crate) fn desktop_alerts_or_default(&self) -> bool {
+        self.desktop_alerts.unwrap_or(false)
+    }
+
     /// Stall threshold, bounded so a mistyped value can neither call every job
     /// quiet on arrival nor keep a finished one lit past any useful horizon.
     pub(crate) fn tab_status_quiet_after_ms_or_default(&self) -> u64 {
@@ -3605,7 +3650,9 @@ impl Config {
         self.cursor_trail.unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
     }
 
-    /// The typing-momentum glow (default ON; `cursor_momentum_glow = false`).
+    /// The typing-momentum glow switch (default ON; `cursor_momentum_glow =
+    /// false`). The glow also needs the effects master
+    /// ([`Self::cursor_trail_or_default`]), which the frame step folds in.
     pub(crate) fn cursor_momentum_glow_or_default(&self) -> bool {
         self.cursor_momentum_glow.unwrap_or(true)
     }
@@ -4570,8 +4617,7 @@ impl Config {
     /// every category is off (the caller then renders byte-identically).
     ///
     /// ON BY DEFAULT: an absent `[sparkle_words]` table (or absent `enabled` key) turns
-    /// on the two live families—profanity sparkle and feline cat-paw. Orca settings
-    /// remain parseable for compatibility but are suspended by `ORCA_SUSPENDED`.
+    /// on the two live families—profanity sparkle and feline cat-paw.
     /// Set `enabled = false` (or a live category's `enabled = false`) to silence it.
     #[cfg(test)]
     pub(crate) fn sparkle_deco_config(&self) -> Option<crate::word_decorations::DecoConfig> {
@@ -4598,7 +4644,6 @@ impl Config {
         let prof = sw.profanity.clone().unwrap_or_default();
         let fel = sw.feline.clone().unwrap_or_default();
         let can_cfg = sw.canine.clone().unwrap_or_default();
-        let orca_cfg = sw.orca.clone().unwrap_or_default();
         let ink_cfg = sw.ink.clone().unwrap_or_default();
         let emph = sw.emphasis.clone().unwrap_or_default();
         // Top Settings exposes exactly two independent keyword toys. Keep the
@@ -4613,11 +4658,6 @@ impl Config {
         // master, keyword kitties alone stay independent), with its own
         // enable bit under it for turning just the dogs off.
         let canine = sparkle_words && can_cfg.enabled.unwrap_or(true);
-        // v3 §4: the orca class is SUSPENDED — the resolver ANDs the single
-        // const gate (engine/lexicon/splash untouched; flip ORCA_SUSPENDED to
-        // re-enable).
-        let orca =
-            sparkle_words && orca_cfg.enabled.unwrap_or(true) && !aterm_effects::ORCA_SUSPENDED;
         let ink_enabled = ink_cfg.enabled.unwrap_or(true);
         // v3 §6: the custom-word spec table (per-word overrides, keyed by the
         // scanner's form_hash semantics — folded spaced surfaces, possessive
@@ -4645,7 +4685,7 @@ impl Config {
         let emphasis = sparkle_words
             && emph.enabled.unwrap_or(true)
             && (ink_enabled || spec_table.has_custom());
-        if !profanity && !feline && !canine && !orca && !emphasis {
+        if !profanity && !feline && !canine && !emphasis {
             return None;
         }
         let ink_loop = ink_cfg.loop_.unwrap_or(false);
@@ -4679,7 +4719,6 @@ impl Config {
             &prof.ignore_words,
             &fel.ignore_words,
             &can_cfg.ignore_words,
-            &orca_cfg.ignore_words,
             &emph.ignore_words,
         ]
         .into_iter()
@@ -4691,7 +4730,6 @@ impl Config {
             profanity,
             feline,
             canine,
-            orca,
             emphasis,
             ink_enabled,
             ink_strength,
@@ -4803,12 +4841,10 @@ impl Config {
         let prof = sw.profanity.clone().unwrap_or_default();
         let fel = sw.feline.clone().unwrap_or_default();
         let can_cfg = sw.canine.clone().unwrap_or_default();
-        let orca_cfg = sw.orca.clone().unwrap_or_default();
         let emph = sw.emphasis.clone().unwrap_or_default();
         append_extra_words_entry(&mut out, "profanity", prof.extra_words.as_deref());
         append_extra_words_entry(&mut out, "feline", fel.extra_words.as_deref());
         append_extra_words_entry(&mut out, "canine", can_cfg.extra_words.as_deref());
-        append_extra_words_entry(&mut out, "orca", orca_cfg.extra_words.as_deref());
         append_extra_words_entry(&mut out, "emphasis", emph.extra_words.as_deref());
         // Each strict pack was already production-scanner validated. Preserve
         // configured order so the lexicon document mirrors spec overlay order.
@@ -6496,37 +6532,47 @@ fn warn_deprecated_display_font_spelling(source: &str, config: &Config) {
         if legacy_key {
             crate::logging::stderr_line!(
                 "aterm-gui: `{legacy}` is deprecated; rename it to `{current}` \
-                 (the old key still works — the faces are now named for the \
-                 letterform rather than a game)",
+                 (the old key still works)",
                 legacy = crate::prefs::LEGACY_EDIT_DISPLAY_FONT,
                 current = crate::prefs::EDIT_DISPLAY_FONT,
             );
         }
-        for id in config
-            .display_font
-            .iter()
-            .flat_map(|raw| raw.split('+'))
-            .map(str::trim)
-        {
-            match aterm_render::DISPLAY_FACE_LEGACY_IDS
-                .iter()
-                .find(|(legacy, _)| *legacy == id)
-            {
-                Some((_, Some(current))) => crate::logging::stderr_line!(
-                    "aterm-gui: `{key} = \"{id}\"` is deprecated; write \"{current}\" \
-                     instead (same face, named for its letterform)",
-                    key = crate::prefs::EDIT_DISPLAY_FONT,
-                ),
-                Some((_, None)) => crate::logging::stderr_line!(
-                    "aterm-gui: `{key} = \"{id}\"` names a face aterm no longer ships \
-                     — it carried no redistribution licence and has no substitute; \
-                     your primary font is used instead",
-                    key = crate::prefs::EDIT_DISPLAY_FONT,
-                ),
-                None => {}
-            }
+        for notice in display_font_notices(config) {
+            crate::logging::stderr_line!("aterm-gui: {notice}");
         }
     });
+}
+
+/// Each retired face id in `display_font`: a renamed one names its new id, and a
+/// deleted one says what draws in its place — the rest of the mix, or the primary
+/// font when nothing else is left. `--validate-config` prints these words too, so
+/// an accepted-but-retired id is not called valid in silence.
+pub(crate) fn display_font_notices(config: &Config) -> Vec<String> {
+    let Some(raw) = config.display_font.as_deref() else {
+        return Vec::new();
+    };
+    let any_face = raw
+        .split('+')
+        .any(|id| aterm_render::display_face_canonical_id(id).is_some());
+    raw.split('+')
+        .map(str::trim)
+        .filter_map(|id| {
+            let (_, current) = aterm_render::DISPLAY_FACE_LEGACY_IDS
+                .iter()
+                .find(|(legacy, _)| legacy.eq_ignore_ascii_case(id))?;
+            Some(match current {
+                Some(current) => {
+                    format!("display_font: {id:?} is deprecated; write {current:?} (same face)")
+                }
+                None if any_face => {
+                    format!("display_font: {id:?} is no longer shipped and is skipped")
+                }
+                None => {
+                    format!("display_font: {id:?} is no longer shipped; your primary font is used")
+                }
+            })
+        })
+        .collect()
 }
 
 /// M5 honest fallback (once per process): `background_opacity < 1.0` requests
@@ -7347,7 +7393,7 @@ pub(crate) fn resolve_wallpaper_asset(raw: Option<&str>) -> WallpaperAsset {
 /// `\`/`"` AND control characters — a raw newline/tab/etc. is illegal in a TOML
 /// basic string, so without this a single malformed `extra_words` entry would
 /// make the WHOLE generated override document fail to parse and silently drop
-/// every custom word (profanity/feline/orca), not just the offending one.
+/// every custom word (profanity/feline/emphasis), not just the offending one.
 fn toml_basic_string(w: &str) -> String {
     let mut s = String::with_capacity(w.len() + 2);
     s.push('"');
@@ -7478,20 +7524,9 @@ impl Config {
         // palette; the per-key color blocks below then override individual slots
         // (last-wins). No theme = this block is skipped, so the per-key path stays
         // byte-identical to before.
-        if let Some(name) = self.resolve_theme_name(appearance) {
-            // Single point that warns on a theme that is absent or invalid in
-            // the admitted startup catalog. The renderer's base resolver is
-            // silent so it cannot double-print this message.
-            if !name.eq_ignore_ascii_case("default") {
-                match themes.resolve(&name) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        crate::logging::stderr_line!(
-                            "aterm-gui: config theme: {name:?} does not resolve ({error}); using Default"
-                        );
-                    }
-                }
-            }
+        if self.resolve_theme_name(appearance).is_some() {
+            // A theme that is absent or invalid resolves to Default here in
+            // silence; [`theme_load_notices`] says so, once per launch or reload.
             let s = self.base_scheme_for_with_themes(appearance, themes);
             tc.default_foreground = s.foreground;
             tc.default_background = s.background;
@@ -7818,7 +7853,7 @@ pub(crate) fn launch_config_notice(
     match problem {
         LaunchConfigProblem::Unreadable(error) => format!(
             "aterm.toml could not be read at launch ({error}) — every setting is running at its \
-             default. Make {} readable and it loads on the next change.",
+             default. Fix {} and it loads on the next change.",
             path.display()
         ),
         LaunchConfigProblem::Invalid(error) => format!(
@@ -7940,7 +7975,7 @@ pub(crate) fn resolve_font_px(config: &Config) -> f32 {
 /// ([`font_px_in_range`]), so the banner speaks exactly when the size is not
 /// applied; the words are the banner row's own — the state and the accepted
 /// range, as the unaccepted-values family beside it says an enum it refused —
-/// where `--validate-config` explains the resolver to a reader of its report.
+/// and `--validate-config` prints the same sentence.
 /// It says the value is IGNORED rather than naming the size used instead:
 /// that is the default, or a valid `--font-px`, which outranks the config.
 /// Startup and every reload push it onto that row.
@@ -7950,6 +7985,37 @@ pub(crate) fn font_px_load_notice(config: &Config) -> Option<String> {
         "config font_px: {px:?} is not accepted (expected {FONT_PX_MIN}–{FONT_PX_MAX}; the \
          value is ignored)"
     ))
+}
+
+/// Each configured `theme` name the window cannot use against `themes`, and that it
+/// draws Default instead: one sentence per name, so a plain name missing from both
+/// appearances is said once. `--validate-config` and Manual print these words; the
+/// band carries them as [`theme_load_notices`].
+pub(crate) fn theme_misses(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
+    let mut misses = Vec::new();
+    for appearance in [
+        aterm_types::Appearance::Dark,
+        aterm_types::Appearance::Light,
+    ] {
+        if let Some(name) = config.resolve_theme_name(appearance)
+            && !name.eq_ignore_ascii_case("default")
+            && let Err(error) = themes.resolve(&name)
+        {
+            let miss = format!("theme: {name:?} is unavailable ({error}); Default is used");
+            if !misses.contains(&miss) {
+                misses.push(miss);
+            }
+        }
+    }
+    misses
+}
+
+/// [`theme_misses`] for the band's unaccepted-values row: until 2026-09-28 a theme
+/// the window could not load drew Default with a line only on stderr, which a Dock
+/// launch does not have. Startup, every reload and every theme-directory change
+/// push it.
+pub(crate) fn theme_load_notices(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
+    prefixed_notices(theme_misses(config, themes))
 }
 
 /// Whether a valid flag/config size pins the physical glyph size.
@@ -8188,6 +8254,87 @@ pub(crate) fn font_px_is_explicit_with(flag: Option<f32>, config: Option<f32>) -
     admitted_font_px(flag, config).is_some()
 }
 
+/// A glyph size as the window carry writes it: thousandths of a physical px,
+/// `None` outside the zoom's own bounds (`FONT_PX_MIN..=FONT_PX_MAX`, which
+/// every size this process draws at is already inside).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "admitted to FONT_PX_MIN..=FONT_PX_MAX first, so the product is a positive \
+              integer of at most 200 000"
+)]
+pub(crate) fn font_px_milli(px: f32) -> Option<u32> {
+    font_px_in_range(&px).then(|| (px * 1000.0).round() as u32)
+}
+
+/// The launch font of a process that ADOPTED a seamless update's sessions,
+/// before its first window is sized.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LaunchFont {
+    /// The glyph size to draw at (`App::font_px`).
+    pub(crate) px: f32,
+    /// Whether it is pinned (`App::font_px_explicit`), which stops the
+    /// Retina auto-scale from replacing it at the first window's attach.
+    pub(crate) explicit: bool,
+    /// What Cmd-0 resets to (`App::default_font_px`).
+    pub(crate) reset_px: f32,
+}
+
+/// THE CARRIED ZOOM, OR THE CONFIG'S FONT (the round-four plan, item 15).
+/// `resolved`/`explicit` are what this launch derived from its flags and
+/// config (`resolve_font_px`, `font_px_is_explicit`, the headless `--scale`
+/// size); `carry` is the outgoing window's frame, `Some` only on an
+/// authenticated handoff boot.
+///
+/// A carry that holds the zoom PAIR (`WindowCarry::font_px_milli` and
+/// `font_reset_px_milli`, written only while a person had the font zoomed)
+/// wins: the successor draws at the zoomed px, pinned the way a live zoom
+/// pins it (`App::set_font_px_with`), and Cmd-0 goes back to the outgoing
+/// process's reset size. The carried `rows`/`cols` are that zoomed grid, so
+/// without this the first window was drawn at the config's font — a
+/// different frame and different text at every update. It outranks the
+/// flags like the rest of the carried frame: a successor inherits its
+/// parent's LAUNCH argv, and `--font-px` there is the size before the zoom.
+///
+/// The successor is the hostile-input boundary: a pair with either half
+/// missing or outside the zoom's own bounds is ignored whole, and the launch
+/// keeps the config's font — today's behaviour, never a clamp to a size
+/// nobody chose.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a carried size is a u32 of thousandths; any value past f32's exact range is far \
+              outside the admitted bounds and is refused by them"
+)]
+pub(crate) fn successor_font_px(
+    resolved: f32,
+    explicit: bool,
+    carry: Option<&crate::session_store::WindowCarry>,
+) -> LaunchFont {
+    let admitted = |milli: Option<u32>| {
+        milli
+            .map(|milli| milli as f32 / 1000.0)
+            .filter(font_px_in_range)
+    };
+    let zoom = carry.and_then(|carry| {
+        Some((
+            admitted(carry.font_px_milli)?,
+            admitted(carry.font_reset_px_milli)?,
+        ))
+    });
+    match zoom {
+        Some((px, reset_px)) => LaunchFont {
+            px,
+            explicit: true,
+            reset_px,
+        },
+        None => LaunchFont {
+            px: resolved,
+            explicit,
+            reset_px: resolved,
+        },
+    }
+}
+
 /// Resolve one raw style against the exact catalog revision used by the host.
 /// Builtins and aliases come exclusively from `prefs`; this function adds only
 /// the dynamic `pack:<id>` domain and fail-closed classification.
@@ -8312,23 +8459,12 @@ pub(crate) fn effective_trail_style_token(raw: &str) -> &str {
         .unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
 }
 
-fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(min, max)
-    } else {
-        0.0
-    }
-}
-
-fn brighten_cursor_color(color: u32, factor: f32) -> u32 {
-    let channel = |shift: u32| ((((color >> shift) & 0xff) as f32) * factor).min(255.0) as u32;
-    (channel(16) << 16) | (channel(8) << 8) | channel(0)
-}
-
-/// Canonical cold-path construction of the engine's `GlowConfig`. The live
-/// terminal and Settings renderer preview differ only in explicitly injected
-/// geometry/theme facts (`dark_theme` and `head_dx`); preference semantics are
-/// byte-for-byte shared here.
+/// Canonical cold-path construction of the engine's `GlowConfig`: THIS
+/// host's resolved spelling and knobs through the engine's one config law
+/// ([`aterm_effects::cursor_fx::resolve_glow_config`], the construction the web
+/// pipeline runs too). The live terminal and Settings renderer preview differ
+/// only in explicitly injected geometry/theme facts (`dark_theme` and
+/// `head_dx`); preference semantics are byte-for-byte shared there.
 pub(crate) fn resolve_cursor_glow(
     inputs: CursorGlowInputs,
     presentation: ResolvedTrailPresentation,
@@ -8342,78 +8478,36 @@ pub(crate) fn resolve_cursor_glow(
     theme_bg: u32,
     head_dx: f32,
 ) -> aterm_effects::cursor_glow::GlowConfig {
-    use aterm_effects::cursor_glow::{
-        BEAM_DEFAULT_COLOR, COMET_DEFAULT_COLOR, GlowStyle, LASER_DEFAULT_COLOR,
-        SPARKLE_DEFAULT_COLOR,
-    };
-
-    let style = presentation.style;
-
-    // Off / missing-pack values carry a harmless concrete enum because
-    // GlowConfig is a POD; `enabled = false` is the sole engine gate and no
-    // geometry is emitted. An unrecognized spelling is NOT one of them — it
-    // arrives already resolved to the default style and renders.
-    // Laser's default is STORM VIOLET (a night strike's white-violet flash —
-    // the old electric yellow read yellow-green on dark themes); Sparkle's is
-    // STARLIGHT GOLD (live review disliked the theme green riding the glitter
-    // emitter cursor). An explicit `cursor_trail_color` overrides any.
-    let glow_style = style.style.unwrap_or(GlowStyle::Lumen);
-    let default_color = match glow_style {
-        GlowStyle::Laser => LASER_DEFAULT_COLOR,
-        GlowStyle::Beam => BEAM_DEFAULT_COLOR,
-        GlowStyle::Comet => COMET_DEFAULT_COLOR,
-        GlowStyle::Sparkle => SPARKLE_DEFAULT_COLOR,
-        _ => theme_cursor & 0x00ff_ffff,
-    };
-    let color = inputs.color.unwrap_or(default_color) & 0x00ff_ffff;
-    let accent = inputs
-        .accent
-        .map(|value| value & 0x00ff_ffff)
-        .unwrap_or_else(|| brighten_cursor_color(color, 1.5));
-    let beam_only = glow_style == GlowStyle::Beam;
-    let intensity = finite_clamp_or_off(inputs.intensity, 0.0, 1.0);
-    let radius = finite_clamp_or_off(inputs.radius, 0.0, 2.0);
-    aterm_effects::cursor_glow::GlowConfig {
+    // An unrecognized spelling arrives here already resolved to the default
+    // style and renders; only `off` and a missing pack resolve to no style.
+    aterm_effects::cursor_fx::resolve_glow_config(
+        aterm_effects::cursor_fx::GlowKnobs {
+            enabled: inputs.enabled,
+            color: inputs.color,
+            accent: inputs.accent,
+            duration_ms: inputs.duration_ms,
+            length: inputs.length,
+            intensity: inputs.intensity,
+            radius: inputs.radius,
+            ring: inputs.ring,
+        },
+        aterm_effects::cursor_fx::GlowSpelling {
+            style: presentation.style.style,
+            pack: presentation.style.pack,
+            beam: presentation.beam,
+            // THE TALL BODY IS THE DEFAULT (owner, 2026-08-29: "WHERE IS MY
+            // TALL RIBBON"): only an explicit `... underline` spelling selects
+            // the highlighter-plus-under-baseline mark.
+            ribbon_tall: presentation.ribbon_tall,
+            ribbon_flat: presentation.ribbon_flat,
+            classic_mono: presentation.classic_mono,
+        },
+        theme_cursor,
+        dark_theme,
         theme_fg,
         theme_bg,
-        enabled: inputs.enabled && style.style.is_some(),
-        style: glow_style,
-        color,
-        accent,
-        duration: std::time::Duration::from_millis(inputs.duration_ms.clamp(30, 2_000)),
-        length: inputs.length.clamp(1, 512),
-        intensity,
-        // FAIL-CLOSED at construction. This resolver has no window and no
-        // focus to offer, and `App::glow_config()` — the windowless variant
-        // `trail status` reads — comes through here too. The FRAME path is
-        // the one thing that knows whose window a key would land in, so it
-        // overwrites this in `tick_cursor_fx`; anything that never reaches a
-        // frame honestly cues nothing.
-        audible: false,
-        radius: if beam_only { 0.0 } else { radius },
-        ring: !beam_only && inputs.ring,
-        dark_theme,
-        beam: presentation.beam,
         head_dx,
-        pack: style.pack,
-        // The ribbon presentation rides the RESOLVED spelling, like the beam
-        // above and the pet companions do. THE TALL BODY IS THE DEFAULT
-        // (owner, 2026-08-29: "WHERE IS MY TALL RIBBON"): every ordinary
-        // rainbow spelling draws the v0.43 full-height body — letters inside
-        // the light — and only an explicit `... underline` spelling selects
-        // the highlighter-plus-under-baseline mark. This reverses 317f765a,
-        // which had flipped the default on a claimed ruling the owner did not
-        // give; the explicit spellings for BOTH looks survive.
-        ribbon_tall: presentation.ribbon_tall,
-        // The flat body is a spelling too (`rainbow kitty flat`): the A/B twin
-        // of the comet body and its vivid rail, which are the default
-        // (`RAINBOW-KITTY-V2.md` §30).
-        ribbon_flat: presentation.ribbon_flat,
-        // The classic wake's colour face rides the RESOLVED spelling, exactly
-        // as the ribbon geometry above does: plain `classic` is v0.28's
-        // shipped spectrum, `classic mono` its theme-following tracer.
-        classic_mono: presentation.classic_mono,
-    }
+    )
 }
 
 /// The lexicon build-time conflicts [`App::recompute_sparkle`] actually logs,
@@ -9005,7 +9099,16 @@ impl App {
         }
     }
 
+    /// A resize ENTRY POINT for the ledger (`site=window`): this shim alone is
+    /// `#[track_caller]`, the body is [`Self::on_resize_inner`].
+    #[track_caller]
     pub(crate) fn on_resize(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
+        let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Window);
+        self.on_resize_inner(wid, size);
+    }
+
+    /// The body of [`Self::on_resize`].
+    fn on_resize_inner(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
         // AUTHORITATIVE SIZE. winit's macOS `Resized` payload is emitted from
         // `frameDidChange:` off the raw NSView frame, which winit itself documents as
         // unreliable ("the frame size may change without a window resize occurring") and
@@ -10128,6 +10231,36 @@ impl App {
             self.apply_theme_live(theme);
         }
         self.publish_native_config_snapshot(&snapshot);
+
+        // A theme file that arrived or left changes whether the configured theme
+        // is drawn, and that verdict rides the unaccepted-values row: rebuild the
+        // row as the byte-equal reload does. Skipped while the snapshot holds a
+        // config edit this App has not applied yet; that apply rebuilds the row.
+        if *snapshot.config == self.config
+            && theme_misses(&self.config, &before.assets.themes)
+                != theme_misses(&self.config, &snapshot.assets.themes)
+        {
+            use crate::message_reporters::ConfigFamily;
+            let mut warns = crate::message_reporters::ConfigWarnings::default();
+            collect_harness_notices(&mut warns, &self.config);
+            warns.extend(
+                ConfigFamily::UnacceptedValues,
+                font_px_load_notice(&self.config),
+            );
+            warns.extend(
+                ConfigFamily::UnacceptedValues,
+                theme_load_notices(&self.config, &snapshot.assets.themes),
+            );
+            let unaccepted = unaccepted_value_notices(&snapshot.text, &warns.told());
+            warns.extend(ConfigFamily::UnacceptedValues, unaccepted);
+            for w in warns.sentences() {
+                crate::logging::stderr_line!("aterm-gui: {w}");
+            }
+            self.replace_config_messages_keyed(
+                &[ConfigFamily::UnacceptedValues.key()],
+                warns.into_messages(),
+            );
+        }
     }
 
     /// Apply a worker-prepared exact config observation after the watcher read
@@ -10435,6 +10568,10 @@ impl App {
                 crate::message_reporters::ConfigFamily::UnacceptedValues,
                 font_px_load_notice(&config),
             );
+            warns.extend(
+                crate::message_reporters::ConfigFamily::UnacceptedValues,
+                theme_load_notices(&config, &config_snapshot.assets.themes),
+            );
             let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
             warns.extend(
                 crate::message_reporters::ConfigFamily::UnacceptedValues,
@@ -10582,6 +10719,9 @@ impl App {
         // `explain_heavy_load` is live: `false` parks the strain engine,
         // withdraws its row and drops the probe thread; nothing is armed after.
         self.reconfigure_strain();
+        // `desktop_alerts` is live: the notification thread reads the switch
+        // per message, so aterm's own notices stop (or resume) with this store.
+        self.apply_desktop_alerts(config.desktop_alerts_or_default());
         // Per-keystroke config caches (predictive_echo / cursor_trail_style): a reload
         // can change either, so drop the resolved values — they re-resolve on the next
         // keystroke. Keeps a live style/predict change taking effect immediately.
@@ -10785,8 +10925,13 @@ impl App {
         // The supervisor's `[harness]` values it refused (a known key with a
         // value it cannot take: `continue = "yes"`).
         collect_harness_notices(&mut warns, &config);
-        // A `font_px` the resolver ignores says so here, like it does at launch.
+        // A `font_px` the resolver ignores says so here, like it does at launch,
+        // and so does a theme the window draws Default in place of.
         warns.extend(ConfigFamily::UnacceptedValues, font_px_load_notice(&config));
+        warns.extend(
+            ConfigFamily::UnacceptedValues,
+            theme_load_notices(&config, &config_snapshot.assets.themes),
+        );
         let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
         warns.extend(ConfigFamily::UnacceptedValues, unaccepted);
         for w in warns.sentences() {
@@ -11942,6 +12087,23 @@ window_title_format = "description"
         );
     }
 
+    /// `desktop_alerts` round-trips: absent reads OFF (the owner turned
+    /// aterm's desktop alerts off), an explicit `true` reads ON, an explicit
+    /// `false` reads OFF and is kept as written.
+    #[test]
+    fn desktop_alerts_default_off_and_round_trip() {
+        let cfg = |s: &str| -> Config { aterm_toml::from_str(s).unwrap() };
+        assert!(!Config::default().desktop_alerts_or_default());
+        assert!(cfg("desktop_alerts = true").desktop_alerts_or_default());
+        assert!(!cfg("desktop_alerts = false").desktop_alerts_or_default());
+        assert_eq!(
+            cfg("desktop_alerts = false").desktop_alerts,
+            Some(false),
+            "an explicit value is kept as written"
+        );
+        assert_eq!(cfg("").desktop_alerts, None, "absent stays absent");
+    }
+
     /// The observation budget is DERIVED, not configured: it must never be
     /// coarser than the dwell it has to serve (a candidate that cannot be
     /// re-seen inside its own window can never be published), and never fall to
@@ -13026,8 +13188,8 @@ mod cfg_engine_tests {
     }
 
     /// The two live Sparkle-word products are ON by default—an absent
-    /// `[sparkle_words]` table enables profanity + feline + bare-`cat`; retained
-    /// Orca config stays suspended, and an explicit master-off fully opts out.
+    /// `[sparkle_words]` table enables profanity + feline + bare-`cat`, and an
+    /// explicit master-off fully opts out.
     #[test]
     fn sparkle_words_default_on_for_the_two_live_products() {
         let deco = Config::default()
@@ -13035,13 +13197,6 @@ mod cfg_engine_tests {
             .expect("sparkle words are ON by default (absent table → defaults)");
         assert!(deco.profanity, "profanity sparkles by default");
         assert!(deco.feline, "feline cat-paw on by default");
-        // v3 §4: the orca class is SUSPENDED — this assertion is tied to
-        // `aterm_effects::ORCA_SUSPENDED` (flip the const to re-enable and
-        // revert this line to `assert!(deco.orca, ...)`).
-        assert!(
-            !deco.orca,
-            "orca splash suspended (ORCA_SUSPENDED) — resolver gate ANDs the const"
-        );
         assert!(
             deco.allow_bare_cat,
             "the literal `cat` decorates by default"
@@ -13192,7 +13347,7 @@ mod cfg_engine_tests {
         assert!(!deco.profanity, "built-in sparkle words are off");
         assert!(!deco.emphasis, "emphasis cannot bypass the product switch");
         assert!(
-            !deco.orca,
+            !deco.canine,
             "every non-feline class shares the product switch"
         );
         assert!(deco.feline, "keyword kitties remain independently on");
@@ -13437,6 +13592,63 @@ mod cfg_engine_tests {
             "a comment-only save leaves the chord's still-true row standing"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A theme the window cannot load draws Default, and until 2026-09-28 said so
+    /// only on stderr. The band's unaccepted-values row now names it, and the
+    /// theme file arriving in the themes directory takes the row down.
+    #[test]
+    fn a_theme_that_does_not_load_is_on_the_band_until_its_file_arrives() {
+        const NAME: &str = "Aterm Test Theme 7F1C";
+        let dir = std::env::temp_dir().join(format!("aterm-theme-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("aterm.toml");
+        let text = format!("theme = {NAME:?}\n");
+        std::fs::write(&path, &text).expect("write config");
+        let observation =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                .expect("observe");
+        let config: Config = aterm_toml::from_str(&text).expect("valid toml");
+        let assets = config.resolve_asset_catalog();
+        let path_feed_fps = config.path_feed_fingerprints();
+        let sparkle = config.prepare_sparkle_runtime();
+        let mut app = crate::App::headless_for_test();
+        app.apply_prepared_config_generation(
+            crate::native_font_catalog::PreparedConfigGeneration {
+                observation,
+                config,
+                values: std::collections::BTreeMap::new(),
+                assets,
+                path_feed_fps,
+                sparkle,
+                fonts: None,
+                warnings: Vec::new(),
+            },
+        );
+        let key = crate::message_reporters::ConfigFamily::UnacceptedValues.key();
+        let row = app
+            .messages
+            .live_by_key(key)
+            .expect("a theme that does not load is on the band");
+        let expected = format!(
+            "theme: {NAME:?} is unavailable (no built-in or loaded custom theme by that name); \
+             Default is used"
+        );
+        assert!(
+            row.msg.detail.iter().any(|line| line.contains(&expected)),
+            "{:?}",
+            row.msg
+        );
+
+        app.reload_theme_catalog(ThemeCatalog::from_schemes([(
+            NAME.to_string(),
+            aterm_types::ColorScheme::default(),
+        )]));
+        assert!(
+            app.messages.live_by_key(key).is_none(),
+            "the theme file arriving takes the row down"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14654,7 +14866,8 @@ mod output_streak_cfg_tests {
                    answer_questions = false\nanswer_text = \"ask me\"\n\
                    dismiss_surveys = false\ncontinue = false\ncontinue_text = \"go\"\n\
                    continue_per_hour = 2\nrules_file = \"/r\"\nretry_api_errors = false\n\
-                   probe_api = false\nresume_limits = false\nmodel_fallback = \"\"\n\
+                   probe_api = false\nresume_limits = false\nlimit_wait = false\n\
+                   model_fallback = \"\"\n\
                    compact_on_context_wall = false\nrelaunch = false\nupgrade = false\n\
                    human_grace_s = 600\n";
         assert_eq!(
@@ -14662,7 +14875,7 @@ mod output_streak_cfg_tests {
             "Automatic \u{b7} limited: headless: off \u{b7} approve: none \
              \u{b7} answer_questions: off \u{b7} dismiss_surveys: off \u{b7} continue: off \
              \u{b7} continue_per_hour: 2 \u{b7} retry_api_errors: off \u{b7} probe_api: off \
-             \u{b7} resume_limits: off \
+             \u{b7} resume_limits: off \u{b7} limit_wait: off \
              \u{b7} model_fallback: off \u{b7} compact_on_context_wall: off \u{b7} relaunch: off \
              \u{b7} upgrade: off \u{b7} human_grace_s: 600 \
              \u{b7} yours: answer_text, continue_text, rules_file"

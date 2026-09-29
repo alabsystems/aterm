@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo forge` — the front door. Arg parsing lives in [`cli`], every verb's
+//! `targo --unverified forge` — the front door. Arg parsing lives in [`cli`], every verb's
 //! work lives in the library, and this file stays thin forever.
 
 mod cli;

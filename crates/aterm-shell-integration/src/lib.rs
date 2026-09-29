@@ -594,7 +594,9 @@ pub fn ensure_script_set() -> Result<PathBuf, std::io::Error> {
 // Skip: `Option<PathBuf>::as_deref` dispatches PathBuf's Deref through the
 // generic trait path (PathBuf is not yet in the std-wrapper deref sentinel
 // set); every I/O path returns Err (fail-closed) and the cache contract is
-// unit-tested. Droppable when the sentinel grows PathBuf.
+// unit-tested. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed: INCONCLUSIVE (2 of 3
+// unknown). Needed from $HOME/trust, in a promoted seal: PathBuf in the
+// std-wrapper deref sentinel set; then drop this.
 #[cfg_attr(trust_verify, trust::skip)]
 fn prepare_cached(
     shell: ShellType,
@@ -1421,6 +1423,7 @@ fn cmd_prompt(inherited: Option<&str>) -> String {
 mod tests {
     include!("tests.rs");
     include!("tests_loader.rs");
+    include!("tests_tty.rs");
 
     /// Regression test for #5959/#5960: `autoload -Uz add-zsh-hook` must
     /// appear before any `add-zsh-hook` call in the zsh script. Violating

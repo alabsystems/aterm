@@ -41,6 +41,12 @@ pub struct Finding {
     /// never inherited from main, whose same words cannot be told from a new
     /// hang or a slower run's ([`crate::differential::judge`]).
     pub timing: Option<&'static str>,
+    /// The crate a FAILED TEST belongs to, from its re-run spec's `-p
+    /// <crate>` ([`crate::nearest::package_of`]); `None` for every whole-row
+    /// finding, and for a test whose spec names no package. Read only by the
+    /// opt-in nearest base ([`crate::nearest`]), which never inherits a
+    /// finding without one.
+    pub package: Option<String>,
 }
 
 /// THE MACHINE'S LOAD AROUND ONE STAGE (2026-09-26): the one-minute load
@@ -253,7 +259,7 @@ impl Report {
     /// wider than the code (corrected 2026-09-21). Every stage that decides a
     /// row from a child's EXIT STATUS comes through here or
     /// [`Report::child_could_not_run`]: the script stages, the libc oracle,
-    /// the cells and kani gates, and the nine drive binaries, whose own exit
+    /// the cells and kani gates, and the drive binaries, whose own exit
     /// contracts cannot see a full disk — `libc-oracle/run.sh` maps a cargo
     /// child that died of ENOSPC (exit 101, since targo never answers 3) onto
     /// a plain failure, which arrived here as a FINDING about the tree until
@@ -316,9 +322,23 @@ impl Report {
     /// accounts for every one ([`crate::differential::test_findings`]) — so a
     /// red test main already has is one inherited finding, not a whole red row.
     pub fn fail_test_child(&mut self, run: &Run, label: impl Into<String>) {
+        self.fail_itemized_child(run, label, crate::differential::test_findings);
+    }
+
+    /// [`Report::fail_child`] for a child whose failing output ITEMIZES its
+    /// failures: `itemize` reads them from the row's label and what the child
+    /// printed — the failed tests of a `targo test` child
+    /// ([`crate::differential::test_findings`]), the export content scan's
+    /// hits ([`crate::differential::export_content_findings`]).
+    pub fn fail_itemized_child(
+        &mut self,
+        run: &Run,
+        label: impl Into<String>,
+        itemize: fn(&str, &str) -> Vec<Finding>,
+    ) {
         let label = label.into();
         if !self.child_could_not_run(run, &label) {
-            let findings = crate::differential::test_findings(&label, &run.output);
+            let findings = itemize(&label, &run.output);
             self.fail_with(label, findings);
         }
     }

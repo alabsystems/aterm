@@ -485,8 +485,37 @@ fn is_activity_row(row: &str) -> bool {
     }
     let text = rest.trim_start();
     let head = text.split(" (").next().unwrap_or(text);
-    head.chars().next().is_some_and(|c| c != '…' && c != '.')
-        && (head.contains('…') || head.contains("..."))
+    (head.chars().next().is_some_and(|c| c != '…' && c != '.')
+        && (head.contains('…') || head.contains("...")))
+        || is_retry_status(text)
+}
+
+/// The text of the vendor's API-retry status row, which no ellipsis ends
+/// (measured on 2.1.283, 2026-09-27): the whole formatted error, then
+/// `· Retrying in 14s · attempt 6/10` — `Can't reach the API server — check
+/// your internet or DNS (ENOTFOUND) · Retrying in 1s · attempt 5/10`. The
+/// worker is busy: the vendor is retrying its own request. Read as the tail
+/// of the row, so the error in front may be cut (`…`) at a narrow width, and
+/// a done row (`Cogitated for 0s · done 11:02 PM`) or the worker's words are
+/// not one.
+fn is_retry_status(text: &str) -> bool {
+    let Some((_, tail)) = text.rsplit_once(" · Retrying in ") else {
+        return false;
+    };
+    let Some((wait, attempt)) = tail.split_once(" · attempt ") else {
+        return false;
+    };
+    let number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    // `14s`, `2m`, `1m 30s`: each word a number and its unit.
+    let wait_ok = !wait.is_empty()
+        && wait
+            .split(' ')
+            .all(|w| w.strip_suffix(['s', 'm', 'h']).is_some_and(number));
+    let attempt_ok = attempt
+        .trim_end()
+        .split_once('/')
+        .is_some_and(|(k, n)| number(k) && number(n));
+    wait_ok && attempt_ok
 }
 
 /// `<prefix><digits><suffix>` somewhere in `row`.
@@ -583,8 +612,9 @@ pub fn prompt_box_holds(rows: &[String], row: usize) -> bool {
 }
 
 /// The index of the composer's BOTTOM rule, when the frame is on the screen —
-/// for aterm's footer (`aterm_agent::harness::footer`), which paints over the
-/// mode row that sits below it and must not look for one anywhere else.
+/// for aterm's footer (`aterm_agent::harness::footer`), which writes its facts
+/// INTO that rule (on the glass only) and reads the mode row under it, and
+/// must not look for either anywhere else.
 pub fn composer_bottom(rows: &[String]) -> Option<usize> {
     composer_frame(rows).map(|f| f.bottom)
 }
@@ -1294,6 +1324,14 @@ fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
     }
 }
 
+/// The reset a limit notice's text names — what [`limit_notice`] hands over
+/// as its reset — for a caller that holds the notice's text from elsewhere
+/// (the session transcript Claude Code writes the notice into).
+#[must_use]
+pub fn notice_reset(message: &str) -> Option<String> {
+    reset_of(message)
+}
+
 /// When the notice says the limit resets: the text after `resets at ` /
 /// `reset at ` / `resets `, up to a ` · ` or ` ∙ ` separator, without a closing
 /// `.`. The auto-continue notice names no reset but says when Claude Code
@@ -1930,6 +1968,111 @@ mod tests {
         assert_eq!(footer_busy(footer), Some("a shell running"), "{footer}");
     }
 
+    /// CLAUDE CODE 2.1.271 AT REST OVER TWO SHELLS THAT NEVER END (the
+    /// upgrade strand of 2026-09-21..27: two background `tail -f … | grep -m1
+    /// …` closers whose grep had long since matched held a tab 5.5 days). The
+    /// done row counts `2 shells still running` and the bypass-mode footer
+    /// `· 2 shells ·`: BUSY, and the busy is the agent's own background work
+    /// ([`background_wait`]) — the break the supervisor hands to the live
+    /// upgrade, where its notice and a give-up's owed release are typed. The
+    /// done row alone, or the footer alone, is still that break. NEGATIVE
+    /// CONTROLS: a message submitted under the done row has begun a turn and
+    /// is no break, busy as it still reads; with no shell counted anywhere,
+    /// the bypass footer over a done row reads idle. The screen is HAND-BUILT
+    /// (its line 1 says from what): no capture of the incident was kept.
+    #[test]
+    fn claude_2_1_271_idle_over_two_shells_is_a_break_of_its_own_work() {
+        use crate::prompt::fixtures::{IDLE_SHELLS_2_1_271 as TEXT, provenance};
+        use crate::reader::{ClaudeReader, Program, ScreenReader, identify};
+        let head = provenance(TEXT).expect("a provenance line");
+        assert!(
+            head.starts_with("claude-code 2.1.271 · HAND-BUILT ")
+                && head.contains("no capture of the incident screen was kept"),
+            "{head}"
+        );
+        // This module's `screen` builds rows; the fixture's are read whole.
+        let r = crate::prompt::fixtures::screen(TEXT);
+        let done = "✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running";
+        assert_eq!(status_row(&r), Some(done));
+        assert_eq!(
+            signal(&r).as_deref(),
+            Some("status row: a shell still running")
+        );
+        assert_eq!(worker_phase(&r), Phase::Busy);
+        assert_eq!(background_wait(&r), Some("a shell still running"));
+        let footer = r.last().expect("rows");
+        assert!(
+            footer.starts_with("  ⏵⏵ bypass permissions on · 2 shells · "),
+            "{footer}"
+        );
+        assert_eq!(footer_busy(footer), Some("a shell running"), "{footer}");
+        // The supervisor's break, as it asks it (`host_steps_in_background`):
+        // busy, background work, no wall — the reader named by the program,
+        // or, for a Claude Code started as `node`, by its screen.
+        for reader in [identify(Some("claude"), &r), identify(Some("node"), &r)] {
+            assert_eq!(reader.program(), Program::Claude);
+            assert_eq!(reader.phase(&r), Phase::Busy);
+            assert_eq!(reader.background_wait(&r), Some("a shell still running"));
+            assert!(reader.wall(&r).is_none(), "{:?}", reader.wall(&r));
+        }
+        assert_eq!(
+            ClaudeReader.background_wait(&r),
+            Some("a shell still running")
+        );
+
+        // THE FOOTER ALONE: the done row counts nothing.
+        let at = r.iter().position(|x| x == done).expect("the done row");
+        let mut footer_only = r.clone();
+        footer_only[at] = "✻ Cogitated for 3m 12s · done 9:29 PM".to_string();
+        assert_eq!(
+            signal(&footer_only).as_deref(),
+            Some("footer: a shell running")
+        );
+        assert_eq!(worker_phase(&footer_only), Phase::Busy);
+        assert_eq!(background_wait(&footer_only), Some("a shell running"));
+
+        // THE DONE ROW ALONE: the bypass footer counts nothing.
+        const BARE: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        let done_only = with_footer(r.clone(), BARE);
+        assert_eq!(
+            signal(&done_only).as_deref(),
+            Some("status row: a shell still running")
+        );
+        assert_eq!(worker_phase(&done_only), Phase::Busy);
+        assert_eq!(background_wait(&done_only), Some("a shell still running"));
+
+        // NEGATIVE CONTROL: a message submitted under the done row (drawn a
+        // frame before its turn's spinner) is a turn begun, not a break.
+        let top = composer_frame(&r).expect("the frame").top;
+        for s in [&r, &footer_only, &done_only] {
+            let mut submitted = s.clone();
+            submitted.insert(top, "❯ keep going".to_string());
+            submitted.remove(0);
+            assert_eq!(worker_phase(&submitted), Phase::Busy);
+            assert_eq!(
+                background_wait(&submitted),
+                None,
+                "{:?}",
+                &submitted[top - 3..=top]
+            );
+        }
+
+        // NEGATIVE CONTROL: no shell counted anywhere — the bypass footer
+        // over a done row is idle.
+        let bare = with_footer(footer_only, BARE);
+        assert_eq!(signal(&bare), None);
+        assert_eq!(worker_phase(&bare), Phase::Idle);
+        assert_eq!(background_wait(&bare), None);
+        for reader in [
+            identify(Some("claude"), &bare),
+            identify(Some("node"), &bare),
+        ] {
+            assert_eq!(reader.program(), Program::Claude);
+            assert_eq!(reader.phase(&bare), Phase::Idle);
+            assert_eq!(reader.background_wait(&bare), None);
+        }
+    }
+
     /// `wait_bg11.out`: the shell rides on the done row under a right-aligned
     /// `get pinged when Claude finishes` hint.
     #[test]
@@ -2065,6 +2208,24 @@ mod tests {
             "✻ Implementing the parser… (2m · ↓ 3.1k tokens)"
         ));
         assert!(!is_activity_row("✻ Cooked for 23m 0s · done 11:24 PM"));
+        // The vendor's API-retry row, MEASURED 2026-09-27 (no ellipsis).
+        for row in [
+            "✻ Can't reach the API server — check your internet or DNS (ENOTFOUND) · Retrying in 1s · attempt 5/10",
+            "✻ Can't reach the API server — check your in… · Retrying in 30s · attempt 7/10",
+            "✻ API Error: 529 Overloaded · Retrying in 1m 30s · attempt 2/10",
+        ] {
+            assert!(is_activity_row(row), "{row}");
+        }
+        // Controls: a done row, the worker's own words, a malformed tail.
+        for row in [
+            "✻ Cogitated for 0s · done 11:02 PM",
+            "✻ I was Retrying in 5s · attempt soon",
+            "✻ Can't reach the API server · Retrying in soon · attempt 5/10",
+            "✻ Can't reach the API server · Retrying in 5s · attempt 5",
+            "⏺ Can't reach the API server · Retrying in 5s · attempt 5/10",
+        ] {
+            assert!(!is_activity_row(row), "{row}");
+        }
         assert!(!is_activity_row("✶ … (4s)"));
         let todo = screen(
             &[

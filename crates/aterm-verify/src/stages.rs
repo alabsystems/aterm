@@ -38,9 +38,11 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::Tippy => tippy(ctx, &mut r),
         StageId::Formatting => formatting(ctx, &mut r),
         StageId::GrepGuards => grep_guards(ctx, &mut r),
+        StageId::ExportContent => export_content(ctx, &mut r),
         StageId::DeliveryTooling => delivery_tooling(ctx, &mut r),
         StageId::AtpkgTooling => atpkg_tooling(ctx, &mut r),
         StageId::TrustContractProbe => trust_contract_probe(ctx, &mut r),
+        StageId::TrustAdvisory => trust_advisory(ctx, &mut r),
         StageId::StartCompare => start_compare(ctx, &mut r),
         StageId::LibcOracle => libc_oracle(ctx, &mut r),
         StageId::FreezeGate => freeze_gate(ctx, &mut r),
@@ -57,13 +59,9 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
             r.skip(format!("{} (unix only)", spec.title));
         }
         StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
-        StageId::ObjcClassAudit => objc_class_audit(ctx, &mut r),
-        StageId::ObjcImeDrive => objc_ime_drive(ctx, &mut r),
-        StageId::ObjcToolbarDrive => objc_toolbar_drive(ctx, &mut r),
-        StageId::ObjcWindowDrive => objc_window_drive(ctx, &mut r),
-        StageId::ObjcEventDrive => objc_event_drive(ctx, &mut r),
-        StageId::ObjcBoundDrive => objc_bound_drive(ctx, &mut r),
+        StageId::ObjcDrives => objc_drives(ctx, &mut r),
         StageId::ForegroundHandback => foreground_handback(ctx, &mut r),
+        StageId::RenderDesync => render_desync(ctx, &mut r),
         StageId::KaniFloor => kani_floor(ctx, &mut r),
         StageId::CrossCells => cross_cells(ctx, &mut r),
         StageId::Forge => forge_gate(ctx, &mut r),
@@ -363,53 +361,91 @@ pub fn tippy_args(scope: &Scope) -> Vec<String> {
 }
 
 /// The workspace's `required-features` targets, as the `(package, feature)`
-/// pairs that switch them on.
+/// pairs that switch them on — READ FROM THE MANIFESTS (`crates/*/Cargo.toml`,
+/// the workspace's members), sorted and without repeats.
 ///
-/// SIX TARGETS HANG OFF THESE THREE PAIRS, and `--all-targets` builds none of
-/// them: cargo skips a target whose `required-features` are off, silently and
-/// without a word in its output. So the main tippy pass — `--workspace
-/// --all-targets` — never compiled `aterm-gui`'s three `bench-support`
-/// benches, its `control-conformance` bin, or `aterm-scrollback`'s two
-/// `disk-tier` benches. That is not a theoretical hole: a broken bench build
-/// lived in it for four days in August 2026, and the campaign's count gates
-/// and reach guards LIVE in those benches, so an unbuilt bench is a gate that
-/// silently stopped existing.
-///
-/// The table is checked against the tree by
-/// `the_gated_feature_table_covers_every_required_features_target` below, so a
-/// seventh gated target cannot be added without either extending this or
-/// reddening that test. An entry no manifest declares any more fails the
-/// `--full` lint itself: cargo refuses a feature a package does not have.
-pub const GATED_LINT_FEATURES: [(&str, &str); 3] = [
-    ("aterm-gui", "bench-support"),
-    ("aterm-gui", "control-conformance"),
-    ("aterm-scrollback", "disk-tier"),
-];
+/// `--all-targets` builds none of those targets: cargo skips a target whose
+/// `required-features` are off, silently and without a word in its output. So
+/// the main tippy pass never compiles `aterm-gui`'s `bench-support` benches,
+/// its `control-conformance` redraw harness or `aterm-scrollback`'s
+/// `disk-tier` benches, and a broken bench build lived in that hole for four
+/// days in August 2026 — with the campaign's count gates and reach guards
+/// inside it. Derived rather than listed (2026-09-28), so a new gated target
+/// is linted the day it is declared and a retired feature leaves the pass the
+/// same day; there is no table to forget.
+#[must_use]
+pub fn gated_lint_features(root: &std::path::Path) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = std::fs::read_dir(root.join("crates"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("Cargo.toml")).ok())
+        .flat_map(|text| manifest_required_features(&text))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The `(package, feature)` pairs one manifest's `required-features` keys
+/// name, under the `[package]` name (`-p` takes it; neither the directory nor
+/// a target's `name =` has to equal it). The DECLARATIONS only, never the
+/// prose beside them; a list may span lines.
+#[must_use]
+pub fn manifest_required_features(text: &str) -> Vec<(String, String)> {
+    let Some(pkg) = crate::changed::manifest_package_name(text) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(rest) = line
+            .trim()
+            .strip_prefix("required-features")
+            .and_then(|r| r.trim_start().strip_prefix('='))
+        else {
+            continue;
+        };
+        let mut list = rest.to_string();
+        while !list.contains(']') {
+            let Some(more) = lines.next() else { break };
+            list.push_str(more);
+        }
+        let inner = list.split_once('[').map_or("", |(_, r)| r);
+        for feat in inner.split(']').next().unwrap_or("").split(',') {
+            let feat = feat.trim().trim_matches('"');
+            if !feat.is_empty() {
+                found.push((pkg.clone(), feat.to_string()));
+            }
+        }
+    }
+    found
+}
 
 /// `<tippy> -p <pkg>… --features <pkg/feat>,… --all-targets --keep-going --
 ///  -D warnings` — the SECOND pass, the one that reaches the targets
-/// [`tippy_args`] cannot.
+/// [`tippy_args`] cannot, over `gated` ([`gated_lint_features`]).
 ///
 /// A separate invocation rather than a flag on the first, because the features
 /// belong to specific packages: turning them on for the whole workspace is not
 /// something cargo offers, and `-p <pkg> --features <pkg>/<feat>` is. Its cost
-/// is one re-lint of the two named packages against a wider feature set — and
+/// is one re-lint of the named packages against a wider feature set — and
 /// CORRECTED 2026-09-13, the dependencies below them are NOT all cache hits
 /// from the first pass: the speed round's unit graphs count 139 unit variants
 /// this feature set resolves that the first pass never builds.
 ///
-/// `None` when the scope selects neither package — under `--scope aterm-core`
-/// there is no gated target to reach, and running the pass anyway would compile
-/// two crates the run had deliberately narrowed away.
+/// `None` when the scope selects no gated package — under `--scope
+/// aterm-core` there is no gated target to reach, and running the pass anyway
+/// would compile crates the run had deliberately narrowed away.
 #[must_use]
-pub fn tippy_gated_args(scope: &Scope) -> Option<Vec<String>> {
+pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec<String>> {
     let mut packages: Vec<&str> = Vec::new();
     let mut features: Vec<String> = Vec::new();
-    for (pkg, feat) in GATED_LINT_FEATURES {
+    for (pkg, feat) in gated {
         if !scope.includes_crate(pkg) {
             continue;
         }
-        if !packages.contains(&pkg) {
+        if !packages.contains(&pkg.as_str()) {
             packages.push(pkg);
         }
         features.push(format!("{pkg}/{feat}"));
@@ -474,9 +510,10 @@ pub fn freeze_gate_args() -> Vec<String> {
 
 /// The crates carrying a Kani BMC floor, in the order the stage runs them.
 /// `aterm-containment` joined 2026-09-25 (its six policy-mapping harnesses
-/// prove in seconds). `aterm-policy` cannot: the bundled trust-mc does not build
-/// its `serde` build scripts, so its harnesses were retired for exhaustive unit
-/// tests.
+/// prove in seconds). `aterm-policy`'s harnesses were retired for exhaustive
+/// unit tests while the bundled trust-mc could not build its `serde` build
+/// scripts; since 2026-09-28 the script routes host units to a host sysroot
+/// (its THE HOST SYSROOT note), which is what put aterm-render back on the floor.
 pub const KANI_CRATES: [&str; 4] = [
     "aterm-parser",
     "aterm-render",
@@ -566,382 +603,156 @@ pub fn redraw_conformance_build_args() -> Vec<String> {
     .collect()
 }
 
-/// The live-class auditor's target name — the `[[example]]`, the built file and
-/// the argv below all have to agree, so they read it from here.
-pub const OBJC_CLASS_AUDIT_EXAMPLE: &str = "objc_live_class_audit";
+/// How an objc driver's exit `3` reads — the one code whose meaning is the
+/// driver's own. `0` pass, `1` finding and `2` NOT RUN mean the same for every
+/// driver ([`objc_drive_outcome`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Code3 {
+    /// A pass that claims LESS than `0`, in its own words: the audit checked
+    /// some rows against the fork's own declaration because this host's AppKit
+    /// registers no protocol for them. A receipt that read it as `0` would
+    /// assert runtime authority nobody had, so the two never share a sentence.
+    WeakerPassOk(&'static str),
+    /// The driver's watchdog fired — a modal tracking loop never returned — so
+    /// it decided nothing: COULD NOT RUN.
+    Hung,
+    /// The driver's signal trap turned an abort into `3`, and for this driver
+    /// the abort IS the finding it exists to make.
+    AbortFinding,
+    /// The driver never answers `3`: an unexpected code, a finding.
+    None,
+}
 
-/// `targo --unverified build -q -p aterm-gui --example objc_live_class_audit`
-///
-/// NO `required-features`, deliberately, unlike the redraw harness beside it:
-/// the auditor needs nothing aterm-gui does not already compile on macOS, and a
-/// feature would be one more thing that can be forgotten in the argv while the
-/// stage gates on a binary from some previous run.
+/// One objc driver: an `[[example]]` that owns `fn main`, because libtest
+/// cannot host AppKit (every `#[test]` body runs on a worker, where
+/// `pthread_main_np()` is 0 and `EventLoop` construction panics). Its header
+/// states its exit contract and why it exists; this row is how the ladder
+/// reads that contract.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ObjcDrive {
+    pub package: &'static str,
+    pub example: &'static str,
+    pub code3: Code3,
+    /// How a death with no exit status (a signal the driver did not trap)
+    /// reads.
+    pub no_status: Severity,
+    /// What exit `0` proved, in one line.
+    pub pass: &'static str,
+}
+
+/// The objc drivers the `objc drives` stage builds and runs, in order — every
+/// row on every macOS run, whatever the scope, and every row after a failure.
+pub const OBJC_DRIVES: [ObjcDrive; 5] = [
+    // The registered classes read back off a real NSWindow: two plants (an
+    // argument retyped `Id` -> `Bool`, `NSWindowDelegate` dropped from
+    // `protocols:`) left the build at 0 and every test green.
+    ObjcDrive {
+        package: "aterm-gui",
+        example: "objc_live_class_audit",
+        code3: Code3::WeakerPassOk(
+            "every registered row agrees — and at least one was checked against THIS FORK'S OWN DECLARATION, not this host's runtime, because its AppKit does not register the protocol that declares it (the auditor's part F and VERDICT lines name each one; exit 3)",
+        ),
+        no_status: Severity::CouldNotRun,
+        pass: "every row the registered WinitWindowDelegate and WinitView hold agrees with the runtime's own authority, and each class claims the protocols its rows come from",
+    },
+    // The audit proves `WinitView` is shaped right; this drives a whole
+    // composition through its NSTextInputClient rows.
+    ObjcDrive {
+        package: "aterm-gui",
+        example: "objc_ime_drive",
+        code3: Code3::None,
+        no_status: Severity::CouldNotRun,
+        pass: "a composition ran through the ported WinitView's NSTextInputClient rows — preedit, cursor conversion, commit and the candidate-window rectangle",
+    },
+    // It enters `-mouseDown:` IMPs directly; a context menu that really popped
+    // would never return, and its watchdog says so as `3`.
+    ObjcDrive {
+        package: "aterm-gui",
+        example: "objc_toolbar_drive",
+        code3: Code3::Hung,
+        no_status: Severity::CouldNotRun,
+        pass: "the real tab strip answered every question — 27 drawn states, and all four declared classes read off live objects against the runtime's own authority",
+    },
+    // The only row that touches the window surface; its first run segfaulted
+    // on a use-after-free that had compiled clean.
+    ObjcDrive {
+        package: "aterm-gui",
+        example: "objc_window_drive",
+        code3: Code3::None,
+        no_status: Severity::CouldNotRun,
+        pass: "the real window answered every question — title, style mask, geometry, limits, theme, tabs, drag-and-drop, close and fullscreen",
+    },
+    // v0.72.0 aborted on the first `mouseMoved:`: an abort here — trapped
+    // (`3`) or not (no status) — is the finding, never could-not-run.
+    ObjcDrive {
+        package: "aterm-gui",
+        example: "objc_event_drive",
+        code3: Code3::AbortFinding,
+        no_status: Severity::GateFailed,
+        pass: "every NSEvent-taking WinitView row and sendEvent: survived a real NSEvent of every type AppKit can deliver; the exception control was contained and the panic control aborted",
+    },
+];
+
+/// `targo --unverified build -q -p <package> --example <example>` — one
+/// driver's own build, a fingerprint check after the driver-builds row.
 #[must_use]
-pub fn objc_class_audit_build_args() -> Vec<String> {
+pub fn objc_drive_build_args(drive: &ObjcDrive) -> Vec<String> {
     [
         "--unverified",
         "build",
         "-q",
         "-p",
-        "aterm-gui",
+        drive.package,
         "--example",
-        OBJC_CLASS_AUDIT_EXAMPLE,
+        drive.example,
     ]
     .into_iter()
     .map(String::from)
     .collect()
 }
 
-/// How the ladder reads the auditor's exit code (`0` clean / `1` finding / `2`
-/// NOT RUN, declared in `crates/aterm-gui/examples/objc_live_class_audit.rs`).
-///
-/// A FUNCTION, and tested, for the same reason [`redraw_outcome`] is: `2` means
-/// no window server answered, no delegate was installed, or the audit ran and
-/// some row had no authority on this host at all; read as green it would restore
-/// exactly the silence this gate exists to remove — the two plants it was
-/// built against both left a GREEN build behind them.
-///
-/// `3` IS A PASS, AND IT IS A DIFFERENT CLAIM FROM `0` (2026-09-21). A protocol
-/// the class claims may be one this host's AppKit does not register — macOS
-/// 14.4.1's and macOS 13.7.8's lack `NSApplicationDelegate`, macOS 26's has it —
-/// and `aterm_objc` then supplies a name-only stand-in so the class can claim it,
-/// which is what stopped v0.72.0–v0.75.0 dying before their first window. A
-/// stand-in declares nothing, so those rows once had NO authority and this
-/// function read the whole audit as NOT RUN: the merge gate could not go green on
-/// any such host, which made a whole platform unable to land anything. The
-/// auditor now carries the fork's own declared shape for exactly those rows
-/// (`HostLacks`), checks them against it, holds that written shape to the
-/// protocol on every host that HAS one, and answers `3` to say which claim it
-/// made. `0` still means what its label says — the runtime arbitrated every row —
-/// and the two are not merged, because the receipt a green run writes would
-/// otherwise assert runtime authority nobody had.
+/// How the ladder reads one driver's exit. A FUNCTION, and tested, because
+/// of `2`: no window server answered, or nothing was installed to drive, and
+/// read as green it would restore exactly the silence these drives exist to
+/// remove. Only `0`, and the audit's weaker `3`, are passes.
 #[must_use]
-pub fn objc_audit_outcome(code: Option<i32>) -> (Outcome, String) {
-    match code {
-        Some(0) => (
-            Outcome::Ok,
-            "objc live-class audit: every method the registered WinitWindowDelegate holds agrees with the runtime's own authority, and the class claims the protocols its rows come from".to_string(),
-        ),
-        Some(1) => (
+pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, String) {
+    let name = drive.example;
+    let (outcome, what) = match (code, drive.code3) {
+        (Some(0), _) => (Outcome::Ok, drive.pass.to_string()),
+        (Some(1), _) => (
             Outcome::Fail(Severity::GateFailed),
-            "objc live-class audit: a registered encoding disagrees with its authority, a row has no authority at all, or the class does not claim a protocol it implements".to_string(),
+            "a finding — the transcript above names each check that failed (exit 1)".to_string(),
         ),
-        Some(2) => (
+        (Some(2), _) => (
             Outcome::Fail(Severity::CouldNotRun),
-            "objc live-class audit: NOT RUN — no event loop, no delegate was installed, or a row whose claimed protocol this host's AppKit does not register and for which the fork wrote down no shape either (aterm's name-only stand-in declares nothing; the auditor's NOT CHECKED lines name them), so the registered class was not fully proven (exit 2, never a pass)".to_string(),
+            "NOT RUN — no event loop, no window, or nothing installed to drive, so nothing was proven (exit 2, never a pass)".to_string(),
         ),
-        Some(3) => (
-            Outcome::Ok,
-            "objc live-class audit: every registered row agrees — and at least one was checked against THIS FORK'S OWN DECLARATION, not this host's runtime, because its AppKit does not register the protocol that declares it (the auditor's part F and VERDICT lines name each one). A host that registers the protocol holds those same written shapes to it on every run".to_string(),
-        ),
-        Some(c) => (
-            Outcome::Fail(Severity::GateFailed),
-            format!("objc live-class audit: unexpected exit {c} (the auditor answers only 0/1/2/3)"),
-        ),
-        None => (
+        (Some(3), Code3::WeakerPassOk(label)) => (Outcome::Ok, label.to_string()),
+        (Some(3), Code3::Hung) => (
             Outcome::Fail(Severity::CouldNotRun),
-            "objc live-class audit: no exit status — killed by a signal, or never spawned".to_string(),
+            "HUNG — the watchdog fired, so a modal tracking loop never returned and the drive proved nothing (exit 3, never a pass)".to_string(),
         ),
-    }
-}
-
-/// The toolbar driver's target name — the `[[example]]`, the built file and
-/// the argv below all have to agree, so they read it from here.
-pub const OBJC_TOOLBAR_DRIVE_EXAMPLE: &str = "objc_toolbar_drive";
-
-/// `targo --unverified build -q -p aterm-gui --example objc_toolbar_drive`
-///
-/// NO `required-features`, for the same reason the auditor has none: the
-/// driver needs nothing `aterm-gui` does not already compile on macOS, and a
-/// feature is one more thing that can be forgotten in the argv while the stage
-/// gates on a binary from some previous run.
-#[must_use]
-pub fn objc_toolbar_drive_build_args() -> Vec<String> {
-    [
-        "--unverified",
-        "build",
-        "-q",
-        "-p",
-        "aterm-gui",
-        "--example",
-        OBJC_TOOLBAR_DRIVE_EXAMPLE,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// The window driver's target name — the `[[example]]`, the built file and the
-/// argv below all have to agree, so they read it from here.
-pub const OBJC_WINDOW_DRIVE_EXAMPLE: &str = "objc_window_drive";
-
-/// `targo --unverified build -q -p aterm-gui --example objc_window_drive`
-#[must_use]
-pub fn objc_window_drive_build_args() -> Vec<String> {
-    [
-        "--unverified",
-        "build",
-        "-q",
-        "-p",
-        "aterm-gui",
-        "--example",
-        OBJC_WINDOW_DRIVE_EXAMPLE,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// How the ladder reads the window driver's exit code (`0` clean / `1` finding
-/// / `2` NOT RUN, declared in `crates/aterm-gui/examples/objc_window_drive.rs`).
-///
-/// THREE codes, not the toolbar's four: this driver enters no `-mouseDown:` IMP
-/// and pops no menu, so there is no modal tracking loop to hang in and no
-/// watchdog to report. It drives through winit's public API plus two rows —
-/// `draggingEntered:` and `windowShouldClose:` — that no public API can reach.
-#[must_use]
-pub fn objc_window_outcome(code: Option<i32>) -> (Outcome, String) {
-    match code {
-        Some(0) => (
-            Outcome::Ok,
-            "objc window drive: the real window answered every question — title round trips through NSString, the style mask against AppKit's own -styleMask, position and size round trips, min/max clamping, visibility, theme through +appearanceNamed:/-bestMatchFromAppearancesWithNames:, shadow and tabs, draggingEntered: answering NSDragOperationCopy as an NSUInteger, windowShouldClose: answering NO, and the fullscreen state machine".to_string(),
-        ),
-        Some(1) => (
+        (Some(3), Code3::AbortFinding) => (
             Outcome::Fail(Severity::GateFailed),
-            "objc window drive: the driven window did not behave — a round trip disagreed, a style-mask bit landed in the wrong place, or a delegate row answered the wrong value".to_string(),
+            "ABORTED — a row raised an NSException or panicked on an NSEvent AppKit can deliver (the v0.72.0 mouse-move crash class); the driver's signal trap turned the abort into exit 3 and the transcript names the row".to_string(),
         ),
-        Some(2) => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc window drive: NOT RUN — no event loop, no window, or no delegate was installed, so nothing was proven about the window surface (exit 2, never a pass)".to_string(),
-        ),
-        Some(c) => (
+        (Some(c), code3) => (
             Outcome::Fail(Severity::GateFailed),
-            format!("objc window drive: unexpected exit {c} (the driver answers only 0/1/2) — a signal here is the shape of the use-after-free its first run found"),
+            format!(
+                "unexpected exit {c} (the driver answers only {})",
+                if code3 == Code3::None { "0/1/2" } else { "0/1/2/3" }
+            ),
         ),
-        None => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc window drive: no exit status — killed by a signal, or never spawned".to_string(),
+        (None, _) => (
+            Outcome::Fail(drive.no_status),
+            match drive.no_status {
+                Severity::GateFailed => "ABORTED — the driver died by a signal its trap could not convert, which is still the finding it exists to make".to_string(),
+                Severity::CouldNotRun => "no exit status — killed by a signal, or never spawned".to_string(),
+            },
         ),
-    }
-}
-
-/// How the ladder reads the toolbar driver's exit code (`0` clean / `1`
-/// finding / `2` NOT RUN / `3` HUNG, declared in
-/// `crates/aterm-gui/src/toolbar_drive.rs`).
-///
-/// FOUR codes and not three, and the fourth is not decoration. The driver
-/// enters `-mouseDown:` / `-rightMouseDown:` IMPs directly, and a context menu
-/// that actually popped would run `-[NSMenu popUpContextMenu:…]`'s modal
-/// tracking loop and never return. Its watchdog kills the process at 180 s
-/// with `3`, so a hang reaches the ladder as a NAMED could-not-run rather than
-/// as a stage that decided nothing while looking busy.
-#[must_use]
-pub fn objc_toolbar_outcome(code: Option<i32>) -> (Outcome, String) {
-    match code {
-        Some(0) => (
-            Outcome::Ok,
-            "objc toolbar drive: the real tab strip answered every question — chips, clicks, a drag, both menu routes, a resize, the rename editor's commit and cancel exits, a 200-rebuild ownership ledger, 27 drawn states, and all four declared classes read off live objects against the runtime's own authority".to_string(),
-        ),
-        Some(1) => (
-            Outcome::Fail(Severity::GateFailed),
-            "objc toolbar drive: the driven strip did not behave, a drawing state stopped drawing, or a registered encoding disagrees with its authority".to_string(),
-        ),
-        Some(2) => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc toolbar drive: NOT RUN — no event loop, no window, or no toolbar was installed, so nothing was proven about the tab strip (exit 2, never a pass)".to_string(),
-        ),
-        Some(3) => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc toolbar drive: HUNG — the watchdog fired, so a modal tracking loop never returned and the drive proved nothing (exit 3, never a pass)".to_string(),
-        ),
-        Some(c) => (
-            Outcome::Fail(Severity::GateFailed),
-            format!("objc toolbar drive: unexpected exit {c} (the driver answers only 0/1/2/3)"),
-        ),
-        None => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc toolbar drive: no exit status — killed by a signal, or never spawned".to_string(),
-        ),
-    }
-}
-
-/// The IME driver's target name — the `[[example]]`, the built file and the
-/// argv below all have to agree, so they read it from here.
-pub const OBJC_IME_DRIVE_EXAMPLE: &str = "objc_ime_drive";
-
-/// `targo --unverified build -q -p aterm-gui --example objc_ime_drive`
-#[must_use]
-pub fn objc_ime_drive_build_args() -> Vec<String> {
-    [
-        "--unverified",
-        "build",
-        "-q",
-        "-p",
-        "aterm-gui",
-        "--example",
-        OBJC_IME_DRIVE_EXAMPLE,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// How the ladder reads the IME driver's exit code (`0` clean / `1` finding /
-/// `2` NOT RUN, declared in `crates/aterm-gui/examples/objc_ime_drive.rs`).
-///
-/// A FUNCTION, and tested, for the same reason [`objc_audit_outcome`] is: `2`
-/// means no window server answered or the view had no input context, and read
-/// as green it would restore exactly the silence these gates exist to remove.
-#[must_use]
-pub fn objc_ime_outcome(code: Option<i32>) -> (Outcome, String) {
-    match code {
-        Some(0) => (
-            Outcome::Ok,
-            "objc IME drive: a composition ran through the ported WinitView's NSTextInputClient rows — preedit, UTF-16 to UTF-8 cursor conversion, the attributed-string branch, the out-of-range clamp, commit, and the candidate-window rectangle".to_string(),
-        ),
-        Some(1) => (
-            Outcome::Fail(Severity::GateFailed),
-            "objc IME drive: a composition did not produce the events winit's API promises, or the candidate-window rectangle was wrong".to_string(),
-        ),
-        Some(2) => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc IME drive: NOT RUN — no event loop, no view, or no input context, so nothing was proven about the IME path (exit 2, never a pass)".to_string(),
-        ),
-        Some(c) => (
-            Outcome::Fail(Severity::GateFailed),
-            format!("objc IME drive: unexpected exit {c} (the driver answers only 0/1/2)"),
-        ),
-        None => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc IME drive: no exit status — killed by a signal, or never spawned".to_string(),
-        ),
-    }
-}
-
-/// The event driver's target name — the `[[example]]`, the built file and the
-/// argv below all have to agree, so they read it from here.
-pub const OBJC_EVENT_DRIVE_EXAMPLE: &str = "objc_event_drive";
-
-/// `targo --unverified build -q -p aterm-gui --example objc_event_drive`
-#[must_use]
-pub fn objc_event_drive_build_args() -> Vec<String> {
-    [
-        "--unverified",
-        "build",
-        "-q",
-        "-p",
-        "aterm-gui",
-        "--example",
-        OBJC_EVENT_DRIVE_EXAMPLE,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// How the ladder reads the event driver's exit (`0` clean / `1` finding /
-/// `2` NOT RUN, declared in `crates/aterm-gui/examples/objc_event_drive.rs`).
-///
-/// ONE DELIBERATE DIFFERENCE from its three siblings: an ABORT — exit `3`
-/// from the driver's own signal trap, or no exit status at all when the trap
-/// could not convert it — is a GATE FAILURE here, not could-not-run. For
-/// the other drivers a signal is an accident of the harness; for this one it
-/// is the very finding it exists to make. v0.72.0 died by `SIGABRT` when a
-/// `WinitView` row sent a key-only accessor to a mouse event inside a
-/// `declare_class!` trampoline, and the driver reproduces exactly that shape
-/// (measured: exit 134 at the first `mouseMoved:` against the v0.72.0
-/// `view.rs`). Reading that as "decided nothing" would be reading the crash
-/// as a shrug.
-///
-/// Since exception containment landed in `aterm_objc`, the driver's two
-/// CONTROL children pin both halves of the trampoline's policy: the v0.72.0
-/// send must now be CONTAINED (exit 0, the containment line on stderr naming
-/// `poke:` and `NSInternalInconsistencyException`, a later send answering),
-/// and a Rust panic must still ABORT with `abort_on_unwind`'s message. Either
-/// control answering the other way is exit `1`.
-#[must_use]
-pub fn objc_event_outcome(code: Option<i32>) -> (Outcome, String) {
-    match code {
-        Some(0) => (
-            Outcome::Ok,
-            "objc event drive: every NSEvent-taking row of the ported WinitView, and the NSApplication sendEvent: override, survived a real NSEvent of every type AppKit can deliver to it — mouse, drag, tracking, scroll, gesture, key, cancelOperation: and the defined kinds — the exception control CONTAINED the v0.72.0 send (named on stderr, later send answered) and the panic control still aborted".to_string(),
-        ),
-        Some(1) => (
-            Outcome::Fail(Severity::GateFailed),
-            "objc event drive: a relation failed (an event did not produce the WindowEvent winit promises), a row went undriven, or a control answered the wrong way (the exception control was not contained and named, or the panic control did not abort)".to_string(),
-        ),
-        Some(2) => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc event drive: NOT RUN — no event loop, no window, no view, or the control could not be spawned, so nothing was proven about the event rows (exit 2, never a pass)".to_string(),
-        ),
-        Some(3) => (
-            Outcome::Fail(Severity::GateFailed),
-            "objc event drive: ABORTED — a WinitView row raised an NSException or panicked on an NSEvent AppKit can deliver (the v0.72.0 mouse-move crash class); the driver's signal trap turned the abort into exit 3 and the transcript names the row".to_string(),
-        ),
-        Some(c) => (
-            Outcome::Fail(Severity::GateFailed),
-            format!("objc event drive: unexpected exit {c} (the driver answers only 0/1/2/3)"),
-        ),
-        None => (
-            Outcome::Fail(Severity::GateFailed),
-            "objc event drive: ABORTED — the driver died by a signal its trap could not convert, which for this driver is still the finding it exists to make: a WinitView row raised an NSException or panicked on an NSEvent AppKit can deliver (the v0.72.0 mouse-move crash class)".to_string(),
-        ),
-    }
-}
-
-/// The container driver's target name — the built file and the argv below
-/// have to agree, so they read it from here. An `aterm-objc` example: the
-/// capability under drive is that crate's own.
-pub const OBJC_BOUND_DRIVE_EXAMPLE: &str = "objc_bound_drive";
-
-/// `targo --unverified build -q -p aterm-objc --example objc_bound_drive`
-#[must_use]
-pub fn objc_bound_drive_build_args() -> Vec<String> {
-    [
-        "--unverified",
-        "build",
-        "-q",
-        "-p",
-        "aterm-objc",
-        "--example",
-        OBJC_BOUND_DRIVE_EXAMPLE,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// How the ladder reads the container driver's exit code (`0` clean / `1`
-/// finding / `2` NOT RUN, declared in
-/// `crates/aterm-objc/examples/objc_bound_drive.rs`).
-///
-/// The driver's hang differential runs in CHILD processes under its own 5 s
-/// watchdog and reports through `1`; the parent has no hang of its own to
-/// name, so there is no fourth code.
-#[must_use]
-pub fn objc_bound_outcome(code: Option<i32>) -> (Outcome, String) {
-    match code {
-        Some(0) => (
-            Outcome::Ok,
-            "objc bound drive: MainThreadBound dropped its payload on the main thread from a worker — a plain T and a declared class's -dealloc with a Rust destructor — where the unsound twin declared beside it dropped both on the worker, and the needs_drop short-circuit was proved load-bearing by a child that hangs without it and returns with it".to_string(),
-        ),
-        Some(1) => (
-            Outcome::Fail(Severity::GateFailed),
-            "objc bound drive: a destructor landed on the wrong thread, the unsound twin stopped being unsound (the comparison lost its subject), or the hang differential answered the wrong way".to_string(),
-        ),
-        Some(2) => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc bound drive: NOT RUN — no main thread or no child could be spawned, so nothing was proven about the container (exit 2, never a pass)".to_string(),
-        ),
-        Some(c) => (
-            Outcome::Fail(Severity::GateFailed),
-            format!("objc bound drive: unexpected exit {c} (the driver answers only 0/1/2) — a signal here is the shape of a -dealloc on the wrong thread"),
-        ),
-        None => (
-            Outcome::Fail(Severity::CouldNotRun),
-            "objc bound drive: no exit status — killed by a signal, or never spawned".to_string(),
-        ),
-    }
+    };
+    (outcome, format!("{name}: {what}"))
 }
 
 /// The nested workspace's checked-in driver is the oracle contract. Keeping
@@ -1078,7 +889,7 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
-        Lane::XtaskTarget => Some(4),
+        Lane::XtaskTarget | Lane::TrustTarget => Some(4),
         Lane::ConformanceRelease => Some(6),
         Lane::DriverTarget => Some(8),
         _ => None,
@@ -1330,7 +1141,7 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     let (k, v) = TRAIL_LAWS_FULL;
     [
         cmd(test_compile_args(&ctx.scope)).demoted(),
-        cmd(test_run_args(&ctx.scope)).env(k, v),
+        in_cells_lane(ctx, cmd(test_run_args(&ctx.scope)).env(k, v)),
     ]
 }
 
@@ -1352,8 +1163,8 @@ fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
 /// its driver checks and claim the contract (the review's P1, P3). Each now
 /// goes through [`build_to_drive`] or says the same (the window-server rows
 /// and two of those drivers, alert and swizzle, were deleted the same day in
-/// gate decruft wave 2; the six left are [`OBJC_DRIVER_EXAMPLES`]). (A build's own row is
-/// never inherited either since that day — nothing shows a build reached the
+/// gate decruft wave 2; the rest are the [`OBJC_DRIVES`] rows). (A build's own
+/// row is never inherited either since that day — nothing shows a build reached the
 /// crates after its first error, [`crate::differential::UNFINISHED`] — so
 /// this row is what names what the build kept from running.)
 pub const NOT_RUN_BEHIND: &str = "; nothing behind it was decided, and a red main's receipt \
@@ -1683,13 +1494,13 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
     );
     // THE SECOND PASS, `--full` ONLY (2026-09-27; every tier until then).
     // `--all-targets` above built no target whose `required-features` are
-    // off, so the six in [`GATED_LINT_FEATURES`] are linted here or nowhere —
+    // off, so the ones [`gated_lint_features`] reads are linted here or nowhere —
     // a broken bench build survived four days that way. It costs a re-lint of
     // two packages at a wider feature set (139 unit variants the first pass
     // never builds), and the targets it reaches are benches and a harness bin,
     // not the shipped build. Its own row, so the ladder shows whether it ran.
     if ctx.mode == crate::Mode::Full
-        && let Some(args) = tippy_gated_args(&ctx.scope)
+        && let Some(args) = tippy_gated_args(&ctx.scope, &gated_lint_features(&ctx.root))
     {
         run_scoped(
             ctx,
@@ -1776,6 +1587,152 @@ fn guard_ran_to_end(name: &str) -> crate::differential::RanToEnd {
         "grep_guard.sh" => crate::differential::guard_ran_to_end,
         "license_check.sh" => crate::differential::license_ran_to_end,
         _ => |_| Err(crate::differential::UNFINISHED),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3.2) EXPORT CONTENT (2026-09-29) — `tools/export-content-scan.py`: the
+//    publication engine's content guards over the export `pub stage` would
+//    build from this tree, run by the engine's OWN code, imported from its
+//    checkout. Export blockers stopped five releases in a row (0.94, 0.95,
+//    0.98, 0.99 twice), each found only when the release preflight ran the
+//    engine's dry run: the commits carrying them had landed through this
+//    contract, which never ran the scan. The preflight's step 0 stays — it is
+//    the engine's whole verdict; this is the early warning. A missing script
+//    is a cannot-run; no engine checkout, or no gitleaks, is a NAMED SKIP.
+// ---------------------------------------------------------------------------
+
+/// The export content scan's script, under `tools/`.
+pub const EXPORT_CONTENT_SCRIPT: &str = "export-content-scan.py";
+
+/// The scan's NOT RUN code: this machine has no publication engine checkout
+/// (`$PUBLICATION_ENGINE`, else `~/publication`) or no `gitleaks` — the
+/// Codex lane's `77`, and read the same way ([`export_content_outcome`]).
+pub const EXPORT_CONTENT_NOT_RUN: i32 = 77;
+
+/// `tools/export-content-scan.py <root>`, with a `SIGTERM` grace: the scan
+/// writes a scratch export of the tree (~150 MB) that only its own exit
+/// removes, and a gate that ends it early should not leave that behind.
+#[must_use]
+pub fn export_content_cmd(ctx: &Ctx) -> Cmd {
+    script_cmd(&ctx.tools_dir().join(EXPORT_CONTENT_SCRIPT), &ctx.root).term_grace(exec::TERM_GRACE)
+}
+
+/// How the ladder reads the scan's exit. A FUNCTION, and tested, because of
+/// the codes that are not verdicts about the tree:
+///
+/// * `77` — NOT RUN: no engine checkout, or no `gitleaks`. The patterns are
+///   the engine's (its baseline is never copied into this repository: it
+///   holds words the export forbids), so a machine without the engine has
+///   nothing to scan with. A NAMED SKIP, the Codex lane's reading of its own
+///   `77` and the trust-mc floor's of an absent prover: counted, printed with
+///   the scan's own reason, forfeiting the run's contract claim — never a
+///   pass, and never a finding about the tree;
+/// * `3` — COULD NOT RUN: the engine is there and could not be driven (it did
+///   not import, an API the scan calls is gone or takes other arguments, a
+///   call raised, a scanner crashed or timed out), the scan stopped on an
+///   error before its verdict, or a `SIGTERM` ended it. Nothing was decided.
+///
+/// A VERDICT IS A LINE, NOT A CODE (2026-09-29, review of the stage). `0` is
+/// a pass only with the scan's `EXPORT CONTENT: PASS`, and `1` a finding only
+/// with its `EXPORT CONTENT: FAIL` (a hit, each named above at its source
+/// file:line with its pattern class) or `EXPORT CONTENT: REFUSED` (the engine
+/// refused the export itself, in its own words above). Without one, the scan
+/// ended in a way it did not choose — Python's own exit status for an
+/// exception it never caught is `1` — and decided nothing: COULD NOT RUN,
+/// never a finding about the tree. Any other code is a finding: the scan
+/// answers only these.
+#[must_use]
+pub fn export_content_outcome(code: Option<i32>, transcript: &str) -> (Outcome, String) {
+    let name = EXPORT_CONTENT_SCRIPT;
+    let said = |prefix: &str| {
+        transcript
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix(prefix))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let verdict = |v: &str| transcript.lines().any(|l| l.starts_with(v));
+    let undecided = |code: i32, verdicts: &str| {
+        (
+            Outcome::Fail(Severity::CouldNotRun),
+            format!(
+                "{name}: COULD NOT RUN — exit {code} without its {verdicts} verdict line, so \
+                 nothing shows a guard decided (the scan's own output is above)"
+            ),
+        )
+    };
+    match code {
+        Some(crate::exit::PASS) if verdict(crate::differential::EXPORT_CONTENT_VERDICT_PASSED) => {
+            (Outcome::Ok, name.to_string())
+        }
+        Some(crate::exit::PASS) => undecided(0, "`EXPORT CONTENT: PASS`"),
+        Some(1) if verdict(crate::differential::EXPORT_CONTENT_VERDICT_FAILED) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!(
+                "{name}: the publication engine's content guards refuse this tree's export — \
+                 the rows above name each hit at its source file:line with its pattern class"
+            ),
+        ),
+        Some(1) if verdict(crate::differential::EXPORT_CONTENT_VERDICT_REFUSED) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!(
+                "{name}: the publication engine refuses to export this tree before its content \
+                 guards run — its own words are above"
+            ),
+        ),
+        Some(1) => undecided(1, "`EXPORT CONTENT: FAIL` or `REFUSED`"),
+        Some(EXPORT_CONTENT_NOT_RUN) => (
+            Outcome::Skip,
+            format!(
+                "{name}: NOT RUN — {} (exit 77: this machine lacks a prerequisite; a named skip, \
+                 never a pass)",
+                not_run_reason(transcript).unwrap_or("the scan skipped without saying why")
+            ),
+        ),
+        Some(crate::exit::COULD_NOT_RUN) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            format!(
+                "{name}: COULD NOT RUN — {} (exit 3, nothing was decided)",
+                said("COULD NOT RUN: ").unwrap_or("the scan could not run and did not say why")
+            ),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("{name}: unexpected exit {c} (the scan answers only 0, 1, 3 and 77)"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            format!("{name}: no exit status — killed by a signal, or never spawned"),
+        ),
+    }
+}
+
+fn export_content(ctx: &Ctx, r: &mut Report) {
+    let script = ctx.tools_dir().join(EXPORT_CONTENT_SCRIPT);
+    if !is_executable_file(&script) {
+        r.cannot_run(format!(
+            "{EXPORT_CONTENT_SCRIPT} missing or not executable ({})",
+            script.display()
+        ));
+        return;
+    }
+    let out = exec::run(&export_content_cmd(ctx), ctx.exec_env());
+    r.raw(out.output.as_str());
+    if r.child_could_not_run(&out, EXPORT_CONTENT_SCRIPT) {
+        return;
+    }
+    let (outcome, label) = export_content_outcome(out.code, &out.output);
+    if outcome == Outcome::Fail(Severity::GateFailed) {
+        // One finding per hit, keyed by its source path and pattern class —
+        // never its line — so main's hits are main's red wherever edits above
+        // them moved them, and a branch that cleared some of them carries only
+        // the rest; a refused export is the one row, never inherited
+        // (`differential::export_content_findings`).
+        r.fail_itemized_child(&out, label, crate::differential::export_content_findings);
+    } else {
+        r.record(outcome, label);
     }
 }
 
@@ -1879,8 +1836,33 @@ fn guard_ran_to_end(name: &str) -> crate::differential::RanToEnd {
 ///   `targo`, and a sysroot bundle signs the version of what it packs.
 ///
 /// (`test-atpkg-pack-arch-gate.sh` is run by aterm-release's `pack_arch_gate`
-/// test.) A suite no gate runs is a test that passes forever.
-pub const DELIVERY_SUITES: [&str; 20] = [
+/// test.)
+///
+/// AND THE PUBLISHER FRONT DOOR, joined 2026-09-27 with the walk it pins:
+///
+/// * `test-bootstrap-publisher.sh` — tools/bootstrap-publisher.sh's toolchain
+///   walk and rustup link: a rustup `trust` OLDER than the store's build ranks
+///   below the store (tools/lib-trust-order.sh), and a rustup `trust` that is a
+///   real directory is never uninstalled. Stubbed xcode-select, rustup and
+///   `targo`; a scratch HOME, config and RUSTUP_HOME. A PASS of 0 checks off
+///   macOS or without Rosetta, where the script stops before the walk.
+///
+/// AND THE EXPORT CONTENT SCAN'S OWN TEST, joined 2026-09-29 with the scan
+/// ([`EXPORT_CONTENT_SCRIPT`], a stage of its own):
+///
+/// * `test-export-content-scan.sh` — tools/export-content-scan.py against the
+///   publication engine's own code over fixture trees: a planted hit per
+///   pattern class (text, binary, file name, a repository extra, gitleaks'
+///   default rules) named at its source line and never quoted; the manifest's
+///   exclusions and the transforms honoured; uncommitted work judged; the
+///   engine checkout and the judged repository left unwritten; the real
+///   engine's real baseline read at run time. Its NOT RUN cases run
+///   everywhere; the rest need the engine and gitleaks, and without them it
+///   passes with those checks alone and says so — the scan's own stage is then
+///   a named skip on that machine.
+///
+/// A suite no gate runs is a test that passes forever.
+pub const DELIVERY_SUITES: [&str; 22] = [
     "test-install-channel.sh",
     "test-publish-export.sh",
     "test-release-preflight.sh",
@@ -1901,6 +1883,8 @@ pub const DELIVERY_SUITES: [&str; 20] = [
     "test-atpkg-auto-alab.sh",
     "test-linux-auto-atpkg.sh",
     "test-atpkg-pack-toolchain.sh",
+    "test-bootstrap-publisher.sh",
+    "test-export-content-scan.sh",
 ];
 
 /// One delivery suite's command. With a `SIGTERM` grace, because each suite
@@ -2032,6 +2016,387 @@ fn trust_contract_probe(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
+// 3.55) THE TRUST VERIFICATION LANE, ADVISORY (2026-09-27, decided under the
+//    owner's standing direction of 2026-08-30: every repo compiles under Trust
+//    with verification ON). Every build here runs `targo --unverified`, and
+//    `.cargo/config.toml`'s table is the off-switch for any lane that names
+//    none; THIS stage is where verification runs: `tools/trust-gate-all.sh`,
+//    i.e. `targo trust check <lib> --lib --allow-l0-gaps` per library — targo
+//    verifies the one library and switches every dependency unit off itself —
+//    every obligation verified and reported. The run FAILS when a library's
+//    proved count falls below the floor its prover recorded in
+//    `tools/trust-gate-ratchet.tsv`, when a verified library has no floor, or
+//    when its verification broke. In order: the script's own verdict self-test
+//    (seconds, stubbed); the ratchet's UP-ONLY check against the shared branch
+//    ([`lowered_floors`] — a floor goes down only onto a new prover, or with its
+//    reason written in the row); the lane.
+//
+//    WHICH LIBRARIES, in every mode. Measured 2026-09-27 on the store seal
+//    (trustc 321aaeda7; docs/measured/trust-advisory-lane-2026-09-27.md): the
+//    median library is about a minute of CPU, the tree 5.6 CPU-hours, and
+//    aterm-gui alone ran past 3 h 30 min wall. So the merge contract verifies
+//    the libraries and admitted forks whose OWN files the change touched (a
+//    library's obligations come from its own MIR; the lane excludes every
+//    dependency unit), and skips the scope list's `full-only` libraries
+//    (`tools/trust-gate-scope.tsv`: ten CPU-minutes or more each), naming them
+//    in its row. The WHOLE tree, those included, is the release's: a whole-tree
+//    run files a trust receipt for its tree, and the cutter refuses a tree with
+//    none (aterm-release `gates::trust_receipt_gate`) — so no floor drops into a
+//    release unverified. Not `--full`'s: `--full` is stage children under the
+//    gate's three-hour ceiling, and the whole tree does not fit in one.
+//    Against what: `--scope` names its crate; `--changed` diffs against its
+//    `--base`; a whole-tree run against `origin/main` (else `main`) — exactly
+//    what this checkout would add to the shared branch.
+// ---------------------------------------------------------------------------
+
+/// What the Trust advisory lane verifies in one run ([`trust_selection`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustSelection {
+    /// These libraries; `why` says where they came from.
+    Crates { crates: Vec<String>, why: String },
+    /// Nothing to verify, and why — a decision, recorded as a pass.
+    Nothing(String),
+    /// The selection could not be computed — a skip, named, never a pass.
+    Undecided(String),
+}
+
+/// The pure decision behind [`TrustSelection`]. `touched` answers "which
+/// libraries did the change touch against this ref" ([`crate::changed::touched_since`]);
+/// `shared` is the ref a whole-tree run diffs against; `has_lib` filters a
+/// `--scope` crate, which may be bin-only.
+#[must_use]
+pub fn trust_selection(
+    scope: &Scope,
+    has_lib: &dyn Fn(&str) -> bool,
+    touched: &dyn Fn(&str) -> Result<crate::changed::Touched, String>,
+    shared: &str,
+) -> TrustSelection {
+    let from_diff = |base: &str| match touched(base) {
+        Err(why) => TrustSelection::Undecided(format!(
+            "could not tell which libraries the change touched against {base} ({why})"
+        )),
+        Ok(t) => {
+            let short: String = t.merge_base.chars().take(9).collect();
+            let mut why = format!(
+                "the libraries changed since {} (merge-base {short})",
+                t.base
+            );
+            if let Some(p) = &t.replanned {
+                why.push_str(&format!(
+                    "; {p} changed too, which can move every library's verdicts — the \
+                     release's whole-tree run verifies them all"
+                ));
+            }
+            if t.libraries.is_empty() {
+                TrustSelection::Nothing(format!("{why}: none"))
+            } else {
+                TrustSelection::Crates {
+                    crates: t.libraries,
+                    why,
+                }
+            }
+        }
+    };
+    match scope {
+        Scope::Crate(c) if has_lib(c) => TrustSelection::Crates {
+            crates: vec![c.clone()],
+            why: format!("--scope {c}"),
+        },
+        Scope::Crate(c) => TrustSelection::Nothing(format!("--scope {c}: no library")),
+        Scope::Changed(ch) => from_diff(&ch.base),
+        Scope::Workspace => from_diff(shared),
+    }
+}
+
+/// THE UP-ONLY FLOOR (2026-09-27, review): every floor `tree` lowers against
+/// `base` — each a line naming the library — as two `tools/trust-gate-ratchet.tsv`
+/// texts (`<crate>\t<proved>\t<total>\t<prover>[\t<why>]`). A floor goes DOWN
+/// in exactly two ways: onto another prover (a re-base, which
+/// `trust-gate-all.sh --update-ratchet` writes with the new prover's line), or
+/// by a hand edit that says WHY in the row's fifth column — a change that
+/// removed proved obligations along with the code that carried them (the same
+/// day's aterm-session fix made its paste-cut arithmetic checked: 304
+/// obligations became 300, and one of the four was proved). A lowering under
+/// the same prover with no new reason is the edit the ratchet exists to refuse.
+/// A row removed while `gated(name)` still holds — the library is still one the
+/// lane verifies — lowers it to nothing. A floor that is not a count is named
+/// too: a typo must not pass.
+#[must_use]
+pub fn lowered_floors(base: &str, tree: &str, gated: &dyn Fn(&str) -> bool) -> Vec<String> {
+    struct Row<'a> {
+        name: &'a str,
+        proved: &'a str,
+        prover: &'a str,
+        why: &'a str,
+    }
+    fn rows(text: &str) -> Vec<Row<'_>> {
+        text.lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                let name = f.next()?;
+                let proved = f.next().unwrap_or("");
+                let _total = f.next();
+                let prover = f.next().unwrap_or("");
+                let why = f.next().unwrap_or("").trim();
+                Some(Row {
+                    name,
+                    proved,
+                    prover,
+                    why,
+                })
+            })
+            .collect()
+    }
+    let now = rows(tree);
+    let mut out = Vec::new();
+    for r in &now {
+        if r.proved.parse::<u64>().is_err() {
+            out.push(format!("{}: floor `{}` is not a count", r.name, r.proved));
+        }
+    }
+    for was in rows(base) {
+        let Ok(was_n) = was.proved.parse::<u64>() else {
+            continue;
+        };
+        match now.iter().find(|r| r.name == was.name) {
+            Some(is) => {
+                if let Ok(is_n) = is.proved.parse::<u64>()
+                    && is_n < was_n
+                    && is.prover == was.prover
+                    && (is.why.is_empty() || is.why == was.why)
+                {
+                    out.push(format!(
+                        "{}: floor {was_n} -> {is_n} under the same prover ({}) and no new \
+                         reason in the row's fifth column",
+                        was.name, was.prover
+                    ));
+                }
+            }
+            None if gated(was.name) => out.push(format!(
+                "{}: floor {was_n} removed while the lane still verifies it",
+                was.name
+            )),
+            None => {}
+        }
+    }
+    out
+}
+
+/// The lane's exit status and its `GATED:` line, as a ladder row — the script's
+/// contract: `0` every verified library held its floor, `1` a library fell below
+/// its floor, had none, or its verification broke (the rows above name which),
+/// `2` the lane could not run. The `GATED:` line says how many of the selected
+/// libraries it verified and which it did not, so a run that skipped everything
+/// it was asked about reads as that, never as a floor held.
+#[must_use]
+pub fn trust_lane_outcome(code: Option<i32>, scope: &str, output: &str) -> (Outcome, String) {
+    let gated = output
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("GATED: "))
+        .map(str::trim);
+    match code {
+        Some(0) => match gated {
+            Some(g) if g.starts_with("0 of ") => (
+                Outcome::Ok,
+                format!(
+                    "trust advisory lane: NOTHING verified — {g}; the release's whole-tree run \
+                     verifies what was skipped ({scope})"
+                ),
+            ),
+            Some(g) => (
+                Outcome::Ok,
+                format!(
+                    "trust advisory lane: every verified library at or above its floor — {g} \
+                     ({scope})"
+                ),
+            ),
+            None => (
+                Outcome::Fail(Severity::CouldNotRun),
+                format!(
+                    "trust advisory lane: exit 0 with no GATED line, so what it verified is \
+                     unknown ({scope})"
+                ),
+            ),
+        },
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!(
+                "trust advisory lane: a library fell below its tools/trust-gate-ratchet.tsv floor, \
+                 had none, or its verification broke — the rows above name it ({scope})"
+            ),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            format!("trust advisory lane: NOT RUN — the script could not start its lane ({scope})"),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("trust advisory lane: unexpected exit {c} (the script answers only 0/1/2)"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "trust advisory lane: no exit status — killed by a signal, or never spawned"
+                .to_string(),
+        ),
+    }
+}
+
+/// The lane's command: the script in its per-commit tier (the scope list's
+/// `full-only` libraries are named and skipped — the release's whole-tree run
+/// verifies them), its target root, the slot count left to the script's own
+/// `--jobs auto` (one slot per six cores and per 32 GiB, heavy libraries one at a
+/// time), and every `ATERM_GATE_*` input pinned — an empty value is the script's
+/// default — so a caller's exported override can neither narrow the run, point
+/// the ratchet somewhere else, nor size the slots.
+#[must_use]
+pub fn trust_lane_cmd(ctx: &Ctx, only: &[String]) -> Cmd {
+    let root = lane_dir(ctx, Lane::TrustTarget).unwrap_or_else(|| ctx.root.join("target-trust"));
+    let cmd = Cmd::new(ctx.tools_dir().join("trust-gate-all.sh"))
+        .arg("--target-root")
+        .arg(root)
+        .arg("--per-commit")
+        .env("ATERM_GATE_ONLY", only.join(" "))
+        .env("ATERM_GATE_RATCHET", "")
+        .env("ATERM_GATE_FORKS", "")
+        .env("ATERM_GATE_SCOPE", "")
+        .env("ATERM_GATE_LOGDIR", "")
+        .env("ATERM_GATE_MACHINE", "");
+    match lane_jobs(Lane::TrustTarget, ctx.env.cargo_build_jobs.as_deref()) {
+        Some(jobs) => cmd.env("CARGO_BUILD_JOBS", jobs.to_string()),
+        None => cmd,
+    }
+    .demoted()
+}
+
+/// The lane's two scripts, under `tools/`: the verdict self-test, then the lane.
+pub const TRUST_LANE_SCRIPTS: [&str; 2] = ["test-trust-gate-verdict.sh", "trust-gate-all.sh"];
+
+/// The ratchet, relative to the repository root.
+pub const TRUST_RATCHET: &str = "tools/trust-gate-ratchet.tsv";
+
+fn trust_advisory(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
+        r.skip("trust advisory lane (no stage2 toolchain)");
+        return;
+    }
+    let [selftest, gate] = TRUST_LANE_SCRIPTS.map(|name| ctx.tools_dir().join(name));
+    for t in [&selftest, &gate] {
+        if !is_executable_file(t) {
+            r.cannot_run(format!(
+                "trust advisory lane: {} missing or not executable",
+                t.display()
+            ));
+            return;
+        }
+    }
+    if !run_labeled(ctx, r, "test-trust-gate-verdict.sh", &Cmd::new(&selftest)) {
+        return;
+    }
+    let shared = shared_branch_ref(ctx);
+    let base = match &ctx.scope {
+        Scope::Changed(ch) => ch.base.clone(),
+        _ => shared.clone(),
+    };
+    trust_floors_up_only(ctx, r, &base);
+    let has_lib = |c: &str| crate::changed::crate_dir_has_lib(&ctx.root, c);
+    let touched = |b: &str| crate::changed::touched_since(&ctx.root, &ctx.tools, &ctx.path_env, b);
+    let (only, scope) = match trust_selection(&ctx.scope, &has_lib, &touched, &shared) {
+        TrustSelection::Nothing(why) => {
+            r.pass(format!("trust advisory lane: nothing to verify — {why}"));
+            return;
+        }
+        TrustSelection::Undecided(why) => {
+            r.skip(format!("trust advisory lane: {why}"));
+            return;
+        }
+        TrustSelection::Crates { crates, why } => {
+            let scope = format!("{}: {}", why, crates.join(" "));
+            (crates, scope)
+        }
+    };
+    let cmd = trust_lane_cmd(ctx, &only);
+    let out = exec::run(&cmd, ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = trust_lane_outcome(out.code, &scope, &out.output);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
+    r.record(outcome, label);
+}
+
+/// The ratchet's up-only check ([`lowered_floors`]) against `base`'s copy.
+/// `base` holding no ratchet is nothing to lower; a base git cannot read is a
+/// named skip of this check alone, never a pass of it.
+fn trust_floors_up_only(ctx: &Ctx, r: &mut Report, base: &str) {
+    let tree = std::fs::read_to_string(ctx.root.join(TRUST_RATCHET)).unwrap_or_default();
+    let shown = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{TRUST_RATCHET}")])
+        .current_dir(&ctx.root)
+        .env("PATH", &ctx.path_env)
+        .output();
+    let base_text = match shown {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) if String::from_utf8_lossy(&o.stderr).contains("does not exist") => String::new(),
+        Ok(o) => {
+            r.skip(format!(
+                "trust ratchet up-only check: git could not read {base}'s {TRUST_RATCHET} ({})",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+            return;
+        }
+        Err(e) => {
+            r.skip(format!(
+                "trust ratchet up-only check: git did not run ({e})"
+            ));
+            return;
+        }
+    };
+    let gated = crate::changed::gated_libraries(&ctx.root, &ctx.tools, &ctx.path_env);
+    // An unread member table cannot say a library is gone, so every removed row
+    // counts as a library the lane still verifies — the direction that refuses.
+    let still = |name: &str| gated.as_ref().is_none_or(|g| g.contains(name));
+    let lowered = lowered_floors(&base_text, &tree, &still);
+    if lowered.is_empty() {
+        r.pass(format!(
+            "trust ratchet up-only against {base}: no floor lowered under its own prover"
+        ));
+    } else {
+        for l in &lowered {
+            r.raw(format!("  LOWERED: {l}"));
+        }
+        r.record(
+            Outcome::Fail(Severity::GateFailed),
+            format!(
+                "trust ratchet up-only against {base}: {} floor(s) lowered by hand — a floor \
+                 goes down only onto a new prover (`tools/trust-gate-all.sh --update-ratchet` \
+                 re-bases it) or with the reason in the row's fifth column",
+                lowered.len()
+            ),
+        );
+    }
+}
+
+/// The ref a whole-tree run's change is measured against: the shared branch as
+/// this checkout last saw it, `origin/main`, else a local `main`.
+fn shared_branch_ref(ctx: &Ctx) -> String {
+    let resolves = |r: &str| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", r])
+            .current_dir(&ctx.root)
+            .env("PATH", &ctx.path_env)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if resolves("origin/main") {
+        "origin/main".to_string()
+    } else {
+        "main".to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 3.6) STARTUP COMPARISON SCHEDULER (`--full` only since 2026-09-27) — the
 //    publishable-startup evidence path must fail closed on malformed samples,
 //    mutable harness bytes, uncertain thermal state, identical-artifact
@@ -2135,38 +2500,27 @@ fn freeze_gate(ctx: &Ctx, r: &mut Report) {
 //    are named skips, so nothing builds it.
 // ---------------------------------------------------------------------------
 
-/// The objc driver examples with the package each lives in, in the order
-/// their stages run.
-pub const OBJC_DRIVER_EXAMPLES: [(&str, &str); 6] = [
-    ("aterm-gui", OBJC_CLASS_AUDIT_EXAMPLE),
-    ("aterm-gui", OBJC_IME_DRIVE_EXAMPLE),
-    ("aterm-gui", OBJC_TOOLBAR_DRIVE_EXAMPLE),
-    ("aterm-gui", OBJC_WINDOW_DRIVE_EXAMPLE),
-    ("aterm-gui", OBJC_EVENT_DRIVE_EXAMPLE),
-    ("aterm-objc", OBJC_BOUND_DRIVE_EXAMPLE),
-];
-
-/// `targo --unverified build -q -p aterm-gui -p aterm-objc --example <each>` —
-/// every objc driver in one cargo invocation. Graph-measured on 07a76fca7
+/// `targo --unverified build -q -p <package> --example <each>` — every
+/// [`OBJC_DRIVES`] row in one cargo invocation. Graph-measured on 07a76fca7
 /// (`--unit-graph`, with the build-override pin, over the eight drivers of
 /// the day): the combined graph equals the union of the single-example
-/// graphs, symmetric difference 0 — so it compiles exactly what the stage
-/// builds compile.
+/// graphs, symmetric difference 0 — so it compiles exactly what the rows'
+/// own builds compile.
 #[must_use]
 pub fn objc_driver_prebuild_args() -> Vec<String> {
     let mut a: Vec<String> = ["--unverified", "build", "-q"]
         .into_iter()
         .map(String::from)
         .collect();
-    for (pkg, _) in OBJC_DRIVER_EXAMPLES {
-        if !a.iter().any(|x| x == pkg) {
+    for drive in &OBJC_DRIVES {
+        if !a.iter().any(|x| x == drive.package) {
             a.push("-p".to_string());
-            a.push(pkg.to_string());
+            a.push(drive.package.to_string());
         }
     }
-    for (_, example) in OBJC_DRIVER_EXAMPLES {
+    for drive in &OBJC_DRIVES {
         a.push("--example".to_string());
-        a.push(example.to_string());
+        a.push(drive.example.to_string());
     }
     a
 }
@@ -2207,7 +2561,7 @@ fn driver_builds(ctx: &Ctx, r: &mut Report) {
         return;
     }
     // Every child, even after a failure: they are independent builds, and the
-    // stage that drives each one reports its own build either way.
+    // row that drives each one reports its own build either way.
     for (label, cmd) in driver_build_cmds(ctx) {
         run_labeled(ctx, r, &label, &cmd);
     }
@@ -2346,49 +2700,55 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 5d) OBJC LIVE-CLASS AUDIT — the registered class, read back off a real
-//    NSWindow's delegate. `vendor/winit`'s `WinitWindowDelegate` is declared by
-//    `aterm_objc::declare_class!`, and until this stage NOTHING IN CI READ IT:
-//    the seam census checks a mirror class the test file declares, and two
-//    compile-verified plants (an argument retyped `Id` -> `Bool`, and
-//    `NSWindowDelegate` dropped from `protocols:`) passed that census 6/6 with
-//    the build at exit 0 and the driven event log byte-identical.
+// 5d) THE OBJC DRIVES — the ported classes and the tab strip, driven on a
+//    real AppKit, one row per [`OBJC_DRIVES`] entry. Each checks what no unit
+//    test can reach (libtest cannot host AppKit), and each driver's header
+//    names the defects it has caught.
 // ---------------------------------------------------------------------------
 
-fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
+fn objc_drives(ctx: &Ctx, r: &mut Report) {
     if !cfg!(target_os = "macos") {
-        // Not a skip for lack of a tool: the class under audit is declared
-        // inside `#[cfg(target_os = "macos")]` and does not exist here at all.
-        r.skip("objc live-class audit (macOS only: the audited class is a macOS one)");
+        // Not a skip for lack of a tool: every driven class is declared inside
+        // `#[cfg(target_os = "macos")]` and does not exist here at all.
+        r.skip("objc drives (macOS only: the driven classes are macOS ones)");
         return;
     }
     if !ctx.tools.have_targo() {
-        r.skip("objc live-class audit (no targo)");
+        r.skip("objc drives (no targo)");
         return;
     }
+    // Every row, even after a failure: each is its own build and its own
+    // verdict, and one red must not hide the rest.
+    for drive in &OBJC_DRIVES {
+        objc_drive(ctx, r, drive);
+    }
+}
+
+fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive) {
+    let name = drive.example;
     if !build_to_drive(
         ctx,
         r,
-        objc_class_audit_build_args(),
-        format!("targo build --example {OBJC_CLASS_AUDIT_EXAMPLE}"),
-        "objc live-class audit",
+        objc_drive_build_args(drive),
+        format!("targo build -p {} --example {name}", drive.package),
+        name,
     ) {
         return;
     }
-    let bin = driver_example(ctx, OBJC_CLASS_AUDIT_EXAMPLE);
+    let bin = driver_example(ctx, name);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
-            "objc live-class audit: just-built auditor missing ({})",
+            "{name}: just-built driver missing ({})",
             bin.display()
         ));
         return;
     }
-    // Driven as a BINARY, never `targo run`, for the same two reasons as the
-    // redraw harness: the driver's lane banner would land in the transcript, and
-    // cargo's own exit codes would collide with the auditor's 0/1/2.
+    // Driven as a BINARY, never `targo run`: cargo's lane banner would land in
+    // the transcript, its own exit codes would collide with the driver's, and
+    // it would turn the event drive's signal death — the finding — into 101.
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
-    let (outcome, label) = objc_audit_outcome(out.code);
+    let (outcome, label) = objc_drive_outcome(drive, out.code);
     if r.child_could_not_run(&out, &label) {
         return;
     }
@@ -2396,235 +2756,15 @@ fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 5c) THE IME DRIVE — the auditor's twin, asking the other question.
-//
-//    The audit proves the ported `WinitView` is SHAPED right: 44 registered
-//    encodings against the runtime's own authority. It cannot prove the class
-//    BEHAVES right, and for `view.rs` that is the question that matters — the
-//    eleven `NSTextInputClient` rows are a state machine an input method
-//    drives, and a port that registers all eleven correctly and still drops a
-//    preedit, mis-clamps a cursor range, or forwards UTF-16 indices where
-//    winit's API promises UTF-8 byte offsets passes every shape check in the
-//    tree. It also drives the one row whose wrong encoding would not raise:
-//    `firstRectForCharacterRange:actualRange:` is how an input method asks
-//    where to put its candidate window, so a garbage answer there is a
-//    misplaced window rather than an exception.
-// ---------------------------------------------------------------------------
-
-fn objc_ime_drive(ctx: &Ctx, r: &mut Report) {
-    if !cfg!(target_os = "macos") {
-        r.skip("objc IME drive (macOS only: the driven class is a macOS one)");
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("objc IME drive (no targo)");
-        return;
-    }
-    if !build_to_drive(
-        ctx,
-        r,
-        objc_ime_drive_build_args(),
-        format!("targo build --example {OBJC_IME_DRIVE_EXAMPLE}"),
-        "objc IME drive",
-    ) {
-        return;
-    }
-    let bin = driver_example(ctx, OBJC_IME_DRIVE_EXAMPLE);
-    if !is_executable_file(&bin) {
-        r.cannot_run(format!(
-            "objc IME drive: just-built driver missing ({})",
-            bin.display()
-        ));
-        return;
-    }
-    // A BINARY, never `targo run`, for the same two reasons as the auditor: the
-    // driver lane's banner would land in the transcript, and cargo's own exit
-    // codes would collide with the driver's 0/1/2.
-    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = objc_ime_outcome(out.code);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
-}
-
-// ---------------------------------------------------------------------------
-// 5e) THE TOOLBAR DRIVE — the same obligation as 5d, one file over and on the
-//    LARGEST ported file in the tree. `crates/aterm-gui/src/toolbar.rs` holds
-//    four declared classes and, after W7, every AppKit binding call in the tab
-//    strip; nothing in CI drove it. Its `#[cfg(test)] mod objc_tests` checks
-//    thirty-two registered encodings against a LITERAL IN THE SAME FILE, and a
-//    plant that registered `controlTextDidChange:` as `v@:B` and edited the
-//    table to agree left it green. This stage installs the real toolbar in a
-//    real NSWindow, enters the registered IMPs through AppKit's dispatch,
-//    captures 27 drawing states, and reads all four classes off the live
-//    objects. On its first run it found a spurious commit posted by
-//    `begin_tab_rename` that left both of the rename editor's exits dead.
-// ---------------------------------------------------------------------------
-
-fn objc_toolbar_drive(ctx: &Ctx, r: &mut Report) {
-    if !cfg!(target_os = "macos") {
-        // Not a skip for lack of a tool: the tab strip and its four declared
-        // classes live inside `#[cfg(target_os = "macos")]`.
-        r.skip("objc toolbar drive (macOS only: the driven strip is a macOS one)");
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("objc toolbar drive (no targo)");
-        return;
-    }
-    if !build_to_drive(
-        ctx,
-        r,
-        objc_toolbar_drive_build_args(),
-        format!("targo build --example {OBJC_TOOLBAR_DRIVE_EXAMPLE}"),
-        "objc toolbar drive",
-    ) {
-        return;
-    }
-    let bin = driver_example(ctx, OBJC_TOOLBAR_DRIVE_EXAMPLE);
-    if !is_executable_file(&bin) {
-        r.cannot_run(format!(
-            "objc toolbar drive: just-built driver missing ({})",
-            bin.display()
-        ));
-        return;
-    }
-    // A BINARY, never `targo run`, for the same two reasons as its siblings:
-    // the driver lane's banner would land in the transcript, and cargo's own
-    // exit codes would collide with the driver's 0/1/2/3.
-    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = objc_toolbar_outcome(out.code);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
-}
-
-fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
-    if !cfg!(target_os = "macos") {
-        r.skip("objc window drive (macOS only: the driven window_delegate.rs is a macOS one)");
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("objc window drive (no targo)");
-        return;
-    }
-    if !build_to_drive(
-        ctx,
-        r,
-        objc_window_drive_build_args(),
-        format!("targo build --example {OBJC_WINDOW_DRIVE_EXAMPLE}"),
-        "objc window drive",
-    ) {
-        return;
-    }
-    let bin = driver_example(ctx, OBJC_WINDOW_DRIVE_EXAMPLE);
-    if !is_executable_file(&bin) {
-        r.cannot_run(format!(
-            "objc window drive: just-built driver missing ({})",
-            bin.display()
-        ));
-        return;
-    }
-    // A BINARY, never `targo run`, for the same two reasons as its siblings:
-    // the driver lane's banner would land in the transcript, and cargo's own
-    // exit codes would collide with the driver's 0/1/2.
-    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = objc_window_outcome(out.code);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
-}
-
-fn objc_event_drive(ctx: &Ctx, r: &mut Report) {
-    if !cfg!(target_os = "macos") {
-        r.skip("objc event drive (macOS only: the driven view.rs is a macOS one)");
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("objc event drive (no targo)");
-        return;
-    }
-    if !build_to_drive(
-        ctx,
-        r,
-        objc_event_drive_build_args(),
-        format!("targo build --example {OBJC_EVENT_DRIVE_EXAMPLE}"),
-        "objc event drive",
-    ) {
-        return;
-    }
-    let bin = driver_example(ctx, OBJC_EVENT_DRIVE_EXAMPLE);
-    if !is_executable_file(&bin) {
-        r.cannot_run(format!(
-            "objc event drive: just-built driver missing ({})",
-            bin.display()
-        ));
-        return;
-    }
-    // A BINARY, never `targo run`, for the same two reasons as its siblings —
-    // and here a third: cargo would turn the driver's signal death into its
-    // own exit 101, and the signal IS the finding (see `objc_event_outcome`).
-    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = objc_event_outcome(out.code);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
-}
-
-fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
-    if !cfg!(target_os = "macos") {
-        r.skip("objc bound drive (macOS only: libdispatch's main queue is a Darwin one)");
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("objc bound drive (no targo)");
-        return;
-    }
-    if !build_to_drive(
-        ctx,
-        r,
-        objc_bound_drive_build_args(),
-        format!("targo build -p aterm-objc --example {OBJC_BOUND_DRIVE_EXAMPLE}"),
-        "objc bound drive",
-    ) {
-        return;
-    }
-    let bin = driver_example(ctx, OBJC_BOUND_DRIVE_EXAMPLE);
-    if !is_executable_file(&bin) {
-        r.cannot_run(format!(
-            "objc bound drive: just-built driver missing ({})",
-            bin.display()
-        ));
-        return;
-    }
-    // A BINARY, never `targo run`, as its siblings — and this driver
-    // re-executes ITSELF as its hang-differential children, by path, so the
-    // path it is run from must be the built file and not cargo's runner.
-    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = objc_bound_outcome(out.code);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
-}
-
-// ---------------------------------------------------------------------------
-// 5l) LIVE ATERM LANES (2026-09-26) — the two shell lanes that drive a PRIVATE
+// 5l) LIVE ATERM LANES (2026-09-26) — the shell lanes that drive a PRIVATE
 //    headless instance of THE one binary, `aterm`, the way a person's tab does:
 //    `tools/test-foreground-handback.sh` (a real shell's job control, and the
-//    modes a killed foreground program leaves armed) and
+//    modes a killed foreground program leaves armed),
 //    `tools/test-codex-live-upgrade.sh` (the harness host moving a REAL Codex
 //    from the managed store's older build to its current one, in a sandbox
-//    with every network denied but one loopback port).
+//    with every network denied but one loopback port) and, since 2026-09-28,
+//    `tools/test-render-desync.sh` (a net-zero alternate-screen flap a
+//    stand-in app cannot see, and the three read surfaces that name it).
 //
 //    Until that day no stage, xtask verb, hook or Rust test invoked either,
 //    and by hand both said nothing useful: each looks for
@@ -2643,9 +2783,10 @@ fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
 //    stale `target/`. And a lane's not-run answer is never a pass
 //    ([`live_aterm_outcome`]).
 //
-//    TWO STAGES, TWO TIERS. The handback lane is the per-commit ladder's last
-//    driver-lane row (`StageId::ForegroundHandback`, ~20 s): its verdict is
-//    the tree's. The Codex lane is `--full`'s last row, run alone
+//    TWO TIERS. The handback lane and the render desync lane are the
+//    per-commit ladder's last driver-lane rows (`StageId::ForegroundHandback`,
+//    ~20 s; `StageId::RenderDesync`, ~12 s): their verdicts are the tree's.
+//    The Codex lane is `--full`'s last row, run alone
 //    (`StageId::CodexLiveUpgrade`, ~10 min): it reads this machine's managed
 //    store (no older Codex, no run) and the vendor's current Codex (whose
 //    release-specific internals it asserts), so in the per-commit contract it
@@ -2686,10 +2827,33 @@ pub const FOREGROUND_HANDBACK_SUITE: &str = "test-foreground-handback.sh";
 /// argument; exits `0` pass, `1` a check failed, `77` skipped. macOS only.
 pub const CODEX_LIVE_UPGRADE_SUITE: &str = "test-codex-live-upgrade.sh";
 
-/// Both live lanes, the roster the fixtures seed from: the handback lane is
-/// `StageId::ForegroundHandback`'s, the Codex lane `StageId::CodexLiveUpgrade`'s
+/// The render desync lane. Takes the binary as `--binary <path>`, as the
+/// handback lane does; exits `0` iff no row FAILed and every variant ran, `1`
+/// when a row FAILed, `3` when the lane could not run (the gate's own COULD NOT
+/// RUN code: no binary, no python3, or a machine too slow to land two resizes
+/// in one run).
+pub const RENDER_DESYNC_SUITE: &str = "test-render-desync.sh";
+
+/// Every live lane, the roster the fixtures seed from: the handback lane is
+/// `StageId::ForegroundHandback`'s, the render desync lane
+/// `StageId::RenderDesync`'s, the Codex lane `StageId::CodexLiveUpgrade`'s
 /// (`--full` only).
-pub const LIVE_ATERM_SUITES: [&str; 2] = [FOREGROUND_HANDBACK_SUITE, CODEX_LIVE_UPGRADE_SUITE];
+pub const LIVE_ATERM_SUITES: [&str; 3] = [
+    FOREGROUND_HANDBACK_SUITE,
+    RENDER_DESYNC_SUITE,
+    CODEX_LIVE_UPGRADE_SUITE,
+];
+
+/// The code a live lane answers when it could not run: the handback lane's
+/// `2`, the render desync lane's `3`, the Codex lane's `77`.
+#[must_use]
+pub fn live_aterm_not_run_code(name: &str) -> i32 {
+    match name {
+        FOREGROUND_HANDBACK_SUITE => 2,
+        RENDER_DESYNC_SUITE => 3,
+        _ => 77,
+    }
+}
 
 /// The build of that binary, in the driver lane. Compile-only, so demoted; the
 /// lanes themselves RUN code and keep the inherited tier.
@@ -2719,16 +2883,16 @@ pub fn live_aterm_binary(ctx: &Ctx) -> std::path::PathBuf {
 pub fn live_aterm_suite_cmd(ctx: &Ctx, name: &str) -> Cmd {
     let cmd = Cmd::new(ctx.tools_dir().join(name)).term_grace(exec::TERM_GRACE);
     let bin = live_aterm_binary(ctx);
-    if name == FOREGROUND_HANDBACK_SUITE {
-        cmd.arg("--binary").arg(bin)
-    } else {
+    if name == CODEX_LIVE_UPGRADE_SUITE {
         cmd.arg(bin)
+    } else {
+        cmd.arg("--binary").arg(bin)
     }
 }
 
 /// The reason a lane gave for not running: the text after the LAST `SKIP: `
-/// (the Codex lane's `skip()`) or `NOT RUN: ` (the handback lane's
-/// `not_run()`) line it printed — each prints exactly one, then exits.
+/// (the Codex lane's `skip()`) or `NOT RUN: ` (the handback and render desync
+/// lanes' `not_run()`) line it printed — each prints exactly one, then exits.
 fn not_run_reason(transcript: &str) -> Option<&str> {
     transcript
         .lines()
@@ -2763,24 +2927,29 @@ fn not_run_reason(transcript: &str) -> Option<&str> {
 /// contract claim. Never a pass either way. Any other code is a finding — a
 /// lane that dies mid-way died on something the shipped binary did, or on its
 /// own script, and both belong to the tree.
+///
+/// The render desync lane (2026-09-28) reads like the handback lane, with the
+/// gate's own COULD NOT RUN code, `3`: no binary, no python3, or a machine too
+/// slow to land two `ctl resize` calls within one 250 ms run — the scenario
+/// never happened, which decides nothing about the tree.
 #[must_use]
 pub fn live_aterm_outcome(name: &str, code: Option<i32>, transcript: &str) -> (Outcome, String) {
-    let handback = name == FOREGROUND_HANDBACK_SUITE;
-    let not_run = if handback { 2 } else { 77 };
+    let codex = name == CODEX_LIVE_UPGRADE_SUITE;
+    let not_run = live_aterm_not_run_code(name);
     match code {
         Some(0) => (Outcome::Ok, name.to_string()),
         Some(1) => (
             Outcome::Fail(Severity::GateFailed),
             format!("{name}: a check failed against the live aterm — its rows above say which"),
         ),
-        Some(2) if handback => (
+        Some(c) if c == not_run && !codex => (
             Outcome::Fail(Severity::CouldNotRun),
             format!(
-                "{name}: NOT RUN — {} (exit 2, never a pass)",
+                "{name}: NOT RUN — {} (exit {c}, never a pass)",
                 not_run_reason(transcript).unwrap_or("the lane could not run and did not say why")
             ),
         ),
-        Some(77) if !handback => (
+        Some(77) if codex => (
             Outcome::Skip,
             format!(
                 "{name}: NOT RUN — {} (exit 77: this machine lacks a prerequisite; a named skip, \
@@ -2812,17 +2981,27 @@ pub fn live_aterm_outcome(name: &str, code: Option<i32>, transcript: &str) -> (O
 /// coverage nobody has seen.
 #[must_use]
 pub fn live_aterm_macos_only(name: &str) -> &'static str {
-    if name == FOREGROUND_HANDBACK_SUITE {
-        "the lane has been measured nowhere else, and its bash row expects macOS's \
-         /bin/bash 3.2, which has no bracketed paste, where bash 5.1+ arms it by default"
-    } else {
-        "the instance runs under sandbox-exec, and the ps stand-in reads sysctl's kinfo_proc"
+    match name {
+        FOREGROUND_HANDBACK_SUITE => {
+            "the lane has been measured nowhere else, and its bash row expects macOS's \
+             /bin/bash 3.2, which has no bracketed paste, where bash 5.1+ arms it by default"
+        }
+        RENDER_DESYNC_SUITE => {
+            "the lane has been measured nowhere else: its stand-in and verbs are portable, \
+             but no run off macOS has been seen, and a skip says so where a pass would claim it"
+        }
+        _ => "the instance runs under sandbox-exec, and the ps stand-in reads sysctl's kinfo_proc",
     }
 }
 
 /// The per-commit live row: the foreground handback.
 fn foreground_handback(ctx: &Ctx, r: &mut Report) {
     live_aterm_stage(ctx, r, FOREGROUND_HANDBACK_SUITE);
+}
+
+/// The per-commit live row: the render desync.
+fn render_desync(ctx: &Ctx, r: &mut Report) {
+    live_aterm_stage(ctx, r, RENDER_DESYNC_SUITE);
 }
 
 /// The `--full` live row: the Codex live upgrade.
@@ -2931,8 +3110,8 @@ pub fn cells_outcome(verb: &str, ok: bool, transcript: &str) -> (Outcome, String
         return (
             Outcome::Skip,
             format!(
-                "{verb} (a forge cell had no installed std — NOTHING was compiled for it; the \
-                 NOT PROVEN line above names which)"
+                "{verb} (a forge cell had no toolchain here — no installed std, or no rustup; \
+                 NOTHING was compiled for it; the NOT PROVEN line above names which and why)"
             ),
         );
     }
@@ -3001,6 +3180,10 @@ fn cross_cells(ctx: &Ctx, r: &mut Report) {
 /// PREREQUISITE: rustup's `stable` with the four foreign std targets. Without
 /// them `xtask` exits 0 naming the missing std, this stage records a SKIP, and
 /// the verdict withholds the merge-contract sentence on that box.
+/// STOCK EXCEPTION (Trust lacks these stds; measured 2026-09-28: E0463 for
+/// wasm32, windows-gnu and both linux triples, and `gate cells-foreign` on a
+/// Trust-only Mac SKIPPED all five cells). Whether the merge contract keeps
+/// requiring stock-compiled cells is an owner decision, not this stage's.
 fn foreign_cells(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.skip("gate cells-foreign (no targo)");
@@ -3021,7 +3204,18 @@ fn foreign_cells(ctx: &Ctx, r: &mut Report) {
 /// removed by its cap. Without it the stage wrote into `xtask`'s per-checkout
 /// default under `~/.cache/aterm/cells`, which no budget counted.
 fn foreign_cells_cmd(ctx: &Ctx) -> Cmd {
-    let cmd = xtask_cmd(ctx, xtask_gate_args("cells-foreign"));
+    in_cells_lane(ctx, xtask_cmd(ctx, xtask_gate_args("cells-foreign")))
+}
+
+/// `cmd` pointed at the run's CELLS LANE, when the run has one. The foreign-cells
+/// stage builds there, and so does the TEST stage's run child: `xtask`'s red
+/// fixture for `cells-foreign` (`a_foreign_cell_under_its_floor_fails_the_cells_verb`)
+/// compiles the wasm-cpu cell whenever a toolchain carries its std, and without the
+/// lane it built a second copy under `~/.cache/aterm/cells` that no budget counted
+/// or capped — measured 2026-09-27, the first run on a box where
+/// `gate::find_rustup` found an off-PATH rustup. The test stage runs after the
+/// xtask lane, so the fixture finds the stage's artifacts warm.
+fn in_cells_lane(ctx: &Ctx, cmd: Cmd) -> Cmd {
     match crate::disk::cells_lane(&ctx.root) {
         Some(cells) => cmd.env("ATERM_CELL_TARGET_DIR", cells),
         None => cmd,
@@ -3029,11 +3223,12 @@ fn foreign_cells_cmd(ctx: &Ctx) -> Cmd {
 }
 
 /// Every gate run: `xtask gate forge` — the third-party surface (vendored
-/// forks and first-party patch targets live on every cell with no unpatched
-/// sibling, carved paths absent, provenance attested, the `[OB-14]` budget
-/// ratchet, `[OB-16]` mirror honesty, `[OB-17]` the fork ledger). Decided
-/// 2026-09-25 under the owner's standing direction: a flat ~9-14 s with no
-/// compiler and no network, in the xtask lane beside the other gate verbs —
+/// forks and first-party patch targets live in the cells that pull them in,
+/// never dead and with no unpatched sibling, carved paths absent, provenance
+/// attested, the `[OB-14]` budget ratchet, `[OB-16]` mirror honesty, `[OB-17]`
+/// the fork ledger). Decided 2026-09-25 under the owner's standing direction:
+/// a flat ~9-14 s with no compiler and no network, in the xtask lane beside the
+/// other gate verbs —
 /// and a gate that only `--full` runs is a gate nothing automatic runs, which
 /// is how `gate cells` missed a Windows break for two days.
 fn forge_gate(ctx: &Ctx, r: &mut Report) {
@@ -3101,7 +3296,7 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
         if r.child_could_not_run(&out, &format!("verify-kani-proofs.sh ({krate})")) {
             continue;
         }
-        let (outcome, why) = kani_floor_outcome(out.ok, &out.output);
+        let (outcome, why) = kani_floor_outcome(out.ok, out.code, &out.output);
         r.record_child(
             &out,
             outcome,
@@ -3118,8 +3313,19 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
 /// the status. Anything else at exit 0 (a rewritten script, a truncated run)
 /// asserted nothing about proofs and is reported the same fail-open-but-honest
 /// way: a skip, which the tally names and the verdict subtracts from the claim.
-/// Which runs FAIL is unchanged — nonzero is still a finding.
-fn kani_floor_outcome(ok: bool, output: &str) -> (Outcome, &'static str) {
+///
+/// Nonzero is a finding, except the script's own exit 3: the MACHINE could not
+/// run the lane (a tool, a derived directory, or — 2026-09-28 — no host sysroot
+/// for build scripts beside trust-mc's panic=abort one), so COULD NOT RUN, which
+/// is never a pass either. That last one was a FAIL row for aterm-render in the
+/// 0.98.0 `--full` run, read as a finding about the tree it never compiled.
+fn kani_floor_outcome(ok: bool, code: Option<i32>, output: &str) -> (Outcome, &'static str) {
+    if code == Some(3) {
+        return (
+            Outcome::Fail(Severity::CouldNotRun),
+            " — could not run: exit 3, the machine not the tree (the script says why above)",
+        );
+    }
     if !ok {
         return (Outcome::Fail(Severity::GateFailed), "");
     }
@@ -3154,6 +3360,270 @@ mod tests {
             EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         )
+    }
+
+    /// A fixture tree's `crates/*/Cargo.toml` — two gated packages (one
+    /// target gated twice), one with none, one directory with no manifest —
+    /// read by [`gated_lint_features`], as the lint reads the real one.
+    fn fixture_gated() -> Vec<(String, String)> {
+        let root = crate::mktemp_dir("atv-gated").expect("mktemp");
+        for (dir, manifest) in [
+            (
+                "gui",
+                "[package]\nname = \"aterm-gui\"\n\n[[bin]]\nname = \"harness\"\n\
+                 required-features = [\"control-conformance\"]\n\n[[bench]]\nname = \"b\"\n\
+                 required-features = [\"bench-support\"]\n",
+            ),
+            (
+                "scrollback",
+                "[package]\nname = \"aterm-scrollback\"\n\n[[bench]]\nname = \"x\"\n\
+                 required-features = [\"disk-tier\"]\n\n[[bench]]\nname = \"y\"\n\
+                 required-features = [\"disk-tier\"]\n",
+            ),
+            ("core", "[package]\nname = \"aterm-core\"\n"),
+        ] {
+            std::fs::create_dir_all(root.join("crates").join(dir)).expect("mkdir");
+            std::fs::write(root.join("crates").join(dir).join("Cargo.toml"), manifest)
+                .expect("write");
+        }
+        std::fs::create_dir_all(root.join("crates/no-manifest")).expect("mkdir");
+        let gated = gated_lint_features(&root);
+        std::fs::remove_dir_all(&root).ok();
+        gated
+    }
+
+    // --- the Trust advisory lane (2026-09-27) ---------------------------------
+
+    fn touched(libraries: &[&str], replanned: Option<&str>) -> crate::changed::Touched {
+        crate::changed::Touched {
+            base: "origin/main".to_string(),
+            merge_base: "0123456789abcdef".to_string(),
+            libraries: libraries.iter().map(ToString::to_string).collect(),
+            replanned: replanned.map(ToString::to_string),
+        }
+    }
+
+    fn select(scope: &Scope, t: Result<crate::changed::Touched, String>) -> TrustSelection {
+        let asked = std::cell::RefCell::new(None::<String>);
+        let has_lib = |c: &str| c != "xtask";
+        let answer = |base: &str| {
+            *asked.borrow_mut() = Some(base.to_string());
+            t.clone().map(|mut t| {
+                t.base = base.to_string();
+                t
+            })
+        };
+        let got = trust_selection(scope, &has_lib, &answer, "origin/main");
+        // A --scope run names its crate and must not pay for git; every other
+        // shape reads the diff — against its own --base, or the shared branch.
+        let want = match scope {
+            Scope::Crate(_) => None,
+            Scope::Changed(ch) => Some(ch.base.clone()),
+            Scope::Workspace => Some("origin/main".to_string()),
+        };
+        assert_eq!(*asked.borrow(), want, "{scope:?}");
+        got
+    }
+
+    /// THE SELECTION, in EVERY mode — the whole tree is the release's
+    /// (`trust_receipt_gate`), never a stage child's. A scope names its own crate,
+    /// libraries only; `--changed` and a whole-tree run verify the libraries
+    /// (and admitted forks) the change touched — the SEEDS, never the reverse
+    /// cone a test run needs.
+    #[test]
+    fn the_trust_lane_verifies_what_the_run_says_it_touched() {
+        assert_eq!(
+            select(&Scope::crate_only("aterm-grid"), Err("unasked".into())),
+            TrustSelection::Crates {
+                crates: vec!["aterm-grid".into()],
+                why: "--scope aterm-grid".into()
+            }
+        );
+        assert!(matches!(
+            select(&Scope::crate_only("xtask"), Err("unasked".into())),
+            TrustSelection::Nothing(why) if why.contains("no library")
+        ));
+        // --changed: what touched_since answers against ITS base — the seeds and
+        // touched forks, not the cone (aterm-gui, which only depends on the grid).
+        let changed = Scope::changed("main", vec!["aterm-grid".into(), "aterm-gui".into()], true);
+        assert_eq!(
+            select(&changed, Ok(touched(&["aterm-grid", "smol_str"], None))),
+            TrustSelection::Crates {
+                crates: vec!["aterm-grid".into(), "smol_str".into()],
+                why: "the libraries changed since main (merge-base 012345678)".into()
+            }
+        );
+        // The whole tree: the libraries touched against origin/main.
+        assert_eq!(
+            select(&Scope::workspace(), Ok(touched(&["aterm-types"], None))),
+            TrustSelection::Crates {
+                crates: vec!["aterm-types".into()],
+                why: "the libraries changed since origin/main (merge-base 012345678)".into()
+            }
+        );
+        assert!(matches!(
+            select(&Scope::workspace(), Ok(touched(&[], None))),
+            TrustSelection::Nothing(why) if why.ends_with(": none")
+        ));
+        // A re-planning change is SAID, not widened into hours of verification.
+        assert!(matches!(
+            select(&Scope::workspace(), Ok(touched(&["aterm-types"], Some("Cargo.lock")))),
+            TrustSelection::Crates { why, .. } if why.contains("Cargo.lock changed too")
+        ));
+        // An unreadable diff is a named skip, never a pass.
+        assert!(matches!(
+            select(&Scope::workspace(), Err("no merge-base".into())),
+            TrustSelection::Undecided(why) if why.contains("no merge-base")
+        ));
+    }
+
+    /// The script's contract, row by row: only `0` passes; `2` is the lane not
+    /// running, never a finding about the tree; and a pass SAYS what it verified
+    /// (review, 2026-09-27: a per-commit run over two full-only libraries passed
+    /// as "every library at or above its floor").
+    #[test]
+    fn the_trust_lane_outcome_reads_the_scripts_answers_and_what_it_gated() {
+        let some = "GATED: 1 of 2 selected; not verified: aterm-grid (full-only)\n";
+        let none = "x\nGATED: 0 of 2 selected; not verified: aterm-grid (full-only) aterm-core (full-only)\n";
+        let (ok, label) = trust_lane_outcome(Some(0), "s", some);
+        assert!(matches!(ok, Outcome::Ok));
+        assert!(
+            label.contains("at or above its floor") && label.contains("aterm-grid (full-only)")
+        );
+        let (ok, label) = trust_lane_outcome(Some(0), "s", none);
+        assert!(matches!(ok, Outcome::Ok));
+        assert!(label.contains("NOTHING verified"), "{label}");
+        assert!(!label.contains("at or above its floor"), "{label}");
+        // Exit 0 with no GATED line decides nothing about the tree.
+        assert!(matches!(
+            trust_lane_outcome(Some(0), "s", "TOTAL: 3/3 proved\n").0,
+            Outcome::Fail(Severity::CouldNotRun)
+        ));
+        assert!(matches!(
+            trust_lane_outcome(Some(1), "s", some).0,
+            Outcome::Fail(Severity::GateFailed)
+        ));
+        assert!(matches!(
+            trust_lane_outcome(Some(2), "s", "").0,
+            Outcome::Fail(Severity::CouldNotRun)
+        ));
+        assert!(matches!(
+            trust_lane_outcome(Some(7), "s", some).0,
+            Outcome::Fail(Severity::GateFailed)
+        ));
+        assert!(matches!(
+            trust_lane_outcome(None, "s", "").0,
+            Outcome::Fail(Severity::CouldNotRun)
+        ));
+        assert!(
+            trust_lane_outcome(Some(1), "the scope", "")
+                .1
+                .contains("the scope")
+        );
+    }
+
+    /// THE UP-ONLY FLOOR (review, 2026-09-27: a hand-lowered floor touched no
+    /// library, so the stage passed "nothing to verify"). Lowered under the same
+    /// prover with no new reason: named. With a reason in the fifth column, or
+    /// re-based onto another prover: allowed. Raised, unchanged, or a new row:
+    /// allowed. A removed row: named while the library is still gated, allowed
+    /// once it is gone. A floor that is not a count: named.
+    #[test]
+    fn a_floor_goes_down_only_onto_a_new_prover() {
+        let a = "targo 1.99.0-dev (aaaaaaaaa 2026-09-17) (targo 0.1.0)";
+        let b = "targo 1.99.0-dev (bbbbbbbbb 2026-09-24) (targo 0.1.0)";
+        let base = format!(
+            "aterm-grid\t987\t3806\t{a}\naterm-core\t936\t3265\t{a}\nold-crate\t5\t9\t{a}\n"
+        );
+        let all = |_: &str| true;
+        assert!(lowered_floors(&base, &base, &all).is_empty(), "unchanged");
+        let raised = base.replace("987\t3806", "990\t3806");
+        assert!(lowered_floors(&base, &raised, &all).is_empty(), "raised");
+        let hand = base.replace("987\t3806", "900\t3806");
+        let got = lowered_floors(&base, &hand, &all);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].starts_with("aterm-grid: floor 987 -> 900 under the same prover"));
+        // …unless the row says why, in its fifth column — a change that removed
+        // proved obligations with the code that carried them. The same reason
+        // again is not a new one.
+        let said = hand.replace(
+            &format!("900\t3806\t{a}\n"),
+            &format!("900\t3800\t{a}\tthe cut's arithmetic is checked now\n"),
+        );
+        assert!(
+            lowered_floors(&base, &said, &all).is_empty(),
+            "a named reason"
+        );
+        let again = said.replace("900\t3800", "890\t3800");
+        assert_eq!(
+            lowered_floors(&said, &again, &all).len(),
+            1,
+            "an old reason is not a new one"
+        );
+        let rebased = base.replace(&format!("987\t3806\t{a}"), &format!("900\t3806\t{b}"));
+        assert!(
+            lowered_floors(&base, &rebased, &all).is_empty(),
+            "a re-base onto a new prover"
+        );
+        let removed = base.replace(&format!("old-crate\t5\t9\t{a}\n"), "");
+        assert_eq!(
+            lowered_floors(&base, &removed, &all),
+            ["old-crate: floor 5 removed while the lane still verifies it"]
+        );
+        assert!(
+            lowered_floors(&base, &removed, &|n| n != "old-crate").is_empty(),
+            "gone"
+        );
+        let typo = base.replace("936\t3265", "93x\t3265");
+        assert!(
+            lowered_floors(&base, &typo, &all)
+                .iter()
+                .any(|l| l == "aterm-core: floor `93x` is not a count")
+        );
+        // No base ratchet: nothing to lower.
+        assert!(lowered_floors("", &base, &all).is_empty());
+    }
+
+    /// The lane's command pins every `ATERM_GATE_*` input — an exported
+    /// `ATERM_GATE_ONLY` must not widen or narrow the run, an exported ratchet
+    /// path move the floor, nor an exported machine size the slots — always runs
+    /// the per-commit tier, and runs in its own lane, demoted.
+    #[test]
+    fn the_trust_lane_command_pins_its_inputs_and_its_lane() {
+        let env = |cmd: &Cmd, k: &str| {
+            cmd.envs
+                .iter()
+                .rev()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        for mode in [Mode::Fast, Mode::Full] {
+            let mut c = ctx(Scope::workspace());
+            c.mode = mode;
+            let cmd = trust_lane_cmd(&c, &["aterm-bits".into(), "aterm-grid".into()]);
+            assert_eq!(cmd.program, PathBuf::from("/repo/tools/trust-gate-all.sh"));
+            assert_eq!(
+                cmd.args,
+                ["--target-root", "/repo/target-trust", "--per-commit"]
+                    .map(std::ffi::OsString::from),
+                "{mode:?}: the per-commit tier in every mode; the slots are the script's"
+            );
+            assert_eq!(
+                env(&cmd, "ATERM_GATE_ONLY").as_deref(),
+                Some("aterm-bits aterm-grid")
+            );
+            for k in [
+                "ATERM_GATE_RATCHET",
+                "ATERM_GATE_FORKS",
+                "ATERM_GATE_SCOPE",
+                "ATERM_GATE_LOGDIR",
+                "ATERM_GATE_MACHINE",
+            ] {
+                assert_eq!(env(&cmd, k).as_deref(), Some(""), "{k} is pinned empty");
+            }
+            assert_eq!(env(&cmd, "CARGO_BUILD_JOBS").as_deref(), Some("4"));
+            assert!(cmd.demoted);
+        }
     }
 
     /// A SNAPSHOT'S FOREIGN CELLS BUILD IN ITS CELLS LANE (2026-09-27): the
@@ -3191,6 +3661,14 @@ mod tests {
             crate::disk::cells_lane(&snap.root),
             target_dir(&foreign_cells_cmd(&snap)),
             "the stage builds where the preflight measures"
+        );
+        // THE TEST STAGE'S RUN CHILD SHARES THE LANE: `xtask`'s cells-foreign red
+        // fixture compiles a foreign cell there.
+        let [_, snap_run] = test_cmds(&snap, false);
+        assert_eq!(
+            target_dir(&snap_run),
+            target_dir(&foreign_cells_cmd(&snap)),
+            "the red fixture builds in the lane the stage warmed"
         );
     }
 
@@ -3626,7 +4104,8 @@ mod tests {
             "the lint must not stop at the first failing crate: {a:?}"
         );
         // …and the `--full` required-features pass holds to the same three.
-        let g = tippy_gated_args(&Scope::workspace()).expect("the workspace selects both");
+        let g = tippy_gated_args(&Scope::workspace(), &fixture_gated())
+            .expect("the workspace selects both");
         let sep = g.iter().position(|x| x == "--").expect("a -- separator");
         assert_eq!(&g[sep + 1..], ["-D", "warnings"], "{g:?}");
         for flag in ["--all-targets", "--keep-going"] {
@@ -3723,7 +4202,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            tippy_gated_args(&ws),
+            tippy_gated_args(&ws, &fixture_gated()),
             Some(words(&[
                 "-p",
                 "aterm-gui",
@@ -3832,67 +4311,45 @@ mod tests {
         );
     }
 
-    /// THE REACH GUARD FOR THE REACH GUARDS (ported from xtask 2026-09-27, as
-    /// a SUBSET check). `--all-targets` builds no target whose
-    /// `required-features` are off, so every `(package, feature)` a
-    /// `crates/*/Cargo.toml` `required-features` names must be in
-    /// [`GATED_LINT_FEATURES`] or that target is linted by nobody — and any
-    /// count gate or reach guard living in it stops existing silently (the
-    /// four-day bench break). An entry no manifest names any more is not this
-    /// test's to find: the `--full` lint fails on a feature cargo does not know.
+    /// THE GATED LIST IS THE MANIFESTS' OWN. Each `required-features` key
+    /// counts under its `[package]` name — never the target's `name =`, never
+    /// prose that mentions the key — inline or spanning lines, and a manifest
+    /// with no `[package]` names nothing. The scan sorts and drops repeats.
     #[test]
-    fn the_gated_feature_table_covers_every_required_features_target() {
-        let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let mut found: Vec<(String, String)> = Vec::new();
-        for entry in std::fs::read_dir(&crates)
-            .expect("crates/ is readable")
-            .flatten()
-        {
-            let Ok(text) = std::fs::read_to_string(entry.path().join("Cargo.toml")) else {
-                continue;
-            };
-            // The PACKAGE name, from the `[package]` table: `-p` takes it, and
-            // neither the directory nor a `[[bin]]`'s `name =` has to equal it.
-            let Some(pkg) = text
-                .lines()
-                .map(str::trim)
-                .skip_while(|l| *l != "[package]")
-                .find_map(|l| l.strip_prefix("name = "))
-                .map(|n| n.trim().trim_matches('"').to_string())
-            else {
-                continue;
-            };
-            // The DECLARATION only, never the prose beside it.
-            for list in text.lines().filter_map(|l| {
-                l.trim()
-                    .strip_prefix("required-features")
-                    .and_then(|r| r.trim_start().strip_prefix('='))
-            }) {
-                for feat in list.trim().trim_matches(['[', ']']).split(',') {
-                    let feat = feat.trim().trim_matches('"');
-                    if !feat.is_empty() {
-                        found.push((pkg.clone(), feat.to_string()));
-                    }
-                }
-            }
-        }
-        assert!(
-            !found.is_empty(),
-            "the manifest scan found nothing — it broke"
+    fn the_gated_features_are_read_from_the_manifests() {
+        assert_eq!(
+            manifest_required_features(
+                "[package]\nname = \"p\"\n# `required-features` keeps it out = [\"prose\"]\n\
+                 [[bin]]\nname = \"not-p\"\nrequired-features = [\"a\", \"b\"] # why\n\
+                 [[bench]]\nname = \"x\"\nrequired-features = [\n    \"c\",\n]\n"
+            ),
+            [("p", "a"), ("p", "b"), ("p", "c")].map(|(p, f)| (p.to_string(), f.to_string()))
         );
-        for (pkg, feat) in &found {
-            assert!(
-                GATED_LINT_FEATURES.contains(&(pkg.as_str(), feat.as_str())),
-                "{pkg}/{feat} gates a target that GATED_LINT_FEATURES does not name, so \
-                 no lint pass builds it: {found:?}"
-            );
-        }
+        assert!(
+            manifest_required_features("[workspace]\nrequired-features = [\"a\"]\n").is_empty()
+        );
+        assert_eq!(
+            fixture_gated(),
+            [
+                ("aterm-gui", "bench-support"),
+                ("aterm-gui", "control-conformance"),
+                ("aterm-scrollback", "disk-tier"),
+            ]
+            .map(|(p, f)| (p.to_string(), f.to_string()))
+        );
+        // The real tree has gated targets, and the scan reaches them.
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(
+            !gated_lint_features(&repo).is_empty(),
+            "the manifest scan found nothing in the real tree — it broke"
+        );
     }
 
     #[test]
     fn the_gated_pass_narrows_with_the_scope_and_disappears_when_it_has_nothing_to_reach() {
+        let gated = fixture_gated();
         // One gated package selected: only its features, only its `-p`.
-        let one = tippy_gated_args(&Scope::crate_only("aterm-scrollback"))
+        let one = tippy_gated_args(&Scope::crate_only("aterm-scrollback"), &gated)
             .expect("aterm-scrollback owns two gated benches");
         assert_eq!(
             one,
@@ -3910,13 +4367,23 @@ mod tests {
         );
         // A scope with no gated target must not compile two crates it was
         // narrowed away from just to lint nothing.
-        assert_eq!(tippy_gated_args(&Scope::crate_only("aterm-core")), None);
         assert_eq!(
-            tippy_gated_args(&Scope::changed("main", vec!["aterm-core".into()], true)),
+            tippy_gated_args(&Scope::crate_only("aterm-core"), &gated),
+            None
+        );
+        assert_eq!(
+            tippy_gated_args(
+                &Scope::changed("main", vec!["aterm-core".into()], true),
+                &gated
+            ),
             None
         );
         assert!(
-            tippy_gated_args(&Scope::changed("main", vec!["aterm-gui".into()], true)).is_some(),
+            tippy_gated_args(
+                &Scope::changed("main", vec!["aterm-gui".into()], true),
+                &gated
+            )
+            .is_some(),
             "a changed-scope run that rebuilt aterm-gui must still lint its benches"
         );
     }
@@ -4084,6 +4551,63 @@ mod tests {
         }
     }
 
+    /// THE KANI FLOOR'S EXIT CODES (2026-09-28). 0.98.0's `--full` recorded
+    /// aterm-render as a FAIL when harness discovery died on build scripts
+    /// compiled against trust-mc's panic=abort sysroot — the machine, not the
+    /// tree. The script now says so with exit 3, read here as COULD NOT RUN;
+    /// its 1 and 2 stay findings, and nothing but a `PASS:` line is `ok`.
+    #[test]
+    fn the_kani_floor_reads_exit_three_as_could_not_run_and_never_a_pass() {
+        use crate::{Outcome, Severity};
+        let cases: [(bool, Option<i32>, &str, Outcome); 7] = [
+            (
+                false,
+                Some(3),
+                "COULD NOT RUN: `cargo trust-mc list` exited 1",
+                Outcome::Fail(Severity::CouldNotRun),
+            ),
+            (
+                false,
+                Some(2),
+                "FAIL: `cargo trust-mc list` exited 1",
+                Outcome::Fail(Severity::GateFailed),
+            ),
+            (
+                false,
+                Some(1),
+                "FAIL: genuine counterexample(s): x",
+                Outcome::Fail(Severity::GateFailed),
+            ),
+            (false, None, "", Outcome::Fail(Severity::GateFailed)),
+            (
+                true,
+                Some(0),
+                "PASS: 3 Kani proof(s) discharged",
+                Outcome::Ok,
+            ),
+            (
+                true,
+                Some(0),
+                "NOT PROVED (no violations found, and NOTHING discharged)",
+                Outcome::Skip,
+            ),
+            (true, Some(0), "", Outcome::Skip),
+        ];
+        for (ok, code, output, want) in cases {
+            assert_eq!(
+                kani_floor_outcome(ok, code, output).0,
+                want,
+                "{code:?} {output:?}"
+            );
+        }
+        assert!(
+            kani_floor_outcome(false, Some(3), "")
+                .1
+                .contains("could not run"),
+            "the row names what happened"
+        );
+    }
+
     /// AN UNAVAILABLE PROVER IS SAID PROMINENTLY AND NEVER DESCRIBED AS
     /// DISCHARGED (`--full`'s trust-mc / Kani floor): a NOTICE naming what did
     /// not run and its repair, one named skip, and so no merge-contract claim.
@@ -4158,6 +4682,190 @@ mod tests {
             );
             assert!(label.contains("missing or not executable"), "{label}");
         }
+    }
+
+    /// THE EXPORT CONTENT SCAN'S EXIT, READ (2026-09-29). `0` is the only
+    /// pass, and only with its PASS line; `1` the finding, and only with its
+    /// FAIL or REFUSED line; `77` — no engine checkout or no gitleaks — a
+    /// NAMED SKIP carrying the scan's own reason, never a pass and never a
+    /// finding; `3` COULD NOT RUN with its reason; anything else a finding,
+    /// and a death with no status decided nothing.
+    ///
+    /// A `0` or `1` WITHOUT A VERDICT LINE decided nothing (review of the
+    /// stage): Python's own status for an exception nobody caught is `1` —
+    /// measured, a `TypeError` from an engine function that gained a
+    /// parameter — and that must never read as the tree's hits.
+    #[test]
+    fn the_export_content_scan_reads_every_code_it_answers() {
+        let name = EXPORT_CONTENT_SCRIPT;
+        assert_eq!(
+            export_content_outcome(Some(0), "EXPORT CONTENT: PASS — clean\n"),
+            (Outcome::Ok, name.to_string())
+        );
+        let (o, l) = export_content_outcome(Some(0), "export content scan: …\n");
+        assert_eq!(o, Outcome::Fail(Severity::CouldNotRun), "a pass says so");
+        assert!(
+            l.contains("exit 0 without its `EXPORT CONTENT: PASS`"),
+            "{l}"
+        );
+        let (o, l) = export_content_outcome(Some(1), "EXPORT CONTENT: FAIL\n");
+        assert_eq!(o, Outcome::Fail(Severity::GateFailed));
+        assert!(l.contains("refuse this tree's export"), "{l}");
+        let (o, l) = export_content_outcome(
+            Some(1),
+            "  engine: FAIL: transforms failed\nEXPORT CONTENT: REFUSED — the engine refused \
+             the export (publish/transforms.sh); no content guard ran\n",
+        );
+        assert_eq!(o, Outcome::Fail(Severity::GateFailed));
+        assert!(l.contains("refuses to export this tree"), "{l}");
+        let (o, l) = export_content_outcome(
+            Some(1),
+            "export content scan: …\nTraceback (most recent call last):\n  File \"…\", line \
+             595, in scan\nTypeError: export_tree() missing 1 required positional argument: \
+             'captured'\n",
+        );
+        assert_eq!(
+            o,
+            Outcome::Fail(Severity::CouldNotRun),
+            "an uncaught exception is no finding about the tree"
+        );
+        assert!(l.contains("exit 1 without its"), "{l}");
+        let (o, l) = export_content_outcome(
+            Some(EXPORT_CONTENT_NOT_RUN),
+            "export content scan: …\nNOT RUN: no publication engine checkout at /x (--engine)\n",
+        );
+        assert_eq!(
+            o,
+            Outcome::Skip,
+            "a machine without the engine is a named skip"
+        );
+        assert!(
+            l.contains("NOT RUN — no publication engine checkout at /x (--engine)")
+                && l.contains("never a pass"),
+            "{l}"
+        );
+        let (o, l) = export_content_outcome(Some(77), "");
+        assert_eq!(o, Outcome::Skip);
+        assert!(l.contains("skipped without saying why"), "{l}");
+        let (o, l) = export_content_outcome(
+            Some(crate::exit::COULD_NOT_RUN),
+            "COULD NOT RUN: the engine at /e has no scan_forbidden — its API moved\n",
+        );
+        assert_eq!(o, Outcome::Fail(Severity::CouldNotRun));
+        assert!(
+            l.contains("COULD NOT RUN — the engine at /e has no scan_forbidden"),
+            "{l}"
+        );
+        for code in [2, 4, 101] {
+            let (o, l) = export_content_outcome(Some(code), "");
+            assert_eq!(o, Outcome::Fail(Severity::GateFailed), "{code}");
+            assert!(l.contains(&format!("unexpected exit {code}")), "{l}");
+        }
+        assert_eq!(
+            export_content_outcome(None, "").0,
+            Outcome::Fail(Severity::CouldNotRun)
+        );
+    }
+
+    /// The scan is handed the root it judges and nothing else, and a gate
+    /// that ends it early sends `SIGTERM` first, so its scratch export goes
+    /// with it. A missing script is a cannot-run; a FAIL row is inheritable
+    /// only when its verdict line shows all three guards decided — a refusal
+    /// of the export itself reached none of them.
+    #[cfg(unix)]
+    #[test]
+    fn the_export_content_stage_runs_the_scan_on_its_root_and_reads_its_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::mktemp_dir("atv-export-content").expect("mktemp");
+        let tools = tmp.join("tools");
+        std::fs::create_dir_all(&tools).expect("mkdir");
+        let mut c = ctx(Scope::workspace());
+        c.root = tmp.clone();
+        let cmd = export_content_cmd(&c);
+        assert_eq!(
+            cmd.argv(),
+            [
+                tools.join(EXPORT_CONTENT_SCRIPT).display().to_string(),
+                tmp.display().to_string()
+            ]
+        );
+        assert_eq!(cmd.term_grace, Some(exec::TERM_GRACE));
+        assert!(cmd.envs.is_empty(), "{:?}", cmd.envs);
+
+        let run = |c: &Ctx| {
+            let mut r = Report::new("export content");
+            export_content(c, &mut r);
+            r
+        };
+        let missing = run(&c);
+        let rows: Vec<_> = missing.outcomes().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, Outcome::Fail(Severity::CouldNotRun));
+        assert!(rows[0].1.contains("missing or not executable"), "{rows:?}");
+
+        let script = |body: &str| {
+            let path = tools.join(EXPORT_CONTENT_SCRIPT);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        script("test -d \"$1/tools\" || exit 9; echo 'EXPORT CONTENT: PASS — clean'");
+        let ok = run(&c);
+        assert_eq!(
+            ok.outcomes().collect::<Vec<_>>(),
+            [(Outcome::Ok, EXPORT_CONTENT_SCRIPT)]
+        );
+
+        script(
+            "echo '  crates/a/src/x.rs:12  forbidden content — Credentials (baseline/forbidden-content.txt:19)'; \
+             echo '  crates/a/src/x.rs:40  forbidden content — Credentials (baseline/forbidden-content.txt:19)'; \
+             echo 'EXPORT CONTENT: FAIL'; exit 1",
+        );
+        let found = run(&c);
+        let (outcome, _, findings) = found.decisions().next().expect("a row");
+        assert_eq!(outcome, Outcome::Fail(Severity::GateFailed));
+        assert_eq!(
+            findings
+                .iter()
+                .map(|f| (f.id.as_str(), f.opaque))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "export-content-scan.py -- crates/a/src/x.rs -- forbidden content — Credentials",
+                    None
+                ),
+                (
+                    "export-content-scan.py -- crates/a/src/x.rs -- forbidden content — Credentials #2",
+                    None
+                )
+            ],
+            "one finding per hit, keyed without its line, each inheritable"
+        );
+        assert!(found.render().contains("crates/a/src/x.rs:12"));
+
+        script(
+            "echo '  engine: FAIL: transforms failed'; \
+             echo 'EXPORT CONTENT: REFUSED — the engine refused the export'; exit 1",
+        );
+        let refused = run(&c);
+        let (outcome, _, findings) = refused.decisions().next().expect("a row");
+        assert_eq!(outcome, Outcome::Fail(Severity::GateFailed));
+        assert!(
+            findings[0].opaque.is_some(),
+            "a refused export decided no guard, so it is never inherited"
+        );
+
+        script("echo 'NOT RUN: no gitleaks on PATH'; exit 77");
+        let skipped = run(&c);
+        let rows: Vec<_> = skipped.outcomes().collect();
+        assert_eq!(rows[0].0, Outcome::Skip);
+        assert!(rows[0].1.contains("no gitleaks on PATH"), "{rows:?}");
+
+        // A scan that died of an exception it never caught is no finding.
+        script("echo 'Traceback (most recent call last):'; echo 'TypeError: x'; exit 1");
+        let crashed = run(&c);
+        let rows: Vec<_> = crashed.outcomes().collect();
+        assert_eq!(rows[0].0, Outcome::Fail(Severity::CouldNotRun), "{rows:?}");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Each delivery suite is a decision of its own, run from the tree the gate
@@ -4264,8 +4972,8 @@ mod tests {
         // uninstalled std on purpose, so the exit code cannot tell the matrix
         // discharged from no compiler having started. The words can.
         let unproven = format!(
-            "{CELLS_NOT_PROVEN} — 5 of the 5 cell(s) this run selected had no installed std, \
-             so NO COMPILER READ THEM: mac-arm (aarch64-apple-darwin), …\n"
+            "{CELLS_NOT_PROVEN} — no std for win (x86_64-pc-windows-msvc), so NO COMPILER \
+             READ THEM. 4 of 5 cell(s) checked: …\n"
         );
         let (outcome, label) = cells_outcome("gate cells", true, &unproven);
         assert_eq!(outcome, Outcome::Skip);
@@ -4318,62 +5026,86 @@ mod tests {
         ));
     }
 
+    /// EVERY ROW READS THE SHARED CODES ALIKE, AND ITS OWN `3` ITS OWN WAY.
+    /// `0` passes, `1` is a finding, `2` is NOT RUN — never green, never a
+    /// quiet skip — and any code a driver does not answer is a finding. Exit
+    /// `3` is the audit's weaker pass, the toolbar's HUNG (could not run) or
+    /// the event drive's ABORTED (the finding), and a death with no status
+    /// reads as the row says.
     #[test]
-    fn the_objc_audits_four_codes_map_to_four_distinct_claims() {
-        // EXIT 2 IS NEVER GREEN. It is the auditor saying a row had no authority
-        // at all, or that no window server answered — the silence this gate was
-        // written to remove.
-        let (two, two_label) = objc_audit_outcome(Some(2));
-        assert_eq!(two, Outcome::Fail(Severity::CouldNotRun));
-        assert_ne!(two, Outcome::Ok);
-        assert_ne!(two, Outcome::Skip);
-        assert!(two_label.contains("NOT RUN"), "{two_label}");
-
-        // EXIT 3 IS GREEN, AND SAYS A WEAKER THING THAN 0. It is the pass a host
-        // whose AppKit lacks a claimed protocol can reach: every row held to a
-        // shape, some to the fork's own declaration rather than the runtime's. A
-        // gate that read this as `0` would write a receipt asserting runtime
-        // authority for rows the runtime could not speak for.
-        let (three, three_label) = objc_audit_outcome(Some(3));
-        assert_eq!(three, Outcome::Ok);
-        assert!(
-            three_label.contains("FORK'S OWN DECLARATION"),
-            "exit 3's label must name the authority it actually used: {three_label}"
-        );
-        assert_ne!(
-            three_label,
-            objc_audit_outcome(Some(0)).1,
-            "0 and 3 are different claims and may not share a sentence"
-        );
-        assert!(
-            objc_audit_outcome(Some(0))
-                .1
-                .contains("runtime's own authority"),
-            "exit 0 must keep claiming the runtime arbitrated"
-        );
-        assert!(
-            !objc_audit_outcome(Some(0)).1.contains("FORK'S OWN"),
-            "exit 0 must not claim the fork-declaration path"
-        );
-
-        assert_eq!(objc_audit_outcome(Some(0)).0, Outcome::Ok);
-        assert_eq!(
-            objc_audit_outcome(Some(1)).0,
-            Outcome::Fail(Severity::GateFailed)
-        );
-        // Anything else is a broken auditor, never green: a panic (101), a code
-        // a future edit adds without teaching this function, and no status at
-        // all (a signal).
-        for code in [4, 5, 101, 255] {
+    fn every_objc_drive_reads_its_exit_contract() {
+        for drive in &OBJC_DRIVES {
+            let name = drive.example;
+            let read = |code| objc_drive_outcome(drive, code);
+            for code in 0..=3 {
+                assert!(
+                    read(Some(code)).1.starts_with(&format!("{name}: ")),
+                    "{name}: every line names its driver"
+                );
+            }
+            assert_eq!(read(Some(0)).0, Outcome::Ok, "{name}");
             assert_eq!(
-                objc_audit_outcome(Some(code)).0,
+                read(Some(1)).0,
                 Outcome::Fail(Severity::GateFailed),
-                "exit {code} must not be green"
+                "{name}"
             );
+            let (two, two_label) = read(Some(2));
+            assert_eq!(two, Outcome::Fail(Severity::CouldNotRun), "{name}");
+            assert!(two_label.contains("NOT RUN"), "{two_label}");
+            let (three, three_label) = read(Some(3));
+            match drive.code3 {
+                Code3::WeakerPassOk(_) => assert_eq!(three, Outcome::Ok, "{name}"),
+                Code3::Hung => {
+                    assert_eq!(three, Outcome::Fail(Severity::CouldNotRun), "{name}");
+                    assert!(three_label.contains("HUNG"), "{three_label}");
+                }
+                Code3::AbortFinding => {
+                    assert_eq!(three, Outcome::Fail(Severity::GateFailed), "{name}");
+                    assert!(three_label.contains("ABORTED"), "{three_label}");
+                }
+                Code3::None => {
+                    assert_eq!(three, Outcome::Fail(Severity::GateFailed), "{name}");
+                    assert!(three_label.contains("unexpected exit 3"), "{three_label}");
+                }
+            }
+            // A panic (101), a code a future edit adds without teaching the
+            // row, and above all no code is green.
+            for code in [4, 5, 101, 255] {
+                assert_eq!(
+                    read(Some(code)).0,
+                    Outcome::Fail(Severity::GateFailed),
+                    "{name}: exit {code} must not be green"
+                );
+            }
+            assert_eq!(read(None).0, Outcome::Fail(drive.no_status), "{name}");
         }
-        assert_eq!(
-            objc_audit_outcome(None).0,
-            Outcome::Fail(Severity::CouldNotRun)
+        // Each reading of `3` is some row's, so none of the arms above is dead.
+        for code3 in [Code3::Hung, Code3::AbortFinding, Code3::None] {
+            assert!(OBJC_DRIVES.iter().any(|d| d.code3 == code3), "{code3:?}");
+        }
+    }
+
+    /// THE AUDIT'S `3` IS GREEN AND SAYS A WEAKER THING THAN ITS `0`. It is the
+    /// pass a host whose AppKit lacks a claimed protocol can reach: every row
+    /// held to a shape, some to the fork's own declaration rather than the
+    /// runtime's. A gate that read it as `0` would write a receipt asserting
+    /// runtime authority for rows the runtime could not speak for.
+    #[test]
+    fn the_audits_weaker_pass_never_shares_a_sentence_with_its_pass() {
+        let audit = OBJC_DRIVES
+            .iter()
+            .find(|d| matches!(d.code3, Code3::WeakerPassOk(_)))
+            .expect("the live-class audit answers 3 as a weaker pass");
+        let zero = objc_drive_outcome(audit, Some(0)).1;
+        let three = objc_drive_outcome(audit, Some(3)).1;
+        assert!(
+            three.contains("FORK'S OWN DECLARATION"),
+            "exit 3 must name the authority it actually used: {three}"
+        );
+        assert_ne!(three, zero, "0 and 3 are different claims");
+        assert!(
+            zero.contains("runtime's own authority") && !zero.contains("FORK'S OWN"),
+            "exit 0 keeps claiming the runtime arbitrated, and only that: {zero}"
         );
     }
 
@@ -4712,8 +5444,7 @@ mod tests {
         }
         for args in [
             redraw_conformance_build_args(),
-            objc_class_audit_build_args(),
-            objc_bound_drive_build_args(),
+            objc_drive_build_args(&OBJC_DRIVES[0]),
         ] {
             assert_eq!(
                 env(&driver_build_cmd(&c, args)),
@@ -4828,6 +5559,21 @@ mod tests {
                 ],
             },
             Row {
+                id: StageId::RenderDesync,
+                build: live_aterm_build_cmd(&c),
+                build_args: live_aterm_build_args(),
+                suite: live_aterm_suite_cmd(&c, RENDER_DESYNC_SUITE),
+                bin: aterm.clone(),
+                handed: Handed::Argv(vec!["--binary".into(), aterm.display().to_string()]),
+                source: "tools/test-render-desync.sh",
+                // The handback lane's three, with the gate's own `3`.
+                reads: &[
+                    "--binary) BIN=$2; shift 2 ;;",
+                    "    NOT_RUN=1\n    exit 3\n}",
+                    "if [[ $status -eq 3 && -z $NOT_RUN ]]; then\n        status=1",
+                ],
+            },
+            Row {
                 id: StageId::CodexLiveUpgrade,
                 build: live_aterm_build_cmd(&c),
                 build_args: live_aterm_build_args(),
@@ -4905,74 +5651,6 @@ mod tests {
         assert!(!codex.contains("--binary)"));
     }
 
-    /// The driver-builds row compiles exactly what the driver stages' own
-    /// builds compile: the smoke binaries and the redraw harness everywhere,
-    /// and on macOS, where they run, the live lanes' `aterm` and — in one
-    /// invocation — every objc driver, the packages and examples of their
-    /// single builds and nothing else.
-    #[test]
-    fn the_driver_prebuild_covers_exactly_the_driver_stages_build_argvs() {
-        use std::collections::BTreeSet;
-        let c = ctx(Scope::workspace());
-        let cmds = driver_build_cmds(&c);
-        let children: BTreeSet<Vec<String>> = cmds
-            .iter()
-            .map(|(_, cmd)| cmd.argv()[1..].to_vec())
-            .collect();
-        assert_eq!(children.len(), cmds.len(), "no child twice");
-        // In the order OBJC_DRIVER_EXAMPLES lists them, which is stage order.
-        let stage_builds = [
-            objc_class_audit_build_args(),
-            objc_ime_drive_build_args(),
-            objc_toolbar_drive_build_args(),
-            objc_window_drive_build_args(),
-            objc_event_drive_build_args(),
-            objc_bound_drive_build_args(),
-        ];
-        assert_eq!(stage_builds.len(), OBJC_DRIVER_EXAMPLES.len());
-        for (single, (pkg, example)) in stage_builds.iter().zip(OBJC_DRIVER_EXAMPLES) {
-            assert_eq!(
-                single,
-                &[
-                    "--unverified",
-                    "build",
-                    "-q",
-                    "-p",
-                    pkg,
-                    "--example",
-                    example
-                ]
-            );
-        }
-        let values = |a: &[String], flag: &str| -> BTreeSet<String> {
-            a.windows(2)
-                .filter(|w| w[0] == flag)
-                .map(|w| w[1].clone())
-                .collect()
-        };
-        let combined = objc_driver_prebuild_args();
-        let pkgs: BTreeSet<String> = stage_builds.iter().flat_map(|a| values(a, "-p")).collect();
-        let examples: BTreeSet<String> = stage_builds
-            .iter()
-            .flat_map(|a| values(a, "--example"))
-            .collect();
-        assert_eq!(combined[..3], ["--unverified", "build", "-q"]);
-        assert_eq!(values(&combined, "-p"), pkgs);
-        assert_eq!(values(&combined, "--example"), examples);
-        assert_eq!(
-            combined.len(),
-            3 + 2 * pkgs.len() + 2 * examples.len(),
-            "nothing but the verb, the packages and the examples: {combined:?}"
-        );
-        let mut want: BTreeSet<Vec<String>> =
-            [smoke_build_args(), redraw_conformance_build_args()].into();
-        if cfg!(target_os = "macos") {
-            want.insert(live_aterm_build_args());
-            want.insert(combined);
-        }
-        assert_eq!(children, want);
-    }
-
     /// A LIVE LANE'S NOT-RUN CODE IS NEVER A PASS. Before 2026-09-26 the two
     /// lanes were run by hand or not at all, and by hand each answered the
     /// missing `<root>/target/debug/aterm` with its not-run code — the handback
@@ -4987,6 +5665,7 @@ mod tests {
     fn a_live_lanes_not_run_code_is_never_a_pass_and_quotes_the_lanes_reason() {
         use crate::Outcome;
         let fh = FOREGROUND_HANDBACK_SUITE;
+        let rd = RENDER_DESYNC_SUITE;
         let cx = CODEX_LIVE_UPGRADE_SUITE;
         assert_eq!(
             live_aterm_outcome(fh, Some(0), "39 ok, 0 FAIL, 1 skip"),
@@ -5047,14 +5726,32 @@ mod tests {
             .0,
             Outcome::Fail(Severity::GateFailed)
         );
-        // Each lane's not-run code is its own; the other's is a finding.
-        assert_eq!(
-            live_aterm_outcome(fh, Some(77), "").0,
-            Outcome::Fail(Severity::GateFailed)
+        // The render desync lane's `3` is COULD NOT RUN with its reason — a
+        // machine that could not land the two resizes in one run decided
+        // nothing (2026-09-28).
+        let (outcome, label) = live_aterm_outcome(
+            rd,
+            Some(3),
+            "---- desync\nNOT RUN: two ctl resizes never landed within the 250 ms run gap in 3 \
+             attempts: desync(gaps: 412ms 390ms 505ms) — a starved machine, not a finding\n",
         );
+        assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun));
         assert_eq!(
-            live_aterm_outcome(cx, Some(2), "").0,
-            Outcome::Fail(Severity::GateFailed)
+            label,
+            "test-render-desync.sh: NOT RUN — two ctl resizes never landed within the 250 ms run \
+             gap in 3 attempts: desync(gaps: 412ms 390ms 505ms) — a starved machine, not a \
+             finding (exit 3, never a pass)"
         );
+        // Each lane's not-run code is its own; another lane's is a finding.
+        for (name, other) in [(fh, 77), (fh, 3), (rd, 2), (rd, 77), (cx, 2), (cx, 3)] {
+            assert_eq!(
+                live_aterm_outcome(name, Some(other), "").0,
+                Outcome::Fail(Severity::GateFailed),
+                "{name} exit {other}"
+            );
+        }
+        assert_eq!(live_aterm_not_run_code(fh), 2);
+        assert_eq!(live_aterm_not_run_code(rd), 3);
+        assert_eq!(live_aterm_not_run_code(cx), 77);
     }
 }

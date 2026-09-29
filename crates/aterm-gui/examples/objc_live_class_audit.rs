@@ -29,8 +29,8 @@
 //!   one as such.
 //!
 //! Both were caught only by an out-of-tree driver. This file is that driver,
-//! in the tree, wired into `aterm verify`'s ladder — see
-//! `aterm_verify::stages::objc_audit_outcome` for the exit-code contract.
+//! in the tree, wired into `aterm verify`'s ladder — see its row in
+//! `aterm_verify::stages::OBJC_DRIVES` for how the exit codes are read.
 //!
 //! # How it refuses to be a mirror
 //!
@@ -327,8 +327,8 @@ const NOT_RUN: i32 = 2;
 /// receipt the merge gate writes would assert runtime authority nobody had. The
 /// gate reads this as a pass (the tree is not at fault and every row WAS held to
 /// a shape) under a label that says which claim was actually made, so a reader
-/// six months later can tell the two runs apart. See `objc_audit_outcome` in
-/// `crates/aterm-verify/src/stages.rs`, which is where that label lives.
+/// six months later can tell the two runs apart. See this driver's row in
+/// `OBJC_DRIVES` (`crates/aterm-verify/src/stages.rs`), where that label lives.
 #[cfg(target_os = "macos")]
 const FORK_DECLARED: i32 = 3;
 

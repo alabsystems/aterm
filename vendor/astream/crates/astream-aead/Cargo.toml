@@ -4,6 +4,7 @@ description = "astream AEAD wire: XChaCha20-Poly1305 seal/open over a pre-shared
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 

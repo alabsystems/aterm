@@ -346,6 +346,227 @@ pub fn open_model_switch(path: &Path, sid: Option<&str>) -> Option<OpenSwitch> {
     open
 }
 
+/// A switch word's value on a ledger row: spaces as `_` (`extra high` →
+/// `extra_high`), `-` for none.
+fn switch_value(v: Option<&str>) -> String {
+    match v.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => v.replace(' ', "_"),
+        None => "-".to_string(),
+    }
+}
+
+/// THE WORDS A CODEX SAVE-THEN-WAIT SWITCH'S ROWS CARRY
+/// (`policy::turn_end::WindDown`): `(model switch: kind=wind-down
+/// from=<model> effort=<effort> to=<model> back_at=<unix|-> marker=<m>
+/// goal=<paused|-> pause=<typed|-> stops=<n> since=<unix|-> esc=<unix|->
+/// opened=<unix|-> pressed=<unix|-> told=<keys|-> phase=<word>)` — on the
+/// press's intent (`phase=intent`, and every row while the press is only
+/// intended: `policy::turn_end::wind_phase_word`) and
+/// approved rows, on every act and edge of it — so a loop that starts while
+/// it is open carries it on ([`open_wind_down`]): whether the harness
+/// stopped the goal (`goal`) and whether that stop was its typed `/goal
+/// pause` rather than its Esc (`pause`), how many stops it spent (`stops`),
+/// when the hold began (`since`: a restart never lengthens it), when its
+/// last Esc went while that turn's point is still to come (`esc`: the
+/// interrupt a restarted loop then sees is the harness's own, in any phase),
+/// when the switch opened (`opened`: the floor under a person's keystrokes,
+/// as the live loop keeps it), when it was pressed (`pressed`: the floor
+/// under the thread's rollout), and the notes a person was told already
+/// (`told=goal,unsaved`: never raised again by a restart). Claude Code's relaunch switch keeps its own two words
+/// ([`model_switch_reason`]).
+#[must_use]
+pub fn wind_switch_words(
+    w: &super::policy::turn_end::WindDown,
+    phase: &str,
+    back_at_unix: Option<i64>,
+    since_unix: Option<i64>,
+    esc_unix: Option<i64>,
+    opened_unix: Option<i64>,
+    pressed_unix: Option<i64>,
+) -> String {
+    let unix = |u: Option<i64>| u.map_or_else(|| "-".to_string(), |s| s.to_string());
+    let told = if w.said.is_empty() {
+        "-".to_string()
+    } else {
+        w.said.join(",")
+    };
+    format!(
+        "(model switch: kind=wind-down from={} effort={} to={} back_at={} marker={} goal={} \
+         pause={} stops={} since={} esc={} opened={} pressed={} told={told} phase={phase})",
+        switch_value(Some(&w.from.model)),
+        switch_value(w.from.effort.as_deref()),
+        switch_value(Some(&w.to)),
+        unix(back_at_unix),
+        switch_value(Some(&w.marker)),
+        if w.goal_paused { "paused" } else { "-" },
+        if w.pause_typed { "typed" } else { "-" },
+        w.stops,
+        unix(since_unix),
+        unix(esc_unix),
+        unix(opened_unix),
+        unix(pressed_unix),
+    )
+}
+
+/// A Codex save-then-wait switch a loop on the session opened and no row
+/// closed ([`open_wind_down`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWind {
+    pub from: super::policy::turn_end::CodexSetting,
+    pub to: String,
+    pub back_at_unix: Option<i64>,
+    pub marker: String,
+    pub goal_paused: bool,
+    /// The harness's stop was its typed `/goal pause` (`pause=typed`).
+    pub pause_typed: bool,
+    /// The harness's stops of Codex's goal so far (`stops=`).
+    pub stops: u32,
+    /// When the hold began (`since=`, epoch seconds).
+    pub since_unix: Option<i64>,
+    /// When the harness's last Esc went, its point still to come (`esc=`,
+    /// epoch seconds).
+    pub esc_unix: Option<i64>,
+    /// When the switch opened (`opened=`, epoch seconds).
+    pub opened_unix: Option<i64>,
+    /// When its switch was pressed (`pressed=`, epoch seconds).
+    pub pressed_unix: Option<i64>,
+    /// The notes a person was told already (`told=`).
+    pub told: Vec<String>,
+    /// When its last row was written (the row's `ts`, epoch milliseconds):
+    /// a person's keystroke since is their hand in whatever runs when a loop
+    /// carries the switch on mid-turn.
+    pub row_ms: Option<i64>,
+    /// The phase its last row left it in
+    /// (`intent|owed|winding|restore|restore-free|holding`).
+    pub phase: String,
+}
+
+impl OpenWind {
+    /// The switch to carry on, its times — the reset, the hold's start, the
+    /// harness's last Esc, the switch's opening and its press, and the last
+    /// row's time — put on the new loop's clock by `clock` (epoch seconds to
+    /// an instant; a hold whose start no row names counts from `now`; a
+    /// switch whose opening no row names opened, as far as a person's
+    /// keystrokes go, at its last row; one whose press no row names was
+    /// pressed, as far as the thread's rollout goes, at its opening). A
+    /// press only intended (`intent`) is carried on as owed, and as only
+    /// intended ([`WindDown::intent`]).
+    ///
+    /// [`WindDown::intent`]: super::policy::turn_end::WindDown::intent
+    #[must_use]
+    pub fn into_wind(
+        self,
+        clock: impl Fn(i64) -> std::time::Instant,
+        now: std::time::Instant,
+    ) -> super::policy::turn_end::WindDown {
+        use super::policy::turn_end::{WindDown, WindPhase, said_key};
+        let back_at = self.back_at_unix.map(&clock);
+        let since = self.since_unix.map(&clock);
+        let esc = self.esc_unix.map(&clock);
+        let opened = self.opened_unix.map(&clock);
+        let pressed = self.pressed_unix.map(&clock);
+        let row_at = self.row_ms.map(|ms| clock(ms.div_euclid(1000)));
+        let phase = match self.phase.as_str() {
+            "owed" | "intent" => WindPhase::Owed,
+            "winding" => WindPhase::Winding,
+            "restore-free" => WindPhase::Restore { hold: false },
+            "holding" => WindPhase::Holding {
+                since: since.unwrap_or(now),
+            },
+            _ => WindPhase::Restore { hold: true },
+        };
+        WindDown {
+            from: self.from,
+            to: self.to,
+            back_at,
+            phase,
+            goal_paused: self.goal_paused,
+            pause_typed: self.pause_typed,
+            saved: None,
+            marker: self.marker,
+            restore_tries: 0,
+            restore_at: None,
+            said: self.told.iter().filter_map(|k| said_key(k)).collect(),
+            pre: false,
+            seeded: false,
+            stops: self.stops,
+            stop_at: esc,
+            restore_shown: false,
+            picker_gone_at: None,
+            intent: self.phase == "intent",
+            footer_since: None,
+            seeded_at: row_at,
+            opened_at: opened.or(row_at),
+            pressed_at: pressed.or(opened).or(row_at),
+            wound: std::time::Duration::ZERO,
+            overran: false,
+        }
+    }
+}
+
+/// The Codex save-then-wait switch `sid`'s ledger at `path` holds open: the
+/// LAST row carrying [`wind_switch_words`], unless its phase is `done` or
+/// `released` — a press's intent row (`intent`) included, as only intended.
+/// `None` when there is none, or the file cannot be read. A row written
+/// before `pause=`, `stops=`, `since=`, `esc=`, `opened=`, `pressed=` and
+/// `told=` were carried reads them as `-`, 0, `-`, `-`, `-`, `-` and none.
+#[must_use]
+pub fn open_wind_down(path: &Path, sid: Option<&str>) -> Option<OpenWind> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let want = sid.map(|s| s.trim_start_matches('@').to_string());
+    let mut last: Option<(String, Option<i64>)> = None;
+    for line in body.lines() {
+        if !line.contains("model switch: kind=wind-down") {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("sid").map(str::to_string) != want {
+            continue;
+        }
+        if let Some(reason) = text("reason") {
+            let ts = v.get("ts").and_then(aterm_json::Value::as_i64);
+            last = Some((reason.to_string(), ts));
+        }
+    }
+    let (reason, row_ms) = last?;
+    let field = |name: &str| {
+        let at = reason.find(&format!(" {name}="))? + name.len() + 2;
+        let word: String = reason[at..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ')')
+            .collect();
+        (word != "-" && !word.is_empty()).then(|| word.replace('_', " "))
+    };
+    let phase = field("phase")?;
+    if matches!(phase.as_str(), "done" | "released") {
+        return None;
+    }
+    Some(OpenWind {
+        from: super::policy::turn_end::CodexSetting {
+            model: field("from")?,
+            effort: field("effort"),
+        },
+        to: field("to")?,
+        back_at_unix: field("back_at").and_then(|w| w.parse().ok()),
+        marker: field("marker")?.replace(' ', "_"),
+        goal_paused: field("goal").as_deref() == Some("paused"),
+        pause_typed: field("pause").as_deref() == Some("typed"),
+        stops: field("stops").and_then(|w| w.parse().ok()).unwrap_or(0),
+        since_unix: field("since").and_then(|w| w.parse().ok()),
+        esc_unix: field("esc").and_then(|w| w.parse().ok()),
+        opened_unix: field("opened").and_then(|w| w.parse().ok()),
+        pressed_unix: field("pressed").and_then(|w| w.parse().ok()),
+        told: field("told")
+            .map(|w| w.split(',').map(str::to_string).collect())
+            .unwrap_or_default(),
+        row_ms,
+        phase,
+    })
+}
+
 /// Lowercase hex SHA-256 of `s`.
 fn sha256_hex(s: &str) -> String {
     aterm_digest::Sha256::digest(s.as_bytes())

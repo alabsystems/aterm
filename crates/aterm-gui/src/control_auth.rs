@@ -1316,15 +1316,37 @@ fn acquire_capture_name_lease_with_wait(
                 .ensure_child(std::ffi::OsStr::new(CAPTURE_LOCK_DIR))?;
             lock_dir.open_namespace_lock(std::ffi::OsStr::new(CAPTURE_NAMESPACE_LEASE_FILE))?
         };
-        match file.try_lock() {
-            Ok(()) => lease.os_lock = Some(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "another aterm process owns the shared image namespace",
-                ));
+        // ANOTHER PROCESS'S capture queues for the same bounded wait as this
+        // process's own (above): an ordinary reply in flight there releases
+        // in milliseconds. One it still holds past the wait is named — a
+        // reply its client has not acknowledged (a client that reads the
+        // line and hangs up without `ACK <nonce>`) is held until the ACK, or
+        // for the handoff and quarantine intervals after it (day nine, D6:
+        // a raw-socket driver's `image <name>` left the next instance's
+        // capture refused with no word of why).
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    lease.os_lock = Some(file);
+                    break;
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if cancelled() {
+                        return Ok(None);
+                    }
+                    if waited_from.elapsed() >= explicit_wait {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "another aterm process owns the shared image namespace — a capture \
+                             reply there is not acknowledged yet (it is released at its \
+                             client's ACK, else up to a minute later); `image --bytes` needs \
+                             no namespace",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
-            Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
     }
     if cancelled() {
@@ -4702,6 +4724,55 @@ mod tests {
         drop(first_lease);
         drop(first);
         drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DAY NINE, D6 (ruling 370): another PROCESS's hold on the shared
+    /// image namespace (its own open file description of the directory) is
+    /// queued for the same bounded wait as this process's own, and past the
+    /// wait the refusal says why. Before, a sibling instance's unacknowledged
+    /// reply refused the capture at once with no word of the cause.
+    #[test]
+    #[cfg(unix)]
+    fn another_processs_namespace_lock_is_waited_for_then_named() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-img-sibling-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let image = ConfinedImage::for_test(&dir, "sibling.png");
+        let sibling = image
+            .pinned()
+            .unwrap()
+            .open_directory_lock()
+            .expect("the sibling's own description of the directory");
+        sibling.try_lock().expect("the sibling holds the namespace");
+        let error = acquire_capture_name_lease_with_wait(
+            &image,
+            || false,
+            std::time::Duration::from_millis(60),
+        )
+        .expect_err("a sibling that never lets go is reported, not waited on forever");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            error.to_string().contains("not acknowledged"),
+            "the refusal names the cause: {error}"
+        );
+        // Released inside the wait: the capture queues and then proceeds.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sibling.unlock().expect("the sibling lets go");
+            sibling
+        });
+        let lease = acquire_capture_name_lease_with_wait(
+            &image,
+            || false,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("the queued capture proceeds once the sibling lets go")
+        .expect("not cancelled");
+        drop(lease);
+        drop(releaser.join().expect("releaser"));
+        drop(image);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

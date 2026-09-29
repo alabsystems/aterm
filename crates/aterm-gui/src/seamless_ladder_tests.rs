@@ -421,8 +421,10 @@ fn producer_is_total_over_hostile_and_large_desks() {
     let mut title = Terminal::new(24, 80);
     title.process(b"prompt % printf '\\e]0;x'\r\n\x1b]0;x");
     assert!(
-        title.checkpoint_carry(0).is_none(),
-        "control: the pre-ladder carry has nothing to send"
+        title
+            .checkpoint_carry(0)
+            .is_some_and(|carry| carry.parser.is_some()),
+        "control: the carry holds the partial title (the round-five plan's item 12)"
     );
     desks.push(("(iii) an unterminated title", title, Full));
 

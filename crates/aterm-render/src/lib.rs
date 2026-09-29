@@ -39,6 +39,7 @@ pub use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, ChromeRing, Ink
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
 
 pub mod apron;
+pub mod band;
 pub mod bundled;
 pub mod chrome_metrics;
 mod colr;
@@ -1964,6 +1965,9 @@ pub struct Renderer {
     /// frame on the shaping path. Mirrors `shapeable_scratch`.
     shape_run_scratch: String,
     shape_chars_scratch: Vec<char>,
+    /// Reused rustybuzz input/output storage. `GlyphBuffer::clear` returns the
+    /// allocation with all segment properties reset after every cache miss.
+    shaping_buffer: rustybuzz::UnicodeBuffer,
     /// Reused per-row line-decoration rect scratch for [`Renderer::render_row_fg`], taken/returned
     /// via `mem::take` so each decorated row reuses one allocation instead of a fresh
     /// `Vec<[usize; 4]>` per row per frame. The `underline_rects_into` /
@@ -2428,6 +2432,23 @@ pub(crate) struct WallpaperPx {
 impl WindowCpu {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Consume a completed snapshot's temporary cache and transfer the pixels
+    /// its last present actually used. A fractional scroll presents the translated
+    /// scratch, not the pristine damage cache. Neither buffer needs cloning when
+    /// the caller owns the whole window cache and will discard it after capture.
+    fn into_presented_frame(self) -> Frame {
+        let cache = self.cache.expect("cache populated by render");
+        Frame {
+            width: cache.width,
+            height: cache.height,
+            pixels: if self.last_translated {
+                self.present_scratch
+            } else {
+                cache.pixels
+            },
+        }
     }
 
     /// Drop the damage cache so the NEXT `render_input_cached` is a full repaint.
@@ -8161,6 +8182,7 @@ impl Renderer {
             image_cells: std::cell::Cell::new(0),
             shape_run_scratch: String::new(),
             shape_chars_scratch: Vec::new(),
+            shaping_buffer: rustybuzz::UnicodeBuffer::new(),
             deco_scratch: Vec::new(),
             deco_skip_rect_scratch: Vec::new(),
             ink_scratch: Vec::new(),
@@ -13098,8 +13120,8 @@ impl Renderer {
         // Styled siblings and injected bold each get their own lazy slot too:
         // styled output can have many distinct runs in one row, but the same
         // font tables only need parsing once. Empty slots parse nothing.
-        let mut row_face: Option<Option<rustybuzz::Face<'_>>> = None;
-        let mut styled_row_faces: [Option<Option<rustybuzz::Face<'_>>>; 4] =
+        let mut row_face: Option<Option<ligature_shaping::RowShaper<'_>>> = None;
+        let mut styled_row_faces: [Option<Option<ligature_shaping::RowShaper<'_>>>; 4] =
             std::array::from_fn(|_| None);
         // Inserting does not rotate the cache: generations still rotate only
         // at the frame boundary. This produces the same final memo as batching
@@ -13108,6 +13130,7 @@ impl Renderer {
         // Borrow the feature array resolved once at config time — no per-run alloc
         // or scan of `font_features`. Empty user features => the base [liga, calt].
         let features = &self.resolved_features;
+        let shaping_buffer = &mut self.shaping_buffer;
         // M4: the user's Cascadia-N:1 opt-in (config `merged_ligatures`), copied out
         // so the shape closure does not borrow `self`. `false` (the default) keeps
         // the gate on the proven 1:1 form — byte-identical to the pre-M4 renderer.
@@ -13160,21 +13183,14 @@ impl Renderer {
                             if !primary_vars.is_empty() {
                                 f.set_variations(primary_vars);
                             }
-                            Some(f)
+                            Some(ligature_shaping::RowShaper::new(f, features))
                         })
                     });
-                    face.as_ref().and_then(|f| {
+                    face.as_mut().and_then(|f| {
                         // M4: `admit_collapsed` (config `merged_ligatures`) admits the
                         // Cascadia N:1 form, which the raster path slices into per-cell
                         // tiles. Off by default -> the proven 1:1 gate, byte-identical.
-                        ligature_shaping::shape_ligature_run_with_face(
-                            f,
-                            run,
-                            run_chars,
-                            true,
-                            admit_collapsed,
-                            features,
-                        )
+                        f.shape(run, run_chars, admit_collapsed, shaping_buffer)
                     })
                 } else {
                     // Preserve each sibling's collection index. These are
@@ -13186,18 +13202,13 @@ impl Renderer {
                         FacePick::Primary => (3, None), // handled above
                     };
                     let face = styled_row_faces[slot].get_or_insert_with(|| {
-                        source.and_then(|(b, idx)| rustybuzz::Face::from_slice(b, idx))
+                        source.and_then(|(b, idx)| {
+                            rustybuzz::Face::from_slice(b, idx)
+                                .map(|f| ligature_shaping::RowShaper::new(f, features))
+                        })
                     });
-                    face.as_ref().and_then(|f| {
-                        ligature_shaping::shape_ligature_run_with_face(
-                            f,
-                            run,
-                            run_chars,
-                            true,
-                            admit_collapsed,
-                            features,
-                        )
-                    })
+                    face.as_mut()
+                        .and_then(|f| f.shape(run, run_chars, admit_collapsed, shaping_buffer))
                 };
                 // Wrap the freshly-shaped run in an `Arc` ONCE, so both the
                 // insert-into-`cur` copy below and the returned handle are refcount
@@ -14487,8 +14498,7 @@ impl Renderer {
 
     pub fn render_input(&mut self, input: &RenderInput) -> Frame {
         // ONE rendering code path: do the damage render into the cache, then
-        // clone the borrowed result into an owned Frame. The clone is the price
-        // of ownership; the hot path avoids it via `render_input_cached`.
+        // transfer its completed pixel buffer into the owned Frame.
         //
         // The owned-`Frame` path is the snapshot / `read_image` / test path: it
         // returns a fresh owned buffer every call, so a window's PERSISTENT damage
@@ -14525,22 +14535,17 @@ impl Renderer {
         // A frame that started no parse pays nothing (the settle spawns none,
         // the epoch holds), so a Latin-only snapshot still never reads the
         // chain. BOUNDED by `SNAPSHOT_SETTLE_PASSES`: see the constant.
-        let mut view;
         let mut pass = 1;
         loop {
             let epoch = self.font_epoch;
-            view = self.render_input_cached(&mut wc, input);
+            let _ = self.render_input_cached(&mut wc, input);
             let _ = self.settle_in_flight_fallback_parses();
             if self.font_epoch == epoch || pass == Self::SNAPSHOT_SETTLE_PASSES {
                 break;
             }
             pass += 1;
         }
-        Frame {
-            width: view.width(),
-            height: view.height(),
-            pixels: view.pixels().to_vec(),
-        }
+        wc.into_presented_frame()
     }
 
     /// Render a pre-extracted snapshot like [`render_input`](Self::render_input)
@@ -14551,7 +14556,7 @@ impl Renderer {
     /// that surface copy (cache→Frame is gone).
     ///
     /// The pixels are byte-identical to [`render_input`](Self::render_input) —
-    /// indeed `render_input` is implemented as this method plus a clone, so there
+    /// indeed `render_input` calls this method and transfers its pixels, so there
     /// is exactly one rendering code path and no way for the two to drift.
     ///
     /// The returned borrow is tied to `&mut self`: it is valid until the next
@@ -15368,13 +15373,20 @@ impl Renderer {
             return;
         }
         let rail_y0 = y1.saturating_sub(chrome_fit(m, self.chrome_room).1).max(y0);
-        for (x0, x1, color, rail) in chrome_raster_runs(m, w, self.pad, self.cell_w, input.cols) {
-            let (ya, yb) = if rail { (rail_y0, y1) } else { (y0, y1) };
-            for y in ya..yb {
-                let row = &mut pixels[y * w..(y + 1) * w];
-                row[x0..x1].fill(color & 0x00ff_ffff);
-            }
-        }
+        visit_chrome_raster_runs(
+            m,
+            w,
+            self.pad,
+            self.cell_w,
+            input.cols,
+            |x0, x1, color, rail| {
+                let (ya, yb) = if rail { (rail_y0, y1) } else { (y0, y1) };
+                for y in ya..yb {
+                    let row = &mut pixels[y * w..(y + 1) * w];
+                    row[x0..x1].fill(color & 0x00ff_ffff);
+                }
+            },
+        );
         // The outlined capsules (ruling 249), over the ground and the rail,
         // standing on the row's underline (ruling 254).
         let floor = self.chrome_ring_floor();
@@ -18453,7 +18465,8 @@ impl Renderer {
                 image.image.format,
                 fp_w,
                 fp_h,
-                image.image.pixel_exact,
+                image.image.scaling,
+                image.image.source_rect,
             )
             .unwrap_or_default();
             ic.put(
@@ -19823,17 +19836,20 @@ impl ImageEqMemo {
             return verdict;
         }
         // The one deep compare this pair pays per frame. UNCHANGED semantics:
-        // bytes + format + cols + rows + z, the derived `ImageData` equality.
+        // the derived `ImageData` equality (the payload and every layout field).
         let verdict = **a == **b;
         self.verdicts.insert(key, verdict);
         verdict
     }
 
-    /// Memoized equality of two per-row placement lists — the drop-in
-    /// replacement for `a.images[ra] == b.images[rb]` (derived `Vec`/tuple/
-    /// `ImageRef` equality), same verdict by construction: length, column,
-    /// tile coordinates, then the shared payload via [`Self::image_eq`].
-    /// Pinned against the derived form by the
+    /// Memoized equality of two per-row placement lists by RENDERED CONTENT:
+    /// length, column, tile coordinates, then the shared payload via
+    /// [`Self::image_eq`]. That is the derived `Vec`/tuple/`ImageRef` equality
+    /// with one field left out on purpose — `ImageRef::kitty`, the Kitty
+    /// placement tag, which is the placement's identity for delete selectors,
+    /// not pixels: a placement re-put onto the same cells under a new serial
+    /// draws the same frame. Pinned against the derived form of tag-stripped
+    /// rows, a tag-only difference included, by the
     /// `image_eq_memo_matches_derived_row_equality` differential test.
     fn rows_eq(
         &mut self,
@@ -20357,9 +20373,9 @@ fn cursor_shown_in(
 /// rail)` in frame pixels over a `w`-pixel frame whose cells start at `pad`
 /// and are `cell_w` wide: the ground first (skipping the cells the raster
 /// leaves to their own backgrounds), then the rail's runs (`rail == true`,
-/// the row's lowest `rail_h` pixels). The ONE builder both backends paint
-/// from — the CPU fills each run, the GPU pushes each as a background quad —
-/// so the two place identical pixels by construction.
+/// the row's lowest `rail_h` pixels). Collects [`visit_chrome_raster_runs`]
+/// for callers that need an owned list; both backends consume its visitor
+/// directly so an animated band does not allocate a temporary list per row.
 #[must_use]
 pub fn chrome_raster_runs(
     m: &ChromeRaster,
@@ -20368,9 +20384,27 @@ pub fn chrome_raster_runs(
     cell_w: usize,
     cols: usize,
 ) -> Vec<(usize, usize, u32, bool)> {
+    let mut runs = Vec::new();
+    visit_chrome_raster_runs(m, w, pad, cell_w, cols, |x0, x1, color, rail| {
+        runs.push((x0, x1, color, rail));
+    });
+    runs
+}
+
+/// Visit the ground and rail runs of [`chrome_raster_runs`] without allocating.
+/// The CPU fills each run and the GPU appends its background quad directly.
+/// Ground runs precede rail runs, each in ascending pixel order; owned cells
+/// keep their backgrounds, and [`ChromeRaster::KEEP`] leaves rail pixels alone.
+pub fn visit_chrome_raster_runs(
+    m: &ChromeRaster,
+    w: usize,
+    pad: usize,
+    cell_w: usize,
+    cols: usize,
+    mut emit: impl FnMut(usize, usize, u32, bool),
+) {
     let cell_w = cell_w.max(1);
     let owned = |x: usize| x >= pad && x < pad + cols * cell_w && m.owns((x - pad) / cell_w);
-    let mut runs = Vec::new();
     let mut push = |px: &[u32], rail: bool| {
         let n = px.len().min(w);
         let mut x = 0;
@@ -20384,14 +20418,13 @@ pub fn chrome_raster_runs(
             while x < n && px[x] == c && !owned(x) {
                 x += 1;
             }
-            runs.push((start, x, c, rail));
+            emit(start, x, c, rail);
         }
     };
     push(&m.ground, false);
     if m.rail_h > 0 {
         push(&m.rail, true);
     }
-    runs
 }
 
 /// The OUTLINED capsules of a [`ChromeRaster`] row (design ruling 249) as
@@ -23427,8 +23460,9 @@ impl<'a> InkWalk<'a> {
 
 /// Sparkle-v2 §7.5 ledger row "ink merge-walk ≡ probe" — the Trust harness
 /// (`trust-mc` discharges `#[kani::proof]` MIR via `ay`; **authored-pending-
-/// build**: no trust-mc binary on this box, so this harness is authored, not
-/// re-run here — the honest label, PROOF_CARRYING_PERFORMANCE.md §0). The
+/// build**: the managed trust-mc 20065 cannot build this crate, whose graph has
+/// a host build script — docs/TOOLCHAIN-PACKAGE-MANAGER.md §15 risk 1 — so this
+/// harness is authored, not re-run — PROOF_CARRYING_PERFORMANCE.md §0). The
 /// runnable-now companions are the sorted-unique property tests + the
 /// `debug_assert` probe check in [`ink_row_slice`].
 #[cfg(kani)]
@@ -25618,23 +25652,30 @@ fn to_rgba8(buf: &[u8], color_type: aterm_png::ColorType, w: usize, h: usize) ->
 /// filling the footprint pixel box `fp_w × fp_h`. Each covered cell then paints
 /// a 1:1 tile of the result.
 ///
-/// `pixel_exact` ([`ImageData::pixel_exact`](aterm_core::grid::extra::ImageData::pixel_exact))
-/// picks between the TWO placement policies, and which one is right depends on
+/// `source_rect` ([`ImageData::source_rect`](aterm_core::grid::extra::ImageData::source_rect))
+/// crops the raster FIRST — Kitty's `x=`/`y=`/`w=`/`h=`; a rectangle wholly
+/// outside the raster draws nothing. `scaling`
+/// ([`ImageData::scaling`](aterm_core::grid::extra::ImageData::scaling)) then
+/// picks one of the THREE placement policies, and which one is right depends on
 /// what the PROGRAM named:
 ///
-/// - `false` — FIT. The source is scaled, ASPECT RATIO PRESERVED, to the largest
-///   box that fits the footprint, centered there, remainder fully transparent
-///   (the cell background shows through). Right when the program asked for a
-///   target in CELLS — iTerm2 `File=width=…;height=…`, Kitty `c=`/`r=`, the
-///   host's own chrome rasters — because filling the cells it asked for IS the
-///   spec.
-/// - `true` — PIXEL-EXACT. One source pixel to one device pixel, anchored at the
-///   footprint's TOP-LEFT, the rounded-up remainder left unpainted. Right when
-///   the program named PIXELS (sixel; Kitty with neither `c=` nor `r=`), where
-///   the footprint was DERIVED from the raster by rounding up to whole cells and
-///   scaling back out to it is pure rounding noise (`place_rgba_at_origin`).
+/// - [`ImageScaling::Fit`](aterm_core::grid::extra::ImageScaling::Fit) — the
+///   source is scaled, ASPECT RATIO PRESERVED, to the largest box that fits the
+///   footprint, centered there, remainder fully transparent (the cell
+///   background shows through). Right when the program asked for a target in
+///   CELLS — iTerm2 `File=width=…;height=…`, Kitty `c=`/`r=`, the host's own
+///   chrome rasters — because filling the cells it asked for IS the spec.
+/// - [`ImageScaling::Stretch`](aterm_core::grid::extra::ImageScaling::Stretch)
+///   — the source is scaled to the WHOLE footprint, aspect ignored. Only an
+///   explicit request earns it: iTerm2's `preserveAspectRatio=0`.
+/// - [`ImageScaling::PixelExact`](aterm_core::grid::extra::ImageScaling::PixelExact)
+///   — one source pixel to one device pixel, anchored at the footprint's
+///   TOP-LEFT, the rounded-up remainder left unpainted. Right when the program
+///   named PIXELS (sixel; Kitty with neither `c=` nor `r=`), where the footprint
+///   was DERIVED from the raster by rounding up to whole cells and scaling back
+///   out to it is pure rounding noise (`place_rgba_at_origin`).
 ///
-/// ## Why not simply fill the box
+/// ## Why fit, not fill, by default
 ///
 /// This used to scale straight to `fp_w × fp_h` on the reasoning that "the engine
 /// already chose the footprint cell count (honoring aspect ratio)". The engine
@@ -25646,77 +25687,96 @@ fn to_rgba8(buf: &[u8], color_type: aterm_png::ColorType, w: usize, h: usize) ->
 /// ellipses on every image whose pixel size was not an exact multiple of the cell
 /// box. Fitting instead of filling makes the drawn raster's aspect EXACT to the
 /// rounding of one destination pixel, at the cost of a few transparent px along
-/// one axis.
+/// one axis. Filling is kept for the one request that asks for it by name
+/// (`Stretch`), which is why it is a separate policy and not a flag on `Fit`.
 ///
 /// A source whose aspect already matches the box (the tab strip's chrome band,
 /// which builds its raster at exactly `cols*cell_w × rows*cell_h + lift`, and any
 /// cell-exact image) fits the full box, so those paths are byte-identical.
 ///
-/// ## Not yet honored
-///
-/// iTerm2's `preserveAspectRatio=0` — "stretch to fill, ignore the inherent
-/// ratio" — has no carrier: [`ImageData`](aterm_core::grid::extra::ImageData)
-/// carries `pixel_exact` but no stretch flag, so the renderer cannot tell a
-/// default placement from an explicit stretch request and treats both as fit.
-/// That option was ALREADY ignored before this change (it stretched both ways
-/// round); making the default correct is strictly closer to the spec, and the
-/// remaining gap is one more bool on `ImageData` away.
-///
-/// Returns `None` only for a format the renderer cannot decode (non-PNG) or a
-/// corrupt/oversized PNG; the caller caches that as "draw nothing" so a bad image
-/// degrades gracefully instead of re-decoding every frame.
+/// Returns `None` only for a format the renderer cannot decode (non-PNG), a
+/// corrupt/oversized PNG, or a `source_rect` that misses the raster; the caller
+/// caches that as "draw nothing" so a bad image degrades gracefully instead of
+/// re-decoding every frame.
 ///
 /// Public so the GPU renderer's image pass decodes byte-identically: it uploads
 /// this exact footprint RGBA into a texture and samples it NEAREST per cell, so a
 /// covered cell's pixels match the CPU `blit_image_cell` 1:1 tile (the CPU/GPU
-/// inline-image parity gate). The fit happens HERE, in the one shared decode, so
-/// neither renderer can drift from the other on it.
+/// inline-image parity gate). The crop and the scaling happen HERE, in the one
+/// shared decode, so neither renderer can drift from the other on them.
 pub fn decode_image_to_footprint(
     bytes: &[u8],
     format: aterm_core::grid::extra::ImageFormat,
     fp_w: usize,
     fp_h: usize,
-    pixel_exact: bool,
+    scaling: aterm_core::grid::extra::ImageScaling,
+    source_rect: Option<aterm_core::grid::extra::SourceRect>,
 ) -> Option<Vec<u8>> {
+    use aterm_core::grid::extra::{ImageFormat, ImageScaling};
+    use std::borrow::Cow;
     if fp_w == 0 || fp_h == 0 {
         return None;
     }
-    // Already-decoded RGBA8 (the sixel path, and Kitty's `f=32`/`f=24`): place
-    // the stored raster into the footprint directly — no container to decode.
-    // The engine guarantees the byte layout (`[r, g, b, a]` per pixel, row-major
-    // over `width`), matching `resample_rgba`'s input contract.
-    if let aterm_core::grid::extra::ImageFormat::RawRgba8 { width, height } = format {
-        let (w, h) = (width as usize, height as usize);
-        if w == 0 || h == 0 || bytes.len() < w.checked_mul(h)?.checked_mul(4)? {
-            return None;
+    let (src, src_w, src_h): (Cow<'_, [u8]>, usize, usize) = match format {
+        // Already-decoded RGBA8 (the sixel path, and Kitty's `f=32`/`f=24`):
+        // place the stored raster into the footprint directly — no container to
+        // decode. The engine guarantees the byte layout (`[r, g, b, a]` per
+        // pixel, row-major over `width`), matching `resample_rgba`'s input
+        // contract.
+        ImageFormat::RawRgba8 { width, height } => {
+            let (w, h) = (width as usize, height as usize);
+            if w == 0 || h == 0 || bytes.len() < w.checked_mul(h)?.checked_mul(4)? {
+                return None;
+            }
+            (Cow::Borrowed(&bytes[..w * h * 4]), w, h)
         }
-        let src = &bytes[..w * h * 4];
-        return Some(if pixel_exact {
-            place_rgba_at_origin(src, w, h, fp_w, fp_h)
-        } else {
-            fit_rgba_into_footprint(src, w, h, fp_w, fp_h)
-        });
+        ImageFormat::Png => {
+            let (decoded, w, h) = decode_png_rgba8(bytes)?;
+            (Cow::Owned(decoded), w, h)
+        }
+        // Only PNG is decodable today; anything else degrades to nothing.
+        ImageFormat::Unknown => return None,
+    };
+    let (src, src_w, src_h) = match source_rect {
+        None => (src, src_w, src_h),
+        Some(rect) => {
+            let (x, y, w, h) =
+                rect.clamp_to(u32::try_from(src_w).ok()?, u32::try_from(src_h).ok()?)?;
+            let (w, h) = (w as usize, h as usize);
+            let cropped = crop_rgba(&src, src_w, x as usize, y as usize, w, h);
+            (Cow::Owned(cropped), w, h)
+        }
+    };
+    // Identity fast path (perf): a decoded (or cropped) source already at
+    // footprint size needs no resample — its aspect IS the box's, so the fit is
+    // the whole box and the area/bilinear ratio is 1:1 (the identity filter);
+    // it fills the box, so it is the stretch too; and a raster that fills the
+    // footprint has no margin to leave unpainted, so it is equally the
+    // pixel-exact answer. Returning the owned buffer directly is byte-identical
+    // AND skips a full multi-megapixel float pass on the event-loop thread. (A
+    // BORROWED raw raster takes the per-policy path, which copies it.)
+    if (src_w, src_h) == (fp_w, fp_h)
+        && let Cow::Owned(owned) = src
+    {
+        return Some(owned);
     }
-    // Only PNG is decodable today; anything else degrades to nothing.
-    if !matches!(format, aterm_core::grid::extra::ImageFormat::Png) {
-        return None;
-    }
-    let (src, src_w, src_h) = decode_png_rgba8(bytes)?;
-    // Identity fast path (perf): a source already at footprint size needs no
-    // resample — its aspect IS the box's, so the fit is the whole box and the
-    // area/bilinear ratio is 1:1 (the identity filter). It is equally the
-    // pixel-exact answer (a raster that fills the footprint has no margin to
-    // leave unpainted), so both policies take it. Returning the decode directly
-    // is byte-identical AND skips a full multi-megapixel float pass on the
-    // event-loop thread.
-    if (src_w, src_h) == (fp_w, fp_h) {
-        return Some(src);
-    }
-    Some(if pixel_exact {
-        place_rgba_at_origin(&src, src_w, src_h, fp_w, fp_h)
-    } else {
-        fit_rgba_into_footprint(&src, src_w, src_h, fp_w, fp_h)
+    Some(match scaling {
+        ImageScaling::Fit => fit_rgba_into_footprint(&src, src_w, src_h, fp_w, fp_h),
+        ImageScaling::Stretch => resample_rgba(&src, src_w, src_h, fp_w, fp_h),
+        ImageScaling::PixelExact => place_rgba_at_origin(&src, src_w, src_h, fp_w, fp_h),
     })
+}
+
+/// Copy the `w × h` sub-rectangle at `(x, y)` out of a row-major RGBA8 raster
+/// `src_w` pixels wide. The caller has already clamped the rectangle to the
+/// raster ([`SourceRect::clamp_to`](aterm_core::grid::extra::SourceRect::clamp_to)).
+fn crop_rgba(src: &[u8], src_w: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in y..y + h {
+        let start = (row * src_w + x) * 4;
+        out.extend_from_slice(&src[start..start + w * 4]);
+    }
+    out
 }
 
 /// PIXEL-EXACT placement: copy `src` into an `fp_w × fp_h` RGBA8 footprint ONE
@@ -26069,18 +26129,21 @@ fn area_rgba_premul(pm: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> V
 }
 
 /// Trust-toolchain (trust-mc / `#[kani::proof]`) proofs of the W10 resampling
-/// laws over the bit-precise integer domain (loops statically bounded so the
-/// BMC unwinds without config) — the arithmetic depth the `ty` model (no `*`)
-/// cannot reach. CONFIG-FREE, discharged by
+/// laws over the bit-precise integer domain — the arithmetic depth the `ty`
+/// model (no `*`) cannot reach. CONFIG-FREE, discharged by
 /// `KANI_CRATE=aterm-render scripts/verify-kani-proofs.sh`.
-/// Current verdicts (honest): the two `area_overlap` obligations and the
-/// empty-set totality are INCONCLUSIVE under today's trust-mc frontier
-/// (fail-closed model gap — `d*src` nonlinearity / iterator adapters — same
-/// class as `pad_split_kani`'s nonlinear three, bounds-independent), and the
-/// bounded strike-law obligation is resource-killed by the iterator fold;
-/// none yields a counterexample. Their always-on proof weight is carried by
-/// the exhaustive lattices in `tests/emoji_resample.rs` + the `ty`-checked
-/// `StrikeSelection` model (aterm-spec).
+/// The two `area_overlap` sums are UNROLLED, not loops, on purpose (measured
+/// 2026-09-28, trust-mc 20065): an 8-trip loop outruns the config-free default
+/// unwind, and the driver reports that as "panic reached" at the loop head,
+/// classified GENUINE — a false counterexample that failed the floor (a
+/// `while` form proves under `--default-unwind 10`, which is config). Current
+/// verdicts (honest): the two `area_overlap` obligations and the empty-set
+/// totality are INCONCLUSIVE (solver undecided — `d*src` nonlinearity, same
+/// class as `pad_split_kani`'s nonlinear three), and the strike law is
+/// undecided through its iterator fold; none yields a counterexample. Their
+/// always-on proof weight is carried by the exhaustive lattices in
+/// `tests/emoji_resample.rs` + the `ty`-checked `StrikeSelection` model
+/// (aterm-spec).
 #[cfg(kani)]
 mod resample_kani {
     use super::{area_overlap, select_strike_ppem};
@@ -26095,12 +26158,14 @@ mod resample_kani {
         kani::assume(src >= 1 && src <= 8);
         kani::assume(dst >= 1 && dst <= 8);
         kani::assume(d < dst);
-        let mut sum: u64 = 0;
-        for s in 0..8usize {
+        let w = |s: usize| {
             if s < src {
-                sum += area_overlap(d, s, src, dst);
+                area_overlap(d, s, src, dst)
+            } else {
+                0
             }
-        }
+        };
+        let sum = w(0) + w(1) + w(2) + w(3) + w(4) + w(5) + w(6) + w(7);
         kani::assert(
             sum == src as u64,
             "footprint weights must sum to exactly src",
@@ -26117,12 +26182,14 @@ mod resample_kani {
         kani::assume(src >= 1 && src <= 8);
         kani::assume(dst >= 1 && dst <= 8);
         kani::assume(s < src);
-        let mut sum: u64 = 0;
-        for d in 0..8usize {
+        let w = |d: usize| {
             if d < dst {
-                sum += area_overlap(d, s, src, dst);
+                area_overlap(d, s, src, dst)
+            } else {
+                0
             }
-        }
+        };
+        let sum = w(0) + w(1) + w(2) + w(3) + w(4) + w(5) + w(6) + w(7);
         kani::assert(
             sum == dst as u64,
             "a source texel's mass must be fully distributed",
@@ -27637,17 +27704,22 @@ mod tests {
 
     /// IMG-1 DIFFERENTIAL ORACLE: the memoized per-row image equality
     /// ([`ImageEqMemo::rows_eq`]) must agree with the derived deep equality
-    /// (`Vec<(usize, ImageRef)>` `==`) on every shape — same-`Arc`, cross-`Arc`
-    /// equal payloads, cross-`Arc` differing payloads (first AND last byte, so
-    /// neither a prefix nor a suffix shortcut could fake it), metadata-only
-    /// differences (footprint / z / tile / column), a length mismatch, and
-    /// REPEAT consultation (the second call resolves the cross-`Arc` pairs
-    /// from the memo and must return the identical verdict). The memo exists
-    /// purely to price the deep compare once per distinct Arc pair instead of
-    /// once per covered cell; any verdict drift would corrupt the dirty set.
+    /// (`Vec<(usize, ImageRef)>` `==`) of the rows with their Kitty placement
+    /// tags stripped, on every shape — same-`Arc`, cross-`Arc` equal payloads,
+    /// cross-`Arc` differing payloads (first AND last byte, so neither a prefix
+    /// nor a suffix shortcut could fake it), metadata-only differences
+    /// (footprint / z / tile / column), a tag-only difference (EQUAL: the tag
+    /// is identity, not pixels), a length mismatch, and REPEAT consultation
+    /// (the second call resolves the cross-`Arc` pairs from the memo and must
+    /// return the identical verdict). The memo exists purely to price the deep
+    /// compare once per distinct Arc pair instead of once per covered cell;
+    /// any verdict drift would corrupt the dirty set.
     #[test]
     fn image_eq_memo_matches_derived_row_equality() {
-        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+        use aterm_core::grid::extra::{
+            ImageData, ImageFormat, ImageRef, ImageScaling, KittyPlacementTag,
+        };
+        use std::num::NonZeroU32;
         use std::sync::Arc;
         let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
         let mk = |bytes: Vec<u8>, cols: u16, z: i32| {
@@ -27658,7 +27730,8 @@ mod tests {
                 rows: 4,
                 z_index: z,
                 band_lift_px: 0,
-                pixel_exact: false,
+                scaling: ImageScaling::Fit,
+                source_rect: None,
             })
         };
         let base = mk(payload.clone(), 8, 0);
@@ -27681,12 +27754,38 @@ mod tests {
                             image: img.clone(),
                             cell_row: tile,
                             cell_col: u16::try_from(i).unwrap(),
+                            kitty: None,
                         },
                     )
                 })
                 .collect::<Vec<_>>()
         };
         let a = row(&base, 2, 0);
+        // The same cells stamped by a Kitty placement: identity, not pixels.
+        let tagged = |serial: u32| {
+            let mut r = a.clone();
+            for (_, iref) in &mut r {
+                iref.kitty = Some(KittyPlacementTag {
+                    image_id: 1,
+                    placement_id: 0,
+                    serial: NonZeroU32::new(serial).unwrap(),
+                });
+            }
+            r
+        };
+        let untagged = |r: &[(usize, ImageRef)]| {
+            r.iter()
+                .map(|(c, iref)| {
+                    (
+                        *c,
+                        ImageRef {
+                            kitty: None,
+                            ..iref.clone()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let cases = [
             Vec::new(),             // empty vs covered
             a.clone(),              // same Arcs, same metadata (ptr_eq path)
@@ -27697,10 +27796,11 @@ mod tests {
             row(&diff_last, 2, 0),  // payload differs at the LAST byte
             row(&diff_meta, 2, 0),  // metadata-only difference
             row(&diff_z, 2, 0),     // z-only difference
+            tagged(7),              // tag-only difference — EQUAL
             a[..2].to_vec(),        // length mismatch
         ];
         for (i, b) in cases.iter().enumerate() {
-            let derived = a == *b;
+            let derived = untagged(&a) == untagged(b);
             let mut memo = ImageEqMemo::default();
             assert_eq!(
                 memo.rows_eq(&a, b),
@@ -27716,6 +27816,10 @@ mod tests {
         // And the re-transmit case is genuinely EQUAL across distinct Arcs —
         // the load-bearing repaint suppression this memo must preserve.
         assert!(ImageEqMemo::default().rows_eq(&a, &row(&same_bytes, 2, 0)));
+        // A Kitty re-put under a new serial is EQUAL too, though the derived
+        // `ImageRef` equality (which sees the tag) says otherwise.
+        assert!(ImageEqMemo::default().rows_eq(&tagged(7), &tagged(8)));
+        assert_ne!(tagged(7), tagged(8), "the tag is part of derived equality");
     }
 
     /// IMG-1 END-TO-END: a RE-TRANSMITTED image (same bytes, fresh `Arc` — the
@@ -27728,7 +27832,7 @@ mod tests {
     /// the first assert and fail this one).
     #[test]
     fn retransmitted_identical_image_gate_hits_and_changed_payload_does_not() {
-        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
         use std::sync::Arc;
         let mut term = Terminal::new(6, 10);
         let template = term.cell_frame(6, 10);
@@ -27743,7 +27847,8 @@ mod tests {
                 rows: 2,
                 z_index: 0,
                 band_lift_px: 0,
-                pixel_exact: false,
+                scaling: ImageScaling::Fit,
+                source_rect: None,
             })
         };
         let fill = |input: &mut RenderInput, img: &Arc<ImageData>| {
@@ -27755,6 +27860,7 @@ mod tests {
                             image: img.clone(),
                             cell_row: u16::try_from(r).unwrap(),
                             cell_col: u16::try_from(c).unwrap(),
+                            kitty: None,
                         },
                     ));
                 }
@@ -28799,7 +28905,8 @@ mod tests {
             },
             4,
             4,
-            false,
+            aterm_core::grid::extra::ImageScaling::Fit,
+            None,
         )
         .expect("RawRgba8 must decode without a codec");
         assert_eq!(out.len(), 4 * 4 * 4, "footprint is 4x4 RGBA");
@@ -28827,7 +28934,8 @@ mod tests {
                 },
                 8,
                 8,
-                false
+                aterm_core::grid::extra::ImageScaling::Fit,
+                None
             )
             .is_none(),
             "a too-short RawRgba8 buffer must decode to None"
@@ -28842,7 +28950,7 @@ mod tests {
     /// while cached. We simulate the reuse with two live, distinct Arcs of equal size.
     #[test]
     fn image_cache_distinguishes_distinct_arcs_of_equal_footprint() {
-        use aterm_core::grid::extra::{ImageData, ImageFormat};
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageScaling};
         let mk = || {
             std::sync::Arc::new(ImageData {
                 bytes: Vec::new(),
@@ -28851,7 +28959,8 @@ mod tests {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
-                pixel_exact: false,
+                scaling: ImageScaling::Fit,
+                source_rect: None,
             })
         };
         let (a, b) = (mk(), mk());
@@ -28886,7 +28995,7 @@ mod tests {
 
     /// Small distinct `ImageData` Arcs for cache-policy tests.
     fn mk_image_arc() -> std::sync::Arc<aterm_core::grid::extra::ImageData> {
-        use aterm_core::grid::extra::{ImageData, ImageFormat};
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageScaling};
         std::sync::Arc::new(ImageData {
             bytes: Vec::new(),
             format: ImageFormat::Unknown,
@@ -28894,7 +29003,8 @@ mod tests {
             rows: 1,
             z_index: 0,
             band_lift_px: 0,
-            pixel_exact: false,
+            scaling: ImageScaling::Fit,
+            source_rect: None,
         })
     }
 
@@ -34120,7 +34230,7 @@ mod tests {
     /// buffer across frames (no per-frame reallocation on a steady-size grid) and
     /// produces byte-identical pixels to the allocating `render_input` (parity
     /// preserved). This pins BOTH the buffer-reuse win (the borrow hot path) and
-    /// the single-code-path invariant (`render_input` == cached + clone).
+    /// the single-code-path invariant (`render_input` == cached pixels).
     #[test]
     fn render_input_cached_reuses_buffer_and_matches_render_input() {
         let Some(mut r) = renderer() else {
@@ -34162,6 +34272,56 @@ mod tests {
         assert_eq!(
             (owned.width, owned.height),
             (input.cols * r.cell_w, input.rows * r.cell_h)
+        );
+    }
+
+    /// Distinct streamed tokens miss the text memo but still share the row's
+    /// font and segment properties. Count the actual plan-construction work on
+    /// the shipping planner, then prove a warm row builds none. A script change
+    /// is the negative control: it must build a distinct plan.
+    #[test]
+    fn row_glyph_plan_reuses_segment_plans_for_distinct_streamed_tokens() {
+        let font = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
+        let mut renderer =
+            Renderer::from_bytes(font, 16.0, Theme::default()).expect("ligature font");
+        assert!(
+            renderer.has_ligature_features,
+            "fixture enables real shaping"
+        );
+        let mut terminal = Terminal::new(2, 120);
+        terminal
+            .process(b"\x1b[?25lalpha beta gamma delta epsilon zeta eta theta iota kappa lambda");
+        let input = terminal.cell_frame(2, 120);
+        let mut plan = Vec::new();
+        let _ = ligature_shaping::take_shape_plan_builds();
+        renderer.row_glyph_plan(&input, 0, &[], &mut plan);
+        assert_eq!(
+            ligature_shaping::take_shape_plan_builds(),
+            1,
+            "all eleven misses share one Latin plan"
+        );
+        assert!(
+            renderer.shaped_runs.cur_len() >= 11,
+            "the row must really miss for distinct tokens"
+        );
+        renderer.row_glyph_plan(&input, 0, &[], &mut plan);
+        assert_eq!(
+            ligature_shaping::take_shape_plan_builds(),
+            0,
+            "warm text creates no face or plan"
+        );
+
+        terminal.process("\x1b[2;1Hfresh => output Ελληνικά".as_bytes());
+        let input = terminal.cell_frame(2, 120);
+        renderer.row_glyph_plan(&input, 1, &[], &mut plan);
+        assert_eq!(
+            ligature_shaping::take_shape_plan_builds(),
+            3,
+            "Latin, common-only and Greek require distinct plans"
+        );
+        assert!(
+            plan.iter().any(|g| !matches!(g, ColumnGlyph::PerCell)),
+            "the operator must still ligate"
         );
     }
 
@@ -35528,6 +35688,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn chrome_raster_visitor_matches_per_pixel_ownership_and_rail_oracle() {
+        // The oracle resolves individual pixels from source arrays and cell
+        // intervals. It has no run grouping, so splitting a run incorrectly,
+        // crossing an owned cell or painting a KEEP rail pixel is observable.
+        let color = |x: usize| match x % 9 {
+            0..=2 => 0x0012_3456,
+            3 => ChromeRaster::KEEP,
+            4..=6 => 0x00ab_cdef,
+            _ => x as u32,
+        };
+        let mut raster = ChromeRaster {
+            row: 0,
+            ground: (0..37).map(color).collect(),
+            rail: (0..23).map(|x| color(x + 3)).collect(),
+            rail_h: 3,
+            clear_rail: false,
+            own: Vec::new(),
+            split: None,
+            rings: Vec::new(),
+            icons: Vec::new(),
+        };
+        let ownership = [
+            vec![],
+            vec![(1, 3)],
+            vec![(3, 6), (1, 2), (2, 5)], // unsorted and overlapping
+            vec![(0, 20)],
+            vec![(4, 2)], // empty interval
+        ];
+        for own in ownership {
+            raster.own = own;
+            for rail_h in [0, 3] {
+                raster.rail_h = rail_h;
+                for w in [0, 1, 7, 23, 37, 43] {
+                    for pad in [0, 2, 11] {
+                        for cell_w in [0, 1, 3, 7] {
+                            for cols in [0, 1, 4, 8] {
+                                let mut ground = vec![None; w];
+                                let mut rail = vec![None; w];
+                                let mut emitted = Vec::new();
+                                let mut last: Option<(usize, u32, bool)> = None;
+                                visit_chrome_raster_runs(
+                                    &raster,
+                                    w,
+                                    pad,
+                                    cell_w,
+                                    cols,
+                                    |x0, x1, c, is_rail| {
+                                        assert!(x0 < x1 && x1 <= w);
+                                        if let Some((end, previous_c, was_rail)) = last {
+                                            assert!(!was_rail || is_rail, "ground precedes rail");
+                                            if was_rail == is_rail {
+                                                assert!(x0 >= end, "ascending disjoint runs");
+                                                assert!(
+                                                    x0 != end || c != previous_c,
+                                                    "maximal run"
+                                                );
+                                            }
+                                        }
+                                        last = Some((x1, c, is_rail));
+                                        let pixels = if is_rail { &mut rail } else { &mut ground };
+                                        for pixel in &mut pixels[x0..x1] {
+                                            assert!(
+                                                pixel.replace(c).is_none(),
+                                                "painted only once"
+                                            );
+                                        }
+                                        emitted.push((x0, x1, c, is_rail));
+                                    },
+                                );
+                                assert_eq!(
+                                    emitted,
+                                    chrome_raster_runs(&raster, w, pad, cell_w, cols),
+                                    "the collecting API keeps the visitor's order"
+                                );
+                                let advance = cell_w.max(1);
+                                for x in 0..w {
+                                    let owned = x < pad + cols * advance
+                                        && raster.own.iter().any(|&(a, b)| {
+                                            x >= pad + usize::from(a) * advance
+                                                && x < pad + usize::from(b) * advance
+                                        });
+                                    let expected_ground =
+                                        raster.ground.get(x).copied().filter(|_| !owned);
+                                    let expected_rail = raster.rail.get(x).copied().filter(|&c| {
+                                        rail_h > 0 && !owned && c != ChromeRaster::KEEP
+                                    });
+                                    assert_eq!(ground[x], expected_ground, "ground pixel {x}");
+                                    assert_eq!(rail[x], expected_rail, "rail pixel {x}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        raster.ground = std::sync::Arc::from([]);
+        raster.rail = std::sync::Arc::from([]);
+        visit_chrome_raster_runs(&raster, 100, 3, 8, 10, |_, _, _, _| {
+            panic!("empty source arrays emit no runs");
+        });
     }
 
     /// A PIXEL-RESOLUTION CHROME ROW ([`ChromeRaster`], the message band's
@@ -37021,7 +37284,8 @@ mod tests {
                 aterm_core::grid::extra::ImageFormat::Png,
                 8,
                 8,
-                false
+                aterm_core::grid::extra::ImageScaling::Fit,
+                None
             )
             .is_none(),
             "oversized inline-image PNG must decode to nothing"
@@ -37056,7 +37320,8 @@ mod tests {
             aterm_core::grid::extra::ImageFormat::Png,
             16,
             16,
-            false,
+            aterm_core::grid::extra::ImageScaling::Fit,
+            None,
         )
         .expect("small PNG resamples to its footprint");
         assert_eq!(fp.len(), 16 * 16 * 4);
@@ -37091,9 +37356,15 @@ mod tests {
 
         let png = solid_rgba_png(8, 4, [12, 200, 99]);
         let (decoded, w, h) = decode_png_rgba8(&png).expect("8x4 PNG decodes");
-        let fp =
-            decode_image_to_footprint(&png, aterm_core::grid::extra::ImageFormat::Png, w, h, false)
-                .expect("identity footprint decodes");
+        let fp = decode_image_to_footprint(
+            &png,
+            aterm_core::grid::extra::ImageFormat::Png,
+            w,
+            h,
+            aterm_core::grid::extra::ImageScaling::Fit,
+            None,
+        )
+        .expect("identity footprint decodes");
         assert_eq!(fp, decoded, "footprint at source size is the decode itself");
     }
 

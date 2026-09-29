@@ -11,9 +11,9 @@ use aterm_uds::CtlListener;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
-const ENV_IDENTITY: &str = "ATERM_HANDOFF_CONTROL_SOCKET_IDENTITY";
+pub(crate) const ENV_IDENTITY: &str = "ATERM_HANDOFF_CONTROL_SOCKET_IDENTITY";
 const MAX_WIRE_BYTES: usize = 2048;
 #[cfg(unix)]
 const MAX_TOKEN_BYTES: usize = 256;
@@ -243,21 +243,76 @@ fn read_token(plan: &SocketPlan) -> Option<TokenIdentity> {
     })
 }
 
-static PUBLISHED: OnceLock<SocketIdentity> = OnceLock::new();
+/// The witness this process publishes: set once at bind, and MOVED only by
+/// [`republish_rebound`] when the supervised listener replaces its own wedged
+/// socket (`control_listener`). A leaf lock: held for a clone or a store, never
+/// across another acquisition or any I/O but the rebind's own two `lstat`s.
+static PUBLISHED: Mutex<Option<SocketIdentity>> = Mutex::new(None);
 
 /// Called only after the real listener has bound and its witness was captured.
+/// The first publication wins, exactly as the one-shot cell this replaced.
 pub(crate) fn publish(identity: SocketIdentity) -> bool {
-    PUBLISHED.set(identity).is_ok()
+    let mut slot = PUBLISHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(identity);
+    true
 }
 
 pub(crate) fn published() -> Option<SocketIdentity> {
-    PUBLISHED.get().cloned()
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Move the published witness onto the socket the supervised listener just
+/// renamed over its OWN endpoint (`control_listener::rebind_socket`). The token
+/// file is untouched by a rebind, so only the socket vnode changes — and only
+/// when the witness being replaced names `previous` (the vnode that rebind
+/// replaced): a witness for anything else is left exactly as it was. The new
+/// witness must still verify against the files ([`SocketIdentity::matches_current`]),
+/// or nothing is published and a later handoff fails closed rather than
+/// trusting a stale inode. Returns whether the witness moved.
+pub(crate) fn republish_rebound(plan: &SocketPlan, previous: (u64, u64)) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut slot = PUBLISHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = slot.as_ref() else {
+            return false;
+        };
+        if (current.device, current.inode) != previous {
+            return false;
+        }
+        let Some(socket) = socket_metadata(&plan.sock_path) else {
+            return false;
+        };
+        let mut next = current.clone();
+        next.device = socket.dev();
+        next.inode = socket.ino();
+        if !next.matches_current(plan) {
+            return false;
+        }
+        *slot = Some(next);
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (plan, previous);
+        false
+    }
 }
 
 /// Clear inherited authority, then carry only this process's bound listener.
 #[cfg(unix)]
 pub(crate) fn bind_command(command: &mut Command) {
-    bind_command_identity(command, PUBLISHED.get());
+    bind_command_identity(command, published().as_ref());
 }
 
 #[cfg(unix)]
@@ -271,22 +326,25 @@ fn bind_command_identity(command: &mut Command, identity: Option<&SocketIdentity
     }
 }
 
+/// [`consume_incoming_from`] over the process environment: the env-shaped entry
+/// point this module's suite drives (`handoff_env::through_process_env`).
+#[cfg(test)]
+pub(crate) fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
+    crate::handoff_env::through_process_env(&[ENV_IDENTITY], consume_incoming_from)
+}
+
 /// Consume the launch value once. An error is a refused handoff, never an absent
 /// witness that permits the ordinary binder. Parsed data gains authority only
 /// beside the existing admitted Ready/Commit gate and matching explicit plan.
 ///
-/// Read-and-remove goes through the workspace's ONE lock-scoped environment
-/// mutator — the shape `env_mutation` asks for — and that helper is also the
-/// reason the pair is now ATOMIC: a split read-then-remove lets two callers both
-/// observe a value that is meant to be consumed exactly once, and a one-shot
-/// authority consumed twice is not one-shot.
-///
-/// The lock cannot serialize a bare `getenv` on another thread, so this must
-/// still be called from single-threaded startup. That is a positioning
-/// requirement on the caller, not a memory-safety contract: the mutation itself
-/// is the blessed helper's, so this function is safe to call.
-pub(crate) fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
-    let Some(raw) = aterm_log::env::take(ENV_IDENTITY) else {
+/// Taken out of the handoff snapshot `main_entry` captured
+/// (`HandoffEnv::capture`, the one read-and-clear of the process environment,
+/// before any thread): a one-shot authority consumed twice is not one-shot, and
+/// a `take` from the snapshot is one-shot by construction.
+pub(crate) fn consume_incoming_from(
+    env: &mut crate::handoff_env::HandoffEnv,
+) -> Result<Option<SocketIdentity>, String> {
+    let Some(raw) = env.take(ENV_IDENTITY) else {
         return Ok(None);
     };
     let invalid = || "invalid handoff control-socket identity".to_string();
@@ -297,7 +355,10 @@ pub(crate) fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
     SocketIdentity::decode(wire).map(Some).ok_or_else(invalid)
 }
 
-#[cfg(all(test, unix))]
+// Two attributes rather than `all(test, unix)`: the lock-order census masks a
+// `#[cfg(test)]` item and reads any other gate as shipping code.
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
@@ -326,6 +387,11 @@ mod tests {
     /// `Debug` on purpose (nothing about a listener's files is for a log line).
     #[test]
     fn consume_incoming_takes_the_witness_once_through_the_blessed_helper() {
+        // The handoff env lock: `HandoffEnv::capture` in the snapshot's
+        // conformance takes this name out of the process too.
+        let _env = crate::seamless::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         aterm_log::env::unset(ENV_IDENTITY);
         assert!(consume_incoming() == Ok(None), "absent: nothing to consume");
         assert!(std::env::var_os(ENV_IDENTITY).is_none());

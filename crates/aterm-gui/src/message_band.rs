@@ -15,7 +15,7 @@
 //! The engine lays the row out in CELLS ([`Presentation`], the width law of
 //! `aterm_messages::glass`), answers where a press landed
 //! ([`Presentation::hit`]), computes every moving thing as FRACTIONS of
-//! the row ([`BandMotion`], design ruling 140 — the owner's architecture ask:
+//! the row ([`BandMotion`](aterm_messages::BandMotion), design ruling 140 — the owner's architecture ask:
 //! *"design the logic in aterm core and then keep the osx layer lightweight"*)
 //! and PAINTS each row's STRUCTURE (`aterm_messages::paint::paint`, ruling 319): which
 //! character goes in which cell, in which ink slot (`aterm_messages::paint::Ink`, ruling
@@ -29,10 +29,12 @@
 //! over the chrome band's material as plain RGB. This module maps the chrome
 //! theme onto that material ([`chrome_band::band_colors`] — the chrome
 //! palette, which also retires the OSC-11 tint drift the config band had),
-//! writes the resolved cells as [`RenderCell`]s ([`paint_rows_on`]), places
-//! each row's pixel raster ([`RowRaster`]) on the renderer's frame
-//! ([`OnFrame`]), and maps a window pixel to a band row and column
-//! ([`App::band_hit_at`]).
+//! hands the resolved rows to the renderer's band composition
+//! (`aterm_render::band`, ruling 331 — the [`RenderCell`] write, each row's
+//! pixel raster ([`RowRaster`]) on the frame, the stack's seams and the
+//! splice, the one table the web module runs too) through [`paint_rows_on`]
+//! and `App::splice_message_band`, and maps a window pixel to a band row and
+//! column ([`App::band_hit_at`]).
 //! Layout and hit test share one law by construction: the painter reads the
 //! same columns the hit test reads, so a capsule is hit exactly where it is
 //! painted.
@@ -41,7 +43,8 @@
 //!
 //! The band writes one `char` per cell (`settings::write_str`, the presence
 //! and strip painters' writer), so the measure handed to the width law is
-//! the char count ([`cell_width`]): the layout and the writer must agree, or
+//! the char count (`aterm_messages::text::char_width`, the measure the engine's
+//! `drive::Lay` lays out with): the layout and the writer must agree, or
 //! a right-aligned capsule would be hit one cell off where it is drawn. Every
 //! reporter's words are ASCII plus a few BMP glyphs; a wide-aware writer and
 //! measure move together when one arrives.
@@ -99,14 +102,14 @@
 //! The fill's ink is the theme's cursor accent (ruling 137, the owner's
 //! "cursor trail theme"), `warn` on a Warn/Error row, and `HIGHLIGHT` under
 //! High Contrast; a stalled bar dims to a slate of it, the glint is a lift
-//! of it, and a Fault echo warms it to the fault hue ([`ink::MeterInks::rgb`]). A BUSY
+//! of it, and a Fault echo warms it to the fault hue ([`MeterInks::rgb`](aterm_messages::ink::MeterInks::rgb)). A BUSY
 //! row's comet wears the same accent held on its words' side of the
-//! luminance scale ([`ink::MeterInks::comet`]: on a dark band a deep, saturated
+//! luminance scale ([`MeterInks::comet`](aterm_messages::ink::MeterInks::comet): on a dark band a deep, saturated
 //! accent), so a word it passes brightens and dims with it and never flips
 //! to the far ink.
 //!
 //! Every word a DETERMINATE row writes over its fill wears the row's CRISP
-//! ink ([`ink::fill_ink`], ruling 222): whichever of the band's own background and
+//! ink ([`fill_ink`](aterm_messages::ink::fill_ink), ruling 222): whichever of the band's own background and
 //! foreground inks reads better on the resting fill, chosen once for the
 //! row, so the edge, the glint and an echo passing never change which ink a
 //! word is.
@@ -123,14 +126,14 @@
 //! # Motion (design §10.7, ruling 140)
 //!
 //! [`paint_rows_on`] paints one FRAME: the layout (time-free, fingerprinted
-//! by the engine) under one [`BandMotion`] (`MessageCenter::motion`, read on
+//! by the engine) under one [`BandMotion`](aterm_messages::BandMotion) (`MessageCenter::motion`, read on
 //! the engine's 33 ms grid). A held row's still bar and a busy row's still
 //! track come from the same call in the still look, so the painter has one
 //! path. An animation never re-runs the width law and never re-grids: the
 //! motion moves only the surface, the time slots, the glyph cell and an
 //! echo's fade — which mixes every cell toward `bar_bg` and never touches
 //! the seam, which the splice draws on the COMPOSED stack afterwards
-//! ([`seal_stack`]).
+//! (`aterm_render::band::seal_stack`).
 //!
 //! # Capsules
 //!
@@ -151,7 +154,8 @@
 //! drawn as `[label]` with no fill: HC separates surfaces with borders. The
 //! closing underline seam belongs to the COMPOSED stack, not to any painted
 //! row: the splice seals whichever chrome row ends up last — a message row, a
-//! padded row, or the presence row when no band row follows ([`seal_stack`]).
+//! padded row, or the presence row when no band row follows
+//! (`aterm_render::band::seal_stack`).
 //!
 //! # The links (design §2.2, §8)
 //!
@@ -166,21 +170,27 @@
 //! is the same `Details ›` press ([`App::press_message_body`], the one law
 //! of §2.2), which is why a pointer on the body lights that chip.
 
-use aterm_core::terminal::{RenderCell, UnderlineStyle};
+use aterm_core::terminal::RenderCell;
+#[cfg(test)]
+use aterm_core::terminal::UnderlineStyle;
+#[cfg(test)]
+use aterm_messages::MARGIN;
+#[cfg(test)]
 use aterm_messages::ink;
+#[cfg(test)]
 use aterm_messages::paint::Icon;
+#[cfg(test)]
 use aterm_messages::text::char_width;
-use aterm_messages::{ActionIndex, BandMotion, Hit, Links, MARGIN, Presentation};
+use aterm_messages::{ActionIndex, Hit, Links, Presentation};
 #[cfg(test)]
 use aterm_messages::{
-    CapsuleLayout, CapsuleRole, FineTone, RowKind, RowLayout, RowMotion, Severity,
+    BandMotion, CapsuleLayout, CapsuleRole, FineTone, RowKind, RowLayout, RowMotion, Severity,
 };
 use aterm_render::Theme;
 
 #[cfg(test)]
 use crate::chrome_band::BandColors;
 use crate::chrome_band::{self};
-use crate::settings::{blank_row, write_str};
 use crate::{App, WindowId};
 
 // The painter's structure types, under the names the host has always used
@@ -189,7 +199,10 @@ use crate::{App, WindowId};
 pub(crate) use aterm_messages::paint::MeterSpan;
 pub(crate) use aterm_messages::paint::{Geometry as BandGeometry, Hover as BandHover, HoverTarget};
 // The band's repaint key (ruling 328): the engine's pure hash, its values kept.
-pub(crate) use aterm_messages::paint::{BandKey, band_fp};
+// The host reads it through its window's view (`drive::View::band_fp`); the
+// tests read it by name.
+#[cfg(test)]
+pub(crate) use aterm_messages::paint::band_fp;
 // The colour resolver's items, under the names the host has always used (ruling
 // 324): the engine resolves the band's colours now (`aterm_messages::ink`).
 pub(crate) use aterm_messages::ink::RowRaster;
@@ -202,7 +215,9 @@ pub(crate) use aterm_messages::ink::{
 pub(crate) use aterm_messages::palette::{lin, oklch};
 
 /// The band's cell measure — the char count, because the band's writer puts
-/// one `char` in one cell (see the module doc).
+/// one `char` in one cell (see the module doc) — the tests' name for the
+/// measure the drive's `Lay` hands the width law.
+#[cfg(test)]
 pub(crate) fn cell_width(s: &str) -> usize {
     char_width(s)
 }
@@ -223,101 +238,38 @@ pub(crate) enum BandTarget {
     },
 }
 
-/// The cells of a `cols`-wide presence row that carry TEXT: the row keeps one
-/// margin cell each side, and `chrome band=` / the a11y detail fit the words
-/// at this width — the same line the human sees, never a slot past the margin.
-pub(crate) fn presence_text_cols(cols: usize) -> usize {
-    cols.saturating_sub(2 * MARGIN)
-}
-
 /// One EMPTY band row, in the same colours a painted row uses. The compose
 /// pads with this when the geometry has committed more rows than the cache
 /// holds, so a reserved row is never a hole the terminal's own top row shows
 /// through.
 pub(crate) fn blank_band_row(cols: usize, theme: Theme) -> Vec<RenderCell> {
-    let c = chrome_band::band_colors(theme);
-    blank_row(cols, c.label, c.bar_bg, false)
+    aterm_render::band::blank_band_row(cols, &chrome_band::band_colors(theme))
 }
 
 /// Paint the PRESENCE band's one row (`crate::presence::Words`) at `cols`: the
-/// six slots laid out by [`crate::presence::Words::pieces`] (which sheds from the
-/// right in the design's order), on the chrome band's material, each slot in
-/// its own ink — the role in `value`, a `since`/fabric figure in `label`, the
-/// hand in the DRIVE hue while a peer types (the rim's own teal family, so
-/// the two surfaces read as one fact — at the TEXT floor,
-/// [`chrome_band::presence_inks`], since these are words), `⊘ hold` in STOP,
-/// the phase in WARN while the row's tone is `Warn` and in the drive hue for
-/// the two seconds after a settled turn. The trust glyph and `⚠` are
-/// text-presentation on purpose (a colour emoji would be two cells wide in
-/// one). The row carries no closing seam of its own: the splice seals it
-/// ([`seal_stack`]) when no band row follows.
+/// engine lays the slots out and inks each cell (`aterm_messages::presence::
+/// paint_row`, design ruling 348 — the six slots shed from the right in the
+/// design's order, each in its own ink, the emoji-capable glyphs pinned to
+/// text presentation) on this host's chrome band ([`chrome_band::band_colors`])
+/// with the presence hues at the text floor ([`chrome_band::presence_inks`]);
+/// the renderer's band table writes the cells (`aterm_render::band::rows`,
+/// the one table the web module runs too). The row carries no closing seam of
+/// its own: the splice seals it (`aterm_render::band::seal_stack`) when no
+/// band row follows.
 pub(crate) fn paint_presence_row(
     words: &crate::presence::Words,
     cols: usize,
     theme: Theme,
 ) -> Vec<RenderCell> {
-    use crate::presence::SlotKind;
-    use crate::presence::Tone;
     let c = chrome_band::band_colors(theme);
     let p = chrome_band::presence_inks(theme);
-    let mut row = blank_row(cols, c.label, c.bar_bg, false);
-    let pieces = words.pieces(presence_text_cols(cols));
-    let mut col = MARGIN;
-    for (i, (kind, text)) in pieces.iter().enumerate() {
-        if i > 0 {
-            col += if *kind == SlotKind::Since { 1 } else { 2 };
-        }
-        let (ink, bold) = match kind {
-            SlotKind::Role => (c.value, true),
-            SlotKind::Phase => match words.tone {
-                Tone::Warn => (c.warn, false),
-                Tone::Success => (p.drive, false),
-                Tone::Info => (c.value, false),
-            },
-            SlotKind::Since => (c.label, false),
-            SlotKind::Hand => {
-                if text.starts_with('\u{2298}') {
-                    (p.stop, true)
-                } else if text.starts_with('\u{25c2}') || text.starts_with('\u{25b8}') {
-                    (p.drive, false)
-                } else {
-                    (c.label, false)
-                }
-            }
-            SlotKind::Mail => (c.value, false),
-            SlotKind::Ctx => {
-                if text.ends_with('\u{26a0}') {
-                    (c.warn, false)
-                } else {
-                    (c.value, false)
-                }
-            }
-            SlotKind::Fabric => {
-                if text.starts_with('\u{2715}') {
-                    (p.stop, false)
-                } else if text.starts_with('~') {
-                    (c.warn, false)
-                } else {
-                    (c.label, false)
-                }
-            }
-        };
-        write_str(&mut row, cols, col, text, ink, c.bar_bg, bold);
-        // The glyphs that have an emoji form are pinned to one cell — the
-        // fleet lock included: U+1F512 is emoji-presentation by default, and
-        // the renderer would take its colour face two cells wide otherwise.
-        for (k, ch) in text.chars().enumerate() {
-            if matches!(
-                ch,
-                '\u{2713}' | '\u{2717}' | '\u{26a0}' | '\u{2709}' | '\u{2715}' | '\u{1f512}'
-            ) && let Some(cell) = row.get_mut(col + k)
-            {
-                cell.text_presentation = true;
-            }
-        }
-        col += text.chars().count();
-    }
-    row
+    let cells = aterm_messages::presence::paint_row(words, cols, &c, &p);
+    let (mut rows, _, _) = aterm_render::band::rows(vec![aterm_messages::ink::Resolved {
+        cells,
+        metered: false,
+        raster: None,
+    }]);
+    rows.pop().unwrap_or_default()
 }
 
 /// A tone's colour against a row's inks — the track mixed toward the fill
@@ -455,7 +407,9 @@ pub(crate) fn paint_rows(
 }
 
 /// A row's PIXEL raster ([`RowRaster`], the engine's, ruling 324) placed on the
-/// renderer's frame.
+/// renderer's frame (`aterm_render::band::on_frame`, ruling 331) — the tests'
+/// name for it; the splice places rasters through `aterm_render::band::compose_band`.
+#[cfg(test)]
 pub(crate) trait OnFrame {
     /// This raster on a frame whose column 0 starts `lo` window pixels in
     /// from the window's left edge (the leading remainder band, `cells_x −
@@ -471,6 +425,7 @@ pub(crate) trait OnFrame {
     ) -> aterm_render::ChromeRaster;
 }
 
+#[cfg(test)]
 impl OnFrame for RowRaster {
     fn on_frame(
         &self,
@@ -479,85 +434,14 @@ impl OnFrame for RowRaster {
         frame_w: usize,
         cell_h: usize,
     ) -> aterm_render::ChromeRaster {
-        let pack = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
-        let at = |v: &[[u8; 3]], x: usize| v[(x + lo).min(v.len().saturating_sub(1))];
-        let ground: std::sync::Arc<[u32]> = if self.ground.is_empty() {
-            std::sync::Arc::from(Vec::new())
-        } else {
-            (0..frame_w).map(|x| pack(at(&self.ground, x))).collect()
-        };
-        let rail: std::sync::Arc<[u32]> = if self.rail.is_empty() {
-            std::sync::Arc::from(Vec::new())
-        } else {
-            (0..frame_w)
-                .map(|x| {
-                    self.rail[(x + lo).min(self.rail.len() - 1)]
-                        .map_or(aterm_render::ChromeRaster::KEEP, pack)
-                })
-                .collect()
-        };
-        let rail_h = if self.rail.is_empty() {
-            0
-        } else {
-            u16::try_from(rail_px(cell_h)).unwrap_or(0)
-        };
-        aterm_render::ChromeRaster {
-            row,
-            ground,
-            rail_h,
-            clear_rail: self.clear_rail && rail_h > 0,
-            rail,
-            own: self.own.clone(),
-            rings: self
-                .rings
-                .iter()
-                .map(|&(start, end, ring, inner)| aterm_render::ChromeRing {
-                    start,
-                    end,
-                    ring: pack(ring),
-                    inner: pack(inner),
-                    // The seam is the composed stack's ([`floor_rings`]).
-                    seam: None,
-                })
-                .collect(),
-            icons: self
-                .icons
-                .iter()
-                .map(|&(col, icon)| aterm_render::ChromeIcon {
-                    col,
-                    icon: band_icon(icon),
-                })
-                .collect(),
-            split: self.split.and_then(|(col, x, ink, bg)| {
-                Some(aterm_render::InkSplit {
-                    col,
-                    x: u32::try_from(usize::try_from(x).ok()?.checked_sub(lo)?).ok()?,
-                    ink: pack(ink),
-                    bg: pack(bg),
-                })
-            }),
-        }
+        aterm_render::band::on_frame(self, row, lo, frame_w, cell_h)
     }
 }
 
-/// The rail band's height on a `cell_h`-pixel row: about an eighth of it —
-/// two pixels on a 1x cell, three on a 24-pixel one, never under two — in
-/// the row's lowest pixels (design ruling 243). A level's rail is at most
-/// this: the renderer fits it, with its words lifted clear, into the room
-/// the face leaves ([`RowRaster::clear_rail`], ruling 248); a bar's glint
-/// drawn there sits under its words' descenders as before.
-pub(crate) fn rail_px(cell_h: usize) -> usize {
-    ((cell_h + 4) / 8).max(2)
-}
-
-/// One painted band: its rows; for each row the `(left, right)` gutter tones
-/// of its meter (`None` on an unmetered row, whose gutters keep the band's
-/// own tone); and each row's pixel raster (`None` where the cells say it all).
-pub(crate) type PaintedBand = (
-    Vec<Vec<RenderCell>>,
-    Vec<Option<([u8; 3], [u8; 3])>>,
-    Vec<Option<RowRaster>>,
-);
+/// One painted band: its rows, each metered row's gutter tones and each row's
+/// pixel raster — the renderer's (`aterm_render::band`, ruling 331).
+#[cfg(test)]
+pub(crate) use aterm_render::band::PaintedBand;
 
 /// Paint every committed band row as one `p.cols`-wide row each, top to
 /// bottom, on the chrome band's material, at ONE motion frame `motion`
@@ -569,12 +453,16 @@ pub(crate) type PaintedBand = (
 /// under the pointer (or the body's `Details ›`) on its row. No row carries
 /// the hairline that closes the chrome against the terminal: the splice pads
 /// and trims this cache to the committed count and puts a presence row above
-/// it, so only the COMPOSED stack knows which row is last — [`seal_stack`]
+/// it, so only the COMPOSED stack knows which row is last — `aterm_render::band::seal_stack`
 /// draws it there. The engine paints each row's structure
 /// (`aterm_messages::paint::paint`, ruling 319, reading the forced-palette
 /// latch once here, as the painter always has) and resolves it on this
 /// palette's colours (`aterm_messages::ink::paint_band`, ruling 324); the host
 /// writes each resolved cell as a [`RenderCell`] and keeps the gutter edges.
+/// The tests' name for the splice's paint: the splice itself paints through
+/// its window's view (`aterm_messages::drive::View::paint`, ruling 336), which
+/// makes the same two calls.
+#[cfg(test)]
 pub(crate) fn paint_rows_on(
     p: &Presentation,
     palette: impl Into<chrome_band::BandPalette>,
@@ -584,161 +472,42 @@ pub(crate) fn paint_rows_on(
 ) -> PaintedBand {
     let c = palette.into().colors();
     let hc = chrome_band::forced_chrome().is_some();
-    let resolved = ink::paint_band(p, hover, geom, motion, hc, &c);
-    let n = resolved.len();
-    let mut rows: Vec<Vec<RenderCell>> = Vec::with_capacity(n);
-    let mut edges = Vec::with_capacity(n);
-    let mut rasters = Vec::with_capacity(n);
-    for r in resolved {
-        // The gutters continue the cells ACTUALLY painted at the row's two
-        // edges — a chip the width law put at column 0 (a degenerate narrow
-        // row) wears its own fill, not the meter's, and an echo's fade mixes
-        // both — so a tone changes only together with its edge cell: the
-        // renderer's no-epoch contract (`aterm_render::ChromeBleed::row_edges`).
-        // A busy row's comet is the same surface, so its gutters light as it
-        // enters and leaves. The pixel raster, where there is one, is drawn
-        // over both (and dirties its row on its own).
-        let row: Vec<RenderCell> = r
-            .cells
-            .iter()
-            .map(|k| {
-                let mut out = chrome_band::cell(k.ch, k.fg, k.bg, k.bold, false);
-                out.text_presentation = k.text_presentation;
-                out
-            })
-            .collect();
-        edges.push((r.metered && !row.is_empty()).then(|| (row[0].bg, row[row.len() - 1].bg)));
-        rows.push(row);
-        rasters.push(r.raster);
-    }
-    (rows, edges, rasters)
+    aterm_render::band::rows(ink::paint_band(p, hover, geom, motion, hc, &c))
 }
 
-/// CLOSE THE COMPOSED CHROME STACK against the terminal: the LAST row carries the
-/// seam ([`chrome_band::seal_band_bottom`]), every row above it carries none.
-///
-/// THE SEAM BELONGS TO THE STACK, NOT TO THE PAINTER'S LAST ROW. [`paint_rows`]
-/// used to stamp it there, and the splice then does two things the painter never
-/// sees: it PADS the cache with [`blank_band_row`] when the geometry has committed
-/// more rows than are on the glass (every dismissal or retirement, for the
-/// `SHRINK_QUIET` 1.5 s before the count follows — and for as long as a handoff
-/// freeze holds it), and it TRIMS the cache when the count is below it (the
-/// handoff successor). Padded, the rule sat MID-band with an unruled blank row
-/// under it touching the terminal; trimmed, the row that carried it was cut off
-/// and the band had no edge at all. And the presence row's seam "when no band row
-/// follows" was promised in three comments and never drawn. Sealing the stack
-/// after it is composed covers the painted, padded, trimmed and presence-only
-/// shapes with one rule. No band or presence cell uses underline for anything
-/// else, so clearing it above the last row erases nothing but a stale seam.
+/// CLOSE THE COMPOSED CHROME STACK against the terminal on `theme`'s band
+/// palette under this host's High Contrast latch: the last row carries the seam,
+/// every row above it a divider — the renderer's `aterm_render::band::seal_stack`
+/// (ruling 331), where the why lives; the splice runs it through
+/// `aterm_render::band::compose_band`.
+#[cfg(test)]
 pub(crate) fn seal_stack(rows: &mut [Vec<RenderCell>], theme: Theme) {
-    let Some((last, above)) = rows.split_last_mut() else {
-        return;
-    };
-    // STACKED ROWS STAY APART (design ruling 260): every row above the last
-    // carries a 1 px DIVIDER, the seam's ink at [`DIVIDER_ALPHA`] over the
-    // band — two rows of the same ground no longer run together into one
-    // slab. A rail lit in a row's lowest pixels takes its place there, as it
-    // takes the seam's (the splice's rail pass).
-    let colors = chrome_band::band_colors(theme);
-    // Under an OS-forced palette every ink is a system colour: the divider is
-    // the seam's own.
-    let divider = if chrome_band::forced_chrome().is_some() {
-        colors.label
-    } else {
-        chrome_band::mix3(colors.bar_bg, colors.label, DIVIDER_ALPHA)
-    };
-    for row in above {
-        for cell in row.iter_mut() {
-            cell.underline = UnderlineStyle::Single;
-            cell.underline_color = Some(divider);
-        }
-    }
-    chrome_band::seal_band_bottom(last, colors.label);
+    aterm_render::band::seal_stack(
+        rows,
+        &chrome_band::band_colors(theme),
+        chrome_band::forced_chrome().is_some(),
+    );
 }
 
 /// How strongly the divider between stacked band rows shows the seam's ink
-/// over the band (design ruling 260): a hairline that separates, softer than
-/// the seam that closes the stack.
-pub(crate) const DIVIDER_ALPHA: f32 = 0.35;
+/// over the band (design ruling 260) — the renderer's (ruling 331).
+#[cfg(test)]
+pub(crate) use aterm_render::band::DIVIDER_ALPHA;
 
-/// GIVE EACH OUTLINED CAPSULE ITS FLOOR (ruling 254): the cells between a
-/// ring's two rounded ends ([`aterm_render::chrome_ring_floor_cols`]) carry
-/// a single underline in the ring's colour, on whichever row the ring sits.
-/// The ring builder stands the pill on the underline's rows and leaves its
-/// straight floor to these cells, so the renderer's descender ink-skip
-/// carves the floor round a `p` exactly as it carves the seam. On the
-/// stack's LAST row the seam hands its two end cells to the ring
-/// ([`aterm_render::ChromeRing::seam`]): the builder draws the seam there
-/// itself, meeting the pill's rounded foot antialiased, and the pill's
-/// floor carries the line on in the ring's colour — one edge, and no seam
-/// pixel crosses the pill's inside. Run after [`seal_stack`] (and after the
-/// seam gives way to a lit rail), each frame the stack is composed;
-/// `rasters` are the frame's chrome rasters, keyed by their row.
-pub(crate) fn floor_rings(
-    rows: &mut [Vec<RenderCell>],
-    rasters: &mut [aterm_render::ChromeRaster],
-) {
-    for m in rasters {
-        let Some(row) = rows.get_mut(usize::from(m.row)) else {
-            continue;
-        };
-        for ring in &mut m.rings {
-            let floor = aterm_render::chrome_ring_floor_cols(ring);
-            let (start, end) = (
-                usize::from(ring.start),
-                usize::from(ring.end).min(row.len()),
-            );
-            if start >= end {
-                continue;
-            }
-            // The seam, when every end cell carries it in one tone.
-            let ends = || (start..end).filter(|c| !floor.contains(c));
-            let tone = row[start].underline_color;
-            let sealed = ends().all(|c| {
-                row[c].underline == UnderlineStyle::Single && row[c].underline_color == tone
-            });
-            ring.seam = tone
-                .filter(|_| sealed)
-                .map(|[r, g, b]| (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b));
-            if ring.seam.is_some() {
-                for c in ends() {
-                    row[c].underline = UnderlineStyle::None;
-                    row[c].underline_color = None;
-                }
-            }
-            let [_, r, g, b] = ring.ring.to_be_bytes();
-            let fe = floor.end.min(end);
-            for cell in row.get_mut(floor.start.min(fe)..fe).into_iter().flatten() {
-                cell.underline = UnderlineStyle::Single;
-                cell.underline_color = Some([r, g, b]);
-            }
-        }
-    }
-}
+/// GIVE EACH OUTLINED CAPSULE ITS FLOOR (ruling 254) — the renderer's
+/// (`aterm_render::band`, ruling 331): run after [`seal_stack`], each frame the
+/// stack is composed.
+#[cfg(test)]
+pub(crate) use aterm_render::band::floor_rings;
 
 /// The renderer's drawn icon for the engine's (ruling 322: one set in two
-/// tables, held together by `band_icon_ids_match_the_renderers`).
-pub(crate) const fn band_icon(icon: Icon) -> aterm_render::BandIcon {
-    use aterm_render::BandIcon as B;
-    match icon {
-        Icon::Info => B::Info,
-        Icon::Success => B::Success,
-        Icon::Warn => B::Warn,
-        Icon::Error => B::Error,
-        Icon::Download => B::Download,
-        Icon::Update => B::Update,
-        Icon::Upload => B::Upload,
-        Icon::Pause => B::Pause,
-        Icon::Sparkle => B::Sparkle,
-        Icon::Alert => B::Alert,
-        Icon::Dot => B::Dot,
-        Icon::More => B::More,
-        Icon::Remove => B::Remove,
-    }
-}
+/// tables, held together by `band_icon_ids_match_the_renderers`) — the
+/// renderer's map since ruling 331.
+#[cfg(test)]
+pub(crate) use aterm_render::band::band_icon;
 
 /// The inks row `l`'s surface resolves against, and — on a BUSY row — the
-/// anchor its words floor toward (the engine's [`ink::inks_for`] from the
+/// anchor its words floor toward (the engine's [`inks_for`](aterm_messages::ink::inks_for) from the
 /// row's layout): a busy row's surface keeps its words' side, a determinate
 /// row's Fault wash keeps the fill's words' side, and a RAIL (a measured
 /// level, ruling 243) wears warn over the band itself.
@@ -796,10 +565,50 @@ fn band_target_for_pixel(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// THE WEB GOLDEN'S SEAM (design ruling 333): while set on a test's thread,
+    /// [`App::band_presentation`] lays the band out as the web module does —
+    /// links withheld (the web has no Settings ▸ Messages page) and no `$HOME`
+    /// to abbreviate — so the native golden and the web replay compare the
+    /// same rows.
+    pub(crate) static WEB_LINKS_WITHHELD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// How many band layouts this test thread has built (each reads the
+    /// home once): a motion frame that re-ran the width law shows here.
+    pub(crate) static BAND_LAYOUTS_BUILT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The `$HOME` the band abbreviates paths under (`~/…`); the log keeps the
 /// absolute path (D4).
 pub(crate) fn band_home() -> Option<String> {
+    #[cfg(test)]
+    BAND_LAYOUTS_BUILT.with(|c| c.set(c.get() + 1));
     aterm_types::dirs::home_dir().map(|h| h.to_string_lossy().into_owned())
+}
+
+/// How this host lays the band out at `cols` (the engine's
+/// `aterm_messages::drive::Lay`): paths under `$HOME` printed as `~/…`,
+/// every row ending in its link ([`Links::Painted`]: Settings ▸ Messages is
+/// where each one goes — module doc).
+pub(crate) fn band_lay(cols: usize) -> aterm_messages::drive::Lay {
+    #[cfg(test)]
+    if WEB_LINKS_WITHHELD.with(std::cell::Cell::get) {
+        return aterm_messages::drive::Lay {
+            cols,
+            links: Links::Withheld,
+            home: || {
+                BAND_LAYOUTS_BUILT.with(|c| c.set(c.get() + 1));
+                None
+            },
+        };
+    }
+    aterm_messages::drive::Lay {
+        cols,
+        links: Links::Painted,
+        home: band_home,
+    }
 }
 
 impl App {
@@ -835,9 +644,7 @@ impl App {
     /// row ending in its link ([`Links::Painted`]: Settings ▸ Messages is
     /// where each one goes — module doc).
     pub(crate) fn band_presentation(&self, cols: usize) -> Presentation {
-        let home = band_home();
-        self.messages
-            .presentation(cols, &cell_width, home.as_deref(), Links::Painted)
+        band_lay(cols).presentation(&self.messages)
     }
 
     /// If window pixel `(x, y)` lands on one of window `wid`'s chrome rows

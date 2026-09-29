@@ -1,53 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PRESENCE — a window shows who is driving it (round 19, the first slice).
+//! PRESENCE — a window shows who is driving it: this host's SENSING half.
 //!
-//! Two surfaces, one model. The RIM is a colour-only inset border painted through
-//! the same overlay pass the drag-drop target and the upgrade surge use
-//! (`app_render::host_visual_state`): teal while a peer's hand is on the
-//! keyboard, amber while a human should look (a prompt, a question, a typed
-//! escalation), red at a wall (a usage limit) and doubled, with a faint wash,
-//! under a hold. The BAND is one chrome row under the tab bar
-//! (`message_band::BandTarget::Presence`) with six fixed slots in a fixed order —
-//! role · phase since · hand · mail · ctx · fabric — so a glance reads left to
-//! right and a screen reader gets the same sentence
-//! (`accesskit_tree::ChromeMessage::PresenceStatus`).
+//! The row's pure core — the facts, the per-session slot and its story, the
+//! levels, the rim, the chip, the words and their width law, the tones, the
+//! painted cells and the per-window view — is the engine's
+//! (`aterm_messages::presence`, design ruling 348: the owner's "design the
+//! logic in aterm core and then keep the osx layer lightweight so that we can
+//! make this cross platform"). It is re-exported here under the names every
+//! call site has always used; the generic types are pinned to this host's
+//! [`Native`] seam ([`Slot`], [`Facts`], [`AgentPhase`], [`AgentReading`]).
 //!
-//! THE LAWS, from the design (r11/presence-spec.md) and binding here:
-//!
-//! * The rim is CHANGE-DRIVEN. Nothing in this module reads a clock on the frame
-//!   path: the per-window view is rebuilt only when a fact changes (a lease, a
-//!   hold, mail, a published agent verdict, `meta set`), and the repaint key's
-//!   `presence_fp` is exactly `0` on a quiet window — an idle desktop pays
-//!   nothing for this feature ([`WindowView::fp`]).
-//! * The rim never carries a fact the band does not say in words: [`Rim`] is
-//!   derived from [`Level`], and [`Level`] is derived from the same [`Slot`] the
-//!   words are composed from. A colour with no sentence is unreachable.
-//! * A stalled or lost bridge is an INSTANCE fact: it lives in the band's fabric
-//!   slot (`~ 7s`, `✕ lost`) and never colours a session's rim. A session goes
-//!   red only on its own `Hold` — which `bridge_lost` applies exactly to the
-//!   sessions the bridge touched (`fabric.rs`), so "disconnected" is read from
-//!   each session's hold, never inferred.
-//! * No message body, command text, OSC title or Limited message text reaches
-//!   any surface. The band is agent-readable (`chrome`, `image`), so its text is
-//!   wire text: counts, kinds, a sender token, a phase word, a reset time.
-//! * Reduced motion: the one animation (a 300 ms edge ripple on a turn submit,
-//!   [`crate::motion::MotionEffect::PresenceRipple`]) has amplitude 0 and the
-//!   frame is the same image as the steady rim.
-//!
-//! The agent PHASE (busy / prompt / question / limited / idle / survey) is the
-//! SERVER'S published verdict ([`agent_verdict`], run by the status sweep in
-//! `session_status.rs`): `aterm_phase`'s readers over the [`live_zone`] (the
-//! last [`CLASSIFY_ROWS`] rows of the screen's content, and the blank rows
-//! under it) with the terminal's cursor ([`Cursor`]: Claude Code's `idle` is
-//! the prompt box that holds it), applied only to a session identified as an
-//! agent, and re-run only when the content or the cursor moved AND those rows
-//! or the cursor's row changed — at most 4 Hz per session, never per frame;
-//! the test-only [`classifier_calls`] counter is the gate's proof. This module
-//! only folds that verdict in.
+//! What stays here is what only a host can do: the wakes that carry a change
+//! from the control and bridge threads to the main thread ([`install_proxy`]),
+//! the agent verdict — `aterm_phase`'s screen readers over the [`live_zone`]
+//! with the terminal's cursor ([`agent_verdict`], run by the status sweep in
+//! `session_status.rs`, at most 4 Hz per session and never per frame; the
+//! test-only [`classifier_calls`] counter is the gate's proof) — the words
+//! for an API error's cause and a wall's wire word, the reset clock that
+//! places a limit notice's reset time on this machine's clock
+//! ([`countdown_to_reset`]), and [`Native`], the seam the engine reads a
+//! wall, an input stall, this process's harness and the wire's percent codec
+//! through. The App's side (`app_presence.rs`) gathers each session's facts,
+//! hosts the engine's presence driver (`aterm_messages::presence::drive`,
+//! ruling 353) and paints the row the engine lays out. The row's pure
+//! `Slot`/`words` tests are the engine's (`presence_tests.rs`, over a test
+//! seam); the tests here prove this host's sensing and its seam.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -57,17 +37,124 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
-/// The colour mood of a chrome row — information, a good end, or something
-/// the user should look at. The presence row's phase slot reads it
-/// ([`Words::tone`]); the message band paints it through
-/// `message_band::paint_presence_row`. Moved here from the retired status
-/// bars (2026-09-22), whose two lanes shared it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum Tone {
-    #[default]
-    Info,
-    Success,
-    Warn,
+// The engine's presence core under the names every call site has always used
+// (design ruling 348).
+pub(crate) use aterm_messages::presence::{
+    ChipLevel, Hand, HoldFact, LeaseMark, Link, MailFacts, MailLast, StoryVerb,
+    TOLD_TEXT_MAX_BYTES, TurnFact, Words, fmt_dur, prompt_band_word, prompt_kind_words,
+    sanitize_token, short_sid,
+};
+// …and the ones only the tests name.
+#[cfg(test)]
+pub(crate) use aterm_messages::presence::{
+    Level, RIPPLE, Rim, StopCause, TOLD_FLASH, words, words_step,
+};
+
+/// The engine's presence slot, pinned to this host's seam.
+pub(crate) type Slot = aterm_messages::presence::Slot<Native>;
+/// The facts one refresh reads, pinned to this host's seam.
+pub(crate) type Facts = aterm_messages::presence::Facts<Native>;
+/// The worker's phase as the row spells it, pinned to this host's seam.
+pub(crate) type AgentPhase = aterm_messages::presence::AgentPhase<Native>;
+/// One screen's agent reading, pinned to this host's seam.
+pub(crate) type AgentReading = aterm_messages::presence::AgentReading<Native>;
+/// One window's presence view (the engine's; the painted-row cache beside it
+/// is the window state's own, `WindowState::presence_row`).
+pub(crate) type WindowView = aterm_messages::presence::View;
+
+/// THIS host's presence seam (`aterm_messages::presence::Host`): an
+/// uninhabited marker, because the orphan rule forbids implementing the
+/// engine's trait on `aterm_phase`'s types. A wall is `aterm_phase`'s
+/// [`aterm_phase::WallKind`], a stall the server's published
+/// [`crate::input_stall::InputStallFact`], this process's harness is
+/// [`crate::harness_host::holder`], and the percent codec is the wire's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Native {}
+
+impl aterm_messages::presence::Host for Native {
+    type Wall = aterm_phase::WallKind;
+    type Stall = crate::input_stall::InputStallFact;
+
+    fn wall_wire(kind: aterm_phase::WallKind) -> &'static str {
+        wall_word(kind)
+    }
+
+    /// A wall the row has always called `limited` (a usage window, a model
+    /// bucket, spend, an API rate limit — [`aterm_phase::WallKind::reads_limited`])
+    /// keeps that word (design §1: `limited → 19:30 · 1d 22h`), an API error
+    /// the network caused says what went wrong ([`api_cause_words`]), and any
+    /// other wall is the state it leaves the session in (the menu bar's
+    /// `status_item::wall_words`).
+    fn wall_band(kind: aterm_phase::WallKind) -> &'static str {
+        if kind.reads_limited() {
+            return "limited";
+        }
+        api_cause_words(kind).unwrap_or_else(|| crate::status_item::wall_words(kind.name()))
+    }
+
+    fn stall_since(stall: &crate::input_stall::InputStallFact) -> aterm_messages::Instant {
+        stall.since
+    }
+
+    fn stall_stopped(stall: &crate::input_stall::InputStallFact) -> bool {
+        stall.stopped
+    }
+
+    fn stall_survived(stall: &crate::input_stall::InputStallFact) -> bool {
+        stall.restart.survived
+    }
+
+    fn is_aterms_holder(holder: &str) -> bool {
+        holder == crate::harness_host::holder()
+    }
+
+    fn pct_encode(s: &str) -> String {
+        aterm_control::wire::pct_encode(s)
+    }
+
+    fn pct_decode(s: &str) -> String {
+        aterm_control::wire::pct_decode(s)
+    }
+}
+
+/// A hold's reason as every human-facing surface prints and speaks it — the
+/// engine's `hold_reason_words` over the wire's decode: the band's hand slot,
+/// its spoken sentence and the greyed menu row (`crate::menu::hold_row_reason`)
+/// all read from here, so they cannot disagree.
+pub(crate) fn hold_reason_words(reason: &str) -> String {
+    aterm_messages::presence::hold_reason_words::<Native>(reason)
+}
+
+/// When a control client was last handed a session's screen GENERATION by a
+/// read an `if-gen=` fence names (`status gen=`, `text --json`):
+/// [`crate::metrics::now_us`] plus one (so `0` stays "never"). Lives on
+/// [`crate::SessionCtx`]; the App's `Desk::looked_at` reads it, and a pending
+/// fold of the presence row waits its quiet past it (ruling 394, bounded by
+/// `FOLD_LOOK_CAP`). Why (2026-09-28 review of ruling 394): with the fold
+/// deferred, its re-grid could land between a driver's read and its fenced
+/// act — `meta` unset, a read, the fold's timer, the act refused
+/// `reason=changed` — where the immediate fold had landed before the read.
+/// Posts no wake: the loop recomputes the presence deadline every pass, and
+/// a tick that finds the fold not yet due re-arms at the later instant.
+/// Lock-free, one relaxed `fetch_max` per read.
+#[derive(Debug, Default)]
+pub(crate) struct GenerationLook(std::sync::atomic::AtomicU64);
+
+impl GenerationLook {
+    /// A generation of the session's screen was handed out at `now_us`.
+    pub(crate) fn note(&self, now_us: u64) {
+        self.0.fetch_max(
+            now_us.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// When one last was ([`crate::metrics::now_us`]); `None`: never.
+    pub(crate) fn last_us(&self) -> Option<u64> {
+        self.0
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .checked_sub(1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,132 +272,6 @@ thread_local! {
 pub(crate) fn classifier_calls() -> u64 {
     CLASSIFIER_CALLS.with(|c| c.get())
 }
-
-/// What the classifier read off one screen: the worker's phase, the context
-/// indicator, and whether the session survey is parked above the composer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AgentReading {
-    pub(crate) phase: AgentPhase,
-    pub(crate) context_pct: Option<u8>,
-}
-
-/// The worker's phase as the band spells it. `Wall` keeps only the wall's
-/// KIND and the RESET time the notice named — never the notice text (the
-/// never-shown law).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AgentPhase {
-    Busy,
-    /// An approval box is showing; `detail` is the box's kind and the
-    /// classifier's verdict on the command (`bash safe`), never the command.
-    Prompt {
-        detail: Option<String>,
-    },
-    Question,
-    /// The last turn ended on a wall ([`aterm_phase::Wall`]): a usage window,
-    /// a model bucket, spend, a full context, a lost login, an API error, an
-    /// overload. The worker sits at an idle composer and will not move on its
-    /// own (an overload or a retryable API error only after a retry).
-    Wall {
-        kind: aterm_phase::WallKind,
-        reset: Option<String>,
-        /// When the reset falls, if the notice's time could be placed on this
-        /// machine's clock ([`countdown_to_reset`]): the band counts DOWN to
-        /// it (the mock: "the band counts down to the reset once a minute").
-        /// `None` prints the reset time alone — never a figure that is not
-        /// the countdown.
-        until: Option<Instant>,
-    },
-    Idle,
-    /// Idle with the session survey parked above the composer.
-    Survey,
-    /// An identified agent whose reader has no EVIDENCE for a phase
-    /// ([`aterm_phase::Reading::phase_authoritative`] false — a Codex screen
-    /// outside its choice box, a Claude Code screen with no prompt box that
-    /// holds the terminal's cursor: its launch, before the REPL is up, an
-    /// earlier run's box above a same-tab relaunch included): its default
-    /// `idle` is not published as idle, since whatever acts on an idle worker
-    /// would act on a guess — a first prompt typed there is lost.
-    Unknown,
-}
-
-impl AgentPhase {
-    /// The `agent=` wire word (`wall:<kind>` for a wall — [`wall_word`]).
-    pub(crate) fn word(&self) -> &'static str {
-        match self {
-            Self::Busy => "busy",
-            Self::Prompt { .. } => "prompt",
-            Self::Question => "question",
-            Self::Wall { kind, .. } => wall_word(*kind),
-            Self::Idle => "idle",
-            Self::Survey => "survey",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// The word the band prints: [`Self::word`], except that a wall the band
-    /// has always called `limited` (a usage window, a model bucket, spend, an
-    /// API rate limit — [`aterm_phase::WallKind::reads_limited`]) keeps that
-    /// word (design §1: `limited → 19:30 · 1d 22h`), an API error the network
-    /// caused says what went wrong ([`api_cause_words`]: `can't reach the
-    /// API`, `reply cut off`, `TLS/proxy refused`), any other wall is the
-    /// state it leaves the session in (the menu bar's
-    /// `status_item::wall_words`), and a parked survey is `idle`: the worker
-    /// waits at its composer either way.
-    pub(crate) fn band_word(&self) -> &'static str {
-        match self {
-            Self::Wall { kind, .. } if kind.reads_limited() => "limited",
-            Self::Wall { kind, .. } => api_cause_words(*kind)
-                .unwrap_or_else(|| crate::status_item::wall_words(kind.name())),
-            Self::Survey => "idle",
-            other => other.word(),
-        }
-    }
-
-    /// What the band's age counts from: its phase word, a box by the kind the
-    /// band names ([`prompt_band_word`]), so a box that follows another
-    /// starts its own age.
-    fn age_key(&self) -> std::borrow::Cow<'static, str> {
-        match self {
-            Self::Prompt { detail } => prompt_band_word(detail.as_deref()).into(),
-            other => other.band_word().into(),
-        }
-    }
-}
-
-/// A box's kind in a person's words: the kind before the colon of
-/// `kind[:verdict]` (`bash:not-read-only` → `bash`), the hyphenated kinds
-/// spelled out (`plan-exit` → `plan`). `None` for a box of no named kind.
-/// The band and the menu bar (`status_item::agent_escalation`) both say it.
-pub(crate) fn prompt_kind_words(detail: Option<&str>) -> Option<&str> {
-    let kind = detail
-        .and_then(|d| d.split(':').next())
-        .filter(|k| !k.is_empty() && *k != "other")?;
-    Some(match kind {
-        "plan-enter" => "plan mode",
-        "plan-exit" => "plan",
-        "held-message" => "held message",
-        "goal-proposal" => "goal",
-        "computer-use" => "computer use",
-        "read-outside-setting" => "outside read",
-        "model-switch" => "model switch",
-        "trust" => "folder trust",
-        "powershell" => "PowerShell",
-        other => other,
-    })
-}
-
-/// A box in the band's words: `bash approval`, `plan approval`; the agent's
-/// question tool is a `question`, never an approval
-/// ([`aterm_phase::PromptKind::Question`]); a box of no named kind is
-/// `approval`.
-pub(crate) fn prompt_band_word(detail: Option<&str>) -> String {
-    match prompt_kind_words(detail) {
-        Some("question") => "question".to_string(),
-        Some(kind) => format!("{kind} approval"),
-        None => "approval".to_string(),
-    }
-}
-
 /// The tab's and the menu's words for an API error that never reached the
 /// API ([`aterm_phase::ApiCause::Unreachable`]). Not `offline`: most of that
 /// family — `Connection refused — a firewall or proxy may be blocking it`,
@@ -769,1747 +730,13 @@ pub(crate) fn local_offset_s() -> Option<i64> {
     None
 }
 
-/// The local zone's offset from UTC AT the instant `unix`, in seconds — `date -r <unix>
-/// +%z` (BSD) / `date -d @<unix> +%z` (GNU): the offset daylight saving gave that instant,
-/// not today's. Uncached and a subprocess each call, so a WORKER's only (Settings ▸
-/// Packages' clock, `packages_screen::LocalClock::read`); `None` where `date` cannot say.
-#[cfg(unix)]
+/// The local zone's offset from UTC AT the instant `unix`, in seconds: the offset
+/// daylight saving gave that instant, not today's — [`limit::offset_at`] with no zone
+/// named, the workspace's one reader of an offset at an instant. A subprocess each
+/// call, so a WORKER's only (Settings ▸ Packages' clock,
+/// `packages_screen::LocalClock::read`); `None` where `date` cannot say.
 pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
-    let mut date = std::process::Command::new("date");
-    if cfg!(target_os = "macos") {
-        date.arg("-r").arg(unix.to_string());
-    } else {
-        date.arg("-d").arg(format!("@{unix}"));
-    }
-    let out = date
-        .arg("+%z")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    limit::parse_zone(String::from_utf8_lossy(&out.stdout).trim())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn local_offset_at(_unix: i64) -> Option<i64> {
-    None
-}
-
-// ---------------------------------------------------------------------------
-// The facts, gathered by the App from the session's own leaf locks.
-// ---------------------------------------------------------------------------
-
-/// Whose hand is on this session's keyboard.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Hand {
-    None,
-    /// A peer's `turn` is open (`Lease::Turn`). `holder` names the driver the
-    /// lease itself records (`Lease::Turn::driver`: the source of the edge the
-    /// turn came over) — its `meta role` if it is a local session with one,
-    /// else its short sid — and is `None` for a turn driven over the Owner
-    /// token (the CLI, a human at the keyboard of another instance), whatever
-    /// write edges happen to stand in the session's table.
-    DrivenTurn {
-        id: u64,
-        holder: Option<String>,
-    },
-    /// A cooperative drive lease is held (`Lease::Drive`).
-    DrivenLease {
-        holder: String,
-    },
-    /// THIS session drives another — its own open `turn` on a peer whose lease
-    /// names it: `sid` is the peer's short form.
-    Driving {
-        sid: String,
-    },
-}
-
-/// Whether `hand` is THIS process's own harness (ruling 313): a drive lease
-/// under the holder name its supervisor loops claim sessions by
-/// ([`crate::harness_host::holder`]). Another instance's harness, a manager
-/// session or an `aterm drive` is somebody else's hand, and stays a fact the
-/// window shows.
-pub(crate) fn is_aterms_hand(hand: &Hand) -> bool {
-    matches!(hand, Hand::DrivenLease { holder } if *holder == crate::harness_host::holder())
-}
-
-/// The standing halt, as the band prints it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HoldFact {
-    pub(crate) reason: String,
-    /// `origin=fleet`: cannot be lifted from this window.
-    pub(crate) fleet: bool,
-}
-
-/// The newest inbox row, trust FIRST (`aterm-link`'s rule, in its `render`
-/// module since round 21: the receiver's verdict is the first thing a reader
-/// sees).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MailLast {
-    pub(crate) kind: String,
-    pub(crate) from: String,
-    /// One of the wire trusts (`agent`, `human`, `unknown`, `forged-self`, …).
-    pub(crate) trust: String,
-}
-
-/// The mail counts the band prints.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub(crate) struct MailFacts {
-    pub(crate) unread: u64,
-    pub(crate) pending: u64,
-    pub(crate) dropped: u64,
-    pub(crate) queued: u64,
-    pub(crate) last: Option<MailLast>,
-    /// The highest row id ever delivered — how the story counts arrivals.
-    pub(crate) head: u64,
-}
-
-/// The instance's bridge link, as `status`'s `fabric=` reports it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Link {
-    Absent,
-    Connected {
-        rtt_ms: Option<u64>,
-    },
-    /// A bridge is attached but its broker link is down — for `age_ms`, when
-    /// the stall has a date (`crate::fabric::fabric_stalled_ms`: the moment
-    /// the link was last reported down after being up, or the dial refused).
-    /// `None` for a bridge still dialing since it attached: there is no stall
-    /// to date, and the slot prints `~` with no figure rather than `~ 0s`.
-    Stalled {
-        age_ms: Option<u64>,
-    },
-    Disconnected,
-}
-
-/// The last completed turn on this session's ledger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TurnFact {
-    pub(crate) id: u64,
-    pub(crate) settled: bool,
-    pub(crate) dur_ms: u64,
-    /// The record came from an EARLIER aterm process, carried across a
-    /// self-update handoff (`TurnRecord::carried`, `history`'s `carried=1`):
-    /// a turn that settled before this process existed. It is the ledger's
-    /// baseline, never news — the slot adopts it without a story point or
-    /// the Success glow (design §4: the handoff carries the ledger, and the
-    /// story is rebuilt from THIS process's own facts).
-    pub(crate) carried: bool,
-}
-
-/// Everything one refresh reads. Built by the App (`app_presence.rs`) from the
-/// session's own leaf locks; pure data so the model is testable without a
-/// store.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Facts {
-    pub(crate) role: Option<String>,
-    pub(crate) attention: Option<String>,
-    /// `attention` is told ELSEWHERE, in full (ruling 270, "one place tells
-    /// it"): its only owner is the agent upgrade, whose stall is the message
-    /// band's row and the log's record. The level, `status why=`, the tab
-    /// chip and the rim still read `attention`; only the presence line's
-    /// phase slot does not repeat its words.
-    pub(crate) attention_told_elsewhere: bool,
-    /// The shell status word (`running`, `idle`, `quiet`, …) and when it was
-    /// published — the phase the band shows when no agent reading exists.
-    pub(crate) shell: Option<(&'static str, Instant)>,
-    /// The sequence number of the server's agent reading
-    /// (`StatusObserver::agent_reading`): `agent` is folded in only when this
-    /// is NEWER than the one the slot last absorbed; `0` = never read.
-    pub(crate) agent_seq: u64,
-    /// The server's agent reading at `agent_seq` — `None` for a session that
-    /// is not an identified agent.
-    pub(crate) agent: Option<AgentReading>,
-    pub(crate) hand: Hand,
-    /// When a cooperative drive lease LAPSES (`Lease::Drive`'s TTL): nothing
-    /// posts a wake for a lapse, so the model arms this as a deadline and
-    /// re-reads the hand when it passes. `None` without such a lease.
-    pub(crate) lease_until: Option<Instant>,
-    pub(crate) hold: Option<HoldFact>,
-    pub(crate) mail: MailFacts,
-    pub(crate) link: Link,
-    pub(crate) turn: Option<TurnFact>,
-    /// The server's published input stall (`input_stall::InputStallFact`,
-    /// `status input=stalled|stopped`): the program has stopped reading its
-    /// input. Ranks [`Level::Limited`] and takes the phase slot as `frozen`
-    /// (or `stopped`) — ahead of typed attention, which during a stall is the
-    /// server's own entry saying the same thing at length.
-    pub(crate) input_stall: Option<crate::input_stall::InputStallFact>,
-}
-
-impl Default for Facts {
-    fn default() -> Self {
-        Self {
-            role: None,
-            attention: None,
-            attention_told_elsewhere: false,
-            shell: None,
-            agent_seq: 0,
-            agent: None,
-            hand: Hand::None,
-            lease_until: None,
-            hold: None,
-            mail: MailFacts::default(),
-            link: Link::Absent,
-            turn: None,
-            input_stall: None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The story: what happened since the human last looked.
-// ---------------------------------------------------------------------------
-
-/// The story ring's capacity (design §4: `Ring<256, …>`).
-const STORY_CAP: usize = 256;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StoryVerb {
-    Turn,
-    /// A turn whose settle deadline passed (`status=timeout` on the ledger):
-    /// counted with the turns, and said — a busy worker with a timed-out turn
-    /// never reads `◇ quiet`.
-    TurnTimedOut,
-    Mail,
-    Hold,
-    Limited,
-    Question,
-    /// The watcher approved a read (`ctl story approved`).
-    Approval,
-    /// A stop (hold / limited) ended.
-    Resumed,
-    // The rest of the CLOSED SET `aterm ctl story <verb>` accepts (design §5):
-    // what the watcher decided or saw, which reaches the GUI no other way.
-    /// `ctl story dismissed` — the session survey was dismissed for the human.
-    Dismissed,
-    /// `ctl story reconnected` — the watcher rode out an outage and is back.
-    Reconnected,
-    /// `ctl story timeout` — the watcher's budget ran out.
-    Timeout,
-    /// `ctl story exit` — the watcher's loop ended.
-    Exit,
-    /// `ctl story compacted` — the worker compacted its context.
-    Compacted,
-    /// `ctl story warned` — the watcher warned (context running low).
-    Warned,
-    /// `ctl story chose <policy>` — the SUPERVISOR answered Claude Code's
-    /// question dialog by policy (`[harness] answer_questions`, or the
-    /// session's `meta set questions recommended`), the text naming the policy
-    /// word. The one told
-    /// verb whose teller is the harness, not a watcher, and the one the window
-    /// answers with a chime and a pulse (`App::tell_story`), because the point
-    /// of it is that the human notices a question was answered without them.
-    Chose,
-}
-
-impl StoryVerb {
-    /// The closed set of words `aterm ctl story <verb>` accepts, in the order
-    /// the usage line prints them. A word outside it is a usage error, never a
-    /// free-text story point.
-    pub(crate) const TOLD_WORDS: [&'static str; 8] = [
-        "approved",
-        "dismissed",
-        "reconnected",
-        "timeout",
-        "exit",
-        "compacted",
-        "warned",
-        "chose",
-    ];
-
-    /// The verb a `ctl story <word>` names, `None` outside the closed set.
-    pub(crate) fn parse_told(word: &str) -> Option<Self> {
-        Some(match word {
-            "approved" => Self::Approval,
-            "dismissed" => Self::Dismissed,
-            "reconnected" => Self::Reconnected,
-            "timeout" => Self::Timeout,
-            "exit" => Self::Exit,
-            "compacted" => Self::Compacted,
-            "warned" => Self::Warned,
-            "chose" => Self::Chose,
-            _ => return None,
-        })
-    }
-
-    /// The word the band prints for a TOLD verb (the wire word), with the
-    /// glyph the mock pairs it with: `✓ approved`.
-    pub(crate) const fn told_words(self) -> Option<(char, &'static str)> {
-        Some(match self {
-            Self::Approval => ('\u{2713}', "approved"),
-            Self::Dismissed => ('\u{2713}', "dismissed"),
-            Self::Reconnected => ('\u{27df}', "reconnected"),
-            Self::Timeout => ('\u{2715}', "timeout"),
-            Self::Exit => ('\u{2715}', "exit"),
-            Self::Compacted => ('\u{25c7}', "compacted"),
-            Self::Warned => ('\u{26a0}', "warned"),
-            // A filled diamond: distinct from an approval's check, and the
-            // solid twin of the quiet summary's `◇`.
-            Self::Chose => ('\u{25c6}', "chose"),
-            Self::Turn
-            | Self::TurnTimedOut
-            | Self::Mail
-            | Self::Hold
-            | Self::Limited
-            | Self::Question
-            | Self::Resumed => return None,
-        })
-    }
-
-    /// WHO acted on a told point, for the spoken sentence (`approved by
-    /// watcher`, `chose by harness`, `compacted by worker`): the harness for
-    /// [`Self::Chose`], the worker for [`Self::Compacted`] (the watcher only
-    /// saw it happen), a watcher for every other told word. Saying "watcher"
-    /// for what the harness or the worker did would misname who acted.
-    pub(crate) const fn teller(self) -> &'static str {
-        match self {
-            Self::Chose => "harness",
-            Self::Compacted => "worker",
-            Self::Approval
-            | Self::Dismissed
-            | Self::Reconnected
-            | Self::Timeout
-            | Self::Exit
-            | Self::Warned
-            | Self::Turn
-            | Self::TurnTimedOut
-            | Self::Mail
-            | Self::Hold
-            | Self::Limited
-            | Self::Question
-            | Self::Resumed => "watcher",
-        }
-    }
-}
-
-/// How long a told story point stands in the PHASE slot (`✓ approved`) before
-/// the slot returns to the phase (the mock: "three seconds after the watcher
-/// approves it, the slot reads ✓ approved, then returns to phase").
-pub(crate) const TOLD_FLASH: Duration = Duration::from_secs(3);
-
-/// The longest text `ctl story` carries, in bytes — the wire cap, checked on
-/// the control thread before any wake.
-pub(crate) const TOLD_TEXT_MAX_BYTES: usize = 96;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StoryPoint {
-    pub(crate) seq: u64,
-    pub(crate) at: Instant,
-    pub(crate) verb: StoryVerb,
-    /// The point happened under aterm's OWN harness's hand
-    /// ([`Slot::aterm_hand`], ruling 313): kept in the story and counted by
-    /// `story=`, never news — the band and the log already tell what aterm
-    /// did there.
-    pub(crate) aterm: bool,
-}
-
-// ---------------------------------------------------------------------------
-// The per-session slot.
-// ---------------------------------------------------------------------------
-
-/// A session's presence, as the last refresh left it.
-#[derive(Clone, Debug)]
-pub(crate) struct Slot {
-    /// The agent-reading sequence last absorbed ([`Facts::agent_seq`]); `None`
-    /// before the first. The classifier itself runs in the status sweep, never
-    /// per refresh or per frame; this only keeps a refresh from re-folding a
-    /// reading it already has.
-    pub(crate) agent_seq_seen: Option<u64>,
-    pub(crate) role: Option<String>,
-    pub(crate) attention: Option<String>,
-    /// [`Facts::attention_told_elsewhere`].
-    pub(crate) attention_told_elsewhere: bool,
-    pub(crate) shell: Option<(&'static str, Instant)>,
-    pub(crate) agent: Option<AgentReading>,
-    /// When the AGENT phase word last changed — the band's `since` for it.
-    pub(crate) agent_since: Instant,
-    pub(crate) hand: Hand,
-    /// When the cooperative lease behind `hand` lapses (see
-    /// [`Facts::lease_until`]); the App's timer re-reads the hand then.
-    pub(crate) lease_until: Option<Instant>,
-    pub(crate) hold: Option<HoldFact>,
-    pub(crate) mail: MailFacts,
-    pub(crate) link: Link,
-    pub(crate) turn: Option<TurnFact>,
-    /// [`Facts::input_stall`].
-    pub(crate) input_stall: Option<crate::input_stall::InputStallFact>,
-    /// When the last turn SETTLED (the Success tone's 2 s window).
-    pub(crate) settled_at: Option<Instant>,
-    /// When a stop (hold or limit) began, for the story's stop duration.
-    /// `None` under a hold the slot first saw at its own mint: nothing in a
-    /// `Hold` says when it began, so the band prints no figure for it
-    /// rather than dating it from the mint.
-    stop_began: Option<(StoryVerb, Instant)>,
-    /// Whether a refresh has been absorbed yet. The FIRST absorb is the
-    /// baseline — what already stood when the slot was minted — and a fact
-    /// already standing then (a hold) is adopted as state, not narrated as
-    /// something that happened since the human last looked.
-    baselined: bool,
-    story: VecDeque<StoryPoint>,
-    /// The seq of the newest story point; 0 = nothing ever happened.
-    pub(crate) story_seq: u64,
-    /// The seq of the newest point that is NEWS — one that did not happen
-    /// under aterm's own hand ([`StoryPoint::aterm`]); what the level reads.
-    news_seq: u64,
-    /// aterm's OWN harness has its hand on the session (ruling 313): a drive
-    /// lease this process's harness holds ([`is_aterms_hand`]), or a `turn`
-    /// typed inside one (an Owner-token turn whose lease hands back to it).
-    /// Not a presence fact: the window's own chrome does not show it, and the
-    /// story points it makes are not news.
-    aterm_hand: bool,
-    /// Set for the length of one [`Self::absorb`] in which aterm's hand was on
-    /// the session at either end: every point it notes is aterm's.
-    noting_aterm: bool,
-    /// The story up to this seq is CLOSED: the agent it was about left the
-    /// session, so it is no longer news to hold the row for (2026-09-24,
-    /// D10: `level=story` stood on a bare shell long after the agent exited,
-    /// and in a headless instance nobody ever acts to read it). Every
-    /// window's watermark is read as at least this.
-    story_closed: u64,
-    /// The last TOLD point (`ctl story`), with its text: the phase slot reads
-    /// it for [`TOLD_FLASH`] after `at`, then returns to the phase.
-    told: Option<(StoryVerb, String, Instant)>,
-}
-
-impl Slot {
-    pub(crate) fn new(now: Instant) -> Self {
-        Self {
-            agent_seq_seen: None,
-            role: None,
-            attention: None,
-            attention_told_elsewhere: false,
-            shell: None,
-            agent: None,
-            agent_since: now,
-            hand: Hand::None,
-            lease_until: None,
-            hold: None,
-            mail: MailFacts::default(),
-            link: Link::Absent,
-            turn: None,
-            input_stall: None,
-            settled_at: None,
-            stop_began: None,
-            baselined: false,
-            story: VecDeque::new(),
-            story_seq: 0,
-            news_seq: 0,
-            aterm_hand: false,
-            noting_aterm: false,
-            story_closed: 0,
-            told: None,
-        }
-    }
-
-    /// `aterm ctl story <verb> [<text>]` landed: one story point, and the
-    /// phase slot reads the verb for [`TOLD_FLASH`]. `text` is the wire text
-    /// (already bounded); it is sanitized for cells here like every other
-    /// free-text value. Returns the point's seq.
-    pub(crate) fn tell(&mut self, verb: StoryVerb, text: &str, now: Instant) -> u64 {
-        self.note(verb, now);
-        self.told = Some((verb, sanitize_token(text, 48), now));
-        self.story_seq
-    }
-
-    /// The told point still standing in the phase slot at `now`.
-    fn told_now(&self, now: Instant) -> Option<(StoryVerb, &str)> {
-        self.told
-            .as_ref()
-            .filter(|(_, _, at)| now.saturating_duration_since(*at) < TOLD_FLASH)
-            .map(|(v, t, _)| (*v, t.as_str()))
-    }
-
-    /// When the phase slot returns from a told point to the phase — the one
-    /// deadline a story post adds (there is no other clock).
-    pub(crate) fn told_deadline(&self, now: Instant) -> Option<Instant> {
-        self.told
-            .as_ref()
-            .map(|(_, _, at)| *at + TOLD_FLASH)
-            .filter(|end| *end > now)
-    }
-
-    fn note(&mut self, verb: StoryVerb, now: Instant) {
-        self.story_seq += 1;
-        let aterm = self.noting_aterm || self.aterm_hand;
-        if !aterm {
-            self.news_seq = self.story_seq;
-        }
-        if self.story.len() >= STORY_CAP {
-            self.story.pop_front();
-        }
-        self.story.push_back(StoryPoint {
-            seq: self.story_seq,
-            at: now,
-            verb,
-            aterm,
-        });
-    }
-
-    /// Fold one refresh's facts in. Returns what CHANGED: whether anything the
-    /// view reads moved, and whether a turn was just SUBMITTED (the ripple's
-    /// edge, taken from the wake rather than inferred).
-    pub(crate) fn absorb(&mut self, facts: Facts, now: Instant) -> bool {
-        let mut changed = false;
-        // aterm's own hand at either end of this refresh makes every point it
-        // notes aterm's (ruling 313): a relaunch's turn settles and its lease
-        // is handed back between two refreshes, in either order.
-        let was_aterm = self.aterm_hand;
-        let now_aterm = is_aterms_hand(&facts.hand)
-            || (was_aterm && matches!(facts.hand, Hand::DrivenTurn { holder: None, .. }));
-        self.noting_aterm = was_aterm || now_aterm;
-        if self.aterm_hand != now_aterm {
-            self.aterm_hand = now_aterm;
-            changed = true;
-        }
-        if self.role != facts.role {
-            self.role = facts.role;
-            changed = true;
-        }
-        if self.attention != facts.attention {
-            self.attention = facts.attention;
-            changed = true;
-        }
-        if self.attention_told_elsewhere != facts.attention_told_elsewhere {
-            self.attention_told_elsewhere = facts.attention_told_elsewhere;
-            changed = true;
-        }
-        if self.shell.map(|s| s.0) != facts.shell.map(|s| s.0) {
-            changed = true;
-        }
-        self.shell = facts.shell;
-        if facts.agent_seq > self.agent_seq_seen.unwrap_or(0) {
-            self.agent_seq_seen = Some(facts.agent_seq);
-            let agent = facts.agent;
-            let word_moved = self.agent.as_ref().map(|a| a.phase.word())
-                != agent.as_ref().map(|a| a.phase.word());
-            if self.agent.as_ref().map(|a| a.phase.age_key())
-                != agent.as_ref().map(|a| a.phase.age_key())
-            {
-                self.agent_since = now;
-            }
-            if word_moved {
-                match agent.as_ref().map(|a| &a.phase) {
-                    Some(AgentPhase::Question) => self.note(StoryVerb::Question, now),
-                    Some(AgentPhase::Wall { .. }) => {
-                        self.note(StoryVerb::Limited, now);
-                        self.stop_began = Some((StoryVerb::Limited, now));
-                    }
-                    _ => {}
-                }
-                if matches!(
-                    self.agent.as_ref().map(|a| &a.phase),
-                    Some(AgentPhase::Wall { .. })
-                ) && !matches!(
-                    agent.as_ref().map(|a| &a.phase),
-                    Some(AgentPhase::Wall { .. })
-                ) {
-                    self.note(StoryVerb::Resumed, now);
-                }
-            }
-            if self.agent != agent {
-                changed = true;
-            }
-            // The agent LEFT (a verdict, then none): what it did while nobody
-            // looked is closed, not left standing on the shell it returned to.
-            if self.agent.is_some() && agent.is_none() && self.story_closed < self.story_seq {
-                self.story_closed = self.story_seq;
-                changed = true;
-            }
-            self.agent = agent;
-        }
-        if self.hand != facts.hand {
-            self.hand = facts.hand;
-            changed = true;
-        }
-        // A renewed lease moves its deadline without moving a word.
-        self.lease_until = facts.lease_until;
-        if self.hold != facts.hold {
-            match (&self.hold, &facts.hold) {
-                (None, Some(_)) if self.baselined => {
-                    self.note(StoryVerb::Hold, now);
-                    self.stop_began = Some((StoryVerb::Hold, now));
-                }
-                // Standing at the mint: the hold is state, its age unknown.
-                (None, Some(_)) => self.stop_began = None,
-                (Some(_), None) => self.note(StoryVerb::Resumed, now),
-                _ => {}
-            }
-            self.hold = facts.hold;
-            changed = true;
-        }
-        if self.mail != facts.mail {
-            if facts.mail.head > self.mail.head {
-                self.note(StoryVerb::Mail, now);
-            }
-            self.mail = facts.mail;
-            changed = true;
-        }
-        if self.link != facts.link {
-            self.link = facts.link;
-            changed = true;
-        }
-        if self.input_stall != facts.input_stall {
-            self.input_stall = facts.input_stall;
-            changed = true;
-        }
-        if self.turn != facts.turn {
-            // A CARRIED record settled in a previous process: the baseline,
-            // not news (see [`TurnFact::carried`]).
-            if let Some(t) = facts.turn
-                && !t.carried
-                && self.turn.is_none_or(|old| old.id < t.id)
-            {
-                if t.settled {
-                    self.note(StoryVerb::Turn, now);
-                    self.settled_at = Some(now);
-                } else {
-                    self.note(StoryVerb::TurnTimedOut, now);
-                }
-            }
-            self.turn = facts.turn;
-            changed = true;
-        }
-        self.baselined = true;
-        self.noting_aterm = false;
-        changed
-    }
-
-    /// The tab chip's mark: a hollow diamond to wait, a filled one at a stop
-    /// (with why it stopped, which the hover names), a dot for a story.
-    pub(crate) fn chip(&self, watermark: u64) -> ChipLevel {
-        match self.level(watermark) {
-            Level::Quiet | Level::Note | Level::Driving | Level::Driven => ChipLevel::Off,
-            Level::Story => ChipLevel::Story,
-            Level::Attention => ChipLevel::Wait,
-            Level::Hold => ChipLevel::Stop(StopCause::Hold),
-            // `level` ranks a stall ahead of a wall, and so does this.
-            Level::Limited => ChipLevel::Stop(match &self.input_stall {
-                Some(stall) if stall.stopped => StopCause::Suspended,
-                Some(_) => StopCause::Frozen,
-                None => StopCause::Wall,
-            }),
-        }
-    }
-
-    /// The severity this slot stands at (`status level=`, `why=` and the
-    /// tab chip follow it).
-    pub(crate) fn level(&self, watermark: u64) -> Level {
-        self.level_counting(watermark, true, true)
-    }
-
-    /// The level the window's OWN chrome shows — the rim and the band row's
-    /// existence: [`Self::level`], except that an attention another place
-    /// already tells ([`Facts::attention_told_elsewhere`]: a stalled agent
-    /// upgrade, whose row and record are the message band's) is not counted.
-    /// Round 18, day four (D1): a Claude stall raised an EMPTY presence line
-    /// (`— quiet 8s — ✉0 ·`) and an orange rim beside its band row, because
-    /// the level stood at attention while the line had no words for it — a
-    /// colour with no words, which [`Level::rim`]'s own rule forbids. The
-    /// fact stays where it is read on purpose: `status level=attention
-    /// why=escalation` and the tab's wait mark.
-    pub(crate) fn shown_level(&self, watermark: u64) -> Level {
-        self.level_counting(watermark, !self.attention_told_elsewhere, !self.aterm_hand)
-    }
-
-    /// `attention`: an escalation counts; `hand`: a hand counts even when it
-    /// is aterm's own (ruling 313 — `status level=` keeps the fact, the
-    /// window's chrome does not show it).
-    fn level_counting(&self, watermark: u64, attention: bool, hand: bool) -> Level {
-        if self.hold.is_some() {
-            return Level::Hold;
-        }
-        // A program that reads nothing is stopped as surely as one at a
-        // wall, whatever its screen still shows (2026-09-24).
-        if self.input_stall.is_some() {
-            return Level::Limited;
-        }
-        if matches!(
-            self.agent.as_ref().map(|a| &a.phase),
-            Some(AgentPhase::Wall { .. })
-        ) {
-            return Level::Limited;
-        }
-        if (attention && self.attention.is_some())
-            || matches!(
-                self.agent.as_ref().map(|a| &a.phase),
-                Some(AgentPhase::Prompt { .. } | AgentPhase::Question)
-            )
-        {
-            return Level::Attention;
-        }
-        match &self.hand {
-            Hand::DrivenTurn { .. } | Hand::DrivenLease { .. } if hand => return Level::Driven,
-            Hand::Driving { .. } => return Level::Driving,
-            _ => {}
-        }
-        // An unread task or ask is a wait state only while no hand is on the
-        // session: a driven worker with mail waiting stays teal (the mock's
-        // first row), and the mail slot says the rest.
-        if self.unread_wants_a_human() {
-            return Level::Attention;
-        }
-        // A story outranks waiting mail: "something happened since you
-        // looked" is the glance fact, and the mail slot prints the mail.
-        if self.news_seq > watermark.max(self.story_closed) {
-            return Level::Story;
-        }
-        if self.mail.unread > 0
-            || self.mail.queued > 0
-            || self.mail.dropped > 0
-            || matches!(self.link, Link::Stalled { .. } | Link::Disconnected)
-        {
-            return Level::Note;
-        }
-        Level::Quiet
-    }
-
-    /// WHY the slot stands at [`Level::Attention`] (`status why=`): the causes
-    /// the level merges, comma-joined in a fixed order — `prompt` (an approval
-    /// box), `question` (the agent asked), `escalation` (a typed `meta
-    /// attention`), `mail` (an unread task/ask with no hand on the session).
-    /// `-` at any other level.
-    pub(crate) fn why(&self, watermark: u64) -> String {
-        if self.level(watermark) != Level::Attention {
-            return "-".to_string();
-        }
-        let phase = self.agent.as_ref().map(|a| &a.phase);
-        let mut causes = Vec::new();
-        if matches!(phase, Some(AgentPhase::Prompt { .. })) {
-            causes.push("prompt");
-        }
-        if matches!(phase, Some(AgentPhase::Question)) {
-            causes.push("question");
-        }
-        if self.attention.is_some() {
-            causes.push("escalation");
-        }
-        if matches!(self.hand, Hand::None) && self.unread_wants_a_human() {
-            causes.push("mail");
-        }
-        if causes.is_empty() {
-            "-".to_string()
-        } else {
-            causes.join(",")
-        }
-    }
-
-    /// An unread `task` or `ask` is addressed to someone: a wait state.
-    fn unread_wants_a_human(&self) -> bool {
-        self.mail.unread > 0
-            && self
-                .mail
-                .last
-                .as_ref()
-                .is_some_and(|l| l.kind == "task" || l.kind == "ask")
-    }
-
-    /// CALM: nothing is happening that the human's next keystroke should not
-    /// fold away — the fold law's second conjunct.
-    pub(crate) fn calm(&self) -> bool {
-        self.hold.is_none()
-            && self.input_stall.is_none()
-            && matches!(self.hand, Hand::None)
-            && self.attention.is_none()
-            && !matches!(
-                self.agent.as_ref().map(|a| &a.phase),
-                Some(AgentPhase::Prompt { .. } | AgentPhase::Question | AgentPhase::Wall { .. })
-            )
-            && !self.unread_wants_a_human()
-    }
-
-    /// The tone the band paints in: Warn while a human should look, Success for
-    /// [`SETTLED_GLOW`] after a settled turn, else Info. It follows the level
-    /// the row is SHOWN at ([`Self::shown_level`], ruling 280): an attention
-    /// the message band already tells painted the row Warn with no words
-    /// for it.
-    pub(crate) fn tone(&self, now: Instant, watermark: u64) -> Tone {
-        if self.shown_level(watermark) >= Level::Attention {
-            return Tone::Warn;
-        }
-        if self
-            .settled_at
-            .is_some_and(|t| now.saturating_duration_since(t) < SETTLED_GLOW)
-        {
-            return Tone::Success;
-        }
-        Tone::Info
-    }
-
-    /// The story points after `watermark` (and after a closed story), oldest
-    /// first.
-    pub(crate) fn story_since(&self, watermark: u64) -> impl Iterator<Item = &StoryPoint> {
-        let seen = watermark.max(self.story_closed);
-        self.story.iter().filter(move |p| p.seq > seen && !p.aterm)
-    }
-
-    /// The current stop (hold / limit) in progress, for the story's summary.
-    fn stop_in_progress(&self) -> Option<(StoryVerb, Instant)> {
-        self.stop_began.filter(|(verb, _)| match verb {
-            StoryVerb::Hold => self.hold.is_some(),
-            _ => matches!(
-                self.agent.as_ref().map(|a| &a.phase),
-                Some(AgentPhase::Wall { .. })
-            ),
-        })
-    }
-}
-
-/// How long the Success tone stands after a settled turn.
-pub(crate) const SETTLED_GLOW: Duration = Duration::from_secs(2);
-
-/// Severity, ascending. `hold > limited > attention > driven > story > quiet`
-/// (design §1), with the rim-less states between: mail waiting (`Note`)
-/// sits under a story, and driving another session under being driven.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Level {
-    Quiet,
-    /// Mail waiting, a queued post, a stalled bridge: information, no rim.
-    Note,
-    /// Something happened since the human last looked; the session is calm.
-    Story,
-    /// This session drives another.
-    Driving,
-    /// A peer's hand is on this keyboard.
-    Driven,
-    /// A human should look: prompt, question, escalation, an unread task.
-    Attention,
-    Limited,
-    Hold,
-}
-
-impl Level {
-    /// The rim this level paints — colour only, and only for the levels whose
-    /// band sentence says why.
-    pub(crate) const fn rim(self) -> Rim {
-        match self {
-            Self::Quiet | Self::Story | Self::Note | Self::Driving => Rim::None,
-            Self::Driven => Rim::Drive,
-            Self::Attention => Rim::Wait,
-            Self::Limited => Rim::Stop { hold: false },
-            Self::Hold => Rim::Stop { hold: true },
-        }
-    }
-
-    /// Whether the band row EXISTS for this level (the fold law's first half:
-    /// state ≠ quiet). `Story` counts — it is the row the summary lives in.
-    pub(crate) const fn shows_row(self) -> bool {
-        !matches!(self, Self::Quiet)
-    }
-
-    /// The wire word `status level=` and `chrome` print: the variant's name in
-    /// lower case, a closed set a reader can match on.
-    pub(crate) const fn wire(self) -> &'static str {
-        match self {
-            Self::Quiet => "quiet",
-            Self::Note => "note",
-            Self::Story => "story",
-            Self::Driving => "driving",
-            Self::Driven => "driven",
-            Self::Attention => "attention",
-            Self::Limited => "limited",
-            Self::Hold => "hold",
-        }
-    }
-}
-
-impl Rim {
-    /// The wire word `chrome` prints for the rim.
-    pub(crate) const fn wire(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Drive => "drive",
-            Self::Wait => "wait",
-            Self::Stop { hold: false } => "stop",
-            Self::Stop { hold: true } => "stop-hold",
-        }
-    }
-}
-
-impl Hand {
-    /// The `status hand=` token: `-` | `turn:<id>[:<holder>]` | `lease:<holder>`
-    /// | `driving:<sid>`, the free-text part percent-encoded so the record
-    /// stays one line of `key=value` words whatever a holder is called.
-    pub(crate) fn wire(&self) -> String {
-        use aterm_control::wire::pct_encode;
-        match self {
-            Self::None => "-".to_string(),
-            Self::DrivenTurn { id, holder: None } => format!("turn:{id}"),
-            Self::DrivenTurn {
-                id,
-                holder: Some(h),
-            } => format!("turn:{id}:{}", pct_encode(h)),
-            Self::DrivenLease { holder } => format!("lease:{}", pct_encode(holder)),
-            Self::Driving { sid } => format!("driving:{}", pct_encode(sid)),
-        }
-    }
-}
-
-/// The rim's colour state. `Stop { hold }` doubles the thickness and adds the
-/// wash under a hold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum Rim {
-    #[default]
-    None,
-    Drive,
-    Wait,
-    Stop {
-        hold: bool,
-    },
-}
-
-/// The tab chip's attention mark as a LEVEL (the chip's old `attention: bool`
-/// is `Wait`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
-pub(crate) enum ChipLevel {
-    #[default]
-    Off,
-    Story,
-    Wait,
-    Stop(StopCause),
-}
-
-/// Why a chip stands at a stop: what decides the remedy (lift a hold, restart
-/// or resume the program, see the agent's wall). Ascending as
-/// [`Slot::level`] ranks them, so a tab's `max` over its panes keeps a hold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum StopCause {
-    /// An agent at a wall ([`AgentPhase::Wall`]).
-    Wall,
-    /// The program has stopped reading its input.
-    Frozen,
-    /// The foreground job is stopped with input queued.
-    Suspended,
-    /// A hold.
-    Hold,
-}
-
-impl ChipLevel {
-    /// The chrome-state tokens the introspection line prints for this mark.
-    pub(crate) const fn chrome_states(self) -> &'static [&'static str] {
-        match self {
-            Self::Off => &[],
-            Self::Story => &["story"],
-            Self::Wait => &["attention"],
-            Self::Stop(_) => &["attention", "stop"],
-        }
-    }
-
-    /// The hover-help clause.
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) const fn help(self) -> Option<&'static str> {
-        match self {
-            Self::Off => None,
-            Self::Story => Some("Something happened while you were away"),
-            Self::Wait => Some("Needs attention"),
-            Self::Stop(StopCause::Hold) => Some("Held"),
-            Self::Stop(StopCause::Frozen) => Some("Frozen, not reading input"),
-            Self::Stop(StopCause::Suspended) => Some("Stopped with input queued"),
-            Self::Stop(StopCause::Wall) => Some("Agent can't continue"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The words.
-// ---------------------------------------------------------------------------
-
-/// The six slots, composed. Each is a whole string; [`Words::fit`] lays them
-/// out at a width and sheds from the right in the design's order.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub(crate) struct Words {
-    pub(crate) role: String,
-    pub(crate) phase: String,
-    /// The `since` clauses, in the order they are printed; elided shortest
-    /// first when the row is narrow.
-    pub(crate) since: Vec<String>,
-    pub(crate) hand: String,
-    /// The hand without its detail (`◂ turn 41` for `◂ manager · turn 41`,
-    /// `⊘ hold` for `⊘ hold <reason>`): what survives past the ctx slot on a
-    /// narrow row, so the hand is never cut mid-word.
-    pub(crate) hand_short: String,
-    pub(crate) mail: String,
-    /// The mail counts alone (`✉2 ↑1`), without `kind←✓from`.
-    pub(crate) mail_short: String,
-    pub(crate) ctx: String,
-    pub(crate) fabric: String,
-    /// The a11y sentence.
-    pub(crate) sentence: String,
-    pub(crate) tone: Tone,
-}
-
-/// Two spaces between slots, one between a glyph and its value.
-const SLOT_GAP: &str = "  ";
-/// The joint between since-clauses.
-const CLAUSE_SEP: &str = " \u{00b7} ";
-/// The empty-slot mark.
-const DASH: &str = "\u{2014}";
-
-/// Which slot a laid-out piece belongs to, so the painter can colour it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SlotKind {
-    Role,
-    Phase,
-    Since,
-    Hand,
-    Mail,
-    Ctx,
-    Fabric,
-}
-
-impl Words {
-    /// Lay the slots out at `cols` cells. Elision right→left: the fabric slot
-    /// (`rtt`), then since-clauses shortest first (the longest stop survives),
-    /// then the role, then ctx; then the mail's `kind←from` and the hand's
-    /// detail fold to their short forms, so hand, phase and mail survive to
-    /// 24 columns — past which the line is cut.
-    pub(crate) fn fit(&self, cols: usize) -> String {
-        let pieces = self.pieces(cols);
-        join_pieces(&pieces)
-    }
-
-    /// The pieces [`Self::fit`] keeps at `cols`, in order, each tagged with
-    /// its slot: a `Since` piece follows its `Phase` by one space, every other
-    /// piece follows its predecessor by two.
-    pub(crate) fn pieces(&self, cols: usize) -> Vec<(SlotKind, String)> {
-        let mut since = self.since.clone();
-        let mut fabric = true;
-        let mut role = true;
-        let mut ctx = true;
-        let mut mail_full = true;
-        let mut hand_full = true;
-        loop {
-            let pieces = self.compose(&since, role, ctx, fabric, hand_full, mail_full);
-            if width(&join_pieces(&pieces)) <= cols {
-                return pieces;
-            }
-            if fabric {
-                fabric = false;
-                continue;
-            }
-            // The since-clauses, shortest first — but the stop clause (the
-            // longest stop) outlives everything below and goes last of all.
-            let is_stop = |c: &String| {
-                c.starts_with("limited") || c.starts_with("held") || c.starts_with('\u{2192}')
-            };
-            if let Some(i) = since
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| !is_stop(c))
-                .min_by_key(|(_, c)| width(c))
-                .map(|(i, _)| i)
-            {
-                since.remove(i);
-                continue;
-            }
-            if role {
-                role = false;
-                continue;
-            }
-            if ctx {
-                ctx = false;
-                continue;
-            }
-            if mail_full && self.mail_short != self.mail {
-                mail_full = false;
-                continue;
-            }
-            if hand_full && self.hand_short != self.hand {
-                hand_full = false;
-                continue;
-            }
-            if !since.is_empty() {
-                since.clear();
-                continue;
-            }
-            // Nothing left to shed: cut the survivors at the width — the
-            // MAIL keeps its cells (it is the rightmost survivor and the
-            // shortest), the hand gives way first, then the phase, so all
-            // three are on the row down to 13 columns.
-            if pieces.len() == 3 {
-                let (phase, hand, mail) = (&pieces[0].1, &pieces[1].1, &pieces[2].1);
-                let (pw, hw, mw) = (width(phase), width(hand), width(mail));
-                if pw + hw + mw + 4 > cols && cols >= mw + 4 + 3 + 4 {
-                    let hand_room = (cols - mw - 4).saturating_sub(pw).max(3);
-                    let hand_cut = truncate(hand, hand_room.min(hw));
-                    let phase_room = cols - mw - 4 - width(&hand_cut);
-                    let phase_cut = truncate(phase, phase_room.min(pw));
-                    return vec![
-                        (SlotKind::Phase, phase_cut),
-                        (SlotKind::Hand, hand_cut),
-                        (SlotKind::Mail, mail.clone()),
-                    ];
-                }
-            }
-            let mut out = Vec::new();
-            let mut used = 0usize;
-            for (i, (kind, text)) in pieces.into_iter().enumerate() {
-                let gap = if i == 0 {
-                    0
-                } else if kind == SlotKind::Since {
-                    1
-                } else {
-                    2
-                };
-                if used + gap >= cols {
-                    break;
-                }
-                let room = cols - used - gap;
-                let cut = truncate(&text, room);
-                used += gap + width(&cut);
-                out.push((kind, cut));
-            }
-            return out;
-        }
-    }
-
-    fn compose(
-        &self,
-        since: &[String],
-        role: bool,
-        ctx: bool,
-        fabric: bool,
-        hand_full: bool,
-        mail_full: bool,
-    ) -> Vec<(SlotKind, String)> {
-        let mut out = Vec::with_capacity(7);
-        if role && !self.role.is_empty() {
-            out.push((SlotKind::Role, self.role.clone()));
-        }
-        out.push((SlotKind::Phase, self.phase.clone()));
-        if !since.is_empty() {
-            out.push((SlotKind::Since, since.join(CLAUSE_SEP)));
-        }
-        out.push((
-            SlotKind::Hand,
-            if hand_full {
-                &self.hand
-            } else {
-                &self.hand_short
-            }
-            .clone(),
-        ));
-        out.push((
-            SlotKind::Mail,
-            if mail_full {
-                &self.mail
-            } else {
-                &self.mail_short
-            }
-            .clone(),
-        ));
-        if ctx && !self.ctx.is_empty() {
-            out.push((SlotKind::Ctx, self.ctx.clone()));
-        }
-        if fabric && !self.fabric.is_empty() {
-            out.push((SlotKind::Fabric, self.fabric.clone()));
-        }
-        out
-    }
-}
-
-/// Join laid-out pieces into the printed line: one space before a `Since`
-/// piece, two before every other.
-pub(crate) fn join_pieces(pieces: &[(SlotKind, String)]) -> String {
-    let mut out = String::new();
-    for (i, (kind, text)) in pieces.iter().enumerate() {
-        if i > 0 {
-            out.push_str(if *kind == SlotKind::Since {
-                " "
-            } else {
-                SLOT_GAP
-            });
-        }
-        out.push_str(text);
-    }
-    out
-}
-
-/// Display width in cells (every glyph the band uses is one cell wide; the
-/// text-presentation rule in the painter keeps ✓ and ⚠ that way).
-fn width(s: &str) -> usize {
-    s.chars().count()
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if width(s) <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new();
-    }
-    let mut t: String = s.chars().take(max - 1).collect();
-    t.push('\u{2026}');
-    t
-}
-
-/// The band's OWN vocabulary — the glyphs that spell a hand, a hold, mail, the
-/// link, a story, a trust verdict, a reset — and its two separators (two
-/// spaces between slots, ` · ` between clauses). None of it may arrive inside
-/// a free-text value: a `meta role` of `⊘ hold pause ·fleet🔒  ◂ manager` would
-/// otherwise print as a hold and a hand the session does not have.
-const BAND_GLYPHS: &[char] = &[
-    '\u{25c2}',
-    '\u{25b8}',
-    '\u{2298}',
-    '\u{2709}',
-    '\u{21af}',
-    '\u{2191}',
-    '\u{27df}',
-    '~',
-    '\u{2715}',
-    '\u{25c7}',
-    '\u{2713}',
-    '\u{2717}',
-    '\u{26a0}',
-    '\u{2190}',
-    '\u{2192}',
-    '\u{00b7}',
-    '\u{1f512}',
-];
-
-/// A wire-safe token: printable, single-spaced, none of the band's own glyphs,
-/// at most `cap` chars, cut with `…`. Every free-text value the band prints (a
-/// role, a holder, a sender, a reason, a reset time, a told story's text)
-/// passes here, so a control byte, a bidi override or the band's grammar in
-/// an agent-chosen name can never reach the chrome or forge a slot.
-pub(crate) fn sanitize_token(s: &str, cap: usize) -> String {
-    let mut clean = String::with_capacity(s.len());
-    let mut at_space = true;
-    for c in s.chars() {
-        let c = if c.is_whitespace() { ' ' } else { c };
-        if c.is_control()
-            || matches!(
-                c,
-                '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            )
-            || BAND_GLYPHS.contains(&c)
-        {
-            continue;
-        }
-        if c == ' ' {
-            if at_space {
-                continue;
-            }
-            at_space = true;
-        } else {
-            at_space = false;
-        }
-        clean.push(c);
-    }
-    truncate(clean.trim_end(), cap)
-}
-
-/// A hold's reason as every human-facing surface prints and speaks it: the
-/// wire token (`status hold=`'s pct-encoded form, `main%20broken`) DECODED to
-/// its words and then held to [`sanitize_token`]'s rule — a bridge-supplied
-/// reason can encode a control byte or a bidi override, and the decode must
-/// not be the step that lets it through. The band's hand slot, its spoken
-/// sentence and the greyed menu row (`crate::menu::hold_row_reason`) all
-/// read from here, so they cannot disagree (`main broken` on one and
-/// `main%20broken` on another was round 19's second review).
-pub(crate) fn hold_reason_words(reason: &str) -> String {
-    sanitize_token(&aterm_control::wire::pct_decode(reason), 32)
-}
-
-/// A duration as the band prints it: `12s`, `3m12s`, `2h05m`, `1d 22h`.
-pub(crate) fn fmt_dur(d: Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m{:02}s", s / 60, s % 60)
-    } else if s < 86_400 {
-        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
-    } else {
-        format!("{}d {}h", s / 86_400, (s % 86_400) / 3600)
-    }
-}
-
-/// The short form of a session id for the hand slot: `s-1e91`.
-pub(crate) fn short_sid(sid: &str) -> String {
-    let n = sid.chars().count().min(6);
-    sid.chars().take(n).collect()
-}
-
-/// The trust glyph: ✓ for a verdict the receiver trusts, ✗ for one it refuses,
-/// ? for anything unresolved. BEFORE the sender, always.
-pub(crate) fn trust_glyph(trust: &str) -> char {
-    match trust {
-        "agent" | "human" | "owner" | "operator" | "verified" => '\u{2713}',
-        "forged-self" | "unreadable" | "observer" | "refused" | "spoof" => '\u{2717}',
-        _ => '?',
-    }
-}
-
-/// Compose the six slots for `slot` as seen from a window whose story
-/// watermark is `watermark`. Pure; allocates (it is called on CHANGE, never per
-/// frame).
-pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
-    // The row's words follow the level it is shown at (ruling 280): an
-    // attention another place tells must not hide the story under it.
-    let level = slot.shown_level(watermark);
-    let tone = slot.tone(now, watermark);
-    let role = slot
-        .role
-        .as_deref()
-        .map(|r| sanitize_token(r, 64))
-        .unwrap_or_else(|| DASH.to_string());
-
-    // phase + since. A TOLD point (`ctl story`) takes the slot for three
-    // seconds ahead of everything: it is the watcher's decision, and the
-    // phase it interrupts is still one keystroke of patience away.
-    let (phase, mut since, mut spoken_phase) = if let Some((verb, text)) = slot.told_now(now)
-        && let Some((glyph, word)) = verb.told_words()
-    {
-        let since = if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![text.to_string()]
-        };
-        let teller = verb.teller();
-        let spoken = if text.is_empty() {
-            format!("{word} by {teller}")
-        } else {
-            format!("{word} by {teller}, {text}")
-        };
-        (format!("{glyph} {word}"), since, spoken)
-    } else if let Some(fact) = &slot.input_stall {
-        crate::input_stall::band_phase(fact, now)
-    } else if let Some(text) = slot
-        .attention
-        .as_ref()
-        .filter(|_| !slot.attention_told_elsewhere)
-    {
-        let t = sanitize_token(text, 48);
-        (t.clone(), Vec::new(), format!("attention, {t}"))
-    } else if level == Level::Story {
-        // The summary of what happened after the watermark (≤6 clauses, zero
-        // counts omitted): turns · timed out · mails · approvals · choices ·
-        // questions · the longest stop that ended since. A `choice` is the
-        // harness answering a question box by policy — counted apart from the
-        // watcher's approvals, and apart from `question` (a box that WAITED).
-        let count = |verb: StoryVerb| {
-            slot.story_since(watermark)
-                .filter(|p| p.verb == verb)
-                .count()
-        };
-        let timeouts = count(StoryVerb::TurnTimedOut);
-        let turns = count(StoryVerb::Turn) + timeouts;
-        let mut story = Vec::new();
-        for (n, word) in [
-            (turns, "turn"),
-            (timeouts, "timed out"),
-            (count(StoryVerb::Mail), "mail"),
-            (count(StoryVerb::Approval), "approval"),
-            (count(StoryVerb::Chose), "choice"),
-            (count(StoryVerb::Question), "question"),
-        ] {
-            if n > 0 {
-                let plural = if n == 1 || word == "timed out" {
-                    ""
-                } else {
-                    "s"
-                };
-                story.push(format!("{n} {word}{plural}"));
-            }
-        }
-        // The longest stop that ENDED since the watermark: its verb, how long
-        // it lasted, and how long ago it lifted.
-        let mut stops: Vec<(StoryVerb, Instant, Instant)> = Vec::new();
-        let mut open: Option<(StoryVerb, Instant)> = None;
-        // A stop that LIFTED but never began in this story — it was already
-        // standing when the slot was minted, so its length is unknown — is
-        // told as the resume alone.
-        let mut unpaired_resume: Option<Instant> = None;
-        for p in slot.story_since(watermark) {
-            match p.verb {
-                StoryVerb::Hold | StoryVerb::Limited => open = Some((p.verb, p.at)),
-                StoryVerb::Resumed => match open.take() {
-                    Some((v, began)) => stops.push((v, began, p.at)),
-                    None => unpaired_resume = Some(p.at),
-                },
-                _ => {}
-            }
-        }
-        if let Some((verb, began, ended)) = stops
-            .into_iter()
-            .max_by_key(|(_, b, e)| e.saturating_duration_since(*b))
-        {
-            let word = if verb == StoryVerb::Hold {
-                "held"
-            } else {
-                "limited"
-            };
-            story.push(format!(
-                "{word} {}, resumed {} ago",
-                fmt_dur(ended.saturating_duration_since(began)),
-                fmt_dur(now.saturating_duration_since(ended))
-            ));
-        } else if let Some(ended) = unpaired_resume {
-            story.push(format!(
-                "resumed {} ago",
-                fmt_dur(now.saturating_duration_since(ended))
-            ));
-        }
-        // A worker still RUNNING is not quiet, story or no story: the live
-        // phase keeps the slot (`busy 31s`) and the story rides `since` after
-        // it — so a turn that timed out on a busy worker never reads `◇ quiet`.
-        let live = match &slot.agent {
-            Some(a) => matches!(a.phase, AgentPhase::Busy).then_some(("busy", slot.agent_since)),
-            None => slot.shell.filter(|(w, _)| *w == "running"),
-        };
-        if let Some((word, at)) = live {
-            let mut since = vec![fmt_dur(now.saturating_duration_since(at))];
-            since.extend(story.iter().cloned());
-            let spoken = if story.is_empty() {
-                word.to_string()
-            } else {
-                format!("{word}, {}", story.join(", "))
-            };
-            (word.to_string(), since, spoken)
-        } else {
-            let mut clauses = Vec::new();
-            if let Some(at) = slot.story_since(watermark).next().map(|p| p.at) {
-                clauses.push(format!(
-                    "since {}",
-                    fmt_dur(now.saturating_duration_since(at))
-                ));
-            }
-            clauses.extend(story);
-            let spoken = format!("quiet, {}", clauses.join(", "));
-            ("\u{25c7} quiet".to_string(), clauses, spoken)
-        }
-    } else if let Some(agent) = &slot.agent {
-        let word = agent.phase.band_word();
-        let mut clauses = Vec::new();
-        let mut spoken = word.to_string();
-        match &agent.phase {
-            AgentPhase::Prompt { detail } => {
-                let word = prompt_band_word(detail.as_deref());
-                clauses.push(fmt_dur(now.saturating_duration_since(slot.agent_since)));
-                spoken.clone_from(&word);
-                (word, clauses, spoken)
-            }
-            AgentPhase::Wall { reset, until, .. } => {
-                // `limited → 19:30 · 1d 22h`: the reset the notice named, then
-                // the time TO it (design §1; the mock counts down) — never the
-                // time since the limit began, which is the story's to tell.
-                if let Some(r) = reset {
-                    clauses.push(format!("\u{2192} {r}"));
-                    spoken = format!("{word}, resets {r}");
-                }
-                if let Some(left) = until
-                    .map(|u| u.saturating_duration_since(now))
-                    .filter(|d| !d.is_zero())
-                {
-                    clauses.push(fmt_dur(left));
-                }
-                (word.to_string(), clauses, spoken)
-            }
-            _ => {
-                clauses.push(fmt_dur(now.saturating_duration_since(slot.agent_since)));
-                (word.to_string(), clauses, spoken)
-            }
-        }
-    } else if let Some((word, at)) = slot.shell {
-        (
-            word.to_string(),
-            vec![fmt_dur(now.saturating_duration_since(at))],
-            word.to_string(),
-        )
-    } else {
-        (DASH.to_string(), Vec::new(), String::new())
-    };
-
-    // hand (and its short form for a narrow row)
-    let (hand, hand_short, spoken_hand) = match (&slot.hold, &slot.hand) {
-        // aterm's own harness is named as aterm, never by its holder's pid
-        // (ruling 313), on the rare row something else raised.
-        (None, Hand::DrivenTurn { .. } | Hand::DrivenLease { .. }) if slot.aterm_hand => (
-            "\u{25c2} aterm".to_string(),
-            "\u{25c2} aterm".to_string(),
-            "driven by aterm".to_string(),
-        ),
-        (Some(h), _) => {
-            let reason = hold_reason_words(&h.reason);
-            let fleet = if h.fleet {
-                " \u{00b7}fleet\u{1f512}"
-            } else {
-                ""
-            };
-            (
-                format!("\u{2298} hold {reason}{fleet}"),
-                "\u{2298} hold".to_string(),
-                format!(
-                    "held, {reason}{}",
-                    if h.fleet {
-                        ", fleet, cannot be lifted here"
-                    } else {
-                        ""
-                    }
-                ),
-            )
-        }
-        (
-            None,
-            Hand::DrivenTurn {
-                id,
-                holder: Some(h),
-            },
-        ) => {
-            let h = sanitize_token(h, 32);
-            (
-                format!("\u{25c2} {h} \u{00b7} turn {id}"),
-                format!("\u{25c2} turn {id}"),
-                format!("driven by {h}, turn {id}"),
-            )
-        }
-        (None, Hand::DrivenTurn { id, holder: None }) => (
-            format!("\u{25c2} turn {id}"),
-            format!("\u{25c2} turn {id}"),
-            format!("driven, turn {id}"),
-        ),
-        (None, Hand::DrivenLease { holder }) => {
-            let h = sanitize_token(holder, 32);
-            (
-                format!("\u{25c2} {h}"),
-                format!("\u{25c2} {}", truncate(&h, 8)),
-                format!("driven by {h}"),
-            )
-        }
-        (None, Hand::Driving { sid }) => {
-            let s = sanitize_token(sid, 12);
-            (
-                format!("\u{25b8} @{s}"),
-                format!("\u{25b8} @{s}"),
-                format!("driving session {s}"),
-            )
-        }
-        (None, Hand::None) => (DASH.to_string(), DASH.to_string(), String::new()),
-    };
-    if slot.hold.is_some() {
-        // Under a hold the stop clause rides `since` so the summary law and the
-        // live row agree on where a duration is printed — but not behind a
-        // told word (`✓ approved 0s ⊘ hold review` read as an approval's age).
-        if let Some((_, began)) = slot.stop_in_progress()
-            && since.is_empty()
-            && slot.told_now(now).is_none()
-        {
-            since.push(fmt_dur(now.saturating_duration_since(began)));
-        }
-    }
-
-    // mail
-    let m = &slot.mail;
-    let mut mail = format!("\u{2709}{}", m.unread);
-    if m.pending > 0 {
-        mail.push_str(&format!(" \u{00b7}{}", m.pending));
-    }
-    if m.dropped > 0 {
-        mail.push_str(&format!(" \u{21af}{}", m.dropped));
-    }
-    if m.queued > 0 {
-        mail.push_str(&format!(" \u{2191}{}", m.queued));
-    }
-    let mail_short = mail.clone();
-    let mut spoken_mail = String::new();
-    if m.unread > 0 {
-        spoken_mail = format!("{} unread", m.unread);
-        if let Some(last) = &m.last {
-            let kind = sanitize_token(&last.kind, 12);
-            let from = sanitize_token(&last.from, 24);
-            mail.push_str(&format!(
-                " {kind}\u{2190}{}{from}",
-                trust_glyph(&last.trust)
-            ));
-            spoken_mail.push_str(&format!(", {kind} from {from}, {}", last.trust));
-        }
-    }
-
-    // ctx
-    // The context LEFT (`<n>% until auto-compact`, `<n>% context left`).
-    let ctx = match slot.agent.as_ref().and_then(|a| a.context_pct) {
-        Some(pct) if pct <= CTX_WARN_PCT => format!("ctx {pct}% left \u{26a0}"),
-        Some(pct) => format!("ctx {pct}% left"),
-        None => String::new(),
-    };
-    let spoken_ctx = slot
-        .agent
-        .as_ref()
-        .and_then(|a| a.context_pct)
-        .map(|p| format!("context {p} percent left"));
-
-    // fabric
-    let (fabric, spoken_fabric) = match slot.link {
-        Link::Absent => ("\u{00b7}".to_string(), None),
-        Link::Connected { rtt_ms: Some(ms) } => (format!("\u{27df} {ms}ms"), None),
-        Link::Connected { rtt_ms: None } => ("\u{27df}".to_string(), None),
-        // A stall with a date prints its age; one without (a bridge still
-        // dialing since it attached) prints the glyph alone — never a figure
-        // the model made up.
-        Link::Stalled { age_ms: Some(a) } => {
-            let s = a / 1000;
-            (
-                format!("~ {s}s"),
-                Some(format!("bridge stalled {s} seconds")),
-            )
-        }
-        Link::Stalled { age_ms: None } => ("~".to_string(), Some("bridge stalled".to_string())),
-        Link::Disconnected => ("\u{2715} lost".to_string(), Some("bridge lost".to_string())),
-    };
-
-    if spoken_phase.is_empty() {
-        spoken_phase = "quiet".to_string();
-    }
-    let mut sentence = Vec::new();
-    if !spoken_hand.is_empty() {
-        sentence.push(spoken_hand);
-    }
-    sentence.push(spoken_phase);
-    if !spoken_mail.is_empty() {
-        sentence.push(spoken_mail);
-    }
-    if let Some(c) = spoken_ctx.filter(|_| !ctx.is_empty()) {
-        sentence.push(c);
-    }
-    if let Some(f) = spoken_fabric {
-        sentence.push(f);
-    }
-
-    Words {
-        role,
-        phase,
-        since,
-        hand,
-        hand_short,
-        mail,
-        mail_short,
-        ctx,
-        fabric,
-        sentence: sentence.join(", "),
-        tone,
-    }
-}
-
-/// The context-left percentage at and below which the band warns.
-pub(crate) const CTX_WARN_PCT: u8 = 15;
-
-// ---------------------------------------------------------------------------
-// The per-window view: what the frame path reads, allocation-free.
-// ---------------------------------------------------------------------------
-
-/// The ripple's life, and how many distinct frames it paints (nine, ~30 fps).
-pub(crate) const RIPPLE: Duration = Duration::from_millis(300);
-pub(crate) const RIPPLE_STEPS: u32 = 9;
-
-/// One window's presence, as the last refresh left it. Every field the frame
-/// path reads is plain data; the words are recomposed only on change.
-#[derive(Clone, Debug)]
-pub(crate) struct WindowView {
-    /// The story watermarks, one per SESSION shown in this window: the newest
-    /// story seq the human has seen of that session here (moved by the fold
-    /// law, never by focus alone or a timer). Per session, not per window:
-    /// reading one tab's story must not fold another's, and a story read once
-    /// must not return after the human reads a second tab.
-    pub(crate) watermarks: HashMap<u64, u64>,
-    /// The band rows COMMITTED to this window's geometry (0 or 1) — the term
-    /// `App::chrome_rows` adds; moved only by `App::sync_presence_rows`.
-    pub(crate) rows: u16,
-    pub(crate) level: Level,
-    pub(crate) rim: Rim,
-    /// The band's words, when the row exists.
-    pub(crate) words: Option<Words>,
-    /// Bumped on every change the painter can see; folded into `presence_fp`.
-    /// Never 0 once anything has shown, but `fp()` maps a quiet window to 0.
-    pub(crate) seed: u64,
-    /// A turn submit's edge ripple: when it started, `None` when none runs
-    /// (and always `None` under reduced motion — amplitude 0 means the ripple
-    /// never STARTS, so the frame is the steady image).
-    pub(crate) ripple_at: Option<Instant>,
-    /// The running ripple is a CHOICE PULSE (`App::start_presence_pulse`): the
-    /// harness answered a question box in the session this window's FRONT tab
-    /// shows. It paints in the story tone and paints on a window with NO rim —
-    /// the one ripple a quiet window shows. Reset with `ripple_at`.
-    pub(crate) ripple_chose: bool,
-    /// When the words' `since` figures next move — the band's own text clock
-    /// (1 s while they print seconds, 60 s after), set by `App::presence_tick`
-    /// when it recomposes them; `None` until the first tick of a row. The tick
-    /// recomposes a window only when this is due, so another owner's wakes
-    /// (the band's 30 fps motion, blink) never re-read presence facts at their
-    /// own rate (audit 2026-09-24).
-    pub(crate) words_due: Option<Instant>,
-    /// The painted band row for `(seed, cols, palette)`, reused until one moves.
-    pub(crate) cached_row: Vec<aterm_core::terminal::RenderCell>,
-    pub(crate) cached_key: Option<(u64, usize, u64)>,
-}
-
-impl Default for WindowView {
-    fn default() -> Self {
-        Self {
-            watermarks: HashMap::new(),
-            rows: 0,
-            level: Level::Quiet,
-            rim: Rim::None,
-            words: None,
-            seed: 0,
-            ripple_at: None,
-            ripple_chose: false,
-            words_due: None,
-            cached_row: Vec::new(),
-            cached_key: None,
-        }
-    }
-}
-
-impl WindowView {
-    /// The story watermark this window holds for `session` (0: never read).
-    pub(crate) fn watermark(&self, session: u64) -> u64 {
-        self.watermarks.get(&session).copied().unwrap_or(0)
-    }
-
-    /// The ripple's step at `now`: `Some(0..RIPPLE_STEPS)` while it runs,
-    /// `None` after.
-    pub(crate) fn ripple_step(&self, now: Instant) -> Option<u32> {
-        let t0 = self.ripple_at?;
-        let elapsed = now.saturating_duration_since(t0);
-        if elapsed >= RIPPLE {
-            return None;
-        }
-        let step = elapsed.as_millis() * u128::from(RIPPLE_STEPS) / RIPPLE.as_millis();
-        Some((step as u32).min(RIPPLE_STEPS - 1))
-    }
-
-    /// The repaint-key term: **exactly 0 on a quiet window** (no rim, no row,
-    /// no ripple), else a nonzero fold of the seed (floored at 1, so the fold
-    /// is never 0) and the ripple step (0 = none, else `step + 1`). No clock is
-    /// read unless a ripple is live, and no allocation ever.
-    pub(crate) fn fp(&self, now: Instant) -> u64 {
-        if self.rows == 0 && matches!(self.rim, Rim::None) && self.ripple_at.is_none() {
-            return 0;
-        }
-        let step = self
-            .ripple_at
-            .and_then(|_| self.ripple_step(now))
-            .map_or(0, |s| u64::from(s) + 1);
-        (self.seed.max(1) << 8) | step
-    }
-
-    /// The next instant this view's PIXELS change on their own — only while a
-    /// ripple runs. Steady rims and rows have no deadline (the change-driven
-    /// law); the band's `since` text ticks through `App::presence_deadline`.
-    pub(crate) fn ripple_deadline(&self, now: Instant) -> Option<Instant> {
-        let t0 = self.ripple_at?;
-        let end = t0 + RIPPLE;
-        if now >= end {
-            return Some(now);
-        }
-        let step = self.ripple_step(now).unwrap_or(0);
-        Some((t0 + RIPPLE * (step + 1) / RIPPLE_STEPS).min(end))
-    }
+    limit::offset_at(None, unix)
 }
 
 #[cfg(test)]
@@ -2518,428 +745,6 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
-    }
-
-    fn driven(now: Instant) -> Slot {
-        let mut s = Slot::new(now);
-        s.absorb(
-            Facts {
-                role: Some("worker:claude-satcomp".into()),
-                agent_seq: 1,
-                agent: Some(AgentReading {
-                    phase: AgentPhase::Busy,
-                    context_pct: Some(41),
-                }),
-                hand: Hand::DrivenTurn {
-                    id: 41,
-                    holder: Some("manager".into()),
-                },
-                mail: MailFacts {
-                    unread: 2,
-                    head: 2,
-                    last: Some(MailLast {
-                        kind: "task".into(),
-                        from: "manager".into(),
-                        trust: "agent".into(),
-                    }),
-                    ..MailFacts::default()
-                },
-                link: Link::Connected { rtt_ms: Some(12) },
-                ..Facts::default()
-            },
-            now,
-        );
-        s
-    }
-
-    /// THE MOCK'S FIRST BAND, verbatim: role, phase since, hand, mail with the
-    /// trust glyph BEFORE the sender, ctx, fabric.
-    #[test]
-    fn the_six_slots_read_like_the_approved_mock() {
-        let now = t0();
-        let s = driven(now);
-        let w = words(&s, now + Duration::from_secs(192), 0);
-        assert_eq!(
-            w.fit(120),
-            "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41% left  \u{27df} 12ms"
-        );
-        assert_eq!(
-            w.sentence,
-            "driven by manager, turn 41, busy, 2 unread, task from manager, agent, context 41 percent left"
-        );
-        assert_eq!(w.tone, Tone::Info);
-        assert_eq!(s.level(0), Level::Driven);
-        assert_eq!(s.level(0).rim(), Rim::Drive);
-    }
-
-    /// Elision right→left: rtt, then since, then role, then ctx; hand, phase
-    /// and mail survive to 24 columns.
-    #[test]
-    fn elision_sheds_from_the_right_and_keeps_hand_phase_mail_to_24_columns() {
-        let now = t0();
-        let s = driven(now);
-        let w = words(&s, now + Duration::from_secs(192), 0);
-        let at = |cols| w.fit(cols);
-        assert_eq!(width(&at(120)), 94, "the whole line: {}", at(120));
-        assert!(!at(90).contains("\u{27df}"), "rtt goes first: {}", at(90));
-        assert!(at(90).contains("3m12s"));
-        assert!(!at(83).contains("3m12s"), "then since: {}", at(83));
-        assert!(at(83).contains("worker:claude-satcomp"));
-        assert!(!at(75).contains("worker:claude"), "then role: {}", at(75));
-        assert!(at(75).contains("ctx 41% left"));
-        assert!(!at(50).contains("ctx"), "then ctx: {}", at(50));
-        assert!(at(50).contains("task\u{2190}\u{2713}manager"));
-        assert!(!at(40).contains("task"), "then the mail detail: {}", at(40));
-        assert!(at(40).contains("\u{25c2} manager \u{00b7} turn 41"));
-        let narrow = at(28);
-        assert!(
-            !narrow.contains("manager"),
-            "then the hand's holder: {narrow}"
-        );
-        let n24 = at(24);
-        assert!(n24.contains("busy"), "{n24}");
-        assert!(
-            n24.contains("\u{25c2} turn 41"),
-            "the hand's short form: {n24}"
-        );
-        assert!(n24.contains("\u{2709}2"), "the mail's short form: {n24}");
-        assert!(!n24.contains("manager"), "{n24}");
-        assert!(width(&n24) <= 24, "{n24}");
-        for cols in [24usize, 60, 120] {
-            assert!(width(&at(cols)) <= cols, "{cols}: {}", at(cols));
-        }
-    }
-
-    /// RULING 270, "ONE PLACE TELLS IT": an attention whose only owner is
-    /// the agent upgrade is still a FACT — `level=attention`, `why=escalation`,
-    /// the tab chip's wait mark and the rim all keep it, so the stall shows at
-    /// the top after its band row folds — but the presence line's phase slot
-    /// does not repeat words the message band already says. NEGATIVE CONTROL:
-    /// the same text from any other owner reads on the line.
-    #[test]
-    fn an_upgrade_only_attention_keeps_its_level_and_chip_but_not_its_words() {
-        let now = t0();
-        let text = "Codex 0.157.0 \u{2192} 0.157.1 stalled";
-        let mut s = Slot::new(now);
-        s.absorb(
-            Facts {
-                attention: Some(text.into()),
-                attention_told_elsewhere: true,
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.level(0), Level::Attention);
-        assert_eq!(s.why(0), "escalation");
-        assert_eq!(s.chip(0), ChipLevel::Wait);
-        // Round 18 (D1): the window's own chrome shows nothing for it — no
-        // rim and no presence row, since the line has no words to say.
-        assert_eq!(s.shown_level(0), Level::Quiet);
-        assert_eq!(s.shown_level(0).rim(), Rim::None);
-        assert!(!s.shown_level(0).shows_row());
-        assert!(!s.calm(), "the stall is not folded by a keystroke");
-        let w = words(&s, now, 0);
-        assert!(
-            !w.phase.contains("Codex") && !w.sentence.contains("Codex"),
-            "the line repeats the band's words: {:?} / {:?}",
-            w.phase,
-            w.sentence
-        );
-        // NEGATIVE CONTROL: another owner's attention is the line's phase.
-        let mut other = Slot::new(now);
-        other.absorb(
-            Facts {
-                attention: Some(text.into()),
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(other.level(0), Level::Attention);
-        assert_eq!(other.shown_level(0), Level::Attention);
-        assert_eq!(other.shown_level(0).rim(), Rim::Wait);
-        assert!(words(&other, now, 0).phase.contains("Codex"));
-        // The flag moving alone is a change the view must re-read.
-        assert!(other.absorb(
-            Facts {
-                attention: Some(text.into()),
-                attention_told_elsewhere: true,
-                ..Facts::default()
-            },
-            now,
-        ));
-        assert!(!words(&other, now, 0).phase.contains("Codex"));
-    }
-
-    /// AN ATTENTION TOLD ELSEWHERE NEVER TAKES THE ROW'S WORDS OR COLOUR
-    /// (ruling 280): with a Claude upgrade stall standing (its row and record
-    /// are the band's) and a story since the watermark, the row is shown at
-    /// the story's level — and its words are the story's summary, its tone
-    /// not Warn. Before 280 the row was shown but `words` and `tone` read the
-    /// full level: no summary, painted Warn — a colour with no words.
-    /// NEGATIVE CONTROL: the same story beside another owner's attention is
-    /// that attention's words, in Warn.
-    #[test]
-    fn a_story_beside_an_attention_told_elsewhere_keeps_its_words_and_tone() {
-        let now = t0();
-        let text = "Claude 2.1.281 \u{2192} 2.1.282 stalled";
-        let slot = |elsewhere: bool| {
-            let mut s = Slot::new(now);
-            for (id, at) in [(1, 5), (2, 70)] {
-                s.absorb(
-                    Facts {
-                        turn: Some(TurnFact {
-                            id,
-                            settled: true,
-                            dur_ms: 10,
-                            carried: false,
-                        }),
-                        attention: Some(text.into()),
-                        attention_told_elsewhere: elsewhere,
-                        ..Facts::default()
-                    },
-                    now + Duration::from_secs(at),
-                );
-            }
-            s
-        };
-        let later = now + Duration::from_secs(130);
-        let s = slot(true);
-        assert_eq!(s.level(0), Level::Attention, "the fact stands");
-        assert_eq!(s.shown_level(0), Level::Story);
-        let w = words(&s, later, 0);
-        assert!(
-            w.since.iter().any(|c| c.ends_with("turns")),
-            "the story's summary: {:?}",
-            w.since
-        );
-        assert_ne!(w.tone, Tone::Warn);
-        assert_ne!(s.tone(later, 0), Tone::Warn);
-
-        let other = slot(false);
-        assert_eq!(other.shown_level(0), Level::Attention);
-        let w = words(&other, later, 0);
-        assert!(w.phase.contains("stalled"), "{:?}", w.phase);
-        assert_eq!(w.tone, Tone::Warn);
-    }
-
-    /// Severity: hold > limited > attention > driven > story > quiet, and the
-    /// rim follows the level exactly — a colour with no words is unreachable.
-    #[test]
-    fn severity_and_rim_follow_the_design_table() {
-        let now = t0();
-        let mut s = Slot::new(now);
-        assert_eq!(s.level(0), Level::Quiet);
-        assert_eq!(s.level(0).rim(), Rim::None);
-        s.absorb(
-            Facts {
-                hand: Hand::DrivenTurn {
-                    id: 1,
-                    holder: None,
-                },
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.level(0), Level::Driven);
-        s.absorb(
-            Facts {
-                hand: Hand::DrivenTurn {
-                    id: 1,
-                    holder: None,
-                },
-                attention: Some("needs a decision".into()),
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.level(0), Level::Attention);
-        assert_eq!(s.level(0).rim(), Rim::Wait);
-        s.absorb(
-            Facts {
-                hand: Hand::DrivenTurn {
-                    id: 1,
-                    holder: None,
-                },
-                attention: Some("needs a decision".into()),
-                agent_seq: 2,
-                agent: Some(AgentReading {
-                    phase: AgentPhase::Wall {
-                        kind: aterm_phase::WallKind::UsageSession,
-                        reset: Some("19:30".into()),
-                        until: None,
-                    },
-                    context_pct: None,
-                }),
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.level(0), Level::Limited);
-        assert_eq!(s.level(0).rim(), Rim::Stop { hold: false });
-        assert_eq!(s.chip(0), ChipLevel::Stop(StopCause::Wall));
-        s.absorb(
-            Facts {
-                hold: Some(HoldFact {
-                    reason: "fabric-lost".into(),
-                    fleet: true,
-                }),
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.level(0), Level::Hold);
-        assert_eq!(s.level(0).rim(), Rim::Stop { hold: true });
-        let w = words(&s, now + Duration::from_secs(40), 0);
-        assert!(
-            w.hand
-                .starts_with("\u{2298} hold fabric-lost \u{00b7}fleet\u{1f512}"),
-            "{}",
-            w.hand
-        );
-        assert!(
-            w.sentence
-                .starts_with("held, fabric-lost, fleet, cannot be lifted here"),
-            "{}",
-            w.sentence
-        );
-        assert_eq!(w.tone, Tone::Warn);
-        // A stalled bridge is an instance fact: fabric slot, never a rim.
-        let mut q = Slot::new(now);
-        q.absorb(
-            Facts {
-                link: Link::Stalled {
-                    age_ms: Some(7_400),
-                },
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(q.level(0), Level::Note);
-        assert_eq!(q.level(0).rim(), Rim::None);
-        assert_eq!(words(&q, now, 0).fabric, "~ 7s");
-        let mut lost = Slot::new(now);
-        lost.absorb(
-            Facts {
-                link: Link::Disconnected,
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(lost.level(0).rim(), Rim::None);
-        assert_eq!(words(&lost, now, 0).fabric, "\u{2715} lost");
-    }
-
-    /// THE INCIDENT'S BAND (2026-09-24): an approval box on the screen, the
-    /// supervisor's "answer this box" as typed attention, a supervisor's turn
-    /// on the hand — and a published input stall. The slot stands at
-    /// `Limited` (the stop rim), is not calm (a keystroke does not fold it),
-    /// and its phase reads `frozen` with the stall's age and why, ahead of the
-    /// attention text. A stopped job reads `stopped` and says to resume it.
-    /// NEGATIVE CONTROL: the same facts with the stall cleared are the box's
-    /// attention again, at `Attention`.
-    #[test]
-    fn a_stall_is_limited_not_calm_and_reads_frozen_over_typed_attention() {
-        let now = t0();
-        let fact = crate::input_stall::InputStallFact {
-            word: aterm_session::input_backlog::InputWord::Stalled,
-            since: now,
-            bytes: 1,
-            stopped: false,
-            rss_mb: Some(39_731),
-            restart: crate::input_stall::Restart::default(),
-        };
-        let facts = |stall: Option<crate::input_stall::InputStallFact>| Facts {
-            attention: Some("answer this box: 4. Chat about this".into()),
-            agent_seq: 1,
-            agent: Some(AgentReading {
-                phase: AgentPhase::Prompt {
-                    detail: Some("question".into()),
-                },
-                context_pct: None,
-            }),
-            hand: Hand::DrivenTurn {
-                id: 3,
-                holder: Some("supervisor".into()),
-            },
-            input_stall: stall,
-            ..Facts::default()
-        };
-        let mut s = Slot::new(now);
-        assert!(s.absorb(facts(Some(fact.clone())), now));
-        assert_eq!(s.level(0), Level::Limited);
-        assert_eq!(s.level(0).rim(), Rim::Stop { hold: false });
-        assert_eq!(s.chip(0), ChipLevel::Stop(StopCause::Frozen));
-        assert!(!s.calm());
-        assert_eq!(s.why(0), "-");
-        let later = now + Duration::from_secs(123);
-        let w = words(&s, later, 0);
-        assert_eq!(w.phase, "frozen");
-        assert_eq!(
-            w.since,
-            vec!["2m03s".to_string(), "not reading input".to_string()]
-        );
-        assert!(
-            w.fit(120)
-                .contains("frozen 2m03s \u{00b7} not reading input"),
-            "{}",
-            w.fit(120)
-        );
-        assert!(!w.fit(120).contains("answer this box"), "{}", w.fit(120));
-        assert!(
-            w.sentence
-                .contains("frozen, not reading input for 2m03s; restart it"),
-            "{}",
-            w.sentence
-        );
-        assert_eq!(w.tone, Tone::Warn);
-        // A stopped job: resume it.
-        let stopped = crate::input_stall::InputStallFact {
-            word: aterm_session::input_backlog::InputWord::Stopped,
-            stopped: true,
-            ..fact
-        };
-        assert!(s.absorb(facts(Some(stopped)), later));
-        let w = words(&s, now + Duration::from_secs(41), 0);
-        assert_eq!(w.phase, "stopped");
-        assert_eq!(w.since, vec!["41s".to_string(), "input queued".to_string()]);
-        assert!(
-            w.sentence
-                .contains("stopped with input queued for 41s; resume it"),
-            "{}",
-            w.sentence
-        );
-        assert_eq!(s.level(0), Level::Limited);
-        assert_eq!(s.chip(0), ChipLevel::Stop(StopCause::Suspended));
-        // NEGATIVE CONTROL: the stall clears — the box's attention is back.
-        assert!(s.absorb(facts(None), later));
-        assert_eq!(s.level(0), Level::Attention);
-        assert_eq!(s.why(0), "prompt,escalation");
-        let w = words(&s, later, 0);
-        assert!(w.phase.starts_with("answer this box"), "{}", w.phase);
-        // A hold still outranks it.
-        let mut held = Slot::new(now);
-        held.absorb(
-            Facts {
-                hold: Some(HoldFact {
-                    reason: "review".into(),
-                    fleet: false,
-                }),
-                ..facts(Some(fact_stalled(now)))
-            },
-            now,
-        );
-        assert_eq!(held.level(0), Level::Hold);
-    }
-
-    fn fact_stalled(since: Instant) -> crate::input_stall::InputStallFact {
-        crate::input_stall::InputStallFact {
-            word: aterm_session::input_backlog::InputWord::Stalled,
-            since,
-            bytes: 1,
-            stopped: false,
-            rss_mb: None,
-            restart: crate::input_stall::Restart::default(),
-        }
     }
 
     /// Ruling 313 (day eight, E1): the turn aterm's OWN harness typed to
@@ -3049,312 +854,6 @@ mod tests {
         let w = words(&s, at, 0);
         assert!(w.since.iter().any(|c| c == "1 turn"), "{w:?}");
         assert!(!w.since.iter().any(|c| c == "2 turns"), "{w:?}");
-    }
-
-    /// The story row: quiet, with a since-summary of what happened after the
-    /// watermark — and it folds to Quiet once the watermark catches up.
-    #[test]
-    fn a_story_summarises_since_the_watermark_and_the_watermark_folds_it() {
-        let now = t0();
-        let mut s = Slot::new(now);
-        for id in 1..=3 {
-            s.absorb(
-                Facts {
-                    turn: Some(TurnFact {
-                        id,
-                        settled: true,
-                        dur_ms: 10,
-                        carried: false,
-                    }),
-                    ..Facts::default()
-                },
-                now + Duration::from_secs(id),
-            );
-        }
-        s.absorb(
-            Facts {
-                turn: Some(TurnFact {
-                    id: 3,
-                    settled: true,
-                    dur_ms: 10,
-                    carried: false,
-                }),
-                mail: MailFacts {
-                    unread: 0,
-                    head: 2,
-                    ..MailFacts::default()
-                },
-                ..Facts::default()
-            },
-            now + Duration::from_secs(5),
-        );
-        s.absorb(
-            Facts {
-                turn: Some(TurnFact {
-                    id: 3,
-                    settled: true,
-                    dur_ms: 10,
-                    carried: false,
-                }),
-                mail: MailFacts {
-                    unread: 0,
-                    head: 2,
-                    ..MailFacts::default()
-                },
-                hold: Some(HoldFact {
-                    reason: "pause".into(),
-                    fleet: false,
-                }),
-                ..Facts::default()
-            },
-            now + Duration::from_secs(10),
-        );
-        s.absorb(
-            Facts {
-                turn: Some(TurnFact {
-                    id: 3,
-                    settled: true,
-                    dur_ms: 10,
-                    carried: false,
-                }),
-                mail: MailFacts {
-                    unread: 0,
-                    head: 2,
-                    ..MailFacts::default()
-                },
-                ..Facts::default()
-            },
-            now + Duration::from_secs(70),
-        );
-        assert_eq!(s.level(0), Level::Story);
-        assert_eq!(s.chip(0), ChipLevel::Story);
-        let w = words(&s, now + Duration::from_secs(130), 0);
-        assert_eq!(w.phase, "\u{25c7} quiet");
-        assert_eq!(
-            w.since,
-            vec![
-                "since 2m09s".to_string(),
-                "3 turns".to_string(),
-                "1 mail".to_string(),
-                "held 1m00s, resumed 1m00s ago".to_string(),
-            ]
-        );
-        // The longest stop survives elision: at 40 columns the counts go first.
-        let narrow = w.fit(44);
-        assert!(narrow.contains("held 1m00s"), "{narrow}");
-        assert!(s.calm());
-        assert_eq!(s.level(s.story_seq), Level::Quiet);
-        assert!(!s.level(s.story_seq).shows_row());
-    }
-
-    /// D10 (2026-09-24): the story an agent told while nobody looked closes
-    /// when the agent LEAVES — a shell does not stand at `level=story` for a
-    /// run that is over, least of all in a headless instance where no person
-    /// ever acts to read it. NEGATIVE CONTROL: the same story with the agent
-    /// still there stands, and a new point after the exit is news again.
-    #[test]
-    fn an_agents_story_closes_when_the_agent_leaves() {
-        let now = Instant::now();
-        let reading = |phase| AgentReading {
-            phase,
-            context_pct: None,
-        };
-        let mut s = Slot::new(now);
-        s.absorb(Facts::default(), now);
-        for (seq, phase) in [(1, AgentPhase::Question), (2, AgentPhase::Idle)] {
-            s.absorb(
-                Facts {
-                    agent_seq: seq,
-                    agent: Some(reading(phase)),
-                    ..Facts::default()
-                },
-                now,
-            );
-        }
-        assert_eq!(
-            s.level(0),
-            Level::Story,
-            "the question is news while it runs"
-        );
-        assert!(s.story_since(0).next().is_some());
-        s.absorb(
-            Facts {
-                agent_seq: 3,
-                agent: None,
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.level(0), Level::Quiet, "the agent left: its story closed");
-        assert_eq!(s.story_since(0).count(), 0);
-        s.absorb(
-            Facts {
-                turn: Some(TurnFact {
-                    id: 1,
-                    settled: true,
-                    dur_ms: 5,
-                    carried: false,
-                }),
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.level(0), Level::Story, "a point after the exit is news");
-        assert_eq!(s.story_since(0).count(), 1);
-    }
-
-    /// The tone: Warn while a human should look, Success for 2 s after a
-    /// settled turn, Info otherwise.
-    #[test]
-    fn tone_is_warn_then_success_for_two_seconds_then_info() {
-        let now = t0();
-        let mut s = Slot::new(now);
-        s.absorb(
-            Facts {
-                turn: Some(TurnFact {
-                    id: 1,
-                    settled: true,
-                    dur_ms: 1,
-                    carried: false,
-                }),
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.tone(now + Duration::from_millis(500), 0), Tone::Success);
-        assert_eq!(s.tone(now + Duration::from_millis(2500), 0), Tone::Info);
-        s.absorb(
-            Facts {
-                turn: Some(TurnFact {
-                    id: 1,
-                    settled: true,
-                    dur_ms: 1,
-                    carried: false,
-                }),
-                agent_seq: 1,
-                agent: Some(AgentReading {
-                    phase: AgentPhase::Prompt {
-                        detail: Some("bash".into()),
-                    },
-                    context_pct: Some(12),
-                }),
-                ..Facts::default()
-            },
-            now,
-        );
-        assert_eq!(s.tone(now, 0), Tone::Warn);
-        let w = words(&s, now, 0);
-        assert_eq!(w.phase, "bash approval");
-        assert_eq!(w.since, ["0s"], "the wait's age, as a question's");
-        assert_eq!(w.ctx, "ctx 12% left \u{26a0}");
-        // The classifier's verdict and an unnamed kind stay off the band.
-        assert_eq!(
-            prompt_band_word(Some("bash:not-read-only")),
-            "bash approval"
-        );
-        assert_eq!(prompt_band_word(Some("other")), "approval");
-        assert_eq!(prompt_band_word(None), "approval");
-        // The question tool asks; it approves nothing.
-        assert_eq!(prompt_band_word(Some("question")), "question");
-        assert_eq!(prompt_band_word(Some("plan-exit")), "plan approval");
-        assert_eq!(
-            prompt_band_word(Some("read-outside-setting")),
-            "outside read approval"
-        );
-        // A box that follows another, with no busy reading between, starts
-        // its own age; the same box's next reading keeps it.
-        let box_of = |seq, detail: &str| Facts {
-            agent_seq: seq,
-            agent: Some(AgentReading {
-                phase: AgentPhase::Prompt {
-                    detail: Some(detail.into()),
-                },
-                context_pct: Some(12),
-            }),
-            ..Facts::default()
-        };
-        let later = now + Duration::from_secs(65);
-        s.absorb(box_of(2, "bash:not-read-only"), later);
-        assert_eq!(words(&s, later, 0).since, ["1m05s"], "the same box");
-        s.absorb(box_of(3, "edit"), later);
-        let w = words(&s, later, 0);
-        assert_eq!(w.phase, "edit approval");
-        assert_eq!(w.since, ["0s"], "a new box's own age");
-    }
-
-    /// No command text, body, title or limit message reaches the words: a
-    /// hostile role/holder/reason is sanitized to a printable token.
-    #[test]
-    fn free_text_is_sanitized_and_the_limit_message_never_appears() {
-        let now = t0();
-        let mut s = Slot::new(now);
-        s.absorb(
-            Facts {
-                role: Some("evil\u{202e}role\nwith\tcontrol".into()),
-                hand: Hand::DrivenLease {
-                    holder: "h\u{7f}older".into(),
-                },
-                agent_seq: 1,
-                agent: Some(AgentReading {
-                    phase: AgentPhase::Wall {
-                        kind: aterm_phase::WallKind::UsageSession,
-                        reset: Some("7:30pm".into()),
-                        until: None,
-                    },
-                    context_pct: None,
-                }),
-                ..Facts::default()
-            },
-            now,
-        );
-        let w = words(&s, now, 0);
-        assert_eq!(w.role, "evilrole with control");
-        assert_eq!(w.hand, "\u{25c2} holder");
-        assert_eq!(w.phase, "limited");
-        assert_eq!(w.since, vec!["\u{2192} 7:30pm".to_string()], "{w:?}");
-        assert_eq!(
-            sanitize_token("You've reached your limit", 8),
-            "You've \u{2026}"
-        );
-    }
-
-    #[test]
-    fn durations_read_like_the_mock() {
-        assert_eq!(fmt_dur(Duration::from_secs(12)), "12s");
-        assert_eq!(fmt_dur(Duration::from_secs(192)), "3m12s");
-        assert_eq!(fmt_dur(Duration::from_secs(7_500)), "2h05m");
-        assert_eq!(fmt_dur(Duration::from_secs(165_600)), "1d 22h");
-        assert_eq!(short_sid("s-1e918c4662a1b7b8bd43"), "s-1e91");
-    }
-
-    /// The repaint term is 0 on a quiet view and nonzero the moment a rim, a
-    /// row or a ripple exists; a ripple steps nine times and then stops.
-    #[test]
-    fn window_view_fp_is_zero_when_quiet_and_the_ripple_steps_nine_times() {
-        let now = t0();
-        let mut v = WindowView::default();
-        for i in 0..1000u64 {
-            assert_eq!(v.fp(now + Duration::from_millis(i)), 0);
-        }
-        v.rim = Rim::Drive;
-        v.seed = 3;
-        let steady = v.fp(now);
-        assert_ne!(steady, 0);
-        assert_eq!(
-            v.fp(now + Duration::from_secs(60)),
-            steady,
-            "no clock in a steady rim"
-        );
-        v.ripple_at = Some(now);
-        let mut seen = std::collections::BTreeSet::new();
-        let mut t = now;
-        while t < now + RIPPLE {
-            seen.insert(v.fp(t));
-            t += Duration::from_millis(1);
-        }
-        assert_eq!(seen.len(), 9, "nine ripple frames");
-        assert_eq!(v.ripple_step(now + RIPPLE), None);
-        assert!(v.ripple_deadline(now).is_some());
     }
 
     /// The classifier is `aterm-phase`'s Claude reader, word for word — a
@@ -3849,10 +1348,11 @@ mod tests {
     #[test]
     fn the_memory_banner_publishes_wall_memory_under_a_busy_spinner() {
         use aterm_phase::prompt::fixtures::composer;
+        // The VENDOR's banner, word for word (its own remedy tail is Claude
+        // Code's text on the screen, never a remedy aterm prints).
         let banner = format!(
-            "{} (140.4GB) \u{2014} restart and resume with {}",
+            "{} (140.4GB) \u{2014} restart and resume with claude --continue",
             aterm_phase::anchor_text("wall.memory"),
-            aterm_phase::resume_hint(aterm_phase::Program::Claude).unwrap()
         );
         let screen = |banner_row: &str, draft: &str| {
             let mut r = vec![
@@ -4032,6 +1532,24 @@ mod tests {
         );
     }
 
+    /// A TALL PANE, A SHORT TRANSCRIPT (a real render of 2026-09-28: Claude
+    /// Code 2.1.284, 144x50, an API error on row 8 and the composer pinned on
+    /// rows 45-47): the status sweep's verdict was `idle` with no wall, the
+    /// error 41 rows above the last drawn row and cut by the zone. The
+    /// verdict reads the wall and its cause, with the cursor on the caret as
+    /// the sweep hands it.
+    #[test]
+    fn an_api_error_far_above_the_composer_is_a_wall_in_the_verdict() {
+        use aterm_phase::prompt::fixtures::{API_ERROR_TALL_PANE_MEASURED, screen};
+        let rows = screen(API_ERROR_TALL_PANE_MEASURED);
+        let caret = Cursor::At(rows.iter().rposition(|r| r.trim() == "❯"));
+        for program in [Some("claude"), None] {
+            let v = agent_verdict(program, false, None, &rows, caret, t0());
+            assert_eq!(v.word(), "wall:api-error", "{program:?}");
+            assert_eq!(v.subject(), Some(API_UNREACHABLE), "{program:?}");
+        }
+    }
+
     /// THE FRESH PANE (the live run of 2026-09-26: Claude Code 2.1.283 in a
     /// private headless aterm, a fresh 149x62 pane whose shell prompt sat at
     /// the top). The folder-trust dialog was drawn on rows 5-20, wholly above
@@ -4119,13 +1637,22 @@ mod tests {
         }
 
         // The live capture's content ends on row 40: its zone is the last
-        // 40 rows of that content and the blank foot under it. A screen with
-        // content on its last row: its last 40 rows, as it always was; an
-        // all-blank one reads whole.
+        // 40 rows of that content and the blank foot under it. A screen
+        // drawn to its last row: its last 40 rows, as it always was; an
+        // all-blank one reads whole. A long blank GAP counts as one row
+        // (`aterm_phase::live_zone_start`), so the dialog above a blank
+        // middle stays in the zone of a screen with content on its last row.
         assert_eq!(live_zone(&live), &live[41 - CLASSIFY_ROWS..]);
+        let drawn: Vec<String> = (0..62).map(|i| format!("row {i}")).collect();
+        assert_eq!(live_zone(&drawn), &drawn[62 - CLASSIFY_ROWS..]);
         let mut full = trust.clone();
         full[61] = "x".to_string();
-        assert_eq!(live_zone(&full), &full[62 - CLASSIFY_ROWS..]);
+        assert!(live_zone(&full).len() > CLASSIFY_ROWS);
+        assert!(
+            live_zone(&full)
+                .iter()
+                .any(|r| r.contains("Accessing workspace"))
+        );
         let blank = vec![String::new(); 62];
         assert_eq!(live_zone(&blank).len(), 62);
     }
@@ -4179,111 +1706,6 @@ mod tests {
 
     // ───── the second adversarial reviews (honesty-cost, menu-a11y), 2026-09-19 ─────
 
-    /// ADV-6 (model): a stalled link with no date behind it (a bridge still
-    /// dialing since it attached) has no age — the composer used to print
-    /// `~ 0s` and speak "bridge stalled 0 seconds". The glyph alone now, and
-    /// the sentence names no figure; a dated stall still prints its seconds.
-    #[test]
-    fn adv6_a_stall_of_unknown_age_prints_no_figure() {
-        let now = Instant::now();
-        let mut s = Slot::new(now);
-        s.absorb(
-            Facts {
-                link: Link::Stalled { age_ms: None },
-                ..Facts::default()
-            },
-            now,
-        );
-        let w = words(&s, now, 0);
-        assert_ne!(w.fabric, "~ 0s", "sentence=`{}`", w.sentence);
-        assert_eq!(w.fabric, "~");
-        assert!(!w.sentence.contains("0 seconds"), "{}", w.sentence);
-        assert!(w.sentence.ends_with("bridge stalled"), "{}", w.sentence);
-        s.absorb(
-            Facts {
-                link: Link::Stalled {
-                    age_ms: Some(7_400),
-                },
-                ..Facts::default()
-            },
-            now,
-        );
-        let w = words(&s, now, 0);
-        assert_eq!(w.fabric, "~ 7s");
-        assert!(
-            w.sentence.ends_with("bridge stalled 7 seconds"),
-            "{}",
-            w.sentence
-        );
-    }
-
-    /// ADV-7 (model): a hold the slot first sees at its mint used to be dated
-    /// from the mint. Nothing in `Hold` says when it began, so the model
-    /// cannot know: the first absorb is the baseline, the hold is state with
-    /// no figure, and when it lifts the story says `resumed N ago` without a
-    /// length it never measured. A hold that BEGINS after the baseline is
-    /// dated and told in full.
-    #[test]
-    fn adv7_a_hold_seen_at_first_sight_has_no_made_up_duration() {
-        let now = Instant::now();
-        let mut s = Slot::new(now);
-        let held = |reason: &str| {
-            Some(HoldFact {
-                reason: reason.into(),
-                fleet: false,
-            })
-        };
-        let later = now + Duration::from_secs(3600);
-        s.absorb(
-            Facts {
-                hold: held("pause"),
-                ..Facts::default()
-            },
-            later,
-        );
-        let w = words(&s, later, 0);
-        assert!(
-            !w.since.iter().any(|c| c == "0s"),
-            "the hold's age is unknown, the band says: {} / since={:?}",
-            w.fit(120),
-            w.since
-        );
-        assert!(w.since.is_empty(), "{:?}", w.since);
-        assert_eq!(w.hand, "\u{2298} hold pause");
-        assert_eq!(s.level(0), Level::Hold);
-        assert_eq!(s.story_seq, 0, "standing at the mint: state, not news");
-        // Lifted 5 s later: the story is the resume alone.
-        let lifted = later + Duration::from_secs(5);
-        s.absorb(Facts::default(), lifted);
-        let at = lifted + Duration::from_secs(3);
-        let w = words(&s, at, 0);
-        assert_eq!(s.level(0), Level::Story);
-        assert_eq!(
-            w.since,
-            vec!["since 3s".to_string(), "resumed 3s ago".to_string()]
-        );
-        assert!(!w.sentence.contains("held"), "{}", w.sentence);
-        // A hold that begins AFTER the baseline is dated and told in full.
-        let began = at + Duration::from_secs(10);
-        s.absorb(
-            Facts {
-                hold: held("review"),
-                ..Facts::default()
-            },
-            began,
-        );
-        let w = words(&s, began + Duration::from_secs(4), 0);
-        assert_eq!(w.since, vec!["4s".to_string()]);
-        let end = began + Duration::from_secs(20);
-        s.absorb(Facts::default(), end);
-        let w = words(&s, end + Duration::from_secs(1), 0);
-        assert!(
-            w.since.iter().any(|c| c == "held 20s, resumed 1s ago"),
-            "{:?}",
-            w.since
-        );
-    }
-
     /// menu-a11y D2: the SPOKEN hold sentence carried the pct-encoded wire
     /// token (`held, main%20broken, …` — VoiceOver read "main percent twenty
     /// broken") while the greyed menu row beside it said `main broken`. The
@@ -4324,6 +1746,89 @@ mod tests {
         );
         // The menu row's own pin (`menu::hold_row_reason`, the same words) lives
         // beside that row in `menu.rs`.
+    }
+
+    /// THIS host's stall seam: `Native`'s three accessors over the server's
+    /// real [`crate::input_stall::InputStallFact`]. The engine's own stall
+    /// tests run on its `TestStall`, so only this one proves that `since`
+    /// reads the fact's instant, `stopped` its `stopped` field (never the
+    /// word) and `survived` its restart record. Each case differs from the
+    /// others in exactly the field its accessor reads, so a crossed or
+    /// constant accessor turns one of them red.
+    #[test]
+    fn the_native_stall_seam_reads_since_stopped_and_survived_off_the_fact() {
+        use crate::input_stall::{InputStallFact, Restart};
+        use aterm_session::input_backlog::InputWord;
+        let now = t0();
+        let since = now - Duration::from_secs(123);
+        let frozen = InputStallFact {
+            word: InputWord::Stalled,
+            since,
+            bytes: 1,
+            stopped: false,
+            rss_mb: None,
+            restart: Restart::default(),
+        };
+        let read = |fact: InputStallFact| {
+            let mut s = Slot::new(now);
+            assert!(s.absorb(
+                Facts {
+                    input_stall: Some(fact),
+                    ..Facts::default()
+                },
+                now
+            ));
+            (s.level(0), s.chip(0), words(&s, now, 0))
+        };
+        // Frozen: the duration counts from the fact's `since`.
+        let (level, chip, w) = read(frozen.clone());
+        assert_eq!(level, Level::Limited);
+        assert_eq!(chip, ChipLevel::Stop(StopCause::Frozen));
+        assert_eq!(
+            (w.phase.as_str(), w.since.as_slice()),
+            (
+                "frozen",
+                &["2m03s".to_string(), "not reading input".to_string()][..]
+            )
+        );
+        assert!(
+            w.sentence
+                .contains("not reading input for 2m03s; restart it"),
+            "{}",
+            w.sentence
+        );
+        // Stopped is the `stopped` FIELD: the word left at `Stalled`.
+        let (level, chip, w) = read(InputStallFact {
+            stopped: true,
+            ..frozen.clone()
+        });
+        assert_eq!(level, Level::Limited);
+        assert_eq!(chip, ChipLevel::Stop(StopCause::Suspended));
+        assert_eq!(w.phase, "stopped");
+        assert!(
+            w.sentence
+                .contains("stopped with input queued for 2m03s; resume it"),
+            "{}",
+            w.sentence
+        );
+        // Survived is the restart record's.
+        let (_, chip, w) = read(InputStallFact {
+            restart: Restart {
+                survived: true,
+                ..Restart::default()
+            },
+            ..frozen
+        });
+        assert_eq!(chip, ChipLevel::Stop(StopCause::Frozen));
+        assert_eq!(
+            w.since,
+            vec!["2m03s".to_string(), "survived its restart".to_string()]
+        );
+        assert!(
+            w.sentence.contains("end it with signal kill"),
+            "{}",
+            w.sentence
+        );
     }
 
     /// A Bash box in Claude Code's layout: header, the block of command (and

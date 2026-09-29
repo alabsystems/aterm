@@ -76,11 +76,10 @@ fn capabilities_match_mode_policy() {
     kani::assume(level <= 3);
     let mode = mode_from_level(level);
 
-    // Network: Containment=0, Safety=1, User=2, Master=2
+    // Network: Containment=0, Safety=User=Master=1
     let expected_net: u8 = match level {
         0 => 0,
-        1 => 1,
-        2 | 3 => 2,
+        1..=3 => 1,
         _ => unreachable!(),
     };
     kani::assert(
@@ -199,7 +198,7 @@ fn policy_is_total_on_all_modes() {
     kani::assume(level <= 3);
     let mode = mode_from_level(level);
     kani::assert(
-        ContainmentPolicy::network(mode) as u8 <= 2,
+        ContainmentPolicy::network(mode) as u8 <= 1,
         "network out of range",
     );
     kani::assert(ContainmentPolicy::fs(mode) as u8 <= 3, "fs out of range");

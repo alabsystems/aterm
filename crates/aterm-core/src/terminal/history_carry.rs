@@ -20,7 +20,7 @@ use crate::scrollback::Line;
 impl Terminal {
     /// The grid holding this terminal's history, mutably — the twin of
     /// [`Self::main_grid`].
-    fn history_grid_mut(&mut self) -> &mut Grid {
+    pub(super) fn history_grid_mut(&mut self) -> &mut Grid {
         if self.modes.alternate_screen
             && let Some(primary) = self.alt_grid.as_mut()
         {

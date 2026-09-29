@@ -562,7 +562,7 @@ pub(crate) fn config_semantic_warnings(
         warnings.push(ConfigSemanticWarning {
             key: "font_px",
             message: format!(
-                "font_px is {font_px:?}, outside the supported {}–{} range; the resolver ignores it rather than clamping it and uses the next valid precedence fallback",
+                "font_px: {font_px:?} is not accepted (expected {}–{}; the value is ignored)",
                 crate::FONT_PX_MIN,
                 crate::FONT_PX_MAX,
             ),
@@ -967,19 +967,11 @@ pub(crate) fn config_semantic_warnings(
                     ),
                 });
             }
-            if connection.sid.is_some() {
+            if connection.sid.is_some() && connection.expect_nonce.is_none() {
                 warnings.push(ConfigSemanticWarning {
                     key: "net.connections.sid",
                     message: format!(
-                        "net.connections.sid in [[net.connections]] record {record} is stored but currently inert because the shipping rebind check is nonce-only"
-                    ),
-                });
-            }
-            if connection.expect_nonce.is_some() {
-                warnings.push(ConfigSemanticWarning {
-                    key: "net.connections.expect_nonce",
-                    message: format!(
-                        "net.connections.expect_nonce in [[net.connections]] record {record} currently makes dialing fail closed because the shipping wire protocol cannot verify the remote launch nonce"
+                        "net.connections.sid in [[net.connections]] record {record} has no effect without expect_nonce"
                     ),
                 });
             }
@@ -1092,7 +1084,7 @@ pub(crate) fn config_semantic_warnings(
         let message = if cfg!(target_os = "linux") {
             "allow_window_ops is wired to the window on Linux: manipulations (iconify, maximize, fullscreen, resize) apply and move stays denied; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
         } else {
-            "allow_window_ops enables only the GUI's XTWINOPS window-title, text-grid-size, text-area-pixels and cell-size fallback reports; no window callback is installed, so host manipulation and window/screen position and size requests are ignored"
+            "allow_window_ops answers the window-title, text-grid-size, text-area-pixels and cell-size reports only; window changes (iconify, maximize, fullscreen, resize, move) and position and screen-size reports are ignored on this platform"
         };
         warnings.push(ConfigSemanticWarning {
             key: "allow_window_ops",
@@ -1205,27 +1197,14 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
         });
     }
 
-    for appearance in [
-        aterm_types::Appearance::Dark,
-        aterm_types::Appearance::Light,
-    ] {
-        if let Some(name) = config.resolve_theme_name(appearance)
-            && !name.eq_ignore_ascii_case("default")
-            && let Err(error) = assets.themes.resolve(&name)
-        {
-            let message =
-                format!("theme: {name:?} does not resolve ({error}); Default used at load");
-            if !warnings
-                .iter()
-                .any(|warning: &ConfigSemanticWarning| warning.message == message)
-            {
-                warnings.push(ConfigSemanticWarning {
-                    key: "theme",
-                    message,
-                });
-            }
-        }
-    }
+    warnings.extend(
+        crate::app_config::theme_misses(config, &assets.themes)
+            .into_iter()
+            .map(|message| ConfigSemanticWarning {
+                key: "theme",
+                message,
+            }),
+    );
 
     warnings.extend(
         assets
@@ -2023,13 +2002,6 @@ fn sparkle_lexicon_conflict_warning(
                 .and_then(|category| category.extra_words.as_deref()),
         ),
         (
-            "sparkle_words.orca.extra_words",
-            sparkle
-                .orca
-                .as_ref()
-                .and_then(|category| category.extra_words.as_deref()),
-        ),
-        (
             "sparkle_words.emphasis.extra_words",
             sparkle
                 .emphasis
@@ -2144,6 +2116,9 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
             ));
         }
     }
+    // Retired face ids load (renamed ones as their successor, a deleted one as
+    // nothing), so the enum walk below accepts them; say what each draws.
+    warnings.extend(crate::app_config::display_font_notices(&config));
     // Hex colours: every colour-typed key the loaders parse-or-skip.
     for (key, value) in [
         ("foreground", config.foreground.as_deref()),
@@ -2164,6 +2139,27 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
                 "{key}: expected #RRGGBB, got {s:?} (ignored at load)"
             ));
         }
+    }
+    // A malformed appearance split still applies the side it can read, and the
+    // side it cannot draws Default (`app_config::resolve_theme_name_value`) —
+    // the same selector Manual marks as an error.
+    if let Some(theme) = config.theme.as_deref()
+        && theme.contains(':')
+        && let Err(message) = crate::native_config_language::theme_names(theme)
+    {
+        let defaulted = [
+            (aterm_types::Appearance::Dark, "dark"),
+            (aterm_types::Appearance::Light, "light"),
+        ]
+        .into_iter()
+        .filter(|(appearance, _)| config.resolve_theme_name(*appearance).is_none())
+        .map(|(_, side)| side)
+        .collect::<Vec<_>>();
+        warnings.push(match defaulted.as_slice() {
+            [] => message,
+            [side] => format!("{message}; {side} mode uses Default"),
+            _ => format!("{message}; both modes use Default"),
+        });
     }
     warnings.extend(
         config_host_semantic_warnings(&config)
@@ -2197,10 +2193,7 @@ pub(crate) fn validate_config() -> (String, bool) {
 
 fn validate_config_path(path: &std::path::Path) -> (String, bool) {
     match crate::native_config_service::VersionedConfigService::observe_path(path, true) {
-        Err(error) => (
-            format!("config {} is unreadable: {error}", path.display()),
-            false,
-        ),
+        Err(error) => (format!("config not read: {error}"), false),
         Ok(observation) if !observation.baseline.observed.exists => (
             format!(
                 "no config file at {} — built-in defaults in use (OK)",
@@ -2212,7 +2205,7 @@ fn validate_config_path(path: &std::path::Path) -> (String, bool) {
             Ok(w) if w.is_empty() => (format!("config {} is valid", path.display()), true),
             Ok(w) => (
                 format!(
-                    "config {} is structurally valid, with {} runtime warning{}:\n  {}",
+                    "config {} loads, with {} warning{}:\n  {}",
                     path.display(),
                     w.len(),
                     if w.len() == 1 { "" } else { "s" },
@@ -2250,20 +2243,43 @@ pub(crate) fn list_fonts() -> String {
 }
 
 /// `--list-themes`: every built-in colour scheme as `name — description`, the
-/// `"Default"` first, from the single registry (`scheme::builtin_themes`). These
-/// are the names accepted by `theme = "<name>"` in the config.
+/// `"Default"` first, from the single registry (`scheme::builtin_themes`), then
+/// the custom themes in the themes folder, which it names (one that did not
+/// load says why). These are the names accepted by `theme = "<name>"`.
 pub(crate) fn list_themes() -> String {
     let mut s = String::new();
     let _ = writeln!(s, "built-in themes (set via `theme = \"<name>\"`):");
     for (name, desc) in aterm_types::scheme::builtin_themes() {
         let _ = writeln!(s, "  {name} — {desc}");
     }
+    if let Some(dir) = aterm_types::scheme::user_theme_dir() {
+        list_custom_themes(&mut s, &dir);
+    }
     s
 }
 
+/// The custom-theme half of [`list_themes`]: the folder a `<name>.conf` goes in,
+/// every theme in it that loaded, and each one that did not, with the reason.
+fn list_custom_themes(s: &mut String, dir: &std::path::Path) {
+    let catalog = crate::app_config::ThemeCatalog::discover_in(dir);
+    let _ = writeln!(s, "\ncustom themes (<name>.conf in {}):", dir.display());
+    let mut any = false;
+    for (name, not_loaded) in catalog.listing() {
+        any = true;
+        let _ = match not_loaded {
+            None => writeln!(s, "  {name}"),
+            Some(reason) => writeln!(s, "  {name} — not loaded: {reason}"),
+        };
+    }
+    if !any {
+        let _ = writeln!(s, "  (none loaded)");
+    }
+}
+
 /// `--list-keybinds`: the keybinding surface. First the BUILT-IN default chords
-/// — PER PLATFORM: on macOS the fixed Cmd-* bindings handled in `on_key`, off
-/// macOS the seeded table `Keybindings::platform_defaults` installs. Printing
+/// — PER PLATFORM: on macOS the fixed Cmd-* bindings handled in `on_key` and the
+/// menu bar's own key equivalents (`builtin_cmd_chords`), off macOS the seeded
+/// table `Keybindings::platform_defaults` installs. Printing
 /// `BUILTIN_CMD_CHORDS` unconditionally (the old behaviour) documented thirty
 /// `cmd+*` chords on Windows and not one that works: `Chord::from_event` maps
 /// `cmd` from `super_key()`, so "cmd+t" literally means Win+T — a keystroke the
@@ -2275,7 +2291,9 @@ pub(crate) fn list_keybinds() -> String {
     #[cfg(target_os = "macos")]
     {
         let _ = writeln!(s, "built-in keybindings (in the window):");
-        for (chord, label) in crate::keybinding::BUILTIN_CMD_CHORDS {
+        for (chord, label) in
+            crate::keybinding::builtin_cmd_chords(crate::keybinding::MENU_BAR_CHORDS)
+        {
             let _ = writeln!(s, "  {chord:<16} {label}");
         }
     }
@@ -2379,6 +2397,35 @@ fn user_keybinding_note_for(action: &str, shadow: Option<&'static str>) -> Strin
     }
 }
 
+/// `--show-config`'s theme line: the configured value, followed by the theme each
+/// appearance draws whenever that is not the name the value gives it (a name that
+/// does not load, or a side the value leaves out, draws Default).
+fn show_config_theme(
+    config: &crate::app_config::Config,
+    themes: &crate::app_config::ThemeCatalog,
+) -> String {
+    let Some(raw) = config.theme.clone() else {
+        return "Default".to_string();
+    };
+    let named = [
+        aterm_types::Appearance::Dark,
+        aterm_types::Appearance::Light,
+    ]
+    .map(|appearance| config.resolve_theme_name(appearance));
+    let drawn = named.clone().map(|name| {
+        name.filter(|name| name.eq_ignore_ascii_case("default") || themes.resolve(name).is_ok())
+    });
+    if drawn == named && named.iter().all(Option::is_some) {
+        return raw;
+    }
+    let [dark, light] = drawn.map(|name| name.unwrap_or_else(|| "Default".to_string()));
+    if dark == light {
+        format!("{raw} ({dark} in use)")
+    } else {
+        format!("{raw} (in use: dark {dark}, light {light})")
+    }
+}
+
 fn show_config_font_px(value: f32, explicit: bool) -> String {
     if explicit {
         format!("{value} (explicit physical px)")
@@ -2388,7 +2435,7 @@ fn show_config_font_px(value: f32, explicit: bool) -> String {
 }
 
 /// `--show-config`: the resolved launch config after applying the
-/// launch flag / env > config > default precedence. Most values are final before a window
+/// launch flag > config > default precedence. Most values are final before a window
 /// exists. An unset font size is necessarily reported as its auto-scale base:
 /// the final physical size is selected only when the real window/display scale
 /// is known. The config FILE path + presence is shown so the reader knows
@@ -2417,24 +2464,29 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
         crate::app_config::font_px_is_explicit(&config),
     );
     let tab_strip_rows = crate::app_config::resolve_tab_strip_rows(&config);
-    let theme_name = config
-        .theme
-        .clone()
-        .unwrap_or_else(|| "Default".to_string());
     let themes = crate::app_config::ThemeCatalog::discover();
+    let theme_name = show_config_theme(&config, &themes);
     let tc = config.applied_terminal_config_for_with_assets(aterm_types::Appearance::Dark, &themes);
-    // The same effective resolution the renderer uses (`--font` > config >
-    // platform default), so `--show-config` reports the face that actually loads — on a
-    // pristine config that is "(built-in candidates)", the library's
-    // FONT_CANDIDATES lead (SF Mono on macOS); `--show-face` names the file.
-    let font_family = crate::effective_font_family(config.font_family_request().as_deref())
-        .unwrap_or_else(|| "(built-in candidates)".to_string());
+    // The same effective resolution and admission the renderer uses (`--font` >
+    // config > platform default), so `--show-config` reports the face that actually
+    // loads — on a pristine config, or a family that does not load, that is
+    // "(built-in candidates)", the library's FONT_CANDIDATES lead (SF Mono on
+    // macOS); `--show-face` names the file.
+    let font_family = match crate::effective_font_family(config.font_family_request().as_deref()) {
+        None => "(built-in candidates)".to_string(),
+        Some(family)
+            if crate::app_config::Config::font_family_admission(Some(&family)).is_err() =>
+        {
+            format!("(built-in candidates; {family:?} did not load)")
+        }
+        Some(family) => family,
+    };
     let columns = crate::app_config::resolve_initial_columns(&config);
     let lines = crate::app_config::resolve_initial_lines(&config);
 
     let mut s = String::new();
-    let _ = writeln!(s, "resolved launch config (flag/env > config > default)");
-    let _ = writeln!(s, "=========================================");
+    let _ = writeln!(s, "resolved launch config (flag > config > default)");
+    let _ = writeln!(s, "================================================");
     s.push_str(&config_line(
         "config file: ",
         &config_path,
@@ -2751,7 +2803,7 @@ palette = ["#112233", "not-a-color"]
             .join("\n");
         for expected in [
             "font_px",
-            "ignores it rather than clamping",
+            "is not accepted (expected",
             "font_variation[1]",
             "font_features[0]",
             "update.owner",
@@ -2819,8 +2871,9 @@ palette = ["#112233"]
                         && warning.message.contains("move stays denied")
                         && warning.message.contains("remain unanswered")
                 } else {
-                    warning.message.contains("host manipulation")
-                        && warning.message.contains("position and size requests")
+                    warning.message.contains("cell-size reports only")
+                        && warning.message.contains("resize, move)")
+                        && warning.message.contains("screen-size reports are ignored")
                 }
         }));
 
@@ -2879,15 +2932,61 @@ expect_nonce = "launch-pin"
             "record 1 must be a nonempty",
             "record 1 must be 64 hexadecimal",
             "record 3 duplicates",
-            "record 3 currently makes dialing fail closed",
         ] {
             assert!(joined.contains(expected), "missing {expected:?}: {joined}");
         }
         assert!(
             warnings
                 .iter()
+                .all(|warning| warning.key != "net.connections.expect_nonce"),
+            "expect_nonce arms the live launch-nonce pin; it is not a refused arm: {joined}"
+        );
+        assert!(
+            warnings
+                .iter()
                 .all(|warning| !warning.message.contains("record 3 is inert")),
             "live custom record must not be called inert"
+        );
+    }
+
+    /// `expect_nonce` arms the launch-nonce pin the dialer enforces against the
+    /// remote's session roster, and `sid` narrows which session it compares: the
+    /// pair is live and draws nothing. Only a `sid` with no `expect_nonce` is
+    /// inert, and only that is disclosed. (Until 2026-09-27 both keys were
+    /// reported as refused — the pin predates its enforcement landing.)
+    #[test]
+    fn a_pinned_sid_is_live_and_only_a_bare_sid_is_disclosed_inert() {
+        let fingerprint = "00".repeat(32);
+        let source = format!(
+            r#"
+[[net.connections]]
+name = "pinned"
+host = "one.example:7100"
+fingerprint = "{fingerprint}"
+sid = "abc"
+expect_nonce = "launch-pin"
+
+[[net.connections]]
+name = "bare"
+host = "two.example:7100"
+fingerprint = "{fingerprint}"
+sid = "abc"
+"#
+        );
+        let warnings = config_semantic_warnings(&parsed(&source));
+        let connection_warnings = warnings
+            .iter()
+            .filter(|warning| warning.key.starts_with("net.connections."))
+            .map(|warning| warning.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            connection_warnings.len(),
+            1,
+            "exactly the bare sid is disclosed: {connection_warnings:?}"
+        );
+        assert!(
+            connection_warnings[0].contains("record 2 has no effect without expect_nonce"),
+            "{connection_warnings:?}"
         );
     }
 
@@ -3596,6 +3695,7 @@ ink = "rainbow"
 
         let (message, valid) = validate_config_path(&path);
         assert!(!valid);
+        assert!(message.starts_with("config not read: "), "{message}");
         assert!(message.contains("exceeds"), "{message}");
         assert!(
             message.contains(&crate::native_config_service::MAX_CONFIG_FILE_BYTES.to_string()),
@@ -3606,6 +3706,29 @@ ink = "rainbow"
         )
         .unwrap_err();
         assert!(direct.contains("admission limit"), "{direct}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The verdict line says the file loads and how many lines need a look.
+    #[test]
+    fn cli_validation_verdict_says_the_file_loads_and_counts_the_warnings() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-config-validation-verdict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "qqq_unknown = 1\n").unwrap();
+        let (message, valid) = validate_config_path(&path);
+        assert!(valid, "{message}");
+        assert!(
+            message.starts_with(&format!(
+                "config {} loads, with 1 warning:\n  line 1: qqq_unknown ",
+                path.display()
+            )),
+            "{message}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3679,7 +3802,7 @@ ink = "rainbow"
             "{joined}"
         );
         assert_eq!(
-            joined.contains("conflicts with built-in New Tab"),
+            joined.contains("conflicts with built-in New Terminal Tab"),
             suite_live,
             "{joined}"
         );
@@ -3758,6 +3881,40 @@ ink = "rainbow"
         )
         .expect("valid");
         assert!(clean.is_empty(), "clean config must not warn: {clean:?}");
+
+        // A split with a side the runtime cannot read: the CLI names the side
+        // that draws Default, as Manual marks the selector.
+        assert_eq!(
+            validate_config_text("theme = \"dark:Nord,lite:Dracula\"\n").expect("valid"),
+            ["theme split mode \"lite\" must be dark or light; light mode uses Default"]
+        );
+        assert_eq!(
+            validate_config_text("theme = \"dark:,light:\"\n").expect("valid"),
+            ["theme split mode dark needs a theme name; both modes use Default"]
+        );
+
+        // Retired display-face ids load, so the enum walk accepts them; the
+        // validator still says what each one draws.
+        for (source, expected) in [
+            (
+                "display_font = \"minecraft\"\n",
+                "display_font: \"minecraft\" is deprecated; write \"pixel\" (same face)",
+            ),
+            (
+                "display_font = \"mariokart\"\n",
+                "display_font: \"mariokart\" is no longer shipped; your primary font is used",
+            ),
+            (
+                "display_font = \"pixel+mariokart\"\n",
+                "display_font: \"mariokart\" is no longer shipped and is skipped",
+            ),
+        ] {
+            assert_eq!(
+                validate_config_text(source).expect("valid"),
+                [expected],
+                "{source}"
+            );
+        }
 
         let retired = validate_config_text("cursor_style = \"underline\"\n")
             .expect("retired compatibility spelling remains structurally loadable");
@@ -4416,6 +4573,50 @@ ink = "rainbow"
         }
     }
 
+    /// The custom half names the folder a theme goes in, each theme that
+    /// loaded from it and each one that did not, with the reason; an empty or
+    /// absent folder says nothing loaded.
+    #[test]
+    fn list_themes_names_the_custom_folder_and_its_loaded_themes() {
+        let dir = std::env::temp_dir().join(format!("aterm-list-themes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut empty = String::new();
+        list_custom_themes(&mut empty, &dir);
+        assert_eq!(
+            empty,
+            format!(
+                "\ncustom themes (<name>.conf in {}):\n  (none loaded)\n",
+                dir.display()
+            )
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Work.conf"),
+            "foreground = #e0e0e0\nbackground = #101010\n",
+        )
+        .unwrap();
+        let mut listed = String::new();
+        list_custom_themes(&mut listed, &dir);
+        assert_eq!(
+            listed,
+            format!(
+                "\ncustom themes (<name>.conf in {}):\n  Work\n",
+                dir.display()
+            )
+        );
+        // A theme that does not parse is listed with its reason, never
+        // dropped into "(none loaded)".
+        std::fs::remove_file(dir.join("Work.conf")).unwrap();
+        std::fs::write(dir.join("Broken.conf"), "foreground = #ffffff\n").unwrap();
+        let mut broken = String::new();
+        list_custom_themes(&mut broken, &dir);
+        let header = format!("\ncustom themes (<name>.conf in {}):\n", dir.display());
+        let body = broken.strip_prefix(&header).expect("header first");
+        assert!(body.starts_with("  Broken — not loaded: "), "{broken}");
+        assert_eq!(body.lines().count(), 1, "{broken}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn list_fonts_has_dirs_header_and_lists_search_dirs() {
         let out = list_fonts();
@@ -4443,6 +4644,12 @@ ink = "rainbow"
             // A couple of the fixed Cmd-* chords are documented.
             assert!(out.contains("cmd+c"), "copy chord listed");
             assert!(out.contains("cmd+t"), "new-tab chord listed");
+            // So are the menu bar's own key equivalents, which reach the
+            // menu before `on_key` — ⇧⌘P among them.
+            assert!(
+                out.contains(&format!("  {:<16} Command Palette…", "cmd+shift+p")),
+                "{out}"
+            );
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -4636,7 +4843,12 @@ ink = "rainbow"
     #[test]
     fn show_config_reports_resolved_launch_values() {
         let out = show_config();
-        assert!(out.contains("resolved launch config"), "header present");
+        // No environment variable overrides an aterm.toml key (2026-09-24), so
+        // the header names no env rung.
+        assert!(
+            out.starts_with("resolved launch config (flag > config > default)\n"),
+            "header present: {out}"
+        );
         // The key resolved knobs are each surfaced with a label.
         for label in [
             "config file:",
@@ -4665,6 +4877,36 @@ ink = "rainbow"
             "12 (auto base; final physical px depends on display scale)"
         );
         assert_eq!(show_config_font_px(24.0, true), "24 (explicit physical px)");
+    }
+
+    /// `--show-config` is the resolved launch config, so a theme the window
+    /// draws Default in place of says so beside the configured name.
+    #[test]
+    fn show_config_theme_names_what_each_appearance_draws() {
+        let themes = crate::app_config::ThemeCatalog::from_schemes([(
+            "Work".to_string(),
+            aterm_types::ColorScheme::default(),
+        )]);
+        let line = |theme: Option<&str>| {
+            let config = crate::app_config::Config {
+                theme: theme.map(str::to_string),
+                ..Default::default()
+            };
+            show_config_theme(&config, &themes)
+        };
+        assert_eq!(line(None), "Default");
+        assert_eq!(line(Some("Work")), "Work");
+        assert_eq!(line(Some("Nord")), "Nord");
+        assert_eq!(line(Some("dark:Nord,light:Work")), "dark:Nord,light:Work");
+        assert_eq!(line(Some("Drakula")), "Drakula (Default in use)");
+        assert_eq!(
+            line(Some("dark:Nord,light:Drakula")),
+            "dark:Nord,light:Drakula (in use: dark Nord, light Default)"
+        );
+        assert_eq!(
+            line(Some("dark:Nord,lite:Work")),
+            "dark:Nord,lite:Work (in use: dark Nord, light Default)"
+        );
     }
 
     /// The renderer label the reports print is derived from the SHARED backend

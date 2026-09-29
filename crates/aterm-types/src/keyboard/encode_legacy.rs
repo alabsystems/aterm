@@ -148,8 +148,8 @@ fn encode_control_named_legacy(
             // Ctrl+Enter stays CR. Under ConPTY win32-input-mode (DEC 9001, the
             // first arm of `encode_key_with_layout`) the Shift/Ctrl chords never
             // reach here: conhost reads a bare LF as Ctrl+Enter, so they go out
-            // as a win32 key record whose UnicodeChar is this same LF — the
-            // policy, carried across the pipe.
+            // as the win32 key record a Windows keyboard makes (`win32_enter_chord`:
+            // CR for Shift+Enter, LF with Ctrl).
             if modifiers.contains(Modifiers::ALT) {
                 vec![0x1b, 0x0d]
             } else if modifiers.contains(Modifiers::SHIFT) && !modifiers.contains(Modifiers::CTRL) {
@@ -168,6 +168,11 @@ fn encode_control_named_legacy(
                 vec![0x09]
             }
         }
+        // Under ConPTY win32-input-mode (DEC 9001) these bytes are still the
+        // question `win32_escape_record` asks, but never the answer sent:
+        // once conhost has read one win32 record it holds a lone ESC (and
+        // `ESC ESC`) until the next byte arrives, so Escape goes out as a
+        // record there.
         NamedKey::Escape => {
             if modifiers.contains(Modifiers::ALT) {
                 vec![0x1b, 0x1b]

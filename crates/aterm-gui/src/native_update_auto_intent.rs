@@ -156,10 +156,58 @@ pub(crate) struct ActivityFacts {
     /// capped by `[privacy] warmup_hold_ms`, and landing on top of a dialog
     /// they asked for would throw away their answer.
     pub(crate) consent_warmup: bool,
+    /// `HostHandle::restored_pending`: a cold restore's agents are still being
+    /// relaunched in the tabs it reopened (round four of the 2026-09 update
+    /// robustness work, plan item 7). Refused in EVERY phase, `Land`
+    /// included, like the warm-up and for the same reason: it is a bounded
+    /// hold that is not the terminal's activity — a queue of seconds, capped
+    /// at `harness_host::RESTORED_HOLD` from the first relaunch and once per
+    /// process — and landing in the middle of it interrupts relaunches the
+    /// reopened layout's row just promised. Past the cap the update lands
+    /// and the successor carries the rest.
+    pub(crate) harness_restored_pending: bool,
 }
 
 /// The refusal that means only the person's TYPING holds the park.
 const TYPING_REFUSAL: &str = "a keystroke landed in an aterm window inside the typing gap";
+
+/// The refusal while a cold restore's agents are still being relaunched
+/// ([`ActivityFacts::harness_restored_pending`]).
+pub(crate) const RESTORED_PENDING_REFUSAL: &str =
+    "the agents of the tabs a restore reopened are still being relaunched";
+
+/// The one log line the restored agents' hold earns at a poll of the automatic
+/// lane for `build`, if any: when `holding` begins it says so — the hold and its
+/// bound — and when it ends it says that too; `said` is the ladder's record of
+/// which was said last, so each is said once.
+///
+/// WHY IT IS SAID AT ALL (the round-four review): the hold refuses every phase,
+/// `Land` included, for up to [`crate::harness_host::RESTORED_HOLD`], while the
+/// phase line had just logged "now waiting for nothing: it lands at the next
+/// poll" and each deferral is logged only at debug. Minutes of arm-then-silence
+/// past that promise, with nothing saying why, is exactly the shape the ladder's
+/// phase lines were written to end. `update status` names the hold too
+/// (`apply_held=`).
+pub(crate) fn restored_hold_line(build: u64, holding: bool, said: &mut bool) -> Option<String> {
+    match (holding, *said) {
+        (true, false) => {
+            *said = true;
+            Some(format!(
+                "update auto-apply for build {build}: held while {RESTORED_PENDING_REFUSAL} (at \
+                 most {} s from the first relaunch); it lands once they are back",
+                crate::harness_host::RESTORED_HOLD.as_secs()
+            ))
+        }
+        (false, true) => {
+            *said = false;
+            Some(format!(
+                "update auto-apply for build {build}: the restored agents' hold is over; it \
+                 lands as soon as the ladder allows"
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// Why the automatic lane will not park in `phase` given `facts`, or `None`
 /// when it may. ONE predicate for the two places that ask — the entry
@@ -173,6 +221,9 @@ pub(crate) fn automatic_park_refusal(
 ) -> Option<&'static str> {
     if facts.consent_warmup {
         return Some("a folder-access warm-up the user started is still running");
+    }
+    if facts.harness_restored_pending {
+        return Some(RESTORED_PENDING_REFUSAL);
     }
     match phase {
         ApplyPhase::Land => None,
@@ -373,6 +424,22 @@ pub(crate) enum StructuralLatchDecision {
         machine = "NativeUpdateStructuralLatch",
         action = "RetryDue",
         reason = "The monotonic clock passing a refused retire's retry deadline (`AutoApplyStructuralVerdict::newer_retry`); the host reads it into `unspent_newer_download` / `newer_download_waiting`."
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "TrialUnreadable",
+        reason = "The installed facts ceasing to report the latched build (the facts worker drops a yanked bundle newer than the running one); the host reads it as `trial_room: None`, and its bound on such looks is `App::look_at_structural_latch`'s."
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "TrialReadAgain",
+        reason = "The installed facts reporting the latched build again; the host reads it into `trial_room`, and a look that finds it clears the unread count."
     )
 )]
 #[must_use]
@@ -772,6 +839,7 @@ mod tests {
             output_quiet: true,
             focused: true,
             consent_warmup: false,
+            harness_restored_pending: false,
         };
         for phase in [
             ApplyPhase::PreferIdle,
@@ -856,6 +924,52 @@ mod tests {
                 "{phase:?}"
             );
         }
+
+        // A cold restore's agents still being relaunched hold every phase too
+        // — `Land` included (round four, plan item 7): the landing used to
+        // drop the queue right after the reopened layout's row said they
+        // resume. RED before the change: there was no such fact, and `Land`
+        // parked over the queue. Bounded by the host, never by the ladder
+        // (`harness_host::RESTORED_HOLD`).
+        let relaunching = ActivityFacts {
+            harness_restored_pending: true,
+            ..calm
+        };
+        for phase in [
+            ApplyPhase::PreferIdle,
+            ApplyPhase::PreferOutputGap,
+            ApplyPhase::KeysOnly,
+            ApplyPhase::Land,
+        ] {
+            assert_eq!(
+                automatic_park_refusal(phase, relaunching),
+                Some(RESTORED_PENDING_REFUSAL),
+                "{phase:?}"
+            );
+        }
+        // Everything the ladder relaxes at `Land` — keys, output, focus — still
+        // does not release it; only the queue emptying or its bound does.
+        let relaunching_busy = ActivityFacts {
+            quiet: false,
+            hands_off_keys: false,
+            output_quiet: false,
+            ..relaunching
+        };
+        assert_eq!(
+            automatic_park_refusal(ApplyPhase::Land, relaunching_busy),
+            Some(RESTORED_PENDING_REFUSAL)
+        );
+        assert_eq!(
+            automatic_park_refusal(
+                ApplyPhase::Land,
+                ActivityFacts {
+                    harness_restored_pending: false,
+                    ..relaunching_busy
+                }
+            ),
+            None,
+            "the queue done, the landing is at once"
+        );
     }
 
     #[test]

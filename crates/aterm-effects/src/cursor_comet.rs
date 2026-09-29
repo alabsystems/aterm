@@ -17,7 +17,7 @@
 //! * **on a jump** — the flare slams the blaze to full, so the landing nucleus
 //!   ignites white-hot and visibly refreezes back through the trail hue.
 //!
-//! Text-safe by construction, mirroring [`crate::cursor_fireball`]: the block
+//! Text-safe by construction, mirroring [`crate::cursor_rainbow`]: the block
 //! FILL is returned for the renderer's `floor_cursor_fill` contrast floor (the
 //! cut-out glyph stays razor-sharp), and the coma/glints are purely additive
 //! [`GlowQuad`] light with capped coverage. Like its siblings it is a CLOCKLESS
@@ -44,8 +44,7 @@ use crate::effect_util::lerp_rgb;
 use crate::effect_util::push_fx_rect as push_rect;
 
 /// Shimmer rate in turns/second: a slow glacial drift at rest, a lively glitter
-/// at full blaze — deliberately calmer than the fireball's flicker (ice glints,
-/// it doesn't roar). The phase only advances when frames render, so a settled
+/// at full blaze — deliberately calm (ice glints, it doesn't roar). The phase only advances when frames render, so a settled
 /// nucleus shimmers at the blink cadence for free.
 const SHIMMER_IDLE: f32 = 0.7;
 const SHIMMER_ACTIVE: f32 = 3.2;
@@ -64,7 +63,7 @@ const RADIUS_MAX: f32 = 0.82;
 const COV_IDLE: f32 = 58.0;
 const COV_MAX: f32 = 148.0;
 /// Per-quad additive coverage ceiling — the same text-safety band as the
-/// fireball and the flame curtain (the readable-at-full-blaze tuning). Inner
+/// light rod and the flame curtain (the readable-at-full-blaze tuning). Inner
 /// discs saturate here (they sit over the cursor cell itself); the wide fringe
 /// quads that actually overlap neighbouring glyphs run at a fraction and stay
 /// a tint.
@@ -150,7 +149,7 @@ impl CursorComet {
         let e = (blaze.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         // Fully inert — byte-identical to the plain themed cursor — when off,
         // when the geometry is degenerate, or when the amplitude is zero
-        // (reduced motion / load-shed), mirroring the fireball's "0 ⇒ off"
+        // (reduced motion / load-shed), mirroring the rainbow block's "0 ⇒ off"
         // contract.
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.blaze = 0.0; // inert: report settled so the host disarms the tick

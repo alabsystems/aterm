@@ -138,7 +138,14 @@ struct SubscriberWait(Subscription);
 
 impl ChangeWait for SubscriberWait {
     fn wait(&self, timeout: Duration) -> bool {
-        self.0.wait(timeout)
+        // Sliced while a socket connection is being served, so the waiting
+        // verb re-asks `caller_gone` often enough to give a dead caller's lane
+        // back promptly.
+        self.0.wait(crate::control::hangup_park(timeout))
+    }
+
+    fn caller_gone(&self) -> bool {
+        crate::control::caller_hung_up()
     }
 }
 
@@ -395,6 +402,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         });
         SessionHandle {
             sid,

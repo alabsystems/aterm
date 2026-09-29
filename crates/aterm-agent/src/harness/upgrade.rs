@@ -661,6 +661,37 @@ pub fn launch_model(argv: &[String]) -> Option<String> {
     }
 }
 
+/// THE CONVERSATION A LAUNCH RESUMED, as Claude's parser reads `argv`
+/// (argv[0] included): `Some(Some(id))` for `--resume <id>` / `-r <id>` (the
+/// last resume flag wins, as Claude's parser keeps the last value);
+/// `Some(None)` for a resume that names no conversation the process keeps —
+/// `--continue` / `-c`, a bare `--resume` (Claude's picker), or any resume
+/// with `--fork-session`, which gives the conversation a new id; `None` for
+/// a launch that resumed nothing. Unlike [`launch_model`] it reads an argv
+/// the rewrite refuses too: a flag this table does not know is read as a
+/// switch.
+#[must_use]
+pub fn launch_resume(argv: &[String]) -> Option<Option<String>> {
+    let mut resumed: Option<Option<String>> = None;
+    let mut fork = false;
+    for (name, _, tokens) in parsed(argv) {
+        match name {
+            "--resume" | "-r" => {
+                let id = match tokens {
+                    [one] => one.split_once('=').map(|(_, v)| v.to_string()),
+                    [_, value] => Some(value.clone()),
+                    _ => None,
+                };
+                resumed = Some(id.filter(|id| !id.is_empty()));
+            }
+            "--continue" | "-c" => resumed = Some(None),
+            "--fork-session" => fork = true,
+            _ => {}
+        }
+    }
+    resumed.map(|id| id.filter(|_| !fork))
+}
+
 /// The tab's shell, as its executable names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
@@ -957,6 +988,28 @@ pub fn ready_marker(session_id: &str, to: &Version, salt: u64) -> String {
 /// The fixed words every READY marker opens with ([`ready_marker`]).
 pub const READY_PREFIX: &str = "ATERM-UPGRADE-READY-";
 
+/// The one-time SAVED marker of a Codex save-then-wait switch's wind-down
+/// (`supervise::policy::turn_end::wind_down_text`): fixed words plus a short
+/// id the agent cannot have seen before the instruction, answered on a line
+/// of its own only once everything is committed and pushed — read by the
+/// same line rule as the READY answer ([`is_ready_line`]).
+#[must_use]
+pub fn saved_marker(session_id: &str, to: &str, salt: u64) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in session_id
+        .bytes()
+        .chain(to.bytes())
+        .chain(salt.to_le_bytes())
+    {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{SAVED_PREFIX}{:08x}", h & 0xffff_ffff)
+}
+
+/// The fixed words every SAVED marker opens with ([`saved_marker`]).
+pub const SAVED_PREFIX: &str = "ATERM-SAVED-";
+
 /// Whether one line of an agent's words IS the READY answer `marker` by the
 /// rule [`transcript_has_ready`] reads the transcript with: the line, trimmed
 /// of spaces and backticks, is the whole marker. Words that merely QUOTE a
@@ -999,12 +1052,31 @@ pub fn prepare_prompt(from: &Version, to: &Version, source: Source, marker: &str
 /// to keep exactly that. Told what ran, with the clause below, the agent
 /// checked the count, stopped both loops, and answered READY within
 /// minutes. aterm itself still ends nothing ([`gate_restart`]).
+///
+/// A WATCH IS NOT WORK EITHER (design record 2026-09-28, §3.2 C7c): tab #1
+/// stayed on Claude Code 2.1.280 for three days behind the agent's own
+/// `while true; … df …; sysctl vm.swapusage …; sleep 120; done`, four days
+/// old, which ends only on an alert. It waits on nothing that has ended, so
+/// the clause above did not name it, and the restart gate waits on anything
+/// under the agent. A monitor the agent can start again after the resume
+/// loses nothing by stopping, so the notice asks for that too, and asks the
+/// agent to note it; the carry-on reminds it to start it again
+/// ([`RESTART_WATCHES`]).
 pub const STOPPING_POINT: &str = "Please get to a good stopping point first: let \
      background tasks, subagents or workflows you started finish while they are still making \
      progress (do not cancel them), but stop any background shell or task of yours that only \
      waits for something that has already ended or can never happen (a poll loop on a workflow, \
-     agent, job or file that is gone): that wait is not work. Save or commit work in progress, \
-     and do not start new long-running work.";
+     agent, job or file that is gone): that wait is not work. A watch or monitor loop you can \
+     start again after the resume (a disk or swap watch, a status poll) is not work either: \
+     stop it, and note it. Save or commit work in progress, and do not start new long-running \
+     work.";
+
+/// What an UPGRADE's carry-on adds ([`continue_prompt`],
+/// [`continue_prompt_with_model`]): the other half of [`STOPPING_POINT`]'s
+/// watch clause. Never a relaunch's (`super::relaunch::resumed_prompt`),
+/// whose notice asked nothing to be stopped.
+pub const RESTART_WATCHES: &str =
+    "If you stopped a watch or loop for this restart, start it again now.";
 
 /// One process under the agent that the restart waits on, as the notice
 /// names it ([`running_clause`]). `age_s` is its elapsed time. `command` is
@@ -1069,6 +1141,14 @@ pub fn running_clause(held: &[Held]) -> String {
 /// paths elided before the cut (`command_words`). Empty when nothing runs.
 #[must_use]
 pub fn held_list(held: &[Held]) -> String {
+    // OLDEST FIRST (design record 2026-09-28, §3.2 C7c): only the first
+    // [`HELD_NAMED`] are named, and they were named in the order the process
+    // table gave them. Tab #1 held 15 processes; its four-day watch loop,
+    // the one that held the restart, could fall among the counted ten while
+    // five shells a minute old were named. A stable sort, so processes of the
+    // same age keep their given order.
+    let mut held: Vec<&Held> = held.iter().collect();
+    held.sort_by_key(|h| std::cmp::Reverse(h.age_s));
     let mut out = String::new();
     for (i, h) in held.iter().take(HELD_NAMED).enumerate() {
         if i > 0 {
@@ -1281,7 +1361,8 @@ pub fn continue_prompt_with_model(
     let why = models::move_why(ran, model).words();
     format!(
         "{HARNESS_MARK} Upgraded: this session was restarted {build} and resumed; {runs} \
-         {model}, {why} (for this session only: your default model is unchanged). {CARRY_ON}"
+         {model}, {why} (for this session only: your default model is unchanged). \
+         {RESTART_WATCHES} {CARRY_ON}"
     )
 }
 
@@ -1298,7 +1379,7 @@ pub fn continue_prompt(from: &Version, to: &Version, ran: Option<&str>) -> Strin
     };
     format!(
         "{HARNESS_MARK} Upgraded: this session was restarted on Claude Code {to} (from \
-         {from}){resumed}. {CARRY_ON}"
+         {from}){resumed}. {RESTART_WATCHES} {CARRY_ON}"
     )
 }
 
@@ -1350,7 +1431,7 @@ fn assistant_models<'a>(
         if !line.contains("assistant") {
             return None;
         }
-        let v = aterm_json::from_str::<Value>(line).ok()?;
+        let v = super::transcript::metadata(line).ok()?;
         if v.get("type").and_then(Value::as_str) != Some("assistant")
             || v.get("isSidechain").and_then(Value::as_bool) == Some(true)
             || version.is_some_and(|want| v.get("version").and_then(Value::as_str) != Some(want))
@@ -1577,13 +1658,13 @@ fn turn_of(line: &str) -> Option<Turn> {
     if !line.contains("\"user\"") && !line.contains("assistant") {
         return None;
     }
-    let v = aterm_json::from_str::<Value>(line).ok()?;
+    let mut v = super::transcript::conversation(line).ok()?;
     if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return None;
     }
     match v.get("type").and_then(Value::as_str) {
         Some("assistant") => {
-            let message = v.get("message").cloned().unwrap_or_default();
+            let message = v.as_object_mut()?.remove("message").unwrap_or_default();
             let theirs = message
                 .get("model")
                 .and_then(Value::as_str)
@@ -1703,7 +1784,7 @@ fn login_rows(jsonl: &str) -> impl Iterator<Item = (LoginRow, Option<u64>)> + '_
         {
             return None;
         }
-        let v = aterm_json::from_str::<Value>(line).ok()?;
+        let v = super::transcript::conversation(line).ok()?;
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             return None;
         }
@@ -2018,7 +2099,7 @@ pub fn notice_scan(jsonl: &str, marker: &str) -> Option<Scan> {
         {
             continue;
         }
-        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+        let Ok(v) = super::transcript::conversation(line) else {
             continue;
         };
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
@@ -2163,7 +2244,7 @@ pub fn transcript_limit_until(jsonl: &str) -> Option<u64> {
         if !line.contains("assistant") && !line.contains("Login successful") {
             continue;
         }
-        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+        let Ok(v) = super::transcript::conversation(line) else {
             continue;
         };
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
@@ -2385,7 +2466,7 @@ impl TaskScan {
         if self.tasked || !(line.contains("\"user\"") || line.contains("\"assistant\"")) {
             return self.tasked();
         }
-        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+        let Ok(v) = super::transcript::conversation(line) else {
             return self.tasked();
         };
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
@@ -2547,13 +2628,15 @@ pub struct Facts {
     /// ([`hold_since`]; 0: none now).
     pub hold_s: u64,
     /// The owner's `aterm harness upgrade <sid> --now` is in force for this
-    /// tab ([`Request::Now`], applied by [`requested_step`]): it waives the
-    /// settling window ([`QUIET_S`]) and the attended-tab guard
-    /// ([`Self::attended`]) — both exist so a person reading the answer is not
-    /// typed over, and this is that person asking — and nothing else: Claude
-    /// idle, an empty composer, no box, no busy footer and no hold are still
-    /// asked of the screen as it is now, and the READY answer and an empty
-    /// process tree of the restart ([`gate_restart`]).
+    /// tab ([`Request::Now`], applied by [`requested_step`]): the upgrade
+    /// stands at the LAST RUNG of its ladder at once ([`Rung::Land`], the
+    /// owner's decision of 2026-09-28) — no settling window, and a person at
+    /// the tab only while they typed within [`KEYS_GAP_S`] — and nothing else:
+    /// Claude idle, an empty composer, no box, no busy footer, no hold and no
+    /// keystroke in the last [`KEYS_GAP_S`] are still asked of the screen as
+    /// it is now, and the READY answer and an empty process tree of the
+    /// restart ([`gate_restart`]). Until 2026-09-28 it waived the person
+    /// outright: a signal could follow a keystroke by a second.
     pub owner_now: bool,
     /// A person is at the tab: a PERSON gave THIS session input within
     /// `[harness] human_grace_s`, by the server's per-session person stamp
@@ -2568,7 +2651,14 @@ pub struct Facts {
     /// signalled in, such a tab ([`gate_announce`], [`gate_restart`]) unless
     /// the owner's `--now` is in force ([`Self::owner_now`]). It is the gate's
     /// FIRST wait after a hold, ahead of Claude's status, so a busy attended
-    /// tab waits `attended` too, and the upgrade owns none of its turn ends.
+    /// tab waits `attended` too. The upgrade owns the tab's turn ends while it
+    /// does, through the person's grace to the look that finds it lapsed,
+    /// bounded only by a backstop on the looks at one point
+    /// (`upgrade_drive::owns_turn_ends`): the loop holds off for that grace
+    /// anyway, and owning nothing it typed `keep going` over a READY the
+    /// moment the grace lapsed (2026-09-27). The look past the grace that
+    /// finds the agent's own work running instead waits on that, and gives
+    /// the turn ends back.
     pub attended: bool,
     /// The step is taken at A BREAK OF THE AGENT'S OWN BACKGROUND WORK (the
     /// owner's answer of 2026-09-26: "Busy agentic sessions get upgraded at
@@ -2690,6 +2780,267 @@ pub struct Facts {
     /// stamp, and reads as stopped long ago. Past [`RETRY_S`] the round is
     /// re-armed ([`Step::Rearm`]): no stop is for good.
     pub failed_s: u64,
+    /// THE AGENT'S OWN WORK HAS ENDED (2026-09-28, s-692e6: every notice was
+    /// answered "I can't stop yet, my workflow is still running; ask again
+    /// later" — and the one moment the move could finish, the first idle point
+    /// after the workflow, went to the loop's `keep going`, because the round
+    /// there waited `awaiting-ready` or rested `failed`, words that own no turn
+    /// end): a look since the latest notice saw the agent's own work run — a
+    /// break of it, or processes under it (`upgrade_drive::St::work_seen`) —
+    /// and THIS look is an idle point with nothing under the agent. What the
+    /// agent's "not yet" waited on is over: [`next_step`] asks again here, at
+    /// once, rather than after [`REASK_S`] — or re-arms a round that gave up
+    /// and asks in the same visit — once [`gate_restart`] would let a READY
+    /// agent go. At most once per end of its work: the notice it leads to
+    /// clears the driver's stamp. What that gate waits on holds an announced
+    /// round only inside the re-ask's window: past it the re-ask decides
+    /// (a status that never catches up with the idle screen is no hold for
+    /// good, the review of 2026-09-28).
+    pub work_ended: bool,
+    /// WHERE THE UPGRADE STANDS ON ITS LADDER ([`rung`] of how long the
+    /// session has been behind; the owner's decision of 2026-09-28): what the
+    /// gate may pass that the natural idle point would not. [`Rung::Prefer`]
+    /// by default — the gate as it always was.
+    pub rung: Rung,
+    /// A PERSON TYPED into this session within [`KEYS_GAP_S`] (the server's
+    /// person stamp, as [`Self::attended`] reads it over its own grace): the
+    /// one presence fact the ladder keeps from [`Rung::KeysOnly`] on, when a
+    /// person merely near the tab no longer holds it. Never waived — the
+    /// owner's `--now` included. A stamp the host does not send (a build
+    /// older than it, read by a hand-run sweep) is no keystroke here:
+    /// [`Self::attended`] fails closed on it below [`Rung::KeysOnly`], and a
+    /// person typing is a draft ([`Self::composer_empty`]) at every rung.
+    pub typing: bool,
+    /// Seconds the session's own reader has read the screen AUTHORITATIVELY
+    /// IDLE with the SAME LAST WORDS, look after look of one process, none
+    /// more than `upgrade_drive::IDLE_RUN_GAP_S` apart (`St::still`; 0: this
+    /// look begins the run, or read anything else) — the REPAINT-PROOF SETTLE
+    /// the ladder counts from [`Rung::Settled`]: a footer clock, a title
+    /// spinner or a goal timer redrawn between two looks restarts the
+    /// screen's own quiet ([`Self::quiet_s`]) but not this, which only new
+    /// words or a look that is not idle begin again. Positive only across two
+    /// looks at least.
+    pub still_s: u64,
+    /// A TURN RUNS WHERE THE SCREEN DOES NOT SHOW IT ([`DaemonTurn`]): a
+    /// daemon-mode Codex client's daemon holds a thread whose rollout says a
+    /// turn is running, and that thread is of this client's own conversation
+    /// — its root or a subagent it spawned, named by the kernel — or one the
+    /// lane cannot place in another session (`upgrade_codex::daemon_turn`:
+    /// a subagent's, a root's with no other Codex attached, one not yet
+    /// placed). Its `/exit` might stop this client's
+    /// own turn: Codex 0.158.0's binary holds `Disconnected from this task.
+    /// The current turn was stopped.` beside 0.157's measured `Any running
+    /// work continues.`, and which case prints it is unmeasured — so nothing
+    /// is typed there at any rung: the running-work floor the ladder never
+    /// relaxes (`NoRunningWorkInterrupted`). Measured 2026-09-28: a goal-mode
+    /// thread began its next turn within 14 ms of every turn's end while its
+    /// screen read an ENDED turn, idle as evidence, for seconds at a time —
+    /// the next turn's first message streaming under the last one's end row
+    /// (`aterm_phase::codex::fixtures::GOAL_NEXT_TURN_0_158`). A turn in
+    /// ANOTHER session on the same daemon holds nothing here once this
+    /// screen has placed it there (`AnotherSessionsTurnHoldsNothing`) — which
+    /// it never does under a goal of its own, whose turns it cannot see
+    /// (`PlacedUnderAGoal`), nor for a subagent's turn or a root's with this
+    /// client the daemon's only Codex (`PlacedAsItRan`: the third review of
+    /// 2026-09-28, the owner's tab's own subagents taken for another
+    /// session's). [`DaemonTurn::None`] for every other agent.
+    pub daemon_turn: DaemonTurn,
+}
+
+/// WHERE A TURN RUNS THAT A DAEMON-MODE CODEX CLIENT'S SCREEN MAY NOT SHOW
+/// ([`Facts::daemon_turn`], the gate's running-work floor; decided by
+/// `upgrade_codex::daemon_turn`). Each is its own wait, worded by what holds
+/// the tab — never a goal paused in the wrong tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DaemonTurn {
+    /// No turn this client's move must wait for: every thread idle, or only
+    /// another session's root running, placed there.
+    #[default]
+    None,
+    /// This client's OWN conversation runs a turn in the daemon — its root's,
+    /// or a subagent's it spawned (`daemon-turn`).
+    Own,
+    /// This client's own conversation runs a turn, and its screen says a GOAL is
+    /// being pursued (`goal`: `Pursuing goal (…)` in its footer) — the one
+    /// wait the owner's decision of 2026-09-28 lets aterm lift, by pausing
+    /// the goal briefly for the move (`/goal pause`, the move, `/goal
+    /// resume`: `upgrade_codex::goal_step`, from the ladder's Land rung or
+    /// the owner's `--now`). The gate still waits on it — the pause lifts it
+    /// by letting the goal's last turn end with no turn after it, never by
+    /// passing over a running one.
+    Goal,
+    /// A turn runs in the daemon that the lane cannot place (`daemon-busy`):
+    /// the client's own conversation is not named (the daemon holds more than
+    /// one root, a thread no loaded root claims, or serves more than this
+    /// client), and the turn is a subagent's (never placed: its turns draw on
+    /// no screen), or a root's with this client the daemon's only Codex
+    /// (never placed: not provably another session's), or one that has not
+    /// run through [`QUIET_S`] (20 s) of this tab's still screen, which would
+    /// place it in another session — or this screen's footer shows a goal
+    /// being pursued, under which nothing is placed (that goal's next turn
+    /// runs where the screen reads idle, as another session's would: the
+    /// second review of 2026-09-28). Said as neither this tab's nor another
+    /// session's (the third review: the owner's were this tab's subagents).
+    Unplaced,
+}
+
+impl DaemonTurn {
+    /// The gate's wait word ([`gate`]).
+    #[must_use]
+    pub fn wait(self) -> Option<&'static str> {
+        match self {
+            DaemonTurn::None => None,
+            DaemonTurn::Own => Some("daemon-turn"),
+            DaemonTurn::Goal => Some("goal"),
+            DaemonTurn::Unplaced => Some("daemon-busy"),
+        }
+    }
+}
+
+/// THE LADDER'S RUNGS (the owner's decision of 2026-09-28: "Time ladder —
+/// prefer a natural pause; the longer it has been behind, the less it waits:
+/// after 20 min a pause that only looks quiet counts, after 1 h 'you're at
+/// the tab' means only that you typed in the last 20 s, and by about 2 h it
+/// moves at the first such pause. It never types over a draft, a dialog or
+/// running work."). ONE ladder, keyed on how long the session has been behind
+/// ([`rung`]), the law of aterm's own update ladder
+/// (docs/DESIGN-auto-apply-ladder-2026-09-21.md): ACTIVITY DELAYS; IT NEVER
+/// DISABLES. Every rung keeps every floor: aterm's hold, the usage limit and
+/// the login wall, a full queue, the agent's own turn and work (Claude's
+/// status, its busy footer, the shells under it, a Codex client's own turn in
+/// its daemon: [`Facts::daemon_turn`]), a box, a draft, a keystroke within
+/// [`KEYS_GAP_S`], the READY answer and an empty process tree of the restart.
+/// What the rungs relax is only what waits for comfort: the settle
+/// ([`QUIET_S`]) and a person merely near the tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rung {
+    /// The natural idle point: Claude idle, the screen still [`QUIET_S`], no
+    /// person within `[harness] human_grace_s`.
+    #[default]
+    Prefer,
+    /// From [`RUNG_SETTLED_S`]: a pause that only LOOKS quiet counts — the
+    /// reader read the screen idle with the same last words across two looks
+    /// [`QUIET_S`] apart ([`Facts::still_s`]), however the screen repainted
+    /// between them (a goal-mode Codex's footer ticks by the minute).
+    Settled,
+    /// From [`RUNG_KEYS_S`]: a person at the tab holds it only while they
+    /// typed within [`KEYS_GAP_S`] ([`Facts::typing`]).
+    KeysOnly,
+    /// From [`RUNG_LAND_S`] — and at once on the owner's `--now`: the first
+    /// such pause, its settle waived; still no keystroke within
+    /// [`KEYS_GAP_S`], and every floor.
+    Land,
+}
+
+impl Rung {
+    /// The word `--status`, the ledger and the rows carry.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Rung::Prefer => "prefer",
+            Rung::Settled => "settled",
+            Rung::KeysOnly => "keys-only",
+            Rung::Land => "land",
+        }
+    }
+}
+
+/// When a pause that only LOOKS quiet starts to count ([`Rung::Settled`]):
+/// twenty minutes behind (the owner, 2026-09-28).
+pub const RUNG_SETTLED_S: u64 = 20 * 60;
+
+/// When a person merely at the tab stops holding it ([`Rung::KeysOnly`]): an
+/// hour behind (the owner, 2026-09-28).
+pub const RUNG_KEYS_S: u64 = 3_600;
+
+/// When the upgrade moves at the first pause ([`Rung::Land`]): two hours
+/// behind (the owner, 2026-09-28: "by about 2 h"). What the owner is told the
+/// move comes by (`upgrade_status::Row::lands_by`).
+pub const RUNG_LAND_S: u64 = 2 * 3_600;
+
+/// How recent a keystroke still holds the upgrade from [`Rung::KeysOnly`] on,
+/// and at the owner's `--now` ([`Facts::typing`]): twenty seconds (the owner,
+/// 2026-09-28: "'you're at the tab' means only that you typed in the last
+/// 20 s"). Never relaxed.
+pub const KEYS_GAP_S: u32 = 20;
+
+const _: () = assert!(RUNG_SETTLED_S < RUNG_KEYS_S && RUNG_KEYS_S < RUNG_LAND_S);
+const _: () = assert!(KEYS_GAP_S as u64 <= QUIET_S);
+
+/// THE LAST WORDS' PRINT for the repaint-proof settle ([`Facts::still_s`]):
+/// `pid`'s screen `rows` ABOVE its composer's caret row (`composer_row`) —
+/// the transcript as drawn, the last words among them — each trimmed at its
+/// end, the blank rows under them dropped, hashed (FNV-1a, 64 bits, as 16
+/// hex digits) with the process. What changes it: new words, a new process.
+/// What does not: the composer's own row (a dim suggestion drawn, a cursor
+/// blink) and everything under it (a footer's clock, Codex's `Pursuing goal
+/// (10d 2h 51m)` counter, a context meter) — the repaints that restarted the
+/// screen's own quiet at every look of a goal-mode Codex (2026-09-28).
+#[must_use]
+pub fn still_print(pid: u32, rows: &[String], composer_row: usize) -> String {
+    let above = rows.get(..composer_row).unwrap_or(rows);
+    let kept = above
+        .iter()
+        .rposition(|r| !r.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    eat(&pid.to_le_bytes());
+    for row in &above[..kept] {
+        eat(row.trim_end().as_bytes());
+        eat(b"\n");
+    }
+    format!("{h:016x}")
+}
+
+/// The rung of an upgrade `behind_s` seconds behind ([`Rung`]).
+#[must_use]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeLadder",
+        action = "Advance",
+        project = "aterm_agent::harness::upgrade_drive::ladder_projection"
+    )
+)]
+pub fn rung(behind_s: u64) -> Rung {
+    if behind_s >= RUNG_LAND_S {
+        Rung::Land
+    } else if behind_s >= RUNG_KEYS_S {
+        Rung::KeysOnly
+    } else if behind_s >= RUNG_SETTLED_S {
+        Rung::Settled
+    } else {
+        Rung::Prefer
+    }
+}
+
+/// The rung the gate reads: [`Rung::Land`] under the owner's `--now`
+/// ([`Facts::owner_now`]: "Upgrade now" jumps straight to the last rung,
+/// keeping every floor), else the ladder's own.
+#[must_use]
+pub fn rung_in_force(f: &Facts) -> Rung {
+    if f.owner_now { Rung::Land } else { f.rung }
+}
+
+/// The GRACE a person's hand keeps the upgrade's acts off for at `rung`: the
+/// harness's own `grace_s` (`[harness] human_grace_s`) until
+/// [`Rung::KeysOnly`], then [`KEYS_GAP_S`] (or `grace_s`, if the owner set it
+/// shorter). What the drivers ask the server's person stamp with — for
+/// [`Facts::typing`], and for the restart's signal and the relaunch line's
+/// `quiet=` (`upgrade_drive`), the Codex `/exit` and its daemon's move.
+#[must_use]
+pub fn person_grace(rung: Rung, grace_s: u32) -> u32 {
+    if rung >= Rung::KeysOnly {
+        grace_s.min(KEYS_GAP_S)
+    } else {
+        grace_s
+    }
 }
 
 /// How many looks in a row must read the screen authoritatively idle
@@ -2769,9 +3120,10 @@ pub fn attended_by(human: crate::supervise::screen::HumanInput, grace_s: u32) ->
 ///
 /// THE PERSON IS ASKED FIRST, before Claude's status (review of
 /// 2026-09-25): a busy attended tab waits `attended`, not `not-idle` — the
-/// wait that names what actually holds it, so the owner reads the person, and
-/// the upgrade owns none of the tab's turn ends for a notice it would refuse
-/// to type.
+/// wait that names what actually holds it, so the owner reads the person. The
+/// upgrade owns the tab's turn ends only for the person's grace
+/// (`upgrade_drive::owns_turn_ends`), and the look past it re-asks Claude's
+/// status: a notice it would refuse to type then owns nothing.
 ///
 /// `not-idle` IS ALSO A TURN THAT ENDED WITH WORK STILL RUNNING. While a
 /// dynamic workflow or another background task the agent started is in
@@ -2840,11 +3192,23 @@ pub fn gate_announce(f: &Facts) -> Gate {
 /// [`gate_announce`] with Claude's own `busy`/`shell` read past where
 /// `lags` — its [`status_lags`] for a line, never for the restart
 /// ([`gate_restart`]).
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HarnessUpgradeLadder",
+        action = "Move",
+        project = "aterm_agent::harness::upgrade_drive::ladder_projection"
+    )
+)]
 fn gate(f: &Facts, lags: bool) -> Gate {
+    let rung = rung_in_force(f);
     if f.held {
         return Gate::Wait("held");
     }
-    if f.attended && !f.owner_now {
+    // A person at the tab: until the ladder's KeysOnly rung, anyone within
+    // `[harness] human_grace_s`; from it — and at the owner's `--now` — only
+    // a keystroke within KEYS_GAP_S, which no rung and no word waives.
+    if f.typing || (f.attended && rung < Rung::KeysOnly) {
         return Gate::Wait("attended");
     }
     if f.limited {
@@ -2868,16 +3232,27 @@ fn gate(f: &Facts, lags: bool) -> Gate {
     if f.busy_footer {
         return Gate::Wait("busy");
     }
+    // A turn running where the screen does not show it (a daemon-mode
+    // Codex's daemon: its own conversation's, or one the lane cannot place
+    // in another session): the running-work floor, at every rung.
+    if let Some(why) = f.daemon_turn.wait() {
+        return Gate::Wait(why);
+    }
     if f.approval_box {
         return Gate::Wait("box");
     }
     if !f.composer_empty {
         return Gate::Wait("draft");
     }
-    if f.owner_now || f.background_point {
+    if rung == Rung::Land || f.background_point {
         return Gate::Go;
     }
-    if f.status_age_s < QUIET_S || f.quiet_s < QUIET_S {
+    // THE SETTLE: the screen and Claude's status still QUIET_S — or, from the
+    // Settled rung, the reader's own run of idle looks at the same last words
+    // (repaint-proof: a footer clock restarts the first, never the second).
+    let settled = (f.status_age_s >= QUIET_S && f.quiet_s >= QUIET_S)
+        || (rung >= Rung::Settled && f.still_s >= QUIET_S);
+    if !settled {
         return Gate::Wait("settling");
     }
     Gate::Go
@@ -3172,10 +3547,12 @@ pub const REQUEUE_MAX: u32 = 2;
 /// ([`rest_extension`]). A late READY the gave-up round hears holds the new
 /// round back while the answer stands ([`retry_due`]: the round acts on it
 /// instead), and one the agent's own work outlives is voided [`DRAIN_S`]
-/// after it — the rest then begins again at the void, a whole `RETRY_S`. So
-/// the longest silence is `REASK_S + rest + DRAIN_S + RETRY_S`, reached by a
-/// READY heard just before the rest runs out: five hours today after a first
-/// stop, eleven after one repeated to the cap (two and a half and eight and a
+/// after it — the rest then begins again at the void, as long as the stop's
+/// streak makes it (round six, F27: a whole bare `RETRY_S` until then, which
+/// undid the back-off for exactly the stop that repeats most). So the longest
+/// silence is `REASK_S + rest + DRAIN_S + rest`, reached by a READY heard
+/// just before the rest runs out: five hours today after a first stop,
+/// seventeen after one repeated to the cap (two and a half and eight and a
 /// half with no late READY). Any other stop (a refused signal, a relaunch
 /// that never came up, a conversation resumed elsewhere) hears no late READY:
 /// its silence is its rest. Whatever else a late READY's restart waits on
@@ -3382,6 +3759,22 @@ pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
     if retry_due(phase, f.failed_s, ready) {
         return Step::Rearm;
     }
+    // THE END OF THE AGENT'S OWN WORK IS THE UPGRADE'S POINT
+    // ([`Facts::work_ended`]): a round that gave up on an agent whose answer
+    // was "not yet, my work still runs" is re-armed there — and the driver
+    // asks in the same visit — once the restart's gate is open but for the
+    // READY. Never at a break (there work runs by definition), never at a
+    // limit or the login wall (the gate waits there).
+    if f.work_ended
+        && !ready
+        && !f.background_point
+        && matches!(phase, Phase::Failed(why) if why == GAVE_UP)
+    {
+        return match gate_restart(f, true) {
+            Gate::Go => Step::Rearm,
+            Gate::Wait(w) => Step::Wait(w),
+        };
+    }
     if f.taskless && matches!(phase, Phase::Pending | Phase::Announced { .. }) {
         if f.limited {
             return Step::Wait("limited");
@@ -3474,6 +3867,29 @@ pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
             }
             if f.undelivered {
                 return reannounce();
+            }
+            // The agent's "not yet" waited on its own work, and that work has
+            // ended ([`Facts::work_ended`]): asked again here, at once and
+            // whatever its asks — an ask the agent's own answer asked for,
+            // exempt from MAX_ASKS — once the restart's gate is open but for
+            // the READY; its settle owns the point
+            // (`upgrade_drive::owns_turn_ends`).
+            //
+            // THAT GATE'S WAIT HOLDS THE POINT ONLY INSIDE THE RE-ASK'S WINDOW
+            // (the review of 2026-09-28): past it the re-ask decides, as for
+            // any announced round — its own gate lets a line through a status
+            // that lags an idle screen, and MAX_ASKS gives up. Held there
+            // whatever the window, a Claude status left at `shell` or `busy`
+            // over the idle screen after the agent's background shell ended
+            // (`status-stale` at every look: the restart's gate never reads a
+            // lag past) kept the round announced for ever — no re-ask, no
+            // give-up, no rest to a new round.
+            if f.work_ended {
+                match gate_restart(f, true) {
+                    Gate::Go => return Step::Announce,
+                    Gate::Wait(w) if since < REASK_S => return Step::Wait(w),
+                    Gate::Wait(_) => {}
+                }
             }
             if since < REASK_S {
                 return Step::Wait("awaiting-ready");
@@ -3747,16 +4163,17 @@ pub enum Request {
     /// Nothing asked: the gates alone decide.
     #[default]
     None,
-    /// Move this session at its next turn end: the settling window
-    /// ([`QUIET_S`]) and the attended-tab guard ([`Facts::attended`]) are
-    /// waived ([`Facts::owner_now`]), for the notice and at the signal alike:
-    /// both waits exist so that a person reading the answer is not typed
-    /// over, and this is that person asking — and nothing else: an idle
-    /// status, an empty composer, no box, no busy footer, no hold, the READY
-    /// answer, an empty process tree and the typed turn's screen fence are
-    /// still required. On a supervised session the turn end it moves at is
-    /// the next idle point the session's worker takes its step at: the waits
-    /// `--now` leaves are the idle point's.
+    /// Move this session at its first pause: the upgrade stands at the
+    /// ladder's LAST RUNG at once ([`Rung::Land`], [`Facts::owner_now`]; the
+    /// owner's decision of 2026-09-28), for the notice and at the signal
+    /// alike — no settling window, and a person holds it only by a keystroke
+    /// within [`KEYS_GAP_S`] — and nothing else: an idle status, an empty
+    /// composer, no box, no busy footer, no hold, no turn running where the
+    /// screen does not show it, the READY answer, an empty process tree and
+    /// the typed turn's screen fence are still required. On a supervised
+    /// session the pause it moves at is the next idle point the session's
+    /// worker takes its step at: the waits `--now` leaves are the idle
+    /// point's.
     Now,
     /// Not before this unix second; the request lapses on its own after it.
     DeferUntil(u64),
@@ -3816,15 +4233,19 @@ impl Request {
 /// [`next_step`] under the owner's [`Request`] for the upgrade to `target`.
 /// A skip of THIS target or a deferral not yet run out holds a session that
 /// has not begun restarting (`skipped`, `deferred`, [`Request::holds`]) — and
-/// a stopped round's new one ([`rearm_held`]); `Now`
-/// waives the settling window and the attended-tab guard and nothing else. A
+/// a stopped round's new one ([`rearm_held`]); `Now` stands the upgrade at
+/// the ladder's last rung ([`Rung::Land`]: no settling window, and a person
+/// holds it only by a keystroke within [`KEYS_GAP_S`]) and nothing else. A
 /// restart already in flight is never held: the agent was signalled, and
 /// stopping half way would strand the conversation.
 ///
 /// `Now` is applied as [`Facts::owner_now`], never by aging the facts: an
 /// earlier spelling raised `status_age_s` and `quiet_s` to [`QUIET_S`], which
-/// read a turn that had just ended as one that had settled. It also clears
-/// [`Facts::attended`], at the notice and at the signal alike.
+/// read a turn that had just ended as one that had settled. Until 2026-09-28
+/// it also cleared [`Facts::attended`] outright, at the notice and at the
+/// signal alike; a keystroke within [`KEYS_GAP_S`] holds it now, as at every
+/// rung (the owner's decision: "Upgrade now" is the last rung, with the same
+/// floors).
 #[must_use]
 pub fn requested_step(
     request: &Request,
@@ -3838,12 +4259,11 @@ pub fn requested_step(
         return Step::Wait(held_word(request));
     }
     let step = if *request == Request::Now {
-        let waived = Facts {
+        let now = Facts {
             owner_now: true,
-            attended: false,
             ..f.clone()
         };
-        next_step(phase, &waived, ready, now_s)
+        next_step(phase, &now, ready, now_s)
     } else {
         next_step(phase, f, ready, now_s)
     };

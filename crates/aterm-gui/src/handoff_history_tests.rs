@@ -58,6 +58,11 @@ fn record(local_id: u64) -> SessionRecord {
         history_dropped: 0,
         history_withheld: false,
         history_lost: 0,
+        hold: None,
+        supervisor: None,
+        claim_known: false,
+        attention_owners: Vec::new(),
+        viewport_from_bottom: None,
     }
 }
 
@@ -69,6 +74,7 @@ fn manifest(ids: &[u64]) -> SessionHandoff {
         connections: Vec::new(),
         next_turn_id: None,
         outgoing_build: None,
+        held: Vec::new(),
     }
 }
 
@@ -698,6 +704,45 @@ fn the_parks_stop_is_answered_and_hands_over_only_whole_exports() {
     assert!(dir_entries(dir.path()).is_empty());
 }
 
+/// THE PARK'S PAUSE ([`HistoryExporter::pause`], round six of the update
+/// audit, finding 14): answered like the stop, and nothing is read while it
+/// holds — but a RESUME goes on following, so the lines printed while a
+/// missed park waited to re-park are in the sidecar the landed one hands
+/// over, and `finish` stops a paused export at once with its work whole.
+#[test]
+fn a_paused_export_resumes_following_and_finishes_whole() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 2500);
+    let mut exporter =
+        HistoryExporter::start(dir.path().to_path_buf(), vec![(1, Arc::clone(&term))], true)
+            .unwrap();
+    assert!(exporter.await_caught_up(Duration::from_secs(30)));
+    assert!(
+        exporter.pause(Duration::from_secs(30)),
+        "the pause is answered"
+    );
+    // Paused: the history grows past it, and a repeated pause of the same
+    // hold is answered again.
+    write_lines(&mut term.lock().unwrap(), "late", 0, 600);
+    exporter.resume();
+    // Resumed: the next pause's last look reaches the history's end.
+    assert!(
+        exporter.pause(Duration::from_secs(30)),
+        "the re-pause is answered"
+    );
+    let results = exporter.finish(Duration::ZERO);
+    assert!(!results.unfinished, "a paused export finishes at once");
+    assert_eq!(results.exports.len(), 1);
+    assert_eq!(
+        results.exports[0].facts.lines as usize,
+        history(&term.lock().unwrap()).len(),
+        "the lines printed while it was paused followed after the resume"
+    );
+    drop(results);
+    assert!(dir_entries(dir.path()).is_empty(), "nobody took it");
+}
+
 /// The finished command whose rows `t` retains, found by the command it ran.
 fn finished_output(t: &Terminal, command: &str) -> Option<String> {
     t.all_blocks()
@@ -1283,4 +1328,653 @@ fn a_frame_corrupt_for_any_other_reason_still_refuses_the_sidecar() {
             .err(),
         Some("a sha other than its stamp")
     );
+}
+
+/// WHERE THE PERSON WAS READING (round five, item 18): a session scrolled
+/// back into its history at the park crosses with its viewport — lines from
+/// the bottom, on the record as `viewport_from_bottom` — and the successor
+/// puts it back once the import has put the history back under it, clamped to
+/// the scrollback that exists there. Here the offset is far past the 256 lines
+/// the screen carry holds, so only an apply AFTER the import can reach it.
+/// NEGATIVE CONTROLS: a view at the live bottom writes nothing (an older
+/// reader sees the wire it always saw, and a record without the field — every
+/// older producer's — leaves the successor at the bottom); a record naming more
+/// than exists is clamped; and a successor view the person already moved is
+/// left where they put it.
+#[test]
+fn a_scrolled_viewport_is_restored_after_import() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    term.lock().unwrap().scroll_display(1000);
+    assert_eq!(term.lock().unwrap().grid().display_offset(), 1000);
+    let crossed = cross(dir.path(), &term, |_| {});
+    let record = &crossed.manifest.sessions[0];
+    assert_eq!(record.viewport_from_bottom, Some(1000), "the park wrote it");
+    let wire = crossed.manifest.to_toml().unwrap();
+    assert!(wire.contains("viewport_from_bottom = 1000"), "{wire}");
+    assert_eq!(
+        SessionHandoff::from_toml(&wire).as_ref(),
+        Some(&crossed.manifest)
+    );
+    let (successor, report) = receive(dir.path(), &crossed);
+    assert_eq!(report.failed, None);
+    assert!(report.imported > 1000, "the history came back under it");
+    let t = successor.lock().unwrap();
+    assert_eq!(
+        t.grid().display_offset(),
+        1000,
+        "the successor shows where the person was reading"
+    );
+    assert_eq!(history(&t), crossed.parent_history, "over the same history");
+    drop(t);
+
+    // At the live bottom: nothing is written, and the successor stays there.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    let crossed = cross(dir.path(), &term, |_| {});
+    assert_eq!(crossed.manifest.sessions[0].viewport_from_bottom, None);
+    assert!(
+        !crossed
+            .manifest
+            .to_toml()
+            .unwrap()
+            .contains("viewport_from_bottom"),
+        "nothing on the wire for a view at the bottom"
+    );
+    let (successor, _) = receive(dir.path(), &crossed);
+    assert_eq!(successor.lock().unwrap().grid().display_offset(), 0);
+
+    // A record naming more than exists is clamped to the scrollback.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 100);
+    let mut crossed = cross(dir.path(), &term, |_| {});
+    crossed.manifest.sessions[0].viewport_from_bottom = Some(u32::MAX);
+    let (successor, _) = receive(dir.path(), &crossed);
+    let t = successor.lock().unwrap();
+    assert!(t.main_grid().scrollback_lines() > 0);
+    assert_eq!(
+        t.grid().display_offset(),
+        t.main_grid().scrollback_lines(),
+        "clamped to the scrollback that exists"
+    );
+    drop(t);
+
+    // A view the person moved in the successor before the import is theirs.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    term.lock().unwrap().scroll_display(1000);
+    let crossed = cross(dir.path(), &term, |_| {});
+    let mut remaining = MAX_AGGREGATE_BYTES;
+    let mut adopted = incoming(
+        &crossed.manifest.sessions[0],
+        false,
+        &named(dir.path(), 1),
+        dir.path(),
+        &mut remaining,
+    );
+    let successor = adopt(&crossed.checkpoint, &mut adopted);
+    successor.lock().unwrap().scroll_display(5);
+    let _ = run_imports(vec![ImportJob {
+        session: 1,
+        term: Arc::clone(&successor),
+        history: adopted,
+    }]);
+    assert_eq!(
+        successor.lock().unwrap().grid().display_offset(),
+        5,
+        "the person's own scroll wins"
+    );
+}
+
+/// The history line at the top of `t`'s view, while it is scrolled back.
+fn top_line(t: &Terminal) -> String {
+    let grid = t.main_grid();
+    let index = grid.scrollback_lines() - grid.display_offset();
+    grid.get_history_line(index)
+        .map(|l| l.to_string().trim_end().to_string())
+        .unwrap_or_default()
+}
+
+/// THE VIEWPORT IS ANCHORED TO THE PARK'S BOTTOM, NOT TO WHEREVER OUTPUT HAS
+/// PUSHED IT BY THE IMPORT. The restore runs on the import worker after
+/// Commit, with the adopted reader already appending; the offset the park
+/// measured, replayed from the bottom as it stands then, lands as many lines
+/// below the reading position as have scrolled into history since. The adopt
+/// notes the bottom it restored, and the restore adds what was pushed since.
+///
+/// RED before the fix: the view landed 50 lines low — `line2050`'s screen
+/// instead of `line2000`'s.
+#[test]
+fn a_restored_viewport_holds_the_lines_read_at_the_park() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    term.lock().unwrap().scroll_display(1000);
+    let read_at_park = top_line(&term.lock().unwrap());
+    let crossed = cross(dir.path(), &term, |_| {});
+    let mut remaining = MAX_AGGREGATE_BYTES;
+    let mut adopted = incoming(
+        &crossed.manifest.sessions[0],
+        false,
+        &named(dir.path(), 1),
+        dir.path(),
+        &mut remaining,
+    );
+    let successor = adopt(&crossed.checkpoint, &mut adopted);
+    // The adopted reader, running between the Commit and the import.
+    write_lines(&mut successor.lock().unwrap(), "after", 0, 50);
+    let report = run_imports(vec![ImportJob {
+        session: 1,
+        term: Arc::clone(&successor),
+        history: adopted,
+    }])
+    .remove(0);
+    assert_eq!(report.failed, None);
+    let t = successor.lock().unwrap();
+    assert_eq!(
+        t.grid().display_offset(),
+        1050,
+        "the offset rides the lines pushed since the adopt"
+    );
+    assert_eq!(
+        top_line(&t),
+        read_at_park,
+        "the person is shown the lines they were reading"
+    );
+}
+
+/// INPUT SENT SINCE THE ADOPT TAKES THE VIEW BACK. A person typing at the
+/// prompt the revealed window shows — before the import worker gets to the
+/// restore — must not have the view yanked up into history under them. The
+/// adopt notes the session's input count; any input attempt since skips the
+/// restore. NEGATIVE CONTROL: the same session with no input is restored.
+///
+/// RED before the fix: the restore ran whatever had been typed.
+#[test]
+fn input_since_the_adopt_skips_the_viewport_restore() {
+    for typed in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let term = live(8, 40);
+        write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+        term.lock().unwrap().scroll_display(1000);
+        let crossed = cross(dir.path(), &term, |_| {});
+        let mut remaining = MAX_AGGREGATE_BYTES;
+        let mut adopted = incoming(
+            &crossed.manifest.sessions[0],
+            false,
+            &named(dir.path(), 1),
+            dir.path(),
+            &mut remaining,
+        );
+        let successor = adopt(&crossed.checkpoint, &mut adopted);
+        // A sink over no descriptor: the write fails, but the ATTEMPT is what
+        // the session's input count takes, exactly as for a keystroke — the
+        // one egress law every key, paste and `send` writes through.
+        let sink = aterm_session::sink::SinkWriter::new(-1);
+        let input = Arc::new(crate::app_input::OutputEchoTracker::default());
+        adopted.watch_input(&input);
+        if typed {
+            let _ = crate::app_input::tracked_egress(
+                &successor,
+                &crate::mode_mirror_of(&successor),
+                &sink,
+                &input,
+                &crate::InputEvent::Text("ls\r".into()),
+                crate::input::EgressMode::Interactive,
+            );
+        }
+        let _ = run_imports(vec![ImportJob {
+            session: 1,
+            term: Arc::clone(&successor),
+            history: adopted,
+        }]);
+        assert_eq!(
+            successor.lock().unwrap().grid().display_offset(),
+            if typed { 0 } else { 1000 },
+            "typed={typed}"
+        );
+    }
+}
+
+/// A pipe whose read end never blocks: the test's stand-in for a PTY master,
+/// read back to see what the session was sent. Both ends are close-on-exec: a
+/// child another test of this binary spawns meanwhile must not inherit the
+/// write end, or a read that expects EOF once the sink drops it sees `EAGAIN`
+/// (measured: `a_pending_viewport_restore_keeps_no_pty_master_open` read -1
+/// under the whole `--lib` suite, and passed alone).
+#[cfg(unix)]
+fn nonblocking_pipe() -> [i32; 2] {
+    let mut pipe = [0; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    for fd in pipe {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    pipe
+}
+
+/// An adopted session scrolled 1000 lines back at the park, adopted and ready
+/// for its import: the successor and its history.
+#[cfg(unix)]
+fn scrolled_back_adoption(dir: &Path) -> (Arc<Mutex<Terminal>>, AdoptedHistory) {
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    term.lock().unwrap().scroll_display(1000);
+    let crossed = cross(dir, &term, |_| {});
+    let mut remaining = MAX_AGGREGATE_BYTES;
+    let mut adopted = incoming(
+        &crossed.manifest.sessions[0],
+        false,
+        &named(dir, 1),
+        dir,
+        &mut remaining,
+    );
+    let successor = adopt(&crossed.checkpoint, &mut adopted);
+    (successor, adopted)
+}
+
+/// What reaches a session after its adopt without anyone typing into it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterAdopt {
+    /// The DEC 1004 focus-in the successor's window sends a focus-reporting
+    /// program (Claude Code) when it takes focus at Commit.
+    FocusReport,
+    /// The engine's DA reply, written by the reply writer
+    /// (`spawn::spawn_reply_writer_thread`) straight to the sink.
+    EngineReply,
+    /// A key the person types: the one of the three that takes the view back.
+    Key,
+}
+
+/// ONLY INPUT SOMEONE SENT TAKES THE VIEW BACK — NOT A REPORT, NOT AN ENGINE
+/// REPLY. The restore stands aside for a person typing at the prompt; it
+/// must not stand aside for the focus report a focus-reporting program is
+/// sent the moment the successor's window takes focus at Commit, nor for the
+/// DA/DSR replies the engine writes — the sink's input epoch counts both, so
+/// a watch on it skipped the restore in exactly the session it is for.
+/// Driven through the real App routes: `write_focus_report` (the report the
+/// focus delta writes), the reply writer's own sink write, and `App::input`
+/// for the key. NEGATIVE CONTROL: the key skips the restore.
+///
+/// RED before the fix: the focus report and the reply each skipped it (the
+/// sink's epoch moved for both, asserted below so the premise is measured).
+#[cfg(unix)]
+#[test]
+fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
+    for after in [
+        AfterAdopt::FocusReport,
+        AfterAdopt::EngineReply,
+        AfterAdopt::Key,
+    ] {
+        let pipe = nonblocking_pipe();
+        let sink = Arc::new(aterm_session::sink::SinkWriter::new(pipe[1]));
+        let mut app = crate::App::headless_for_test_with_sink(Arc::clone(&sink));
+        let wid = crate::WindowId(0);
+        let session = app.front_terminal_mirror(wid).expect("a session").session;
+        let ctx = Arc::clone(&app.pool.get(session).expect("pooled").ctx);
+        app.pool
+            .get(session)
+            .expect("pooled")
+            .term
+            .lock()
+            .unwrap()
+            .process(b"\x1b[?1004h");
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (successor, mut adopted) = scrolled_back_adoption(dir.path());
+        adopted.watch_input(&ctx.output_echo);
+        let epoch = sink.input_epoch();
+        match after {
+            AfterAdopt::FocusReport => app.write_focus_report(session, true),
+            AfterAdopt::EngineReply => {
+                let _ = sink.write_frame_nonparking(b"\x1b[?62;22c");
+            }
+            AfterAdopt::Key => {
+                let _ = app.input(
+                    wid,
+                    crate::InputEvent::Text("a".into()),
+                    crate::Source::Human,
+                );
+            }
+        }
+        let mut wrote = [0u8; 64];
+        let n = unsafe { libc::read(pipe[0], wrote.as_mut_ptr().cast(), wrote.len()) };
+        let wrote = &wrote[..usize::try_from(n).unwrap_or(0)];
+        match after {
+            AfterAdopt::FocusReport => assert_eq!(wrote, b"\x1b[I", "the focus-in was sent"),
+            AfterAdopt::EngineReply => assert_eq!(wrote, b"\x1b[?62;22c", "the reply was sent"),
+            AfterAdopt::Key => assert_eq!(wrote, b"a", "the key was sent"),
+        }
+        assert_ne!(
+            sink.input_epoch(),
+            epoch,
+            "{after:?}: the sink's epoch moved — the watch must not read it"
+        );
+        let _ = run_imports(vec![ImportJob {
+            session: 1,
+            term: Arc::clone(&successor),
+            history: adopted,
+        }]);
+        assert_eq!(
+            successor.lock().unwrap().grid().display_offset(),
+            if after == AfterAdopt::Key { 0 } else { 1000 },
+            "{after:?}"
+        );
+        drop(ctx);
+        drop(app);
+        drop(sink);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+}
+
+/// THE WATCH HOLDS NO DESCRIPTOR. An owned sink closes the PTY master when
+/// its last reference goes; a tab closed while the imports run must hang up
+/// its child then, not whenever the import worker reaches its job. The
+/// adopted history waiting for its import keeps the session's input count,
+/// never its sink: dropping the sink closes the master at once (the read end
+/// sees EOF) with the watch still alive, and the watch still works.
+///
+/// RED before the fix: the watch held the sink, and the master stayed open
+/// (the read end saw `EAGAIN`, not EOF) until the history was dropped.
+#[cfg(unix)]
+#[test]
+fn a_pending_viewport_restore_keeps_no_pty_master_open() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let pipe = nonblocking_pipe();
+    let master = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let sink = Arc::new(aterm_session::sink::SinkWriter::new_owned(master));
+    let input = Arc::new(crate::app_input::OutputEchoTracker::default());
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (successor, mut adopted) = scrolled_back_adoption(dir.path());
+    adopted.watch_input(&input);
+    // The tab closes: its session context — the sink with it — is dropped.
+    drop(sink);
+    let mut byte = [0u8; 1];
+    let n = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) };
+    assert_eq!(
+        n, 0,
+        "the master closed when its tab did (EOF), import pending"
+    );
+    let _ = run_imports(vec![ImportJob {
+        session: 1,
+        term: Arc::clone(&successor),
+        history: adopted,
+    }]);
+    assert_eq!(
+        successor.lock().unwrap().grid().display_offset(),
+        1000,
+        "nothing was sent: the view is put back"
+    );
+    unsafe {
+        libc::close(pipe[0]);
+    }
+}
+
+/// THE ATTACH'S OWN RENUMBERING IS NOT OUTPUT. The restore adds every rise
+/// of the history grid's absolute row counter since the adopt, as lines
+/// output pushed into history; but an attach whose history is longer than
+/// the adopt reserved (a rewrap, or a reserve that fell short) raises the
+/// counter itself, moving every key — the adopt's bottom with them — and
+/// pushing nothing. Here the parent sent no counter (an older producer) and
+/// the reserve fell short, so the attach renumbers by the whole import; the
+/// view must still land on the lines read at the park.
+///
+/// RED before the fix: the view landed as many lines too high as the attach
+/// renumbered.
+#[test]
+fn an_attach_that_renumbers_does_not_move_the_restored_viewport() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    term.lock().unwrap().scroll_display(1000);
+    let read_at_park = top_line(&term.lock().unwrap());
+    let mut crossed = cross(dir.path(), &term, |_| {});
+    crossed.checkpoint.absolute_row_counter = 0;
+    let mut remaining = MAX_AGGREGATE_BYTES;
+    let mut adopted = incoming(
+        &crossed.manifest.sessions[0],
+        false,
+        &named(dir.path(), 1),
+        dir.path(),
+        &mut remaining,
+    );
+    let take = adopted.reserve();
+    assert!(take > 0, "a carry to import");
+    // The adopt with a reserve that falls short: the restore, a claim for no
+    // keys, and the bottom noted under the same lock.
+    let successor = live(8, 40);
+    {
+        let mut engine = successor.lock().unwrap();
+        engine.restore_checkpoint(&crossed.checkpoint);
+        adopted.claim = Some(engine.reserve_older_history_keys(0));
+        adopted.anchor_in(&engine);
+    }
+    let bottom = adopted.bottom_at_adopt.expect("anchored");
+    let report = run_imports(vec![ImportJob {
+        session: 1,
+        term: Arc::clone(&successor),
+        history: adopted,
+    }])
+    .remove(0);
+    assert_eq!(report.failed, None);
+    assert!(report.imported > 0);
+    let t = successor.lock().unwrap();
+    assert!(
+        t.main_grid().absolute_row_counter() > bottom,
+        "the premise: the attach renumbered"
+    );
+    assert_eq!(t.grid().display_offset(), 1000, "nothing was pushed");
+    assert_eq!(top_line(&t), read_at_park, "the lines read at the park");
+}
+
+/// The text of the top row the view shows.
+fn top_row(t: &Terminal) -> String {
+    t.display_row_text(0)
+        .unwrap_or_default()
+        .trim_end()
+        .to_string()
+}
+
+/// ROUND SIX, FINDING 24: OUTPUT AFTER THE PARK DOES NOT MOVE THE READER. At
+/// Commit the adopted readers parse whatever the freeze queued BEFORE the
+/// import puts the view back, so a session still printing had moved its
+/// bottom by then — and a view put back as "N lines above the bottom" landed
+/// on lines printed after the update. The view comes back on the very line
+/// the person was reading. NEGATIVE CONTROL: with no output in between, the
+/// same line (as round five's test, above, pins by offset).
+#[test]
+fn output_after_the_park_does_not_move_the_restored_view() {
+    for post_park in [0usize, 30] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let term = live(8, 40);
+        write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+        term.lock().unwrap().scroll_display(1000);
+        let reading = top_row(&term.lock().unwrap());
+        assert!(reading.starts_with("line"), "reading history: {reading:?}");
+        let crossed = cross(dir.path(), &term, |_| {});
+        let mut remaining = MAX_AGGREGATE_BYTES;
+        let mut adopted = incoming(
+            &crossed.manifest.sessions[0],
+            false,
+            &named(dir.path(), 1),
+            dir.path(),
+            &mut remaining,
+        );
+        let successor = adopt(&crossed.checkpoint, &mut adopted);
+        // The post-Commit drain: the readers run before the import does.
+        write_lines(&mut successor.lock().unwrap(), "after", 0, post_park);
+        let report = run_imports(vec![ImportJob {
+            session: 1,
+            term: Arc::clone(&successor),
+            history: adopted,
+        }])
+        .remove(0);
+        assert_eq!(report.failed, None);
+        assert_eq!(
+            top_row(&successor.lock().unwrap()),
+            reading,
+            "{post_park} line(s) after the park: the person is back on the line they read"
+        );
+    }
+}
+
+/// ROUND SIX, FINDING 24 (its second half): A PERSON WORKING AT THE PROMPT IS
+/// NOT PULLED UP. Keys typed before Commit replay at Commit, and more follow
+/// it; paste and End do the same at the bottom. None of them moves a view that
+/// is already at the bottom, so "still at the bottom" cannot tell them from
+/// "nobody touched it" — and the import, which runs on a worker after Commit,
+/// scrolled the prompt up the screen mid-command. Each gesture between the
+/// adopt and the import now leaves the view at the bottom. NEGATIVE CONTROL:
+/// with no gesture, and with only output, a bare modifier or a key release in
+/// between (none of which says where the person wants to be), the view is put
+/// back on the line read at the park.
+#[test]
+fn a_gesture_after_the_adopt_keeps_the_view_at_the_bottom() {
+    use crate::app_input::{PressKind, apply_press_custody};
+    type Gesture = fn(&mut Terminal);
+    let cases: [(&str, Gesture, bool); 7] = [
+        ("nothing", |_| {}, true),
+        ("output", |t| write_lines(t, "after", 0, 5), true),
+        (
+            "a bare modifier",
+            |t| {
+                let _ = apply_press_custody(t, PressKind::Inert);
+            },
+            true,
+        ),
+        (
+            "a key release",
+            |t| {
+                let _ = apply_press_custody(t, PressKind::Release);
+            },
+            true,
+        ),
+        (
+            "typing",
+            |t| {
+                let _ = apply_press_custody(t, PressKind::Typing);
+            },
+            false,
+        ),
+        (
+            "a held key's repeat",
+            |t| {
+                let _ = apply_press_custody(t, PressKind::Repeat);
+            },
+            false,
+        ),
+        ("a return to live", Terminal::return_to_live, false),
+    ];
+    for (what, gesture, restored) in cases {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let term = live(8, 40);
+        write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+        term.lock().unwrap().scroll_display(1000);
+        let reading = top_row(&term.lock().unwrap());
+        let crossed = cross(dir.path(), &term, |_| {});
+        let mut remaining = MAX_AGGREGATE_BYTES;
+        let mut adopted = incoming(
+            &crossed.manifest.sessions[0],
+            false,
+            &named(dir.path(), 1),
+            dir.path(),
+            &mut remaining,
+        );
+        let successor = adopt(&crossed.checkpoint, &mut adopted);
+        gesture(&mut successor.lock().unwrap());
+        let report = run_imports(vec![ImportJob {
+            session: 1,
+            term: Arc::clone(&successor),
+            history: adopted,
+        }])
+        .remove(0);
+        assert_eq!(report.failed, None, "{what}");
+        let t = successor.lock().unwrap();
+        if restored {
+            assert_eq!(top_row(&t), reading, "{what}: the view is put back");
+        } else {
+            assert_eq!(
+                t.grid().display_offset(),
+                0,
+                "{what} after the adopt: the person stays at the bottom"
+            );
+        }
+    }
+}
+
+/// A VIEW SCROLLED INTO HISTORY THAT DID NOT CROSS STAYS AT THE LIVE BOTTOM
+/// (round seven, item 21). Under a successor policy of `carry = "visible"` or
+/// `"repaint"` the park carries no history — a zero-history screen carry and
+/// the withheld plan — yet the record still names where the person was
+/// reading. The adopted program keeps writing after Commit, and those lines
+/// are the only scrollback the successor holds when the import worker runs:
+/// scrolling the view up into them shows output printed after the update, not
+/// what the person was reading, and stops the pane following live output.
+/// NEGATIVE CONTROL: an offset inside the history the screen carry brought is
+/// still put back, riding the lines pushed since the adopt; one past it is
+/// clamped to the oldest line that crossed.
+///
+/// RED before the fix: the withheld view was scrolled up 50 lines, into the
+/// output written after the adopt.
+#[test]
+fn a_view_into_withheld_history_stays_at_the_live_bottom() {
+    for (carried, scrolled, want) in [(0, 500, 0), (256, 100, 150), (256, 500, 306)] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let term = live(8, 40);
+        write_lines(&mut term.lock().unwrap(), "line", 0, 1000);
+        term.lock().unwrap().scroll_display(scrolled);
+        let results = HistoryPlan::Withheld.results(dir.path());
+        let (checkpoint, head) = {
+            let t = term.lock().unwrap();
+            let checkpoint = t.checkpoint_carry(carried).expect("a Ground parser");
+            (checkpoint, capture_head(1, &t))
+        };
+        let mut manifest = manifest(&[1]);
+        stamp_manifest(
+            &mut manifest,
+            &[(1, checkpoint.clone())],
+            &[head],
+            results,
+            dir.path(),
+            NONCE,
+        );
+        let mut remaining = MAX_AGGREGATE_BYTES;
+        let mut adopted = incoming(
+            &manifest.sessions[0],
+            false,
+            &named(dir.path(), 1),
+            dir.path(),
+            &mut remaining,
+        );
+        let successor = adopt(&checkpoint, &mut adopted);
+        // The adopted program, writing between the Commit and the import.
+        write_lines(&mut successor.lock().unwrap(), "after", 0, 50);
+        let _ = run_imports(vec![ImportJob {
+            session: 1,
+            term: Arc::clone(&successor),
+            history: adopted,
+        }]);
+        assert_eq!(
+            successor.lock().unwrap().grid().display_offset(),
+            want,
+            "carried {carried}, scrolled {scrolled}"
+        );
+    }
 }

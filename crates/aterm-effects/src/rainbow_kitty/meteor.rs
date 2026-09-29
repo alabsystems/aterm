@@ -8915,7 +8915,7 @@ mod tests {
     /// burst to count. An instrument, not a law — ignored like the other
     /// census instruments: run with `-- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "census instrument, prints; run with --ignored --nocapture"]
     fn landing_palette_census_2026_09_14() {
         use super::super::ribbon::{bed_ink, bed_luma_budget};
         use crate::spectrum::{SPECTRUM_CYAN_HI, SPECTRUM_CYAN_LO, SPECTRUM_CYAN_SAT_MIN};
@@ -10971,7 +10971,7 @@ mod tests {
     /// burst is drawn from the same landing with its band origin removed).
     /// Prints; run with `-- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "pace census instrument, prints; run with --ignored --nocapture"]
     fn landing_pace_census_2026_09_14() {
         let cfg = config();
         let g = owner_device_geom();

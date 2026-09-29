@@ -8,6 +8,8 @@
 
 use std::ptr::NonNull;
 
+use crate::cell::Cell;
+
 #[cfg(any(test, kani))]
 use super::Offset;
 use super::{PAGE_SIZE, Page, PageSlice};
@@ -44,6 +46,11 @@ pub(crate) struct PoolStats {
 /// for typical allocations that don't fill entire pages.
 #[derive(Debug, Default)]
 pub struct PageStore {
+    /// Cell slices returned by removed rows, before `pages` for drop order.
+    /// Each is a unique allocation token; reusing it transfers that token
+    /// back to a Row. Never discard these during `shrink_to_fit`: their
+    /// backing allocations remain in active pages until the arena is reset.
+    recycled_cells: Vec<PageSlice<Cell>>,
     /// Active pages (currently holding allocations).
     pages: Vec<Box<Page>>,
     /// Free list of recycled pages (available for reuse).
@@ -62,6 +69,14 @@ pub struct PageStore {
 impl PageStore {
     /// Create a new, empty page store.
     #[must_use]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "ResizeRowReuse",
+            action = "Rebuild",
+            project = "grid::tests::resize_row_reuse::resize_row_reuse_conforms"
+        )
+    )]
     pub fn new() -> Self {
         Self::default()
     }
@@ -145,6 +160,7 @@ impl PageStore {
     #[must_use]
     pub(crate) fn total_memory(&self) -> usize {
         (self.pages.len() + self.free_pages.len()) * PAGE_SIZE
+            + self.recycled_cells.capacity() * std::mem::size_of::<PageSlice<Cell>>()
     }
 
     /// Release all free pages back to the system.
@@ -167,6 +183,9 @@ impl PageStore {
     /// Caller must ensure no `PageSlice` references are used after reset.
     #[cfg(any(test, kani))]
     pub fn reset(&mut self) {
+        // These handles point into the pages reset is about to recycle.
+        // Discard them before an allocation can overwrite their old ranges.
+        self.recycled_cells.clear();
         // Build used-byte metadata in page order so it stays aligned when
         // pages are popped in reverse order below.
         let mut used_bytes_by_page = std::mem::take(&mut self.page_used_bytes);
@@ -213,6 +232,40 @@ impl PageStore {
             self.stats.pages_allocated += 1;
             Page::new()
         }
+    }
+
+    /// Allocate row cells, consuming a returned slice of the exact width first.
+    /// A grid arena keeps one width; the reverse search also tolerates other
+    /// typed users without handing a row a short or overlapping allocation.
+    pub(crate) fn alloc_cells(&mut self, cols: u16) -> PageSlice<Cell> {
+        if let Some(index) = self
+            .recycled_cells
+            .iter()
+            .rposition(|cells| cells.len() == usize::from(cols))
+        {
+            return self.recycled_cells.swap_remove(index);
+        }
+        self.alloc_slice(cols)
+    }
+
+    /// Return a removed row's unique allocation to this arena.
+    ///
+    /// The pool is bounded by the arena's allocations, not by viewport height:
+    /// a height grow can reveal history instead of consuming a returned blank
+    /// row. Dropping handles at an arbitrary cap would strand their bump
+    /// allocations and let repeated shrink/reveal/scroll cycles grow forever.
+    ///
+    /// # Safety
+    ///
+    /// `cells` must have been allocated by this live PageStore, and no other
+    /// handle or reference may retain access to its range after this transfer.
+    pub(crate) unsafe fn recycle_cells(&mut self, cells: PageSlice<Cell>) {
+        self.recycled_cells.push(cells);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recycled_rows(&self) -> usize {
+        self.recycled_cells.len()
     }
 
     /// Allocate a typed slice within the page store.

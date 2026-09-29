@@ -245,6 +245,13 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "more tabs were open than one handover can carry",
         "too many tabs",
     ),
+    // The same fact since the park reads the dialled claim's own limit (round
+    // six of the update audit): one message or the chunked grant.
+    (
+        "descriptor grant carries",
+        "more tabs were open than one handover can carry",
+        "too many tabs",
+    ),
     // ── Preparation, all of it BEFORE any successor existed
     // (`send_handoff_preparation_failure` for the candidate's pre-park
     // verification; `send_handoff_producer_failure` and the park's own
@@ -252,6 +259,18 @@ const CAUSES: &[(&str, &str, &str)] = &[
     // each carrying its `io::ErrorKind` since plan P1-2; plus the descriptor
     // transfer on the out-of-band lane). Nothing was started, so nothing
     // "failed to start".
+    // ── A check that did not FINISH (round four of the 2026-09 update
+    // robustness work, plan item 2): `aterm_update::PASSING_REFUSAL_KEY`, which
+    // `aterm-update`'s verifier appends to a helper past its budget or ceiling,
+    // a helper the kernel would not start just then, and the apply lock held
+    // past its wait. Ahead of every preparation row, the installed-copy one
+    // included: such a reason says nothing about either bundle, and the lane
+    // retries it by itself.
+    (
+        aterm_update::PASSING_REFUSAL_KEY,
+        "the new version could not be checked just then",
+        "couldn\u{2019}t check it just then",
+    ),
     // ── The INSTALLED copy cannot be the swap's rollback source (2026-09-14):
     // `install::rollback_source_refusal`, both lanes. This is the historical
     // failure, not evidence that the source is still broken. Only the current
@@ -305,6 +324,13 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "handoff process could not start",
         "the handover could not be set up",
         "couldn\u{2019}t be set up",
+    ),
+    // The proof deadline ran out in THIS process before the grant was sent —
+    // after the successor dialed (round six of the update audit, item 48).
+    (
+        "proof deadline passed before the grant was sent",
+        "the terminal was too busy to hand over",
+        "terminal too busy",
     ),
     (
         "descriptors could not be delivered",
@@ -619,6 +645,18 @@ mod tests {
         "overlap handoff failed safely: visible checkpoint set could not be committed \
          canonically: session 0: meta out of bounds at 55x149 with 0 carried line(s): \
          saved_cursor_main.cursor_row=55 must be below rows=55",
+        // A pre-park check that did not finish (round four, plan item 2): the
+        // verifier's budget, and the apply lock a sibling held.
+        "overlap handoff failed safely: staged update failed pre-park verification: bundle \
+         policy: codesign --verify (team-pinned) ran past this apply's verification budget; \
+         treating as a rejection (a passing condition, not a verdict on the update)",
+        "overlap handoff failed safely: installed bundle failed pre-park verification: \
+         pre-verify lock: another process has held the update lock for more than 10s (a \
+         passing condition, not a verdict on the update)",
+        "staged update failed pre-park verification: the installed bundle at \
+         /Applications/aterm.app could not be verified just then: bundle policy: spctl \
+         assessment did not finish within 30s; treating as a rejection (a passing \
+         condition, not a verdict on the update); the terminal was left untouched",
         // `aterm_update::install`, both boot-trial recovery arms.
         "update trial for build 1787699398 was unrecoverable across 3 launches of build \
          1787690000; disarmed the boot sentinel to keep updates possible",
@@ -777,7 +815,23 @@ mod tests {
             "too many tabs"
         );
         assert_eq!(
+            short(
+                "overlap handoff failed safely: more sessions opened than the successor's \
+                 descriptor grant carries (63 open, its rendezvous claim carries at most 62)"
+            ),
+            "too many tabs"
+        );
+        assert_eq!(
             full("overlap handoff failed safely: the outgoing process did not park within 120 s"),
+            "the terminal was too busy to hand over"
+        );
+        assert_eq!(
+            full(
+                "overlap handoff failed safely: the handoff descriptors could not be delivered: \
+                 the handoff's proof deadline passed before the grant was sent (the successor \
+                 had dialed; this process's preparation after the park outran it), so no \
+                 descriptor left"
+            ),
             "the terminal was too busy to hand over"
         );
         // A CAPTURE REFUSAL (plan P0-3) says it could not capture — never "could
@@ -1047,6 +1101,48 @@ mod tests {
             !sentence.contains("try again by itself"),
             "a structural refusal must not promise a retry that cannot succeed: {sentence}"
         );
+    }
+
+    /// A CHECK THAT DID NOT FINISH IS SAID AS A MOMENT, NEVER AS THE PERSON'S
+    /// (round four of the 2026-09 update robustness work, plan item 2). Before
+    /// the passing key, a `codesign` that ran out of the apply budget was wrapped
+    /// as the installed-source refusal: this surface said "the installed copy
+    /// could not be verified for replacement", `needs_person` suspended the lane,
+    /// and the owner was told to reinstall an app that was fine. The same shape
+    /// an older build wrote into the ledger — the installed-source key AROUND a
+    /// passing error — reads as the moment too.
+    #[test]
+    fn a_check_that_did_not_finish_is_named_as_a_moment_and_never_a_person_s() {
+        let passing = "overlap handoff failed safely: installed bundle failed pre-park \
+                       verification: the installed bundle at /Applications/aterm.app could \
+                       not be verified just then: bundle policy: codesign --verify \
+                       (team-pinned) ran past this apply's verification budget; treating as \
+                       a rejection (a passing condition, not a verdict on the update)";
+        let legacy = "installed bundle failed pre-park verification: the installed bundle at \
+                      /Applications/aterm.app cannot be the rollback source the swap installs: \
+                      bundle policy: spctl assessment did not finish within 30s; treating as \
+                      a rejection (a passing condition, not a verdict on the update); this \
+                      install cannot update itself";
+        for reason in [passing, legacy] {
+            assert!(aterm_update::is_passing_refusal(reason));
+            assert!(
+                !ApplyTrouble::needs_person(reason),
+                "a moment is never a person's to clear: {reason}"
+            );
+            let (full, short) = clauses(reason);
+            assert_eq!(full, "the new version could not be checked just then");
+            assert_eq!(short, "couldn\u{2019}t check it just then");
+            let trouble = ApplyTrouble::new(1, reason, ApplyRetry::Scheduled)
+                .expect("trouble")
+                .with_retry_in(Some(std::time::Duration::from_secs(599)));
+            assert!(
+                trouble
+                    .sentence()
+                    .ends_with("It will try again by itself in about 10 min."),
+                "{}",
+                trouble.sentence()
+            );
+        }
     }
 
     #[test]

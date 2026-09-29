@@ -14,9 +14,8 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-# The shared source walk (`collect_rs_files`) the harness manifest reads the
-# tree with — the same walk the censuses use.
-aterm-census = { workspace = true }
+# `aterm_spec::harness_manifest`, behind the `harness-manifest` verb.
+aterm-spec = { workspace = true }
 # THE workspace's one lock-scoped environment helper (`aterm_log::env`), for the
 # single `$CARGO` handoff in driver.rs. A direct edge to the dependency-free leaf
 # that is already in this binary's graph — the point of the shared helper is that
@@ -28,7 +27,7 @@ aterm-log = { workspace = true }
 # different toolchain than the gate did.
 aterm-verify = { workspace = true }
 # aterm-forge: the third-party surface policy (`gate forge`) and the cell list
-# (`gate cells`), one implementation shared with `cargo forge check`. A PATH dep:
+# (`gate cells`), one implementation shared with `targo --unverified forge check`. A PATH dep:
 # the root [workspace.dependencies] table has no `aterm-forge` row.
 aterm-forge = { path = "../aterm-forge" }
 # `gate cells` reads cargo's `--message-format=json` stream, because that is the

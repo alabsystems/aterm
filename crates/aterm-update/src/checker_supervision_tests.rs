@@ -42,6 +42,9 @@ fn args(provider: crate::SourceProvider) -> CheckerArgs {
         settings_retry: Duration::ZERO,
         staging: Arc::new(|| None),
         checker_lock_wait: Duration::from_millis(200),
+        checker_ungated_after: crate::checker_watch::CHECKER_UNGATED_AFTER,
+        // Never the network: a check that finds nothing to do.
+        check: Arc::new(|_, _| Ok(None)),
         pause: Some(Duration::ZERO),
     }
 }
@@ -160,6 +163,11 @@ fn the_loop_defers_each_cycle_a_sibling_holds_the_checker_lock_and_resumes_when_
         let staging = staging.clone();
         Arc::new(move || Some(staging.clone()))
     };
+    // This test pins the deferral streak itself — its lines, its published
+    // count, its end — over more cycles than the loop now defers before it
+    // checks without the lock; that bound has its own test
+    // (`a_checker_lock_held_forever_does_not_stop_checks`).
+    loop_args.checker_ungated_after = u64::MAX;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = crate::log_capture::take();
@@ -214,6 +222,190 @@ fn the_loop_defers_each_cycle_a_sibling_holds_the_checker_lock_and_resumes_when_
         "the cycle past the lock read the sibling's receipt: {lines:?}"
     );
     let _ = std::fs::remove_dir_all(staging.root);
+}
+
+/// A STOPPED SIBLING HOLDING `checker.lock` NO LONGER STOPS UPDATE CHECKS ON
+/// THE WHOLE MACHINE (round four of the 2026-09 update robustness work, plan item
+/// 14). The sibling here takes the lock and never lets go — a `SIGSTOP`ped aterm
+/// mid-check, which has written its pid into the lock as a holder now does. The
+/// loop defers to it [`crate::checker_watch::CHECKER_UNGATED_AFTER`] times, then
+/// CHECKS WITHOUT THE LOCK on that cycle and every one after, naming the holder
+/// once; the deferral streak stays published (the window's watchdog raises its
+/// warning from it) and is not reported as over.
+///
+/// RED before the change: the Deferred arm returned before the check on every
+/// cycle, so the injected check below never ran — `checks` stayed 0.
+#[test]
+fn a_checker_lock_held_forever_does_not_stop_checks() {
+    let _turn = LANE_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    static WATCH: CheckerWatch = CheckerWatch::new();
+    let generation = WATCH.register(1_000);
+    let staging = crate::paths::Staging::scratch("checker-lock-held-forever");
+    let lock_path = staging.status.with_file_name("checker.lock");
+    let _sibling = aterm_update_core::FileLock::acquire(&lock_path).expect("the sibling takes it");
+    // The holder names itself — a live pid, as a stopped aterm's is.
+    std::fs::write(&lock_path, format!("{}\n", std::process::id()))
+        .expect("the holder names itself");
+    let bound = crate::checker_watch::CHECKER_UNGATED_AFTER;
+    let cycles = bound + 2;
+    let checks = Arc::new(AtomicU64::new(0));
+    let calls = Arc::new(AtomicU64::new(0));
+    // (cycle, deferrals published, checks run) as each cycle began.
+    let seen: Arc<Mutex<Vec<(u64, u64, u64)>>> = Arc::default();
+    let provider: crate::SourceProvider = {
+        let (calls, checks, seen) = (Arc::clone(&calls), Arc::clone(&checks), Arc::clone(&seen));
+        Arc::new(move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let deferrals = WATCH.snapshot().map_or(0, |beat| beat.deferrals);
+            seen.lock()
+                .unwrap()
+                .push((n, deferrals, checks.load(Ordering::SeqCst)));
+            if n > cycles {
+                WATCH.supersede(generation);
+            }
+            Some(source())
+        })
+    };
+    let mut loop_args = args(provider);
+    loop_args.staging = {
+        let staging = staging.clone();
+        Arc::new(move || Some(staging.clone()))
+    };
+    loop_args.check = {
+        let checks = Arc::clone(&checks);
+        Arc::new(move |_, _| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        })
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = crate::log_capture::take();
+        let exit = crate::run_checker(&WATCH, generation, &loop_args);
+        let _ = tx.send((exit, crate::log_capture::take()));
+    });
+    let (exit, lines) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the loop must come round every cycle");
+    assert_eq!(
+        exit,
+        CheckerExit::Superseded {
+            phase: CheckerPhase::Settings
+        }
+    );
+    // The first `bound - 1` cycles deferred without checking; from the
+    // `bound`-th on, every cycle checked, and the streak kept counting.
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        cycles - bound + 1,
+        "checked on the bound-th cycle and every one after: {:?}",
+        seen.lock().unwrap()
+    );
+    let seen = seen.lock().unwrap().clone();
+    for (n, deferrals, ran) in &seen[1..] {
+        assert_eq!(
+            *deferrals,
+            n - 1,
+            "the streak stands while the holder does: {seen:?}"
+        );
+        assert_eq!(*ran, (n - 1).saturating_sub(bound - 1), "{seen:?}");
+    }
+    let said: Vec<_> = lines
+        .iter()
+        .filter(|(_, line)| line.starts_with("update check without the checker lock"))
+        .collect();
+    assert_eq!(said.len(), 1, "said once per streak: {lines:?}");
+    assert_eq!(said[0].0, aterm_log::Level::Warn);
+    assert!(
+        said[0]
+            .1
+            .contains(&format!("the lock names pid {}", std::process::id())),
+        "the holder named: {said:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|(_, line)| line.starts_with("update checks resumed")),
+        "a streak the holder still stands in is not over: {lines:?}"
+    );
+    let _ = std::fs::remove_dir_all(staging.root);
+}
+
+/// A MACHINE WHOSE LAST COMPLETED CHECK IS OLDER THAN `STALE_CHECK_AFTER` checks
+/// past a held `checker.lock` at the FIRST deferral (round four, plan item 14):
+/// nobody on this machine has checked for hours, so whoever holds the lock is not
+/// checking for it. NEGATIVE CONTROL: a fresh receipt is honoured — the cycle
+/// defers, as a sibling mid-check deserves.
+#[test]
+fn a_stale_machine_ledger_checks_past_a_held_lock_at_once() {
+    let _turn = LANE_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (stale, want_checks) in [(true, 1), (false, 0)] {
+        static WATCH: CheckerWatch = CheckerWatch::new();
+        let generation = WATCH.register(1_000);
+        let staging = crate::paths::Staging::scratch("checker-lock-stale-ledger");
+        let lock_path = staging.status.with_file_name("checker.lock");
+        let _sibling =
+            aterm_update_core::FileLock::acquire(&lock_path).expect("the sibling takes it");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let checked = if stale {
+            now - crate::STALE_CHECK_AFTER.as_secs() - 60
+        } else {
+            now - 30
+        };
+        // A receipt some OTHER channel's check left: it cannot excuse this
+        // cycle's own check (`checker_skip_for`), only date the machine's last.
+        std::fs::write(
+            crate::check_receipt::path(&staging),
+            format!(
+                "schema = 1\nupdated_at = \"{}\"\ncurrent_build = 1\nsource = \"other/channel\"\n",
+                aterm_types::rfc3339::format_rfc3339(checked)
+            ),
+        )
+        .unwrap();
+        let checks = Arc::new(AtomicU64::new(0));
+        let calls = Arc::new(AtomicU64::new(0));
+        let provider: crate::SourceProvider = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                if calls.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    WATCH.supersede(generation);
+                }
+                Some(source())
+            })
+        };
+        let mut loop_args = args(provider);
+        loop_args.staging = {
+            let staging = staging.clone();
+            Arc::new(move || Some(staging.clone()))
+        };
+        loop_args.check = {
+            let checks = Arc::clone(&checks);
+            Arc::new(move |_, _| {
+                checks.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+        };
+        let exit = crate::run_checker(&WATCH, generation, &loop_args);
+        assert_eq!(
+            exit,
+            CheckerExit::Superseded {
+                phase: CheckerPhase::Settings
+            }
+        );
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            want_checks,
+            "stale ledger {stale}: one cycle, one deferral"
+        );
+        let _ = std::fs::remove_dir_all(staging.root);
+    }
 }
 
 /// A STALL INSIDE THE LANE IS STILL A STALL AFTER ITS REPLACEMENT STARTS. The
@@ -488,4 +680,320 @@ fn a_superseded_generation_exits_without_checking_and_leaves_the_replacements_st
         CheckerPhase::Starting,
         "the stale thread wrote nothing over its replacement's stamp"
     );
+}
+
+/// A sibling holding `checker.lock` that is STILL CHECKING: it rewrites the lock
+/// every few milliseconds while `beating` is set, as a holder's beat does
+/// (`crate::HolderBeat`), until `done`.
+fn live_holder(
+    path: std::path::PathBuf,
+    beating: Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !done.load(Ordering::SeqCst) {
+            if beating.load(Ordering::SeqCst) {
+                let _ = std::fs::write(&path, format!("{}\n", std::process::id()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })
+}
+
+/// A HOLDER STILL CHECKING IS NEVER CALLED STOPPED, HOWEVER LONG IT TAKES (the
+/// round-four review). A sibling holds `checker.lock` through a download far longer
+/// than a check cycle — twenty minutes on a slow link — and writes the lock as it
+/// works: every cycle behind it defers, none checks without the lock, and the streak
+/// the window's watchdog warns on stays 0. The moment it stops writing (a `SIGSTOP`
+/// mid-download) the streak starts, and the bound's worth of cycles later the loop
+/// checks without it, as it always has.
+///
+/// FAILS WITHOUT THE FIX: deferrals counted cycles alone, so the third cycle behind
+/// the working holder was published as a stuck sibling (the banner) and checked
+/// without the lock — six checks here instead of two.
+#[test]
+fn a_holder_still_checking_is_never_called_stopped() {
+    let _turn = LANE_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    static WATCH: CheckerWatch = CheckerWatch::new();
+    let generation = WATCH.register(1_000);
+    let staging = crate::paths::Staging::scratch("checker-lock-live-holder");
+    let lock_path = staging.status.with_file_name("checker.lock");
+    let _sibling = aterm_update_core::FileLock::acquire(&lock_path).expect("the sibling takes it");
+    let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = live_holder(lock_path.clone(), Arc::clone(&beating), Arc::clone(&done));
+    let bound = crate::checker_watch::CHECKER_UNGATED_AFTER;
+    let working = bound + 1;
+    let cycles = working + bound + 1;
+    let checks = Arc::new(AtomicU64::new(0));
+    let calls = Arc::new(AtomicU64::new(0));
+    let seen: Arc<Mutex<Vec<(u64, u64, u64)>>> = Arc::default();
+    let provider: crate::SourceProvider = {
+        let (calls, checks, seen, beating) = (
+            Arc::clone(&calls),
+            Arc::clone(&checks),
+            Arc::clone(&seen),
+            Arc::clone(&beating),
+        );
+        Arc::new(move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let deferrals = WATCH.snapshot().map_or(0, |beat| beat.deferrals);
+            seen.lock()
+                .unwrap()
+                .push((n, deferrals, checks.load(Ordering::SeqCst)));
+            if n > working {
+                // The holder is stopped: it writes nothing from here on.
+                beating.store(false, Ordering::SeqCst);
+            }
+            if n > cycles {
+                WATCH.supersede(generation);
+            }
+            Some(source())
+        })
+    };
+    let mut loop_args = args(provider);
+    // Long enough that the writer's 10 ms beat is far inside the half-wait a
+    // sibling reads as progress, on a loaded machine too.
+    loop_args.checker_lock_wait = Duration::from_millis(400);
+    loop_args.staging = {
+        let staging = staging.clone();
+        Arc::new(move || Some(staging.clone()))
+    };
+    loop_args.check = {
+        let checks = Arc::clone(&checks);
+        Arc::new(move |_, _| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        })
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = crate::log_capture::take();
+        let exit = crate::run_checker(&WATCH, generation, &loop_args);
+        let _ = tx.send((exit, crate::log_capture::take()));
+    });
+    let (exit, lines) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the loop must come round every cycle");
+    done.store(true, Ordering::SeqCst);
+    let _ = writer.join();
+    assert_eq!(
+        exit,
+        CheckerExit::Superseded {
+            phase: CheckerPhase::Settings
+        }
+    );
+    let seen = seen.lock().unwrap().clone();
+    // Cycles 1..=working deferred to a working holder: nothing published, nothing
+    // checked. From the first cycle behind a stopped holder the streak counts, and
+    // the bound-th such cycle checks without the lock.
+    for (n, deferrals, ran) in &seen[1..] {
+        let stalled_before = (n - 1).saturating_sub(working);
+        assert_eq!(*deferrals, stalled_before, "cycle {n}: {seen:?}");
+        assert_eq!(
+            *ran,
+            stalled_before.saturating_sub(bound - 1),
+            "cycle {n}: {seen:?}"
+        );
+    }
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        cycles - working - bound + 1,
+        "{seen:?}"
+    );
+    // Said once the holder stops, and not before: the one line that calls it
+    // stopped comes after the cycles it was seen working.
+    let said: Vec<_> = lines
+        .iter()
+        .filter(|(_, line)| line.starts_with("update check without the checker lock"))
+        .collect();
+    assert_eq!(said.len(), 1, "{lines:?}");
+    assert!(
+        said[0]
+            .1
+            .contains(&format!("through {bound} cycles in a row")),
+        "the streak it names is the stopped holder's alone: {said:?}"
+    );
+    let _ = std::fs::remove_dir_all(staging.root);
+}
+
+/// A STALE MACHINE LEDGER DOES NOT UNGATE A HOLDER THAT IS WORKING (the round-four
+/// review). The machine slept overnight, so no check has completed for hours; on
+/// wake one aterm takes the lock and starts a download that outlasts a sibling's
+/// lock wait. The sibling's first deferral used to trust the ledger's age alone: it
+/// called the holder stopped, checked without the lock, and failed on the stage lock
+/// the download held. With the holder writing the lock as it works, the sibling
+/// defers — no check, nothing published — while the same stale ledger behind a
+/// holder that writes nothing still checks at once
+/// (`a_stale_machine_ledger_checks_past_a_held_lock_at_once`).
+///
+/// FAILS WITHOUT THE FIX: the stale ledger ungated the first deferral, and the
+/// injected check ran.
+#[test]
+fn a_stale_ledger_waits_for_a_holder_that_is_working() {
+    let _turn = LANE_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    static WATCH: CheckerWatch = CheckerWatch::new();
+    let generation = WATCH.register(1_000);
+    let staging = crate::paths::Staging::scratch("checker-lock-stale-ledger-live");
+    let lock_path = staging.status.with_file_name("checker.lock");
+    let _sibling = aterm_update_core::FileLock::acquire(&lock_path).expect("the sibling takes it");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        crate::check_receipt::path(&staging),
+        format!(
+            "schema = 1\nupdated_at = \"{}\"\ncurrent_build = 1\nsource = \"other/channel\"\n",
+            aterm_types::rfc3339::format_rfc3339(now - crate::STALE_CHECK_AFTER.as_secs() - 60)
+        ),
+    )
+    .unwrap();
+    let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = live_holder(lock_path.clone(), beating, Arc::clone(&done));
+    let checks = Arc::new(AtomicU64::new(0));
+    let calls = Arc::new(AtomicU64::new(0));
+    let published = Arc::new(AtomicU64::new(0));
+    let provider: crate::SourceProvider = {
+        let (calls, published) = (Arc::clone(&calls), Arc::clone(&published));
+        Arc::new(move || {
+            published.fetch_max(
+                WATCH.snapshot().map_or(0, |beat| beat.deferrals),
+                Ordering::SeqCst,
+            );
+            if calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+                WATCH.supersede(generation);
+            }
+            Some(source())
+        })
+    };
+    let mut loop_args = args(provider);
+    loop_args.checker_lock_wait = Duration::from_millis(400);
+    loop_args.staging = {
+        let staging = staging.clone();
+        Arc::new(move || Some(staging.clone()))
+    };
+    loop_args.check = {
+        let checks = Arc::clone(&checks);
+        Arc::new(move |_, _| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        })
+    };
+    let exit = crate::run_checker(&WATCH, generation, &loop_args);
+    done.store(true, Ordering::SeqCst);
+    let _ = writer.join();
+    assert_eq!(
+        exit,
+        CheckerExit::Superseded {
+            phase: CheckerPhase::Settings
+        }
+    );
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        0,
+        "two deferrals to a working holder, no check without the lock"
+    );
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        0,
+        "and no stuck sibling shown"
+    );
+    let _ = std::fs::remove_dir_all(staging.root);
+}
+
+/// THE HOLDER'S BEAT: a cycle that holds `checker.lock` through a long check keeps
+/// writing it while its checker is alive, so its siblings read it as working
+/// (`crate::checker_holder_progressing`); a retired generation's beat writes
+/// nothing, so a checker the watchdog replaced cannot vouch for itself.
+///
+/// FAILS WITHOUT THE FIX: the lock was written once, when it was taken, and read as
+/// no progress by every sibling a few seconds into any long check.
+#[test]
+fn the_holder_writes_the_lock_while_its_checker_is_alive() {
+    static WATCH: CheckerWatch = CheckerWatch::new();
+    let staging = crate::paths::Staging::scratch("checker-lock-holder-beat");
+    let path = staging.status.with_file_name("checker.lock");
+    let _lock = aterm_update_core::FileLock::acquire(&path).expect("the cycle takes it");
+    let fresh = Duration::from_millis(200);
+    let every = Duration::from_millis(50);
+    let written_within = |fresh| crate::checker_holder_progressing(&path, fresh);
+
+    let live = WATCH.register(1_000);
+    assert!(WATCH.beat(live, CheckerPhase::Checking));
+    let beat = crate::HolderBeat::start(path.clone(), &WATCH, live, every);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        written_within(fresh),
+        "a live holder's lock is fresh 600 ms into its check"
+    );
+    drop(beat);
+
+    let retired = WATCH.register(1_000);
+    assert!(WATCH.supersede(retired).is_some());
+    let beat = crate::HolderBeat::start(path.clone(), &WATCH, retired, every);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        !written_within(fresh),
+        "a retired generation's beat writes nothing"
+    );
+    drop(beat);
+    let _ = std::fs::remove_dir_all(staging.root);
+}
+
+/// A BEAT THAT LANDS AS A SIBLING READS IS PROGRESS. The sibling used to read its
+/// clock and then the lock's stamp: a holder's write landing between the two was a
+/// stamp from after the clock read — "from the future", which the rule counts as no
+/// progress — so a holder writing every few milliseconds was now and then called
+/// not progressing (measured in a loaded run of this suite: a stamp 1.4 ms past the
+/// clock read, the first deferral behind a working holder counted as stalled, and
+/// `a_holder_still_checking_is_never_called_stopped` and
+/// `the_holder_writes_the_lock_while_its_checker_is_alive` red together). The stamp
+/// is now read first, so it can be past the clock only by the clocks' granularity:
+/// a stamp that close counts as written now, while a stamp a second ahead (a clock
+/// stepped back) still defers nothing, and a stamp older than `fresh` is still no
+/// progress.
+///
+/// FAILS WITHOUT THE FIX: a stamp 2 ms past the clock read as no progress.
+#[test]
+fn a_stamp_just_past_the_readers_clock_is_progress_and_a_wrong_clock_is_not() {
+    let staging = crate::paths::Staging::scratch("checker-lock-stamp-order");
+    let path = staging.status.with_file_name("checker.lock");
+    std::fs::write(&path, "1\n").expect("the lock file");
+    let stamp = |at: std::time::SystemTime| {
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(at))
+            .expect("the lock's stamp is set");
+    };
+    let fresh = Duration::from_millis(200);
+    let now = std::time::SystemTime::now;
+
+    stamp(now() + Duration::from_millis(2));
+    assert!(
+        crate::checker_holder_progressing(&path, fresh),
+        "a beat that landed just after the reader's clock is progress"
+    );
+    stamp(now() - Duration::from_millis(50));
+    assert!(
+        crate::checker_holder_progressing(&path, fresh),
+        "a beat 50 ms ago is progress"
+    );
+    stamp(now() - Duration::from_millis(500));
+    assert!(
+        !crate::checker_holder_progressing(&path, fresh),
+        "a stamp older than fresh is none"
+    );
+    stamp(now() + Duration::from_secs(1));
+    assert!(
+        !crate::checker_holder_progressing(&path, fresh),
+        "a clock stepped back a second defers nothing"
+    );
+    let _ = std::fs::remove_dir_all(staging.root);
 }

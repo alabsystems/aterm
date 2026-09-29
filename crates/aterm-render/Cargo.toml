@@ -58,6 +58,11 @@ aterm-grapheme = { workspace = true }
 # Ligature config (LigatureMode / TextShapingConfig / FontFeature): the shaping
 # settings that gate liga/calt. Plain data types, no default features.
 aterm-types = { workspace = true }
+# The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md,
+# ruling 331): `src/band.rs` turns its resolved band rows into this renderer's
+# input, the one composition the native window and the web module share.
+# `aterm-time` is its only dependency — clockless, wasm-clean.
+aterm-messages = { workspace = true }
 # Fast non-DoS hasher (FxHash) for the per-cell glyph caches — the render profile
 # showed ~10% of rasterize time in SipHash. Glyph-cache keys are local render state
 # (font glyphs), not an untrusted hashmap-flood vector, so FxHash is the standard,

@@ -133,6 +133,7 @@ fn judge_branch(main: &Report, branch: &Report) -> aterm_verify::Verdict {
         source: "receipt aaaaaaaaa".into(),
         failures,
         now: NOW,
+        nearest: None,
     };
     let t_branch = tally(std::slice::from_ref(branch));
     assert!(t_branch.failed(), "the branch is red");
@@ -509,6 +510,20 @@ fn git(dir: &Path, args: &[&str]) -> String {
     git_env(dir, args, &[])
 }
 
+/// A git call that may fail: `Err` with its stderr when it does.
+fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
 /// [`git`] with more of the environment set — a committer date.
 fn git_env(dir: &Path, args: &[&str], env: &[(&str, String)]) -> String {
     let out = Command::new("git")
@@ -558,6 +573,9 @@ const TOOLCHAIN: &str = "/store/trust/9192/bin trustc 43f8b339fe0c";
 const CHECKERS: &str =
     "ty = /store/ty/3007/bin/ty (atpkg store, ty 0.15.0); trust-ir = absent; ay = absent";
 
+/// The cargo config files main's receipts below were built reading.
+const BUILD_CONFIG: &str = "repo/.cargo/config.toml=0123456789abcdef0123456789abcdef01234567";
+
 /// The tools main's receipts below were made by — a run's own, unless a case
 /// says otherwise.
 fn tools() -> Tools {
@@ -565,7 +583,33 @@ fn tools() -> Tools {
         toolchain: TOOLCHAIN.into(),
         checkers: CHECKERS.into(),
         build_env: Some("none".into()),
+        build_config: Some(BUILD_CONFIG.into()),
     }
+}
+
+/// Main on `origin` at `commit`, fetched: a bare `origin` inside `root`'s git
+/// dir (made on first use), its `main` forced to `commit`, and
+/// `refs/remotes/origin/main` there — so the base's freshness can be read
+/// from the remote as a real run reads it
+/// ([`differential::remote_main_fresh`]).
+fn origin_main(root: &Path, commit: &str) {
+    let bare = root.join(".git").join("test-origin.git");
+    if !bare.exists() {
+        let bare_s = bare.to_str().expect("utf-8");
+        git(root, &["init", "-q", "--bare", bare_s]);
+        git(root, &["remote", "add", "origin", bare_s]);
+    }
+    git(
+        root,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{commit}:refs/heads/main"),
+        ],
+    );
+    git(root, &["update-ref", "refs/remotes/origin/main", commit]);
 }
 
 /// A whole-tree baseline receipt for `head` listing `failures`.
@@ -581,6 +625,7 @@ fn baseline_receipt(root: &Path, head: &str, failures: Vec<Failure>, when: u64) 
         toolchain: TOOLCHAIN.into(),
         checkers: CHECKERS.into(),
         build_env: Some("none".into()),
+        build_config: Some(BUILD_CONFIG.into()),
         failures: Some(failures),
         baseline: true,
         when,
@@ -605,7 +650,7 @@ fn a11_a_stale_origin_main_is_no_base() {
     .expect("receipt");
     let m2 = commit(&root, "a.txt", "2 (fixes X)");
     receipt::write(&root, &baseline_receipt(&root, &m2, Vec::new(), NOW - 1800)).expect("receipt");
-    git(&root, &["update-ref", "refs/remotes/origin/main", &m1]);
+    origin_main(&root, &m1);
     git(&root, &["switch", "-q", "-c", "feature", &m2]);
     let head = commit(&root, "b.txt", "puts X back");
 
@@ -621,7 +666,7 @@ fn a11_a_stale_origin_main_is_no_base() {
     assert!(matches!(plan.against(NOW), Against::Absolute(Some(_))));
 
     // The control: fetched, the base is M2, and X is not on it.
-    git(&root, &["update-ref", "refs/remotes/origin/main", &m2]);
+    origin_main(&root, &m2);
     let plan = differential::resolve(&root, &head, false, &tools());
     let Plan::Judge(found) = &plan else {
         panic!("a fresh origin/main is a base: {plan:?}");
@@ -632,6 +677,7 @@ fn a11_a_stale_origin_main_is_no_base() {
         hash: red_x(&m1, 0).hash,
         opaque: None,
         timing: None,
+        package: None,
     };
     assert_eq!(
         differential::judge(&x, &found.reds(NOW)),
@@ -719,6 +765,7 @@ fn a12_a_baseline_reads_mains_published_notes_first() {
         source: "note".into(),
         failures: recorded,
         now: NOW + 60,
+        nearest: None,
     };
     let f = t.all_findings().next().expect("X");
     assert!(matches!(
@@ -758,6 +805,7 @@ fn a14_an_unaccounted_baseline_does_not_restart_x_s_clock() {
         source: format!("note {}", differential::short(&r.head)),
         receipt: Receipt::parse(&r.render()).expect("a receipt round-trips"),
         clock_floor: None,
+        nearest: None,
     };
     let receipt = |head: &str, t: &Tally, chain: Option<&BaseReds>, when: u64| Receipt {
         head: head.to_string(),
@@ -837,12 +885,14 @@ fn a15_a_clock_behind_mains_receipt_is_judged_by_the_absolute_rule() {
             ..Receipt::default()
         },
         clock_floor: None,
+        nearest: None,
     });
     let f = Finding {
         id: red_x("", 0).id,
         hash: red_x("", 0).hash,
         opaque: None,
         timing: None,
+        package: None,
     };
     let Against::Base(at_real) = plan.against(NOW) else {
         panic!("a clock ahead of the receipt judges against it");
@@ -879,7 +929,7 @@ fn forked_off_a_red_main(tag: &str) -> (PathBuf, String, String) {
         &baseline_receipt(&root, &m, vec![red_x(&m, NOW - 3600)], NOW - 3600),
     )
     .expect("receipt");
-    git(&root, &["update-ref", "refs/remotes/origin/main", &m]);
+    origin_main(&root, &m);
     git(&root, &["switch", "-q", "-c", "feature"]);
     let head = commit(&root, "b.txt", "a change");
     (root, m, head)
@@ -892,6 +942,7 @@ fn x_again() -> Finding {
         hash: red_x("", 0).hash,
         opaque: None,
         timing: None,
+        package: None,
     }
 }
 
@@ -1124,7 +1175,7 @@ fn b4_a_branch_judged_absolute_carries_mains_clock_into_the_next_base() {
     )
     .expect("receipt");
     let m1 = commit(&root, "a.txt", "1");
-    git(&root, &["update-ref", "refs/remotes/origin/main", &m1]);
+    origin_main(&root, &m1);
     git(&root, &["switch", "-q", "-c", "slice"]);
     let c = commit(&root, "b.txt", "a slice");
 
@@ -1161,13 +1212,14 @@ fn b4_a_branch_judged_absolute_carries_mains_clock_into_the_next_base() {
             toolchain: TOOLCHAIN.into(),
             checkers: CHECKERS.into(),
             build_env: Some("none".into()),
+            build_config: Some(BUILD_CONFIG.into()),
             failures: Some(recorded),
             when: ran,
             ..Receipt::default()
         },
     )
     .expect("receipt");
-    git(&root, &["update-ref", "refs/remotes/origin/main", &c]);
+    origin_main(&root, &c);
     git(&root, &["switch", "-q", "-c", "next"]);
     let d = commit(&root, "c.txt", "the next slice");
     let plan = differential::resolve(&root, &d, false, &tools());
@@ -1285,7 +1337,7 @@ fn b11_a_clock_behind_mains_newest_commit_is_no_clock() {
     )
     .expect("receipt");
     let tip = commit_at("a.txt", "2", NOW - 3600);
-    git(&root, &["update-ref", "refs/remotes/origin/main", &tip]);
+    origin_main(&root, &tip);
     git(&root, &["switch", "-q", "-c", "feature", &m]);
     let head = commit_at("b.txt", "a change", NOW - 20 * 3600);
 
@@ -1515,5 +1567,287 @@ fn c6_a_toolchain_switch_never_restarts_mains_clock() {
         Disposition::Expired(since) => assert_eq!(since.when, NOW - 30 * 3600),
         other => panic!("X has been red on main for 30 h, whatever read it: {other:?}"),
     }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Round four (2026-09-28): a stale origin/main the remote knows, and config
+// files
+// ---------------------------------------------------------------------------
+
+/// D1. MAIN MOVED ON THE REMOTE, AND THIS CHECKOUT NEVER FETCHED IT. The
+/// branch merged a newer main from somewhere this checkout's refs do not show
+/// (another worktree's fetch, a pull straight from the remote), so the
+/// local-main check had nothing to see, and the merge-base with the stale
+/// `origin/main` was an older main whose receipt was inherited. Main's tip is
+/// now READ from `origin`: a tip `origin/main` does not hold is no base, and
+/// the reason says to fetch — whether or not the remote's newer commit is in
+/// this repository's objects. The controls: the same tip, and a remote tip
+/// BEHIND `origin/main`, are fresh.
+#[test]
+fn d1_main_ahead_on_the_remote_is_no_base() {
+    let (root, m, head) = forked_off_a_red_main("atv-sound-remote-ahead");
+    assert!(
+        matches!(
+            differential::resolve(&root, &head, false, &tools()),
+            Plan::Judge(_)
+        ),
+        "the control: the remote's main is origin/main"
+    );
+
+    // The remote moved to M2 — a commit this repository has, pushed from a
+    // detached HEAD, and origin/main put back where it was fetched.
+    git(&root, &["switch", "-q", "--detach", &m]);
+    let m2 = commit(&root, "a.txt", "2 (fixes X)");
+    git(
+        &root,
+        &["push", "-q", "origin", &format!("{m2}:refs/heads/main")],
+    );
+    git(&root, &["update-ref", "refs/remotes/origin/main", &m]);
+    git(&root, &["switch", "-q", "feature"]);
+    let plan = differential::resolve(&root, &head, false, &tools());
+    let Plan::Absolute { why, chain } = &plan else {
+        panic!("judged against a main the remote has moved past: {plan:?}");
+    };
+    assert!(
+        why.contains(&format!(
+            "main on origin is at {}",
+            differential::short(&m2)
+        )) && why.contains("is stale")
+            && why.contains("`git fetch origin`"),
+        "{why}"
+    );
+    assert_eq!(
+        chain.as_ref().map(|c| c.commit.as_str()),
+        Some(m.as_str()),
+        "main's clocks are still carried"
+    );
+    assert!(matches!(plan.against(NOW), Against::Absolute(Some(_))));
+    assert_eq!(
+        plan.header_line(false, &head),
+        format!("verify: base — {why}: every red counts (the absolute rule)\n")
+    );
+
+    // A remote commit this repository has never seen: the same answer.
+    let other = root.join(".git").join("other-clone");
+    let bare = root.join(".git").join("test-origin.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            bare.to_str().expect("utf-8"),
+            other.to_str().expect("utf-8"),
+        ],
+    );
+    let m3 = commit(&other, "c.txt", "3");
+    git(&other, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    assert!(
+        git_ok(&root, &["cat-file", "-e", &m3]).is_err(),
+        "the new tip is not in this repository"
+    );
+    let Plan::Absolute { why, .. } = differential::resolve(&root, &head, false, &tools()) else {
+        panic!("judged against a main the remote has moved past");
+    };
+    assert!(
+        why.contains(&format!(
+            "main on origin is at {}",
+            differential::short(&m3)
+        )),
+        "{why}"
+    );
+
+    // Fetched, the remote's tip is origin/main again: fresh — and a remote
+    // tip BEHIND origin/main (a force-push this checkout already has past)
+    // is fresh too.
+    git(&root, &["fetch", "-q", "origin"]);
+    assert!(differential::remote_main_fresh(&root).is_ok());
+    git(
+        &root,
+        &[
+            "push",
+            "-q",
+            "-f",
+            "origin",
+            &format!("{m}:refs/heads/main"),
+        ],
+    );
+    git(&root, &["update-ref", "refs/remotes/origin/main", &m3]);
+    assert!(
+        differential::remote_main_fresh(&root).is_ok(),
+        "a remote tip origin/main already holds is not newer than it"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// D2. A REMOTE THAT CANNOT BE READ CONFIRMS NOTHING. Offline, a remote
+/// whose URL is gone, no `origin` at all, or an `origin` with no main: the
+/// freshness of `origin/main` cannot be confirmed, so the run is judged by
+/// the absolute rule, saying so and naming `git fetch origin`. Fail-closed:
+/// never "I could not look, so it is fresh".
+#[test]
+fn d2_a_remote_that_cannot_be_read_is_no_base() {
+    let (root, m, head) = forked_off_a_red_main("atv-sound-offline");
+    let unconfirmed = |root: &Path, wants: &str| {
+        let plan = differential::resolve(root, &head, false, &tools());
+        let Plan::Absolute { why, chain } = &plan else {
+            panic!("judged against an origin/main nobody could confirm ({wants}): {plan:?}");
+        };
+        assert!(
+            why.contains(wants)
+                && why.contains("cannot be confirmed fresh")
+                && why.contains("`git fetch origin`"),
+            "{wants}: {why}"
+        );
+        assert_eq!(chain.as_ref().map(|c| c.commit.as_str()), Some(m.as_str()));
+    };
+
+    // The URL is gone (a network that cannot be reached answers the same).
+    let gone = root.join(".git").join("no-such-origin.git");
+    git(
+        &root,
+        &["remote", "set-url", "origin", gone.to_str().expect("utf-8")],
+    );
+    unconfirmed(
+        &root,
+        "could not be read (`git ls-remote origin refs/heads/main`",
+    );
+
+    // An origin with no main.
+    let empty = root.join(".git").join("empty-origin.git");
+    git(
+        &root,
+        &["init", "-q", "--bare", empty.to_str().expect("utf-8")],
+    );
+    git(
+        &root,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            empty.to_str().expect("utf-8"),
+        ],
+    );
+    unconfirmed(&root, "origin names no refs/heads/main");
+
+    // No origin at all, with origin/main still in the refs.
+    git(&root, &["remote", "remove", "origin"]);
+    git(&root, &["update-ref", "refs/remotes/origin/main", &m]);
+    unconfirmed(&root, "could not be read");
+
+    // The control: the remote back, and readable.
+    let bare = root.join(".git").join("test-origin.git");
+    git(
+        &root,
+        &["remote", "add", "origin", bare.to_str().expect("utf-8")],
+    );
+    assert!(matches!(
+        differential::resolve(&root, &head, false, &tools()),
+        Plan::Judge(_)
+    ));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// D3. MAIN'S REDS UNDER OTHER CONFIG FILES. `build-env` recorded what the
+/// caller's ENVIRONMENT gave the compiles, and nothing recorded the cargo
+/// config FILES they read — a `~/.cargo/config.toml` or an ancestor
+/// directory's `.cargo/config.toml` with `rustflags`, a profile or a runner
+/// builds other code exactly as `RUSTFLAGS` does. A receipt names them now
+/// (`build-config`), and a base serves only a run that read the same; a
+/// receipt that does not say — an older gate's, or a run whose files could
+/// not be read — serves none, and a run that cannot say is served by none.
+#[test]
+fn d3_a_base_built_reading_other_config_files_is_no_base() {
+    let (root, m, head) = forked_off_a_red_main("atv-sound-config");
+    let elsewhere = Tools {
+        build_config: Some(format!(
+            "{BUILD_CONFIG} cargo-home/config.toml=fedcba9876543210fedcba9876543210fedcba98"
+        )),
+        ..tools()
+    };
+    let plan = differential::resolve(&root, &head, false, &elsewhere);
+    let Plan::Absolute { why, .. } = &plan else {
+        panic!("judged against reds built reading other config files: {plan:?}");
+    };
+    assert!(
+        why.contains(&format!("reading the cargo config files `{BUILD_CONFIG}`"))
+            && why.contains("cargo-home/config.toml=fedcba98"),
+        "{why}"
+    );
+    assert!(matches!(plan.against(NOW), Against::Absolute(Some(_))));
+
+    // The control: the same files are the same build.
+    assert!(matches!(
+        differential::resolve(&root, &head, false, &tools()),
+        Plan::Judge(_)
+    ));
+
+    // A run whose config files could not be read is served by no base.
+    let unreadable = Tools {
+        build_config: None,
+        ..tools()
+    };
+    let Plan::Absolute { why, .. } = differential::resolve(&root, &head, false, &unreadable) else {
+        panic!("judged a run whose config files it could not read");
+    };
+    assert!(
+        why.contains("this run's cargo config files could not be read"),
+        "{why}"
+    );
+
+    // Main's receipt without the line (an older gate's) serves no run.
+    let older = Receipt {
+        build_config: None,
+        ..baseline_receipt(&root, &m, vec![red_x(&m, NOW - 60)], NOW - 60)
+    };
+    receipt::write(&root, &older).expect("receipt");
+    let Plan::Absolute { why, .. } = differential::resolve(&root, &head, false, &tools()) else {
+        panic!("judged against a receipt that does not say what config it read");
+    };
+    assert!(
+        why.contains("does not say what cargo config files its compiles read"),
+        "{why}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+
+    // ABSENT ON BOTH SIDES is not "the same": nothing was said.
+    let silent = Tools {
+        build_config: None,
+        ..tools()
+    };
+    assert!(differential::tools_differ(&silent, &silent).is_some());
+    // `none` — no config file at all — on both sides is.
+    let bare = Tools {
+        build_config: Some("none".into()),
+        ..tools()
+    };
+    assert!(differential::tools_differ(&bare, &bare).is_none());
+    assert!(differential::tools_differ(&bare, &tools()).is_some());
+    assert!(differential::tools_differ(&tools(), &bare).is_some());
+}
+
+/// D3, recorded for real: the line a run writes is read back from the
+/// receipt it is written into, and a receipt without it parses to `None`.
+#[test]
+fn d3_the_build_config_line_round_trips_through_a_receipt() {
+    let root = aterm_verify::mktemp_dir("atv-sound-config-rt").expect("mktemp");
+    let r = Receipt {
+        build_config: Some(BUILD_CONFIG.into()),
+        ..baseline_receipt(&root, &"a".repeat(40), Vec::new(), NOW)
+    };
+    let text = r.render();
+    assert!(
+        text.contains(&format!("\nbuild-config {BUILD_CONFIG}\n")),
+        "{text}"
+    );
+    assert_eq!(Receipt::parse(&text), Some(r.clone()));
+    let without: String = text
+        .lines()
+        .filter(|l| !l.starts_with("build-config "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(Receipt::parse(&without).map(|r| r.build_config), Some(None));
     std::fs::remove_dir_all(&root).ok();
 }

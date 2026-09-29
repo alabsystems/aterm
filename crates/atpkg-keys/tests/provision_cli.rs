@@ -710,6 +710,47 @@ fn unknown_and_malformed_arguments_are_refused_by_name() {
     assert!(!err.contains("unexpected argument"), "{err}");
 }
 
+/// `machine-revoke` WITH NO ROSTER REFUSES BEFORE THE PHRASE — there is nothing to revoke
+/// from — and writes nothing where the operator is standing.
+#[test]
+fn machine_revoke_with_no_roster_refuses_before_asking_for_the_phrase() {
+    let dir = scratch("revoke-no-roster");
+    let roster = p(&dir, "dist/aterm-machines.toml");
+    let out = run(
+        &dir,
+        None,
+        &["machine-revoke", "--id", "m3", "--roster", &roster],
+    );
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(err.contains("no roster at "), "{err}");
+    assert!(
+        !err.contains("/dev/tty"),
+        "refused before the phrase is asked for: {err}"
+    );
+    assert!(
+        !dir.join("dist").exists(),
+        "no roster lock or directory is created: {err}"
+    );
+
+    // NEGATIVE CONTROL: with a roster there, the run gets as far as the phrase.
+    armed_tree(&dir);
+    let out = run(
+        &dir,
+        None,
+        &[
+            "machine-revoke",
+            "--id",
+            "m3",
+            "--roster",
+            &p(&dir, "roster.toml"),
+        ],
+    );
+    let err = stderr_of(&out);
+    assert!(!err.contains("no roster at "), "{err}");
+    assert!(err.contains("/dev/tty"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // THE ROSTER FORK.
 // ---------------------------------------------------------------------------

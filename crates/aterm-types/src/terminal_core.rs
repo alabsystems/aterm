@@ -72,14 +72,16 @@ impl TerminalCapabilities {
             hyperlinks: true,
             sixel_graphics: true,
             iterm_images: true,
-            // Kitty graphics protocol: core transmit/display works (APC 'G' →
-            // decode PNG/RGBA/RGB → place via the shared image pipeline), incl.
-            // chunked transmission, the per-id store (a=t/a=p), targeted delete,
-            // and the a=q support query. Advanced sub-features (o=z compression,
-            // Unicode placeholders, animation, file/shared-mem mediums, z-index
-            // compositing) degrade gracefully (skip, never garbage). Enforced by
-            // `gate drift` (witness: handle_kitty_command). See KITTY-CORE in
-            // docs/EXCEED_GHOSTTY_PLAN.md.
+            // Kitty graphics protocol (APC 'G' → decode PNG/RGBA/RGB → place via
+            // the shared image pipeline): transmit/put/query, chunked and `o=z`
+            // transfers, the file/shm mediums behind the host's opt-in resolver,
+            // placement ids, `I=` numbers, every delete selector (frames
+            // included), source rectangles, `z<0` under text, Unicode
+            // placeholders with their virtual placements, relative placements,
+            // and frame loading, composition and selection. What is not built is
+            // listed on `handle_complete_kitty_command`, with what each does
+            // instead. Pinned by `kitty_graphics_advertised_after_kitty_core`
+            // below.
             kitty_graphics: true,
             clipboard: true,
             shell_integration: true,
@@ -88,7 +90,7 @@ impl TerminalCapabilities {
             // Soft fonts (DRCS/DECDLD) are not supported: the integration was
             // permanently removed (dd8061b06) and the DCS `{` payload is consumed
             // and discarded (handler_dcs.rs), so the capability is advertised
-            // false. `gate drift` keeps it false unless `fn handle_decdld` exists.
+            // false. Pinned by `soft_fonts_not_advertised` below.
             soft_fonts: false,
             unicode: true,
             bracketed_paste: true,

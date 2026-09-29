@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-keeper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — the PTY keeper: a per-login holder of a custody copy of every terminal's master, so a window's crash does not hang up its shells (docs/DESIGN-pty-keeper-2026-09-26.md). The pure custody core, the AKP1 wire, the server loop, the client, job control and relaunch. Links no AppKit, CoreGraphics or winit."
+
+[features]
+# The `#[refines]` / `#[spec_unmodeled]` anchors on KeeperCore's handlers are
+# compiled in only for this crate's tests and for builds that ask for them; the
+# shipped binary carries no probe.
+spec-anchors = ["dep:aterm-spec"]
+
+[dependencies]
+# The descriptor, peer, process-birth, exit-watch, spawn and holder-scan
+# primitives: the cordoned unsafe crate the keeper's OS half is built on.
+aterm-uds = { workspace = true }
+aterm-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

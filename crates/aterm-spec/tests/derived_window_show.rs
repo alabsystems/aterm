@@ -85,6 +85,29 @@ fn window_show_walks_the_update_the_way_the_user_meets_it() {
         "the window typed into keeps the keyboard"
     );
 
+    // Typed into BEFORE the proof (round six, finding 45): the window the
+    // reveal order left key, typed into while the proof was still owed, keeps
+    // the keyboard through the stack and Commit.
+    let mut typed_early = m.init_state();
+    for action in ["Launch", "Reveal", "Type", "Prove", "Stack", "Commit"] {
+        assert!(
+            m.fire(action, &mut typed_early),
+            "{action}: {typed_early:?}"
+        );
+        for invariant in &m.invariants {
+            assert!(
+                m.check_invariant(invariant.name, &typed_early),
+                "{action}: {} on {typed_early:?}",
+                invariant.name
+            );
+        }
+    }
+    assert_eq!(
+        (typed_early["keyed"], typed_early["typed"]),
+        (0, 1),
+        "the window typed into before the stack keeps the keyboard"
+    );
+
     let mut stolen = m.init_state();
     for action in ["Launch", "Reveal", "Prove", "Stack", "Steal", "Commit"] {
         assert!(m.fire(action, &mut stolen), "{action}: {stolen:?}");

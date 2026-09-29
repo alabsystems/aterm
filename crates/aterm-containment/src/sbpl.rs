@@ -310,7 +310,7 @@ pub const PRIVATE_SUBDIRS: &[&str] = &[
 /// `Containment` mode. The returned profile is the one [`profile_for_home`]
 /// builds for the current `$HOME` and the set's filesystem capability. For every
 /// other capability set (network
-/// `Allowlist` or `Full` — `Safety`/`User`/`Master`) it returns `None`, meaning
+/// `Full` — `Safety`/`User`/`Master`) it returns `None`, meaning
 /// "no `sandbox-exec` wrap; spawn exactly as before". This is the load-bearing
 /// safety property: the OS sandbox is applied ONLY when the policy denies network,
 /// never otherwise, so the default User-mode spawn is byte-identical.
@@ -320,9 +320,18 @@ pub const PRIVATE_SUBDIRS: &[&str] = &[
 /// per-user and an owned `String`.
 #[must_use]
 pub fn profile_for(caps: &Capabilities) -> Option<String> {
+    profile_for_scoped(*caps, home_dir().as_deref()).map(|(profile, _)| profile)
+}
+
+/// [`profile_for`] for the given home (the caller passes [`home_dir`]), and
+/// whether that profile holds the home-scoped read denies (credential stores,
+/// and for `TmpOnly` private data): `false` when the home is absent, empty or
+/// does not canonicalize, so a posture record never claims them.
+#[must_use]
+pub(crate) fn profile_for_scoped(caps: Capabilities, home: Option<&str>) -> Option<(String, bool)> {
     match caps.network {
         // Containment: network fully denied → the Seatbelt profile, scoped under
-        // the current $HOME.
+        // `home`.
         //
         // The write confinement and the private-user-data set are gated on the
         // FILESYSTEM capability, not the network one (see `profile_for_home`): if a
@@ -330,14 +339,9 @@ pub fn profile_for(caps: &Capabilities) -> Option<String> {
         // would get the network and credential deny but NOT the `TmpOnly` rules.
         // Today only Containment reaches this arm, and Containment is
         // `network == None ∧ fs == TmpOnly`, so the full set applies.
-        NetworkCapability::None => Some(profile_for_home(
-            home_dir().as_deref(),
-            Some(&std::env::temp_dir()),
-            caps.fs,
-        )),
-        // Safety (Allowlist) / User+Master (Full): no OS network sandbox. Spawn
-        // unchanged.
-        NetworkCapability::Allowlist | NetworkCapability::Full => None,
+        NetworkCapability::None => Some(profile_scoped(home, Some(&std::env::temp_dir()), caps.fs)),
+        // Safety / User / Master (Full): no OS network sandbox. Spawn unchanged.
+        NetworkCapability::Full => None,
     }
 }
 
@@ -345,7 +349,7 @@ pub fn profile_for(caps: &Capabilities) -> Option<String> {
 ///
 /// Empty is treated as absent so we never join secret components onto `""` (which
 /// would produce absolute `/.ssh`-style denies for a bogus root-relative path).
-fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => Some(h),
         _ => None,
@@ -392,6 +396,16 @@ fn home_dir() -> Option<String> {
 /// before emission so the emitted SBPL literal is always well-formed.
 #[must_use]
 pub fn profile_for_home(home: Option<&str>, user_temp: Option<&Path>, fs: FsCapability) -> String {
+    profile_scoped(home, user_temp, fs).0
+}
+
+/// [`profile_for_home`], and whether the home resolved — i.e. whether the
+/// home-scoped read denies are in the profile.
+fn profile_scoped(
+    home: Option<&str>,
+    user_temp: Option<&Path>,
+    fs: FsCapability,
+) -> (String, bool) {
     let tmp_only = fs == FsCapability::TmpOnly;
     // Canonicalize the HOME itself (it must exist). Seatbelt matches the canonical
     // path; a non-canonical prefix would silently fail to match (security theater).
@@ -410,7 +424,7 @@ pub fn profile_for_home(home: Option<&str>, user_temp: Option<&Path>, fs: FsCapa
         push_write_confinement(&mut profile, user_temp, canon_home.as_deref());
     }
     let Some(canon_home) = canon_home else {
-        return profile;
+        return (profile, false);
     };
 
     let mut clauses = String::new();
@@ -479,7 +493,7 @@ pub fn profile_for_home(home: Option<&str>, user_temp: Option<&Path>, fs: FsCapa
         profile.push_str(&ancestor_clauses);
         profile.push(')');
     }
-    profile
+    (profile, true)
 }
 
 /// Emit the deny clause(s) for the secret/private entry `<canon_home>/<entry>`,
@@ -713,7 +727,11 @@ mod tests {
                 profile_for_home(home, None, FsCapability::TmpOnly),
                 tmp_only
             );
+            // …and says so, so the posture record does not claim the read denies.
+            assert!(!profile_scoped(home, None, FsCapability::TmpOnly).1);
         }
+        let home = aterm_tempfile::tempdir().unwrap();
+        assert!(profile_scoped(home.path().to_str(), None, FsCapability::TmpOnly).1);
     }
 
     /// `TmpOnly` confines WRITES (decided 2026-09-26 under the owner's standing
@@ -1351,7 +1369,7 @@ mod tests {
 
     #[test]
     fn non_containment_modes_get_no_sandbox() {
-        // User/Master have Full network; Safety has Allowlist. NONE of them is
+        // User, Master and Safety have Full network. NONE of them is
         // sandboxed — profile_for must return None so their spawn is byte-identical
         // (no sandbox-exec wrap).
         for mode in [
@@ -1377,10 +1395,6 @@ mod tests {
         let mut none = base;
         none.network = NetworkCapability::None;
         assert!(profile_for(&none).is_some());
-
-        let mut allow = base;
-        allow.network = NetworkCapability::Allowlist;
-        assert!(profile_for(&allow).is_none());
 
         let mut full = base;
         full.network = NetworkCapability::Full;

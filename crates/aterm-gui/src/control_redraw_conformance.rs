@@ -172,6 +172,8 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         fabric: std::sync::Arc::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        generation_look: Default::default(),
+        reset_lane: Default::default(),
     });
     SessionHandle {
         sid,

@@ -20,15 +20,15 @@
 //!   (trailing spectrum on the left lobe, leading on the right), so the emitter
 //!   reads as a prism focusing the sweep, distinct from the rainbow kitty's banded ring.
 //!
-//! Text-safe by construction, mirroring [`crate::cursor_rainbow`] /
-//! [`crate::cursor_fireball`]: the block FILL is returned for the renderer's
-//! `floor_cursor_fill` contrast floor (the cut-out glyph stays razor-sharp), and
-//! the wings are purely additive [`GlowQuad`] light with capped coverage — the
-//! only layer that reaches over neighbouring glyphs is the dim outer tint. Like
-//! its siblings it is a CLOCKLESS pure function of an injected `now`, settles to
-//! inactive when the charge dies (the idle emitter then rides the blink cadence
-//! — no perpetual wakeups), and emits identical premultiplied quads on the CPU
-//! and Metal backends.
+//! Text-safe by construction, mirroring [`crate::cursor_rainbow`]: the block
+//! FILL is returned for the renderer's `floor_cursor_fill` contrast floor (the
+//! cut-out glyph stays razor-sharp), and the wings are purely additive
+//! [`GlowQuad`] light with capped coverage — the only layer that reaches over
+//! neighbouring glyphs is the dim outer tint. Like its siblings it is a
+//! CLOCKLESS pure function of an injected `now`, settles to inactive when the
+//! charge dies (the idle emitter then rides the blink cadence — no perpetual
+//! wakeups), and emits identical premultiplied quads on the CPU and Metal
+//! backends.
 
 use aterm_time::Instant;
 
@@ -85,7 +85,7 @@ const WING_LAYERS: [(f32, f32, f32, f32); 4] = [
 
 /// Innermost-layer peak coverage (× charge, pre-cap): a dim idle port, a bright
 /// charged core. Every push is additionally clamped by [`COV_CAP`], matching the
-/// fireball's text-safety band — the wings overlap the neighbouring glyph cells,
+/// light rod's text-safety band — the wings overlap the neighbouring glyph cells,
 /// so the additive light must stay a tint out there.
 const COV_IDLE: f32 = 46.0;
 const COV_MAX: f32 = 132.0;
@@ -189,7 +189,7 @@ impl CursorPhaser {
         let e = (energy.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         // Fully inert — byte-identical to the plain themed cursor — when off, when
         // the geometry is degenerate, or when the amplitude is zero (reduced
-        // motion / load-shed), mirroring the rainbow/fireball "0 ⇒ off" contract.
+        // motion / load-shed), mirroring the rainbow block's "0 ⇒ off" contract.
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.energy = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);

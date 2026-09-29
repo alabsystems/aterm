@@ -97,7 +97,7 @@ const STAPLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 // ---------------------------------------------------------------------------
 
 /// The owner's signing material, loaded from the path given to
-/// `cargo ship cut --release-credentials <path>`.
+/// `targo --unverified ship cut --release-credentials <path>`.
 ///
 /// This replaces the per-machine `~/.aterm/release.conf`. That file was AMBIENT:
 /// present or absent, invisible either way, and discovered only at the moment of
@@ -191,6 +191,10 @@ pub struct ReleaseCredentials {
     /// match the committed Team ID, and can therefore never widen what is
     /// accepted, only narrow it. See [`select_devid_identity`].
     identity_sha1: Option<String>,
+    /// The profile these credentials were loaded from; `None` for the
+    /// `~/.aterm/machine.key` fallback, which names no notary credential. Only
+    /// [`resolve_apple_tier`]'s refusal reads it, to name the file to fix.
+    profile: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ReleaseCredentials {
@@ -298,6 +302,7 @@ impl ReleaseCredentials {
             machine_roster: staged.exists().then_some(staged),
             notary: None,
             identity_sha1: None,
+            profile: None,
         }))
     }
 
@@ -354,6 +359,7 @@ impl ReleaseCredentials {
             machine_roster,
             notary,
             identity_sha1,
+            profile: Some(path.to_path_buf()),
         })
     }
 
@@ -399,6 +405,13 @@ impl ReleaseCredentials {
     #[must_use]
     pub fn machine_roster(&self) -> Option<&Path> {
         self.machine_roster.as_deref()
+    }
+
+    /// The `--release-credentials` profile these were loaded from; `None` when
+    /// they came from `~/.aterm/machine.key` with no profile given.
+    #[must_use]
+    pub fn profile(&self) -> Option<&Path> {
+        self.profile.as_deref()
     }
 
     /// Detached Ed25519 signature over `msg`.
@@ -777,19 +790,25 @@ pub fn resolve_apple_tier(
     if team_id.is_empty() {
         return Ok(AppleTier::Inactive);
     }
-    let credentials = credentials.ok_or_else(|| {
-        format!(
-            "pins::APPLE_TEAM_ID is set to {team_id}, so every artifact must be Developer-ID \
-             signed and notarized — but no --release-credentials profile was given, so there \
-             is no notarytool credential to submit with"
-        )
-    })?;
+    // No profile at all, or only `~/.aterm/machine.key` (which `resolve` falls back to
+    // and which names no notary credential): the remedy is the profile, not an edit.
+    let Some((credentials, profile)) =
+        credentials.and_then(|c| c.profile().map(|profile| (c, profile)))
+    else {
+        return Err(format!(
+            "no --release-credentials profile was given, and pins::APPLE_TEAM_ID ({team_id}) \
+             notarizes every artifact, which needs the profile's notary credential. Cut with `--release-credentials ~/.aterm/release-credentials.toml` (`{} provision \
+             --id <machine-id>` writes it)",
+            crate::publish::SHIP_COMMAND
+        ));
+    };
     let auth = credentials.notary().ok_or_else(|| {
         format!(
-            "pins::APPLE_TEAM_ID is set to {team_id}, but the release-credentials profile \
-             names no notarytool credential. Run `xcrun notarytool store-credentials <name> \
-             --apple-id <id> --team-id {team_id} --password <app-specific-password>` once, then \
-             add `notary_profile = \"<name>\"` to the profile"
+            "pins::APPLE_TEAM_ID is set to {team_id}, but {} names no notarytool credential. \
+             Run `xcrun notarytool store-credentials <name> --apple-id <id> --team-id {team_id} \
+             --password <app-specific-password>` once, then add `notary_profile = \"<name>\"` \
+             to it",
+            profile.display()
         )
     })?;
     let listing = Command::new(SECURITY)

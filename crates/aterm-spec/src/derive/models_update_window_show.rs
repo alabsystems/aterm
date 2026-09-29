@@ -42,6 +42,17 @@ use super::Model;
 /// `Stack`, `Commit` (the outgoing process's answer to the proof) and
 /// `EnterFullScreen`.
 ///
+/// TYPING BEFORE THE STACK (round six, finding 45). A revealed window takes
+/// keys from the moment it is on glass — a click on it activates the
+/// successor — and the proof, which the stack waits for, can be seconds
+/// later. So `Type` is enabled from the reveal, not from the stack: the
+/// keyboard is then on a window the reveal order left key (`keyed == 0`), and
+/// a stack that raised the carried key window last over it split what the
+/// person was typing across two terminals. The stack keys the window typed
+/// into instead (`keyed` stays 0 with `typed == 1`), and Commit leaves it
+/// there. Until this, `Type` required `stacked == 1`, so neither the model nor
+/// its Tier-1 replay ever typed before the stack.
+///
 /// Invariants: `StackOnlyOnGlass` — the stack never raises a window before its
 /// first present (a raise is a reveal, and a frame on glass before the carried
 /// pixels is exactly what the reveal-at-first-present rule forbids).
@@ -108,7 +119,7 @@ pub fn native_update_window_show_model() -> Model {
                     && ((revealed == 1 && (lane == 2 || proof == 1)) || Buggy == 1)
             ) {
                 stacked = 1;
-                keyed = if Buggy == 1 { 0 } else { 1 };
+                keyed = if typed == 1 || Buggy == 1 { 0 } else { 1 };
             }
             action Activate when (front == 0) {
                 front = 1;
@@ -119,7 +130,7 @@ pub fn native_update_window_show_model() -> Model {
             action Steal when (lane == 1 && committed == 0 && stacked == 1 && keyed == 1) {
                 keyed = 0;
             }
-            action Type when (lane == 1 && committed == 0 && stacked == 1 && keyed == 0) {
+            action Type when (lane == 1 && committed == 0 && revealed == 1 && keyed == 0) {
                 typed = 1;
             }
             action Commit when (lane == 1 && committed == 0 && proof == 1) {

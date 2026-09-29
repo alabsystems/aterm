@@ -29,8 +29,9 @@ impl InlineBuf {
     // which lives in the ABSENT std body — and both sub-slices here are
     // `..n` ranges (provably equal length; the `if let (Some, Some)` makes
     // the bounds total), so the panic is unreachable in every real state.
-    // Audited; droppable when the toolchain grows the conditional
-    // `copy_from_slice` len==len caller-side template.
+    // Audited. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed: INCONCLUSIVE (1 of 2
+    // unknown). Needed from $HOME/trust, in a promoted seal: a conditional
+    // `copy_from_slice` len==len caller-side template; then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     fn from_slice(bytes: &[u8]) -> Self {

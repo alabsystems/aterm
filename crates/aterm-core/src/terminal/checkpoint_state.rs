@@ -20,18 +20,27 @@
 //!   counters observers key on. Their rows are absolute, and the checkpoint
 //!   carries each grid's absolute row counter so the restored grids continue
 //!   the same numbering: a mark means the same line after the handoff.
+//! * [`TitleRepr`] carries the window title (OSC 0/2), the icon name (OSC 0/1)
+//!   and the XTWINOPS title stack (CSI 22/23 t). An in-session update used to
+//!   drop all three: the tab kept its label only until the successor's first
+//!   frame, then fell back to the working directory until the program happened
+//!   to set a title again (the 2026-09-28 round-four plan, item 8), and a
+//!   program that pushed its caller's title to restore it on exit restored
+//!   nothing. The successor treats a carried title as OSC input
+//!   ([`Terminal::restore_title`]): capped, stripped of controls, the stack
+//!   bounded.
 
 use std::collections::VecDeque;
 
 use aterm_types::{ColorPalette, Rgb};
 
 use super::Terminal;
-use super::callbacks::COLOR_STACK_MAX_DEPTH;
+use super::callbacks::{COLOR_STACK_MAX_DEPTH, TITLE_STACK_MAX_DEPTH};
 use super::grouped_state::{ColorStackEntry, ShellIntegrationPhase};
 use super::shell::{
     BlockState, COMMAND_MARKS_MAX, CommandMark, OUTPUT_BLOCKS_MAX, OutputBlock, ShellState,
 };
-use super::{MAX_COMMANDLINE_BYTES, MAX_CWD_PATH_BYTES};
+use super::{MAX_COMMANDLINE_BYTES, MAX_CWD_PATH_BYTES, MAX_TITLE_BYTES};
 
 /// One palette entry an application changed (OSC 4 / OSC 21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +136,53 @@ impl ColorRepr {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// The titles a program set: the window title, the icon name, and the
+/// XTWINOPS title stack, whole. `Default` is a terminal nothing has titled.
+///
+/// Every string is exactly what the engine stores, which is already capped and
+/// stripped of controls on the way in; a restore does both again
+/// ([`Terminal::restore_title`]), because the wire is not the engine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TitleRepr {
+    /// The window title (OSC 0 or 2) — the one a tab is labelled with.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "String::is_empty")
+    )]
+    pub window: String,
+    /// The icon name (OSC 0 or 1).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "String::is_empty")
+    )]
+    pub icon: String,
+    /// The title stack, bottom first, as `(icon name, window title)` pairs —
+    /// the engine's own order. An entry pushed for one of the two holds an
+    /// empty string for the other, which a pop leaves alone.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub stack: Vec<(String, String)>,
+}
+
+impl TitleRepr {
+    /// Whether nothing has been titled.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A carried title string, made what the OSC 0/1/2 handler would have stored:
+/// capped at [`MAX_TITLE_BYTES`] on a character boundary, then stripped of C0,
+/// C1 and bidi controls (`handler_osc::sanitize_title`) — in the handler's own
+/// order, so a carried title is never longer than a live one could be.
+fn carried_title(text: &str) -> String {
+    super::handler_osc::sanitize_title(&text[..text.floor_char_boundary(MAX_TITLE_BYTES)])
 }
 
 /// The span fields an OSC 133 command mark and an output block share.
@@ -500,6 +556,47 @@ impl Terminal {
             next_block_id: s.next_block_id,
             completed_seq: s.completed_seq,
         }
+    }
+
+    /// Project the titles a program set (see [`TitleRepr`]).
+    pub(super) fn capture_title_repr(&self) -> TitleRepr {
+        TitleRepr {
+            window: self.title.window.to_string(),
+            icon: self.title.icon.to_string(),
+            stack: self
+                .title
+                .stack
+                .iter()
+                .map(|(icon, window)| (icon.to_string(), window.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Install a carried [`TitleRepr`] AS IF A PROGRAM HAD SENT IT: every string
+    /// capped and stripped the way the OSC handler stores one, and the stack cut
+    /// to [`TITLE_STACK_MAX_DEPTH`] entries — its BOTTOM ones, because that is
+    /// what a live engine keeps when a push finds the stack full (the push is
+    /// dropped). A real change of the window title bumps the title epoch, so a
+    /// host polling [`Terminal::title_epoch`] relabels the tab.
+    ///
+    /// Why not the host's `set_title`: it caps but does not sanitize, since a
+    /// host sets its own words. A carried title is the previous process's copy
+    /// of a PROGRAM's words, read back from a file, and gets the program's rules.
+    pub fn restore_title(&mut self, repr: &TitleRepr) {
+        let window = carried_title(&repr.window);
+        if *self.title.window != *window {
+            self.title
+                .epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.title.window = window.into();
+        self.title.icon = carried_title(&repr.icon).into();
+        self.title.stack = repr
+            .stack
+            .iter()
+            .take(TITLE_STACK_MAX_DEPTH)
+            .map(|(icon, window)| (carried_title(icon).into(), carried_title(window).into()))
+            .collect();
     }
 
     /// Install a carried [`ShellRepr`], bounding what a wire can hand in to the

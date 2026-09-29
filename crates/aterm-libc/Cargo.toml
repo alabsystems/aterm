@@ -14,7 +14,7 @@ name = "libc"
 # strictest are `^0.2.172` (wgpu-hal) and `^0.2.171` (jobserver), and the lock
 # held 0.2.186 before the swap. 0.2.186 satisfies every one of them AND keeps
 # the lockfile's version line still. A version BELOW any requirement would make
-# the patch silently inert — cargo does not warn, `cargo forge check` does.
+# the patch silently inert — cargo does not warn, `targo --unverified forge check` does.
 version = "0.2.186"
 edition.workspace = true
 license.workspace = true

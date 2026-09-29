@@ -327,8 +327,8 @@ impl TerminalHandler<'_> {
 
     /// Perform a line feed, honoring DECLRMM left/right margins (#7687).
     ///
-    /// (When the Kitty graphics protocol lands (KITTY-CORE), placement
-    /// scroll-adjustment hooks here — today there are no placements to adjust.)
+    /// Inline-image placements (Kitty, iTerm2, sixel) need no hook here: they
+    /// live in cell extras, which the margined scroll shifts with their cells.
     #[inline]
     pub(super) fn margined_line_feed(&mut self, left_right_margin_mode: bool) {
         self.grid.line_feed_margined(left_right_margin_mode);

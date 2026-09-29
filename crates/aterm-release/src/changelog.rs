@@ -457,8 +457,8 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
 /// the guide names exactly the lean DMG, the zip, the evergreen aliases and
 /// the sidecars — nothing this release does not carry.
 pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
-    // Sizes are ballpark labels for a reader scanning the asset list, not
-    // records (the `.sha256` sidecars are the records).
+    // No sizes: GitHub lists each asset's real size beside it, and a label here
+    // went stale as the app grew (~28 MB written, 40.6 MB shipped at v0.98.0).
     //
     // THE BOUND IS TAKEN ON THE WHOLE DOCUMENT, not on `changelog_body` alone:
     // the preamble is ~1.3 KB that the POST carries too, so bounding the body
@@ -468,10 +468,10 @@ pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
     bound_release_body(&format!(
         "**aterm** is the terminal for AI. New here? What each file is:\n\
          \n\
-         - `aterm-{version}.dmg` — the signed, notarized app as a drag-install DMG \
-         (~28 MB). The ALab toolchain installs itself on first launch (or on demand via \
+         - `aterm-{version}.dmg` — the signed, notarized app as a drag-install DMG. \
+         The ALab toolchain installs itself on first launch (or on demand via \
          `aterm pkg install --default-set`).\n\
-         - `aterm-{version}-mac.zip` — the same app as a zip (~26 MB); this is the \
+         - `aterm-{version}-mac.zip` — the same app as a zip; this is the \
          container the in-app updater and Homebrew stage from.\n\
          - `aterm.dmg` / `aterm-mac.zip` — permanent `releases/latest/download/` names \
          for the DMG and the zip above (byte-identical copies).\n\

@@ -166,9 +166,8 @@ impl UniversalControlState {
 
 /// `defaults read`'s rendering of a boolean, as bytes: `1`/`0`, `true`/`false`,
 /// `YES`/`NO` (any case), surrounded by whitespace. Anything else — a dict, a string —
-/// is `None`: not a switch this module understands, so never "set". Byte-based so
-/// [`crate::platform::unix`] (compiled under the strict gate, no `fmt::Arguments`) can
-/// call it.
+/// is `None`: not a switch this module understands, so never "set". Byte-based: it reads
+/// a subprocess's raw stdout.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub fn parse_defaults_bool(stdout: &[u8]) -> Option<bool> {
@@ -581,7 +580,7 @@ pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::Machin
     let tmp = layout
         .prefix
         .join(format!("machine.applied.tmp-{}", std::process::id()));
-    if crate::call2(std::fs::write, &tmp, text).is_err() || std::fs::rename(&tmp, &path).is_err() {
+    if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }

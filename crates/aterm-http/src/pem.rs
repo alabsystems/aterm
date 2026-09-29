@@ -81,7 +81,16 @@ pub fn decode_certificates(text: &str) -> Result<Vec<Vec<u8>>, PemError> {
         if base64.is_empty() {
             return Err(PemError(format!("PEM {label} block is empty")));
         }
-        let der = aterm_codec::base64::decode(&base64)
+        // STRICT: RFC 7468 mandates canonical padded base64 for a PEM body, the
+        // whitespace filter directly above has already produced exactly that
+        // form, and a CA bundle is a TLS trust override — the same caller class
+        // `decode_strict` was introduced for. The lenient decoder would take an
+        // unpadded or trailing-bit-dirty body and hand rustls the DER it
+        // implies, which is a confusing X.509 error later instead of a precise
+        // one here. (`decode_certificates_lossy` below stays lenient on purpose:
+        // it reads a machine-generated system store, where a block it cannot
+        // take is skipped, never trusted.)
+        let der = aterm_codec::base64::decode_strict(base64.as_bytes())
             .map_err(|error| PemError(format!("PEM {label} block is not valid base64: {error}")))?;
         if der.is_empty() {
             return Err(PemError(format!("PEM {label} block decoded to no bytes")));
@@ -166,8 +175,8 @@ mod tests {
         let text = bundle(&["aaaa", "bbbb"]);
         let out = decode_certificates(&text).unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0], aterm_codec::base64::decode("aaaa").unwrap());
-        assert_eq!(out[1], aterm_codec::base64::decode("bbbb").unwrap());
+        assert_eq!(out[0], aterm_codec::base64::decode_strict(b"aaaa").unwrap());
+        assert_eq!(out[1], aterm_codec::base64::decode_strict(b"bbbb").unwrap());
     }
 
     #[test]
@@ -224,6 +233,21 @@ mod tests {
     fn invalid_base64_is_rejected() {
         let text = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
         assert!(decode_certificates(text).is_err());
+    }
+
+    /// An unpadded or trailing-bit-dirty body is REFUSED rather than decoded
+    /// to the DER it implies — the acceptance set a trust override needs.
+    #[test]
+    fn a_non_canonical_body_is_rejected() {
+        // "aaa" is a truncated quad: canonical PEM pads it.
+        assert!(decode_certificates(&bundle(&["aaa"])).is_err());
+        // "aaa=" and "aab=" carry bits in the third symbol that the decode
+        // discards, so each is a second spelling of what "aaA=" already means.
+        assert!(decode_certificates(&bundle(&["aaa="])).is_err());
+        assert!(decode_certificates(&bundle(&["aab="])).is_err());
+        // ...and the canonical spellings still decode.
+        assert!(decode_certificates(&bundle(&["aaA="])).is_ok());
+        assert!(decode_certificates(&bundle(&["aaaa"])).is_ok());
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! there is no grid-relative RECT pusher left for one to be routed through by
 //! accident: `push_grid_rect` — a thin additive wrapper over
 //! [`push_grid_quad`] — was the trap that put the momentum halo, the comet's
-//! coma, the droplet's bead and the fireball's ball 84 px above and 24 px left
+//! coma, the droplet's bead (and the since-deleted fireball's ball) 84 px above and 24 px left
 //! of the caret in a real window, and it is deleted. The grid form survives
 //! only as [`push_grid_quad`], whose one caller is `output_streak` — light
 //! anchored to a TEXT RUN and not to the caret.
@@ -196,7 +196,7 @@ const WATER_STOPS: [(f32, u32); 5] = [
 /// WHY (driver-03): both ramps built their stop table as a function local and
 /// linear-searched it PER CALL, while the fire/water emit paths call them per
 /// particle per frame (the ember-shower loop, the water sparks, the
-/// fireball/droplet nucleus bands). Hoisting one constant-argument call site
+/// droplet nucleus bands). Hoisting one constant-argument call site
 /// was measured as invisible (wave-2 `cg2-undertow-hoist`: no win), so the
 /// fix is at the source instead: the window index IS the count of interior
 /// stop positions strictly below `t` — three compares summed, no stack
@@ -226,16 +226,15 @@ fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
 }
 
 /// Black-body-ish FIRE ramp, `t` 0 (cool, deep red) → 1 (hot, white-yellow) —
-/// the one palette behind the aurora's fire comet/curtain and the fireball
-/// nucleus.
+/// the one palette behind the aurora's fire comet/curtain.
 #[inline]
 pub(crate) fn fire_ramp(t: f32) -> u32 {
     ramp_5stop(&FIRE_STOPS, t)
 }
 
 /// OCEAN ramp, `t` 0 (deep navy) → 1 (bright cyan crest, just shy of foam) —
-/// the one water palette behind the aurora's fluid wake, the droplet nucleus,
-/// and the word-decoration splash (ORCA_PALETTE).
+/// the one water palette behind the aurora's fluid wake and the droplet
+/// nucleus.
 #[inline]
 pub(crate) fn water_ramp(t: f32) -> u32 {
     ramp_5stop(&WATER_STOPS, t)

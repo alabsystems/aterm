@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo forge survey` — the inventory report, and the answer to "what are all
+//! `targo --unverified forge survey` — the inventory report, and the answer to "what are all
 //! the third-party dependencies of aterm?".
 //!
 //! # Every number here is MEASURED, never transcribed
@@ -80,8 +80,8 @@ pub fn run(
             let _ = writeln!(why, "      {c}: {e}");
         }
         return Err(format!(
-            "not one requested cell resolved:\n{why}    Fix: run `cargo fetch --locked` once \
-             in {} so the offline resolver has an index, then re-run `cargo forge survey`.",
+            "not one requested cell resolved:\n{why}    Fix: run `targo fetch --locked` once \
+             in {} so the offline resolver has an index, then re-run `targo --unverified forge survey`.",
             root.display()
         ));
     }
@@ -122,7 +122,7 @@ pub fn run(
         let _ = writeln!(
             log,
             "    Fix: re-run with the cell reachable, or restrict the report honestly with\n    \
-             `cargo forge survey --cell <name>` so nothing claims to have been measured."
+             `targo --unverified forge survey --cell <name>` so nothing claims to have been measured."
         );
         let _ = writeln!(log, "{PRECISION_NOTE}");
     }
@@ -159,7 +159,7 @@ fn preamble(out: &mut String, root: &Path, surveys: &[CellSurvey]) {
     let _ = writeln!(out, "  cells   {}", names.join(", "));
     let _ = writeln!(
         out,
-        "  method  RESOLUTION ONLY — `cargo tree -e normal --locked --offline`. No \
+        "  method  RESOLUTION ONLY — `targo tree -e normal --locked --offline`. No \
          compiler,\n          no network. LOC is physical lines over every *.rs under a \
          package root\n          (rs-physical-all-files-v1), so it measures the source \
          aterm would OWN."
@@ -337,7 +337,7 @@ fn partition_check(
             out,
             "    PARTITION CHECK DISAGREES: {} non-nested rows cover {} packages / {} LOC, \
              but the\n    cell holds {} / {}. The ranking is indicative only until that is \
-             explained.\n    Fix: re-run `cargo forge survey --cell {}` after `cargo fetch \
+             explained.\n    Fix: re-run `targo --unverified forge survey --cell {}` after `targo fetch \
              --locked`; if it persists, the dominator sets and the fact table disagree and \
              dominator.rs is the place to look.",
             commas(roots.len() as u64),
@@ -523,7 +523,7 @@ fn cross_cell(out: &mut String, surveys: &[CellSurvey]) {
     if surveys.len() < 2 {
         let _ = writeln!(
             out,
-            "\n  One cell surveyed, so there is no cross-cell union — run `cargo forge \
+            "\n  One cell surveyed, so there is no cross-cell union — run `targo --unverified forge \
              survey`\n  with no `--cell` for the union and the target-specific split."
         );
         return;

@@ -356,7 +356,7 @@ pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), Strin
     if !have_root {
         return Err(
             "cargo tree printed no depth-0 line — the requested root package resolved to \
-             nothing; check the `-p` name against `cargo metadata --no-deps`."
+             nothing; check the `-p` name against `targo metadata --no-deps`."
                 .to_string(),
         );
     }
@@ -380,10 +380,9 @@ pub fn graph_and_paths(
         Err(offline_err) => {
             let online = run_tree(root, cell, false).map_err(|online_err| {
                 format!(
-                    "`cargo tree` could not resolve cell `{}` ({}).\n  \
+                    "`targo tree` could not resolve cell `{}` ({}).\n  \
                      with --offline: {}\n  without --offline: {}\n  \
-                     fix: run `cargo fetch` in {} (or `cargo metadata --offline >/dev/null` \
-                     if Cargo.lock is merely stale), then re-run `cargo forge`.",
+                     fix: run `targo fetch` in {}, then re-run.",
                     cell.name,
                     cell.triple,
                     first_line(&offline_err),
@@ -394,7 +393,7 @@ pub fn graph_and_paths(
             log.push_str(&format!(
                 "    NOTE: cell `{}` ({}) did not resolve with `--offline`; forge retried \
                  once WITHOUT it and succeeded. The registry cache is incomplete — run \
-                 `cargo fetch` to make this measurement reproducible offline.\n      \
+                 `targo fetch` to make this measurement reproducible offline.\n      \
                  offline error: {}\n",
                 cell.name,
                 cell.triple,
@@ -470,9 +469,10 @@ pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 }
 
 fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
-    // `CARGO` is set by cargo itself, so a nested invocation uses the very
-    // toolchain that launched forge rather than whatever `cargo` is on PATH.
-    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // `CARGO` is set by targo itself, so a nested invocation uses the very
+    // toolchain that launched forge; unset, it is Trust's `targo` (`tree` takes
+    // no lane flag), never a stock `cargo`.
+    let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
     let mut cmd = Command::new(exe);
     cmd.arg("tree")
         .arg("--manifest-path")
@@ -493,8 +493,8 @@ fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
     }
     let out = cmd.output().map_err(|e| {
         format!(
-            "could not execute `cargo tree`: {e} — install a cargo on PATH, or set CARGO \
-             to the binary to use"
+            "could not execute `targo tree`: {e} — install the Trust toolchain (`aterm pkg \
+             install trust`), or set CARGO to the targo to use"
         )
     })?;
     if !out.status.success() {
@@ -502,7 +502,7 @@ fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
     }
     String::from_utf8(out.stdout).map_err(|e| {
         format!(
-            "`cargo tree` emitted non-UTF-8 output for `{}`: {e}",
+            "`targo tree` emitted non-UTF-8 output for `{}`: {e}",
             cell.name
         )
     })

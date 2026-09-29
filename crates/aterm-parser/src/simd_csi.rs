@@ -569,10 +569,10 @@ mod tests {
     #[test]
     fn fuzz_simd_parse_csi_params_never_panics() {
         // The CSI param scanner runs on untrusted escape sequences emitted by any
-        // program. It must NEVER panic on arbitrary bytes — in particular the
-        // `unreachable!("no end byte found in 16-byte scan")` must hold for every
-        // input (a SIMD-vs-scalar end-byte classification mismatch would reach it
-        // and crash the terminal — a DoS). This deterministic fuzz sweeps 200k
+        // program. It must NEVER panic on arbitrary bytes — a chunk-vs-scalar
+        // end-byte classification mismatch must not be able to crash the terminal
+        // (a DoS; the scan once ended in an `unreachable!()` that such a mismatch
+        // would reach, retired by 904d99a5c). This deterministic fuzz sweeps 200k
         // pseudo-random byte sequences (incl. lengths that exercise the 16-byte
         // SIMD chunk boundary) and checks the result invariants.
         let mut state: u64 = 0xD1B5_4A32_D192_ED03;

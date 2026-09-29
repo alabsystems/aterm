@@ -11,10 +11,12 @@
 //!
 //! Protocol: <https://sw.kovidgoyal.net/kitty/graphics-protocol/>.
 //!
-//! This is the FOUNDATION slice of KITTY-CORE (docs/EXCEED_GHOSTTY_PLAN.md): it is
-//! pure, allocation-bounded, and never panics, so it is fully unit-testable
-//! without a `Terminal`. The per-screen image store + renderer integration (and
-//! only then re-advertising `kitty_graphics` in the capability set) build on it.
+//! The parser is pure, allocation-bounded, and never panics, so it is fully
+//! unit-testable without a `Terminal`. The image store, placements and deletes
+//! built on it live in `handler_actions.rs` (`handle_complete_kitty_command`,
+//! which lists what the engine does not implement); `kitty_graphics` is
+//! advertised TRUE on the strength of that core (`aterm-types`
+//! `terminal_core.rs`).
 
 /// The `a=` action of a Kitty graphics command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +89,10 @@ pub enum KittyMedium {
 /// key is distinguishable from an explicit `0`; the payload is base64-DECODED
 /// (empty when absent or undecodable).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent protocol key (m=, o=, C=, U=); a state machine would invent states the protocol does not have"
+)]
 pub struct KittyCommand {
     /// `a=` — what to do (default [`KittyAction::Transmit`]).
     pub action: KittyAction,
@@ -96,12 +102,32 @@ pub struct KittyCommand {
     pub format: KittyFormat,
     /// `t=` — transmission medium (default [`KittyMedium::Direct`]).
     pub medium: KittyMedium,
-    /// `i=` — client-assigned image id.
+    /// `i=` — client-assigned image id. `i=0` means "none", as in kitty.
     pub id: Option<u32>,
-    /// `I=` — client-assigned image number (id alternative).
+    /// `I=` — client-assigned image number (id alternative: the terminal picks
+    /// the id and reports it). `I=0` means "none".
     pub number: Option<u32>,
-    /// `p=` — placement id.
+    /// `p=` — placement id. `p=0` means "none".
     pub placement: Option<u32>,
+    /// `x=` — for a display, the LEFT edge of the source rectangle in pixels;
+    /// for a delete (`d=p`/`q`/`x`), the 1-based cell COLUMN; for `d=r`, the
+    /// lowest image id of the range.
+    pub x: Option<u32>,
+    /// `y=` — for a display, the TOP edge of the source rectangle in pixels;
+    /// for a delete (`d=p`/`q`/`y`), the 1-based cell ROW; for `d=r`, the
+    /// highest image id of the range.
+    pub y: Option<u32>,
+    /// `w=` — width of the source rectangle in pixels (`0`/absent = to the
+    /// right edge).
+    pub crop_width: Option<u32>,
+    /// `h=` — height of the source rectangle in pixels (`0`/absent = to the
+    /// bottom edge).
+    pub crop_height: Option<u32>,
+    /// `C=1` — do not move the cursor after placing the image.
+    pub cursor_stays: bool,
+    /// `U=1` — a VIRTUAL placement: the image is shown only where the client
+    /// prints Unicode placeholders, never stamped at the cursor.
+    pub virtual_placement: bool,
     /// `s=` — source image width in pixels (for raw formats).
     pub width: Option<u32>,
     /// `v=` — source image height in pixels (for raw formats).
@@ -112,6 +138,25 @@ pub struct KittyCommand {
     pub rows: Option<u32>,
     /// `z=` — z-index (may be negative: behind the text).
     pub z_index: Option<i32>,
+    /// `X=` — for a display, the pixel offset within the first cell at which
+    /// the image starts; for `a=f`, the frame's composition mode; for `a=c`,
+    /// the source rectangle's left edge.
+    pub cell_x_offset: Option<u32>,
+    /// `Y=` — for a display, the pixel offset within the first cell at which
+    /// the image starts; for `a=f`, the frame's background colour; for `a=c`,
+    /// the source rectangle's top edge.
+    pub cell_y_offset: Option<u32>,
+    /// `P=` — the image id of a relative placement's PARENT. `P=0` means none.
+    pub parent_id: Option<u32>,
+    /// `Q=` — the placement id of a relative placement's parent. `Q=0` means
+    /// none.
+    pub parent_placement: Option<u32>,
+    /// `H=` — a relative placement's offset from its parent, in columns
+    /// (negative is left).
+    pub parent_dx: Option<i32>,
+    /// `V=` — a relative placement's offset from its parent, in rows (negative
+    /// is up).
+    pub parent_dy: Option<i32>,
     /// `m=1` — more chunks of this image follow (chunked transmission).
     pub more: bool,
     /// `o=z` — the payload is zlib-compressed.
@@ -174,14 +219,26 @@ pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
                     _ => KittyMedium::Direct,
                 };
             }
-            "i" => cmd.id = value.parse().ok(),
-            "I" => cmd.number = value.parse().ok(),
-            "p" => cmd.placement = value.parse().ok(),
+            "i" => cmd.id = nonzero(value),
+            "I" => cmd.number = nonzero(value),
+            "p" => cmd.placement = nonzero(value),
+            "x" => cmd.x = value.parse().ok(),
+            "y" => cmd.y = value.parse().ok(),
+            "w" => cmd.crop_width = value.parse().ok(),
+            "h" => cmd.crop_height = value.parse().ok(),
+            "C" => cmd.cursor_stays = value == "1",
+            "U" => cmd.virtual_placement = value == "1",
             "s" => cmd.width = value.parse().ok(),
             "v" => cmd.height = value.parse().ok(),
             "c" => cmd.columns = value.parse().ok(),
             "r" => cmd.rows = value.parse().ok(),
             "z" => cmd.z_index = value.parse().ok(),
+            "X" => cmd.cell_x_offset = value.parse().ok(),
+            "Y" => cmd.cell_y_offset = value.parse().ok(),
+            "P" => cmd.parent_id = nonzero(value),
+            "Q" => cmd.parent_placement = nonzero(value),
+            "H" => cmd.parent_dx = value.parse().ok(),
+            "V" => cmd.parent_dy = value.parse().ok(),
             "m" => cmd.more = value == "1",
             "o" => cmd.compressed = value == "z",
             "d" => cmd.delete_target = value.chars().next(),
@@ -200,6 +257,73 @@ pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
     }
 
     Some(cmd)
+}
+
+/// Parse an id-like key (`i=`, `I=`, `p=`), where kitty reserves `0` for "not
+/// specified".
+fn nonzero(value: &str) -> Option<u32> {
+    value.parse().ok().filter(|&v| v != 0)
+}
+
+/// Compose straight-alpha RGBA8 pixels the way kitty composes animation
+/// frames: the `w × h` rectangle at `(sx, sy)` of `over` (a raster `over_w`
+/// pixels wide) lands at `(dx, dy)` of `under` (a raster `under_w` pixels
+/// wide) — alpha-blended ("source over") when `blend`, copied when not
+/// (kitty's `X=1` / `C=1`). Whatever falls outside either raster is skipped,
+/// so no geometry a client sends can index out of bounds.
+pub fn compose_rgba(
+    under: &mut [u8],
+    under_w: usize,
+    (dx, dy): (usize, usize),
+    over: &[u8],
+    over_w: usize,
+    (sx, sy, w, h): (usize, usize, usize, usize),
+    blend: bool,
+) {
+    let height = |len: usize, width: usize| len.checked_div(width.saturating_mul(4)).unwrap_or(0);
+    let (under_h, over_h) = (height(under.len(), under_w), height(over.len(), over_w));
+    for row in 0..h {
+        let (src_row, dst_row) = (sy.saturating_add(row), dy.saturating_add(row));
+        if src_row >= over_h || dst_row >= under_h {
+            break;
+        }
+        for col in 0..w {
+            let (src_col, dst_col) = (sx.saturating_add(col), dx.saturating_add(col));
+            if src_col >= over_w || dst_col >= under_w {
+                break;
+            }
+            let s = (src_row * over_w + src_col) * 4;
+            let d = (dst_row * under_w + dst_col) * 4;
+            let (Some(src), Some(dst)) = (over.get(s..s + 4), under.get_mut(d..d + 4)) else {
+                return;
+            };
+            if blend {
+                blend_over(dst, src);
+            } else {
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+}
+
+/// Straight-alpha "source over" of one RGBA8 pixel onto another.
+fn blend_over(dst: &mut [u8], src: &[u8]) {
+    let sa = u32::from(src[3]);
+    if sa == 255 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    if sa == 0 {
+        return;
+    }
+    let dst_weight = u32::from(dst[3]) * (255 - sa);
+    // The result's alpha, scaled by 255: never 0, since `sa > 0`.
+    let alpha = sa * 255 + dst_weight;
+    for c in 0..3 {
+        let mixed = u32::from(src[c]) * sa * 255 + u32::from(dst[c]) * dst_weight;
+        dst[c] = u8::try_from((mixed + alpha / 2) / alpha).unwrap_or(u8::MAX);
+    }
+    dst[3] = u8::try_from((alpha + 127) / 255).unwrap_or(u8::MAX);
 }
 
 /// Extract `(width, height)` in pixels from a PNG's IHDR header, or `None` if the
@@ -303,6 +427,48 @@ mod tests {
     }
 
     #[test]
+    fn source_rect_cursor_and_virtual_keys() {
+        let c = parse_kitty_command(&apc("a=p,i=4,x=3,y=5,w=7,h=9,C=1,U=1", b"")).expect("parses");
+        assert_eq!((c.x, c.y), (Some(3), Some(5)));
+        assert_eq!((c.crop_width, c.crop_height), (Some(7), Some(9)));
+        assert!(c.cursor_stays && c.virtual_placement);
+        let c = parse_kitty_command(&apc("a=p,i=4", b"")).expect("parses");
+        assert_eq!(
+            (c.x, c.y, c.crop_width, c.crop_height),
+            (None, None, None, None)
+        );
+        assert!(!c.cursor_stays && !c.virtual_placement);
+    }
+
+    /// The cell-offset and relative-placement keys. The negative control is
+    /// the parse before these keys were read: every one of them fell to the
+    /// unknown-key arm, so a relative put parsed as a plain put at the cursor.
+    #[test]
+    fn cell_offset_and_relative_placement_keys() {
+        let c = parse_kitty_command(&apc("a=p,i=4,X=3,Y=5,P=7,Q=9,H=-2,V=4", b"")).expect("parses");
+        assert_eq!((c.cell_x_offset, c.cell_y_offset), (Some(3), Some(5)));
+        assert_eq!((c.parent_id, c.parent_placement), (Some(7), Some(9)));
+        assert_eq!((c.parent_dx, c.parent_dy), (Some(-2), Some(4)));
+        let c = parse_kitty_command(&apc("a=p,i=4,P=0,Q=0", b"")).expect("parses");
+        assert_eq!(
+            (
+                c.parent_id,
+                c.parent_placement,
+                c.parent_dx,
+                c.cell_x_offset
+            ),
+            (None, None, None, None),
+            "P=0/Q=0 name no parent, as i=0 names no image"
+        );
+    }
+
+    #[test]
+    fn zero_ids_mean_unspecified() {
+        let c = parse_kitty_command(&apc("a=p,i=0,I=0,p=0", b"")).expect("parses");
+        assert_eq!((c.id, c.number, c.placement), (None, None, None));
+    }
+
+    #[test]
     fn unknown_keys_ignored_last_value_wins() {
         let c = parse_kitty_command(&apc("zz=99,i=1,i=2,bogus", b"")).expect("parses");
         assert_eq!(c.id, Some(2), "duplicate key takes the last value");
@@ -330,6 +496,64 @@ mod tests {
     fn non_utf8_control_is_none() {
         // A 0xFF byte in the control half is not valid UTF-8.
         assert!(parse_kitty_command(b"Ga=\xfft").is_none());
+    }
+
+    /// Composition copies or blends inside both rasters and skips what falls
+    /// outside them — a rectangle past either edge is clipped, never a panic.
+    #[test]
+    fn compose_rgba_copies_blends_and_clips() {
+        // A 2x2 opaque blue canvas.
+        let mut under = [0, 0, 255, 255].repeat(4);
+        // A 1x1 half-transparent red pixel, blended at (1, 1).
+        compose_rgba(
+            &mut under,
+            2,
+            (1, 1),
+            &[255, 0, 0, 128],
+            1,
+            (0, 0, 1, 1),
+            true,
+        );
+        assert_eq!(
+            &under[12..16],
+            &[128, 0, 127, 255],
+            "source over an opaque pixel"
+        );
+        assert_eq!(&under[..4], &[0, 0, 255, 255], "the rest untouched");
+        // The same pixel COPIED keeps its own alpha.
+        compose_rgba(
+            &mut under,
+            2,
+            (0, 0),
+            &[255, 0, 0, 128],
+            1,
+            (0, 0, 1, 1),
+            false,
+        );
+        assert_eq!(&under[..4], &[255, 0, 0, 128]);
+        // Over a fully transparent pixel, blending is the source itself.
+        let mut clear = [0u8; 4];
+        compose_rgba(
+            &mut clear,
+            1,
+            (0, 0),
+            &[10, 20, 30, 40],
+            1,
+            (0, 0, 1, 1),
+            true,
+        );
+        assert_eq!(clear, [10, 20, 30, 40]);
+        // Out of bounds on every side: clipped.
+        let before = under.clone();
+        compose_rgba(&mut under, 2, (2, 0), &[1; 16], 2, (0, 0, 9, 9), false);
+        compose_rgba(&mut under, 2, (0, 0), &[1; 16], 2, (2, 2, 9, 9), false);
+        assert_eq!(under, before, "nothing lands outside either raster");
+        compose_rgba(&mut under, 2, (1, 0), &[9; 16], 2, (0, 0, 9, 9), false);
+        assert_eq!(
+            &under[4..8],
+            &[9; 4],
+            "the in-bounds part of a large rectangle lands"
+        );
     }
 
     #[test]

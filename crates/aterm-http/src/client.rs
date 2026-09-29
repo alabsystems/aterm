@@ -22,9 +22,13 @@
 //! * The header block is bounded too: an endpoint that never stops sending
 //!   headers hits [`MAX_HEADER_BYTES`] instead of growing a buffer without end.
 //! * `Content-Length` and `Transfer-Encoding: chunked` arriving TOGETHER is a
-//!   request-smuggling signature and is rejected outright.
+//!   request-smuggling signature and is rejected outright, and so is every
+//!   other response whose end is ambiguous: duplicate `Content-Length` headers
+//!   that disagree, and a length that is not `1*DIGIT` (`decide_framing`).
+//! * An unusable endpoint is refused WITHOUT echoing it, since the one shape
+//!   the URI policy exists to refuse (userinfo) carries a credential.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -254,7 +258,16 @@ impl RequestBuilder<'_> {
             return Err(error);
         }
         let target = Uri::parse(&self.endpoint)
-            .ok_or_else(|| Error::Invalid(format!("unusable endpoint: {}", self.endpoint)))?;
+            // The raw endpoint is NEVER echoed. `uri::parse` rejects userinfo
+            // rather than stripping it, precisely so a credential cannot ride
+            // along — and this error reaches stderr through the GUI worker, so
+            // interpolating the string that just failed to parse would print
+            // the password of the one endpoint shape the policy exists to
+            // refuse. The caller already holds the configured value to
+            // correlate against.
+            .ok_or_else(|| {
+                Error::Invalid("endpoint is not a usable absolute http(s) URL".to_owned())
+            })?;
         let deadline = Deadline::after(self.client.timeout);
         let guard: Arc<dyn Guard> = self
             .guard
@@ -517,12 +530,18 @@ fn read_status_line<R: Read>(reader: &mut R) -> Result<StatusLine, Error> {
 
 /// Read status line, headers and body from `stream`.
 fn read_response(stream: Stream, limit: usize) -> Result<Response, Error> {
-    let mut reader = BufReader::new(stream);
-    let status = read_status_line(&mut reader)?;
+    read_response_from(&mut BufReader::new(stream), limit)
+}
+
+/// The response parser over any buffered reader: the live socket above, or the
+/// in-memory bytes the unit tests feed it, so both run ONE framing path rather
+/// than the tests exercising a copy that could drift from what ships.
+fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Response, Error> {
+    let status = read_status_line(reader)?;
     let mut consumed = 0usize;
     let mut headers = Vec::new();
     loop {
-        let line = read_line(&mut reader, &mut consumed)?;
+        let line = read_line(reader, &mut consumed)?;
         if line.is_empty() {
             break;
         }
@@ -535,45 +554,92 @@ fn read_response(stream: Stream, limit: usize) -> Result<Response, Error> {
         headers.push((name.trim().to_owned(), value.trim().to_owned()));
     }
 
-    let find = |name: &str| {
-        headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    };
-    let chunked = find("transfer-encoding").is_some_and(|v| {
-        v.split(',')
-            .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
-    });
-    let content_length = find("content-length");
-    // Both framings at once is the request-smuggling signature. Refuse.
-    if chunked && content_length.is_some() {
-        return Err(Error::Protocol(
-            "response carries both Content-Length and chunked Transfer-Encoding".to_owned(),
-        ));
-    }
-
-    let body = if chunked {
-        read_chunked(&mut reader, limit)?
-    } else if let Some(text) = content_length {
-        let declared = text
-            .parse::<usize>()
-            .map_err(|_| Error::Protocol(format!("unparseable Content-Length {text:?}")))?;
-        if declared > limit {
-            return Err(Error::TooLarge { limit });
+    let body = match decide_framing(&headers)? {
+        Framing::Chunked => read_chunked(reader, limit)?,
+        Framing::Length(declared) => {
+            if declared > limit {
+                return Err(Error::TooLarge { limit });
+            }
+            let mut body = vec![0u8; declared];
+            reader.read_exact(&mut body)?;
+            body
         }
-        let mut body = vec![0u8; declared];
-        reader.read_exact(&mut body)?;
-        body
-    } else {
         // No framing header: the body runs to EOF (we sent Connection: close).
-        read_to_limit(&mut reader, limit)?
+        Framing::ToEof => read_to_limit(reader, limit)?,
     };
     Ok(Response {
         status: status.code,
         headers,
         body,
     })
+}
+
+/// How the response body is delimited. One function decides this, because a
+/// body whose end two parties disagree about is the whole smuggling class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// `Content-Length`, already parsed and agreed across duplicates.
+    Length(usize),
+    /// Neither header: the body runs to EOF (we always send `Connection: close`).
+    ToEof,
+}
+
+/// Resolve the response framing, refusing every ambiguous combination.
+///
+/// Rejected: chunked and `Content-Length` together (the smuggling signature),
+/// duplicate `Content-Length` headers that disagree, and a length that is not
+/// `1*DIGIT` per RFC 9112 — Rust's `usize` parser accepts a leading `+`, which
+/// the grammar does not, so the digits are checked before parsing. EVERY
+/// `Transfer-Encoding` header is read, not only the first: a peer that sends
+/// `gzip` in one header and `chunked` in the next is still framing the body as
+/// chunked, and taking the first alone would read it as unframed.
+fn decide_framing(headers: &[(String, String)]) -> Result<Framing, Error> {
+    /// EVERY value under `name`, not just the first — duplicates are the point.
+    fn values<'a>(headers: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> {
+        headers
+            .iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+    let chunked = values(headers, "transfer-encoding").any(|v| {
+        v.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+    });
+
+    let mut declared: Option<usize> = None;
+    for text in values(headers, "content-length") {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::Protocol(format!(
+                "Content-Length is not 1*DIGIT: {text:?}"
+            )));
+        }
+        let parsed = text
+            .parse::<usize>()
+            .map_err(|_| Error::Protocol(format!("unparseable Content-Length {text:?}")))?;
+        // Repeating the SAME value is legal and harmless; repeating a different
+        // one leaves two parties disagreeing about where this response ends.
+        match declared {
+            Some(first) if first != parsed => {
+                return Err(Error::Protocol(
+                    "response carries conflicting Content-Length headers".to_owned(),
+                ));
+            }
+            _ => declared = Some(parsed),
+        }
+    }
+
+    // Both framings at once is the request-smuggling signature. Refuse.
+    if chunked && declared.is_some() {
+        return Err(Error::Protocol(
+            "response carries both Content-Length and chunked Transfer-Encoding".to_owned(),
+        ));
+    }
+    if chunked {
+        return Ok(Framing::Chunked);
+    }
+    Ok(declared.map_or(Framing::ToEof, Framing::Length))
 }
 
 /// Read to EOF, erroring rather than truncating past `limit`.
@@ -897,52 +963,91 @@ mod tests {
     }
 
     fn parse(raw: &[u8], limit: usize) -> Result<Response, Error> {
-        // Drive the parser over a plain in-memory reader by reusing the same
-        // functions read_response uses on a live socket.
-        let mut reader = BufReader::new(raw);
-        let status = read_status_line(&mut reader)?;
-        let mut consumed = 0usize;
-        let mut headers = Vec::new();
-        loop {
-            let line = read_line(&mut reader, &mut consumed)?;
-            if line.is_empty() {
-                break;
-            }
-            let (n, v) = line.split_once(':').unwrap();
-            headers.push((n.trim().to_owned(), v.trim().to_owned()));
+        // Drive the SAME parser read_response runs on a live socket, over an
+        // in-memory reader. (This used to re-implement the framing decision
+        // inline, so a framing defect in the shipped path could not redden
+        // these tests.)
+        read_response_from(&mut BufReader::new(raw), limit)
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn framing_refuses_every_response_whose_end_is_ambiguous() {
+        // One function owns this decision because a body whose end two parties
+        // disagree about IS the smuggling class.
+        assert_eq!(decide_framing(&headers(&[])).unwrap(), Framing::ToEof);
+        assert_eq!(
+            decide_framing(&headers(&[("Content-Length", "7")])).unwrap(),
+            Framing::Length(7)
+        );
+        assert_eq!(
+            decide_framing(&headers(&[("Transfer-Encoding", "chunked")])).unwrap(),
+            Framing::Chunked
+        );
+        // A later Transfer-Encoding still frames the body; taking only the
+        // first header would read this one as unframed and run to EOF.
+        assert_eq!(
+            decide_framing(&headers(&[
+                ("Transfer-Encoding", "gzip"),
+                ("Transfer-Encoding", "chunked"),
+            ]))
+            .unwrap(),
+            Framing::Chunked
+        );
+        // Repeating the SAME length is legal; disagreeing is not.
+        assert_eq!(
+            decide_framing(&headers(&[
+                ("Content-Length", "5"),
+                ("content-length", "5")
+            ]))
+            .unwrap(),
+            Framing::Length(5)
+        );
+        for ambiguous in [
+            vec![("Content-Length", "5"), ("Content-Length", "9")],
+            vec![("Content-Length", "5"), ("Transfer-Encoding", "chunked")],
+            vec![
+                ("Transfer-Encoding", "gzip"),
+                ("Transfer-Encoding", "chunked"),
+                ("Content-Length", "5"),
+            ],
+            // RFC 9112 allows 1*DIGIT only; Rust's usize parser is laxer.
+            vec![("Content-Length", "+5")],
+            vec![("Content-Length", "5 ")],
+            vec![("Content-Length", "")],
+        ] {
+            assert!(
+                matches!(
+                    decide_framing(&headers(&ambiguous)),
+                    Err(Error::Protocol(_))
+                ),
+                "{ambiguous:?} must be refused"
+            );
         }
-        let find = |name: &str| {
-            headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.as_str())
-        };
-        let chunked = find("transfer-encoding").is_some_and(|v| {
-            v.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
-        });
-        let content_length = find("content-length");
-        if chunked && content_length.is_some() {
-            return Err(Error::Protocol("both framings".to_owned()));
+    }
+
+    #[test]
+    fn the_parser_frames_through_decide_framing() {
+        // The in-memory parser and the socket path are one function now; a
+        // response decide_framing refuses must be refused end to end too.
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 9\r\n\r\nhi"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nhi"[..],
+        ] {
+            assert!(
+                matches!(parse(raw, 1024), Err(Error::Protocol(_))),
+                "{:?} must be refused",
+                String::from_utf8_lossy(raw)
+            );
         }
-        let body = if chunked {
-            read_chunked(&mut reader, limit)?
-        } else if let Some(text) = content_length {
-            let declared = text.parse::<usize>().unwrap();
-            if declared > limit {
-                return Err(Error::TooLarge { limit });
-            }
-            let mut body = vec![0u8; declared];
-            reader.read_exact(&mut body)?;
-            body
-        } else {
-            read_to_limit(&mut reader, limit)?
-        };
-        Ok(Response {
-            status: status.code,
-            headers,
-            body,
-        })
+        let later_chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
+        assert_eq!(parse(later_chunked, 1024).unwrap().body(), b"hi");
     }
 
     #[test]

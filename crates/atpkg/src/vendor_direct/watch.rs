@@ -1333,6 +1333,14 @@ mod tests {
     const CLAUDE_HEAD: &str = "https://downloads.claude.ai/claude-code-releases/latest";
     const CODEX_HEAD: &str = "https://releases.openai.com/codex/channels/latest";
 
+    /// A wait for something that must happen — a worker's answer, a test's own
+    /// release — is a hang detector of a minute, never a latency budget
+    /// (AGENTS.md). A simulated GET the test holds waits twice this for its
+    /// release, so it never gives up inside one.
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// A park of two minutes, woken at 100 ms, returns inside [`HANG`]: the
+    /// wake and the slice running out are told apart whatever the load.
     #[test]
     fn an_independent_package_hint_interrupts_an_idle_vendor_park() {
         let mut watch = HeadWatch::new(&[]);
@@ -1342,8 +1350,8 @@ mod tests {
             owner.unpark();
         });
         let started = std::time::Instant::now();
-        watch.park_for_hint(Duration::from_secs(5));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        watch.park_for_hint(2 * HANG);
+        assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
         notifier.join().unwrap();
     }
 
@@ -1608,9 +1616,7 @@ mod tests {
                     let (lock, ready) = &*gate;
                     let released = lock.lock().unwrap();
                     let (released, _) = ready
-                        .wait_timeout_while(released, Duration::from_secs(30), |released| {
-                            !*released
-                        })
+                        .wait_timeout_while(released, 2 * HANG, |released| !*released)
                         .unwrap();
                     assert!(*released, "test release arrived before the network timeout");
                     finished.store(true, Ordering::Release);
@@ -1633,7 +1639,7 @@ mod tests {
             2,
             "both independent hints are in flight"
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + HANG;
         let moved = loop {
             watch.park_for_hint(Duration::from_millis(100));
             let moved = watch.check_pending(&l, at(0), &get);
@@ -1658,7 +1664,7 @@ mod tests {
         let (lock, ready) = &*release_claude;
         *lock.lock().unwrap() = true;
         ready.notify_all();
-        watch.park_for_hint(Duration::from_secs(5));
+        watch.park_for_hint(HANG);
         assert_eq!(watch.check_pending(&l, at(0), &get), ["claude"]);
         assert_eq!(watch.pending_count(), 0);
         let notes = watch.take_notes();
@@ -1689,7 +1695,7 @@ mod tests {
             let (lock, ready) = &*wait_gate;
             let released = lock.lock().unwrap();
             let (released, _) = ready
-                .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+                .wait_timeout_while(released, 2 * HANG, |released| !*released)
                 .unwrap();
             assert!(*released, "the test released the simulated vendor GET");
             Ok(VendorGet::Body {
@@ -1706,19 +1712,19 @@ mod tests {
             let moved = watch.check_pending(&caller_layout, at(0), &caller_get);
             returned_tx.send((watch, moved)).unwrap();
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let early = returned_rx.recv_timeout(Duration::from_secs(2));
+        started_rx.recv_timeout(HANG).unwrap();
+        let early = returned_rx.recv_timeout(HANG);
         let returned_while_blocked = early.is_ok();
         let owned_while_blocked = early
             .as_ref()
             .is_ok_and(|(watch, moved)| moved.is_empty() && watch.pending_count() == 1);
         // Release on both sides of the regression so the old inline behavior
-        // fails promptly instead of leaving its caller blocked for 30 seconds.
+        // fails once the minute is out instead of leaving its caller blocked
+        // for the GET's two.
         let (lock, ready) = &*gate;
         *lock.lock().unwrap() = true;
         ready.notify_all();
-        let (mut watch, moved) =
-            early.unwrap_or_else(|_| returned_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        let (mut watch, moved) = early.unwrap_or_else(|_| returned_rx.recv_timeout(HANG).unwrap());
         caller.join().unwrap();
         assert!(
             returned_while_blocked,
@@ -1726,7 +1732,7 @@ mod tests {
         );
         assert!(owned_while_blocked, "the blocked GET must remain owned");
         assert!(moved.is_empty());
-        watch.park_for_hint(Duration::from_secs(5));
+        watch.park_for_hint(HANG);
         assert_eq!(watch.check_pending(&l, at(0), &get), ["claude"]);
         assert_eq!(watch.pending_count(), 0);
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1762,7 +1768,7 @@ mod tests {
         );
         assert!(watch.check_pending(&l, at(0) + BUSY_RETRY, &get).is_empty());
         assert_eq!(watch.pending_count(), 1);
-        watch.park_for_hint(Duration::from_secs(2));
+        watch.park_for_hint(HANG);
         assert_eq!(
             watch.check_pending(&l, at(0) + BUSY_RETRY, &get),
             ["claude"]
@@ -1852,7 +1858,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(watch.pending_count(), 1);
-        watch.park_for_hint(Duration::from_secs(2));
+        watch.park_for_hint(HANG);
         assert_eq!(
             watch.check_pending_with_index_in_flight(&l, at(0) + BUSY_RETRY, &get, true),
             ["claude"]
@@ -1903,7 +1909,7 @@ mod tests {
         assert_eq!(claude_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state["inline_vendor_get"], 0);
         assert_eq!(watch.pending_count(), 1, "the other vendor keeps its slot");
-        watch.park_for_hint(Duration::from_secs(2));
+        watch.park_for_hint(HANG);
         assert!(watch.check_pending(&l, at(0), &get).is_empty());
         assert_eq!(watch.pending_count(), 0);
         assert!(!watch.round_active);
@@ -1915,7 +1921,7 @@ mod tests {
         // owned worker now that it is the only due vendor.
         assert!(watch.check_pending(&l, at(0) + BUSY_RETRY, &get).is_empty());
         assert_eq!(watch.pending_count(), 1);
-        watch.park_for_hint(Duration::from_secs(2));
+        watch.park_for_hint(HANG);
         assert_eq!(
             watch.check_pending(&l, at(0) + BUSY_RETRY, &get),
             ["claude"]
@@ -1943,7 +1949,7 @@ mod tests {
                 let (lock, ready) = &*gate;
                 let released = lock.lock().unwrap();
                 let (released, _) = ready
-                    .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+                    .wait_timeout_while(released, 2 * HANG, |released| !*released)
                     .unwrap();
                 assert!(*released);
                 b"2.1.281".to_vec()
@@ -1959,10 +1965,8 @@ mod tests {
         });
         let mut watch = HeadWatch::new(&[]);
         assert!(watch.check_pending(&l, at(0), &get).is_empty());
-        codex_started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap();
-        watch.park_for_hint(Duration::from_secs(5));
+        codex_started_rx.recv_timeout(HANG).unwrap();
+        watch.park_for_hint(HANG);
         install(&l, "codex", "0.157.0");
         assert!(
             watch.check_pending(&l, at(0), &get).is_empty(),
@@ -1972,7 +1976,7 @@ mod tests {
         let (lock, ready) = &*release_claude;
         *lock.lock().unwrap() = true;
         ready.notify_all();
-        watch.park_for_hint(Duration::from_secs(5));
+        watch.park_for_hint(HANG);
         assert_eq!(watch.check_pending(&l, at(0), &get), ["claude"]);
         let notes = watch.take_notes();
         assert!(

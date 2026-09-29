@@ -850,7 +850,7 @@ pub(crate) fn refresh_view_with(
             deferred: Some(deferred),
         });
     }
-    let pid = crate::dec_u64(u64::from(std::process::id()));
+    let pid = std::process::id().to_string();
     for dir in VIEW_DIRS {
         let src = build.join(dir);
         let at = view.join(dir);
@@ -1222,7 +1222,7 @@ fn refresh_linked_view(
             deferred: Some(deferred),
         });
     }
-    let pid = crate::dec_u64(u64::from(std::process::id()));
+    let pid = std::process::id().to_string();
     let mut changed = false;
     for dir in VIEW_DIRS {
         let src = checkout.join(dir);
@@ -2282,9 +2282,9 @@ fn displaced_name(path: &Path, name: &str) -> PathBuf {
         .unwrap_or(0);
     let mut file = String::from(name);
     file.push_str(".displaced-by-aterm-");
-    file.push_str(&crate::dec_u64(secs));
+    file.push_str(&secs.to_string());
     file.push('-');
-    file.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    file.push_str(&std::process::id().to_string());
     path.with_file_name(file)
 }
 
@@ -4175,6 +4175,7 @@ mod tests {
                 last_pass_attempted_index_build: 0,
                 last_pass_attempted_at: String::new(),
                 pass_seq: 0,
+                stale_index_only_pass_seq: 0,
                 programs,
                 extra: Default::default(),
             },

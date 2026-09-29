@@ -580,6 +580,15 @@ fn watch(kq: &std::os::fd::OwnedFd, dir: &Path) -> std::io::Result<std::fs::File
 mod tests {
     use super::*;
 
+    /// A wake that must come is waited for this long: a hang detector, never a
+    /// latency budget (AGENTS.md).
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// The fallback a parked wait is given where the test tells a push from the
+    /// fallback running out: twice [`HANG`], so the one outcome lands inside
+    /// the detector and the other far outside it whatever the machine's load.
+    const FALLBACK: Duration = Duration::from_secs(120);
+
     fn fixed(path: PathBuf) -> Box<dyn FnMut() -> Option<PathBuf> + Send> {
         Box::new(move || Some(path.clone()))
     }
@@ -602,7 +611,7 @@ mod tests {
         wake.marks[0].ensure_watch(&kq);
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let woke = wake.wait(Duration::from_secs(5));
+            let woke = wake.wait(FALLBACK);
             tx.send(woke).unwrap();
         });
         std::thread::sleep(Duration::from_millis(50));
@@ -631,9 +640,9 @@ mod tests {
         std::fs::write(&tmp, b"1\n").unwrap();
         std::fs::rename(&tmp, &marker).unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).ok(),
+            rx.recv_timeout(HANG).ok(),
             Some(true),
-            "the marker replacement wakes the parked host before the 5 s fallback, and says so"
+            "the marker replacement wakes the parked host before its fallback, and says so"
         );
         waiter.join().unwrap();
         // NEGATIVE CONTROL: a wait that only runs out its fallback reports
@@ -662,7 +671,7 @@ mod tests {
         assert_eq!(watch_dir(&marker), Some(dir.clone()));
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            tx.send(wake.wait(Duration::from_secs(5))).unwrap();
+            tx.send(wake.wait(FALLBACK)).unwrap();
         });
         std::thread::sleep(Duration::from_millis(50));
         std::fs::write(dir.join("unrelated"), b"x").unwrap();
@@ -674,9 +683,9 @@ mod tests {
         std::fs::write(&tmp, b"1\n").unwrap();
         std::fs::rename(&tmp, &marker).unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).ok(),
+            rx.recv_timeout(HANG).ok(),
             Some(true),
-            "the word wakes the parked host before the 5 s fallback"
+            "the word wakes the parked host before its fallback"
         );
         waiter.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -703,7 +712,7 @@ mod tests {
             .retain(|m| m.path.as_deref() == Some(link.as_path()));
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            tx.send(wake.wait(Duration::from_secs(5))).unwrap();
+            tx.send(wake.wait(FALLBACK)).unwrap();
         });
         std::thread::sleep(Duration::from_millis(50));
         std::fs::write(versions.join("2.1.282"), b"new").unwrap();
@@ -716,7 +725,7 @@ mod tests {
         std::os::unix::fs::symlink(versions.join("2.1.282"), &next).unwrap();
         std::fs::rename(&next, &link).unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).ok(),
+            rx.recv_timeout(HANG).ok(),
             Some(true),
             "the repointed link wakes the host"
         );
@@ -725,18 +734,23 @@ mod tests {
     }
 
     /// THE TRIGGER ends a parked wait at once, reporting no activation (the
-    /// host's shutdown), instead of the fallback's ten minutes. NEGATIVE
-    /// CONTROL: unpulled, the same wait runs out its fallback.
+    /// host's shutdown), instead of the fallback's ten minutes: inside [`HANG`],
+    /// which the fallback is ten times. NEGATIVE CONTROL: unpulled, the same
+    /// wait runs out its fallback.
     #[test]
     fn the_trigger_ends_a_parked_wait_at_once() {
         let mut wake = ActivationWake::with_marks(Vec::new());
         let trigger = wake.trigger();
-        let started = Instant::now();
-        let waiter = std::thread::spawn(move || wake.wait(Duration::from_secs(600)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(wake.wait(Duration::from_secs(600))));
         std::thread::sleep(Duration::from_millis(50));
         trigger.pull();
-        assert!(!waiter.join().unwrap(), "no activation");
-        assert!(started.elapsed() < Duration::from_secs(5), "at once");
+        assert_eq!(
+            rx.recv_timeout(HANG).ok(),
+            Some(false),
+            "the pulled trigger ends the wait long before its ten-minute fallback, \
+             reporting no activation"
+        );
         let mut quiet = ActivationWake::with_marks(Vec::new());
         let started = Instant::now();
         assert!(!quiet.wait(Duration::from_millis(80)));
@@ -767,7 +781,7 @@ mod tests {
         let mut wake = ActivationWake::with_marks(vec![
             Mark::new(fixed(marker.clone())).rechecked_before_its_dir(),
         ]);
-        let waiter = std::thread::spawn(move || wake.wait(Duration::from_secs(15)));
+        let waiter = std::thread::spawn(move || wake.wait(HANG));
         std::thread::sleep(Duration::from_millis(50));
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"1\n").unwrap();
@@ -780,9 +794,10 @@ mod tests {
 
     /// A LOST ANCESTOR WAKE (m3, 2026-09-24): with every vnode event lost
     /// (the fault injected), a marker created under a missing directory is
-    /// still seen by the [`ANCESTOR_RECHECK`] look, long before the 10 s
-    /// fallback. NEGATIVE CONTROL: the same mark not rechecked waits the
-    /// fallback out.
+    /// still seen by the [`ANCESTOR_RECHECK`] look, long before the fallback:
+    /// inside [`HANG`], which the [`FALLBACK`] is twice, so a recheck that
+    /// waited for the fallback is told from one that did not. NEGATIVE
+    /// CONTROL: the same mark not rechecked waits the fallback out.
     #[test]
     fn first_install_rechecks_a_missing_path_after_a_lost_ancestor_notification() {
         let root = std::env::temp_dir().join(format!(
@@ -801,7 +816,7 @@ mod tests {
         ]);
         wake.deaf = true;
         let started = Instant::now();
-        let waiter = std::thread::spawn(move || wake.wait(Duration::from_secs(10)));
+        let waiter = std::thread::spawn(move || wake.wait(FALLBACK));
         std::thread::sleep(Duration::from_millis(100));
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"1\n").unwrap();
@@ -809,7 +824,7 @@ mod tests {
             waiter.join().unwrap(),
             "a lost ancestor event must not delay a first install until the fallback"
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
         let mut control = ActivationWake::with_marks(vec![Mark::new(fixed(root.join("x/y/z")))]);
         control.deaf = true;
         assert!(!control.wait(Duration::from_millis(300)), "the control");
@@ -817,9 +832,10 @@ mod tests {
     }
 
     /// AN AGENT'S EXIT IS A PUSH: [`wait_exit`] returns as the process ends,
-    /// long before its limit, and at once for one already gone. NEGATIVE
-    /// CONTROL: a process that keeps running is waited for until the limit,
-    /// and reads as not exited.
+    /// long before its limit — inside [`HANG`], which the [`FALLBACK`] limit
+    /// is twice — and at once for one already gone. NEGATIVE CONTROL: a
+    /// process that keeps running is waited for until the limit, and reads as
+    /// not exited.
     #[test]
     fn an_exit_is_seen_as_it_happens() {
         let mut child = std::process::Command::new("/bin/sleep")
@@ -829,10 +845,10 @@ mod tests {
         let pid = child.id();
         let reaper = std::thread::spawn(move || child.wait());
         let started = Instant::now();
-        assert!(wait_exit(pid, Duration::from_secs(20)));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(wait_exit(pid, FALLBACK));
+        assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
         reaper.join().unwrap().unwrap();
-        assert!(wait_exit(pid, Duration::from_secs(20)), "already gone");
+        assert!(wait_exit(pid, FALLBACK), "already gone");
         let mut runs = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()

@@ -138,27 +138,26 @@ pub(crate) const MIN_PANE_ROWS: u16 = 3;
 /// you can work.
 pub(crate) const MIN_PANE_COLS: u16 = 16;
 
-/// Can a pane of `rows` x `cols` cells be split in `dir` and leave BOTH halves at
-/// least [`MIN_PANE_ROWS`] x [`MIN_PANE_COLS`]?
+/// Can a pane allocation of `rows` x `cols` cells be split in `dir` and leave
+/// BOTH halves at least [`MIN_PANE_ROWS`] x [`MIN_PANE_COLS`] content cells,
+/// with one additional subtab header row each?
 ///
 /// THE EXACT GEOMETRY, not an estimate. A fresh split is always 50/50 over the
 /// splittable extent — everything but the 1-cell divider — so the divided axis
 /// yields `ceil((extent - 1) / 2)` and `floor((extent - 1) / 2)`; the SMALLER half
 /// is the floor, and it clears the minimum exactly when `extent - 1 >= 2 * min`.
-/// The perpendicular axis is untouched by the split, so it must ALREADY clear its
-/// own minimum — a 2-row pane split left/right is two 2-row panes, and neither is
-/// a pane anyone can use.
+/// The perpendicular axis must clear its content minimum plus the header.
+/// `rows` includes any existing header, since the two new headers replace it.
 ///
 /// `pane_tree_min_fit_matches_the_layout_engine` re-derives this against the real
 /// [`PaneTree::compute_layout`] over every window size in a wide sweep, so this
 /// closed form can never drift away from the layout it predicts.
 #[must_use]
 pub(crate) fn split_fits_in(dir: SplitDir, rows: u16, cols: u16) -> bool {
+    let min_rows = MIN_PANE_ROWS + 1; // each child also owns a subtab header
     match dir {
-        SplitDir::Vertical => rows >= MIN_PANE_ROWS && cols.saturating_sub(1) >= 2 * MIN_PANE_COLS,
-        SplitDir::Horizontal => {
-            cols >= MIN_PANE_COLS && rows.saturating_sub(1) >= 2 * MIN_PANE_ROWS
-        }
+        SplitDir::Vertical => rows >= min_rows && cols.saturating_sub(1) >= 2 * MIN_PANE_COLS,
+        SplitDir::Horizontal => cols >= MIN_PANE_COLS && rows.saturating_sub(1) >= 2 * min_rows,
     }
 }
 
@@ -168,8 +167,8 @@ pub(crate) fn split_fits_in(dir: SplitDir, rows: u16, cols: u16) -> bool {
 #[must_use]
 pub(crate) fn split_needs(dir: SplitDir) -> (u16, u16) {
     match dir {
-        SplitDir::Vertical => (MIN_PANE_ROWS, 2 * MIN_PANE_COLS + 1),
-        SplitDir::Horizontal => (2 * MIN_PANE_ROWS + 1, MIN_PANE_COLS),
+        SplitDir::Vertical => (MIN_PANE_ROWS + 1, 2 * MIN_PANE_COLS + 1),
+        SplitDir::Horizontal => (2 * (MIN_PANE_ROWS + 1) + 1, MIN_PANE_COLS),
     }
 }
 
@@ -490,7 +489,8 @@ impl PaneTree {
     }
 
     /// Compute every visible pane's placement for a window of `rows`×`cols` cells.
-    /// Returns one [`PaneRect`] per leaf, with 1-cell dividers reserved between
+    /// Returns one content [`PaneRect`] per leaf, with a subtab header row in
+    /// each visible split pane and 1-cell dividers reserved between
     /// split children (the gaps are NOT covered by any rect; the GUI paints them).
     /// A single-leaf tab yields exactly one rect covering the whole window — the
     /// non-split geometry, byte-identical to today.
@@ -505,11 +505,27 @@ impl PaneTree {
     /// the compositor drew off the end of the world.
     #[must_use]
     pub(crate) fn compute_layout(&self, rows: u16, cols: u16) -> Vec<PaneRect> {
-        self.layout_cells(rows, cols, self.zoomed)
+        let mut rects = self.layout_cells(rows, cols, self.zoomed);
+        if rects.len() > 1 {
+            for rect in &mut rects {
+                if crate::tab_model::pane_header_rect(LogicalRect::new(
+                    f32::from(rect.col_off),
+                    f32::from(rect.row_off),
+                    f32::from(rect.cols),
+                    f32::from(rect.rows),
+                ))
+                .is_some()
+                {
+                    rect.row_off += 1;
+                    rect.rows -= 1;
+                }
+            }
+        }
+        rects
     }
 
-    /// [`Self::compute_layout`] with zoom named EXPLICITLY instead of read off the
-    /// tree. The one caller that must override it is [`Self::focused_rect`]: a
+    /// Outer pane allocations before subtab rows are reserved, with zoom named
+    /// explicitly. The caller that overrides it is [`Self::focused_rect`]: a
     /// split un-zooms (see [`Self::split_focused`]), so the rectangle a split is
     /// about to divide is the UNZOOMED one, never the full window a zoomed pane
     /// currently occupies. Measuring the zoomed rect would let a split through on
@@ -559,10 +575,11 @@ impl PaneTree {
             .collect()
     }
 
-    /// The FOCUSED pane's rect in a `rows`×`cols` window, measured on the UNZOOMED
-    /// layout — the geometry a split would actually divide, since splitting exits
-    /// zoom. `None` only if the focused leaf somehow isn't in the tree, and the
-    /// caller must treat that as "unmeasurable", never as "fits".
+    /// The FOCUSED pane's outer allocation, including its subtab header, in a
+    /// `rows`×`cols` window. Measured on the UNZOOMED layout: a split divides this
+    /// allocation and installs a header in each child, replacing the old one.
+    /// `None` only if the focused leaf somehow isn't in the tree, and the caller
+    /// must treat that as "unmeasurable", never as "fits".
     #[must_use]
     pub(crate) fn focused_rect(&self, rows: u16, cols: u16) -> Option<PaneRect> {
         self.layout_cells(rows, cols, false)
@@ -814,9 +831,9 @@ mod tests {
             rects[0],
             PaneRect {
                 session: 1,
-                row_off: 0,
+                row_off: 1,
                 col_off: 0,
-                rows: 24,
+                rows: 23,
                 cols: 40
             }
         );
@@ -825,9 +842,9 @@ mod tests {
             rects[1],
             PaneRect {
                 session: 2,
-                row_off: 0,
+                row_off: 1,
                 col_off: 41,
-                rows: 24,
+                rows: 23,
                 cols: 39
             }
         );
@@ -852,9 +869,9 @@ mod tests {
             rects[0],
             PaneRect {
                 session: 1,
-                row_off: 0,
+                row_off: 1,
                 col_off: 0,
-                rows: 12,
+                rows: 11,
                 cols: 80
             }
         );
@@ -862,9 +879,9 @@ mod tests {
             rects[1],
             PaneRect {
                 session: 2,
-                row_off: 13,
+                row_off: 14,
                 col_off: 0,
-                rows: 11,
+                rows: 10,
                 cols: 80
             }
         );
@@ -888,7 +905,7 @@ mod tests {
         assert_eq!(rects.len(), 3);
         // Left pane spans full height.
         let left = rects.iter().find(|r| r.session == 1).unwrap();
-        assert_eq!(left.rows, 24);
+        assert_eq!(left.rows, 23);
         // The two right panes share the right column band and stack.
         let top = rects.iter().find(|r| r.session == 2).unwrap();
         let bot = rects.iter().find(|r| r.session == 3).unwrap();
@@ -1198,6 +1215,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn subtab_content_geometry_matches_the_canonical_plan() {
+        use crate::tab_model::{LeafSizing, LogicalSize, Tab, TabId, TabPresentation, ViewId};
+
+        let mut tree = PaneTree::new(1);
+        tree.split_focused(SplitDir::Vertical, 2);
+        tree.split_focused(SplitDir::Horizontal, 3);
+        let tab = Tab::from_root(
+            TabId::from_stored(1),
+            tree.map_sessions(ViewId::from_stored),
+            ViewId::from_stored(tree.focus()),
+            false,
+            TabPresentation::terminal("shell"),
+        );
+        for rows in 4..=48 {
+            for cols in [8, 33, 80, 121] {
+                let mut plan = tab.visible_plan(
+                    LogicalRect::new(0.0, 0.0, f32::from(cols), f32::from(rows)),
+                    1.0,
+                    |_| LeafSizing::new(LogicalSize::new(2.0, 1.0), LogicalSize::new(80.0, 24.0)),
+                );
+                plan.reserve_pane_headers();
+                for (body, leaf) in tree.compute_layout(rows, cols).iter().zip(&plan.leaves) {
+                    assert_eq!(
+                        LogicalRect::new(
+                            f32::from(body.col_off),
+                            f32::from(body.row_off),
+                            f32::from(body.cols),
+                            f32::from(body.rows),
+                        ),
+                        leaf.rect,
+                        "canonical sizing/input and compatibility blits must agree at {cols}x{rows}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Divider drag on a vertical split: hitting the divider column yields a
     /// `DividerHit`, and `set_divider_ratio` moves the boundary — the left pane
     /// grows/shrinks while the geometry stays a valid 2-pane split.
@@ -1266,8 +1321,8 @@ mod tests {
         assert!(t.set_divider_ratio(&hit, ratio));
         let mut rects = t.compute_layout(24, 80);
         rects.sort_by_key(|r| r.row_off);
-        assert_eq!(rects[0].rows, 6);
-        assert_eq!(rects[1].row_off, 7);
+        assert_eq!(rects[0].rows, 5);
+        assert_eq!(rects[1].row_off, 8);
     }
 
     /// In a NESTED tree the hit-test targets the correct (inner) split: dragging the
@@ -1392,19 +1447,18 @@ mod tests {
 
     /// The exact boundary, spelled out: a left/right split needs
     /// `2 * MIN_PANE_COLS + 1` columns (two panes plus the divider) and
-    /// `MIN_PANE_ROWS` rows — the perpendicular axis a split does NOT divide must
-    /// ALREADY be usable, because splitting a 2-row pane sideways yields two
-    /// 2-row panes and neither is a pane you can work in.
+    /// `MIN_PANE_ROWS + 1` rows — usable content plus each child's title row.
     #[test]
     fn split_fit_boundary_is_two_panes_plus_the_divider() {
+        let pane_rows = MIN_PANE_ROWS + 1;
         let need = 2 * MIN_PANE_COLS + 1;
-        assert!(split_fits_in(SplitDir::Vertical, MIN_PANE_ROWS, need));
-        assert!(!split_fits_in(SplitDir::Vertical, MIN_PANE_ROWS, need - 1));
+        assert!(split_fits_in(SplitDir::Vertical, pane_rows, need));
+        assert!(!split_fits_in(SplitDir::Vertical, pane_rows, need - 1));
         assert!(
-            !split_fits_in(SplitDir::Vertical, MIN_PANE_ROWS - 1, need),
+            !split_fits_in(SplitDir::Vertical, pane_rows - 1, need),
             "the undivided axis must already clear the minimum"
         );
-        let need_rows = 2 * MIN_PANE_ROWS + 1;
+        let need_rows = 2 * pane_rows + 1;
         assert!(split_fits_in(
             SplitDir::Horizontal,
             need_rows,
@@ -1424,7 +1478,7 @@ mod tests {
         assert!(!split_fits_in(SplitDir::Vertical, 0, 0));
         assert!(!split_fits_in(SplitDir::Horizontal, 0, 0));
         // And the refusal message's numbers ARE the boundary.
-        assert_eq!(split_needs(SplitDir::Vertical), (MIN_PANE_ROWS, need));
+        assert_eq!(split_needs(SplitDir::Vertical), (pane_rows, need));
         assert_eq!(
             split_needs(SplitDir::Horizontal),
             (need_rows, MIN_PANE_COLS)

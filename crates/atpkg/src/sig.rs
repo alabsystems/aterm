@@ -799,22 +799,12 @@ impl Floor {
     /// callers then proceed best-effort, which is still rollback-safe, only not
     /// strictly monotonic under concurrency.
     fn acquire_file_lock(&self) -> Option<FileLock> {
-        // `Path::file_name` / `OsStr::to_str` go via `call1`: std's INLINED
-        // `unsafe` (the `from_utf8_unchecked` fast path, the `OsStr` byte-slice
-        // casts) is otherwise attributed to this function's spans as
-        // missing-SAFETY-comment refutations under the strict Trust gate (see
-        // `lib.rs`). Same calls, same receivers; behavior identical. The
-        // `format!("{name}.lock")` is a manual concat for the same reason (its
-        // expansion embeds `fmt::Arguments` construction the gate cannot lower)
-        // — byte-identical.
-        let name = match crate::call1(std::path::Path::file_name, self.path.as_path()) {
-            Some(n) => crate::call1(std::ffi::OsStr::to_str, n),
-            None => None,
-        }
-        .unwrap_or("floor");
-        let mut lock_name = String::from(name);
-        lock_name.push_str(".lock");
-        let lockpath = self.path.with_file_name(lock_name);
+        let name = self
+            .path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("floor");
+        let lockpath = self.path.with_file_name(format!("{name}.lock"));
         FileLock::acquire(&lockpath).ok()
     }
 

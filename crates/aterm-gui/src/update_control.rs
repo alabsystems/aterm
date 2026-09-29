@@ -16,6 +16,9 @@ pub(crate) struct Snapshot {
     posture: Option<ApplyPosture>,
     /// Where the automatic lane stands on its ladder, for the staged build.
     phase: Option<ApplyPhase>,
+    /// The restored agents' hold is holding the automatic lane
+    /// (`HostHandle::restored_pending`).
+    restored_hold: bool,
     applying: bool,
     retry_scheduled: bool,
 }
@@ -42,6 +45,10 @@ impl Snapshot {
                 .staged
                 .as_ref()
                 .map(|_| app.automatic_apply_phase(now)),
+            restored_hold: app
+                .harness
+                .as_ref()
+                .is_some_and(|host| host.restored_pending(now)),
             applying: updater.phase == UpdaterPhase::Applying,
             retry_scheduled: updater
                 .staged
@@ -60,6 +67,17 @@ impl Snapshot {
             "automatic" | "automatic-idle" => self.phase.map(ApplyPhase::as_str),
             _ => None,
         }
+    }
+
+    /// What is holding the automatic lane past its ladder — `apply_held=` on the
+    /// wire — while that lane is the one that will apply the staged build: today
+    /// only the restored agents' hold (`restored-agents`), the one hold that
+    /// refuses the `land` phase too. Without it `apply_phase=land` read as
+    /// "lands at the next poll" for up to the hold's bound with nothing on the
+    /// line to say why it did not (the round-four review).
+    pub(crate) fn apply_held(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
+        (matches!(self.apply_posture(status), "automatic" | "automatic-idle") && self.restored_hold)
+            .then_some("restored-agents")
     }
 
     /// The ledger and the GUI can observe different generations. Never attach a
@@ -292,6 +310,7 @@ mod tests {
             }),
             posture: Some(ApplyPosture::Automatic),
             phase: Some(ApplyPhase::PreferOutputGap),
+            restored_hold: false,
             applying: false,
             retry_scheduled: false,
         };
@@ -328,6 +347,87 @@ mod tests {
         assert_eq!(snapshot.apply_posture(&status), "manual-config");
         status.staged_commit = Some("d".repeat(40));
         assert_eq!(snapshot.apply_posture(&status), "unreconciled");
+    }
+
+    /// THE RESTORED AGENTS' HOLD IS NAMED ON THE STATUS LINE (the round-four
+    /// review), beside an automatic posture and nowhere else, and so is its start
+    /// and end in the log, once each way. Before, the hold refused even the
+    /// `land` phase for up to seven minutes with nothing on either to say so.
+    ///
+    /// FAILS WITHOUT THE FIX: neither the token nor the line existed.
+    #[test]
+    fn the_restored_agents_hold_is_named_while_it_holds() {
+        let status = status();
+        let mut snapshot = Snapshot {
+            owner: None,
+            repo: None,
+            auto_apply: true,
+            staged: Some(StagedUpdate {
+                build: 11,
+                version: "test".into(),
+                commit: status.staged_commit.clone(),
+                dmg_sha256: status.staged_dmg_sha256.clone().unwrap(),
+                changelog: None,
+                generation: 1,
+            }),
+            posture: Some(ApplyPosture::Automatic),
+            phase: Some(ApplyPhase::Land),
+            restored_hold: true,
+            applying: false,
+            retry_scheduled: true,
+        };
+        assert_eq!(snapshot.apply_phase(&status), Some("land"));
+        assert_eq!(snapshot.apply_held(&status), Some("restored-agents"));
+        snapshot.restored_hold = false;
+        assert_eq!(snapshot.apply_held(&status), None);
+        snapshot.restored_hold = true;
+        snapshot.posture = Some(ApplyPosture::ManualByConfig);
+        assert_eq!(
+            snapshot.apply_held(&status),
+            None,
+            "a lane that will not apply by itself is held by nothing"
+        );
+
+        let mut said = false;
+        let began = crate::native_update_auto_intent::restored_hold_line(11, true, &mut said)
+            .expect("the hold's start is said");
+        assert!(
+            began.contains("build 11") && began.contains("held while"),
+            "{began}"
+        );
+        assert!(
+            began.contains(&format!(
+                "{} s",
+                crate::harness_host::RESTORED_HOLD.as_secs()
+            )),
+            "with its bound: {began}"
+        );
+        assert_eq!(
+            crate::native_update_auto_intent::restored_hold_line(11, true, &mut said),
+            None,
+            "once"
+        );
+        let ended = crate::native_update_auto_intent::restored_hold_line(11, false, &mut said)
+            .expect("its end is said");
+        assert!(ended.contains("hold is over"), "{ended}");
+        assert_eq!(
+            crate::native_update_auto_intent::restored_hold_line(11, false, &mut said),
+            None
+        );
+        // The verb's help names the token and the hold's bound as it is.
+        let help = aterm_types::control_verbs::spec("update")
+            .expect("the update verb")
+            .help_line();
+        assert!(
+            help.contains("apply_held=") && help.contains("restored-agents"),
+            "{help}"
+        );
+        assert_eq!(
+            crate::harness_host::RESTORED_HOLD.as_secs(),
+            7 * 60,
+            "the help says seven minutes"
+        );
+        assert!(help.contains("seven minutes"), "{help}");
     }
 
     #[test]

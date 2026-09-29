@@ -164,12 +164,15 @@ pub struct Hover {
     pub target: HoverTarget,
 }
 
-/// What one window's painted band rows were built from — `(center
-/// fingerprint at cols, cols, palette key, hover, window geometry, motion
-/// fingerprint)` — a host's splice cache key, which reads the same terms
-/// [`band_fp`] folds. The motion term is [`BandMotion::fingerprint`]: 0 with
-/// nothing moving or indicating, and moved only by a frame that draws
-/// something new (ruling 140).
+/// What one view's painted band rows were built from — `(center
+/// fingerprint at cols, cols, inks key, hover, window geometry, motion
+/// fingerprint)` — the paint cache key of [`crate::drive::View::paint`],
+/// which reads the same terms [`band_fp`] folds. The inks key hashes the
+/// resolved `BandInks` and the forced-palette flag the rows are painted
+/// with (ruling 337: a key on the theme alone missed a High Contrast toggle).
+/// The motion term is [`BandMotion::fingerprint`]: 0 with nothing moving or
+/// indicating, and moved only by a frame that draws something new (ruling
+/// 140).
 pub type BandKey = (u64, usize, u64, Option<Hover>, Geometry, u64);
 
 /// The band's repaint term: the center's fingerprint at `cols` ⊕ the

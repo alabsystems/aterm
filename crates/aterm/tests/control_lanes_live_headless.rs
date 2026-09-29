@@ -39,6 +39,15 @@
 //!   240 idle connections use the process up (2026-09-26): every fresh client
 //!   then got a dropped connection instead of the busy line, and a new tab had
 //!   no descriptor left.
+//! * `hung_up_waits_give_their_lanes_back_and_ctl_names_busy`: a blocking verb
+//!   whose caller hangs up gives its lane back within a hangup poll, not at its
+//!   own timeout (2026-09-25: SIGKILLed `aterm ctl await … timeout=20000`
+//!   clients kept every lane busy for the full 20 s). The socket is saturated
+//!   with long waits; while it is, `aterm ctl` reports the refusal as busy — an
+//!   ordinary failure naming the server's words, never "Broken pipe"; then
+//!   every waiting client hangs up and a fresh client, and a fresh wait, must be
+//!   admitted within a second and a half — long before the waits' own minute.
+//!   The listener's health fields are on `metrics`.
 //!
 //! Every instance runs under a descriptor limit its test names (the cap is a
 //! quarter of it), so no verdict depends on the shell the suite was started
@@ -800,5 +809,132 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
             "a closed connection never gave its place back: {reply:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `aterm ctl --sock <sock> <args…>` in the world's isolation.
+fn aterm_ctl(root: &Path, sock: &Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    launch_isolation::apply(&mut cmd, root);
+    cmd.arg("ctl")
+        .arg("--sock")
+        .arg(sock)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run aterm ctl")
+}
+
+#[test]
+fn hung_up_waits_give_their_lanes_back_and_ctl_names_busy() {
+    /// Far longer than the test: only a hangup can end these waits in time.
+    const WAIT_MS: u64 = 60_000;
+
+    roomy_test_process();
+    let Some(world) = world("h") else {
+        eprintln!("SKIP: no scratch base with a short enough socket path");
+        return;
+    };
+    let sock = world.0.join("run/aterm/lanes.sock");
+    let Some((_instance, soft_limit)) = boot(&world.0, &sock, ROOMY_SOFT_LIMIT) else {
+        return;
+    };
+    assert!(
+        connection_cap(soft_limit) > RPC_LANES + WAIT_LANES + 8,
+        "the connection cap at soft limit {soft_limit} would saturate before the lanes"
+    );
+    let token = token(&sock);
+
+    // Saturate the socket with waits (each one admitted), judged by a refusal
+    // that STAYS, exactly as the negative control above does.
+    let mut waits: Vec<Driver> = Vec::new();
+    let mut reopened = 0;
+    let saturated = loop {
+        assert!(
+            waits.len() < RPC_LANES + WAIT_LANES + 8,
+            "{} waits open and no fresh client was refused",
+            waits.len()
+        );
+        let (wait, mut reply, _) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
+        waits.push(wait);
+        if reply == BUSY {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(50));
+                reply = probe(&sock, &token).0;
+                if reply != BUSY {
+                    break;
+                }
+            }
+        }
+        if reply == BUSY {
+            break waits.len();
+        }
+        assert!(
+            reply.starts_with("OK"),
+            "a fresh client below saturation got {reply:?}"
+        );
+    };
+    eprintln!("saturated at {saturated} waits ({reopened} refused on arrival and reopened)");
+
+    // The client names a refusal for what it is: an ordinary failure carrying
+    // the server's own words, never a transport error.
+    let out = aterm_ctl(
+        &world.0,
+        &sock,
+        &["await", "seq", "999999999999", "timeout=50"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "busy is a plain failure: {stderr}"
+    );
+    assert!(
+        stderr.contains(BUSY),
+        "busy must be reported as busy: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe") && !stderr.contains("not connected"),
+        "busy was misreported: {stderr}"
+    );
+
+    // Every waiting client hangs up (a SIGKILLed `aterm ctl` closes exactly
+    // so). Their lanes must come back within a hangup poll, not at the minute
+    // their waits were given: a fresh client is served, and a fresh wait is
+    // admitted and runs to its own (short) timeout.
+    let hung_up = Instant::now();
+    drop(waits);
+    let released = loop {
+        let (reply, _) = probe(&sock, &token);
+        if reply.starts_with("OK") {
+            break hung_up.elapsed();
+        }
+        assert_eq!(reply, BUSY, "an unexpected answer while the lanes drain");
+        assert!(
+            hung_up.elapsed() < Duration::from_secs(10),
+            "hung-up clients still hold their lanes after {:?}",
+            hung_up.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    eprintln!("a lane came back {released:?} after its caller hung up");
+    assert!(
+        released < Duration::from_millis(1_500),
+        "hung-up callers held their lanes for {released:?}"
+    );
+    let mut fresh = Driver::established(&sock, &token)
+        .unwrap_or_else(|reply| panic!("a fresh driver after the hangups: {reply:?}"));
+    assert_eq!(fresh.request(&long_wait(20)), "OK timeout");
+
+    // And the listener's health is published.
+    let metrics = fresh.request("metrics");
+    for field in [
+        "control_accepts=",
+        "control_last_accept_age_ms=",
+        "control_queue_pending=",
+        "control_rebinds=",
+        "control_busy_replies=",
+    ] {
+        assert!(metrics.contains(field), "metrics lacks {field}: {metrics}");
     }
 }

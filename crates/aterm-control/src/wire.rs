@@ -21,6 +21,29 @@ pub fn visible_char(ch: char) -> char {
     }
 }
 
+/// The visible, trailing-trimmed text of screen row `r`: the engine's
+/// combining-aware `get_line_text` with interior control chars collapsed to
+/// spaces ([`visible_char`]) and the tail trimmed. THE single source for a
+/// screen row's text: `aterm-gui`'s `visible_row` (behind `text`, `text --json`,
+/// the pushed `subscribe screen` DELTA and the `status` hash) delegates here, and
+/// `cast drift` compares a replayed engine against the live one with it, so a
+/// replay and the screen it is held against can never disagree about a trailing
+/// space. Caller holds whatever lock guards `t`.
+#[must_use]
+pub fn visible_row(t: &aterm_core::terminal::Terminal, r: usize) -> String {
+    let line = t.get_line_text(r as i32, None).unwrap_or_default();
+    let mut out: String = line.chars().map(visible_char).collect();
+    // Truncate in place instead of `trim_end().to_string()`: `trim_end` returns
+    // a PREFIX slice, so its length is always a char boundary and the bytes that
+    // survive are identical — but the old form allocated a second full row and
+    // memcpy'd into it. This runs once per screen row per `subscribe screen`
+    // push WITH THE TERMINAL LOCK HELD, so the copy stalled the PTY reader.
+    // (Two statements: `out.truncate(out.trim_end().len())` cannot borrow-check.)
+    let end = out.trim_end().len();
+    out.truncate(end);
+    out
+}
+
 /// Percent-encode a string so it occupies ONE space-free token in a response
 /// line: every byte that is not ASCII-graphic (and `%` itself) becomes `%XX`.
 /// Spaces, newlines and non-ASCII are escaped; the client decodes. Empty -> "".

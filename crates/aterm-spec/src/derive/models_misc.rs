@@ -2777,8 +2777,9 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var diagnostic_wake = 1;
             // THE LATE PARK (2026-09-19). On the launched lane the successor
             // exists BEFORE the parent parks: launched, booted and dialled with
-            // every reader live, holding NOTHING until the one post-park
-            // descriptor message (`granted`). Until then a revocation kills,
+            // every reader live, holding NOTHING until the post-park grant's
+            // first descriptor message (`granted`; a grant of more than 62
+            // sessions continues in further messages, `NativeUpdateRendezvousGrant`). Until then a revocation kills,
             // reaps and retires the candidate with the parent's readers never
             // stopped, and a parked parent whose capture missed may resume its
             // readers beside the live candidate and park again — legitimately,

@@ -155,7 +155,12 @@ impl<T, const N: usize> ArrayVec<T, N> {
     // (verified in-bounds writes that increment `len` only AFTER
     // initializing `buf[len]`) and `pop` (decrements before reading below
     // the old `len`); round-trip unit tests cover the boundary. Verify-only;
-    // behavior unchanged; droppable when init tracking lands.
+    // behavior unchanged. Re-measured 2026-09-27 on seal 321aaeda7 with this
+    // skip removed: VIOLATIONS (2 of 4 obligations refuted — the false
+    // refutation per-slot tracking would close). Needed from $HOME/trust, in a
+    // promoted seal: per-slot `MaybeUninit` init tracking; then drop this and
+    // the same family's skips below (`targo trust check -p aterm-alloc --lib
+    // --allow-l0-gaps`).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn pop(&mut self) -> Option<T> {
         // Same local-copy idiom as `push`/`try_push` (above); wrapping_sub is

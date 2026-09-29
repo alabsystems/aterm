@@ -8,7 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "aterm-winsign — Authenticode signing and verification of the shipped Windows exe, behind `cargo winsign` (Tier WINDOWS)"
+description = "aterm-winsign — Authenticode signing and verification of the shipped Windows exe, behind `targo --unverified winsign` (Tier WINDOWS)"
 
 [[bin]]
 name = "aterm-winsign"

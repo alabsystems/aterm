@@ -24,12 +24,16 @@
 //! still has from one main fixed since and a conflict resolution put back.
 //! So a HEAD holding a commit of the local `main` that [`MAIN_REF`] lacks
 //! (a stale `origin/main`, whose merge-base is an older main than the one the
-//! branch merged) has no base (2026-09-27, second review). Only a whole-tree
+//! branch merged) has no base (2026-09-27, second review), and neither has
+//! any run whose `origin/main` cannot be confirmed as new as main on
+//! [`MAIN_REMOTE`] — read there, bounded, and an unreadable remote confirms
+//! nothing (2026-09-28, [`remote_main_fresh`]). Only a whole-tree
 //! receipt that lists its failures serves ([`usable`]) — and only one made by
 //! the same tools as the run (2026-09-27, third review: the same trustc
 //! commit, the same spec checkers and the same build environment taken from
-//! the caller, [`tools_differ`]): a red another compiler, another `ty` or
-//! other flags found is not main's under this run's.
+//! the caller, [`tools_differ`] — and, 2026-09-28, the same cargo config
+//! files, [`crate::build_config`]): a red another compiler, another `ty`,
+//! other flags or another `config.toml` found is not main's under this run's.
 //!
 //! THE SAME FAILURE. Each failure is itemized ([`Finding`]): per failed test,
 //! with the binary that failed it, for a `targo test` child whose log accounts
@@ -79,6 +83,13 @@
 //! NO BASE, NO DIFFERENTIAL. No `origin/main`, no merge-base, a HEAD that is
 //! itself on main, or no usable receipt for the base: the run is judged by
 //! the absolute rule it always was, and says why before any stage runs.
+//!
+//! THE NEAREST BASE (2026-09-28) is OPT-IN and OFF by default, pending the
+//! owner's decision: `--nearest-base` ([`BaseMode::Nearest`], [`resolve_with`])
+//! lets a run whose merge-base has no receipt that serves be judged against
+//! its newest ancestor's, for the failed tests whose blast radius did not
+//! change between the two ([`crate::nearest`], [`judge`]). [`resolve`] is the
+//! exact rule, unchanged.
 //!
 //! THE BASELINE. `tools/verify.sh --baseline`, run on a commit of main (any
 //! idle machine, by hand for now), is an ordinary whole-tree run whose receipt
@@ -578,7 +589,8 @@ fn is_diagnostic(line: &str) -> bool {
 ///
 /// AND THE WORDS OF A POLL THAT GAVE UP (2026-09-27, third review), which
 /// name no clock but are one: the smokes' `control socket never started
-/// listening` (a hundred polls, ten seconds), `the window never presented`
+/// listening` (a hundred polls, [`crate::smoke_stages::SOCKET_POLLS`], ten
+/// seconds and each poll's cost), `the window never presented`
 /// and `never produced an initial present` (a hundred and fifty), and a
 /// control client that answered NOTHING (`<no reply>`, `no metrics reply`) —
 /// a crash, a hang and a slow start all leave the same empty answer. Main's
@@ -656,6 +668,7 @@ pub fn row_finding(label: &str, output: &str) -> Finding {
         hash: fingerprint(lines.iter().map(String::as_str)),
         opaque,
         timing,
+        package: None,
     }
 }
 
@@ -703,6 +716,7 @@ pub fn label_finding(label: &str) -> Finding {
         hash: fingerprint([normalized.as_str()]),
         opaque: normalized.trim().is_empty().then_some(SILENT),
         timing: timing_marker([label]).or(duration.then_some(MEASURED_DURATION)),
+        package: None,
     }
 }
 
@@ -755,6 +769,7 @@ pub fn test_findings(label: &str, output: &str) -> Vec<Finding> {
                         .chain(std::iter::once(t.name.as_str())),
                 )
                 .or(duration.then_some(MEASURED_DURATION)),
+                package: crate::nearest::package_of(&t.spec),
             }
         })
         .collect()
@@ -896,6 +911,165 @@ pub fn guard_ran_to_end(output: &str) -> Result<(), &'static str> {
 /// [`CUT_SHORT`] when the verdict line never came.
 pub fn license_ran_to_end(output: &str) -> Result<(), &'static str> {
     closing_line(output, "LICENSE: FAIL")
+}
+
+/// How `tools/export-content-scan.py` closes a run whose guards found
+/// something — its `VERDICT_FAIL`; if either changes, change both. Printed
+/// only after all three of the engine's content guards decided.
+pub const EXPORT_CONTENT_VERDICT_FAILED: &str = "EXPORT CONTENT: FAIL";
+
+/// `tools/export-content-scan.py` ran every guard: its `EXPORT CONTENT: FAIL`
+/// comes after the forbidden-content, private-reference and gitleaks guards
+/// have all decided, and a run the engine stopped before them — it refused
+/// the export itself — closes `EXPORT CONTENT: REFUSED` instead.
+///
+/// # Errors
+/// [`CUT_SHORT`] when the verdict line never came.
+pub fn export_content_ran_to_end(output: &str) -> Result<(), &'static str> {
+    closing_line(output, EXPORT_CONTENT_VERDICT_FAILED)
+}
+
+/// How `tools/export-content-scan.py` opens the line of a run whose three
+/// guards are clean — its `VERDICT_PASS`; if either changes, change both. An
+/// exit 0 without it decided nothing ([`crate::stages::export_content_outcome`]).
+pub const EXPORT_CONTENT_VERDICT_PASSED: &str = "EXPORT CONTENT: PASS";
+
+/// How `tools/export-content-scan.py` opens the line of a run the engine
+/// stopped before any guard — it refused the export itself — its
+/// `VERDICT_REFUSED`; if either changes, change both.
+pub const EXPORT_CONTENT_VERDICT_REFUSED: &str = "EXPORT CONTENT: REFUSED";
+
+/// THE EXPORT CONTENT SCAN'S HITS, ONE FINDING EACH (2026-09-29, review of the
+/// stage). The scan prints one row per hit, `  <location>  <what>`, before
+/// its `EXPORT CONTENT: FAIL`; each is a finding keyed by what does not move
+/// when unrelated code does — the hit's source path and its pattern classes —
+/// and, for the second and later hit with one key, its ordinal (`#2`, …):
+///
+/// * the line number and the bracketed notes (`[export only: …]`, the
+///   astream submodule's rev) are dropped from the location, and each
+///   pattern file's `(<file>:<line>)` from the classes, leaving each class
+///   its section heading;
+/// * the id is `export-content-scan.py -- <path> -- <classes>[ #n]`, and the
+///   fingerprint is of that key, so one id always fails the same way.
+///
+/// WHY. As ONE row finding — every printed line fingerprinted, each carrying
+/// its source line — a red main (a hit landed, or the engine's baseline grew
+/// a pattern) blocked every branch that edited a file above one of its hits,
+/// and every branch that cleared some of them but not all: each printed a
+/// different set of lines, so FAILED DIFFERENTLY. Keyed per hit, a branch is
+/// judged by what it adds: main's hits it still carries are main's red
+/// wherever they moved, the ones it cleared are simply gone, and a hit of a
+/// path and class main has fewer of — or none — is new.
+///
+/// A run that never printed its FAIL verdict (the engine refused the export
+/// before any guard ran) is the one row finding, never inherited
+/// ([`export_content_ran_to_end`]); so is output with any other line before
+/// the verdict, which cannot be itemized, as the row finding (inherited only
+/// when it prints exactly what main's did).
+#[must_use]
+pub fn export_content_findings(label: &str, output: &str) -> Vec<Finding> {
+    let row = || {
+        let finding = row_finding(label, output);
+        match export_content_ran_to_end(output) {
+            Ok(()) => finding,
+            Err(why) => never_inherited(finding, why),
+        }
+    };
+    let plain = strip(output);
+    if export_content_ran_to_end(&plain).is_err() {
+        return vec![row()];
+    }
+    let mut keys = Vec::new();
+    for line in plain
+        .lines()
+        .take_while(|l| l.trim_end() != EXPORT_CONTENT_VERDICT_FAILED)
+    {
+        if line.trim().is_empty() || line.starts_with(EXPORT_CONTENT_BANNER) {
+            continue;
+        }
+        match export_content_hit_key(line) {
+            Some(key) => keys.push(key),
+            None => return vec![row()],
+        }
+    }
+    if keys.is_empty() {
+        return vec![row()];
+    }
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    keys.into_iter()
+        .map(|key| {
+            let n = seen.entry(key.clone()).or_default();
+            *n += 1;
+            let id = if *n == 1 {
+                format!("{} -- {key}", crate::stages::EXPORT_CONTENT_SCRIPT)
+            } else {
+                format!("{} -- {key} #{n}", crate::stages::EXPORT_CONTENT_SCRIPT)
+            };
+            Finding {
+                id: one_line(&id),
+                hash: fingerprint([key.as_str()]),
+                opaque: None,
+                // A hit is a string in a file, never a clock.
+                timing: None,
+                package: None,
+            }
+        })
+        .collect()
+}
+
+/// The line `tools/export-content-scan.py` opens every run with.
+const EXPORT_CONTENT_BANNER: &str = "export content scan: ";
+
+/// `<path> -- <classes>` of one hit row, `  <location>  <what>`
+/// ([`export_content_findings`]); `None` for a line that is not one.
+fn export_content_hit_key(line: &str) -> Option<String> {
+    let row = line.strip_prefix("  ")?;
+    if row.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let (location, what) = row.split_once("  ")?;
+    let what = what.trim();
+    if location.is_empty() || what.is_empty() {
+        return None;
+    }
+    // The path: up to its first ` [note]`, without its `:<line>`.
+    let path = location.split_once(" [").map_or(location, |(p, _)| p);
+    let path = match path.rsplit_once(':') {
+        Some((p, n)) if !p.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            p
+        }
+        _ => path,
+    };
+    Some(format!("{path} -- {}", without_pattern_lines(what)))
+}
+
+/// `what` with every ` (<file>:<line>)` — a pattern file's own line after a
+/// class's heading — taken out.
+fn without_pattern_lines(what: &str) -> String {
+    let mut out = String::with_capacity(what.len());
+    let mut rest = what;
+    while let Some(at) = rest.find(" (") {
+        let (before, open) = rest.split_at(at);
+        out.push_str(before);
+        let inner = &open[2..];
+        let located = inner.split_once(')').filter(|(inside, _)| {
+            inside.rsplit_once(':').is_some_and(|(file, n)| {
+                !file.is_empty()
+                    && !file.contains(char::is_whitespace)
+                    && !n.is_empty()
+                    && n.bytes().all(|b| b.is_ascii_digit())
+            })
+        });
+        match located {
+            Some((_, after)) => rest = after,
+            None => {
+                out.push_str(" (");
+                rest = inner;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn closing_line(output: &str, verdict: &str) -> Result<(), &'static str> {
@@ -1078,6 +1252,10 @@ pub struct BaseReds {
     /// When this run is judged, in seconds since the epoch; the age cap is
     /// measured from here.
     pub now: u64,
+    /// `Some` when `commit` is not the merge-base but its NEAREST ancestor
+    /// with a receipt — opt-in, `--nearest-base` ([`crate::nearest`]): which
+    /// findings it may excuse. `None` — the default, the exact rule — always.
+    pub nearest: Option<crate::nearest::Gate>,
 }
 
 /// What a run's verdict is judged against.
@@ -1111,8 +1289,25 @@ impl Against {
 /// by 900 ms hash the same, so the same words say nothing about whether it
 /// is the same failure. Main listing it counts for nothing: it is NEW, and
 /// the verdict's UNDER LOAD label still says when its stage ran busy.
+///
+/// THROUGH A NEAREST BASE (opt-in, [`crate::nearest`]) a finding the exact
+/// rule would inherit is inherited only when [`crate::nearest::Gate::qualifies`]
+/// says its blast radius did not change between that base and the
+/// merge-base; otherwise it is NEW, and the reason says why.
 #[must_use]
 pub fn judge(f: &Finding, base: &BaseReds) -> Disposition {
+    let exact = judge_exact(f, base);
+    match (&base.nearest, &exact) {
+        (Some(gate), Disposition::Inherited(_)) => match gate.qualifies(f) {
+            Ok(_) => exact,
+            Err(why) => Disposition::New(NewWhy::Opaque(why)),
+        },
+        _ => exact,
+    }
+}
+
+/// [`judge`] by the exact rule: the base's reds as they stand.
+fn judge_exact(f: &Finding, base: &BaseReds) -> Disposition {
     if let Some(why) = f.opaque {
         return Disposition::New(NewWhy::Opaque(why));
     }
@@ -1295,6 +1490,9 @@ pub struct Found {
     /// HEAD ([`resolve`]) — which a judging clock must not be behind either
     /// ([`Plan::against`]). `None`: the receipt's `when` is the latest known.
     pub clock_floor: Option<(u64, String)>,
+    /// `Some` when this is a NEAREST base, not the merge-base's own receipt
+    /// (opt-in, [`crate::nearest::find`]); `None` by the exact rule.
+    pub nearest: Option<crate::nearest::Gate>,
 }
 
 impl Found {
@@ -1306,6 +1504,7 @@ impl Found {
             source: self.source.clone(),
             failures: self.receipt.failures.clone().unwrap_or_default(),
             now,
+            nearest: self.nearest.clone(),
         }
     }
 
@@ -1410,6 +1609,31 @@ impl Plan {
     pub fn header_line(&self, baseline: bool, head: &str) -> String {
         let cap = INHERITED_CAP_SECS / 3600;
         match self {
+            Self::Judge(
+                found @ Found {
+                    nearest: Some(gate),
+                    ..
+                },
+            ) => {
+                let n = found.receipt.failures.as_ref().map_or(0, Vec::len);
+                format!(
+                    "verify: base {} — NEAREST (--nearest-base, opt-in): the merge-base with \
+                     {MAIN_REF}, {}, has no receipt that serves this run, and {} is the newest \
+                     main commit before it with one ({} commit(s), {} h earlier) — main's {} \
+                     lists {n} red(s); the same red here is inherited only when it is a failed \
+                     test of a crate none of whose files, nor any of a crate it builds on, \
+                     changed between the two ({} of {} crates qualify) — never a whole-row red — and \
+                     until main has been red on it {cap} h\n",
+                    short(&found.commit),
+                    short(&gate.merge_base),
+                    short(&found.commit),
+                    gate.steps,
+                    gate.span_secs / 3600,
+                    found.source,
+                    gate.qualifying(),
+                    gate.crates.len()
+                )
+            }
             Self::Judge(found) => {
                 let n = found.receipt.failures.as_ref().map_or(0, Vec::len);
                 format!(
@@ -1454,6 +1678,17 @@ impl Plan {
 /// merged, and its receipt cannot tell a red main fixed since from one the
 /// merge put back. The run is judged by the absolute rule, and says to fetch.
 ///
+/// AND SO IS ONE THE REMOTE HAS MOVED PAST (2026-09-28). The local-main check
+/// sees only a main this checkout HAS: a branch that merged main from another
+/// ref, another worktree's fetch or a pull straight from the remote holds a
+/// main that neither `origin/main` nor the local `main` has, and its merge-base
+/// with `origin/main` was an older main all the same. So main's tip is READ
+/// from [`MAIN_REMOTE`] ([`remote_main_fresh`], bounded by
+/// [`FRESHNESS_BOUND`]): a tip `origin/main` does not hold is a stale
+/// `origin/main`, and a remote that cannot be read — offline, no such remote,
+/// no main there, the bound overrun — cannot confirm it fresh. Either way the
+/// run is judged by the absolute rule, saying why and `git fetch origin`.
+///
 /// ONLY A RECEIPT OF THE SAME TOOLS IS A BASE (2026-09-27, third review): a
 /// receipt made by another trustc, or other spec checkers, than `tools` —
 /// this run's — cannot serve ([`tools_differ`]); the next candidate is tried
@@ -1472,6 +1707,34 @@ impl Plan {
 /// whatever tools made it: an older since only makes a red block sooner.
 #[must_use]
 pub fn resolve(root: &Path, head: &str, baseline: bool, tools: &Tools) -> Plan {
+    resolve_with(root, head, baseline, tools, BaseMode::Exact)
+}
+
+/// Which receipt may serve as a run's base.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BaseMode {
+    /// The merge-base's own, and nothing else: the default, and the rule the
+    /// owner approved.
+    #[default]
+    Exact,
+    /// `--nearest-base` (opt-in, pending the owner's decision,
+    /// [`crate::nearest`]): when the merge-base has none that serves, its
+    /// newest ancestor's within [`crate::nearest::Bound::DEFAULT`], for the
+    /// failed tests whose blast radius did not change between the two.
+    Nearest,
+}
+
+/// [`resolve`], with the base `mode` the run asked for. [`BaseMode::Exact`]
+/// is [`resolve`] exactly; [`BaseMode::Nearest`] changes only the plan of a
+/// run whose merge-base has no receipt that serves it.
+#[must_use]
+pub fn resolve_with(
+    root: &Path,
+    head: &str,
+    baseline: bool,
+    tools: &Tools,
+    mode: BaseMode,
+) -> Plan {
     let absolute = |why: String| Plan::Absolute { why, chain: None };
     if !is_sha(head) {
         return absolute(format!("HEAD is {head}, not a commit"));
@@ -1520,6 +1783,9 @@ pub fn resolve(root: &Path, head: &str, baseline: bool, tools: &Tools) -> Plan {
             short(&held)
         ));
     }
+    if let Err(why) = remote_main_fresh(root) {
+        return chained(why);
+    }
     let judge = |mut found: Found| {
         found.clock_floor = clock_floor(root, head);
         oldest_clocks(root, &mut found);
@@ -1538,6 +1804,12 @@ pub fn resolve(root: &Path, head: &str, baseline: bool, tools: &Tools) -> Plan {
             None => why.push_str("; no published note either"),
         },
         Err(e) => why.push_str(&format!("; published notes unavailable ({e})")),
+    }
+    if mode == BaseMode::Nearest {
+        match crate::nearest::find(root, &base, tools, crate::nearest::Bound::DEFAULT) {
+            Ok(found) => return judge(found),
+            Err(e) => why.push_str(&format!("; --nearest-base: {e}")),
+        }
     }
     // Named only when it is NEWER than the base: the walk from main's tip
     // passes the base, which has no usable receipt, and finds an ancestor of
@@ -1648,6 +1920,69 @@ fn clock_floor(root: &Path, head: &str) -> Option<(u64, String)> {
 /// ([`resolve`]).
 pub const LOCAL_MAIN: &str = "refs/heads/main";
 
+/// Main on [`MAIN_REMOTE`], as `git ls-remote` names it: the tip a fresh
+/// [`MAIN_REF`] holds ([`remote_main_fresh`]).
+pub const REMOTE_MAIN: &str = "refs/heads/main";
+
+/// How long reading main's tip from [`MAIN_REMOTE`] may take: one ref
+/// advertisement, so far shorter than a fetch ([`NETWORK_BOUND`]). Past it
+/// the remote is unreachable for this run, and freshness unconfirmed. It
+/// bounds the whole call, the transport git starts included (`git_bounded`
+/// kills git's process group, plus at most a second's drain grace).
+pub const FRESHNESS_BOUND: Duration = Duration::from_secs(10);
+
+/// IS [`MAIN_REF`] AS NEW AS MAIN ON [`MAIN_REMOTE`]? (2026-09-28.) Reads the
+/// remote's [`REMOTE_MAIN`] with `git ls-remote` (bounded by
+/// [`FRESHNESS_BOUND`], never a credential prompt) and answers `Ok` only when
+/// that tip is `origin/main` itself or an ancestor of it. `Err` — the reason
+/// the run is judged by the absolute rule, naming `git fetch origin` — when
+/// the remote cannot be read (offline, no such remote, no main there, the
+/// bound overrun: freshness cannot be confirmed, and a base it cannot confirm
+/// is no base) and when the remote's main holds a commit `origin/main` does
+/// not (the merge-base with `origin/main` may be an older main than the one
+/// the branch merged).
+///
+/// # Errors
+/// Why `origin/main` cannot be confirmed fresh.
+pub fn remote_main_fresh(root: &Path) -> Result<(), String> {
+    let local = rev(root, &format!("{MAIN_REF}^{{commit}}")).unwrap_or_default();
+    let unconfirmed = |what: String| {
+        format!(
+            "{what}, so {MAIN_REF} ({}) cannot be confirmed fresh, and the merge-base with a \
+             stale one may be an older main than the one this branch merged — `git fetch \
+             {MAIN_REMOTE}` where {MAIN_REMOTE} can be reached, and run again",
+            short(&local)
+        )
+    };
+    let listed = git_bounded(
+        root,
+        &["ls-remote", "--refs", MAIN_REMOTE, REMOTE_MAIN],
+        FRESHNESS_BOUND,
+    )
+    .map_err(|e| {
+        unconfirmed(format!(
+            "main on {MAIN_REMOTE} could not be read (`git ls-remote {MAIN_REMOTE} \
+             {REMOTE_MAIN}`: {e})"
+        ))
+    })?;
+    let Some(tip) = listed.lines().find_map(|l| {
+        let (sha, name) = l.split_once('\t')?;
+        (name.trim() == REMOTE_MAIN && is_sha(sha.trim())).then(|| sha.trim().to_string())
+    }) else {
+        return Err(unconfirmed(format!("{MAIN_REMOTE} names no {REMOTE_MAIN}")));
+    };
+    if tip == local || git_status(root, &["merge-base", "--is-ancestor", &tip, MAIN_REF]).is_ok() {
+        return Ok(());
+    }
+    Err(format!(
+        "main on {MAIN_REMOTE} is at {}, which {MAIN_REF} here ({}) does not have: {MAIN_REF} is \
+         stale, and the merge-base with it may be an older main than the one this branch \
+         merged — `git fetch {MAIN_REMOTE}` and run again",
+        short(&tip),
+        short(&local)
+    ))
+}
+
 /// What git says when [`MAIN_REMOTE`] has no [`NOTES_REF`] yet: no baseline
 /// was ever published, which is not a failure to fetch one.
 const NO_REMOTE_NOTES: &str = "couldn't find remote ref";
@@ -1708,6 +2043,7 @@ pub fn lookup(
                         source: format!("receipt {}", short_key(&key)),
                         receipt: r,
                         clock_floor: None,
+                        nearest: None,
                     });
                 }
                 Err(why) => seen.push(format!(
@@ -1765,6 +2101,7 @@ fn note_receipt(root: &Path, commit: &str, tools: Option<&Tools>) -> Option<Resu
             source: format!("note {}", short(commit)),
             receipt: r,
             clock_floor: None,
+            nearest: None,
         }),
         Err(why) => Err(format!("note {} cannot serve: {why}", short(commit))),
     })
@@ -1776,8 +2113,8 @@ fn note_receipt(root: &Path, commit: &str, tools: Option<&Tools>) -> Option<Resu
 
 /// WHAT RAN A RUN, as a receipt records it: its `toolchain` line (`<stage2
 /// bin dir> trustc <commit-hash>`), its `checkers` line
-/// ([`crate::checkers::Checkers::summary`]) and its `build-env` line
-/// ([`build_env`]).
+/// ([`crate::checkers::Checkers::summary`]), its `build-env` line
+/// ([`build_env`]) and its `build-config` line ([`crate::build_config`]).
 ///
 /// A RED IS MAIN'S ONLY UNDER THE TOOLS THAT FOUND IT (2026-09-27, third
 /// review). A base receipt made by another trustc — a re-seal, an older
@@ -1798,6 +2135,10 @@ pub struct Tools {
     /// The compile and test-run configuration the environment gave the run
     /// ([`build_env`]); `None` for a receipt that does not say.
     pub build_env: Option<String>,
+    /// The cargo config files the run's builds read
+    /// ([`crate::build_config::record`], 2026-09-28); `None` for a receipt
+    /// that does not say, and for a run whose config files could not be read.
+    pub build_config: Option<String>,
 }
 
 /// The `RUST*` and `CARGO*` variables a receipt's `build-env` line does NOT
@@ -1945,6 +2286,7 @@ impl Tools {
             toolchain: r.toolchain.clone(),
             checkers: r.checkers.clone(),
             build_env: r.build_env.clone(),
+            build_config: r.build_config.clone(),
         }
     }
 
@@ -2008,8 +2350,10 @@ fn checker_words(name: &str, seen: &CheckerSeen) -> String {
 /// machine (a note is published from another one, whose stage2 lives in
 /// another directory); a side that names no commit — no `toolchain` line (a
 /// receipt an older gate wrote), or a trustc that answered none — cannot be
-/// told from any other compiler. THE SAME BUILD: the same `build-env` line,
-/// and a receipt without one says nothing about it. THE SAME CHECKERS: each
+/// told from any other compiler. THE SAME BUILD: the same `build-env` line
+/// and the same `build-config` line (2026-09-28: the cargo config FILES the
+/// compiles read, [`crate::build_config`]), and a receipt without either says
+/// nothing about it. THE SAME CHECKERS: each
 /// of `ty`, `trust-ir` and `ay` absent on both sides, or found by the same
 /// discovery tier and saying the same `--version` — and where either side
 /// has no version to compare, found at the same path. A side that names no
@@ -2057,6 +2401,30 @@ pub fn tools_differ(base: &Tools, run: &Tools) -> Option<String> {
                 "its reds were built under `{theirs}`, and this run's under `{}` — the same \
                  compiler under other flags builds other code",
                 ours.as_deref().unwrap_or("an environment it cannot say")
+            ));
+        }
+    }
+    match (&base.build_config, &run.build_config) {
+        (None, _) => {
+            return Some(
+                "it does not say what cargo config files its compiles read (`.cargo/config.toml` \
+                 in the repository and its ancestors, `$CARGO_HOME`'s)"
+                    .to_string(),
+            );
+        }
+        (Some(_), None) => {
+            return Some(
+                "this run's cargo config files could not be read, so no receipt's can be told \
+                 from them"
+                    .to_string(),
+            );
+        }
+        (Some(theirs), Some(ours)) if theirs == ours => {}
+        (Some(theirs), Some(ours)) => {
+            return Some(format!(
+                "its reds were built reading the cargo config files `{theirs}`, and this run's \
+                 read `{ours}` — a `rustflags`, a profile or a runner in a config file builds \
+                 other code exactly as the variable would"
             ));
         }
     }
@@ -2335,7 +2703,7 @@ fn is_sha(s: &str) -> bool {
     s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn git(root: &Path, args: &[&str]) -> Command {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Command {
     let mut c = Command::new("git");
     // Never a credential prompt on a terminal nobody is watching, and git's
     // own words in one language: the publish loop reads one of its messages.
@@ -2349,7 +2717,7 @@ fn git(root: &Path, args: &[&str]) -> Command {
 }
 
 /// A local git call's stdout, when it succeeded.
-fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
     let out = git(root, args).stderr(Stdio::null()).output().ok()?;
     out.status
         .success()
@@ -2382,24 +2750,52 @@ fn git_status(root: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// How long a bounded git call's pipes may stay open after git itself has
+/// exited or been killed ([`git_bounded`]): long enough for the kernel to hand
+/// over what git wrote, never long enough to wait on a process git left behind.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
+
 /// A git call that may touch the network: stdout on success, the reason
-/// otherwise — its stderr, or the bound it overran (the child is killed).
-/// POLLED, as [`crate::exec`]'s ceiling is; both pipes are drained on threads
-/// so a chatty child cannot wedge on a full one.
+/// otherwise — its stderr, or the bound it overran. POLLED, as
+/// [`crate::exec`]'s ceiling is; both pipes are drained on threads so a chatty
+/// child cannot wedge on a full one.
+///
+/// THE BOUND IS A BOUND ON THE WHOLE CALL (2026-09-28, review). git reaches a
+/// remote through a CHILD of its own — `git-remote-https` for this repo's
+/// origin, `ssh` for an ssh one — and that child inherits git's pipes. Killing
+/// git alone left it running, and joining the drain threads then waited for it
+/// to close them: measured, a remote helper that slept 40 s held a 10 s bound
+/// for 40.06 s. So git runs in a PROCESS GROUP OF ITS OWN, and an overrun
+/// kills the group ([`crate::exec::group::kill`]) — every helper with it —
+/// and the drains are waited on for [`DRAIN_GRACE`] at most, never joined
+/// unconditionally: a helper that left the group (a `setsid`, an ssh
+/// `ControlPersist` master) and still holds a pipe costs a detached thread,
+/// never the gate's time. The group is on the interrupt list while it runs
+/// ([`crate::exec::group::Live`]), because a group of its own no longer hears
+/// the terminal's Ctrl-C; and in a background group, an `ssh` that opens the
+/// terminal for a passphrase is stopped (`SIGTTIN`) rather than prompting, so
+/// it too ends at the bound.
 fn git_bounded(root: &Path, args: &[&str], bound: Duration) -> Result<String, String> {
-    let mut child = git(root, args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run git: {e}"))?;
+    let mut cmd = git(root, args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("cannot run git: {e}"))?;
+    #[cfg(unix)]
+    let _live = crate::exec::group::Live::enter(child.id(), false);
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut s = String::new();
             if let Some(mut p) = pipe {
                 let _ = p.read_to_string(&mut s);
             }
-            s
-        })
+            let _ = tx.send(s);
+        });
+        rx
     };
     let out = drain(
         child
@@ -2418,30 +2814,44 @@ fn git_bounded(root: &Path, args: &[&str], bound: Duration) -> Result<String, St
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if started.elapsed() < bound => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+            _ => break None,
         }
     };
-    let (out, err) = (
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
-    );
-    match status {
-        Some(s) if s.success() => Ok(out),
-        Some(_) => Err(err
+    // Whatever git started dies with it — on an overrun, and on an exit that
+    // left a helper behind holding a pipe. A group already empty answers an
+    // error, which is the case with nothing to do.
+    #[cfg(unix)]
+    let _ = crate::exec::group::kill(child.id());
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let what = args
+        .iter()
+        .find(|a| !a.starts_with('-') && !a.contains('='))
+        .copied()
+        .unwrap_or_default();
+    let overran = || format!("git {what} did not finish within {} s", bound.as_secs());
+    let Some(status) = status else {
+        return Err(overran());
+    };
+    let deadline = Instant::now() + DRAIN_GRACE;
+    let collect = |rx: &std::sync::mpsc::Receiver<String>| {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    };
+    let (out, err) = (collect(&out), collect(&err).unwrap_or_default());
+    match (status.success(), out) {
+        (true, Some(out)) => Ok(out),
+        // git exited, but something it started still held its output open:
+        // what it printed cannot be known to be whole.
+        (true, None) => Err(overran()),
+        (false, _) => Err(err
             .trim()
             .lines()
             .last()
             .unwrap_or("git failed")
             .to_string()),
-        None => Err(format!(
-            "git {} did not finish within {} s",
-            args.first().copied().unwrap_or_default(),
-            bound.as_secs()
-        )),
     }
 }
 
@@ -2455,6 +2865,7 @@ mod tests {
             hash: hash.into(),
             opaque: None,
             timing: None,
+            package: None,
         }
     }
 
@@ -2475,6 +2886,7 @@ mod tests {
             source: "receipt aaaaaaaaa".into(),
             failures,
             now: NOW,
+            nearest: None,
         }
     }
 
@@ -2692,6 +3104,9 @@ mod tests {
                 ("-p x --test probe -- b", Some(REFUSED)),
             ]
         );
+        // Each names the crate its re-run spec names; a whole row names none.
+        assert!(got.iter().all(|f| f.package.as_deref() == Some("x")));
+        assert_eq!(row_finding("tippy lint", "error: x\n").package, None);
         // What the test printed before its panic is the message, and so is
         // the panic's line; a thread id is noise.
         for changed in [
@@ -2994,6 +3409,23 @@ mod tests {
             Err(CUT_SHORT)
         );
 
+        // The export content scan: its FAIL verdict comes after all three
+        // guards; a refused export never reached them.
+        assert_eq!(
+            export_content_ran_to_end(
+                "  crates/a/src/x.rs:12  forbidden content — Credentials \
+                 (baseline/forbidden-content.txt:19)\nEXPORT CONTENT: FAIL\n  1 hit(s)\n"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            export_content_ran_to_end(
+                "  engine: FAIL: transforms failed\nEXPORT CONTENT: REFUSED — the engine \
+                 refused the export (publish/transforms.sh); no content guard ran\n"
+            ),
+            Err(CUT_SHORT)
+        );
+
         // The formatter: its verb's verdict, no pass NOT RUN, no error.
         let fmt = |extra: &str| {
             format!(
@@ -3087,6 +3519,141 @@ mod tests {
             ),
             Err(LINT_BLOCKED),
             "colour is not a difference"
+        );
+    }
+
+    /// THE EXPORT SCAN'S HITS ARE KEYED BY PATH AND CLASS (2026-09-29, review
+    /// of the stage). Main carries three hits; a branch that edits above them
+    /// (every line moves), clears one, and has the engine's baseline shifted
+    /// under it (every pattern line moves) still carries only main's — each
+    /// inherited — while one more hit of a path and class main has is new,
+    /// and so is one in a file main has none in. A refusal, or a row with a
+    /// line that is not a hit, stays the one row finding.
+    #[test]
+    fn export_content_hits_are_findings_keyed_by_path_and_class() {
+        let scan = |hits: &[&str]| {
+            let mut s = String::from(
+                "export content scan: the publication engine's content guards over this \
+                 tree's export (publish/manifest.txt + publish/transforms.sh)\n",
+            );
+            for h in hits {
+                s.push_str(&format!("  {h}\n"));
+            }
+            s.push_str(
+                "EXPORT CONTENT: FAIL\n  3 hit(s) the engine's content guards refuse\n  Fix the \
+                 SOURCE — …; the engine: /Users//x/publication (rev 0123456789ab).\n",
+            );
+            s
+        };
+        let label = "export-content-scan.py: the publication engine's content guards refuse";
+        let main = export_content_findings(
+            label,
+            &scan(&[
+                "crates/a/src/footer.rs:1876  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:31)",
+                "crates/a/src/footer.rs:9  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:31)",
+                "crates/b/src/codex_tests.rs:1358  forbidden content — Personal / machine \
+                 paths (baseline/forbidden-content.txt:9)",
+            ]),
+        );
+        let ids: Vec<&str> = main.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "export-content-scan.py -- crates/a/src/footer.rs -- forbidden content — \
+                 Agent-session artifacts",
+                "export-content-scan.py -- crates/a/src/footer.rs -- forbidden content — \
+                 Agent-session artifacts #2",
+                "export-content-scan.py -- crates/b/src/codex_tests.rs -- forbidden content — \
+                 Personal / machine paths",
+            ]
+        );
+        assert!(
+            main.iter()
+                .all(|f| f.opaque.is_none() && f.timing.is_none())
+        );
+        let reds = base(
+            main.iter()
+                .map(|f| failure(&f.id, &f.hash, NOW - 3600))
+                .collect(),
+        );
+        let judged = |hits: &[&str]| -> Vec<bool> {
+            export_content_findings(label, &scan(hits))
+                .iter()
+                .map(|f| judge(f, &reds).excused())
+                .collect()
+        };
+        // Lines moved, the baseline's too, the private-reference hit cleared.
+        assert_eq!(
+            judged(&[
+                "crates/a/src/footer.rs:2015  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:33)",
+                "crates/a/src/footer.rs:40  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:33)",
+            ]),
+            [true, true]
+        );
+        // One more of main's class in main's file, and one in a new file.
+        assert_eq!(
+            judged(&[
+                "crates/a/src/footer.rs:12  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:31)",
+                "crates/a/src/footer.rs:1876  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:31)",
+                "crates/a/src/footer.rs:9  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:31)",
+                "crates/c/src/new.rs:3  forbidden content — Agent-session artifacts \
+                 (baseline/forbidden-content.txt:31)",
+            ]),
+            [true, true, false, false]
+        );
+        // A notes-carrying location, a withheld name, gitleaks' rule text.
+        let keyed = export_content_findings(
+            label,
+            &scan(&[
+                "src/t.txt:2 [export only: publish/transforms.sh rewrote this line]  forbidden \
+                 content — Agent artifacts (baseline/forbidden-content.txt:10)",
+                "vendor/astream/x.rs:4 [the astream submodule, rev 0123abcd]  forbidden \
+                 content — A (baseline/forbidden-content.txt:1); B (publish/forbidden-extra.txt:5)",
+                "src/[REDACTED]  forbidden file name — Agent artifacts \
+                 (baseline/forbidden-content.txt:10)",
+                "src/token.rs:1  gitleaks github-pat — GitHub Personal Access Token (PAT)",
+            ]),
+        );
+        assert_eq!(
+            keyed.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            [
+                "export-content-scan.py -- src/t.txt -- forbidden content — Agent artifacts",
+                "export-content-scan.py -- vendor/astream/x.rs -- forbidden content — A; B",
+                "export-content-scan.py -- src/[REDACTED] -- forbidden file name — Agent \
+                 artifacts",
+                "export-content-scan.py -- src/token.rs -- gitleaks github-pat — GitHub \
+                 Personal Access Token (PAT)",
+            ]
+        );
+
+        // Never itemized: a refused export, and a line that is not a hit.
+        let refused = export_content_findings(
+            label,
+            "export content scan: …\n  engine: FAIL: transforms failed\nEXPORT CONTENT: \
+             REFUSED — the engine refused the export (publish/transforms.sh); no content \
+             guard ran\n",
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].id, label);
+        assert_eq!(refused[0].opaque, Some(CUT_SHORT));
+        let mut stray = scan(&["src/a.rs:1  forbidden content — A (baseline/x.txt:1)"]);
+        stray.insert_str(
+            stray.find("  src/a.rs").expect("the hit"),
+            "Traceback (most recent call last):\n",
+        );
+        let whole = export_content_findings(label, &stray);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].id, label);
+        assert_eq!(
+            whole[0].opaque, None,
+            "a whole row that ran to its verdict is main's only when it printed the same"
         );
     }
 
@@ -3499,6 +4066,7 @@ mod tests {
                 ..Receipt::default()
             },
             clock_floor: None,
+            nearest: None,
         };
         let parsed = Receipt::parse(&found.receipt.render()).expect("it parses");
         assert_eq!(parsed.hidden, std::slice::from_ref(&x));
@@ -3567,5 +4135,69 @@ mod tests {
                  under it)"
             )
         );
+    }
+
+    /// THE BOUND HOLDS THROUGH A REMOTE HELPER (2026-09-28, review): git
+    /// reaches a remote through a child of its own that inherits its pipes —
+    /// `git-remote-https` for an https origin; here the `ext::` transport's
+    /// `sh`, the same shape without a network. It sleeps far past the bound.
+    /// The call must answer at the bound (plus the drain grace), not when the
+    /// helper exits, and the helper must be dead: before the fix a 40 s helper
+    /// held a 10 s bound for 40.06 s.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_git_call_ends_at_its_bound_and_takes_its_helper_with_it() {
+        let root = crate::mktemp_dir("atv-bounded-helper").expect("mktemp");
+        let marker = format!("47.{}", std::process::id());
+        let url = format!("ext::sh -c sleep% {marker}");
+        let bound = Duration::from_secs(2);
+        let started = Instant::now();
+        let got = git_bounded(
+            &root,
+            &["-c", "protocol.ext.allow=always", "ls-remote", &url],
+            bound,
+        );
+        let took = started.elapsed();
+        assert!(
+            took < bound + DRAIN_GRACE + Duration::from_secs(3),
+            "the bound did not hold: {took:?} ({got:?})"
+        );
+        let e = got.expect_err("a call that overran is an error");
+        assert!(e.contains("git ls-remote did not finish within 2 s"), "{e}");
+        // The helper died with git's group. (A killed process can take a
+        // moment to leave the table.)
+        let alive = || {
+            Command::new("pgrep")
+                .args(["-f", &format!("sleep {marker}")])
+                .stdout(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let gone_by = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "the helper outlived the bound");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fast path is untouched: a call that finishes answers its stdout, and
+    /// one that fails answers git's last line of stderr.
+    #[test]
+    fn a_bounded_git_call_that_finishes_answers_its_output_or_its_reason() {
+        let root = crate::mktemp_dir("atv-bounded-fast").expect("mktemp");
+        assert_eq!(
+            git_bounded(&root, &["--version"], Duration::from_secs(10))
+                .map(|s| s.starts_with("git version")),
+            Ok(true)
+        );
+        let e = git_bounded(
+            &root,
+            &["ls-remote", &root.join("no-such-repo").to_string_lossy()],
+            Duration::from_secs(10),
+        )
+        .expect_err("no such repository");
+        assert!(!e.contains("did not finish"), "{e}");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

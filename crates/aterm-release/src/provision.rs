@@ -337,7 +337,6 @@ pub fn run_provision(
     if let Some(bin) = &stage2_bin {
         record("verifiers", verifiers_check(bin), &mut checks);
         record("front door", front_door_check(bin), &mut checks);
-        record("rustup", rustup_note(bin), &mut checks);
     }
     // NOT gated on a proven stage2, unlike the two above: this one reads the farm link
     // and PATH, which exist (and can be wrong) whether or not a stage2 resolves — so it
@@ -633,19 +632,8 @@ pub(crate) fn report_next_before_cut(r: &atpkg_keys::provision::Report) -> Vec<S
         out.push(format!("review: git diff -- {}", r.paths.pins));
     }
     if r.verb == Verb::Setup {
-        // WRONG BEFORE: both tests named here were deleted by the 2026-08-15 arming
-        // commit, so this step sent an operator hunting for work that does not exist. A
-        // fork arming from an empty anchor may carry its own tripwires, so the step
-        // stays — the two names are now given as a record.
-        out.push(
-            "delete any tripwire test that asserts an empty anchor — a fork's own; this \
-             tree's two went with the 2026-08-15 arming commit. For the record:\n  \
-             crates/aterm-update-core/src/pins.rs::tests::\
-             the_paper_master_is_unset_so_the_roster_tier_is_inert\n  \
-             crates/atpkg-keys/tests/paper_master_to_client.rs::\
-             the_shipped_master_anchor_is_still_empty"
-                .to_string(),
-        );
+        // The same step `atpkg-keys setup` prints (`provision::render_report`).
+        out.push("delete any test that asserts the anchor is empty".to_string());
     }
     if r.pins_changed {
         out.push("commit — durable from here".to_string());
@@ -1258,7 +1246,7 @@ fn write_pair(
 /// lock for the duration of this one write.
 ///
 /// The locked [`write_pair`] is the form a phase uses when it reads, decides and writes
-/// under ONE lock. This is for the writer that has no such span — `cargo ship recover`
+/// under ONE lock. This is for the writer that has no such span — `targo --unverified ship recover`
 /// rewriting `dist/` from an already-published release — so that it, too, publishes
 /// through the redo transaction instead of two bare `write`s that a death can tear.
 /// Never call it while another roster lock is held in this process: `flock` is per open
@@ -1683,8 +1671,9 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
 /// `cargo`/`rustc` on PATH, and until 2026-09-18 this row ran `rustup … which cargo`
 /// and reported exactly that correctly provisioned machine as a GAP (measured:
 /// `command -v cargo rustc rustup` → nothing; `aterm pkg which targo` → the store's
-/// build 9192). The rustup link is reported beside it, informationally
-/// ([`rustup_note`]).
+/// build 9192). The informational rustup row that sat beside it (suggesting a
+/// `rustup toolchain link trust` so a stock `cargo` typed here would reach Trust)
+/// was removed 2026-09-28: the host lane is `targo`, never a rustup `cargo`.
 #[cfg(unix)]
 fn front_door_check(bin: &Path) -> Check {
     front_door_verdict(bin, |tool| {
@@ -1745,62 +1734,10 @@ fn front_door_verdict(
     ))
 }
 
-/// INFORMATIONAL — never a GAP. rustup is not this repo's toolchain and no host lane
-/// dispatches through it; the ONE thing it is for is the x86_64 compat slice's
-/// upstream-stable std, which `x86_slice_check` audits on its own. A `trust` link is
-/// still worth a line: an operator who types stock `cargo` in this checkout gets
-/// whatever that link points at (rust-toolchain.toml pins `channel = "trust"`).
-#[cfg(unix)]
-fn rustup_note(bin: &Path) -> Check {
-    let out = Command::new("rustup")
-        .env("RUSTUP_TOOLCHAIN", "trust")
-        .args(["which", "cargo"])
-        .output();
-    rustup_note_from(
-        bin,
-        out.ok().map(|o| {
-            (
-                o.status.success(),
-                String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            )
-        }),
-    )
-}
-
-/// `probe`: `None` when rustup is not runnable; `Some((linked, path))` otherwise.
-/// Always a `Pass` — the line informs, it never counts.
-#[cfg(unix)]
-fn rustup_note_from(bin: &Path, probe: Option<(bool, String)>) -> Check {
-    let root = bin.parent().unwrap_or(bin).display();
-    Check::Pass(match probe {
-        None => "not installed — informational; no host lane needs it (the x86 slice row \
-                 says what upstream stable is for)"
-            .to_string(),
-        Some((true, path)) => {
-            let carries_trustc = Path::new(&path)
-                .parent()
-                .map(|linked| linked.join("trustc").is_file() || linked.join("rustc").is_file())
-                .unwrap_or(false);
-            if carries_trustc {
-                format!(
-                    "'trust' linked ({path}) — informational; no host lane dispatches through it"
-                )
-            } else {
-                format!(
-                    "'trust' linked ({path}) but that dir carries no trustc — informational; \
-                     stock `cargo` typed here would not be Trust. optional: rustup toolchain \
-                     link trust {root}"
-                )
-            }
-        }
-        Some((false, _)) => format!(
-            "installed, no 'trust' link — informational; optional: rustup toolchain link \
-             trust {root}"
-        ),
-    })
-}
-
 /// The x86_64 compat slice of the universal binary rides upstream stable.
+/// STOCK EXCEPTION (Trust lacks an x86_64-apple-darwin std; measured 2026-09-28
+/// `targo --unverified check --target x86_64-apple-darwin -p aterm`: error[E0463]
+/// can't find crate for `std`) — this row audits that stock lane, nothing else.
 #[cfg(unix)]
 fn x86_slice_check() -> Check {
     if !cfg!(target_os = "macos") {
@@ -2065,7 +2002,7 @@ fn notary_check() -> Check {
 /// demands the file be owner-owned with no group/other access (`check_credentials_perms`,
 /// because it holds a private key), and refuses a profile naming two notary credentials.
 /// So a hand-written or restored profile could pass this audit — READY TO CUT, every item
-/// green — and be refused by `cargo ship cut` on its first line. An audit that admits what
+/// green — and be refused by `targo --unverified ship cut` on its first line. An audit that admits what
 /// the cut rejects is the exact false green this verb exists to abolish, so there is now
 /// one validator, not two.
 #[cfg(unix)]
@@ -2522,7 +2459,7 @@ mod tests {
 
     /// The audit must refuse exactly what the cut refuses. Each profile below is a way
     /// the old two-key scan reported "carries the Tier APPLE keys" — and READY TO CUT —
-    /// about a file `cargo ship cut` rejects on its first line.
+    /// about a file `targo --unverified ship cut` rejects on its first line.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_profile_audit_refuses_what_the_cut_refuses() {
@@ -2807,24 +2744,6 @@ mod tests {
             other => panic!("a missing driver is a GAP: {other:?}"),
         }
 
-        // The rustup row is informational in EVERY state — never a Fail, never a Skip
-        // (a Skip marks the host unable to cut).
-        for probe in [
-            None,
-            Some((false, String::new())),
-            Some((
-                true,
-                dir.join("elsewhere/bin/cargo")
-                    .to_string_lossy()
-                    .into_owned(),
-            )),
-            Some((true, bin.join("cargo").to_string_lossy().into_owned())),
-        ] {
-            match rustup_note_from(&bin, probe.clone()) {
-                Check::Pass(line) => assert!(line.contains("informational"), "{line}"),
-                other => panic!("rustup never counts: {probe:?} → {other:?}"),
-            }
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2930,7 +2849,7 @@ mod tests {
 
     /// A PROCESS DEATH IN PHASE 1 CONVERGES FORWARD.
     ///
-    /// `cargo ship provision` writes the roster pair TWICE: phase 1 seeds `dist/` from
+    /// `targo --unverified ship provision` writes the roster pair TWICE: phase 1 seeds `dist/` from
     /// the kept copy or the channel, and the in-process mint re-signs the same two files
     /// at the end of the same run. Protecting only the mint therefore left the window
     /// open in the write that happens FIRST — a death between phase 1's two renames left

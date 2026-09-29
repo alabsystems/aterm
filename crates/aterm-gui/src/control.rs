@@ -67,6 +67,10 @@ pub(crate) use control_query::{
     ScreenGen, gather_styled_frame, screen_gen, screen_stamp, screen_text, serialize_styled_frame,
     trimmed_len, visible_row,
 };
+// The driver-geometry conformance reads a generation the way a fenced driver
+// does, through the verb's own function.
+#[cfg(test)]
+pub(crate) use control_query::{cmd_text_json_looked, text_args};
 // The shared full-history search (the GUI ⌘F find + the `search` verb both call it) and
 // its config-driven index depth cap, reached through the stable `crate::control::NAME`
 // path from `app_search`/`app_config`/`main`.
@@ -207,7 +211,7 @@ pub(crate) use control_session::cmd_history;
 /// The `turn` composite and its io, for the presence tests that drive a REAL
 /// turn through the lease seam (`app_presence`'s driver-attribution tests).
 #[cfg(test)]
-pub(crate) use control_session::{TurnIo, cmd_turn};
+pub(crate) use control_session::{TurnIo, cmd_lease, cmd_turn, end_turn_input};
 
 /// The containment subsystem name used in audit denials from this socket.
 const AUDIT_SUBSYSTEM: &str = "control_socket";
@@ -844,6 +848,16 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
         // expresses, so Owner-only, fenced here with the other argument seams
         // rather than inside the handler.
         "family" if !rest.trim().is_empty() => Some(Escalation::OwnerOnly),
+        // `pointer` is verb-level `Write` (moving the pointer resolves a
+        // hover, and under DEC mouse modes reports motion — the human
+        // vocabulary `WriteInput` covers), but `pointer click` PRESSES what
+        // is under it: every message-band capsule (Upgrade now, Not today,
+        // Stop paste, the file-access question…). Ruling 174 made every
+        // capsule pressable only because `notice act` is Owner-only, so the
+        // click is fenced to the same class (ruling 373), and its capsule
+        // presses spend `notice act`'s budget (`App::pointer_cmd`). Classified
+        // by the first token, like `open <target> close` above.
+        "pointer" if rest.split_whitespace().next() == Some("click") => Some(Escalation::OwnerOnly),
         _ => None,
     }
 }
@@ -1408,6 +1422,9 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let apply_phase = apply_snapshot
         .as_ref()
         .and_then(|live| live.apply_phase(&st));
+    let apply_held = apply_snapshot
+        .as_ref()
+        .and_then(|live| live.apply_held(&st));
     // Self-healing ledger fields: failing=<consecutive>:<kind> (0 when healthy) and
     // failing_applies=<n> — so a driver can see a broken pipeline from one line,
     // without parsing health.toml.
@@ -1471,7 +1488,8 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     // this process's live heartbeat: `checker_stalled=<secs>:<phase>` the moment
     // the loop has gone quiet past its phase's budget, `checker_respawns=` once
     // the watchdog has replaced it, `checker_deferred=` while another aterm has
-    // held the checker lock through consecutive cycles. Each is absent in the
+    // held the checker lock through consecutive cycles without showing it is
+    // still working (a holder mid-download is not counted). Each is absent in the
     // healthy state, so a healthy line stays byte-identical.
     let checker = crate::update_checker_watch::checker_status_tokens(
         aterm_update::checker_watch::checker_snapshot(),
@@ -1516,6 +1534,12 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     // the apply; the token's absence on every other posture is deliberate.
     if let Some(phase) = apply_phase {
         out = format!("{} apply_phase={phase}\n", out.trim_end_matches('\n'));
+    }
+    // WHAT HOLDS the automatic lane past its ladder, beside the phase: the one
+    // hold that refuses `land` too (the restored agents' relaunch), which a
+    // driver reading `apply_phase=land` would otherwise take for "any second".
+    if let Some(held) = apply_held {
+        out = format!("{} apply_held={held}\n", out.trim_end_matches('\n'));
     }
     if let Some(reason) = apply_policy_reason {
         out = format!(
@@ -2484,6 +2508,90 @@ impl<T: std::fmt::Display> std::fmt::Display for Retained<T> {
 pub(crate) struct ControlReply {
     body: String,
     retention: Option<ReplyHandoff>,
+    /// Released once this reply's bytes are written and flushed (or the write
+    /// failed, or the reply was dropped unwritten): what a seamless update's
+    /// Commit waits on before its `_exit` for a `video` reply it caused
+    /// ([`ReplyWire`]).
+    written: Option<ReplyWritten>,
+}
+
+/// A latch the control connection releases once one reply is on the wire —
+/// written and flushed, or past the point where it ever could be (the write
+/// failed, the connection closed, the reply was dropped). The main thread
+/// holds the [`ReplyWire`] half; the request's connection thread carries the
+/// [`ReplyWritten`] half inside its [`ControlReply`], and dropping it is the
+/// release.
+///
+/// Why it exists (round six of the update audit, finding 31): a `video` take
+/// or export answered just before a seamless update's Commit hands its reply
+/// to a channel, and the connection thread writes it later. Commit's `_exit`
+/// could come between the two, and the client read EOF with no reply. Commit
+/// now waits, bounded, for every such wire it knows of.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReplyWire(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+/// The connection thread's half of a [`ReplyWire`]; dropping it releases the
+/// latch.
+#[derive(Debug)]
+pub(crate) struct ReplyWritten(ReplyWire);
+
+impl ReplyWire {
+    /// A fresh, unreleased latch and the half that releases it.
+    #[must_use]
+    pub(crate) fn new() -> (Self, ReplyWritten) {
+        let wire = Self::default();
+        (wire.clone(), ReplyWritten(wire))
+    }
+
+    /// Whether the reply is written (or never will be).
+    #[must_use]
+    pub(crate) fn is_released(&self) -> bool {
+        *self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wait until the latch is released or `deadline` passes; whether it was
+    /// released.
+    #[must_use]
+    pub(crate) fn wait_released(&self, deadline: std::time::Instant) -> bool {
+        let (released, changed) = &*self.0;
+        let mut released = released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*released {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            released = changed
+                .wait_timeout(released, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+}
+
+impl Drop for ReplyWritten {
+    fn drop(&mut self) {
+        let (released, changed) = &*(self.0).0;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+    }
+}
+
+/// What a verb handler hands the connection beside its body: the artifact
+/// retention that must span the socket write, and the [`ReplyWritten`] latch
+/// the write releases.
+#[derive(Default)]
+pub(crate) struct ReplyTail {
+    retention: Option<ReplyHandoff>,
+    written: Option<ReplyWritten>,
 }
 
 impl ControlReply {
@@ -2492,16 +2600,41 @@ impl ControlReply {
         Self {
             body,
             retention: retention.map(ReplyHandoff::Acknowledged),
+            written: None,
         }
     }
 
     pub(crate) fn with_handoff(body: String, retention: Option<ReplyHandoff>) -> Self {
-        Self { body, retention }
+        Self {
+            body,
+            retention,
+            written: None,
+        }
     }
 
-    fn into_body_retaining(self, slot: &mut Option<ReplyHandoff>) -> String {
-        let Self { body, retention } = self;
-        *slot = retention;
+    /// This reply, releasing `written` once the connection has written it.
+    #[must_use]
+    pub(crate) fn releasing_on_write(mut self, written: ReplyWritten) -> Self {
+        self.written = Some(written);
+        self
+    }
+
+    fn with_tail(body: String, tail: ReplyTail) -> Self {
+        Self {
+            body,
+            retention: tail.retention,
+            written: tail.written,
+        }
+    }
+
+    fn into_body_retaining(self, slot: &mut ReplyTail) -> String {
+        let Self {
+            body,
+            retention,
+            written,
+        } = self;
+        slot.retention = retention;
+        slot.written = written;
         body
     }
 
@@ -2518,6 +2651,7 @@ impl From<String> for ControlReply {
         Self {
             body,
             retention: None,
+            written: None,
         }
     }
 }
@@ -2913,7 +3047,9 @@ const CONTROL_CONNECTIONS_MAX: usize = 1024;
 ///
 /// Every open connection holds a descriptor, and the window's descriptor budget
 /// is small: an app started by launchd (the Dock, Finder, `open`) runs with a
-/// SOFT `RLIMIT_NOFILE` of 256, and aterm does not raise it. A fixed cap of 1024
+/// SOFT `RLIMIT_NOFILE` of 256, and aterm does not raise it (except in a
+/// successor launched for an update, which raises it for its descriptor grant
+/// before it dials: `handoff_rendezvous::claim_incoming`). A fixed cap of 1024
 /// ignored that (measured 2026-09-26 under `ulimit -n 256`): about 240 idle
 /// connections used up the process, every fresh client then got a dropped
 /// connection instead of the busy line, and a new tab or a file open had no
@@ -2954,6 +3090,11 @@ fn soft_descriptor_limit() -> Option<u64> {
 fn soft_descriptor_limit() -> Option<u64> {
     None
 }
+
+/// The one busy reply, from the listener when every request lane is taken by
+/// work or the open-connection cap is reached. Clients match its `ERR control
+/// server busy` prefix (`aterm-agent`'s `TURNED_AWAY`, `aterm ctl`'s report).
+const CONTROL_BUSY_REPLY: &[u8] = b"ERR control server busy; retry\n";
 
 struct SubscriptionJob {
     line: String,
@@ -3890,6 +4031,19 @@ pub(crate) fn spawn(
         // for us at Commit (`identity_claim` module header, the third gate). A
         // no-op for a launch that adopted nothing across a handoff.
         crate::identity_claim::settle_transferred();
+        // Every `aterm ctl` opens with the `version` connect probe, whose reply
+        // carries the running binary's content signature: a one-time read and
+        // hash of the whole executable (tens of MB). Pay it here, once, off
+        // every lane, so the first client's probe finds it cached instead of
+        // spending its connect deadline on it. (A probe that races this waits
+        // on the same `OnceLock`; nothing is hashed twice.)
+        let _ = std::thread::Builder::new()
+            .name("aterm-build-signature".into())
+            .spawn(|| {
+                // A lane may be waiting on this result: never below the lanes.
+                crate::qos::set_self(crate::qos::Role::Responsive);
+                let _ = crate::build_info::binary_signature();
+            });
         // Secure-default-OFF network drive: only when the operator configures it
         // (the `[net]` table) does this open a TLS port that relays a channel-bound
         // remote driver into THIS control socket. `maybe_spawn` itself enforces
@@ -3906,46 +4060,23 @@ pub(crate) fn spawn(
         // (§3.1's lane accounting).
         #[cfg(unix)]
         crate::fabric_launch::spawn_supervisor(&network_config);
-        let mut accept_backoff: Option<std::time::Duration> = None;
-        for stream in listener.incoming() {
-            let stream = match stream {
-                Ok(s) => {
-                    accept_backoff = None;
-                    s
-                }
-                Err(e) => {
-                    // Descriptor or buffer exhaustion returns at once on every
-                    // retry; a hot `continue` spun a core at 100% until the fds
-                    // came back. Back off instead (and say so once per streak).
-                    if let Some(wait) = accept_error_backoff(&e, accept_backoff) {
-                        if accept_backoff.is_none() {
-                            crate::logging::stderr_line!(
-                                "aterm-gui: control socket accept failing ({e}); backing off"
-                            );
-                        }
-                        accept_backoff = Some(wait);
-                        std::thread::sleep(wait);
-                    }
-                    continue;
-                }
-            };
+        // Admission for one accepted peer: never parks the accept thread. It
+        // owns the lanes (`'static`): a rebind hands it to a new accept thread.
+        let admit = move |stream: CtlStream| {
             // Peer credential gate: refuse any connection NOT from our own uid
             // before spending a thread on it (Unix: `None`/cannot-verify also
             // refuses — fail closed; Windows: the peer pid's token user, enforced
             // where the ioctl and the token can be read, the token remaining the
             // mandatory gate — the startup notice above discloses which).
-            match control_auth::peer_check(&stream) {
-                Ok(()) => {}
-                Err(why) => {
-                    log_denial(
-                        AUDIT_SUBSYSTEM,
-                        &why,
-                        aterm_containment::mode_or_containment(),
-                        "peer uid mismatch",
-                    );
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    continue;
-                }
+            if let Err(why) = control_auth::peer_check(&stream) {
+                log_denial(
+                    AUDIT_SUBSYSTEM,
+                    &why,
+                    aterm_containment::mode_or_containment(),
+                    "peer uid mismatch",
+                );
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
             }
             // Admission counts queued PLUS running REQUESTS, not merely inbox
             // depth, and not connections that are merely open: an idle one is
@@ -3953,19 +4084,72 @@ pub(crate) fn spawn(
             // Thus every accepted connection owns a runnable request lane however
             // many persistent drivers are connected. Only a socket saturated with
             // work (or holding `control_connections_cap()` connections) gives a
-            // same-uid peer the short explicit retry response; the listener
-            // remains in `accept` and no unbounded queue or pthread churn is
-            // created.
+            // same-uid peer the short explicit retry response; the listener never
+            // parks and no unbounded queue or pthread churn is created.
             if let Err(mut stream) = lanes.admit(stream) {
+                crate::control_listener::note_busy_reply();
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
-                let _ = stream.write_all(b"ERR control server busy; retry\n");
+                let _ = stream.write_all(CONTROL_BUSY_REPLY);
                 let _ = stream.flush();
                 // Do not `shutdown(Both)` here: this lane rejected the socket
                 // before reading its AUTH/request bytes, and macOS may discard
                 // the queued reply when a socket with unread input is reset.
                 // Dropping after the bounded write preserves the explicit busy
-                // frame; `aterm-ctl` sends AUTH + request atomically so it can
-                // always consume this early status.
+                // frame; `aterm-ctl` reads it before it sends its request.
+            }
+        };
+        // THE SUPERVISED ACCEPT LOOP (`control_listener`): an accept thread
+        // that never parks inside `accept`, watched from THIS thread by a
+        // watchdog that never touches the socket; a listening socket whose
+        // accept thread is stuck, or whose queue stands still, is replaced at
+        // the same path with the same token.
+        #[cfg(unix)]
+        {
+            let rebind_plan = plan.clone();
+            let rebind_path = sock_path.clone();
+            let mut published = crate::control_listener::socket_file_id(&sock_path);
+            let rebind = move || {
+                let previous = published;
+                let fresh = crate::control_listener::rebind_socket(&rebind_path, &mut published)?;
+                control_auth::lock_socket_file(&rebind_path);
+                if let Some(previous) = previous {
+                    // A fixed endpoint's handoff witness names the socket vnode;
+                    // move it with the socket or a later update fails closed.
+                    let _ = crate::control_socket_identity::republish_rebound(
+                        &rebind_plan,
+                        previous,
+                    );
+                }
+                Some(fresh)
+            };
+            crate::control_listener::Supervisor::new(listener, rebind).run(admit, || false);
+        }
+        #[cfg(windows)]
+        {
+            let mut accept_backoff: Option<std::time::Duration> = None;
+            for stream in listener.incoming() {
+                let stream = match stream {
+                    Ok(s) => {
+                        accept_backoff = None;
+                        s
+                    }
+                    Err(e) => {
+                        // Descriptor or buffer exhaustion returns at once on every
+                        // retry; a hot `continue` spun a core at 100% until the fds
+                        // came back. Back off instead (and say so once per streak).
+                        if let Some(wait) = accept_error_backoff(&e, accept_backoff) {
+                            if accept_backoff.is_none() {
+                                crate::logging::stderr_line!(
+                                    "aterm-gui: control socket accept failing ({e}); backing off"
+                                );
+                            }
+                            accept_backoff = Some(wait);
+                            std::thread::sleep(wait);
+                        }
+                        continue;
+                    }
+                };
+                admit(stream);
             }
         }
     });
@@ -3978,7 +4162,8 @@ pub(crate) fn spawn(
 /// Windows' `WSAEMFILE`/`WSAENOBUFS`), which would come straight back on the next
 /// `accept` — 10 ms, doubling to one second — and `None` for a per-connection
 /// error (a peer that reset before it was accepted), which is retried at once.
-fn accept_error_backoff(
+/// The supervised accept thread (`control_listener`) paces itself by it too.
+pub(crate) fn accept_error_backoff(
     err: &std::io::Error,
     prev: Option<std::time::Duration>,
 ) -> Option<std::time::Duration> {
@@ -4193,9 +4378,16 @@ fn try_proxy_forward<R: Read>(
     let pre = crate::proxy::drain_buffered(reader);
     // A dial/handshake failure happens BEFORE any relay byte (the client stream is
     // untouched), so honor the contract and answer ERR rather than a silent EOF.
-    if crate::proxy::connect_and_relay(&sock_path, &first_line, client, &pre).is_err() {
-        let _ = (&*client)
-            .write_all(b"ERR forward: could not reach the aterm that hosts that session\n");
+    if let Err(error) = crate::proxy::connect_and_relay(&sock_path, &first_line, client, &pre) {
+        // A child that accepted nothing within the connect bound is named as
+        // such (the caller is not left to guess at a slow verb); every other
+        // failure says the host could not be reached.
+        let reply = if error.kind() == std::io::ErrorKind::TimedOut {
+            format!("ERR forward: {error}\n")
+        } else {
+            "ERR forward: could not reach the aterm that hosts that session\n".to_string()
+        };
+        let _ = (&*client).write_all(reply.as_bytes());
         let _ = (&*client).flush();
     }
     true
@@ -5675,7 +5867,7 @@ fn dispatch_request(
         }
         .into();
     };
-    let mut retention = None;
+    let mut tail = ReplyTail::default();
     let body = handle(
         line,
         &term,
@@ -5689,9 +5881,9 @@ fn dispatch_request(
         sock_dir,
         subscribers,
         front_active_session,
-        &mut retention,
+        &mut tail,
     );
-    ControlReply::with_handoff(body, retention)
+    ControlReply::with_tail(body, tail)
 }
 
 /// How serving a request can END a connection's time on its lane. A connection
@@ -5959,6 +6151,10 @@ fn write_control_reply_with_timeout_arm(
     // write-only permit. Free it before releasing or quarantining any handoff,
     // so a newly admitted request can never overlap unaccounted reply memory.
     drop(std::mem::take(&mut reply.body));
+    // The reply is on the wire (or never will be): release whoever waits for
+    // that — a seamless update's Commit, for a `video` reply ([`ReplyWire`]).
+    // Before the ACK wait below, which can take far longer than the write.
+    drop(reply.written.take());
     if let Err(error) = write {
         match reply.retention.take() {
             Some(ReplyHandoff::Acknowledged(mut retention)) => {
@@ -6141,7 +6337,85 @@ thread_local! {
     /// Whether the connection being served made a connection-scoped claim, so
     /// only such a connection pays for the release sweep when it ends.
     static CONNECTION_CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The descriptor of the connection this lane is serving, for the blocking
+    /// verbs' hangup check ([`caller_hung_up`]). Set while a lane carries the
+    /// connection (`control_lanes.rs`'s `serve_here`, which borrows the stream
+    /// for that whole span) and for the length of the bridge's
+    /// [`serve_preresolved`].
+    #[cfg(unix)]
+    static SERVING_FD: std::cell::Cell<Option<std::os::fd::RawFd>> =
+        const { std::cell::Cell::new(None) };
 }
+
+/// How often a parked blocking verb re-checks whether its caller is still
+/// there. Below the ~250 ms a killed client's lane may stay held.
+pub(crate) const HANGUP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// THE CALLER'S HANGUP, as a blocking verb sees it: `true` when the client of
+/// the connection this lane is serving has closed it (killed, exited, timed
+/// out), so no answer can ever be read. A half-closed client — one that sent
+/// its request and shut its write side — is still waiting and is NOT hung up
+/// (`aterm_uds::hangup`). `false` off a serving lane (an in-process caller).
+///
+/// `await`, `ready`, `wait`, `turn`, `await inbox` and `post --wait` check it
+/// on every wake and park at most [`hangup_park`] between checks, so a
+/// SIGKILLed `aterm ctl await … timeout=600000` gives its lane back within
+/// [`HANGUP_POLL`] instead of holding it — a wait lane, or a request lane when
+/// every wait lane is taken — for ten minutes.
+pub(crate) fn caller_hung_up() -> bool {
+    #[cfg(unix)]
+    {
+        SERVING_FD
+            .with(std::cell::Cell::get)
+            .is_some_and(aterm_uds::hangup::fd_peer_closed)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Cap one park of a blocking verb at [`HANGUP_POLL`] while this thread serves
+/// a connection, so [`caller_hung_up`] is asked again soon enough; a caller
+/// with no connection (in-process, tests) parks exactly as asked.
+pub(crate) fn hangup_park(park: std::time::Duration) -> std::time::Duration {
+    #[cfg(unix)]
+    {
+        if SERVING_FD.with(std::cell::Cell::get).is_some() {
+            return park.min(HANGUP_POLL);
+        }
+    }
+    park
+}
+
+/// Marks this thread as serving one connection, for [`caller_hung_up`], until
+/// dropped. The stream must outlive the guard (it is the connection being
+/// served, borrowed for the whole serve).
+struct ServingFd;
+
+impl ServingFd {
+    fn enter(stream: &CtlStream) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            SERVING_FD.with(|fd| fd.set(Some(stream.as_raw_fd())));
+        }
+        #[cfg(not(unix))]
+        let _ = stream;
+        Self
+    }
+}
+
+impl Drop for ServingFd {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        SERVING_FD.with(|fd| fd.set(None));
+    }
+}
+
+/// The reply a blocking verb returns when its caller hung up. Never read by
+/// anyone — the connection is gone — but spelled for the file log and tests.
+pub(crate) const HUNG_UP_REPLY: &str = "ERR hangup\n";
 
 /// Per-process connection serial: every served connection gets a fresh one, so
 /// a claim can never be released by a later connection that reused its lane.
@@ -6168,6 +6442,7 @@ fn note_connection_claim() {
 #[cfg(unix)]
 struct ConnectionScope<'a> {
     id: u64,
+    _serving: ServingFd,
     store: &'a Store,
     subscribers: &'a Subscribers,
     proxy: &'a EventLoopProxy<Wake>,
@@ -6179,12 +6454,14 @@ impl<'a> ConnectionScope<'a> {
         store: &'a Store,
         subscribers: &'a Subscribers,
         proxy: &'a EventLoopProxy<Wake>,
+        stream: &CtlStream,
     ) -> Self {
         let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
         SERVING_CONNECTION.with(|serving| serving.set(Some(id)));
         CONNECTION_CLAIMED.with(|claimed| claimed.set(false));
         Self {
             id,
+            _serving: ServingFd::enter(stream),
             store,
             subscribers,
             proxy,
@@ -6253,7 +6530,7 @@ fn serve_preresolved(
     operator: Option<&crate::operator_host::ControlHandle>,
 ) -> ServeDisposition {
     // Claims bound to this connection end with it, however it ends.
-    let _connection = ConnectionScope::enter(store, subscribers, proxy);
+    let _connection = ConnectionScope::enter(store, subscribers, proxy, stream);
     if arm_authenticated_read_poll(stream).is_err() {
         return ServeDisposition::Close;
     }
@@ -6371,6 +6648,10 @@ fn is_wait_request(line: &str, store: &Store) -> bool {
         }
         // `dial <name>` relays the connection over TLS; bare `dial` answers.
         "dial" => !rest.trim().is_empty(),
+        // `cast drift` settles 60 ms for a consistent cut, then folds the whole
+        // recording through fresh engines (up to 2 + 16 of them): seconds of lane
+        // time on a long recording, which must not hold a request lane.
+        "cast" => rest.split_whitespace().next() == Some("drift"),
         _ => false,
     }
 }
@@ -8851,6 +9132,15 @@ fn resolve_target(self_tuple: &Target, store: &Store, sel: &Selector) -> Option<
 /// serving, so an address that resolves at all keeps resolving to exactly one
 /// place, and the answer names the pid to address instead.
 ///
+/// ONE ENTRY IS NO SECOND HOLDER: one naming this process's own seamless-update
+/// candidate (`identity_claim::register_handoff_candidate`). A successor on a
+/// per-process socket publishes the carried ids BEFORE the Commit, and until the
+/// Commit this process still owns them — refused, its own supervisor's `@<sid>`
+/// failed inside every update's ~200 ms window (2026-09-28, 0.95 → 0.97:
+/// `ERR ambiguous session id s-d3346… also served by pid 9356`, a supervisor
+/// restart). `identity_claim`'s module header, "The other order"; the derived
+/// model is `HandoffAddressOwner`.
+///
 /// WHAT IT COSTS, and where it does not: `@.` never arrives (the dispatch matches
 /// it with the flagless path) and `@<local>` leaves on the first line, both being
 /// process-local by construction; an id this process MINTED is answered from a
@@ -8860,6 +9150,14 @@ fn resolve_target(self_tuple: &Target, store: &Store, sel: &Selector) -> Option<
 /// instance at most — spends the read of `graph/<sid>` plus a `kill(pid, 0)`:
 /// measured 11.7–12.7 µs in the debug lane on this machine, against a 4.8–5.7 µs
 /// floor for one request+reply over the socket the request already crossed.
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "HandoffAddressOwner",
+        action = "Request",
+        project = "aterm_gui::identity_claim::project_handoff_address_owner"
+    )
+)]
 fn ambiguous_sid_refusal(sel: &Selector) -> Option<String> {
     let Selector::Sid(sid) = sel else {
         return None;
@@ -8957,6 +9255,36 @@ fn is_front_driving_verb(verb: &str) -> bool {
         verb,
         "key" | "ctrl" | "mouse" | "paste" | "focus" | "send" | "feed" | "turn"
     )
+}
+
+/// What a scoped caller's front-surface observation hop came back with: the
+/// surface, or the whole reply `handle` sends instead. A failed hop is an
+/// authorization failure, never "no surface" (fail closed): it is audited
+/// with `log_denial` and answered `ERR denied`. The one exception is a
+/// stalled main thread's refusal (`ERR main thread stalled <N>s since <root>;
+/// retry`). It was given before anything was posted, so nothing was observed
+/// and nothing authorized either way, and it goes to the wire as it is, as it
+/// does for every other main-thread verb. As `ERR denied` it would be a false
+/// authority failure in the audit log, and the harness, which rides out the
+/// stall refusal (aterm-agent's `CtlReply::lost`), would read it as the
+/// server's final answer.
+fn front_surface_authority(
+    verb: &str,
+    hop: Result<FrontControlSurface, control_media::MainHopError>,
+) -> Result<FrontControlSurface, String> {
+    match hop {
+        Ok(surface) => Ok(surface),
+        Err(control_media::MainHopError::Stalled(stall)) => Err(format!("ERR {stall}\n")),
+        Err(error) => {
+            log_denial(
+                AUDIT_SUBSYSTEM,
+                &format!("self {verb} front-surface authorization failed"),
+                aterm_containment::mode_or_containment(),
+                &format!("could not observe front input authority: {error}"),
+            );
+            Err("ERR denied\n".to_string())
+        }
+    }
 }
 
 /// PART B pure decision: given the caller's `scope`, input `verb`, and the FRONT
@@ -9333,7 +9661,7 @@ fn front_routed_license_clear(proxy: &EventLoopProxy<Wake>, session: u64) -> Str
     }))
 }
 
-fn license_clear_reply(result: Result<bool, &'static str>) -> String {
+fn license_clear_reply(result: Result<bool, control_media::MainHopError>) -> String {
     match result {
         // `false` is a safe tab-switch race: the named target is no longer
         // visible and therefore holds no licence, but the authorized
@@ -9540,7 +9868,17 @@ fn cross_resize(
     // target's viewport right after this resize (`pty_resize_policy`). Asked
     // BEFORE `term_lock`, as there: the answer takes the PTY registry's lock.
     let policy = crate::app_render::pty_resize_policy(master);
-    let pending = term_lock(term).resize_offloading_scrollback_with_policy(rows, cols, policy);
+    // THE RESIZE LEDGER: the engine's journal is copied inside the resize's own
+    // hold and booked below, after every lock here is released (`site=ctl-cross`).
+    let (pending, journal, cast_stamp) = {
+        let mut t = term_lock(term);
+        let pending = t.resize_offloading_scrollback_with_policy(rows, cols, policy);
+        (
+            pending,
+            crate::resize_ledger::JournalCopy::take(&t),
+            crate::cast::ResizeStamp::take(&t),
+        )
+    };
     if let Some(pending) = pending {
         // THE TARGET'S REWRAP GAUGE (rulings 233, 234, 236): the same hold the
         // window-resize hand-off takes, so a person who searches the target
@@ -9615,13 +9953,21 @@ fn cross_resize(
     // honest zeros instead of the 8x16 placeholder.
     let cell_px = term_lock(term).host_cell_pixel_size();
     aterm_pty::resize_with_cell_px(master, rows, cols, cell_px);
-    // Mirror `apply_term_resize`'s per-session asciicast record (main.rs:2459-2463)
-    // so the target's own `screen.cast` timeline shows the geometry change.
-    {
-        let mut rec = ctx.cast.lock().unwrap_or_else(|p| p.into_inner());
-        let t = rec.now();
-        rec.record_resize(t, cols, rows);
-    }
+    // Mirror the window pass's per-session asciicast record so the target's
+    // own `screen.cast` timeline shows the geometry change, at the place the
+    // resize's hold stamped (P4(b)).
+    ctx.cast
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record_resize_stamped(cast_stamp, cols, rows);
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ingest_resizes(
+            &journal,
+            Some(crate::resize_ledger::Attribution::CTL_CROSS),
+            crate::turn_ledger::now_ms(),
+        );
     "OK\n".to_string()
 }
 
@@ -9694,7 +10040,7 @@ fn handle(
     // Artifact verbs park their handoff here: it must outlive this `String`
     // body through the bounded socket write. Published paths additionally wait
     // for the client's ACK; in-memory bytes release after flush.
-    reply_retention: &mut Option<ReplyHandoff>,
+    reply_retention: &mut ReplyTail,
 ) -> String {
     // Tolerate CRLF clients; the protocol itself is bare-LF terminated.
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -9908,19 +10254,15 @@ fn handle(
     // main-thread observation therefore supplies an additional argument-aware
     // escalation: Settings -> ConfigWrite; any transient overlay -> Owner-only.
     // Owner and cross-session requests never take this hop.  A failed hop is an
-    // authorization failure, never "no surface" (fail closed).
+    // authorization failure, never "no surface" (fail closed), except a stalled
+    // main thread's refusal (`front_surface_authority`).
     let front_surface = if !is_cross && !scope.is_owner_class() && is_front_driving_verb(verb) {
-        match control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }) {
+        match front_surface_authority(
+            verb,
+            control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }),
+        ) {
             Ok(surface) => surface,
-            Err(error) => {
-                log_denial(
-                    AUDIT_SUBSYSTEM,
-                    &format!("self {verb} front-surface authorization failed"),
-                    aterm_containment::mode_or_containment(),
-                    &format!("could not observe front input authority: {error}"),
-                );
-                return "ERR denied\n".to_string();
-            }
+            Err(reply) => return reply,
         }
     } else {
         FrontControlSurface::None
@@ -10010,11 +10352,7 @@ fn handle(
             // dropped — an unknown token is the `TEXT_USAGE` line (a span naming no
             // row, `ERR bad rows`), the same answer as the text form.
             "text" => Some(match control_query::text_args(&body) {
-                Ok(args) => control_query::cmd_text_json_read(
-                    term,
-                    args,
-                    ctx.human_input.ms_since(crate::metrics::now_us()),
-                ),
+                Ok(args) => control_query::cmd_text_json_looked(term, ctx, args),
                 Err(err) => err,
             }),
             // `screen` is ALWAYS styled JSON; accept `screen --json` for symmetry.
@@ -10068,8 +10406,10 @@ fn handle(
     // named keys still fence. A FENCED key (`if=`, `if-gen=`, `if-fp=`) fences too: it is
     // delivered on the control thread, past the seam that would have armed its
     // class (see `control_input::input_if_fenced`).
-    let fenced_write =
-        leading.guard.is_some() || leading.if_gen.is_some() || leading.if_fp.is_some();
+    let fenced_write = leading.guard.is_some()
+        || leading.if_gen.is_some()
+        || leading.if_fp.is_some()
+        || leading.if_human.is_some();
     if control_attempt_closes_cursor_license(verb)
         && !(verb == "key" && !fenced_write && control_input::key_arms_own_license(rest))
     {
@@ -10194,6 +10534,7 @@ fn handle(
         guard: guard.as_deref(),
         generation: leading.if_gen,
         fp: leading.if_fp,
+        human: leading.if_human,
         guard_at_cursor: false,
     };
 
@@ -10549,6 +10890,11 @@ fn handle(
             &ctx.sink,
             ctx.human_input.ms_since(crate::metrics::now_us()),
         ),
+        // The manual reset (2026-09-26, `crate::manual_reset`): the escape
+        // hatch for a terminal the foreground handback cannot reach. Runs on
+        // the target's PTY reader, so the self, front and background forms are
+        // one arm — it touches no App UI state and writes no input.
+        "reset" => crate::manual_reset::cmd_reset(session, term, ctx, rest),
         // The parser's refusal is the reply, as it is for the self verb
         // (`cmd_mouse`) and the background cross arm (`cross_mouse`): a bad
         // modifier answers `ERR bad modifier …` naming what a report can carry,
@@ -10871,11 +11217,27 @@ fn handle(
         "cast" if rest.split_whitespace().next() == Some("frames") => {
             control_session::cmd_cast_frames(ctx, rest.strip_prefix("frames").unwrap_or("").trim())
         }
+        // `cast drift [max_runs=<k>] [rows=<n>] [seed=…]` replays the TARGET's own
+        // recording against the TARGET's own engine (line-framed): both locks are the
+        // target's, so it is cross-session correct like `cast`. The seam policy is
+        // asked here, before either lock is taken. A wait-lane verb
+        // (`is_wait_request`): it settles for 60 ms and folds the recording.
+        "cast" if rest.split_whitespace().next() == Some("drift") => {
+            let policy = crate::app_render::pty_resize_policy(master);
+            control_session::cmd_cast_drift(
+                term,
+                &ctx.cast,
+                policy,
+                rest.trim_start().strip_prefix("drift").unwrap_or("").trim(),
+            )
+        }
         "cast" => control_session::cmd_cast(ctx),
         // `temporal [tick]` reconstructs the TARGET session's screen at a past
         // instant from its OWN temporal recorder (the read half of B.9), never the
         // shared renderer — correct cross-session like `cast`, no `is_cross` guard.
-        "temporal" => control_session::cmd_temporal(ctx, rest),
+        // It reads the TARGET's engine too (its own lock, never nested with the
+        // recorder's): the resizes not yet on the spine, `pending_resizes=`.
+        "temporal" => control_session::cmd_temporal(ctx, term, rest),
         // `turns`: read back this session's TURN LEDGER (what was driven + what
         // settled), the durable twin of the live events digest. Read-side.
         // `history [<n>] [since=<id>]`: read the session's TURN LEDGER (what was
@@ -10915,6 +11277,11 @@ fn handle(
         // twin of `history`) — pure observer of the ctx ring, cross-session
         // correct like `cast`/`history`, no `is_cross` guard.
         "timeline" => control_session::cmd_timeline(ctx, rest),
+        // `resizes`: the TARGET session's RESIZE LEDGER (what re-gridded it, the
+        // runs, and whether the app drew over displaced content) — the target's
+        // own engine and timeline, so cross-session correct like `timeline`, no
+        // `is_cross` guard.
+        "resizes" => crate::resize_ledger::cmd_resizes(ctx, term, rest),
         // `status`: the TARGET session's Subject + classified Status record. A
         // main-thread hop, unlike its `meta`/`timeline` neighbours: the
         // classifier is `App` state owned by the event loop, not ctx state the
@@ -11056,7 +11423,7 @@ fn typing_momentum_reading(
     session: u64,
 ) -> Result<(f32, std::time::Instant), String> {
     control_media::call_main(proxy, |tx| Wake::TypingMomentum { session, reply: tx })
-        .map_err(str::to_string)
+        .map_err(|error| error.to_string())
         .and_then(|r| r)
 }
 
@@ -11250,6 +11617,141 @@ mod tests {
         crate::identity_claim::set_rendezvous_override(None);
     }
 
+    /// AN ID HANDED TO THIS PROCESS'S OWN UPDATE CANDIDATE IS SERVED HERE UNTIL
+    /// THE COMMIT (the 2026-09-28 update 0.95 → 0.97, `~/Library/Logs/aterm/aterm.log`
+    /// at 1790587062.924: the successor 9356's per-process socket published every
+    /// carried id at .717, the predecessor 39284 committed at .923, and in between
+    /// its own supervisor's `text --json` for `@s-d3346…` earned `ERR ambiguous
+    /// session id … also served by pid 9356` and a supervisor restart).
+    ///
+    /// **TIER-1 BINDING FOR `HandoffAddressOwner`** — the REAL dispatch probe and
+    /// resolver, the state projected onto the model
+    /// (`identity_claim::project_handoff_address_owner`) and the model's
+    /// `Request` fired on it: the real refusal must equal the model's `refused`
+    /// at every state — the live pre-Commit shape (served), the same shape before
+    /// the lane registered its candidate (the pre-fix refusal, which the `Buggy`
+    /// model makes too), a stranger mid-update (refused), the registration dropped
+    /// with the candidate still up (refused again), and the candidate dead
+    /// (nothing holds the id). A minted id is never contestable at all.
+    #[cfg(unix)]
+    #[test]
+    fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() {
+        use super::{Selector, ambiguous_sid_refusal, resolve_explicit};
+        use crate::identity_claim::project_handoff_address_owner as project;
+        use aterm_session::SessionId;
+
+        let _guard = crate::identity_claim::rendezvous_test_guard();
+        let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+        crate::identity_claim::set_rendezvous_override(Some(dir.path().to_path_buf()));
+        let model = aterm_spec::derive::handoff_address_owner_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+        // A session this process hosts under an ADOPTED id — it survived one
+        // handoff already, like s-d3346 (adopted at 1790565247.600).
+        let store = crate::session_store::new_store();
+        let mut handle = crate::session_store::test_handle(1);
+        let sid = SessionId::generate();
+        handle.sid = sid.clone();
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(handle);
+        crate::identity_claim::note_adopted(&sid);
+        let sel = Selector::Sid(sid.clone());
+
+        // The candidate: a live process that is not us.
+        let mut candidate = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the candidate stand-in");
+        let cand = candidate.id();
+        std::fs::create_dir_all(dir.path().join("graph")).expect("graph dir");
+        let entry = |pid: u32| {
+            std::fs::write(
+                dir.path().join("graph").join(sid.as_str()),
+                format!("sock /nonexistent/aterm-{pid}.sock\nnonce ab\npid {pid}\n"),
+            )
+            .expect("plant the entry");
+        };
+        // The real verdict beside the model's, at the state the real code is in.
+        let conforms = |m: &aterm_spec::derive::Model, why: &str| -> Option<String> {
+            let mut st = project(dir.path(), &sid, cand);
+            assert!(m.fire("Request", &mut st), "{why}: Request at {st:?}");
+            let refusal = ambiguous_sid_refusal(&sel);
+            let resolved = resolve_explicit(&store, &sel);
+            assert_eq!(
+                refusal.is_some(),
+                resolved.is_err(),
+                "{why}: the resolver and the dispatch seam agree"
+            );
+            assert_eq!(
+                i64::from(refusal.is_some()),
+                st["refused"],
+                "{why}: the real refusal {refusal:?} against the model at {st:?}"
+            );
+            refusal
+        };
+
+        // THE LIVE PRE-COMMIT SHAPE BEFORE THE FIX: the candidate's entry, no
+        // registration — exactly the refusal the log carries, and the `Buggy`
+        // model's verdict on the same path.
+        entry(cand);
+        let refusal = conforms(&model, "unregistered").expect("the pre-fix refusal");
+        assert_eq!(
+            refusal,
+            format!(
+                "ERR ambiguous session id {} also served by pid {cand}; use aterm ctl --pid \
+                 {cand}\n",
+                sid.as_str()
+            ),
+            "the live line"
+        );
+        let mut path = buggy.init_state();
+        for action in ["Launch", "SuccessorPublishes", "Request"] {
+            assert!(buggy.fire(action, &mut path), "{action} at {path:?}");
+        }
+        assert_eq!(path["refused"], 1, "the Buggy model refuses the same path");
+
+        // THE FIX: the lane registered its candidate — served, by the dispatch
+        // probe and by the resolver every seam shares.
+        let reg = crate::identity_claim::register_handoff_candidate(cand);
+        assert!(conforms(&model, "registered").is_none());
+        assert!(
+            resolve_explicit(&store, &sel)
+                .expect("served here until the Commit")
+                .is_some()
+        );
+
+        // NEGATIVE CONTROL: a stranger publishing the same id mid-update.
+        entry(LIVE_FOREIGN_PID);
+        let refusal = conforms(&model, "stranger").expect("a stranger is refused");
+        assert!(
+            refusal.contains(&format!("pid {LIVE_FOREIGN_PID}")),
+            "{refusal:?}"
+        );
+
+        // NEGATIVE CONTROL: the registration dropped, the candidate still up.
+        drop(reg);
+        entry(cand);
+        assert!(conforms(&model, "dropped").is_some(), "refused again");
+
+        // A MINTED id is never contestable, whatever its entry says.
+        let minted = SessionId::generate();
+        std::fs::write(
+            dir.path().join("graph").join(minted.as_str()),
+            format!("sock /nonexistent/aterm.sock\nnonce ab\npid {cand}\n"),
+        )
+        .expect("plant the entry");
+        assert!(ambiguous_sid_refusal(&Selector::Sid(minted)).is_none());
+
+        // The candidate dead (a rejected attempt's reap): its entry holds nothing.
+        let _ = candidate.kill();
+        let _ = candidate.wait();
+        assert!(conforms(&model, "dead").is_none());
+        crate::identity_claim::set_rendezvous_override(None);
+    }
+
     /// THE ROUTING LAW an explicit selector takes (regression: `@self` — the
     /// selector the docs recommend — expands client-side to `@<sid>`, which was
     /// classified as a background target even when it named the tab on screen.
@@ -11290,7 +11792,43 @@ mod tests {
         // be dropped.
         assert_eq!(license_clear_reply(Ok(true)), "OK\n");
         assert_eq!(license_clear_reply(Ok(false)), "OK\n");
-        assert!(license_clear_reply(Err("event loop gone")).starts_with("ERR "));
+        assert!(
+            license_clear_reply(Err(super::control_media::MainHopError::Reason(
+                "event loop gone"
+            )))
+            .starts_with("ERR ")
+        );
+
+        // A scoped caller's front-surface hop. A stalled main thread's
+        // refusal reaches the wire as the retryable stall line, as it does
+        // for every other main-thread verb (the harness rides it out), and
+        // never as an authority denial. Any other failed hop is still denied
+        // (fail closed).
+        let stall = crate::watchdog::MainStall {
+            stalled: std::time::Duration::from_secs(6),
+            root: crate::watchdog::Breadcrumb::AboutToWait,
+            returned: true,
+        };
+        assert_eq!(
+            front_surface_authority(
+                "key",
+                Err(super::control_media::MainHopError::Stalled(stall))
+            ),
+            Err("ERR main thread stalled 6s since `AboutToWait` returned; retry\n".to_string())
+        );
+        assert_eq!(
+            front_surface_authority(
+                "key",
+                Err(super::control_media::MainHopError::Reason(
+                    "event loop gone"
+                ))
+            ),
+            Err("ERR denied\n".to_string())
+        );
+        assert_eq!(
+            front_surface_authority("send", Ok(FrontControlSurface::None)),
+            Ok(FrontControlSurface::None)
+        );
 
         // Parsing happens only after this verb-level boundary, so malformed
         // front and cross forms cancel exactly like valid ones. Read-only and
@@ -11830,9 +12368,10 @@ mod tests {
     /// (`artifact_reply_quarantine`), the class macOS starves first: on a host
     /// running several test suites at once (load average near 50 on 18 cores,
     /// 2026-09-26) the three waits that used 2-3 s timed out together, and each
-    /// passed alone. A wait ends the moment the guard goes, so this bound only
-    /// decides how long a reaper that never runs takes to fail the test.
-    const REAPER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+    /// passed alone; at load 170 (2026-09-29) two of them ran out 30 s. A wait
+    /// ends the moment the guard goes, so this bound only decides how long a
+    /// reaper that never runs takes to fail the test: the house hang detector.
+    const REAPER_PATIENCE: std::time::Duration = EVENTUALLY;
 
     /// Drive the shipping reservation through a real failed ACK. The permit
     /// must remain charged while its guard is in the process-global quarantine,
@@ -11908,17 +12447,31 @@ mod tests {
         }
         assert!(!alive.load(Ordering::Acquire), "quarantine must expire");
 
-        let mut reopened = Vec::new();
-        for _ in 0..ARTIFACT_HANDOFF_LIMIT {
-            reopened.push(
-                ReplyRetention::try_new(WireProbe {
-                    alive: Arc::new(AtomicBool::new(true)),
-                    prepared: Arc::new(AtomicBool::new(false)),
-                    fail_prepare: false,
+        // The guard going is not yet the permit coming back: the reaper drops
+        // the guard, fires its release anchor, and only then the permit
+        // (`ReplyRetention`'s drop, then its fields), all on the thread macOS
+        // starves first. So the capacity itself is what is waited for, as long
+        // as the reaper takes; a permit the reaper never returns still fails.
+        let deadline = std::time::Instant::now() + REAPER_PATIENCE;
+        let reopened = loop {
+            let all: Result<Vec<_>, _> = (0..ARTIFACT_HANDOFF_LIMIT)
+                .map(|_| {
+                    ReplyRetention::try_new(WireProbe {
+                        alive: Arc::new(AtomicBool::new(true)),
+                        prepared: Arc::new(AtomicBool::new(false)),
+                        fail_prepare: false,
+                    })
                 })
-                .unwrap_or_else(|_| panic!("expired quarantine returns every permit")),
+                .collect();
+            if let Ok(all) = all {
+                break all;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expired quarantine returns every permit"
             );
-        }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         drop(reopened);
     }
 
@@ -12199,6 +12752,82 @@ mod tests {
             .is_none()
         );
         assert_eq!(ordinary_wire.bytes, b"OK next\n");
+    }
+
+    /// A reply carrying a [`ReplyWritten`] releases its [`ReplyWire`] once its
+    /// bytes are written and flushed — not before, and not only at the ACK
+    /// that follows a guarded reply — and on a failed write too, since no
+    /// write is coming then (round six of the update audit, finding 31: what
+    /// a seamless update's Commit waits on for a `video` reply). A reply that
+    /// is dropped unwritten releases it as well.
+    #[test]
+    fn a_reply_wire_releases_when_its_reply_is_written() {
+        struct WireCheckingWriter {
+            wire: ReplyWire,
+            bytes: Vec<u8>,
+            flushed: bool,
+        }
+        impl Write for WireCheckingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(!self.wire.is_released(), "released before the write");
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(!self.wire.is_released(), "released before the flush");
+                self.flushed = true;
+                Ok(())
+            }
+        }
+
+        let (wire, written) = ReplyWire::new();
+        let reply = ControlReply::from("ERR video: recording aborted: aterm is updating\n")
+            .releasing_on_write(written);
+        let mut writer = WireCheckingWriter {
+            wire: wire.clone(),
+            bytes: Vec::new(),
+            flushed: false,
+        };
+        assert!(!wire.is_released(), "owed until written");
+        assert!(write_control_reply(&mut writer, reply).unwrap().is_none());
+        assert!(writer.flushed && wire.is_released(), "written, so released");
+        assert!(wire.wait_released(std::time::Instant::now()));
+
+        // A failed write releases it too: nothing more is coming.
+        let (wire, written) = ReplyWire::new();
+        let reply = ControlReply::from("OK a\n").releasing_on_write(written);
+        let mut failing = FailAfterFirstWrite {
+            bytes: b"x".to_vec(),
+        };
+        assert!(write_control_reply(&mut failing, reply).is_err());
+        assert!(wire.is_released());
+
+        // Through `handle`'s tail, as the `video` arm hands it on.
+        let (wire, written) = ReplyWire::new();
+        let mut tail = ReplyTail::default();
+        let body = ControlReply::from("OK b\n")
+            .releasing_on_write(written)
+            .into_body_retaining(&mut tail);
+        assert!(!wire.is_released(), "the tail keeps it owed");
+        let mut bytes = Vec::new();
+        assert!(
+            write_control_reply(&mut bytes, ControlReply::with_tail(body, tail))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(bytes, b"OK b\n");
+        assert!(wire.is_released());
+
+        // Dropped unwritten: released, and a waiter is not left hanging.
+        let (wire, written) = ReplyWire::new();
+        drop(ControlReply::from("OK c\n").releasing_on_write(written));
+        assert!(wire.wait_released(std::time::Instant::now()));
+        // CONTROL: an unreleased wire's wait ends at its deadline.
+        let (wire, _written) = ReplyWire::new();
+        assert!(
+            !wire.wait_released(std::time::Instant::now() + std::time::Duration::from_millis(20))
+        );
     }
 
     #[test]
@@ -14989,6 +15618,9 @@ mod tests {
             "inbox get @42",
             "dial work",
             "@s-not-hosted-here text",
+            // Settles 60 ms and folds the whole recording (`cast drift`).
+            "cast drift",
+            &format!("@{local_sid} cast drift max_runs=4"),
         ] {
             assert!(is_wait_request(line, &store), "{line:?} parks or relays");
         }
@@ -15006,6 +15638,8 @@ mod tests {
             "dial-list",
             "meta set supervisor aterm-harness@1 ttl=60000",
             &format!("@{local_sid} text"),
+            "cast",
+            "cast frames count=4",
         ] {
             assert!(
                 !is_wait_request(line, &store),
@@ -15749,7 +16383,7 @@ mod tests {
     /// every `image read` / styled frame.
     #[test]
     fn oversized_image_payload_is_truncated_not_encoded() {
-        use aterm_core::grid::extra::{ImageData, ImageFormat};
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageScaling};
         let small = ImageData {
             bytes: vec![1, 2, 3, 4],
             format: ImageFormat::Png,
@@ -15757,7 +16391,8 @@ mod tests {
             rows: 1,
             z_index: 0,
             band_lift_px: 0,
-            pixel_exact: false,
+            scaling: ImageScaling::Fit,
+            source_rect: None,
         };
         let (fmt, b64) = image_payload(&small);
         assert_eq!(fmt, "png");
@@ -15770,7 +16405,8 @@ mod tests {
             rows: 24,
             z_index: 0,
             band_lift_px: 0,
-            pixel_exact: false,
+            scaling: ImageScaling::Fit,
+            source_rect: None,
         };
         let (fmt, b64) = image_payload(&big);
         assert_eq!(fmt, "truncated", "oversized image must be marked truncated");
@@ -16577,11 +17213,17 @@ mod tests {
         let (handshake_tx, handshake_rx) = std::sync::mpsc::channel::<String>();
         let child_side = std::thread::spawn(move || {
             let (conn, _) = listener.accept().expect("accept the forward");
-            let mut first = String::new();
-            BufReader::new(conn.try_clone().expect("clone"))
-                .read_line(&mut first)
-                .expect("read the handshake");
-            let _ = handshake_tx.send(first);
+            let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+            // The forward's connect probe comes first and is answered; the
+            // handshake the model speaks of is the probe plus the verb.
+            let mut probe = String::new();
+            reader.read_line(&mut probe).expect("read the handshake");
+            (&conn)
+                .write_all(b"OK version=child\n")
+                .expect("answer the probe");
+            let mut verb = String::new();
+            reader.read_line(&mut verb).expect("read the verb");
+            let _ = handshake_tx.send(format!("{probe}{verb}"));
             (&conn).write_all(b"OK served\n").expect("answer");
             let _ = conn.shutdown(std::net::Shutdown::Both);
         });
@@ -16651,8 +17293,9 @@ mod tests {
         );
         assert_eq!(
             handshake,
-            format!("TOKEN {} @. screen\n", entry.read.to_hex()),
-            "the child receives the edge handshake and the rewritten verb"
+            format!("TOKEN {} version\n@. screen\n", entry.read.to_hex()),
+            "the child receives the edge handshake (with the connect probe) and \
+             the rewritten verb"
         );
         let relayed = step(&parked, "Relay", &[("buffered", 0), ("relayed", 1)]);
 
@@ -17219,14 +17862,17 @@ mod tests {
     /// pins both halves: the false `Ok` a dropped reader alone can hand back,
     /// and the `EPIPE` the swap earns with a stranger still holding the read
     /// end. The sibling `cross_session_paste_reports_a_dead_spill_peer_as_write_failed`
-    /// keeps the residual exposure this note describes: it closes the peer
-    /// MID-WRITE by design, from a thread, so it has no moment before the write
-    /// at which to swap anything.
+    /// closes the peer MID-WRITE by design, from a thread, so it has no moment
+    /// before the write at which to swap anything; since 2026-09-27 it probes the
+    /// pipe after the reply instead and asserts only over a peer it saw dead,
+    /// rebuilding a run a stranger voided ([`paste_while_the_peer_closes_mid_write`],
+    /// with `a_reading_stranger_voids_the_mid_write_paste_run` as its negative
+    /// control). No assertion in this file rests on the window any more.
     ///
-    /// Darwin therefore keeps `pipe(2)` + `F_SETFD`, and keeps the narrowed but
-    /// real window, because a rare wrong answer is the lesser defect against a
-    /// suite that never finishes. This is the same trade
-    /// [`crate::seamless`]'s own `cloexec_pipe` already records.
+    /// Darwin therefore keeps `pipe(2)` + `F_SETFD` and its narrowed window: what
+    /// the window can still cost a test here is a delay (a held read end holds
+    /// the drainer until the stranger exits), never a wrong verdict. This is the
+    /// same trade [`crate::seamless`]'s own `cloexec_pipe` already records.
     ///
     /// The flag is READ BACK on both descriptors rather than trusted, because
     /// the flag is the entire point of the helper — the same discipline the
@@ -17314,6 +17960,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         });
         let handle = SessionHandle {
             sid,
@@ -17925,6 +18573,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         });
         let before = ctx.cast.lock().unwrap().event_count();
 
@@ -18214,6 +18864,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         })
     }
 
@@ -18566,6 +19218,9 @@ mod tests {
                 // `escalated_op_fences_invoke_and_open_indirect_seams`).
                 "meta",
                 "timeline",
+                // `resizes` OBSERVES the resize ledger: the engine's journal and
+                // the verdicts read from it. It resizes nothing.
+                "resizes",
                 // `status` OBSERVES the local status classifier. It has no write
                 // sub-form at all — the only things that move a status are the
                 // session itself and `settings set tab_status …` — so unlike
@@ -18696,6 +19351,10 @@ mod tests {
                 // watcher's verb), so it takes the write op-class too; the same
                 // `OwnerOnly` gate keeps a child edge from writing `✓ approved`.
                 "story",
+                // The manual reset (2026-09-26) MUTATES the session's terminal
+                // modes (and, with `flush`, drops its input queue) — the write
+                // class, like `resize`; it writes no PTY input.
+                "reset",
             ],
             "WriteInput set (input vocabulary + app-drive verbs)",
         );
@@ -20221,6 +20880,8 @@ mod tests {
             fabric: std::sync::Arc::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            generation_look: Default::default(),
+            reset_lane: Default::default(),
         });
         SessionHandle {
             sid,
@@ -20418,6 +21079,7 @@ mod tests {
         *root.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
             id: 9,
             driver: None,
+            typing: true,
         });
         let _watch = subscribe::SubscriberSet::register(&subs, &[0]);
         let out = cmd_who(&store, &subs);
@@ -23509,15 +24171,34 @@ mod tests {
         assert_eq!(unsafe { libc::close(stranger) }, 0, "close the stranger");
     }
 
-    /// A cross-session paste reply is a kernel-delivery receipt, not merely
-    /// acceptance into the process-local spill. Build a real wedged pipe, put
-    /// an older interactive frame in its spill, then close the peer while the
-    /// paste waits behind it. `cross_input` must preserve the sink's sticky
-    /// failure verdict and return an error after the queued bytes are
-    /// discarded. Ported from `codex/cursor-effects-integration` (03a066831).
-    #[test]
+    /// What one run of [`paste_while_the_peer_closes_mid_write`] observed.
     #[cfg(unix)]
-    fn cross_session_paste_reports_a_dead_spill_peer_as_write_failed() {
+    struct MidWriteClose {
+        reply: String,
+        /// The probe after the reply: one more byte into the pipe earned `EPIPE`,
+        /// so no reader existed anywhere — not this test's, not a stranger's.
+        peer_observed_dead: bool,
+        reached_kernel: bool,
+        spill_empty: bool,
+    }
+
+    /// Build a real wedged pipe, put an older interactive frame in its spill,
+    /// then close the peer from a thread while a paste waits behind it, and
+    /// report what the paste was answered and whether the peer was DEAD.
+    ///
+    /// The last question is not rhetorical. [`cloexec_pipe`] cannot close
+    /// Darwin's inherit window, so a child some concurrent test spawns can hold a
+    /// duplicate of the read end, and dropping this test's copy then kills
+    /// nothing. Holding alone only delays the verdict (the drainer's wait lasts
+    /// until the stranger exits, and then earns `EPIPE`); a stranger that READS
+    /// lets the spill reach the kernel, and `OK` is then the correct answer for
+    /// that run. Either way the one-byte probe after the reply says which world
+    /// the run was in, so a verdict is asserted only over a peer observed dead.
+    /// `reading_stranger` plants the second world on purpose (the negative
+    /// control).
+    #[cfg(unix)]
+    fn paste_while_the_peer_closes_mid_write(reading_stranger: bool) -> MidWriteClose {
+        use std::os::fd::AsRawFd;
         let (handle, reader) = pipe_session(73);
         aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
         handle.ctx.sink.note_master_nonblocking(true);
@@ -23544,6 +24225,28 @@ mod tests {
             "negative control: bytes really remain process-local before paste",
         );
 
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stranger = reading_stranger.then(|| {
+            // SAFETY: `reader` is live here, and `dup` either returns a new
+            // descriptor for the same read end or -1.
+            let fd = unsafe { libc::dup(reader.as_raw_fd()) };
+            assert!(fd >= 0, "dup the read end: the stranger's duplicate");
+            aterm_pty::set_nonblocking(fd, true).expect("nonblocking stranger");
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    // SAFETY: a read into a live local buffer of exactly its
+                    // length, from the stranger's own descriptor.
+                    let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if read <= 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                // SAFETY: the stranger's own duplicate, closed exactly once.
+                unsafe { libc::close(fd) };
+            })
+        });
         let closer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(25));
             drop(reader);
@@ -23555,14 +24258,79 @@ mod tests {
             "ERR malformed\n",
         );
         closer.join().expect("peer closer");
-        assert_eq!(reply, "ERR write failed\n");
-        assert!(
-            !handle.ctx.sink.wait_egress_drained_to_kernel(),
-            "empty-after-peer-death remains a sticky completion failure",
+        // SAFETY: a one-byte write from a static buffer to this test's own live
+        // (non-blocking) write end.
+        let probe = unsafe { libc::write(handle.master, b"x".as_ptr().cast(), 1) };
+        let peer_observed_dead =
+            (probe, std::io::Error::last_os_error().raw_os_error()) == (-1, Some(libc::EPIPE));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(stranger) = stranger {
+            stranger.join().expect("stranger reader");
+        }
+        MidWriteClose {
+            reply,
+            peer_observed_dead,
+            reached_kernel: handle.ctx.sink.wait_egress_drained_to_kernel(),
+            spill_empty: handle.ctx.sink.egress_drained_to_kernel(),
+        }
+    }
+
+    /// A cross-session paste reply is a kernel-delivery receipt, not merely
+    /// acceptance into the process-local spill. Close the peer while the paste
+    /// waits behind an older spilled frame: `cross_input` must preserve the
+    /// sink's sticky failure verdict and return an error after the queued bytes
+    /// are discarded. Ported from `codex/cursor-effects-integration` (03a066831).
+    ///
+    /// Asserted only over a run whose peer the probe saw dead; a run a stranger
+    /// voided (see [`paste_while_the_peer_closes_mid_write`]) is rebuilt, and the
+    /// test fails only if every attempt is void.
+    #[test]
+    #[cfg(unix)]
+    fn cross_session_paste_reports_a_dead_spill_peer_as_write_failed() {
+        const ATTEMPTS: usize = 3;
+        for attempt in 1..=ATTEMPTS {
+            let run = paste_while_the_peer_closes_mid_write(false);
+            if !run.peer_observed_dead {
+                eprintln!(
+                    "attempt {attempt}: a stranger still held the read end (reply {:?}); \
+                     the run is void, not a verdict",
+                    run.reply
+                );
+                continue;
+            }
+            assert_eq!(run.reply, "ERR write failed\n");
+            assert!(
+                !run.reached_kernel,
+                "empty-after-peer-death remains a sticky completion failure",
+            );
+            assert!(
+                run.spill_empty,
+                "nothing process-local remains: the handoff's polling fence is settled",
+            );
+            return;
+        }
+        panic!("every one of {ATTEMPTS} runs had a stranger on the read end");
+    }
+
+    /// NEGATIVE CONTROL for the probe: a stranger that holds the read end AND
+    /// reads it lets the spill reach the kernel, so the paste is honestly
+    /// answered `OK` — the answer the unguarded assertion used to fail on — and
+    /// the probe classifies that run void instead of dead.
+    #[test]
+    #[cfg(unix)]
+    fn a_reading_stranger_voids_the_mid_write_paste_run() {
+        let run = paste_while_the_peer_closes_mid_write(true);
+        assert_eq!(
+            run.reply, "OK\n",
+            "with a live reader the bytes landed, and OK is the honest reply"
         );
         assert!(
-            handle.ctx.sink.egress_drained_to_kernel(),
-            "nothing process-local remains: the handoff's polling fence is settled",
+            !run.peer_observed_dead,
+            "the probe must see the stranger, or a void run would be read as a verdict"
+        );
+        assert!(
+            run.reached_kernel,
+            "the stranger drained the spill to the kernel"
         );
     }
 
@@ -24093,7 +24861,7 @@ mod tests {
                     driver: None,
                 },
             );
-            let laid = app.borrow().windows[&wid].cursor_glow.ribbon_segments();
+            let laid = app.borrow().windows[&wid].cursor_fx.glow.ribbon_segments();
             (out.lines().next().unwrap_or("").to_string(), laid)
         };
 
@@ -24328,8 +25096,15 @@ mod tests {
         assert_eq!(out, "OK momentum 0.10\n");
         assert_eq!(reads.get(), 2, "solve, then confirm — no read in between");
         let crossing = Duration::from_secs_f32(2.0 * (0.40f32 / 0.30).ln());
+        // The return time is the subject, so the upper bound is a budget, and
+        // it is the park's own slice: a served park re-derives its wake from
+        // the crossing at least every `HANGUP_POLL`, and this unserved one
+        // sleeps to the crossing itself, so a return a whole `HANGUP_POLL`
+        // past it is a wake no park of this verb scheduled (a tick coarser
+        // than the slice, a crossing solved late). The lower bound needs no
+        // headroom: load only makes a wake later.
         assert!(
-            waited >= crossing && waited < crossing + Duration::from_millis(150),
+            waited >= crossing && waited < crossing + HANGUP_POLL,
             "returned at the analytic crossing ({crossing:?}), not before and not on a tick: {waited:?}"
         );
 
@@ -24518,7 +25293,10 @@ mod tests {
         );
 
         // ...and latches on the frame that clears it, woken by the SAME notify
-        // the GUI's Wake::Output hook fires — well before the 5 s timeout.
+        // the GUI's Wake::Output hook fires — well before the two-minute timeout.
+        // A lost notify would park to that timeout, where the re-poll still
+        // latches `OK gone`: only the clock tells the two apart, so the bound
+        // sits between them, a minute clear of both.
         let (term_t, reg_t) = (h.term.clone(), registry.clone());
         let painter = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(120));
@@ -24531,7 +25309,7 @@ mod tests {
             &store,
             0,
             &h.ctx,
-            "gone interrupt timeout=5000",
+            "gone interrupt timeout=120000",
             &registry,
         );
         painter.join().unwrap();
@@ -24540,7 +25318,7 @@ mod tests {
             "the footer leaving latches: {out:?}"
         );
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(4),
+            t0.elapsed() < std::time::Duration::from_secs(60),
             "woken by the clearing frame, not by the timeout"
         );
     }
@@ -24925,6 +25703,7 @@ mod tests {
         *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
             id: 41,
             driver: None,
+            typing: true,
         });
         let paste = |_: &str| true;
         let press = |_: &str| true;
@@ -25208,6 +25987,7 @@ mod tests {
         *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
             id: 77,
             driver: None,
+            typing: true,
         });
         // A plain release refuses (a turn releases its own lease)...
         let refused = cmd_lease(&h.ctx, "release");
@@ -25293,6 +26073,32 @@ mod tests {
         assert!(dispatch_authorized(read, "family", "", &ctx));
         assert!(!dispatch_authorized(read, "family", "s-other", &ctx));
         assert!(dispatch_authorized(Scope::Owner, "family", "s-other", &ctx));
+    }
+
+    /// `pointer click` presses band capsules, so it is Owner-only at the
+    /// dispatch gate as `notice act` is (ruling 373); moving the pointer,
+    /// its status and `leave` keep the verb's base `Write` class.
+    #[test]
+    fn pointer_click_is_owner_only_at_the_dispatch() {
+        let ctx = test_ctx();
+        let write = edge_granted(Op::WriteInput, &ctx);
+        for rest in ["", "status", "leave", "move 1 2", "move -1 4"] {
+            assert_eq!(escalated_op("pointer", rest), None, "pointer {rest:?}");
+            assert!(
+                dispatch_authorized(write, "pointer", rest, &ctx),
+                "{rest:?}"
+            );
+        }
+        assert_eq!(
+            escalated_op("pointer", "click"),
+            Some(Escalation::OwnerOnly)
+        );
+        assert_eq!(
+            escalated_op("pointer", "  click  "),
+            Some(Escalation::OwnerOnly)
+        );
+        assert!(!dispatch_authorized(write, "pointer", "click", &ctx));
+        assert!(dispatch_authorized(Scope::Owner, "pointer", "click", &ctx));
     }
 
     /// THE ACCEPT LOOP BACKS OFF ON EXHAUSTION. It used to `continue` on every
@@ -27293,6 +28099,71 @@ mod tests {
     #[cfg(unix)]
     const BOX_B: &[u8] = b"\x1b[2J\x1b[H Bash command\r\n   rm -rf /tmp/work\r\n\r\n Do you want to proceed?\r\n \xe2\x9d\xaf 1. Yes\r\n   2. No\r\n";
 
+    /// THE PERSON FENCE (`if-human=<n>`, 2026-09-27; R3b of the question
+    /// answer's critique). A supervisor read the session's person count, then
+    /// a PERSON keyed it — a key the program has not read yet moves no screen,
+    /// so `if-gen=` passes — and `key if-human=<the count read> 1` answers `OK
+    /// skipped reason=person` and writes NOTHING, ahead of the screen fences.
+    /// NEGATIVE CONTROLS: the same fence before the person keyed presses, the
+    /// count read after it presses, and a screen fence alone presses over it.
+    #[test]
+    #[cfg(unix)]
+    fn a_key_fenced_on_the_person_count_never_lands_after_a_persons_key() {
+        use control_input::InputFence;
+        let (h, rx) = guarded_pipe_session(1);
+        crate::term_lock(&h.term).process(BOX_A);
+        let gen_a = screen_gen(&crate::term_lock(&h.term));
+        let press =
+            |fence: InputFence<'_>| control_input::cmd_key_fenced(&h.term, &h.ctx, &fence, "1");
+        let read = h.ctx.human_input.seq();
+        assert_eq!(
+            press(InputFence {
+                human: Some(read),
+                ..InputFence::default()
+            }),
+            "OK\n",
+            "nobody keyed: the fence holds"
+        );
+        assert_eq!(drain_pipe(&rx), b"1");
+        // A person's key reaches the session (the App seam's stamp).
+        h.ctx.human_input.note(crate::metrics::now_us());
+        for fence in [
+            InputFence {
+                human: Some(read),
+                ..InputFence::default()
+            },
+            InputFence {
+                human: Some(read),
+                generation: Some(gen_a),
+                ..InputFence::default()
+            },
+        ] {
+            assert_eq!(press(fence), "OK skipped reason=person\n");
+            assert!(
+                drain_pipe(&rx).is_empty(),
+                "a person keyed: nothing written"
+            );
+        }
+        // NEGATIVE CONTROLS: the screen fence alone cannot see it, and the
+        // count read after the person's key presses.
+        assert_eq!(
+            press(InputFence {
+                generation: Some(gen_a),
+                ..InputFence::default()
+            }),
+            "OK\n"
+        );
+        assert_eq!(drain_pipe(&rx), b"1");
+        assert_eq!(
+            press(InputFence {
+                human: Some(h.ctx.human_input.seq()),
+                ..InputFence::default()
+            }),
+            "OK\n"
+        );
+        assert_eq!(drain_pipe(&rx), b"1");
+    }
+
     /// THE SWAP SCENARIO. A supervisor read box A (its `gen=`/`hash=`), then
     /// box B replaced it. `key if-gen=<A's gen> 1` and `key if-fp=<A's hash> 1`
     /// answer `OK skipped reason=changed` and write NOTHING. NEGATIVE CONTROLS:
@@ -28136,6 +29007,9 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "control_hangup_tests.rs"]
+mod control_hangup_tests;
 #[cfg(all(test, unix))]
 #[path = "control_socket_handoff_tests.rs"]
 mod control_socket_handoff_tests;

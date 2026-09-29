@@ -196,21 +196,27 @@ impl Grid {
     /// Replaces characters with blanks in place. Does not shift remaining characters.
     /// Uses the BCE cursor template for fill per VT420/xterm spec (#7522).
     /// This implements the ECH (Erase Character) CSI sequence.
+    ///
+    /// ECH IS NOT BOUNDED BY THE DECLRMM MARGINS. The comment that used to sit
+    /// here claimed the opposite and cited the spec for it; the VT510 ECH page
+    /// says, in one sentence, "ECH works inside or outside the scrolling
+    /// margins", and DECSLRM's page is what makes those margins the horizontal
+    /// scrolling region. xterm agrees by construction — `do_erase_char`
+    /// (util.c) is a call to `ClearRight`, the same function EL 0 uses, and
+    /// `ClearRight` bounds by `MaxCols(screen)`. Ghostty's `eraseChars` bounds
+    /// by `self.cols - cursor.x` and has no out-of-margin early return at all;
+    /// iTerm2's `eraseCharactersAfterCursor:` bounds by `size.width`.
+    ///
+    /// The margins DO bind the SHIFTING operations in this file — `insert_chars`
+    /// (ICH) and `delete_chars` (DCH) — which is the split VT510 draws with
+    /// "ICH/DCH has no effect outside the scrolling margins". See the module
+    /// note in `erase.rs`.
     #[inline]
     pub fn erase_chars(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
         let cursor_row = self.storage.cursor.row;
         let cursor_col = self.storage.cursor.col;
-        let mut right_bound = self.storage.effective_cols_for_row(cursor_row);
-        // Per VT420/VT510 spec, ECH is bounded by the DECLRMM right margin
-        // when horizontal margins are active AND cursor is within the margins.
-        // When cursor is outside the margin region, use screen edge (#7491, #7580).
-        if self.storage.has_horizontal_margins {
-            let margins = self.storage.horizontal_margins();
-            if cursor_col >= margins.left && cursor_col <= margins.right {
-                right_bound = right_bound.min(margins.right + 1);
-            }
-        }
+        let right_bound = self.storage.effective_cols_for_row(cursor_row);
         if cursor_col < right_bound {
             let count = count.min(right_bound - cursor_col);
             let fill = self.storage.cursor_template;
@@ -227,6 +233,18 @@ impl Grid {
             // same one-row band; see `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
+            // An ECH that runs through the last column it can reach clears the
+            // row's right part exactly as EL 0 does, so it breaks the wrap into
+            // the row below the same way (`clear_wrap_into_next_row`). One that
+            // stops short leaves the right part's text, and the row still
+            // continues into the next: xterm's `ClearRight` breaks the link on
+            // every ECH, but conhost paints a blank run INSIDE a row as ECH then
+            // CUF and goes on writing that row (measured in an aterm cast of pwsh
+            // under ConPTY, 2026-09-22: `CSI H CSI 28 X … CSI 28 C` then the
+            // rest of row 0), so a short ECH says nothing about the row's end.
+            if cursor_col + count == right_bound {
+                self.clear_wrap_into_next_row(cursor_row);
+            }
         }
     }
 
@@ -1340,6 +1358,82 @@ mod tests {
         grid.move_cursor_to(0, 0);
         grid.erase_chars(4);
         assert!(row_trimmed(&grid, 1).starts_with("ROW1DATA"));
+    }
+
+    /// Row 0 `ABCDE` autowrapped into row 1 `FG` (a continuation), 5 columns.
+    fn wrapped_pair() -> Grid {
+        let mut grid = Grid::new(4, 5);
+        for c in "ABCDEFG".chars() {
+            grid.write_char_wrap(c);
+        }
+        assert!(
+            grid.row(1).is_some_and(|r| r.is_wrapped()),
+            "precondition: row 1 continues row 0"
+        );
+        grid
+    }
+
+    #[test]
+    fn test_ech_through_the_last_column_breaks_the_wrap_as_el0_does() {
+        // Exactly to the end and past it (ECH clamps): the right part is
+        // cleared, as by EL 0, so row 0 no longer continues into row 1.
+        for col in [0u16, 2, 4] {
+            for count in [5 - col, 99] {
+                let mut grid = wrapped_pair();
+                grid.move_cursor_to(0, col);
+                grid.erase_chars(count);
+                assert!(
+                    !grid.row(1).unwrap().is_wrapped(),
+                    "ECH {count} at col {col} breaks the link"
+                );
+                assert_eq!(row_trimmed(&grid, 1), "FG", "row 1's cells survive");
+            }
+        }
+    }
+
+    #[test]
+    fn test_ech_short_of_the_last_column_keeps_the_wrap() {
+        // conhost's blank run inside a row (`CSI n X`, `CSI n C`, then the
+        // rest of the row): the row's last column keeps its text, so the row
+        // still continues into the next.
+        for (col, count) in [(0u16, 3u16), (1, 1), (2, 2)] {
+            let mut grid = wrapped_pair();
+            grid.move_cursor_to(0, col);
+            grid.erase_chars(count);
+            assert!(
+                grid.row(1).unwrap().is_wrapped(),
+                "ECH {count} at col {col} keeps the link"
+            );
+            assert_eq!(char_at(&grid, 0, 4), 'E');
+        }
+    }
+
+    #[test]
+    fn test_ech_under_margins_runs_to_the_row_end_and_breaks_the_wrap_as_el0_does() {
+        // DECLRMM margins do not bound ECH ("ECH works inside or outside the
+        // scrolling margins", VT510; see `tests/horizontal_margin_scope.rs`),
+        // so the last column ECH can reach is the row's own, where EL 0 stops
+        // too: an ECH through it clears the right part and breaks the link.
+        let mut grid = wrapped_pair();
+        grid.set_horizontal_margins(0, 3);
+        grid.move_cursor_to(0, 1);
+        grid.erase_chars(99);
+        assert_eq!(char_at(&grid, 0, 3), ' ', "erased through the margin");
+        assert_eq!(char_at(&grid, 0, 4), ' ', "and past it, to the row end");
+        assert!(!grid.row(1).unwrap().is_wrapped());
+    }
+
+    #[test]
+    fn test_ech_under_margins_short_of_the_row_end_keeps_the_wrap() {
+        // Reaching the right margin is not reaching the row end: the last
+        // column keeps its text, so the row still continues into the next.
+        let mut grid = wrapped_pair();
+        grid.set_horizontal_margins(0, 3);
+        grid.move_cursor_to(0, 1);
+        grid.erase_chars(3);
+        assert_eq!(char_at(&grid, 0, 3), ' ', "erased through the margin");
+        assert_eq!(char_at(&grid, 0, 4), 'E', "the last column keeps its text");
+        assert!(grid.row(1).unwrap().is_wrapped());
     }
 
     // =========================================================================

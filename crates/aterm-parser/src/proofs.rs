@@ -578,6 +578,12 @@ fn transition_table_lookup_safe() {
 }
 
 // === SIMD Pointer Arithmetic Safety Proofs (#1413) ===
+//
+// These three model the SHAPE of the chunk loops in `simd.rs` (a `while offset
+// + chunk <= len` walk, then a scalar tail); they do not call `simd.rs`, so they
+// prove the arithmetic of that shape, not the shipped loop. A fourth,
+// `simd_pointer_within_bounds`, asserted its own loop guard inside the loop and
+// so proved nothing; it was deleted on 2026-09-27.
 
 /// Proof FV-SIMD-1: AVX2 offset arithmetic cannot overflow.
 ///
@@ -643,43 +649,6 @@ fn simd_neon_offset_no_overflow() {
     }
 
     kani::assert(offset <= len, "final offset must be within bounds");
-}
-
-/// Proof FV-SIMD-3: Pointer offset is always within allocation bounds.
-///
-/// Verifies that `ptr.add(offset)` in SIMD loops produces a pointer
-/// that stays within the original allocation. The condition
-/// `offset + chunk_size <= len` guarantees this.
-/// Uses bounded len (<=256) for tractable verification.
-#[kani::proof]
-#[kani::unwind(18)] // 256/16 = 16 max iterations + 1
-fn simd_pointer_within_bounds() {
-    let len: usize = kani::any();
-    let chunk_size: usize = kani::any();
-
-    // Constrain to realistic SIMD chunk sizes (16 for NEON, 32 for AVX2)
-    kani::assume(chunk_size == 16 || chunk_size == 32);
-    kani::assume(len <= 256);
-
-    let mut offset: usize = 0;
-
-    while offset + chunk_size <= len {
-        // Key invariant: we're about to read chunk_size bytes starting at offset
-        // The condition `offset + chunk_size <= len` guarantees:
-        // 1. offset < len (we're within the allocation)
-        // 2. offset + chunk_size - 1 < len (last byte of chunk is within allocation)
-
-        kani::assert(
-            offset < len,
-            "offset must be strictly less than len before read",
-        );
-        kani::assert(
-            offset + chunk_size <= len,
-            "chunk must fit within allocation",
-        );
-
-        offset += chunk_size;
-    }
 }
 
 /// Proof FV-SIMD-4: Scalar fallback processes remaining bytes correctly.
@@ -778,79 +747,24 @@ fn simd_avx2_bias_correct() {
 }
 
 // =============================================================================
-// F11-3 (#7941): CSI 16-byte SIMD chunk — non-param byte is always found
+// F11-3 (#7941): CSI parameter byte classification
 // =============================================================================
 //
-// LEDGER NOTE (2026-07): these two harnesses no longer guard production code.
-// `simd_csi` lost its last production caller when the speculative parameter
-// pre-parse was removed from `parse_csi_general` (it measured as a net loss on
-// every shape that reached it), and the module is now `#[cfg(test)]`. The
-// `unreachable!()` these proofs were written for is also long gone — the line
-// anchor below is stale. They are kept as standing proofs of the `has_end`
-// predicate algebra, which any future bulk CSI parameter parser would have to
-// re-establish; do not count them as covering shipped code.
-//
-// The NEON implementation in `simd_csi.rs` (line 403) contains an
-// `unreachable!()` guarded by the claim "has_end guarantees at least one
-// non-param byte in the 16-byte chunk, so the `else` branch above always
-// returns." This Kani harness proves that claim for all 256 byte values on
-// all 16 lanes, so the `unreachable!()` is genuinely unreachable when the
-// NEON `has_end` predicate is true.
-//
-// Concretely, the claim is:
-//
-//     has_end(chunk) == true   ==>   exists i in 0..16, chunk[i] < 0x30 || chunk[i] > 0x3B
-//
-// where `has_end` is the NEON reduction of `(chunk < 0x30) | (chunk > 0x3B)`.
-// The proof does not run the NEON intrinsics directly (Kani cannot model
-// them); it mirrors the predicate with a scalar reduction and asserts
-// logical equivalence across every lane value.
+// LEDGER NOTE: `simd_csi` has no production caller (the speculative parameter
+// pre-parse was removed from `parse_csi_general`, 2026-07; the module is
+// `#[cfg(test)]`), and its NEON scan no longer ends in an `unreachable!()`:
+// 904d99a5c replaced the intrinsics classifier with a safe chunk scan whose
+// `has_end` chunk falls through to `scalar_tail`. The harness that "proved"
+// that `unreachable!()` dead recomputed the predicate it checked and asserted
+// it equal to itself; it was deleted on 2026-09-27 (PROOF_CARRYING_PERFORMANCE
+// A4). What stays is the per-byte algebra below, a standing proof any future
+// bulk CSI parameter parser would have to re-establish — not a claim about
+// shipped code.
 
-/// For every possible 16-byte input, the NEON `has_end` reduction is true
-/// iff at least one lane is outside the CSI parameter byte range
-/// `[0x30, 0x3B]`. Equivalently, when `has_end` is true, the scalar scan in
-/// `parse_csi_params_neon` always hits the `else` branch (at line ~391) and
-/// returns, so line 403's `unreachable!()` is unreachable.
-#[kani::proof]
-fn csi_simd_has_end_implies_non_param_byte_exists() {
-    let chunk: [u8; 16] = kani::any();
-
-    // Scalar mirror of the NEON `has_end` predicate.
-    let mut has_end_scalar = false;
-    for &b in &chunk {
-        if b < 0x30 || b > 0x3B {
-            has_end_scalar = true;
-        }
-    }
-
-    if has_end_scalar {
-        // Exhibit the witness: there must be at least one lane with a
-        // non-param byte, so the linear scan would take the `else` branch.
-        let mut found_non_param = false;
-        for &b in &chunk {
-            if b < 0x30 || b > 0x3B {
-                found_non_param = true;
-            }
-        }
-        kani::assert(
-            found_non_param,
-            "has_end == true ==> exists non-param byte; simd_csi.rs:403 unreachable",
-        );
-    } else {
-        // Converse: every lane is in [0x30, 0x3B].
-        for &b in &chunk {
-            kani::assert(
-                (0x30..=0x3B).contains(&b),
-                "has_end == false ==> every lane in [0x30, 0x3B]",
-            );
-        }
-    }
-}
-
-/// Stronger: every u8 value is classified by the NEON branch in exactly one
-/// of three buckets: digit `[0x30, 0x39]`, delimiter `{0x3A, 0x3B}`, or
-/// non-param (the `else` branch). The match at simd_csi.rs:375-399 is
-/// therefore exhaustive for all 256 byte values.
+/// Every u8 value is classified in exactly one of three buckets: digit
+/// `[0x30, 0x39]`, delimiter `{0x3A, 0x3B}`, or non-param — and the chunk
+/// scan's per-lane end test (`b < 0x30 || b > 0x3B`, `simd_csi.rs`'s
+/// `has_end`) fires exactly on the non-param bucket.
 #[kani::proof]
 fn csi_simd_byte_classification_exhaustive() {
     let b: u8 = kani::any();
@@ -1111,3 +1025,92 @@ per_state_invariant_proof!(pbpi_dcs_passthrough, State::DcsPassthrough);
 per_state_invariant_proof!(pbpi_dcs_ignore, State::DcsIgnore);
 per_state_invariant_proof!(pbpi_osc_string, State::OscString);
 per_state_invariant_proof!(pbpi_sos_pm_apc_string, State::SosPmApcString);
+
+/// At most `max` arbitrary elements: a bounded symbolic `Vec`, the shape the
+/// seamless-update carry crosses the wire in.
+fn any_vec<T: kani::Arbitrary>(max: usize) -> Vec<T> {
+    let len: usize = kani::any();
+    kani::assume(len <= max);
+    let mut out = Vec::new();
+    for _ in 0..len {
+        out.push(kani::any());
+    }
+    out
+}
+
+/// A seamless update's parser carry is written by another build, so
+/// `restore_carry` must hold for EVERY value, hostile ones included: whatever
+/// it accepts leaves the parser inside the TLA+ `TypeInvariant`, in an
+/// accepted state, with no DCS or APC consumer armed and the UTF-8 decoder
+/// holding an incomplete prefix — and still inside the invariant after one
+/// arbitrary next byte; whatever it refuses leaves the parser as it was (a
+/// fresh Ground parser here).
+///
+/// Bounds: `params` up to 3 (the `MAX_PARAMS` compare is pinned past the bound
+/// by the unit refusal table), intermediates up to `MAX_INTERMEDIATES + 1`, an
+/// OSC payload up to 2 bytes, a UTF-8 tail up to `UTF8_TAIL_MAX + 1`.
+#[kani::proof]
+#[kani::unwind(7)]
+fn restore_carry_yields_valid_state() {
+    let state_idx: usize = kani::any();
+    kani::assume(state_idx < State::COUNT);
+    let carry = ParserCarry {
+        state: State::ALL[state_idx],
+        params: any_vec(3),
+        subparam_mask: kani::any(),
+        current_param: kani::any(),
+        param_started: kani::any(),
+        last_was_colon: kani::any(),
+        intermediates: any_vec(MAX_INTERMEDIATES + 1),
+        osc: any_vec(2),
+        osc_overflowed: kani::any(),
+        utf8_tail: any_vec(UTF8_TAIL_MAX + 1),
+        utf8_expected: kani::any(),
+    };
+    let mut parser = Parser::kani_stub();
+    match parser.restore_carry(&carry) {
+        Ok(()) => {
+            kani::assert(
+                parser.type_invariant(),
+                "a restored carry keeps the invariant",
+            );
+            kani::assert(
+                !matches!(
+                    parser.state,
+                    State::DcsEntry
+                        | State::DcsParam
+                        | State::DcsIntermediate
+                        | State::DcsPassthrough
+                ),
+                "a restored carry never names a hookable DCS state",
+            );
+            kani::assert(
+                !parser.dcs_active && !parser.apc_active,
+                "no consumer is armed",
+            );
+            kani::assert(
+                parser.subparam_mask >> parser.params.len() == 0,
+                "subparameter bits only below the parameters",
+            );
+            kani::assert(
+                parser.utf8_len == 0
+                    || (parser.state == State::Ground && parser.utf8_len < parser.utf8_expected),
+                "a UTF-8 tail only at Ground, and still incomplete",
+            );
+            let byte: u8 = kani::any();
+            let mut sink = NullSink;
+            parser.advance(&[byte], &mut sink);
+            kani::assert(parser.type_invariant(), "the next byte keeps the invariant");
+        }
+        Err(_) => {
+            kani::assert(
+                parser.state == State::Ground
+                    && parser.params.is_empty()
+                    && parser.intermediates.is_empty()
+                    && parser.utf8_len == 0
+                    && !parser.osc_discard,
+                "a refusal installs nothing",
+            );
+        }
+    }
+}

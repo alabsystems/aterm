@@ -458,8 +458,8 @@ impl AtermTerminal {
     /// lexicon once and starts scanning the visible grid; disabling drops all
     /// occurrence state and restores byte-identical output next render.
     /// Defaults (until other setters run) mirror the native launch config:
-    /// all four families on (profanity nova / feline cat / orca splash /
-    /// emphasis ink), animated ink on.
+    /// every class on (profanity nova / feline cat / canine / emphasis ink),
+    /// animated ink on.
     pub fn set_sparkle_words_enabled(&mut self, on: bool) {
         // WF-1 frame gate: an effects CONFIG/ignition change can light up
         // pixels on the NEXT render while `is_active()` still reads false at
@@ -477,13 +477,18 @@ impl AtermTerminal {
     }
 
     /// Per-class gates (native `[sparkle_words.<class>] enabled`): profanity
-    /// (supernova/sparkle), feline (peeking cat/paw), orca (water splash),
-    /// emphasis (ink-only; effective only while ink is enabled).
+    /// (supernova/sparkle), feline (peeking cat/paw), emphasis (ink-only;
+    /// effective only while ink is enabled).
+    ///
+    /// The third argument was the orca class's gate. The class was deleted on
+    /// 2026-09-27 (it had been suspended, so the gate already did nothing);
+    /// the argument is accepted and ignored so an embedder's existing
+    /// four-argument call keeps `emphasis` in the fourth position.
     pub fn set_sparkle_classes(
         &mut self,
         profanity: bool,
         feline: bool,
-        orca: bool,
+        _retired_orca: bool,
         emphasis: bool,
     ) {
         // WF-1 frame gate: an effects CONFIG/ignition change can light up
@@ -493,7 +498,7 @@ impl AtermTerminal {
         // lets the pipeline seed itself (same rule as `note_keystroke`).
         self.note_host_visual_change();
         self.effects
-            .set_sparkle_classes(profanity, feline, orca, emphasis);
+            .set_sparkle_classes(profanity, feline, emphasis);
     }
 
     /// Animated-ink knobs (native `[sparkle_words.ink]`): the glyph-ink
@@ -739,8 +744,9 @@ impl AtermTerminal {
     }
 
     /// The pointer's position in FRAME px (the canvas's own device pixels,
-    /// chrome included — the same space `selection_start` speaks). The pet
-    /// watches a moving pointer and pounces on a fast one; feed every
+    /// chrome and message band included — the pixels the page already has;
+    /// the pipeline reads them against the grid where the frame draws it).
+    /// The pet watches a moving pointer and pounces on a fast one; feed every
     /// `mousemove`. Value-shadowed: a sample equal to the last one changes
     /// nothing and costs no render, so an idle hover cannot delete the frame
     /// gate. A non-finite coordinate is dropped.
@@ -763,7 +769,8 @@ impl AtermTerminal {
         }
     }
 
-    /// A left press at FRAME px `(x, y)`. Returns the engine's verdict as a
+    /// A left press at FRAME px `(x, y)` (the canvas's device pixels, chrome
+    /// and message band included). Returns the engine's verdict as a
     /// small integer: `0` = pass (nothing of the engine's was under the
     /// pointer — start your selection as usual), `1` = the pet was petted
     /// and the press is CONSUMED (chrome wins: do not start a selection, do

@@ -229,7 +229,9 @@ fn a_refused_state_root_is_said_not_silent() {
         .expect("piped")
         .read_to_string(&mut stderr);
     assert!(
-        stderr.contains("no private log dir") && stderr.contains("ATERM_STATE_HOME"),
+        stderr.contains(
+            "ATERM_STATE_HOME is not an absolute path; crash reports and aterm.log are off"
+        ),
         "{stderr}"
     );
     assert!(

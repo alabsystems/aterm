@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-release` — the release cutter behind the `cargo ship` alias
+//! `aterm-release` — the release cutter behind the `targo --unverified ship` alias
 //! (release spec "aterm release+update v2").
 //!
 //! One binary owns the whole cut: pre-claim gates → build-number ledger claim

@@ -67,13 +67,22 @@ pub fn parse_update_enabled(text: &str) -> bool {
     match aterm_toml::from_str::<UpdateOnly>(text) {
         Ok(root) => root.update.and_then(|u| u.enabled).unwrap_or(true),
         Err(e) => {
-            crate::warn(&format!(
-                "ignoring a malformed [update] table in aterm.toml — automatic updates \
-                 stay on: {e}"
-            ));
+            crate::warn(&update_parse_notice(text, &e));
             true
         }
     }
+}
+
+/// The log line for text [`parse_update_enabled`] could not read: a file that does not
+/// parse at all is told apart from a mistyped `[update]` value, and either way the
+/// person learns their `enabled = false` is not in force.
+fn update_parse_notice(text: &str, e: &aterm_toml::Error) -> String {
+    let what = if aterm_toml::from_str::<aterm_toml::Table>(text).is_err() {
+        "aterm.toml does not parse"
+    } else {
+        "[update] in aterm.toml has a value of the wrong type"
+    };
+    format!("{what} — automatic updates stay on: {e}")
 }
 
 /// [`parse_update_enabled`] over the file at `path`; a file that is absent, not a
@@ -180,6 +189,26 @@ mod tests {
         ));
         assert!(parse_update_enabled("[update]\nenabled = \"no\"\n"));
         assert!(parse_update_enabled("[update\nbroken"));
+    }
+
+    #[test]
+    fn the_parse_notice_names_the_whole_file_or_the_update_table() {
+        let notice = |text: &str| {
+            let e = aterm_toml::from_str::<UpdateOnly>(text).expect_err("fixture must fail");
+            update_parse_notice(text, &e)
+        };
+        let syntax = notice("font_px =\n[update]\nenabled = false\n");
+        assert!(
+            syntax.starts_with("aterm.toml does not parse — automatic updates stay on: "),
+            "{syntax}"
+        );
+        let typed = notice("[update]\nenabled = \"no\"\n");
+        assert!(
+            typed.starts_with(
+                "[update] in aterm.toml has a value of the wrong type — automatic updates stay on: "
+            ),
+            "{typed}"
+        );
     }
 
     #[test]

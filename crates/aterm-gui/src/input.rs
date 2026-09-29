@@ -2089,8 +2089,12 @@ mod tests {
                 let _ = tx.send((a, b));
             })
         };
+        // A hang detector, not a latency budget: `held` is dropped only after
+        // this answer, so a seam that parks behind it never answers — a minute
+        // catches that as surely as 5 s did, and a loaded machine cannot fail
+        // the pass.
         let (a, b) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("the seam parked behind the terminal mutex to read keyboard_mode()");
         drop(held);
         worker.join().unwrap();

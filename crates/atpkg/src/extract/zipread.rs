@@ -84,11 +84,9 @@ const LOCAL_FIXED: u64 = 30;
 /// A symlink target longer than `PATH_MAX` names no valid link.
 const MAX_LINK_TARGET: u64 = 4096;
 
-/// `zip: <what>` as an `InvalidData` error (manual concat — see `lib.rs` on `format!`).
+/// `zip: <what>` as an `InvalidData` error.
 fn bad(what: &str) -> io::Error {
-    let mut m = String::from("zip: ");
-    m.push_str(what);
-    io::Error::new(io::ErrorKind::InvalidData, m)
+    io::Error::new(io::ErrorKind::InvalidData, format!("zip: {what}"))
 }
 
 fn u16_at(b: &[u8], off: usize) -> io::Result<u16> {

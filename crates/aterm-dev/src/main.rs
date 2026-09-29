@@ -154,7 +154,14 @@ fn run_ship(forwarded: &[String]) -> i32 {
             return 1;
         }
     };
-    let driver = ship_driver();
+    let Some(driver) = ship_driver() else {
+        // THE LADDER'S LAST RUNG IS A REFUSAL (owner directive 2026-09-28). A
+        // bare `targo` here would re-admit exactly what rung 4 filters out —
+        // a PATH-order targo that is not the managed one — so no rung
+        // answering means no build, never a guess.
+        eprintln_str(NO_SHIP_DRIVER);
+        return 1;
+    };
     let status = Command::new(&driver)
         .args(cargo_lane_args(&driver))
         .arg(SHIP_NAME)
@@ -175,7 +182,7 @@ fn run_ship(forwarded: &[String]) -> i32 {
             msg.push_str(&e.to_string());
             msg.push_str(
                 " (fix: aterm pkg install trust, then `aterm pkg which targo`; \
-                          or put a rustup `cargo` on PATH)",
+                          or set CARGO to a Trust targo)",
             );
             eprintln_str(&msg);
             1
@@ -211,8 +218,11 @@ fn run_ship(forwarded: &[String]) -> i32 {
 ///      the shim's EXEC TARGET ([`shim_exec_target`]), the build-numbered store
 ///      file, as the scripts pin it — never the shim path, whose body the next
 ///      `aterm pkg install trust` rewrites.
-///   5. bare `cargo` — the documented last resort for a rustup box; the spawn
-///      failure in `run_ship` names the product's fix first.
+///   5. nothing — `None`, and `run_ship` REFUSES with [`NO_SHIP_DRIVER`]. Until
+///      2026-09-28 this rung was a bare `cargo` (a rustup box's last resort);
+///      it is neither that nor a bare `targo`, which would adopt the very
+///      PATH-order copy step 4 declines (owner directive 2026-09-28: ALab
+///      systems build with Trust, and the managed one).
 ///
 /// EVERY HIT IS RESOLVED BEFORE IT RUNS ([`physical`]). Step 3 used to return
 /// `store/trust/current/bin/targo` as it stood, and targo takes its `trustc`,
@@ -224,7 +234,7 @@ fn run_ship(forwarded: &[String]) -> i32 {
 /// flip under the build-numbered path finished clean. A `$CARGO` that names
 /// `current` (an outer targo started that way) is the same hazard, so it is
 /// resolved too.
-fn ship_driver() -> PathBuf {
+fn ship_driver() -> Option<PathBuf> {
     let which = || {
         Command::new("aterm")
             .args(["pkg", "which", "targo"])
@@ -249,12 +259,12 @@ fn ship_driver_from(
     which: impl FnOnce() -> Option<PathBuf>,
     home: Option<std::ffi::OsString>,
     path: Option<std::ffi::OsString>,
-) -> PathBuf {
+) -> Option<PathBuf> {
     if let Some(cargo) = cargo.filter(|c| !c.is_empty()) {
-        return physical(PathBuf::from(cargo));
+        return Some(physical(PathBuf::from(cargo)));
     }
     if let Some(cand) = which().filter(|cand| is_executable(cand)) {
-        return physical(cand);
+        return Some(physical(cand));
     }
     let prefix = home
         .filter(|h| !h.is_empty())
@@ -267,7 +277,7 @@ fn ship_driver_from(
             .join("bin")
             .join("targo");
         if is_executable(&cand) {
-            return physical(cand);
+            return Some(physical(cand));
         }
     }
     if let (Some(prefix), Some(path)) = (&prefix, path) {
@@ -277,12 +287,21 @@ fn ship_driver_from(
             }
             let cand = dir.join("targo");
             if cand.starts_with(prefix) && is_executable(&cand) {
-                return physical(shim_exec_target(&cand).unwrap_or(cand));
+                return Some(physical(shim_exec_target(&cand).unwrap_or(cand)));
             }
         }
     }
-    PathBuf::from("cargo")
+    None
 }
+
+/// What `ship` prints when [`ship_driver`] found no managed Trust `targo` —
+/// the product's fix first, then the one explicit override. Never a stock
+/// `cargo`, and never "whatever `targo` PATH holds".
+const NO_SHIP_DRIVER: &str = "aterm-dev: no managed Trust targo to run `ship` with ($CARGO is \
+                              unset, `aterm pkg which targo` named no store copy, and no targo \
+                              under the atpkg prefix was found in the store or on PATH) (fix: \
+                              aterm pkg install trust, then `aterm pkg which targo`; or set \
+                              CARGO to a Trust targo)";
 
 /// `path` with its DIRECTORY resolved to the physical one — the Rust form of
 /// the scripts' `$(cd "$(dirname "$cand")" && pwd -P)/$(basename "$cand")`.
@@ -758,7 +777,10 @@ mod tests {
         std::os::unix::fs::symlink("9192", prefix.join("store/trust/current")).expect("ln");
         let real = std::fs::canonicalize(&build).expect("real").join("targo");
         let through_current = prefix.join("store/trust/current/bin/targo");
-        let pinned = |got: PathBuf, rung: &str| {
+        let pinned = |got: Option<PathBuf>, rung: &str| {
+            let Some(got) = got else {
+                panic!("{rung}: the ladder refused a rung that has a driver");
+            };
             assert_eq!(got, real, "{rung}");
             assert!(
                 !got.components().any(|c| c.as_os_str() == "current"),
@@ -800,11 +822,43 @@ mod tests {
             ship_driver_from(None, || None, Some(home.clone().into()), Some(shims.into())),
             "4: the managed shim, pinned to its exec target",
         );
-        // 5: nothing names a driver.
+        // 5: nothing names a driver — a refusal, never a bare `targo`/`cargo`.
+        assert_eq!(ship_driver_from(None, || None, None, None), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A STRAY `targo` ON PATH IS NEVER THE SHIP DRIVER. Rung 4 declines a
+    /// PATH copy outside the atpkg prefix (a source-built stage2, a Homebrew
+    /// farm link, an impostor script); until 2026-09-28 the bare-name rung
+    /// after it adopted that same copy by name anyway (a bare `cargo` before
+    /// that). Now the ladder answers `None` and `run_ship` refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_stray_path_targo_is_refused_not_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("aterm-dev-stray-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let stray = tmp.join("stray-bin");
+        std::fs::create_dir_all(&stray).expect("mkdir stray");
+        let impostor = stray.join("targo");
+        std::fs::write(&impostor, "#!/bin/sh\necho 'targo 0.0.0-fake'\n").expect("write");
+        std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Home set (so rung 3/4 know the prefix, which holds no store), the
+        // impostor FIRST on PATH, no $CARGO, no `aterm pkg which` answer.
         assert_eq!(
-            ship_driver_from(None, || None, None, None),
-            PathBuf::from("cargo")
+            ship_driver_from(
+                None,
+                || None,
+                Some(home.clone().into()),
+                Some(stray.clone().into_os_string())
+            ),
+            None,
+            "a targo outside the atpkg prefix must not become the ship driver"
         );
+        assert!(NO_SHIP_DRIVER.contains("aterm pkg install trust"));
+        assert!(!NO_SHIP_DRIVER.contains("rustup"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

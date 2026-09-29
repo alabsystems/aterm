@@ -2737,7 +2737,8 @@ impl App {
         };
         let now = Instant::now();
         let all: Vec<String> = ws
-            .cursor_glow
+            .cursor_fx
+            .glow
             .admission_log()
             .map(|record| record.line(now))
             .collect();
@@ -3180,7 +3181,7 @@ impl App {
             let (detector, cat, glow, riff_bar) = (
                 &mut ws.kitty_sing,
                 &mut ws.cursor_cat,
-                &mut ws.cursor_glow,
+                &mut ws.cursor_fx.glow,
                 &mut ws.sing_riff_bar,
             );
             sync_capture_companion_song(CaptureCompanionSongSync {
@@ -3565,7 +3566,7 @@ impl App {
             let (detector, cat, glow, riff_bar) = (
                 &mut ws.kitty_sing,
                 &mut ws.cursor_cat,
-                &mut ws.cursor_glow,
+                &mut ws.cursor_fx.glow,
                 &mut ws.sing_riff_bar,
             );
             sync_capture_companion_song(CaptureCompanionSongSync {
@@ -4764,17 +4765,17 @@ impl App {
             } else if blink_epoch != ws.blink_epoch_seen {
                 ws.blink_epoch_seen = blink_epoch;
                 ws.last_blink_at = Some(now);
-                ws.cursor_glow.note_repaint_blink(now);
-                ws.cursor_trail.note_repaint_blink(now);
+                ws.cursor_fx.glow.note_repaint_blink(now);
+                ws.cursor_fx.trail.note_repaint_blink(now);
             }
-            ws.cursor_glow.note_context(is_alt);
-            ws.cursor_trail.note_context(is_alt);
+            ws.cursor_fx.glow.note_context(is_alt);
+            ws.cursor_fx.trail.note_context(is_alt);
             // `splice_cursor_fx` only ticks a single/zoomed pane, in the
             // capture grid's zero-based coordinate space. Restamp that shape
             // explicitly so a prior composed-frame offset cannot survive a
             // split/zoom transition and misclassify the physical margin.
-            ws.cursor_glow.note_pane_columns(0, cols);
-            ws.cursor_trail.note_pane_columns(0, cols);
+            ws.cursor_fx.glow.note_pane_columns(0, cols);
+            ws.cursor_fx.trail.note_pane_columns(0, cols);
             let blink_recent = ws.last_blink_at.is_some_and(|t| {
                 now.saturating_duration_since(t) <= crate::app_render::BLINK_RECENT_MAX
             });
@@ -4793,17 +4794,18 @@ impl App {
                         &term,
                         usize::from(cpos.row),
                         rows,
-                        ws.cursor_glow.v2_owns_frame(),
+                        ws.cursor_fx.glow.v2_owns_frame(),
                         &mut ws.poof_row_above_buf,
                         &mut ws.poof_row_below_buf,
                     );
                 // THE CONTENT WITNESS's rows — the windowed frame-hold capture's
                 // twin, so this helper retires an abandoned band exactly as
                 // a windowed present would.
-                ws.cursor_glow
+                ws.cursor_fx
+                    .glow
                     .observe_ribbon_row(cpos.row, &ws.poof_row_buf);
                 let mut ribbon_rows = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
-                let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
+                let n = ws.cursor_fx.glow.ribbon_rows(&mut ribbon_rows);
                 for &r in &ribbon_rows[..n] {
                     if usize::from(r) < rows && r != cpos.row {
                         if let Some(captured) = crate::app_render::captured_witness_neighbor(
@@ -4812,9 +4814,9 @@ impl App {
                             neighbor_above.then_some(ws.poof_row_above_buf.as_slice()),
                             neighbor_below.then_some(ws.poof_row_below_buf.as_slice()),
                         ) {
-                            ws.cursor_glow.observe_ribbon_row(r, captured);
+                            ws.cursor_fx.glow.observe_ribbon_row(r, captured);
                         } else {
-                            ws.cursor_glow.capture_ribbon_row(r, |cols| {
+                            ws.cursor_fx.glow.capture_ribbon_row(r, |cols| {
                                 term.row_cols_into(usize::from(r), cols);
                             });
                         }
@@ -4877,27 +4879,27 @@ impl App {
         // colour they render at.
         ws.input_scratch
             .cursor_glow_add
-            .clone_from(&ws.glow_scratch);
+            .clone_from(&ws.cursor_fx.glow_scratch);
         ws.input_scratch.glow_halo.clear();
         ws.input_scratch
             .glow_halo
-            .extend_from_slice(ws.cursor_glow.halos());
+            .extend_from_slice(ws.cursor_fx.glow.halos());
         ws.input_scratch.fire_patch.clear();
         ws.input_scratch
             .fire_patch
-            .extend_from_slice(ws.cursor_glow.patches());
+            .extend_from_slice(ws.cursor_fx.glow.patches());
         ws.input_scratch.glow_under.clear();
         ws.input_scratch
             .glow_under
-            .extend_from_slice(ws.cursor_glow.under_quads());
+            .extend_from_slice(ws.cursor_fx.glow.under_quads());
         ws.input_scratch.char_fg.clear();
         ws.input_scratch
             .char_fg
-            .extend_from_slice(ws.cursor_glow.charred());
+            .extend_from_slice(ws.cursor_fx.glow.charred());
         ws.input_scratch.fire_halo.clear();
         ws.input_scratch
             .fire_halo
-            .extend_from_slice(ws.cursor_glow.halo_cells());
+            .extend_from_slice(ws.cursor_fx.glow.halo_cells());
         // Shape and the canonical resolved fill, mirroring `redraw_window`.
         // `tick_cursor_fx` already applied precedence and presentation opacity;
         // rebuilding the seven raw candidates here would bypass the shed fade.
@@ -4915,7 +4917,9 @@ impl App {
                 fx.momentum_steady,
             );
         ws.input_scratch.cursor_fill_override = fx.block_fill.map(|owned| owned.fill);
-        ws.input_scratch.cursor_trail.clone_from(&ws.trail_scratch);
+        ws.input_scratch
+            .cursor_trail
+            .clone_from(&ws.cursor_fx.trail_scratch);
         ws.input_scratch.cursor_trail_color = fx.trail_color;
     }
 
@@ -5193,6 +5197,8 @@ impl App {
                     // splice. The helper dispatches the split path itself and
                     // retains (rather than advances) under a recording owner.
                     self.splice_word_decorations_sampled(front, capture_now, capture_focus);
+                    self.refresh_pane_headers(front, &capture_plan);
+                    self.paint_pane_headers(front);
                     self.splice_tab_strip(front);
                     self.splice_find_bar(front);
                     self.splice_settings_panel(front);
@@ -5992,8 +5998,11 @@ impl App {
                     image.z_index.hash(hash);
                     // Placement POLICY, not just payload: the same raster in the
                     // same footprint draws differently pixel-exact (sixel,
-                    // un-sized Kitty) than fitted (OSC 1337, Kitty `c=`/`r=`).
-                    image.pixel_exact.hash(hash);
+                    // un-sized Kitty) than fitted (OSC 1337, Kitty `c=`/`r=`)
+                    // or stretched (`preserveAspectRatio=0`), and a Kitty crop
+                    // shows a different part of it.
+                    image.scaling.hash(hash);
+                    image.source_rect.hash(hash);
                     image.bytes.hash(hash);
                 }
             }
@@ -6167,8 +6176,8 @@ impl App {
     /// headless driver asserts split state, reads zoom, and aims per-pane
     /// mouse/focus actions off these cell rects). One `layout …` header, then
     /// one `pane …` row per VISIBLE pane (a zoomed tab reports the single
-    /// zoomed rect — what the glass shows). Cell coords; the 1-cell divider
-    /// gaps are exactly the cells no rect covers. `session` = cross-session
+    /// zoomed rect — what the glass shows). Content cell coords; split dividers
+    /// and the per-pane subtab headers are outside these rects. `session` = cross-session
     /// target: the window whose ACTIVE tab displays it (the `image` routing
     /// rule, so `@<sid> panes` and `@<sid> image` describe the SAME window).
     /// Empty when no window resolves (the verb frames `OK 0` — for a cross
@@ -6587,6 +6596,8 @@ impl App {
             // dispatches on one-pane versus composed geometry. It also owns the
             // capture/recording clock boundary, so this is safe in both modes.
             self.splice_word_decorations_sampled(front, capture_now, capture_focus);
+            self.refresh_pane_headers(front, &capture_plan);
+            self.paint_pane_headers(front);
             self.splice_tab_strip(front);
             self.splice_find_bar(front);
             self.splice_settings_panel(front);
@@ -6853,6 +6864,23 @@ impl App {
     /// Off macOS there is no native chrome, so it returns a single explanatory line.
     #[cfg(target_os = "macos")]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
+        /// The title a row shows now: ⌘W's is live state that the item carries
+        /// only as last stamped (`menu::native_row_title`).
+        fn menu_item_title(item: aterm_objc::Id) -> String {
+            use aterm_objc::sel;
+            // SAFETY: `item` is a live `NSMenuItem` borrowed from its menu's
+            // `itemArray` inside the caller's pool, on the main thread; `-tag`
+            // and `-title` are side-effect-free getters with no preconditions,
+            // and the title is +0, copied out before the pool drains.
+            let (tag, stamped) = unsafe {
+                (
+                    crate::appkit::send_isize(item, sel!(tag)),
+                    crate::appkit::nsstring_to_rust(crate::appkit::send_id(item, sel!(title))),
+                )
+            };
+            crate::menu::native_row_title(tag, stamped)
+        }
+
         /// A menu item the menu does not show: `-isHidden`, or an
         /// `-isAlternate` item standing in for its neighbour only while a
         /// modifier is held. Both are `-(BOOL)` getters with no side effect.
@@ -7062,7 +7090,7 @@ impl App {
                             if kid.is_null() {
                                 continue;
                             }
-                            let name = appkit::nsstring_to_rust(appkit::send_id(kid, sel!(title)));
+                            let name = menu_item_title(kid);
                             // Skip separators (empty title) so the listing reads as
                             // the command set, not the dividers — and what the
                             // menu does not SHOW (ruling 267): AppKit keeps hidden
@@ -7092,7 +7120,7 @@ impl App {
                                     if item.is_null() || menu_item_unshown(item) {
                                         String::new()
                                     } else {
-                                        appkit::nsstring_to_rust(appkit::send_id(item, sel!(title)))
+                                        menu_item_title(item)
                                     }
                                 })
                                 .filter(|t| !t.is_empty())
@@ -7148,11 +7176,16 @@ impl App {
             .frontmost_window
             .and_then(|w| self._toolbars.get(&w))
             .map_or_else(Vec::new, |handle| self.apprt.read_toolbar_tab_menus(handle));
+        // The Version menu's install row and ⌘W's title are live state, read
+        // as the palette reads them: the install row's label or no row, and
+        // Close Pane on a split tab.
+        let live = self.palette_live();
+        let apply_row = crate::palette::apply_row_label(&live);
         non_macos_chrome_output(
             out,
             toolbar_tabs,
             tab_menus,
-            crate::menu::menu_chrome_lines(),
+            crate::menu::menu_chrome_lines(apply_row.as_deref(), live.front_tab_split),
         )
     }
 
@@ -9479,9 +9512,10 @@ mod dims_snapshot_tests {
     /// visible plan — and the two engines place panes by different rules once
     /// a layout is squeezed (the plan honours a nested split's minimum, the
     /// tree clamps each leaf to one cell: `pane.rs`'s module docs). Two stacked
-    /// splits in a window dragged down to five rows: the plan gives the top
-    /// pane one row so the nested pair keeps a row each, the tree gives it two
-    /// — so `panes` said `2x…` over an engine `dims` read as one row. The
+    /// splits in a window dragged down to six rows: after reserving title rows, the plan
+    /// gives the top pane one content row so the nested pair keeps a row each,
+    /// while the tree gives it two. Reporting the tree would therefore claim
+    /// `2x…` over an engine `dims` reads as one row. The
     /// negative control pins that the old source really disagrees here, so
     /// the agreement above is not vacuous.
     #[test]
@@ -9491,7 +9525,7 @@ mod dims_snapshot_tests {
         app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
         app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Horizontal);
         let cols = app.windows[&wid].cols;
-        app.windows.get_mut(&wid).expect("window 0").rows = 5;
+        app.windows.get_mut(&wid).expect("window 0").rows = 6;
         app.resize_panes(wid);
 
         let reported = panes_rows_matching_the_engines(&app, 3);
@@ -9499,7 +9533,7 @@ mod dims_snapshot_tests {
         let tree = app
             .active_tree(wid)
             .expect("an all-terminal tab has a tree");
-        let old = tree.compute_layout(5, cols);
+        let old = tree.compute_layout(6, cols);
         assert!(
             old.iter().any(|rect| {
                 reported
@@ -11409,7 +11443,25 @@ mod terminal_split_capture_tests {
     #[test]
     fn split_capture_grid_composes_sparse_panes_without_present_side_effects() {
         let (mut app, wid, right) = split_fixture();
-        let rects = app.active_tree(wid).unwrap().compute_layout(24, 80);
+        let plan = app
+            .active_visible_leaf_plan(wid)
+            .expect("visible split plan");
+        let rects: Vec<_> = plan
+            .leaves
+            .iter()
+            .map(|leaf| crate::pane::PaneRect {
+                session: app
+                    .view_store
+                    .get(leaf.view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    .expect("terminal leaf"),
+                row_off: leaf.rect.origin.y.round() as u16,
+                col_off: leaf.rect.origin.x.round() as u16,
+                rows: leaf.rect.size.height.round() as u16,
+                cols: leaf.rect.size.width.round() as u16,
+            })
+            .collect();
         let left_rect = rects.iter().find(|rect| rect.session == 0).unwrap();
         let right_rect = rects.iter().find(|rect| rect.session == right).unwrap();
         let left_term = app.pool.get(0).unwrap().term.clone();
@@ -11446,7 +11498,7 @@ mod terminal_split_capture_tests {
         );
         {
             let window = app.windows.get_mut(&wid).unwrap();
-            window.glow_scratch = vec![aterm_render::GlowQuad {
+            window.cursor_fx.glow_scratch = vec![aterm_render::GlowQuad {
                 row: right_rect.row_off,
                 x: 0,
                 y: 0,
@@ -11458,7 +11510,7 @@ mod terminal_split_capture_tests {
                 color2: 0x0012_3456,
                 alpha2: 0,
             }];
-            window.trail_scratch = vec![
+            window.cursor_fx.trail_scratch = vec![
                 aterm_render::TrailCell {
                     row: usize::from(right_rect.row_off),
                     col: usize::from(right_rect.col_off),
@@ -11475,8 +11527,8 @@ mod terminal_split_capture_tests {
             window.composed_cursor_fill = Some(0x00AB_CDEF);
             window.composed_cursor_trail_color = 0x00DE_ADBE;
         }
-        let retained_glow = app.windows[&wid].glow_scratch.clone();
-        let retained_trail = app.windows[&wid].trail_scratch.clone();
+        let retained_glow = app.windows[&wid].cursor_fx.glow_scratch.clone();
+        let retained_trail = app.windows[&wid].cursor_fx.trail_scratch.clone();
         assert!(
             app.splice_focused_composed_cursor_effects(
                 wid,
@@ -11488,7 +11540,9 @@ mod terminal_split_capture_tests {
         );
 
         let ws = &app.windows[&wid];
-        let row = &ws.input_scratch.cells[0];
+        let content_row = usize::from(left_rect.row_off);
+        assert_eq!(left_rect.row_off, right_rect.row_off);
+        let row = &ws.input_scratch.cells[content_row];
         assert_eq!(row[usize::from(left_rect.col_off)].ch, 'L');
         assert_eq!(row[usize::from(right_rect.col_off)].ch, 'R');
         let divider = usize::from(left_rect.col_off + left_rect.cols);
@@ -11513,7 +11567,7 @@ mod terminal_split_capture_tests {
             [0x40, 0x50, 0x60],
             "right sparse tail uses the right terminal's implicit OSC-11 blank"
         );
-        assert_eq!(ws.input_scratch.cursor_row, 0);
+        assert_eq!(ws.input_scratch.cursor_row, usize::from(right_rect.row_off));
         assert!(
             (usize::from(right_rect.col_off)..usize::from(right_rect.col_off + right_rect.cols))
                 .contains(&ws.input_scratch.cursor_col),
@@ -11524,12 +11578,12 @@ mod terminal_split_capture_tests {
         // so this all-ordinary split must stay uniform and every pane column must
         // still resolve to a single-width run — the same clip both renderers read.
         assert!(
-            ws.input_scratch.line_size_spans[0].is_empty(),
+            ws.input_scratch.line_size_spans[content_row].is_empty(),
             "an all-single-width split records no DEC runs"
         );
         assert!(
-            aterm_render::row_is_uniform(&ws.input_scratch, 0),
-            "the capture composite must present row 0 to the renderers as uniform"
+            aterm_render::row_is_uniform(&ws.input_scratch, content_row),
+            "the capture composite must present the first content row as uniform"
         );
         let uniform_run = (
             aterm_core::grid::LineSize::SingleWidth,
@@ -11543,24 +11597,28 @@ mod terminal_split_capture_tests {
             usize::from(right_rect.col_off + right_rect.cols - 1),
         ] {
             assert_eq!(
-                ws.input_scratch.line_size_run_at(0, col),
+                ws.input_scratch.line_size_run_at(content_row, col),
                 uniform_run,
                 "ordinary pane column {col} resolves to the uniform single-width run"
             );
         }
         assert_eq!(
-            ws.input_scratch.default_bg_spans[0].len(),
+            ws.input_scratch.default_bg_spans[content_row].len(),
             2,
             "both panes retain independent live default-background provenance"
         );
         assert_eq!(
-            ws.input_scratch
-                .default_bg_at(0, usize::from(left_rect.col_off + left_rect.cols - 1),),
+            ws.input_scratch.default_bg_at(
+                content_row,
+                usize::from(left_rect.col_off + left_rect.cols - 1),
+            ),
             0x0010_2030,
         );
         assert_eq!(
-            ws.input_scratch
-                .default_bg_at(0, usize::from(right_rect.col_off + right_rect.cols - 1),),
+            ws.input_scratch.default_bg_at(
+                content_row,
+                usize::from(right_rect.col_off + right_rect.cols - 1),
+            ),
             0x0040_5060,
         );
         let (cell_w, cell_h) = app.win_cell_size(wid);
@@ -11620,8 +11678,8 @@ mod terminal_split_capture_tests {
             window.input_scratch.cells, styled_cells,
             "clean strips effects without changing the composed terminal grid"
         );
-        assert_eq!(window.glow_scratch, retained_glow);
-        assert_eq!(window.trail_scratch, retained_trail);
+        assert_eq!(window.cursor_fx.glow_scratch, retained_glow);
+        assert_eq!(window.cursor_fx.trail_scratch, retained_trail);
         assert_eq!(
             window.predictor.next_deadline(),
             predictor_deadline,
@@ -11981,6 +12039,15 @@ mod terminal_split_capture_tests {
         app.tab_strip_rows = 1;
         let base_rows = usize::from(app.windows[&wid].rows);
         let cols = usize::from(app.windows[&wid].cols);
+        let plan = app
+            .active_visible_leaf_plan(wid)
+            .expect("visible split plan");
+        let content_row = plan.leaves[0].rect.origin.y.round() as usize;
+        assert!(
+            plan.leaves
+                .iter()
+                .all(|leaf| leaf.rect.origin.y.round() as usize == content_row)
+        );
 
         let dir =
             std::env::temp_dir().join(format!("aterm-terminal-split-image-{}", std::process::id()));
@@ -12036,8 +12103,8 @@ mod terminal_split_capture_tests {
         );
         assert_eq!(ws.input_scratch.cells.len(), base_rows + 1);
         let text = terminal_capture_text(&ws.input_scratch, 1, cols);
-        assert!(text.lines().next().unwrap().contains("LEFT"));
-        assert!(text.lines().next().unwrap().contains("RIGHT"));
+        assert!(text.lines().nth(content_row).unwrap().contains("LEFT"));
+        assert!(text.lines().nth(content_row).unwrap().contains("RIGHT"));
         assert!(
             ws.companion.brain().is_active(),
             "the production composed-image route advances the default resident pet"
@@ -14082,7 +14149,7 @@ mod encode_worker_tests {
         );
         {
             let window = app.windows.get_mut(&wid).unwrap();
-            window.glow_scratch = vec![aterm_render::GlowQuad {
+            window.cursor_fx.glow_scratch = vec![aterm_render::GlowQuad {
                 row: u16::try_from(terminal_rect.0).unwrap(),
                 x: 0,
                 y: 0,
@@ -14094,7 +14161,7 @@ mod encode_worker_tests {
                 color2: 0x0042_84C6,
                 alpha2: 0,
             }];
-            window.trail_scratch = vec![
+            window.cursor_fx.trail_scratch = vec![
                 aterm_render::TrailCell {
                     row: terminal_rect.0,
                     col: terminal_rect.1,
@@ -15260,7 +15327,7 @@ mod encode_worker_tests {
         );
         let steady = app.host_visual_state(wid, Instant::now());
         let before = app.windows[&wid].presence.fp(Instant::now());
-        app.start_presence_ripple(wid, Instant::now());
+        aterm_messages::presence::drive::ripple(&mut app, wid, Instant::now());
         assert!(
             app.windows[&wid].presence.ripple_at.is_none(),
             "no ripple starts"
@@ -16306,8 +16373,8 @@ mod headless_cursor_fx_tests {
         // explicit preview/test licence before changing the terminal cursor.
         {
             let ws = app.windows.get_mut(&wid).expect("headless window 0");
-            ws.cursor_glow.note_synthetic_move(t0);
-            ws.cursor_trail.note_synthetic_move(t0);
+            ws.cursor_fx.glow.note_synthetic_move(t0);
+            ws.cursor_fx.trail.note_synthetic_move(t0);
         }
         // Advance the scripted cursor without minting a parser generation: a
         // synthetic licence is for preview/test geometry, while parser output
@@ -16379,9 +16446,9 @@ mod headless_cursor_fx_tests {
                 .process(b"\x1b[5;1HABOVE\x1b[6;1HCURRENT\x1b[7;1HBELOW\x1b[6;8H");
         }
         let t0 = Instant::now();
-        assert!(!app.windows[&wid].cursor_glow.v2_owns_frame());
+        assert!(!app.windows[&wid].cursor_fx.glow.v2_owns_frame());
         app.splice_cursor_fx(wid, t0);
-        let glow = &app.windows[&wid].cursor_glow;
+        let glow = &app.windows[&wid].cursor_fx.glow;
         assert!(glow.v2_owns_frame(), "the first capture's tick engages v2");
         assert_eq!(
             glow.neighbor_rows_probed(),
@@ -16391,7 +16458,7 @@ mod headless_cursor_fx_tests {
         app.splice_cursor_fx(wid, t0 + Duration::from_millis(16));
         let ws = &app.windows[&wid];
         assert_eq!(
-            ws.cursor_glow.neighbor_rows_probed(),
+            ws.cursor_fx.glow.neighbor_rows_probed(),
             Some((true, true)),
             "once v2 owns the frame the capture's rows reach the witnesses"
         );

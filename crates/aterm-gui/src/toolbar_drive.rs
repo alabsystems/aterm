@@ -46,8 +46,7 @@
 //! arm64, not 2, and the only instrument that could see it was the strip's own
 //! ink columns.
 //!
-//! # The exit contract, which `aterm_verify::stages::objc_toolbar_outcome`
-//! reads
+//! # The exit contract, which `aterm_verify::stages::OBJC_DRIVES` reads
 //!
 //! | code | meaning |
 //! |---|---|

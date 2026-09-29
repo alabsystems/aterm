@@ -193,7 +193,7 @@ impl<'de> Deserializer<'de> {
                 b'\\' => {
                     self.push_chunk(&mut out, chunk)?;
                     self.bump();
-                    self.parse_escape(&mut out)?;
+                    out.push(self.parse_escape()?);
                     chunk = self.pos;
                 }
                 0x00..=0x1F => return Err(self.err("control character in string")),
@@ -213,8 +213,35 @@ impl<'de> Deserializer<'de> {
         }
     }
 
+    /// Validate a discarded string without allocating its decoded contents.
+    /// Escapes and UTF-8 use the same checks as the materializing reader.
+    fn skip_string_body(&mut self) -> Result<()> {
+        let mut chunk = self.pos;
+        loop {
+            let Some(byte) = self.peek() else {
+                return Err(self.eof());
+            };
+            match byte {
+                b'"' | b'\\' => {
+                    let raw = self.input.get(chunk..self.pos).unwrap_or(&[]);
+                    if core::str::from_utf8(raw).is_err() {
+                        return Err(self.err("invalid UTF-8 in string"));
+                    }
+                    self.bump();
+                    if byte == b'"' {
+                        return Ok(());
+                    }
+                    self.parse_escape()?;
+                    chunk = self.pos;
+                }
+                0x00..=0x1F => return Err(self.err("control character in string")),
+                _ => self.bump(),
+            }
+        }
+    }
+
     /// Parse one escape sequence, the backslash already consumed.
-    fn parse_escape(&mut self, out: &mut String) -> Result<()> {
+    fn parse_escape(&mut self) -> Result<char> {
         let Some(byte) = self.peek() else {
             return Err(self.eof());
         };
@@ -232,8 +259,7 @@ impl<'de> Deserializer<'de> {
             _ => return Err(self.err("invalid escape sequence")),
         };
         if let Some(ch) = simple {
-            out.push(ch);
-            return Ok(());
+            return Ok(ch);
         }
         let first = self.parse_hex4()?;
         // A surrogate half is only meaningful as part of a pair; a lone one is
@@ -264,8 +290,7 @@ impl<'de> Deserializer<'de> {
         } else {
             char::from_u32(u32::from(first)).ok_or_else(|| self.err("invalid \\u escape"))?
         };
-        out.push(ch);
-        Ok(())
+        Ok(ch)
     }
 
     fn parse_hex4(&mut self) -> Result<u16> {
@@ -476,7 +501,7 @@ impl<'de> Deserializer<'de> {
             b'f' => self.literal(b"false", "false"),
             b'"' => {
                 self.bump();
-                self.parse_string_body().map(|_| ())
+                self.skip_string_body()
             }
             b'-' | b'0'..=b'9' => self.parse_number().map(|_| ()),
             b'[' => {
@@ -518,7 +543,7 @@ impl<'de> Deserializer<'de> {
                     }
                     first = false;
                     self.expect(b'"', "an object key")?;
-                    self.parse_string_body()?;
+                    self.skip_string_body()?;
                     self.expect(b':', "`:`")?;
                     self.skip_value()?;
                 }

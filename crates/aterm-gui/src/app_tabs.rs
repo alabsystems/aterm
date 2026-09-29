@@ -16,6 +16,33 @@ use crate::{
     App, TabAction, TabIndex, WindowId, WindowState, pane, session_store, tab_bar, term_lock,
 };
 
+/// How soon after its spawn a failed interactive shell can count as one that
+/// never started: room for a slow rc file's `exit 1` or a moved dylib's abort.
+/// A shell that drew a prompt or was written to within it did start
+/// ([`App::shell_failed_at_start`]).
+pub(crate) const SHELL_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most the exit path's FIRST look ([`ExitLook::First`]) waits for the
+/// status of a shell that may have failed at start
+/// ([`App::unstarted_shell`]): its PTY can close a moment before the kernel
+/// retires the process. It waits whether the exit turns out clean or not, since
+/// nothing knows until the status is in. Every other exit is one non-blocking
+/// look.
+const SHELL_START_STATUS_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Which look at an exited child's status [`App::exit_status`] is making.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitLook {
+    /// The first on the exit path: the status classifier, or the exit ledger
+    /// when `tab_status` is off. It waits up to [`SHELL_START_STATUS_WAIT`]
+    /// for a shell that may have failed at start.
+    First,
+    /// The ledger's second chance after the classifier found nothing: one more
+    /// non-blocking look, except for a shell the first look already waited on,
+    /// whose "unknown" then stands for every reader.
+    Retry,
+}
+
 /// Whether a native close preflight is allowed to take over the screen when a
 /// reducer answers [`crate::native_app::CloseReadiness::Blocked`].
 ///
@@ -148,6 +175,12 @@ thread_local! {
     /// `App::post_herald_notice` would have queued for the notifier.
     pub(crate) static HERALD_POSTS: std::cell::RefCell<Vec<crate::status_item::HeraldNotice>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Why the notifier's queue refuses this thread's NEXT herald post
+    /// (test-only): `App::post_herald_notice` takes it and returns it as its
+    /// `Err`, recording nothing — the full queue a test cannot otherwise
+    /// fill without running the notifier.
+    pub(crate) static HERALD_REFUSAL: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -374,9 +407,19 @@ fn remove_terminal_projection(ws: &mut WindowState, projection_index: usize) {
 /// correct for a barrier that abandons the close instead (a native reducer's
 /// `Blocked` verdict, answered by a recovery palette and a fresh human
 /// gesture): that attribution stays parked until the window's next close.
+///
+/// With NO teardown parked there is nothing to cancel, and the attribution is
+/// left alone: the one other writer of the slot is the Windows close banner
+/// (`App::present_close_banner`), whose question is still standing and whose
+/// `confirm yes` replay is the close that consumes it. Clearing it here
+/// unconditionally was a live defect (measured 2026-09-27 on 0.95.0, 3 of 3):
+/// `invoke CloseTab` on a busy window, then `settings`, then `confirm yes`
+/// journalled `reason=unknown exit_code=- by=-` for a close the wire had asked
+/// for and answered, where every other path writes `reason=ctl-close by=ctl`.
 pub(crate) fn cancel_pending_close(ws: &mut WindowState) {
-    ws.pending_close = false;
-    ws.pending_close_attribution = None;
+    if std::mem::take(&mut ws.pending_close) {
+        ws.pending_close_attribution = None;
+    }
 }
 
 /// How far [`App::close_session_by_id`] got — NOT the wire verdict. A last-tab
@@ -462,6 +505,26 @@ pub(crate) fn home_abbreviated(path: &str) -> String {
     match cached_home().and_then(|home| home_relative_suffix(path, home)) {
         Some(rest) => format!("~{rest}"),
         None => path.to_string(),
+    }
+}
+
+/// The in-GUI supervisor host's reach over the sessions, for one refresh of
+/// the menu-bar rows ([`App::harness_hosting`]).
+#[derive(Default)]
+struct HarnessHosting {
+    /// The host supervises agent sessions at all now.
+    supervising: bool,
+    /// The adopted sessions it is holding off for their claim grace.
+    held_off: Vec<String>,
+    /// The sessions whose frozen agent it would relaunch
+    /// (`HostHandle::relaunching`).
+    relaunching: std::collections::HashSet<String>,
+}
+
+impl HarnessHosting {
+    /// Whether the host answers for `sid` (when it runs an agent).
+    fn hosts(&self, sid: &str) -> bool {
+        self.supervising && !self.held_off.iter().any(|held| held == sid)
     }
 }
 
@@ -2514,12 +2577,15 @@ impl App {
     /// The session's shell-reported cwd by registry LOCAL id (raw, the
     /// [`Self::tab_session_cwd`] rung without the tab resolution) — the
     /// connected spawn's origin-cwd default (design §6: `cwd=` overrides it).
+    /// A folder reported while ssh (or any program) holds the session, and not
+    /// here, is not taken, as for a New Tab ([`Self::inherited_cwd`]).
     fn session_cwd_by_local(&self, local: u64) -> Option<String> {
         let s = self.pool.get(local)?;
-        let term = term_lock(&s.term);
-        term.current_working_directory()
+        let reported = term_lock(&s.term)
+            .current_working_directory()
             .filter(|c| !c.is_empty())
-            .map(str::to_string)
+            .map(str::to_string)?;
+        Self::inherited_cwd(s, reported)
     }
 
     /// Mint a CONNECTED spawn's `both` session connection through the ONE mint
@@ -2698,9 +2764,25 @@ impl App {
     /// (one timeline leaf-lock take, never nested in the first). No
     /// `Terminal` lock: the verdict is the status sweep's publication, not a
     /// re-read.
+    ///
+    /// `relaunching` is the host's own word of which sessions' agents it
+    /// would relaunch once a stall's remedy ends them
+    /// ([`crate::harness_host::HostHandle::relaunching`], read before the
+    /// store's lock); the stall row says so only where the host also holds
+    /// the session's claim and nobody else's hand is on it
+    /// ([`crate::input_stall::host_relaunches`], resume-hint review
+    /// 2026-09-26: a `drive watch` session was promised the relaunch), and
+    /// otherwise names the tab's own resume line, never `claude --continue`
+    /// ([`crate::input_stall::after_restart`], 2026-09-26). The memory wall's
+    /// row names the same line ([`crate::status_item::SessionRow::resume`]),
+    /// and says the host restarts the agent only on that same predicate
+    /// ([`crate::status_item::SessionRow::restarts`]): a supervised row under
+    /// `relaunch = false` or a `drive watch` claim was promised a restart
+    /// that never came (resume-hint review, 2026-09-26).
     pub(crate) fn status_session_row(
         h: &crate::session_store::SessionHandle,
         hosted: bool,
+        relaunching: &std::collections::HashSet<String>,
     ) -> crate::status_item::SessionRow {
         let (user_title, role, attention, supervised) = {
             let m = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -2711,7 +2793,10 @@ impl App {
                 m.live_supervisor(crate::metrics::now_us()).is_some(),
             )
         };
-        let (agent, host_supervises, stall) = {
+        // Before the timeline's leaf lock, never under it.
+        let relaunches =
+            crate::input_stall::host_relaunches(&h.ctx, relaunching, crate::metrics::now_us());
+        let (agent, host_supervises, stall, resume) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let a = tl.agent();
             let agent = (a.word != "-").then(|| crate::status_item::AgentFact {
@@ -2720,21 +2805,29 @@ impl App {
                 rev: a.rev,
                 subject: a.subject.clone(),
             });
-            let stall = a.input.clone().map(|f| (f, a.program.clone(), a.reader));
+            let stall = a.input.clone().map(|f| {
+                (
+                    f,
+                    a.program.clone(),
+                    crate::input_stall::after_restart(&tl, relaunches),
+                )
+            });
+            let resume = tl.claude_footer().and_then(|facts| facts.resume.clone());
             (
                 agent,
                 hosted && crate::harness_host::agent_of(a).is_some(),
                 stall,
+                resume,
             )
         };
         // The published stall, in the server attention's own words — composed
         // after the timeline's leaf lock is released (it reads the clock and
         // the zone).
-        let input_stall = stall.map(|(fact, program, reader)| {
+        let input_stall = stall.map(|(fact, program, after)| {
             crate::input_stall::menu_row(
                 &fact,
                 program.as_deref(),
-                reader,
+                &after,
                 h.ctx.self_id.as_str(),
                 std::time::Instant::now(),
             )
@@ -2747,32 +2840,61 @@ impl App {
             agent,
             supervised: supervised || host_supervises,
             input_stall,
+            resume,
+            // The one predicate the stall row's "aterm relaunches it" rides:
+            // the memory row says "restarting it" on the same word, never on
+            // supervision alone (resume-hint review, 2026-09-26).
+            restarts: relaunches,
         }
     }
 
     /// Fold one session's escalation into the herald
     /// ([`crate::status_item::Herald`]): re-render the menu-bar item when its
     /// row moved, and post the one native notification a transition earns.
+    /// The decision is one `aterm.log` line, written after the post so it
+    /// says what the notifier's queue did with it — `info` for a transition's
+    /// (queued, or why not), a `warn` for a notice the queue refused, and no
+    /// text ([`crate::status_item::herald_log_line`]). A refused notice is
+    /// handed back to the herald ([`crate::status_item::Herald::refused`]),
+    /// which owes it again.
     /// Called from [`Self::refresh_presence_session`], i.e. at change rate
     /// (a verdict move from the status sweep, a `meta set`, a lease wake).
     /// Leaf locks only, each released before the next; the notification is
     /// a `try_send` onto `notify.rs`'s bounded queue, so nothing here blocks
     /// the event loop. A headless instance has no menu bar and posts nothing:
     /// it never reaches the notifier subprocesses (AGENTS.md rule 5).
+    /// Which sessions the in-GUI supervisor host answers for, read ONCE per
+    /// refresh and before the registry lock is taken (the host's state lock
+    /// is never nested under it): all of its agent sessions while it
+    /// supervises, except those it is holding off for their adopted-claim
+    /// grace after an update (round four, item 9) — nobody here answers
+    /// their boxes yet, so the menu bar raises them as it would for a
+    /// session no host supervises, until a claim (the host's, or the
+    /// external supervisor's it waited for) is live.
+    fn harness_hosting(&self) -> HarnessHosting {
+        match self.harness.as_ref() {
+            Some(host) if host.supervising() => HarnessHosting {
+                supervising: true,
+                held_off: host.held_off(),
+                relaunching: host.relaunching(),
+            },
+            _ => HarnessHosting::default(),
+        }
+    }
+
     pub(crate) fn herald_session(&mut self, session: u64) {
         if self.headless {
             return;
         }
-        let hosted = self
-            .harness
-            .as_ref()
-            .is_some_and(crate::harness_host::HostHandle::supervising);
+        let hosting = self.harness_hosting();
         let row = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
             store
                 .by_local(session)
                 .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-                .map(|h| Self::status_session_row(h, hosted))
+                .map(|h| {
+                    Self::status_session_row(h, hosting.hosts(h.sid.as_str()), &hosting.relaunching)
+                })
         };
         let current = row.as_ref().and_then(crate::status_item::escalation);
         let looking = self
@@ -2780,20 +2902,44 @@ impl App {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(&session);
-        let outcome = self.presence.herald.note(
+        let now = std::time::Instant::now();
+        let alerts = self.config.desktop_alerts_or_default();
+        let outcome = self
+            .presence
+            .herald
+            .note(session, current.as_ref(), looking, alerts, now);
+        // Posted BEFORE the line is written: `queued` is only true once the
+        // queue took it, and a refusal is the decision's one line instead.
+        // `desktop_alerts = false` (the default) offers the queue nothing: the
+        // escalation still has its menu-bar row, band row and tab mark, and
+        // the line says the setting held the banner back.
+        let post = match outcome.notice.as_ref() {
+            Some(_) if !alerts => crate::status_item::HeraldPost::Suppressed,
+            Some(notice) => match self.post_herald_notice(notice) {
+                Ok(()) => crate::status_item::HeraldPost::Queued,
+                Err(why) => crate::status_item::HeraldPost::Refused(why),
+            },
+            None => crate::status_item::HeraldPost::Queued,
+        };
+        // A refused notice told nobody: the herald takes the post back, so
+        // it stays owed (the App's timer retries it) and a machine's fact
+        // does not quiet the other tabs as told. A suppressed one is not
+        // owed: the person turned the banner off.
+        if matches!(post, crate::status_item::HeraldPost::Refused(_)) {
+            self.presence.herald.refused(session, outcome.owed, now);
+        }
+        if let Some((level, line)) = crate::status_item::herald_log_line(
             session,
             current.as_ref(),
-            looking,
-            std::time::Instant::now(),
-        );
-        if let Some(notice) = outcome.notice {
-            self.post_herald_notice(notice);
-        } else if self.presence.herald.last_quiet()
-            == Some(crate::status_item::HeraldQuiet::Limited)
-        {
-            aterm_log::debug!(
-                "escalation notification for session {session} held by the rate limit"
-            );
+            &outcome,
+            self.presence.herald.last_quiet(),
+            post,
+        ) {
+            match level {
+                aterm_log::Level::Warn => aterm_log::warn!("{line}"),
+                aterm_log::Level::Info => aterm_log::info!("{line}"),
+                _ => aterm_log::debug!("{line}"),
+            }
         }
         if outcome.row_moved {
             self.refresh_operator_status_item();
@@ -2801,27 +2947,43 @@ impl App {
     }
 
     /// Post one herald notification through `notify.rs`'s bounded queue — the
-    /// consent notice's path: `try_send`, dropped (and logged) when full. Not
-    /// behind `allow_notifications`: that opt-in guards PROGRAM-originated
-    /// escapes, and this text is aterm's own. Under `cfg(test)` the notice
-    /// is recorded instead, so no test ever runs a notifier subprocess.
-    fn post_herald_notice(&self, notice: crate::status_item::HeraldNotice) {
+    /// consent notice's path: `try_send`, dropped when full. `Err` says why
+    /// the queue refused it, for the herald's one `aterm.log` line
+    /// ([`crate::status_item::herald_log_line`] makes it a `warn`) — never
+    /// logged here with the body, which can carry a box's command (a bug
+    /// report attaches the log). Not behind `allow_notifications`: that
+    /// opt-in guards PROGRAM-originated escapes, and this text is aterm's
+    /// own — behind `desktop_alerts` instead, which [`Self::herald_session`]
+    /// checks before calling here (and the delivery thread again, for every
+    /// [`crate::notify::NotifyMsg::own`]). Under `cfg(test)` the notice is recorded instead (and counts as
+    /// queued, unless a test armed `HERALD_REFUSAL`), so no test ever runs a
+    /// notifier subprocess.
+    fn post_herald_notice(
+        &self,
+        notice: &crate::status_item::HeraldNotice,
+    ) -> Result<(), &'static str> {
         #[cfg(test)]
-        HERALD_POSTS.with(|posts| posts.borrow_mut().push(notice.clone()));
+        {
+            if let Some(why) = HERALD_REFUSAL.take() {
+                return Err(why);
+            }
+            HERALD_POSTS.with(|posts| posts.borrow_mut().push(notice.clone()));
+            Ok(())
+        }
         #[cfg(not(test))]
         {
-            let message = crate::notify::NotifyMsg::new(
+            let message = crate::notify::NotifyMsg::own(
                 notice.session,
                 Some(notice.title.to_owned()),
-                notice.body,
+                notice.body.clone(),
             );
-            if let Err(
-                std::sync::mpsc::TrySendError::Full(dropped)
-                | std::sync::mpsc::TrySendError::Disconnected(dropped),
-            ) = self.session_factory.notify_tx.try_send(message)
-            {
-                aterm_log::debug!("escalation notification not delivered: {}", dropped.body);
-            }
+            self.session_factory
+                .notify_tx
+                .try_send(message)
+                .map_err(|refused| match refused {
+                    std::sync::mpsc::TrySendError::Full(_) => "the notifier's queue is full",
+                    std::sync::mpsc::TrySendError::Disconnected(_) => "the notifier is gone",
+                })
         }
     }
 
@@ -2834,17 +2996,20 @@ impl App {
     /// paths). `Exited` sessions are excluded: a dead operator is not a
     /// running operator.
     pub(crate) fn operator_fleet_glance(&self) -> crate::status_item::FleetGlance {
-        let hosted = self
-            .harness
-            .as_ref()
-            .is_some_and(crate::harness_host::HostHandle::supervising);
+        let hosting = self.harness_hosting();
         let rows: Vec<crate::status_item::SessionRow> = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
             store
                 .snapshot()
                 .into_iter()
                 .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
-                .map(|h| Self::status_session_row(&h, hosted))
+                .map(|h| {
+                    Self::status_session_row(
+                        &h,
+                        hosting.hosts(h.sid.as_str()),
+                        &hosting.relaunching,
+                    )
+                })
                 .collect()
         };
         let mut glance = crate::status_item::classify(&rows);
@@ -4602,11 +4767,7 @@ impl App {
 
     pub(crate) fn can_reopen_closed_tab(&self) -> bool {
         let now_ms = self.lat_epoch.elapsed().as_millis() as u64;
-        self.closed_recovery
-            .tabs
-            .candidate_snapshot(now_ms)
-            .is_some()
-            && !self.windows.is_empty()
+        self.closed_recovery.tabs.has_candidate(now_ms) && !self.windows.is_empty()
     }
 
     pub(crate) fn reopen_last_closed_view(&mut self) -> Result<(), String> {
@@ -4797,11 +4958,7 @@ impl App {
 
     pub(crate) fn can_reopen_closed_view(&self) -> bool {
         let now_ms = self.lat_epoch.elapsed().as_millis() as u64;
-        self.closed_recovery
-            .views
-            .candidate_snapshot(now_ms)
-            .is_some()
-            && !self.windows.is_empty()
+        self.closed_recovery.views.has_candidate(now_ms) && !self.windows.is_empty()
     }
 
     /// Close the PANE holding session `id` in window `window` (its reader hit EOF).
@@ -4857,6 +5014,8 @@ impl App {
     /// window closing exits the app, the `ExitIffEmpty` invariant). This is the
     /// el-free twin the multi-window tests drive; `Wake::Exit` wraps it with
     /// `close_window`/`el.exit()`. An already-closed/unknown session finds no owner.
+    /// An interactive shell that failed at start closes nothing: its pane stays
+    /// with one line saying how it ended ([`Self::shell_failed_at_start`]).
     pub(crate) fn exit_session_logical(&mut self, session: u64) -> Vec<WindowId> {
         self.store
             .write()
@@ -4864,6 +5023,12 @@ impl App {
             .set_state(session, session_store::SessionState::Exited);
         // The exit ledger takes the child's status now, before teardown discards it.
         self.note_shell_exit_for_ledger(session);
+        // A shell that failed at start keeps its pane in every viewer, the way
+        // `--hold` keeps one; otherwise its error shows for a frame and the tab
+        // (with one tab, aterm itself) is gone with nothing saying why.
+        if self.keep_shell_failed_at_start(session) {
+            return Vec::new();
+        }
         let mut owners = Vec::new();
         for (&window, state) in &self.windows {
             for tab in state.tab_set.tabs() {
@@ -4893,6 +5058,108 @@ impl App {
             }
         }
         to_close
+    }
+
+    /// The start of a fresh interactive shell that may have failed at start: it
+    /// closed its PTY within [`SHELL_START_WINDOW`] of its spawn, never drew a
+    /// prompt (no shell-integration prompt mark), and nothing was written to
+    /// its PTY since the spawn. `None` for everything else: a `-e` command or a
+    /// shell adopted across an update (neither records a start), a later exit,
+    /// a shell someone typed into or that got to its prompt, and every pane
+    /// under `--hold` (which keeps every pane its own way).
+    ///
+    /// Measured to the reader's EOF stamp (`Session::pty_closed_at`), not to
+    /// now: a cold launch can take seconds to reach the exit.
+    fn unstarted_shell<'s>(
+        &self,
+        pooled: &'s crate::Session,
+    ) -> Option<&'s crate::spawn::ShellStart> {
+        if self.hold {
+            return None;
+        }
+        let start = pooled.shell_start.as_ref()?;
+        let closed = pooled
+            .pty_closed_at
+            .get()
+            .copied()
+            .unwrap_or_else(std::time::Instant::now);
+        if closed.saturating_duration_since(start.at) > SHELL_START_WINDOW
+            || pooled.ctx.sink.input_epoch() != start.input
+            || term_lock(&pooled.term).all_blocks().next().is_some()
+        {
+            return None;
+        }
+        Some(start)
+    }
+
+    /// How `session`'s child ended, for every reader on the exit path: the
+    /// classifier, the exit ledger and the failed-start line all read this one
+    /// status. A child an earlier look reaped answers with what that look kept
+    /// (`Session::child_exit`); otherwise this reaps without blocking, and a
+    /// [`ExitLook::First`] look at a shell that may have failed at start
+    /// ([`Self::unstarted_shell`]) tries again for at most
+    /// [`SHELL_START_STATUS_WAIT`]. `None`: no status (an adopted session, a
+    /// child not yet reapable, or one this process cannot wait for).
+    pub(crate) fn exit_status(&self, session: u64, look: ExitLook) -> Option<aterm_pty::ChildExit> {
+        let pooled = self.pool.get(session)?;
+        if pooled
+            .child_reaped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return pooled.child_exit.get().copied();
+        }
+        if look == ExitLook::Retry && self.unstarted_shell(pooled).is_some() {
+            return None;
+        }
+        if let Some(exit) = pooled.reap_child() {
+            return Some(exit);
+        }
+        if look == ExitLook::Retry || pooled.pid <= 1 || self.unstarted_shell(pooled).is_none() {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + SHELL_START_STATUS_WAIT;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if let Some(exit) = pooled.reap_child() {
+                return Some(exit);
+            }
+        }
+        None
+    }
+
+    /// The line a pane keeps when its interactive shell failed at start
+    /// ([`Self::unstarted_shell`]) and ended non-zero or by a signal:
+    /// `[zsh ended at start: exit 1]`, `[fish ended at start: signal 6]`.
+    /// `None` for everything else, a clean exit and a status nobody could
+    /// collect included. Reads the status the exit path's looks kept
+    /// (`Session::child_exit`); it never reaps.
+    pub(crate) fn shell_failed_at_start(&self, session: u64) -> Option<String> {
+        let pooled = self.pool.get(session)?;
+        let start = self.unstarted_shell(pooled)?;
+        let how = match pooled.child_exit.get().copied()? {
+            aterm_pty::ChildExit::Code(0) => return None,
+            aterm_pty::ChildExit::Code(code) => format!("exit {code}"),
+            aterm_pty::ChildExit::Signal(signal) => format!("signal {signal}"),
+        };
+        Some(format!("[{} ended at start: {how}]", start.name))
+    }
+
+    /// Keep the pane of a shell that failed at start
+    /// ([`Self::shell_failed_at_start`]) and write its line into it. Returns
+    /// whether it kept it. A kept pane then closes the way a `--hold` pane does:
+    /// by Cmd-W, the tab's close button, or a `close` verb.
+    fn keep_shell_failed_at_start(&mut self, session: u64) -> bool {
+        let Some(line) = self.shell_failed_at_start(session) else {
+            return false;
+        };
+        if let Some(pooled) = self.pool.get(session) {
+            let mut term = term_lock(&pooled.term);
+            // On a line of its own: after whatever the shell printed last.
+            let lead = if term.cursor().col == 0 { "" } else { "\r\n" };
+            term.process(format!("{lead}{line}\r\n").as_bytes());
+        }
+        let _ = self.admit_output_redraws(session, std::time::Instant::now());
+        true
     }
 
     /// A click in window `wid`'s tab strip at column `col`: resolve it against that
@@ -5991,6 +6258,25 @@ impl App {
 #[cfg(test)]
 mod mixed_tab_tests {
     use super::*;
+
+    /// A SESSION HELD OFF FOR ITS CLAIM GRACE IS NOBODY'S YET (the round-four
+    /// plan, item 9): while the supervisor host waits for an external
+    /// supervisor to claim an adopted session again, it answers nothing there,
+    /// so the menu-bar rows treat that session as unsupervised — its agent's
+    /// own box is raised rather than left to a host that is not answering it.
+    /// Every other session stays the host's; a host that supervises nothing
+    /// hosts nothing.
+    #[test]
+    fn a_session_held_off_for_its_claim_grace_is_not_the_hosts() {
+        let hosting = HarnessHosting {
+            supervising: true,
+            held_off: vec!["s-adopted".to_string()],
+            relaunching: Default::default(),
+        };
+        assert!(!hosting.hosts("s-adopted"));
+        assert!(hosting.hosts("s-other"));
+        assert!(!HarnessHosting::default().hosts("s-other"));
+    }
 
     /// Address a real temp-dir file the way the SHIPPING code does.
     ///
@@ -7362,6 +7648,7 @@ mod mixed_tab_tests {
                     questions: None,
                     identity: None,
                     agent: None,
+                    held: false,
                 },
             )),
             focused_path: Vec::new(),
@@ -8523,6 +8810,167 @@ mod operator_glance_tests {
         assert!(app.focus_session_window(0));
         assert!(!app.focus_session_window(777));
     }
+
+    /// `herald_session` hands a refusal back to the herald (review,
+    /// 2026-09-28): a notice the notifier's queue refused told nobody, so it
+    /// stays owed — due again once [`crate::status_item::NOTIFY_RETRY`] has
+    /// passed — where it used to be counted told and lost. NEGATIVE CONTROL:
+    /// a notice the queue took is owed no more.
+    #[test]
+    fn a_refused_herald_notice_stays_owed() {
+        let take_posts = || HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let herald = |refusal: Option<&'static str>| {
+            let mut app = App::headless_for_test();
+            // A windowed instance's herald, and nobody looking at the tab.
+            app.headless = false;
+            app.config.desktop_alerts = Some(true);
+            app.notify_suppress
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            set_meta(&app, 0, "attention", "wedged on CI");
+            let _ = take_posts();
+            HERALD_REFUSAL.set(refusal);
+            app.herald_session(0);
+            app
+        };
+
+        let app = herald(Some("the notifier's queue is full"));
+        assert!(take_posts().is_empty(), "the queue refused it");
+        let later = std::time::Instant::now() + crate::status_item::NOTIFY_BURST_WINDOW;
+        assert_eq!(app.presence.herald.due(later).0, vec![0], "owed again");
+
+        let app = herald(None);
+        assert_eq!(take_posts().len(), 1, "the queue took it");
+        let later = std::time::Instant::now() + crate::status_item::NOTIFY_BURST_WINDOW;
+        assert_eq!(app.presence.herald.due(later), (vec![], None));
+    }
+
+    /// `desktop_alerts = false` (the owner, 2026-09-28: "these OSX alerts …
+    /// are annoying, disable them") posts NOTHING for an escalation — and
+    /// the notice is not owed either, so the herald's retry timer does not
+    /// keep offering it — while the escalation keeps its menu-bar row.
+    /// The absent key reads the same as `false` (the default). NEGATIVE
+    /// CONTROL: the same escalation with `desktop_alerts = true` posts its one
+    /// notice, so the silence is the setting's.
+    #[test]
+    fn desktop_alerts_off_posts_no_herald_notice() {
+        let take_posts = || HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let herald = |alerts: Option<bool>| {
+            let mut app = App::headless_for_test();
+            // A windowed instance's herald, and nobody looking at the tab.
+            app.headless = false;
+            app.config.desktop_alerts = alerts;
+            app.notify_suppress
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            set_meta(&app, 0, "attention", "wedged on CI");
+            let _ = take_posts();
+            HERALD_REFUSAL.set(None);
+            app.herald_session(0);
+            app
+        };
+
+        for alerts in [Some(false), None] {
+            let app = herald(alerts);
+            assert!(take_posts().is_empty(), "{alerts:?}: no desktop notice");
+            let later = std::time::Instant::now() + crate::status_item::NOTIFY_BURST_WINDOW;
+            assert_eq!(
+                app.presence.herald.due(later),
+                (vec![], None),
+                "{alerts:?}: nothing owed, so nothing retried"
+            );
+            assert!(
+                !app.operator_fleet_glance().warnings.is_empty(),
+                "{alerts:?}: the menu bar still carries the escalation"
+            );
+        }
+
+        let _app = herald(Some(true));
+        let posts = take_posts();
+        assert_eq!(posts.len(), 1, "switch on: the one notice (control)");
+        assert_eq!(posts[0].session, 0);
+    }
+
+    /// Disabled transitions cannot spend the instance burst or leave a later
+    /// session's notification owed. The previous producer-side check ran after
+    /// `note`, so the fourth session silently armed the presence timer anyway.
+    #[test]
+    fn desktop_alerts_off_never_arms_rate_limited_herald_retries() {
+        let mut app = App::headless_for_test();
+        for _ in 0..crate::status_item::NOTIFY_BURST {
+            app.push_stub_tab(WindowId(0), crate::stub_session(app.next_session_id));
+        }
+        app.headless = false;
+        app.notify_suppress.lock().unwrap().clear();
+        HERALD_POSTS.with(|p| p.borrow_mut().clear());
+        HERALD_REFUSAL.set(None);
+        let sessions: Vec<_> = app.pool.iter().map(|s| s.id).collect();
+        for &session in &sessions {
+            set_meta(&app, session, "attention", "first request");
+            app.herald_session(session);
+            // A second transition also crosses the per-session floor in the
+            // old implementation, even without filling the instance burst.
+            set_meta(&app, session, "attention", "second request");
+            app.herald_session(session);
+        }
+        let now = std::time::Instant::now();
+        for at in [now, now + crate::status_item::NOTIFY_BURST_WINDOW] {
+            assert_eq!(app.presence.herald.due(at), (vec![], None));
+        }
+        assert!(HERALD_POSTS.with(|p| p.borrow().is_empty()));
+        assert_eq!(app.operator_fleet_glance().warnings.len(), sessions.len());
+    }
+
+    /// Turning the setting off must cancel debt that predates the config
+    /// commit, including a queue refusal. Re-enabling keeps the current row
+    /// spent, while a new session's transition still reaches the desktop.
+    #[test]
+    fn disabling_desktop_alerts_cancels_owed_notices_without_replaying_them() {
+        for refused in [false, true] {
+            let mut app = App::headless_for_test();
+            app.push_stub_tab(WindowId(0), crate::stub_session(app.next_session_id));
+            app.headless = false;
+            app.config.desktop_alerts = Some(true);
+            app.apply_desktop_alerts(true);
+            app.notify_suppress.lock().unwrap().clear();
+            HERALD_POSTS.with(|p| p.borrow_mut().clear());
+            HERALD_REFUSAL.set(refused.then_some("the notifier's queue is full"));
+            set_meta(&app, 0, "attention", "first request");
+            app.herald_session(0);
+            if !refused {
+                set_meta(&app, 0, "attention", "second request");
+                app.herald_session(0);
+            }
+            let later = std::time::Instant::now() + crate::status_item::NOTIFY_BURST_WINDOW;
+            assert_eq!(app.presence.herald.due(later).0, vec![0], "debt exists");
+            let warnings = app.operator_fleet_glance().warnings;
+
+            app.config.desktop_alerts = Some(false);
+            app.apply_desktop_alerts(false);
+            assert_eq!(app.presence.herald.due(later), (vec![], None));
+            assert_eq!(app.operator_fleet_glance().warnings, warnings);
+            assert!(
+                !app.notify_own_alerts
+                    .load(std::sync::atomic::Ordering::Acquire)
+            );
+
+            HERALD_POSTS.with(|p| p.borrow_mut().clear());
+            app.config.desktop_alerts = Some(true);
+            app.apply_desktop_alerts(true);
+            app.herald_session(0);
+            assert!(HERALD_POSTS.with(|p| p.borrow().is_empty()), "no replay");
+            assert_eq!(app.presence.herald.due(later), (vec![], None));
+            set_meta(&app, 1, "attention", "new request after enabling");
+            app.herald_session(1);
+            HERALD_POSTS.with(|p| {
+                let posts = std::mem::take(&mut *p.borrow_mut());
+                assert_eq!(posts.len(), 1, "new transitions still notify");
+                assert_eq!(posts[0].session, 1);
+            });
+        }
+    }
 }
 
 /// C5 — the in-grid tab CONTEXT MENU's App-level wiring: the popup carries the
@@ -9469,6 +9917,47 @@ mod exit_attribution_tests {
         assert_eq!(by, "-");
     }
 
+    /// A close the WIRE raised as a question keeps its name through a Settings
+    /// open while the question stands. Measured 2026-09-27 on 0.95.0, 3 of 3:
+    /// `invoke CloseTab` on a busy window, `settings`, `confirm yes` journalled
+    /// `reason=unknown exit_code=- by=-`, because opening Settings cancelled a
+    /// parked teardown that was not there and took the question's attribution
+    /// with it. CONTROL: a teardown that IS parked is still cancelled with its
+    /// attribution (`a_cancelled_deferred_close_drops_the_attribution_it_stashed`).
+    #[test]
+    fn a_wire_close_question_keeps_its_name_through_a_settings_open() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let prompt = crate::quit_safety::confirm_prompt(true, true).expect("a busy quit prompts");
+        let raised = app.invoke_attributed(crate::session_store::ExitActor::Ctl, |app| {
+            Ok(app
+                .present_close_banner(wid, prompt, crate::close_confirm::CloseReplay::Window(wid))
+                .to_string())
+        });
+        assert_eq!(
+            raised.as_deref(),
+            Ok("false"),
+            "the gesture waits for its answer"
+        );
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert!(!app.windows[&wid].pending_close, "nothing was parked");
+        assert_eq!(
+            app.windows[&wid].pending_close_attribution,
+            Some((ExitReason::CtlClose, crate::session_store::ExitActor::Ctl)),
+            "the standing question's attribution survives the Settings open"
+        );
+        assert_eq!(
+            app.answer_close_confirm_from_wire(true),
+            Ok("answered=yes kind=quit".to_string())
+        );
+        // `confirm yes` posts `Wake::ConfirmedClose`, whose replay runs
+        // `close_window`, whose teardown is this one.
+        assert_eq!(app.close_window_logical(wid), CloseOutcome::Exit);
+        let (reason, by) = sole_exit(&app);
+        assert_eq!(reason, ExitReason::CtlClose);
+        assert_eq!(by, "ctl");
+    }
+
     /// A last-tab UI close (Cmd-W / menu Close, `close_active_tab`) is deferred
     /// the same way (`apply_close_outcome`'s `LastPane` + `canonical_last`
     /// returns true without deregistering), and its `ui-close by=human`
@@ -9834,5 +10323,400 @@ mod pane_close_render_seam_tests {
                 }
             }
         }
+    }
+}
+
+/// A SHELL THAT FAILS AT START KEEPS ITS PANE (audit #7 finding 49). An rc file
+/// that runs `exit 1`, or a shell whose dylib moved and aborts, used to take its
+/// tab with it — the last tab its window, the last window aterm — with nothing
+/// saying why. These drive the reader-EOF path (`Wake::Exit`'s el-free half:
+/// classify, retire the input watch, `exit_session_logical`) over a REAL child
+/// running a stub shell, so the status the path reaps is the kernel's.
+#[cfg(all(test, unix))]
+mod shell_start_exit_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A stub shell called `name` in `dir` that runs `body`.
+    fn stub_shell(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the stub shell");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub shell executable");
+        path
+    }
+
+    /// Run `program` as this process's child and wait — WITHOUT reaping — until
+    /// it has exited, so the exit path finds the zombie the way a real shell
+    /// leaves one. A minute is a hang detector, not a budget.
+    fn run_to_zombie(program: &std::path::Path) -> i32 {
+        let child = std::process::Command::new(program)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stub shell");
+        let pid = i32::try_from(child.id()).expect("pid fits");
+        // Dropping a `Child` neither waits nor kills: the zombie stays ours.
+        drop(child);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            // SAFETY: a zeroed `siginfo_t` out-param for a non-reaping peek.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `WNOWAIT` leaves the child waitable; `WNOHANG` never blocks.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            assert_eq!(rc, 0, "waitid on our own child");
+            // SAFETY: `waitid` either filled a `CLD_*` siginfo or, under
+            // `WNOHANG` with nothing waitable, left it zeroed; `si_pid` is
+            // defined in both. A method on Linux, a field on macOS: the method
+            // compiles on both.
+            let exited = unsafe { info.si_pid() };
+            if exited == pid {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the stub shell did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// What the spawn recorded: the shell's name and when it started. `None`:
+    /// no start (a `-e` command or an adopted shell, `records_shell_start`).
+    type Start = Option<(&'static str, Instant)>;
+
+    fn started(name: &'static str, at: Instant) -> Start {
+        Some((name, at))
+    }
+
+    /// A fresh headless app plus a window whose only pane is `pid`'s session:
+    /// `start` is what the spawn recorded, `closed` when the reader saw its PTY
+    /// close.
+    fn app_with(pid: i32, start: Start, closed: Option<Instant>) -> (App, WindowId, u64) {
+        let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(-1));
+        app_with_sink(pid, start, closed, sink)
+    }
+
+    /// [`app_with`] over the caller's sink, for a test that writes to the PTY.
+    fn app_with_sink(
+        pid: i32,
+        start: Start,
+        closed: Option<Instant>,
+        sink: std::sync::Arc<aterm_session::sink::SinkWriter>,
+    ) -> (App, WindowId, u64) {
+        let mut app = App::headless_for_test();
+        let id = app.next_session_id;
+        let mut session = crate::stub_session_with_sink(id, sink);
+        session.pid = pid;
+        // The input epoch is read at the spawn, before anything can write.
+        session.shell_start = start.map(|(name, at)| crate::spawn::ShellStart {
+            at,
+            name: name.to_string(),
+            input: session.ctx.sink.input_epoch(),
+        });
+        if let Some(at) = closed {
+            let _ = session.pty_closed_at.set(at);
+        }
+        // Registered, as every spawn seam does, so the registry's view shows.
+        App::register_session(&app.store, &session, None);
+        let wid = app.insert_logical_window(session, 24, 80);
+        (app, wid, id)
+    }
+
+    /// The exit code the ledger noted for `session` (`None`: `exit_code=-`).
+    fn ledger_code(app: &App, session: u64) -> Option<i32> {
+        app.store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .noted_exit_code(session)
+    }
+
+    /// The reader's EOF, as the `Wake::Exit` arm runs it minus the event loop.
+    fn reader_eof(app: &mut App, session: u64) -> Vec<WindowId> {
+        app.note_session_exit(session);
+        app.retire_input_watch(session);
+        app.exit_session_logical(session)
+    }
+
+    fn pane_text(app: &App, session: u64) -> String {
+        term_lock(&app.pool.get(session).expect("the pane's session").term).visible_content()
+    }
+
+    fn assert_kept(app: &App, wid: WindowId, session: u64, to_close: &[WindowId], line: &str) {
+        assert!(to_close.is_empty(), "nothing closes: {to_close:?}");
+        assert!(
+            app.window_contains_session(wid, session),
+            "the pane stays in its window"
+        );
+        assert!(
+            pane_text(app, session).contains(line),
+            "the pane says why: {:?}",
+            pane_text(app, session)
+        );
+        let reaped = app
+            .pool
+            .get(session)
+            .expect("still pooled")
+            .child_reaped
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert!(reaped, "the exit path reaped the child");
+        assert_eq!(
+            app.store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_local(session)
+                .map(|h| h.state),
+            Some(session_store::SessionState::Exited),
+            "the registry still says the session exited"
+        );
+    }
+
+    /// THE BUG: an rc file's `exit 3` within moments of the spawn. The pane
+    /// stays, the line names the shell and the code, and the classifier still
+    /// publishes the failure.
+    #[test]
+    fn a_shell_that_exits_3_at_start_keeps_its_pane_with_the_line() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 3");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+
+        let to_close = reader_eof(&mut app, id);
+
+        assert_kept(&app, wid, id, &to_close, "[zsh ended at start: exit 3]");
+        assert_eq!(
+            app.session_status.status(id).map(|s| s.last_outcome),
+            Some(crate::session_status::Outcome::Failure { exit_code: 3 }),
+            "the classification is unchanged"
+        );
+        // One status for every reader: the classifier, the ledger, the line,
+        // and any later look.
+        assert_eq!(ledger_code(&app, id), Some(3), "the ledger has the code");
+        for look in [ExitLook::First, ExitLook::Retry] {
+            assert_eq!(
+                app.exit_status(id, look),
+                Some(aterm_pty::ChildExit::Code(3)),
+                "{look:?} reads the status the first look kept"
+            );
+        }
+        // Kept once, it closes the way a held pane does: by an explicit close,
+        // which takes its window's last tab and hands the window to teardown.
+        assert_eq!(
+            app.close_session_by_id(id),
+            Ok(CloseProgress::Deferred(wid)),
+            "an explicit close still takes it"
+        );
+        let _ = app.close_window_logical(wid);
+        assert!(app.pool.get(id).is_none(), "and the session is retired");
+    }
+
+    /// A signal death at start (the moved-dylib abort, here a `SIGKILL` so no
+    /// crash report is written) keeps the pane with the signal's number.
+    #[test]
+    fn a_shell_killed_by_a_signal_at_start_keeps_its_pane_with_the_signal_line() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "fish", "kill -KILL $$");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("fish", at), Some(Instant::now()));
+
+        let to_close = reader_eof(&mut app, id);
+
+        assert_kept(&app, wid, id, &to_close, "[fish ended at start: signal 9]");
+    }
+
+    /// With `tab_status` off nothing classifies the exit, so the ledger's look
+    /// is the one that reaps — and the line still has the signal.
+    #[test]
+    fn the_line_survives_tab_status_being_off() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "fish", "kill -KILL $$");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("fish", at), Some(Instant::now()));
+        app.config.tab_status = Some(false);
+
+        let to_close = reader_eof(&mut app, id);
+
+        assert_kept(&app, wid, id, &to_close, "[fish ended at start: signal 9]");
+        assert_eq!(ledger_code(&app, id), None, "a signal has no code");
+    }
+
+    /// With `tab_status` off the ledger's look is the first one, and the line
+    /// and the ledger read the same code.
+    #[test]
+    fn with_tab_status_off_the_ledger_and_the_line_agree() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 4");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        app.config.tab_status = Some(false);
+
+        let to_close = reader_eof(&mut app, id);
+
+        assert_kept(&app, wid, id, &to_close, "[zsh ended at start: exit 4]");
+        assert_eq!(ledger_code(&app, id), Some(4));
+    }
+
+    /// THE REVIEW'S CASE: a shell that started and was used. An rc file whose
+    /// last line leaves `$?` at 1 (`[ -f ~/.fzf.zsh ] && source ~/.fzf.zsh`
+    /// with no such file), then a Ctrl-D within 2 s: zsh exits 1, and the tab
+    /// closes as the person asked.
+    #[test]
+    fn a_shell_that_got_input_closes_as_before_even_on_exit_1() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 1");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let mut fds = [0; 2];
+        // SAFETY: a fresh two-slot out-param for `pipe(2)`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
+        let (mut app, wid, id) =
+            app_with_sink(pid, started("zsh", at), Some(Instant::now()), sink.clone());
+        sink.write_frame(b"\x04")
+            .expect("the Ctrl-D reaches the PTY");
+
+        assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
+        assert!(!pane_text(&app, id).contains("ended at start"));
+        assert_eq!(ledger_code(&app, id), Some(1), "the ledger is unchanged");
+
+        drop(app);
+        drop(sink);
+        // SAFETY: both ends of the pipe opened above; the borrowed sink that
+        // used the write end is gone.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// A shell that drew its prompt started, whatever ends it next: here a
+    /// `signal kill` sent to a fresh prompt. The tab closes as before.
+    #[test]
+    fn a_shell_that_drew_its_prompt_closes_as_before_even_on_a_signal() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "kill -KILL $$");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        // The shell-integration prompt marks around a prompt, as zsh draws it.
+        term_lock(&app.pool.get(id).expect("the pane's session").term)
+            .process(b"\x1b]133;A\x07% \x1b]133;B\x07");
+
+        assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
+        assert!(!pane_text(&app, id).contains("ended at start"));
+    }
+
+    /// The window is measured to the reader's EOF stamp, not to when the main
+    /// thread got to the exit: a launch that took 3 s to reach the exit, whose
+    /// shell failed 1 s after its spawn, still keeps its pane.
+    #[test]
+    fn a_slow_launch_is_measured_to_the_readers_eof() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 3");
+        let pid = run_to_zombie(&shell);
+        let at = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("the clock reaches back 3 s");
+        let (mut app, wid, id) =
+            app_with(pid, started("zsh", at), Some(at + Duration::from_secs(1)));
+
+        let to_close = reader_eof(&mut app, id);
+
+        assert_kept(&app, wid, id, &to_close, "[zsh ended at start: exit 3]");
+    }
+
+    /// NEGATIVE CONTROL: a clean exit at start closes as today — its window's
+    /// last tab goes, and the caller escalates to closing the window.
+    #[test]
+    fn a_clean_exit_at_start_closes_as_today() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 0");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+
+        assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
+        assert!(!pane_text(&app, id).contains("ended at start"));
+    }
+
+    /// NEGATIVE CONTROL: a session with no recorded start (a `-e` command or
+    /// an adopted shell, `records_shell_start`) closes on a failure at once, as
+    /// documented ("the window closes when it exits").
+    #[test]
+    fn a_session_with_no_recorded_start_closes_as_today() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let command = stub_shell(dir.path(), "false", "exit 1");
+        let pid = run_to_zombie(&command);
+        let (mut app, wid, id) = app_with(pid, None, Some(Instant::now()));
+
+        assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
+        assert!(!pane_text(&app, id).contains("ended at start"));
+    }
+
+    /// NEGATIVE CONTROL: a shell that fails after the start window ran; its
+    /// exit closes as today.
+    #[test]
+    fn a_shell_that_fails_after_two_seconds_closes_as_today() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 3");
+        let pid = run_to_zombie(&shell);
+        let closed = Instant::now();
+        let at = closed
+            .checked_sub(SHELL_START_WINDOW + Duration::from_millis(500))
+            .expect("the clock reaches back 2.5 s");
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(closed));
+
+        assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
+        assert!(!pane_text(&app, id).contains("ended at start"));
+    }
+
+    /// `--hold` keeps every pane its own way: no line is added.
+    #[test]
+    fn hold_keeps_its_own_behaviour() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 3");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        app.hold = true;
+
+        assert!(reader_eof(&mut app, id).is_empty());
+        assert!(app.window_contains_session(wid, id), "held, as always");
+        assert!(!pane_text(&app, id).contains("ended at start"));
+    }
+
+    /// A CO-VIEWED shell that fails at start stays in EVERY window that shows
+    /// it, and its one engine carries the line once.
+    #[test]
+    fn a_shared_shell_that_fails_at_start_stays_in_every_viewer() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let shell = stub_shell(dir.path(), "zsh", "exit 1");
+        let at = Instant::now();
+        let pid = run_to_zombie(&shell);
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        app.frontmost_window = Some(wid);
+        let second = app
+            .open_active_session_in_new_window_logical()
+            .expect("share the pane into a second window");
+
+        let to_close = reader_eof(&mut app, id);
+
+        assert_kept(&app, wid, id, &to_close, "[zsh ended at start: exit 1]");
+        assert!(app.window_contains_session(second, id));
+        assert_eq!(
+            pane_text(&app, id).matches("ended at start").count(),
+            1,
+            "one line, not one per viewer"
+        );
     }
 }

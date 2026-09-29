@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # aterm-census — the MAIN-LOOP COMPLETENESS CENSUS (L0 whole-Mac-freeze class,
-# OB-1..OB-6) and the LOCK-ORDER CENSUS (L0-DEADLOCK lock-graph sense, OB-7)
+# OB-1..OB-6 and OB-22) and the LOCK-ORDER CENSUS (L0-DEADLOCK lock-graph sense, OB-7)
 # as ONE shared library with TWO consumers each, so the manual runner and the
 # build-blocking gate can never diverge:
 #

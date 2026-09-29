@@ -17,6 +17,9 @@
 # - A LOADER and a BODY (2026-09-26): the shell that is ALREADY RUNNING takes a newer
 #   build's integration at its next prompt, when the host that owns it points it there
 #   (see "THE LOADER" below)
+# - The tty settings, REPAIRED (2026-09-26): a raw-mode program that exits non-zero
+#   without restoring them no longer leaves Ctrl-C and Enter broken for every later
+#   command (see "The tty settings after a failed command" below)
 #
 # Compatible with: bash 3.2+
 
@@ -752,6 +755,42 @@ __aterm_preexec() {
     fi
 }
 
+# ─── The tty settings after a failed command (2026-09-26) ───
+#
+# The zsh script's twin ("The tty settings the shell keeps" there has the whole
+# story), narrower because bash already does half of it. bash saves the tty
+# before a foreground job and PUTS IT BACK when the job dies by a signal — but
+# after a job that EXITS it adopts whatever the job left. So a raw-mode program
+# that exits without restoring (`tty.setraw` and an uncaught error, `os._exit`)
+# leaves every later command `-icanon -isig -iexten -icrnl -ixon -opost`: Ctrl-C
+# arrives as a literal ^C byte and interrupts nothing, and Enter ends no line
+# (`read x` hangs). Measured 2026-09-26, bash 3.2.57 `--norc` and with this file
+# sourced, in a pty: a python `tty.setraw` child SIGKILLed or a node
+# `setRawMode` child SIGKILLed left bash fine (Ctrl-C ended `sleep 3` at
+# 0.46 s); the same python child ending in `os._exit(1)` or `os._exit(0)` left it
+# broken (Ctrl-C ended `sleep 3` only at 3.03–3.09 s, `read -r x` never returned).
+#
+# bash has no `ttyctl -f`, so this is the REPAIR alone: after a command that
+# FAILED, one `stty -a` fork, and — only when the tty is in a dead raw program's
+# state (ISIG off: every raw mode clears it, and nobody keeps it off at a prompt
+# on purpose, since it disables Ctrl-C and Ctrl-Z) — a second one turning back on
+# what raw modes turn off: `isig icanon iexten echo icrnl opost`. IXON is
+# deliberately NOT touched: a user's own `stty -ixon` clears it too and cannot be
+# told apart, so it survives. A successful command costs nothing — which is the
+# residual: a raw program that exits 0 without restoring is not caught here
+# (measured with this code: exit 1 repaired, Ctrl-C at 0.48 s; exit 0 not).
+__aterm_tty_repair() {
+    local __aterm_tty_state=""
+    __aterm_tty_state="$(command stty -a 2>/dev/null)" || return 0
+    # Newlines to spaces and a space at each end, so ` -isig ` matches the word
+    # wherever `stty -a` put it — first on its line (Linux), or after a label.
+    __aterm_tty_state=" ${__aterm_tty_state//$'\n'/ } "
+    case "$__aterm_tty_state" in
+        *" -isig "*) command stty isig icanon iexten echo icrnl opost 2>/dev/null ;;
+    esac
+    return 0
+}
+
 # PROMPT_COMMAND handler - runs before each prompt, from the loader's trampoline,
 # which hands it the status the command before it left.
 __aterm_body_prompt_command() {
@@ -761,6 +800,10 @@ __aterm_body_prompt_command() {
 
     # A waiting re-key first, so every mark this prompt emits carries it.
     __aterm_rekey_check
+
+    # The tty settings (see "The tty settings after a failed command" above): one
+    # probe after a failed command, nothing after a successful one.
+    [[ "$last_status" == 0 ]] || __aterm_tty_repair
 
     # The managed dirs, live (see "LIVE" above): one probe, an assign only on change.
     __aterm_managed_path_live

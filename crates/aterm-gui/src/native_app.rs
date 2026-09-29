@@ -2099,10 +2099,10 @@ pub(crate) enum PackagesOutcome {
 }
 
 /// What came of an [`AppEffect::MessageAct`] — the host's answer, already in
-/// the words the page shows (`messages_host::act_feedback`): the intent was
-/// performed, it was refused (a path that is no crash log, a pane that did
-/// not open), or the entry no longer offers that button (a decision row
-/// that retired under the press, an id the ring has evicted).
+/// the words the page shows (`aterm_messages::page::act_feedback`): the
+/// intent was performed, it was refused (a path that is no crash log, a pane
+/// that did not open), or the entry no longer offers that button (a decision
+/// row that retired under the press, an id the ring has evicted).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MessageActOutcome {
     Performed { feedback: String },

@@ -1273,7 +1273,7 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
         .to_string();
     assert!(err.contains("byte-identical"), "{err}");
 
-    // With no local artifact to compare (`cargo ship verify`), the same corrupt
+    // With no local artifact to compare (`targo --unverified ship verify`), the same corrupt
     // bytes must still fail — on the Ed25519 check itself, which is the one
     // branch the byte comparison above never reaches.
     let err = publish::verify_channel_head_signature_with(
@@ -1992,7 +1992,7 @@ fn no_stop_negative_control_reproduces_old_appcast_503() {
     assert!(err.to_string().contains("v0.41.0 appcast: HTTP 503"));
 }
 
-/// `cargo ship status` intentionally requests the exhaustive policy: drafts
+/// `targo --unverified ship status` intentionally requests the exhaustive policy: drafts
 /// and appcast-less releases remain invisible, while every published appcast
 /// is downloaded so dangling ledger claims can be computed over the full set.
 #[test]
@@ -2223,9 +2223,13 @@ fn cli_parses_the_whole_spec_5_surface() {
     assert!(opts.dry_run && opts.gate && opts.arm64_only && !opts.resume);
     assert_eq!(opts.min_build, Some(42));
 
-    let cli::Cmd::Cut { opts, .. } =
-        parse(&["cut", "--rehearse", "alabsystems/aterm-rehearsal"]).unwrap()
-    else {
+    let cli::Cmd::Cut { opts, .. } = parse(&[
+        "cut",
+        "--mac-only",
+        "--rehearse",
+        "alabsystems/aterm-rehearsal",
+    ])
+    .unwrap() else {
         panic!("expected Cut");
     };
     assert_eq!(
@@ -2386,7 +2390,7 @@ fn the_retired_strand_flag_is_refused_in_one_sentence() {
         assert_eq!(err.matches(". ").count(), 0, "one sentence: {err}");
     }
     // Negative control: a cut without it parses, and the usage no longer teaches it.
-    assert!(parse(&["cut"]).is_ok());
+    assert!(parse(&["cut", "--mac-only"]).is_ok());
     assert!(
         !cli::USAGE.contains(cli::RETIRED_STRAND_FLAG),
         "{}",

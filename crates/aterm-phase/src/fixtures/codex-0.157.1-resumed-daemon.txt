@@ -1,0 +1,41 @@
+# codex 0.157.1 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm 120x40 (tools/test-codex-live-upgrade.sh lane A: network denied, a loopback Responses API) · a daemon-mode client the live upgrade relaunched (`codex resume <thread>` onto 0.157.1): the conversation redrawn under the session card, and a BARE composer (`›`, no placeholder) over the footer
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.157.1)                 │
+│                                            │
+│ model:       fake-model   /model to change │
+│ directory:   /private/tmp/cxlive.xxxx/work │
+│ permissions: YOLO mode                     │
+╰────────────────────────────────────────────╯
+
+
+› start bg 7771 please
+
+
+• ok
+
+• Failed (exit -1) sleep 7771
+  └ (no output)
+
+  8:22 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+›
+
+
+  fake-model default · /private/tmp/cxlive.xxxx/work
+

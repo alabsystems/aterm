@@ -135,7 +135,7 @@ impl Grid {
                 row, &extracted, len,
             ));
         }
-        drop(self.storage.rows.drain(hist..hist + belt));
+        self.storage.recycle_rows(hist..hist + belt);
         self.storage.total_lines -= belt;
         let belt_u16 = row_u16(belt);
         let old_bottom = self.storage.visible_rows.saturating_sub(1);
@@ -300,7 +300,7 @@ impl Grid {
             self.storage.ring_head = 0;
         }
         let keep = hist - n;
-        drop(self.storage.rows.drain(keep..hist));
+        self.storage.recycle_rows(keep..hist);
         while self.storage.ring_extras.len() > keep {
             self.storage.ring_extras.pop_back();
         }

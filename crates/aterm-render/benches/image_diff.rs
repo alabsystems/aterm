@@ -34,7 +34,7 @@
 // would fail the first guard; one that skipped the compare would fail the
 // second.
 
-use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
 use aterm_render::{DirtyDecision, compute_dirty_rows, is_unchanged_frame};
@@ -67,7 +67,8 @@ fn transmit(bytes: Vec<u8>) -> Arc<ImageData> {
         rows: IMG_ROWS as u16,
         z_index: 0,
         band_lift_px: 0,
-        pixel_exact: false,
+        scaling: ImageScaling::Fit,
+        source_rect: None,
     })
 }
 
@@ -83,6 +84,7 @@ fn input_with(template: &RenderInput, img: &Arc<ImageData>) -> RenderInput {
                     image: img.clone(),
                     cell_row: r as u16,
                     cell_col: c as u16,
+                    kitty: None,
                 },
             ));
         }

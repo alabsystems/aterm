@@ -270,6 +270,60 @@ fn cht_forward_and_cbt_backward_tab_stops() {
     assert_eq!(s.cursor(), (0, 8), "CBT moves back one tab stop");
 }
 
+/// CBT's left-margin clamp is gated on DECOM, and this pins it THROUGH THE
+/// ESCAPE SEQUENCE.
+///
+/// xterm `tabs.c` `TabToPrevStop` clamps the landing column to the left margin
+/// only when the ORIGIN flag is set:
+///
+/// ```c
+/// int next_column = TabPrev(xw->tabs, screen->cur_col);
+/// if (xw->flags & ORIGIN) {
+///     int left = ScrnLeftMargin(xw);
+///     if (next_column < left) next_column = left;
+/// }
+/// set_cur_col(screen, next_column);
+/// ```
+///
+/// Note this is NOT `CursorBack`'s rule: `cursor.c` clamps CUB to the left
+/// margin unconditionally. xterm treats the two differently, and aterm used to
+/// apply the CUB rule to both.
+///
+/// The Grid-level tests for this call `back_tab_margin` directly, so they
+/// cannot see whether the handler passes the mode at all — a review found that
+/// replacing `self.modes.origin_mode` with `false` left every other test in the
+/// tree green. Both arms below run the real `CSI Z`, and the DECOM-set arm is
+/// the one that dies under that mutation. (Swapping the two mode arguments is
+/// not observable: the clamp's gate is their conjunction.)
+#[test]
+fn cbt_stops_at_the_left_margin_only_under_decom() {
+    // Margins at 1-based 11..31, i.e. 0-based 10..30. Default tab stops are
+    // every 8, so the nearest stop left of column 12 is column 8 — OUTSIDE the
+    // left margin, which is what makes the two arms differ.
+    let armed = b"\x1b[?69h\x1b[11;31s";
+
+    // DECOM RESET: no clamp. CBT runs past the left margin to the real stop.
+    let mut s = Screen::new(3, 40);
+    s.feed(armed);
+    s.feed(b"\x1b[?6l\x1b[1;13H\x1b[Z");
+    assert_eq!(
+        s.cursor(),
+        (0, 8),
+        "DECOM reset: CBT is unclamped and reaches the tab stop at column 8"
+    );
+
+    // DECOM SET: clamped. The cursor stops ON the left margin instead.
+    // `CSI 1;3H` is margin-relative under DECOM, so it lands on column 12 too.
+    let mut s = Screen::new(3, 40);
+    s.feed(armed);
+    s.feed(b"\x1b[?6h\x1b[1;3H\x1b[Z");
+    assert_eq!(
+        s.cursor(),
+        (0, 10),
+        "DECOM set: CBT stops at the left margin instead of the stop at column 8"
+    );
+}
+
 #[test]
 fn tbc_clears_one_stop_then_all_stops() {
     let mut s = Screen::new(24, 80);

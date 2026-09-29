@@ -354,18 +354,23 @@ impl Journal {
 
     /// Append one line that is already a JSON object (the approval ledger's
     /// rows, [`super::approvals`]), under the same open-once, warn-once rule
-    /// as [`Self::record`].
-    pub fn append_raw(&mut self, json: &str, warn: &mut dyn Write) {
+    /// as [`Self::record`]. Answers whether the line is ON RECORD: `false`
+    /// with no journal, or when the write failed (a full disk) — for a
+    /// caller that must not act on what it could not record (the disk
+    /// journal's intent rows).
+    pub fn append_raw(&mut self, json: &str, warn: &mut dyn Write) -> bool {
         let res = match self.file.as_mut() {
             Some(f) => f
                 .write_all(json.as_bytes())
                 .and_then(|()| f.write_all(b"\n"))
                 .and_then(|()| f.flush()),
-            None => return,
+            None => return false,
         };
         if let Err(e) = res {
             self.warn(&format!("cannot append to it: {e}"), warn);
+            return false;
         }
+        true
     }
 
     fn warn(&mut self, why: &str, warn: &mut dyn Write) {

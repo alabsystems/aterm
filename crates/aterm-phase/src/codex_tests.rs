@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One test per measured Codex screen (codex 0.156.1), each with its
-//! negative control.
+//! One test per measured Codex screen (codex 0.156.1, and the 0.157 ones
+//! measured since), each with its negative control.
 
 use super::fixtures::*;
 use super::*;
@@ -39,6 +39,25 @@ const ALL: &[&str] = &[
     HIT_LIMIT,
     TRUST_TALL_PANE,
     END_OF_TURN_TIP,
+    RATE_NUDGE,
+    IDLE_158,
+    MODEL_PICK,
+    EFFORT_PICK,
+    EFFORT_PICK_MORE,
+    EFFORT_PICK_OTHER,
+    ADVANCED_PICK,
+    ADVANCED_PICK_ULTRA,
+    GOAL_PAUSE_NONE,
+    GOAL_BUSY,
+    GOAL_BUSY_0_158,
+    GOAL_NEXT_TURN_0_158,
+    GOAL_RESUME,
+    HIT_LIMIT_NO_RESET,
+    QUESTION_0157,
+    PLAN_0157,
+    RESUMED_DAEMON,
+    RESUMED_DAEMON_0_159,
+    RESUMED_INLINE_0_159,
 ];
 
 /// Every Codex fixture names the program, its version and how its rows were
@@ -48,7 +67,9 @@ fn every_fixture_names_codex_its_version_and_its_provenance() {
     for text in ALL {
         let line = provenance(text).expect("a provenance line");
         assert!(
-            line.starts_with("codex 0.156.1 · ") || line.starts_with("codex 0.157.0 · "),
+            ["0.156.1", "0.157.0", "0.157.1", "0.158.0", "0.159.0"]
+                .iter()
+                .any(|v| line.starts_with(&format!("codex {v} · "))),
             "{line}"
         );
         let measured = line.contains(" · MEASURED 2026-09-2");
@@ -56,6 +77,11 @@ fn every_fixture_names_codex_its_version_and_its_provenance() {
         assert!(!screen(text)[0].starts_with("# "), "{line}");
     }
     assert!(provenance(HIT_LIMIT).is_some_and(|l| l.contains("HAND-BUILT")));
+    assert!(provenance(RATE_NUDGE).is_some_and(|l| l.contains("HAND-BUILT")));
+    assert!(provenance(GOAL_RESUME).is_some_and(|l| l.contains("HAND-BUILT")));
+    for measured in [MODEL_PICK, EFFORT_PICK, ADVANCED_PICK, IDLE_158] {
+        assert!(provenance(measured).is_some_and(|l| l.contains("MEASURED 2026-09-28")));
+    }
 }
 
 /// A fresh session at its composer: idle, and evidence (the session card,
@@ -340,6 +366,31 @@ fn the_patch_box_is_an_edit_prompt_with_its_roles() {
 /// CONTROL: Claude Code's reader sees no box on it.
 #[test]
 fn the_question_dialog_is_a_question_prompt() {
+    // 0.157.1's, measured as the supervisor answered it live (lane G of
+    // tools/test-codex-live-upgrade.sh), reads the same.
+    for text in [QUESTION_0157, QUESTION] {
+        let r = codex(text);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+        let p = r.prompt.expect("the dialog");
+        assert_eq!(
+            (p.kind, p.title.as_str()),
+            (PromptKind::Question, "Question 1/1 (1 unanswered)")
+        );
+        assert_eq!(
+            labels(&p),
+            vec!["subtract (Recommended)", "sub", "None of the above"]
+        );
+        assert_eq!(roles(&p), vec![Role::Answer, Role::Answer, Role::Other]);
+        assert_eq!(
+            p.recommended().map(|o| (o.n, o.label.as_str())),
+            Some((Some(1), "subtract (Recommended)"))
+        );
+        assert_ne!(
+            ClaudeReader.phase(&screen(text)),
+            Phase::Prompt,
+            "the control"
+        );
+    }
     let r = codex(QUESTION);
     assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
     let p = r.prompt.expect("the dialog");
@@ -389,19 +440,25 @@ fn the_question_dialog_is_a_question_prompt() {
 /// above it is transcript.
 #[test]
 fn the_plan_box_is_a_plan_prompt() {
-    let p = codex(PLAN).prompt.expect("the box");
-    assert_eq!(p.kind, PromptKind::PlanExit);
-    assert_eq!(p.title, anchor_text("codex.plan.title"));
-    assert_eq!(
-        labels(&p),
-        vec![
-            "Yes, implement this plan",
-            "Yes, clear context and implement",
-            "No, stay in Plan mode"
-        ]
-    );
-    assert_eq!(roles(&p), vec![Role::Once, Role::Other, Role::Deny]);
-    assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Back));
+    // 0.157.1's (its descriptions without the full stop, the fresh thread's
+    // without the context figure), measured as the supervisor pressed it
+    // live, reads the same. NEGATIVE CONTROL: its answered question above
+    // is transcript, never a second box.
+    for text in [PLAN, PLAN_0157] {
+        let p = codex(text).prompt.expect("the box");
+        assert_eq!(p.kind, PromptKind::PlanExit);
+        assert_eq!(p.title, anchor_text("codex.plan.title"));
+        assert_eq!(
+            labels(&p),
+            vec![
+                "Yes, implement this plan",
+                "Yes, clear context and implement",
+                "No, stay in Plan mode"
+            ]
+        );
+        assert_eq!(roles(&p), vec![Role::Once, Role::Other, Role::Deny]);
+        assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Back));
+    }
 }
 
 /// Esc stopped the turn: idle, evidence, `interrupted`, no wall.
@@ -513,6 +570,25 @@ fn the_usage_limit_row_is_a_wall() {
     );
     assert!(r.phase_authoritative);
     assert_eq!(codex(END_OF_TURN).wall, None, "the control");
+}
+
+/// MEASURED on 0.157.1 (2026-09-27, a private instance whose loopback model
+/// answered `usage_limit_reached`): the wall the hand-built fixture above
+/// stood in for, reached live — the usage window, the row naming NO reset
+/// (`try again later`), so a supervisor waits out its longest back-off.
+/// NEGATIVE CONTROL: the hand-built row's reset is read where it names one.
+#[test]
+fn the_measured_usage_limit_row_is_a_wall_with_no_reset() {
+    let r = codex(HIT_LIMIT_NO_RESET);
+    let w = r.wall.clone().expect("the wall");
+    assert_eq!(w.kind, WallKind::UsageSession);
+    assert_eq!(w.reset, None, "{}", w.message);
+    assert!(w.message.contains("try again later"), "{}", w.message);
+    assert!(r.phase_authoritative);
+    assert!(
+        codex(HIT_LIMIT).wall.and_then(|w| w.reset).is_some(),
+        "the control"
+    );
 }
 
 /// The rest of [`WALLS`], each as the turn's last `■` row; an interrupt
@@ -870,4 +946,770 @@ fn a_background_terminal_after_an_ended_turn_is_the_agents_own_work() {
     let idle = ended("");
     assert_eq!(phase(&idle), (Phase::Idle, true));
     assert_eq!(background_wait(&idle), None);
+}
+
+/// A TURN ENDED UNDER A BACKGROUND TERMINAL, HOWEVER IT ENDED
+/// ([`ended_under_background`], the round-3 re-review of 2026-09-28): with
+/// the line under it the whole screen reads busy, and the rest reads the
+/// ended turn — idle, a QUESTION (the save's "Should I merge them and push
+/// again?") — each named; a usage WALL's or an API error's `■` block under
+/// the line is the turn's end already (not busy), and named the same.
+/// NEGATIVE CONTROLS: the same screens without the line
+/// name nothing (they are points already), a turn still running beside the
+/// line names nothing, and only the idle end is the host's
+/// [`background_wait`].
+#[test]
+fn a_turn_ended_under_a_background_terminal_is_named_however_it_ended() {
+    let line = "  1 background terminal running · /ps to view · /stop to close";
+    let ended = |said: &[&str], status: &str| {
+        let mut r = vec!["› start bg 7771 please", ""];
+        r.extend_from_slice(said);
+        r.extend_from_slice(&[
+            "",
+            "  1:41 AM",
+            "",
+            status,
+            "",
+            "› Ask Codex to do anything",
+            "",
+        ]);
+        r.push("  fake-model default · /w");
+        rows(&r)
+    };
+    let idle = ["• The server runs in the background."];
+    let asks = [
+        "• The push was rejected: the remote has two new commits.",
+        "",
+        "  Should I merge them and push again?",
+    ];
+    for (said, want) in [(&idle[..], Phase::Idle), (&asks[..], Phase::Question)] {
+        let bg = ended(said, line);
+        assert_eq!(phase(&bg), (Phase::Busy, true), "{said:?}");
+        assert_eq!(ended_under_background(&bg), Some(want.clone()), "{said:?}");
+        assert_eq!(
+            background_wait(&bg).is_some(),
+            want == Phase::Idle,
+            "{said:?}"
+        );
+        assert_eq!(ended_under_background(&ended(said, "")), None, "{said:?}");
+    }
+    // A wall's `■` block under the line is the turn's end whatever runs
+    // under it — a point already, not busy (measured on these screens) —
+    // and named the same.
+    let walls = [
+        rows(&[
+            "› save it",
+            "",
+            "■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to \
+             purchase more credits or try again at Sep 25th, 2026 3:05 PM.",
+            "",
+            line,
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  fake-model default · /w",
+        ]),
+        rows(&[
+            "› save it",
+            "",
+            "■ stream disconnected before completion: exceeded retry limit, last status: 500",
+            "",
+            line,
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  fake-model default · /w",
+        ]),
+    ];
+    for w in &walls {
+        let rest: Vec<String> = w
+            .iter()
+            .filter(|r| !is_background_terminal_row(r))
+            .cloned()
+            .collect();
+        let (p, auth) = phase(&rest);
+        assert!(auth, "{rest:#?}");
+        assert_eq!(phase(w), (p.clone(), true), "{w:#?}");
+        assert_ne!(p, Phase::Busy, "{w:#?}");
+        assert_eq!(ended_under_background(w), Some(p.clone()), "{w:#?}");
+        assert!(wall(&rest).is_some(), "{rest:#?}");
+    }
+    // A turn still running beside the line: no end.
+    let running = rows(&[
+        "› start bg 7771 please",
+        "",
+        "• Working (6s • esc to interrupt)",
+        line,
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  fake-model default · /w",
+    ]);
+    assert_eq!(ended_under_background(&running), None);
+}
+
+// --- the rate-limit nudge, the `/model` picker, the footer (2026-09-28) -----
+
+/// The rate-limit model nudge (HAND-BUILT from the 0.157.1 strings on the
+/// measured 0.158.0 list geometry) is its own kind: its plain keep the
+/// refusal that settles nothing, its never-show-again keep a standing
+/// setting (it writes Codex's config), its switch no role at all. NEGATIVE
+/// CONTROLS: retitled it is a box of no kind whose options carry no roles;
+/// its head cut off the rows read, it is named by nothing either.
+#[test]
+fn the_rate_limit_nudge_is_its_own_kind_and_keeps_by_role() {
+    let r = codex(RATE_NUDGE);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Prompt, true)
+    );
+    let p = r.prompt.expect("the nudge");
+    assert_eq!(p.kind, PromptKind::RateNudge);
+    assert_eq!(p.kind.name(), "rate-nudge");
+    assert_eq!(p.title, anchor_text("codex.nudge.title"));
+    assert_eq!(
+        labels(&p),
+        [
+            "Switch to gpt-6-luna",
+            "Keep current model",
+            "Keep current model (never show again)"
+        ]
+    );
+    assert_eq!(roles(&p), [Role::Other, Role::Deny, Role::Persist]);
+    assert_eq!(p.select, Select::Digits);
+    assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Back));
+    assert!(!p.head_off_screen);
+
+    let retitled: Vec<String> = screen(RATE_NUDGE)
+        .into_iter()
+        .map(|r| r.replace("Approaching rate limits", "Approaching usage limits"))
+        .collect();
+    let q = prompt(&retitled).expect("still a box");
+    assert_eq!(q.kind, PromptKind::Other);
+    assert!(roles(&q).iter().all(|r| *r == Role::Other), "{q:?}");
+
+    let all = screen(RATE_NUDGE);
+    let first = all
+        .iter()
+        .position(|r| r.starts_with("› 1."))
+        .expect("the options");
+    // Cut under the title: the subtitle is the first row read.
+    let cut = all[first - 3..].to_vec();
+    assert!(cut[0].contains("for lower credit usage?"), "{cut:#?}");
+    let q = prompt(&cut).expect("the options still read");
+    assert!(q.head_off_screen);
+    assert_eq!(q.kind, PromptKind::Other);
+    assert!(!roles(&q).contains(&Role::Deny), "{q:?}");
+    // The plan box stays a plan box.
+    assert_eq!(
+        prompt(&screen(PLAN)).map(|p| p.kind),
+        Some(PromptKind::PlanExit)
+    );
+}
+
+/// `/model`'s boxes (MEASURED on 0.158.0): the model box, the effort box —
+/// of the current model and of another, its cursor on `More reasoning…` —
+/// and the advanced box are all the model picker, every option of no role
+/// (a choice the harness makes only by label, only for its own restore), each
+/// chosen by digit on its list, each footer's Esc a going back. NEGATIVE
+/// CONTROL: the exec box stays an exec box.
+#[test]
+fn the_model_picker_boxes_are_the_model_picker() {
+    let cases: [(&str, &str, &[&str], &str); 6] = [
+        (
+            MODEL_PICK,
+            "Select Model and Effort",
+            &[
+                "GPT-6-Astra (current)",
+                "GPT-6-Sol",
+                "GPT-6-Luna",
+                "GPT-5.6-Sol",
+                "GPT-5.6-Terra",
+                "GPT-5.6-Luna",
+                "GPT-5.5",
+            ],
+            "GPT-6-Astra (current)",
+        ),
+        (
+            EFFORT_PICK,
+            "Select Reasoning Level for GPT-6-Astra",
+            &[
+                "Low",
+                "Medium (default) (current)",
+                "High",
+                "Extra high",
+                "More reasoning…",
+            ],
+            "Medium (default) (current)",
+        ),
+        (
+            EFFORT_PICK_MORE,
+            "Select Reasoning Level for GPT-6-Astra",
+            &[
+                "Low",
+                "Medium (default) (current)",
+                "High",
+                "Extra high",
+                "More reasoning…",
+            ],
+            "More reasoning…",
+        ),
+        (
+            EFFORT_PICK_OTHER,
+            "Select Reasoning Level for GPT-6-Luna",
+            &[
+                "Low",
+                "Medium (default)",
+                "High",
+                "Extra high",
+                "More reasoning…",
+            ],
+            "Medium (default)",
+        ),
+        (
+            ADVANCED_PICK,
+            "Advanced Reasoning",
+            &["Max", "Ultra"],
+            "Max",
+        ),
+        (
+            ADVANCED_PICK_ULTRA,
+            "Advanced Reasoning",
+            &["Max", "Ultra"],
+            "Ultra",
+        ),
+    ];
+    for (text, title, want, focused) in cases {
+        let r = codex(text);
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Prompt, true),
+            "{title}"
+        );
+        let p = r.prompt.expect("the picker");
+        assert_eq!(p.kind, PromptKind::ModelPick, "{title}");
+        assert_eq!(p.kind.name(), "model-pick");
+        assert_eq!(p.title, title);
+        assert_eq!(labels(&p), want, "{title}");
+        assert!(roles(&p).iter().all(|r| *r == Role::Other), "{title}");
+        assert_eq!(
+            p.focused().map(|o| o.label.as_str()),
+            Some(focused),
+            "{title}"
+        );
+        assert_eq!(p.select, Select::Digits);
+        assert_eq!(
+            p.cancel.map(|c| c.effect),
+            Some(CancelEffect::Back),
+            "{title}"
+        );
+        // The footer is gone under the box: no model is read off it.
+        assert_eq!(footer_model(&screen(text)), None, "{title}");
+    }
+    // The effort boxes offer the session-only `s` beside Enter's default.
+    for text in [
+        EFFORT_PICK,
+        EFFORT_PICK_OTHER,
+        ADVANCED_PICK,
+        ADVANCED_PICK_ULTRA,
+    ] {
+        assert!(
+            screen(text)
+                .last()
+                .is_some_and(|f| f.contains(anchor_text("codex.pick.session"))),
+            "{}",
+            provenance(text).unwrap_or_default()
+        );
+    }
+    assert!(
+        !screen(MODEL_PICK)
+            .last()
+            .is_some_and(|f| f.contains(anchor_text("codex.pick.session")))
+    );
+    assert_eq!(
+        prompt(&screen(BOX_EXEC)).map(|p| p.kind),
+        Some(PromptKind::Bash)
+    );
+}
+
+/// The footer's first field is the THREAD's model and effort (0.158.0 at
+/// idle, measured; a live goal tab's footer; 0.157.0's and 0.156.1's): the
+/// display name the picker lists, the effort lowercased. NEGATIVE CONTROLS:
+/// under a box nothing is read, and a footer field with no effort word is
+/// the model alone.
+#[test]
+fn the_footer_names_the_threads_model_and_effort() {
+    let m = |text: &str| footer_model(&screen(text));
+    let want = |model: &str, effort: &str| Some((model.to_string(), Some(effort.to_string())));
+    assert_eq!(m(IDLE_158), want("GPT-6-Astra", "medium"));
+    assert_eq!(m(GOAL_BUSY), want("GPT-6-Astra", "ultra"));
+    assert_eq!(
+        footer_status(&screen(IDLE_158)),
+        Some("GPT-6-Astra medium · ~")
+    );
+    let old = m(END_OF_TURN_TIP).expect("0.157.0's footer");
+    assert_eq!(old.1.as_deref(), Some("low"), "{old:?}");
+    assert_eq!(m(RATE_NUDGE), None, "a box");
+    let bare = rows(&[
+        "  1:39 PM",
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  gpt-6-astra · ~/pj",
+    ]);
+    assert_eq!(footer_model(&bare), Some(("gpt-6-astra".to_string(), None)));
+    let extra = rows(&[
+        "› Ask Codex to do anything",
+        "",
+        "  GPT-6-Sol extra high · ~/pj",
+    ]);
+    assert_eq!(
+        footer_model(&extra),
+        Some(("GPT-6-Sol".to_string(), Some("extra high".to_string())))
+    );
+}
+
+/// The footer's right side names Codex's goal: pursued (measured on a live
+/// tab), paused, stopped at a usage limit, stalled, achieved, unmet — each by
+/// its own words.
+/// NEGATIVE CONTROLS: a footer with no goal, and the words in a transcript
+/// row rather than the footer, name none.
+#[test]
+fn the_footer_names_codexs_goal() {
+    let with = |right: &str| -> Vec<String> {
+        screen(GOAL_BUSY)
+            .into_iter()
+            .map(|r| r.replace("Pursuing goal (10d 3h 2m)", right))
+            .collect()
+    };
+    assert_eq!(goal_state(&screen(GOAL_BUSY)), Some(CodexGoal::Pursuing));
+    assert!(CodexReader.goal_active(&screen(GOAL_BUSY)));
+    assert_eq!(
+        goal_state(&with("Goal paused (/goal resume)")),
+        Some(CodexGoal::Paused)
+    );
+    assert_eq!(
+        goal_state(&with("Goal hit usage limits (/goal resume)")),
+        Some(CodexGoal::UsageLimited)
+    );
+    assert_eq!(
+        goal_state(&with("Goal stalled (/goal resume)")),
+        Some(CodexGoal::Stalled)
+    );
+    // A goal that ENDED, as the vendor's footer draws it (rust-v0.158.0
+    // `goal_status_indicator_line`): complete, or out of its token budget.
+    for (right, ended) in [
+        ("Goal achieved (10h 12m)", CodexGoal::Achieved),
+        ("Goal achieved", CodexGoal::Achieved),
+        ("Goal unmet (63.9K / 50K tokens)", CodexGoal::Unmet),
+        ("Goal abandoned", CodexGoal::Unmet),
+    ] {
+        assert_eq!(goal_state(&with(right)), Some(ended), "{right}");
+    }
+    assert!(!CodexReader.goal_active(&with("Goal paused (/goal resume)")));
+    assert_eq!(goal_state(&screen(IDLE_158)), None);
+    let quoted = rows(&[
+        "• The footer said Pursuing goal (3m) before.",
+        "",
+        "  1:39 PM",
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  GPT-6-Astra ultra · ~/pj",
+    ]);
+    assert_eq!(goal_state(&quoted), None);
+}
+
+/// IN A NARROW PANE the goal still reads (the goal-pause review of
+/// 2026-09-28; each footer CAPTURED LIVE from Codex 0.158.0 in a scratch
+/// headless aterm, a scratch `$CODEX_HOME` and a dummy key): Codex cuts the
+/// status row's left side to keep the goal's state whole, and its ` · `
+/// goes — at 45 columns the paused goal's row, at 40 both — while the
+/// key-hint row under it keeps its own. Read by the ` · ` alone, the
+/// key-hint row was taken for the status row: the goal read as none, and
+/// the upgrade released a hold that still owed its resume. NEGATIVE
+/// CONTROLS: the same pane with no goal on its cut row names none and reads
+/// no model off the key-hint row; a key-hint row alone is no status row.
+#[test]
+fn a_narrow_panes_footer_still_names_the_goal() {
+    let pane = |status: &str, hints: &str| {
+        rows(&[
+            "    dummy**robe. You can find your API key a\u{2026}",
+            "",
+            "\u{203a} Ask Codex to do anything",
+            "",
+            status,
+            hints,
+            "",
+        ])
+    };
+    let hints45 = "  \u{2190} for agents \u{b7} ? for shortcuts    \u{26a0} 1 \u{b7} f2";
+    let hints40 = "  \u{2190} for agents \u{b7} ? for shortc  \u{26a0} 1 \u{b7} f2";
+    let pursuing45 = pane(
+        "  gpt-5 default \u{b7} /pri\u{2026} Pursuing goal (21s)",
+        hints45,
+    );
+    let paused45 = pane(
+        "  gpt-5 default\u{2026} Goal paused (/goal resume)",
+        hints45,
+    );
+    let paused40 = pane("  gpt-5 de\u{2026} Goal paused (/goal resume)", hints40);
+    let wide = pane(
+        "  gpt-5 default \u{b7} /private/tmp/claude-502/scratchpad/\u{2026} Goal paused (/goal \
+         resume)",
+        "  \u{2190} for agents \u{b7} ? for shortcuts        \u{26a0} 1 warning \u{b7} f2 to view",
+    );
+    assert_eq!(goal_state(&pursuing45), Some(CodexGoal::Pursuing));
+    assert_eq!(goal_state(&paused45), Some(CodexGoal::Paused));
+    assert_eq!(goal_state(&paused40), Some(CodexGoal::Paused));
+    assert_eq!(goal_state(&wide), Some(CodexGoal::Paused));
+    assert_eq!(
+        footer_status(&paused40),
+        Some("gpt-5 de\u{2026} Goal paused (/goal resume)")
+    );
+    let bare = pane("  gpt-5 de\u{2026}", hints40);
+    assert_eq!(footer_status(&bare), None, "never the key-hint row");
+    assert_eq!(goal_state(&bare), None);
+    assert_eq!(footer_model(&bare), None);
+    let hints_only = rows(&["\u{203a} Ask Codex to do anything", "", hints45]);
+    assert_eq!(footer_status(&hints_only), None);
+}
+
+/// 0.158.0's status row while a background terminal runs carries the
+/// status line's items after its Esc hint on the same row (measured on a
+/// live tab): still a turn running — under the `»` input line a goal turn
+/// draws, which is the composer ([`CARETS`], the one reader), as under `›`.
+/// NEGATIVE CONTROL: an agent's own row that mentions the hint mid-sentence
+/// is no status row.
+#[test]
+fn a_status_row_with_the_background_terminal_tail_is_busy() {
+    let busy = screen(GOAL_BUSY);
+    assert_eq!(
+        phase(&busy),
+        (Phase::Busy, true),
+        "the `»` input line is the composer"
+    );
+    let at_caret: Vec<String> = busy
+        .iter()
+        .map(|r| r.replacen("» Ask Codex", "› Ask Codex", 1))
+        .collect();
+    assert_eq!(phase(&at_caret), (Phase::Busy, true));
+    let mut prose = busy.clone();
+    let at = prose
+        .iter()
+        .position(|r| r.starts_with("• Working ("))
+        .expect("the status row");
+    prose[at] = "• I pressed (esc to interrupt) and then went on with the fix".to_string();
+    prose[at + 1] = String::new();
+    prose.insert(at + 1, String::new());
+    prose.insert(at + 2, "  1:39 PM".to_string());
+    assert_ne!(phase(&prose), (Phase::Busy, true), "{prose:#?}");
+}
+
+/// A usage wall with Codex's `Tip:` row right under it (0.157.1, the owner's
+/// 2026-09-27 wall): the reset is the wall's own words, never the tip joined
+/// on. NEGATIVE CONTROL: the same wall with no tip reads the same reset.
+#[test]
+fn a_tip_under_a_usage_wall_is_not_its_reset() {
+    let plain = screen(HIT_LIMIT);
+    let want = wall(&plain).expect("the wall").reset;
+    assert!(want.is_some());
+    let head = plain
+        .iter()
+        .rposition(|r| r.starts_with('■'))
+        .expect("the ■ row");
+    let end = (head + 1..plain.len())
+        .find(|&i| plain[i].trim().is_empty())
+        .expect("the blank under the block");
+    for tip in [
+        "  Tip: Use /statusline to configure which items appear in the status line.",
+        "  └ Tip: Use /statusline to configure which items appear in the status line.",
+    ] {
+        let mut with_tip = plain.clone();
+        with_tip.insert(end, tip.to_string());
+        let w = wall(&with_tip).expect("still the wall");
+        assert_eq!(w.reset, want, "{tip}");
+        assert!(!w.message.contains("Tip:"), "{}", w.message);
+    }
+}
+
+/// `/goal pause` with no goal set (MEASURED 0.158.0): the `■ Failed to
+/// update thread goal …` row ends nothing a wall names — no wall, and no
+/// person's interrupt. NEGATIVE CONTROL: the measured interrupt is one.
+#[test]
+fn a_failed_goal_command_is_no_wall_and_no_interrupt() {
+    let r = codex(GOAL_PAUSE_NONE);
+    assert_eq!(r.wall, None);
+    assert!(!r.interrupted);
+    assert!(codex(INTERRUPTED).interrupted, "the control");
+}
+
+/// CODEX 0.158.0 DRAWS ITS INPUT LINE `»` (measured 2026-09-28 on a live
+/// goal-mode session, read only: `cell 60 0` is `»` bold, `cell 60 2` the
+/// placeholder's `A` dim). Read with `›` alone that screen had no composer —
+/// `idle` NOT authoritatively — and the owner's tab stood a Codex upgrade
+/// behind with nothing that acts on an idle point ever running there. The
+/// `»` row is the composer, its placeholder the draft, its mark the one a
+/// typed guard anchors to, and a turn running under it is busy as evidence.
+/// The same screen with its turn ended is idle as evidence.
+///
+/// NEGATIVE CONTROLS: a `»` or `›` row of the TRANSCRIPT — the blocks under
+/// it — is never the input line; and the same screen with a mark no build
+/// draws in its place reads no composer and no evidence, as the old reader
+/// read the real one.
+#[test]
+fn a_0_158_input_line_drawn_with_its_new_mark_is_the_composer() {
+    let rows = screen(GOAL_BUSY_0_158);
+    let caret = rows
+        .iter()
+        .position(|row| row.starts_with("» Ask Codex"))
+        .expect("the input line");
+    assert_eq!(
+        crate::prompt::fixtures::cursor(GOAL_BUSY_0_158),
+        Some((caret, 2)),
+        "measured: the cursor on the placeholder"
+    );
+    let r = codex(GOAL_BUSY_0_158);
+    assert_eq!(r.program, Program::Codex);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Busy, true)
+    );
+    assert_eq!(
+        r.composer,
+        Some((
+            caret,
+            vec![anchor_text("codex.composer.placeholder").to_string()]
+        ))
+    );
+    assert_eq!(caret_on(&rows), Some('»'));
+    assert_eq!(CodexReader.caret_on(&rows), Some('»'));
+    assert!(is_codex_screen(&rows));
+    assert_eq!(identify(None, &rows).program(), Program::Codex);
+
+    // Its turn ended (the status row and its tip gone, an end row under the
+    // last answer): idle, as evidence, at the same input line.
+    let status = rows
+        .iter()
+        .position(|row| row.starts_with("• Working ("))
+        .expect("the status row");
+    let mut ended = rows.clone();
+    ended[status] = "  8:51 AM".to_string();
+    ended[status + 1] = String::new();
+    assert_eq!(phase(&ended), (Phase::Idle, true));
+    assert_eq!(composer(&ended), Some(caret));
+
+    // A typed draft on the new mark is the person's.
+    let mut drafted = ended.clone();
+    drafted[caret] = "» fix the footer".to_string();
+    assert_eq!(
+        composer_draft(&drafted).map(|(_, l)| l),
+        Some(vec!["fix the footer".to_string()])
+    );
+
+    // NEGATIVE CONTROL: a transcript row opening with either mark, blocks
+    // under it, is no input line — the one under them all is.
+    for mark in CARETS {
+        let mut quoted = ended.clone();
+        quoted[status - 1] = format!("{mark} a message that opens with the mark");
+        assert_eq!(composer(&quoted), Some(caret), "{mark}");
+        let mut last = ended[..status].to_vec();
+        last.push(format!("{mark} a message with the transcript under it"));
+        last.push("• and the agent's answer".to_string());
+        last.push("  1:39 PM".to_string());
+        assert_eq!(composer(&last), None, "{mark}");
+    }
+
+    // NEGATIVE CONTROL: a mark no build draws reads as the old reader read
+    // the real screen — no composer, and no evidence either way.
+    let mut unknown = ended.clone();
+    unknown[caret] = unknown[caret].replacen('»', "▸", 1);
+    assert_eq!(composer(&unknown), None);
+    assert_eq!(phase(&unknown), (Phase::Idle, false));
+    assert_eq!(caret_on(&unknown), None);
+    assert_eq!(CodexReader.caret_on(&unknown), Some('›'), "the stock mark");
+}
+
+/// A GOAL'S NEXT TURN IS INVISIBLE TO THE SCREEN FOR ITS FIRST SECONDS
+/// (measured 2026-09-28 on the owner's goal-mode Codex 0.158.0, read only):
+/// about a second after a turn's end row, the next turn — a goal
+/// continuation, which writes no user row — streams its first message under
+/// that row with no status row, and the screen reads an ENDED turn, idle as
+/// evidence, its last words the previous turn's. Frames a second apart grew
+/// the message row by row; the goal's
+/// rollout began that turn within 14 ms of the last one's end. This reading
+/// is pinned as the fact it is: the screen cannot see such a turn, and what
+/// may not end a running turn asks the thread's own record instead (the live
+/// upgrade's floor on a client's own thread, `aterm_agent::harness::upgrade::
+/// Facts::daemon_turn`). NEGATIVE CONTROL: the same frame with its status row
+/// up reads busy.
+#[test]
+fn a_goals_next_turn_streaming_under_the_last_end_row_reads_ended() {
+    let rows = screen(GOAL_NEXT_TURN_0_158);
+    assert_eq!(
+        crate::prompt::fixtures::cursor(GOAL_NEXT_TURN_0_158),
+        Some((60, 2))
+    );
+    assert_eq!(phase(&rows), (Phase::Idle, true));
+    // The last words read are the ENDED turn's; the next turn's streaming
+    // message under its end row is not even among them.
+    let said = said_tail(&rows).expect("the ended turn's last words");
+    assert!(said.starts_with("All three are clean on main"), "{said}");
+    assert!(!said.contains("The last turn made"), "{said}");
+    assert_eq!(caret_on(&rows), Some('»'));
+    let mut running = rows.clone();
+    running[58] = "• Working (2s • esc to interrupt)".to_string();
+    assert_eq!(phase(&running), (Phase::Busy, true));
+}
+
+// --- the paused goal's box, as `codex resume` draws it (2026-09-28) --------
+
+/// `Resume paused goal?` (HAND-BUILT from the vendor's own render of it) is
+/// its own kind: `Leave paused` the refusal that settles nothing, `Resume
+/// goal` no role at all — the one decider that presses it matches it by its
+/// label ([`resume_box`]: the live upgrade's resume of a goal it paused),
+/// focused first. Its footer is a box's, so no footer (and no goal) is read
+/// under it. NEGATIVE CONTROLS: retitled it is a box of no kind, which
+/// [`resume_box`] does not read; the focus moved to `Leave paused`, the box
+/// reads with no resume focused; the composer screen reads no such box.
+#[test]
+fn the_paused_goals_box_is_its_own_kind_and_reads_its_focus() {
+    let r = codex(GOAL_RESUME);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Prompt, true)
+    );
+    let p = r.prompt.expect("the box");
+    assert_eq!(p.kind, PromptKind::GoalResume);
+    assert_eq!(p.kind.name(), "goal-resume");
+    assert_eq!(p.title, anchor_text("codex.goal.resume.title"));
+    assert_eq!(
+        labels(&p),
+        [
+            anchor_text("codex.goal.resume.yes"),
+            anchor_text("codex.goal.resume.leave")
+        ]
+    );
+    assert_eq!(roles(&p), [Role::Other, Role::Deny]);
+    assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Back));
+    let rows = screen(GOAL_RESUME);
+    let (row, resume) = resume_box(&rows).expect("read");
+    assert!(resume);
+    assert!(rows[row].starts_with("› 1. Resume goal"), "{}", rows[row]);
+    assert_eq!(
+        footer_status(&rows),
+        None,
+        "a box stands where the footer was"
+    );
+    assert_eq!(goal_state(&rows), None);
+
+    let retitled: Vec<String> = rows
+        .iter()
+        .map(|r| r.replace("Resume paused goal?", "Resume paused task?"))
+        .collect();
+    assert_eq!(
+        prompt(&retitled).expect("still a box").kind,
+        PromptKind::Other
+    );
+    assert_eq!(resume_box(&retitled), None);
+
+    let moved: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r.replacen("› 1. Resume goal", "  1. Resume goal", 1)
+                .replacen("  2. Leave paused", "› 2. Leave paused", 1)
+        })
+        .collect();
+    let (row, resume) = resume_box(&moved).expect("read");
+    assert!(!resume);
+    assert!(moved[row].starts_with("› 2. Leave paused"));
+
+    assert_eq!(resume_box(&screen(GOAL_NEXT_TURN_0_158)), None);
+    assert_eq!(resume_box(&screen(RATE_NUDGE)), None);
+}
+
+/// A DAEMON-MODE CLIENT THE UPGRADE RELAUNCHED (lane A, 2026-09-27): its
+/// conversation is redrawn under the session card over a BARE composer —
+/// `›` and nothing, no placeholder — and, the program named, it is an
+/// ended turn at an idle composer, authoritatively (its last block a tool
+/// row: no last words). NEGATIVE CONTROL, and why a supervisor must name the
+/// program before it trusts the point: by its layout alone the screen is
+/// nobody's (the placeholder is what names an empty Codex composer), and a
+/// generic read of it is no evidence.
+#[test]
+fn a_resumed_daemon_client_is_idle_once_its_program_is_named() {
+    let rows = screen(RESUMED_DAEMON);
+    let r = codex(RESUMED_DAEMON);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    assert_eq!(r.said_tail, None, "a tool row is no last words");
+    assert!(composer(&rows).is_some());
+    assert!(!is_codex_screen(&rows), "no placeholder, no status row");
+    let unnamed = read(None, &rows, None);
+    assert_eq!(identify(None, &rows).program(), Program::Generic);
+    assert!(!unnamed.phase_authoritative, "{unnamed:?}");
+}
+
+/// CODEX 0.159.0 ENDS A TURN ON `Worked for <1s • 2:58 AM` — U+2022 where
+/// every build before it drew ` · ` (measured 2026-09-29, lanes A and D of
+/// `tools/test-codex-live-upgrade.sh`, the managed store on 0.159.0). Read
+/// with ` · ` alone, no end was found under the last message: a relaunched
+/// daemon client read BUSY for good and an inline one, its message scrolled
+/// off, idle with no evidence — so the loop reached no idle point after the
+/// live upgrade's `adopted` and nothing typed its carry-on (every tab stood
+/// at `adopted` for the lane's 600 s). Both screens are ended turns at an
+/// idle composer, authoritatively. NEGATIVE CONTROLS: the last end row taken
+/// away, the daemon client's message has no end under it (busy) and the
+/// inline screen says nothing (idle, no evidence); a `Worked for` row whose
+/// clock follows neither mark is no end row; and 0.158.0's ` · ` still ends
+/// a turn.
+#[test]
+fn a_relaunched_0_159_codex_ends_its_turns_on_the_bullet_end_row() {
+    let r = codex(RESUMED_DAEMON_0_159);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert_eq!(r.said_tail.as_deref(), Some("ok"));
+    assert_eq!(r.composer.map(|(row, _)| row), Some(36));
+    let r = codex(RESUMED_INLINE_0_159);
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative),
+        (Phase::Idle, true)
+    );
+    assert!(
+        r.said_tail
+            .as_deref()
+            .is_some_and(|t| t.ends_with("line 45 of a long answer")),
+        "{:?}",
+        r.said_tail
+    );
+    // NEGATIVE CONTROLS: the last end row gone.
+    let without_last_end = |text: &str| {
+        let mut rows = screen(text);
+        let end = rows
+            .iter()
+            .rposition(|row| row.trim_start().starts_with("Worked for "))
+            .expect("an end row");
+        rows[end].clear();
+        rows
+    };
+    let daemon = read(Some("codex"), &without_last_end(RESUMED_DAEMON_0_159), None);
+    assert_eq!(
+        (daemon.phase, daemon.phase_authoritative),
+        (Phase::Busy, true)
+    );
+    let inline = read(Some("codex"), &without_last_end(RESUMED_INLINE_0_159), None);
+    assert_eq!(
+        (inline.phase, inline.phase_authoritative),
+        (Phase::Idle, false)
+    );
+    let end = |row: &str| {
+        let rows = rows(&["• ok", "", row, "", "› Ask Codex to do anything"]);
+        is_end_row(&rows, 2)
+    };
+    assert!(end("  Worked for <1s • 2:58 AM"), "0.159.0");
+    assert!(end("  Worked for 22m 18s · 9:17 AM"), "0.158.0");
+    assert!(end("  Worked for 1m 2s • 13:39"), "a 24-hour clock");
+    assert!(!end("  Worked for <1s - 2:58 AM"), "no mark");
+    assert!(!end("  Worked for <1s • soon"), "no clock after the mark");
 }

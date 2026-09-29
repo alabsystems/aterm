@@ -133,37 +133,13 @@ pub(crate) fn lock_socket_file(path: &str) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
-/// The connecting peer's effective uid via `getpeereid(2)`, or `None` if the
-/// call fails (e.g. the peer already vanished). macOS/BSD path; Linux can use
-/// `SO_PEERCRED`, added below for portability of the test/CI matrix.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+/// The connecting peer's effective uid (`getpeereid(2)` on macOS/BSD,
+/// `SO_PEERCRED` on Linux), or `None` if the kernel will not say. Moved to
+/// `aterm_uds::peer` (2026-09-28), shared with the PTY keeper.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
 #[must_use]
 pub(crate) fn peer_uid(stream: &CtlStream) -> Option<u32> {
-    use std::os::unix::io::AsRawFd;
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    if rc == 0 { Some(uid) } else { None }
-}
-
-/// Linux peer-uid via `SO_PEERCRED` (`struct ucred`). Present so the same auth
-/// path compiles and is exercised off macOS; macOS remains the target.
-#[cfg(target_os = "linux")]
-#[must_use]
-pub(crate) fn peer_uid(stream: &CtlStream) -> Option<u32> {
-    use std::os::unix::io::AsRawFd;
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast::<libc::c_void>(),
-            &mut len,
-        )
-    };
-    if rc == 0 { Some(cred.uid) } else { None }
+    aterm_uds::peer::peer_uid(stream)
 }
 
 /// Other Unixes: no portable peer-cred primitive wired here. Return `None`,

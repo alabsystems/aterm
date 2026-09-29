@@ -1741,8 +1741,14 @@ mod tests {
 
     /// The stop signal uses `thread::unpark`, so even a denied session's
     /// minute-long admission park must end immediately on process shutdown.
+    /// The clock here stretches that park to ten minutes, so a stop that ends
+    /// it is told from one that waits it out by a minute's hang detector,
+    /// whatever the machine's load — never by a budget of seconds against the
+    /// real park's one minute.
     #[test]
     fn stop_unparks_a_denied_minute_wait() {
+        const HANG: Duration = Duration::from_secs(60);
+
         struct NotifyingClock {
             origin: Instant,
             parked: std::sync::mpsc::Sender<Duration>,
@@ -1760,6 +1766,8 @@ mod tests {
             fn park(&mut self, watch: &mut HeadWatch, wait: Duration) {
                 if wait >= CADENCE - SLICE {
                     self.parked.send(wait).unwrap();
+                    watch.park_for_hint(10 * HANG);
+                    return;
                 }
                 watch.park_for_hint(wait);
             }
@@ -1789,7 +1797,7 @@ mod tests {
         runner.admit_after = CADENCE;
         let handle = runner.spawn().unwrap();
         assert!(
-            parked_rx.recv_timeout(Duration::from_secs(2)).unwrap() >= CADENCE - SLICE,
+            parked_rx.recv_timeout(HANG).unwrap() >= CADENCE - SLICE,
             "the denied runner entered its long park"
         );
         let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
@@ -1797,7 +1805,9 @@ mod tests {
             handle.stop();
             stopped_tx.send(()).unwrap();
         });
-        stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        stopped_rx
+            .recv_timeout(HANG)
+            .expect("the stop ended the long park");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -2686,25 +2696,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// Ends a fake pass and removes its prefix on EVERY way out of a test that unwinds, a
+    /// failed assertion included. The pass is detached — launchd's child, not ours — and
+    /// loops until `go` stands or its directory is gone; `go` used to be written on the
+    /// success path only, so every failure left an orphaned `sh` forking `sleep` 20 times
+    /// a second for good (2026-09-28: one was still running 30 minutes later). A test
+    /// process KILLED runs no drop: the fake's own loop ends that way ([`fake_pass`]).
+    struct Release {
+        go: PathBuf,
+        prefix: PathBuf,
+    }
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.go, b"");
+            let _ = std::fs::remove_dir_all(&self.prefix);
+        }
+    }
+
+    /// The most turns a fake pass's wait takes, 50 ms apart: ten minutes, far past any
+    /// test that follows it (20 s), so no wait of a test is ever cut short by it.
+    const FAKE_PASS_TURNS: u32 = 12_000;
+
+    /// A FAKE `aterm` PASS for the detached launch: `warm` exits at once (its first exec is
+    /// paid unbounded, [`warm`]); anything else writes `<pid> <spawner> <argv>` to `said`
+    /// beside it and waits for `go` there. The wait ALSO ENDS when the process `owner`
+    /// (the test) is gone, and after [`FAKE_PASS_TURNS`] turns at most: a test killed
+    /// outright (SIGKILL from a harness ceiling, SIGTERM or SIGINT — no drop runs, and the
+    /// detached fake sits in a process group of its own that no signal to the test's
+    /// reaches) left a ppid-1 `sh` forking `sleep` 20 times a second until something
+    /// removed its directory (the review of 2026-09-28: still running 28 s after the kill,
+    /// and the prefix under TMPDIR is removed by nothing but the drop).
+    fn fake_pass(owner: u32) -> String {
+        format!(
+            "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nd=$(dirname \"$0\")\nprintf '%s %s %s\\n' \
+             \"$$\" \"$ATPKG_SPAWNER_PID\" \"$*\" >\"$d/said.tmp\"\nmv \"$d/said.tmp\" \
+             \"$d/said\"\nn=0\nwhile [ -d \"$d\" ] && [ ! -e \"$d/go\" ] && kill -0 {owner} \
+             2>/dev/null && [ \"$n\" -lt {FAKE_PASS_TURNS} ]; do n=$((n + 1)); sleep 0.05; \
+             done\n"
+        )
+    }
+
+    /// Write [`fake_pass`] for `owner` as `dir/aterm`, and PAY ITS FIRST EXEC HERE,
+    /// UNBOUNDED. The first exec of a new file waits, at 0% CPU, until macOS `syspolicyd`
+    /// has assessed it, one file at a time behind every test binary the gate links: this
+    /// script measured 40 s from being written to its first line running (2026-09-28),
+    /// past the 20 s clocks that follow it. A later exec of the same file costs nothing
+    /// (the manual.rs `run_once` rule), and the detaching `/bin/sh` in between is the
+    /// system's own.
+    #[cfg(unix)]
+    fn warm(dir: &Path, owner: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let exe = dir.join("aterm");
+        std::fs::write(&exe, fake_pass(owner)).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::process::Command::new(&exe)
+            .arg("warm")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        exe
+    }
+
     /// A DETACHED PASS IS NOT THIS PROCESS'S CHILD — a session reaping its shell can never
     /// take the pass's exit for the shell's, and the pass outlives the session — it names
     /// no spawner, and it is followed to its end by pid.
     #[cfg(unix)]
     #[test]
     fn a_detached_pass_is_nobodys_child_and_is_followed_to_its_end() {
-        use std::os::unix::fs::PermissionsExt as _;
         let l = layout("detached");
         let dir = l.prefix.join("bin");
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("aterm");
-        std::fs::write(
-            &exe,
-            "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s %s %s\\n' \"$$\" \"$ATPKG_SPAWNER_PID\" \
-             \"$*\" >\"$d/said.tmp\"\nmv \"$d/said.tmp\" \"$d/said\"\nwhile [ ! -e \"$d/go\" ]; \
-             do sleep 0.05; done\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _release = Release {
+            go: dir.join("go"),
+            prefix: l.prefix.clone(),
+        };
+        let exe = warm(&dir, std::process::id());
         let mut passes = DetachedPasses::new(exe, vec!["pkg".into()], &l);
         let mut pass = passes.launch("claude").unwrap();
         let said = dir.join("said");
@@ -2738,6 +2806,65 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(ended, "a detached pass's end is the store's to judge");
-        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// THE FAKE PASS ENDS WITH ITS TEST (the review of 2026-09-28). A test process killed
+    /// outright runs no drop, and nothing else writes `go` or removes the prefix: the
+    /// fake's own wait ends once the process it was written for is gone ([`fake_pass`]).
+    /// Here that process is a stand-in the test kills with SIGKILL and reaps, as a
+    /// harness's ceiling kills a test binary (nextest's `terminate-after`); the fake,
+    /// launched detached exactly as the pass is and never told `go`, ends by itself.
+    /// NEGATIVE CONTROL: while its owner lives, it waits.
+    #[cfg(unix)]
+    #[test]
+    fn a_fake_pass_ends_once_the_test_it_was_written_for_is_gone() {
+        /// The stand-in test process, killed and reaped however this test ends.
+        struct Owner(std::process::Child);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let l = layout("detached-owner");
+        let dir = l.prefix.join("bin");
+        let _release = Release {
+            go: dir.join("go"),
+            prefix: l.prefix.clone(),
+        };
+        let mut owner = Owner(
+            std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let exe = warm(&dir, owner.0.id());
+        let mut passes = DetachedPasses::new(exe, vec!["pkg".into()], &l);
+        let mut pass = passes.launch("claude").unwrap();
+        let said = dir.join("said");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !said.exists() {
+            assert!(Instant::now() < deadline, "the pass started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(pass.ended(), None, "it waits while its test lives");
+        // SIGKILL, and reaped: gone, not a zombie `kill -0` still finds.
+        let _ = owner.0.kill();
+        let _ = owner.0.wait();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let ended = loop {
+            if let Some(ok) = pass.ended() {
+                break ok;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fake ended by itself once its test was gone"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(ended, "{:?}", pass.ended());
+        assert!(!dir.join("go").exists(), "nobody said go");
     }
 }

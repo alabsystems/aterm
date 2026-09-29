@@ -464,7 +464,6 @@ mod synthesized {
     use super::ChromeMetrics;
 
     /// Whether the pen draws `ch` itself when no loaded face covers it.
-    #[cfg(any(not(target_os = "macos"), test))]
     pub(super) const fn covers(ch: char) -> bool {
         matches!(ch, '\u{2139}' | '\u{23f8}')
     }
@@ -2143,7 +2142,6 @@ pub(crate) fn warm_chrome_font_assets() {}
 /// seed swap moves the epoch, so the fold is a total key; the band then
 /// re-rasters once and the title moves from the cell lane into the band. The
 /// worker poll and the rung sync are a `try_recv` and a few atomic loads.
-#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn strip_band_font_epoch() -> u64 {
     let mut fonts = lock_fonts();
     fonts.poll_semantic_renderer();
@@ -2197,7 +2195,6 @@ pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
 /// instead of vanishing from a proportional run. A CJK title takes that lane
 /// only until the terminal has parsed its chain face; it is then a band title
 /// like any other, on the cap-centred baseline rather than the cell's.
-#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn strip_band_run_coverable(s: &str) -> bool {
     let mut fonts = lock_fonts();
     if fonts.ui_regular.is_none() {

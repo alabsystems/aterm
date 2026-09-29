@@ -11,7 +11,7 @@
 //! window's pass children, the terminal session's detached pass (whose stdio is
 //! `/dev/null`), a verb typed in a shell, the `claude update`/`codex update` intercept's
 //! child and the head watch's door all run through [`crate::cli::main_entry`], and every
-//! program row any of them changes goes through [`crate::status::write`]. Three kinds of
+//! program row any of them changes goes through [`crate::status::write`]. Four kinds of
 //! event, one whole line each:
 //!
 //! * a PASS — `pass-start` once the verb holds the store lock, `pass-end` when it returns
@@ -20,6 +20,9 @@
 //! * a PROGRAM TRANSITION — a row whose build moved, or that became (or stopped being) not
 //!   current: program, from → to, source (`Anthropic latest`, `ALab index 44`), a one-word
 //!   result and the row's reason ([`transitions`]);
+//! * a WARM — the one headless run of an agent build a pass just landed ([`crate::warm`]):
+//!   program, build, how it ended and how long it took. Settings' Activity leaves it out;
+//!   the file keeps it, so "why were the new models not there" has an answer;
 //! * a SEAM REPLACED — rustup's `trust` entry re-pointed away from a stale toolchain a
 //!   person had linked there (`crate::seam::Attached::ReplacedStale`, 2026-09-26): what it
 //!   named, what it names now, why, and the command that puts it back. The one change a
@@ -80,6 +83,8 @@ pub mod kind {
     pub const PASS_END: &str = "pass-end";
     /// A program's row moved.
     pub const PROGRAM: &str = "program";
+    /// A landed agent build was warmed ([`crate::warm`]).
+    pub const WARM: &str = "warm";
     /// A rustup seam's entry replaced a stale foreign link.
     pub const SEAM: &str = "seam";
 }
@@ -193,6 +198,18 @@ pub enum Event<'a> {
     },
     /// A program's row moved.
     Program(&'a Transition),
+    /// A landed agent build was warmed ([`crate::warm`]).
+    Warm {
+        /// The program.
+        program: &'a str,
+        /// The build warmed.
+        build: u64,
+        /// How it ended: `exit=<code>`, `signal=<n>`, `killed` (at the deadline) or
+        /// `spawn-failed`; or why it did not run: `opted-out`, `never-run`.
+        outcome: &'a str,
+        /// How long it ran, in milliseconds.
+        ms: u64,
+    },
     /// A rustup seam's entry REPLACED a stale foreign link
     /// (`crate::seam::Attached::ReplacedStale`).
     Seam {
@@ -300,7 +317,7 @@ fn transition(
 /// `event` as its one line, `\n` included.
 #[must_use]
 pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
-    let (exit, secs);
+    let (exit, secs, build, ms);
     let (kind, fields): (&str, Vec<(&str, &str)>) = match *event {
         Event::PassStart { lane, verb } => (kind::PASS_START, vec![("lane", lane), ("verb", verb)]),
         Event::PassEnd {
@@ -310,8 +327,8 @@ pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
             secs: held,
             outcome,
         } => {
-            exit = crate::dec_u64(u64::from(code));
-            secs = crate::dec_u64(held);
+            exit = code.to_string();
+            secs = held.to_string();
             (
                 kind::PASS_END,
                 vec![
@@ -334,6 +351,24 @@ pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
                 ("reason", &t.reason),
             ],
         ),
+        Event::Warm {
+            program,
+            build: warmed,
+            outcome,
+            ms: took,
+        } => {
+            build = warmed.to_string();
+            ms = took.to_string();
+            (
+                kind::WARM,
+                vec![
+                    ("program", program),
+                    ("build", &build),
+                    ("outcome", outcome),
+                    ("ms", &ms),
+                ],
+            )
+        }
         Event::Seam {
             seam,
             from,
@@ -376,7 +411,7 @@ pub fn render_record(
     }
     line.push('\t');
     line.push_str(kind);
-    push_field(&mut line, "pid", &crate::dec_u64(u64::from(pid)), max_chars);
+    push_field(&mut line, "pid", &pid.to_string(), max_chars);
     for (key, value) in fields {
         push_field(&mut line, key, value, max_chars);
     }
@@ -707,7 +742,7 @@ pub fn rotated_path(path: &Path, n: u32) -> PathBuf {
         std::ffi::OsStr::to_os_string,
     );
     name.push(".");
-    name.push(crate::dec_u64(u64::from(n)));
+    name.push(n.to_string());
     path.with_file_name(name)
 }
 
@@ -762,7 +797,14 @@ impl Entry {
 #[must_use]
 pub fn parse_line(line: &str) -> Option<Entry> {
     parse_record(line).filter(|entry| {
-        [kind::PASS_START, kind::PASS_END, kind::PROGRAM, kind::SEAM].contains(&entry.kind.as_str())
+        [
+            kind::PASS_START,
+            kind::PASS_END,
+            kind::PROGRAM,
+            kind::WARM,
+            kind::SEAM,
+        ]
+        .contains(&entry.kind.as_str())
     })
 }
 
@@ -974,6 +1016,35 @@ mod tests {
         );
         assert!(start.starts_with("-\tpass-start\t"), "{start}");
         assert_eq!(parse_line(&start).unwrap().at, None);
+        // A warm ([`crate::warm`]) reads back too — its outcome keeps its own `=`.
+        let warm = render(
+            1_790_000_000,
+            9,
+            &Event::Warm {
+                program: "claude",
+                build: 2_001_280,
+                outcome: "exit=0",
+                ms: 10_412,
+            },
+        );
+        assert_eq!(
+            warm,
+            "2026-09-21T14:13:20Z\twarm\tpid=9\tprogram=claude\tbuild=2001280\t\
+             outcome=exit=0\tms=10412\n"
+        );
+        let entry = parse_line(&warm).unwrap();
+        assert_eq!(entry.kind, kind::WARM);
+        assert_eq!(entry.pid, 9);
+        assert_eq!(
+            entry.fields,
+            [
+                ("program", "claude"),
+                ("build", "2001280"),
+                ("outcome", "exit=0"),
+                ("ms", "10412"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
         // Nothing this module did not write reads as an event.
         for foreign in [
             "",

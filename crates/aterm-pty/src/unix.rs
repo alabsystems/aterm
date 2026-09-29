@@ -17,7 +17,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
-use crate::{SpawnedShell, build_child_env};
+use crate::{ShellHangup, ShellIdentity, SpawnedShell, build_child_env};
 
 /// Fixed absolute path to the macOS Seatbelt wrapper used by the OS-sandbox wrap
 /// (see [`spawn_shell_with_pid`]'s `sandbox_wrap`). Inlined here (rather than depending on
@@ -768,12 +768,20 @@ fn note_racy_exec_status_carrier(why: &io::Error) {
         // abort a spawn. Found by the 2026-09-02 abort audit.
         {
             use std::io::Write as _;
+            // The folder is the one thing a person can fix (a missing or read-only
+            // $TMPDIR): on macOS it is where the private FIFO was refused — unless the
+            // refusal was the descriptor limit, which no folder explains.
+            #[cfg(target_os = "macos")]
+            let place = if matches!(why.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+                String::new()
+            } else {
+                format!(" in {}", String::from_utf8_lossy(exec_status_fifo_dir()))
+            };
+            #[cfg(not(target_os = "macos"))]
+            let place = "";
             let _ = writeln!(
                 std::io::stderr(),
-                "aterm-pty: the atomic exec-status channel could not be created ({why}); falling \
-                 back to pipe(2)+fcntl, which leaves both ends briefly inheritable by a concurrent \
-                 spawn. The spawn's status wait stays bounded at {EXEC_STATUS_BUDGET:?}, so this \
-                 degrades to a slow visible failure rather than a hang."
+                "aterm: cannot create a private pipe{place} ({why}); shells still start"
             );
         }
     }
@@ -1150,7 +1158,6 @@ fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatu
     let (rd, wr, carrier) = match atomic {
         Ok(chan) => chan,
         Err(why) => {
-            note_racy_exec_status_carrier(&why);
             // THE RACY FALLBACK — the original carrier, verbatim. `pipe(2)`
             // returns both ends UNFLAGGED, so the window is open from here until
             // the second `fcntl` lands. Kept only because refusing to spawn at
@@ -1179,6 +1186,9 @@ fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatu
                 }
                 return Err(err);
             }
+            // Announced only once it exists: "shells still start" must not print ahead
+            // of a spawn that fails because the fallback failed too (EMFILE/ENFILE).
+            note_racy_exec_status_carrier(&why);
             (rd, wr, ExecStatusCarrier::RacyPipe)
         }
     };
@@ -1541,13 +1551,17 @@ fn inherited_fd_ceiling() -> libc::c_int {
     )
 )]
 // Skip: extraction classifies this body `TreatedAsAssumption(AddressOfField)`
-// (a `&raw`-of-field shape the extractor cannot yet model) — the DEFAULT lane
-// records exactly that assumption row, but the explicit-full gate lane ABORTS
-// the whole crate on it. The explicit skip is the same epistemic state
-// (unverified-by-capability-gap, machine-visible), spelled through the honored
-// opt-out channel. The fork..exec window's safety is separately machine-checked
-// by the ForkExec.tla refinement anchors above (OnlySafeBeforeExec proven).
-// Droppable when AddressOfField extraction lands.
+// (a `&raw`-of-field shape the extractor cannot yet model; $HOME/trust's
+// trust-mir-extract `supportability.rs` returns `UnsupportedReason::AddressOfField`
+// for any `Rvalue::RawPtr` over a field projection). Measured 2026-09-27 on
+// seal 321aaeda7 with this skip removed: the body is not lowered into the
+// bundle (its caller sees an absent callee) and the function reads
+// INCONCLUSIVE, which strict verification refuses. The explicit skip is the
+// same epistemic state (unverified-by-capability-gap, machine-visible), spelled
+// through the honored opt-out channel. The fork..exec window's safety is
+// separately machine-checked by the ForkExec.tla refinement anchors above
+// (OnlySafeBeforeExec proven). Needed from $HOME/trust, in a promoted seal:
+// field-address `&raw` extraction; then drop this.
 //
 // WHICH shape, kept current: the `forkpty` rewrite REMOVED the
 // `ptr::addr_of_mut!(*t)` that used to hand `forkpty` its optional termios (the
@@ -1555,8 +1569,9 @@ fn inherited_fd_ceiling() -> libc::c_int {
 // The field-address shapes that remain in this body are in the child branch —
 // `addr_of_mut!(sa.sa_mask)` / `addr_of!(sa)` in the signal normalisation, and
 // `addr_of!(b)` for the status byte. If the extractor ever stops flagging those,
-// this skip becomes unjustified rather than merely redundant; `xtask gate
-// dormant` and the explicit-full lane are what notice.
+// this skip becomes unjustified rather than merely redundant, and nothing
+// notices on its own: re-check with `targo trust check -p aterm-pty --lib
+// --allow-l0-gaps` after each `aterm pkg update trust`.
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_shell_with_pid_cell_px(
@@ -1603,11 +1618,16 @@ pub fn spawn_shell_with_pid_cell_px(
     // lock, or call `setenv`. We pre-build the C arrays and hand them to
     // `execve`; a lock a vanished thread held would otherwise deadlock (or, with
     // the macOS Obj-C runtime, hard-abort) the child.
-    let shell = shell_override
-        .filter(|s| !s.is_empty())
-        .map(std::ffi::OsString::from)
-        .or_else(|| std::env::var_os("SHELL"))
-        .unwrap_or_else(|| "/bin/sh".into());
+    // The shell, and where it came from: an exec failure names the source, so the
+    // person knows which setting to fix.
+    let (shell, shell_from): (std::ffi::OsString, &str) =
+        match shell_override.filter(|s| !s.is_empty()) {
+            Some(s) => (s.into(), " (set by --shell or `shell` in aterm.toml)"),
+            None => match std::env::var_os("SHELL") {
+                Some(s) => (s, " (from $SHELL)"),
+                None => ("/bin/sh".into(), ""),
+            },
+        };
     // The fallback is a compile-time `c"..."` literal (interior-NUL-free by
     // construction), not a runtime `CString::new(..).unwrap()`: same bytes, no
     // panic path — behavior-identical while discharging the Trust unwrap
@@ -1640,6 +1660,8 @@ pub fn spawn_shell_with_pid_cell_px(
     // "-"+basename (the macOS convention → sources
     // .zprofile / .bash_profile / path_helper). `argv_store` + `exec_target` own
     // the C strings the child's `execve` reads.
+    // `-e`'s program is named as typed, with no shell source beside it.
+    let runs_program = exec_command.is_some_and(|c| !c.is_empty());
     let (exec_target, argv_store): (CString, Vec<CString>) =
         if let Some(cmd) = exec_command.filter(|c| !c.is_empty()) {
             let argv: Vec<CString> = cmd
@@ -1726,7 +1748,7 @@ pub fn spawn_shell_with_pid_cell_px(
     // `Command::spawn` on another thread can inherit either one. See the long
     // comment on `open_exec_status_channel` for the defect, the measurements, and
     // the carriers that were tried and rejected.
-    let (status_rd, status_wr, status_carrier) = open_exec_status_channel()?;
+    let (status_rd, status_wr, _status_carrier) = open_exec_status_channel()?;
     // How far the child's inheritance strip (step 3b) reaches, read HERE: the
     // child's resource sandbox may lower RLIMIT_NOFILE before that step runs.
     let fd_ceiling = inherited_fd_ceiling();
@@ -1799,8 +1821,9 @@ pub fn spawn_shell_with_pid_cell_px(
         //     when fd >= 3. Every one of those is async-signal-safe — no
         //     allocation, no locks, no libc state — so it is legal in this
         //     window. It is what makes the child a SESSION LEADER with
-        //     pid == sid == pgid, the identity `hangup`'s `killpg`, `reap`'s
-        //     `getpgid` check, and the GUI's `tcgetpgrp(master)` all depend on.
+        //     pid == sid == pgid, the identity `hangup`'s `killpg`,
+        //     `record_adopted_shell`'s `tcgetsid` proof, and the GUI's
+        //     `tcgetpgrp(master)` all depend on.
         //
         //     The `dup2`s CLEAR FD_CLOEXEC on the copies (dup2 never carries the
         //     flag over), so a close-on-exec slave still yields stdio that
@@ -2017,21 +2040,23 @@ pub fn spawn_shell_with_pid_cell_px(
         )),
         ExecStatus::FailedBeforeExec(_) => Some((
             io::ErrorKind::Other,
-            // NAME THE TARGET. This is overwhelmingly a config typo (`shell` in
-            // aterm.toml, `--shell` — the exec target is used
-            // VERBATIM, no PATH search), and the anonymous version of this
-            // message gave the user a fact with no handle on it. The child
-            // cannot say more (async-signal-safe: one status byte), but the
-            // parent holds the exact path the child's `execve` read —
-            // `exec_target` covers every mode, including `-e`, where the
-            // program is not the shell at all.
-            format!(
-                "child could not exec `{}` (_exit(127)) — usually a nonexistent or \
-                 non-executable path. If this is the shell, it came from `--shell`, \
-                 `shell` in aterm.toml, or $SHELL (in that precedence). `aterm doctor` \
-                 reports whether $SHELL is executable; for the other two sources, test \
-                 the path above directly",
-                exec_target.to_string_lossy()
+            // NAME THE TARGET, and what is wrong with it. This is overwhelmingly
+            // a config typo (`shell` in aterm.toml, `--shell` — the exec target
+            // is used VERBATIM, no PATH search). The child cannot say more
+            // (async-signal-safe: one status byte), but the parent holds the
+            // exact path the child's `execve` read — `exec_target` covers every
+            // mode, including `-e`, where the program is not the shell at all —
+            // and can look at it. Under the sandbox the target is the wrapper,
+            // so no shell source is named.
+            exec_failure(
+                &exec_target,
+                if runs_program || sandbox_wrap.is_some() {
+                    ""
+                } else {
+                    shell_from
+                },
+                runs_program,
+                chdir_c.as_deref(),
             ),
         )),
         // The budget elapsed with neither a byte nor EOF. FAIL CLOSED.
@@ -2057,16 +2082,16 @@ pub fn spawn_shell_with_pid_cell_px(
         ExecStatus::NoVerdict => Some((
             io::ErrorKind::TimedOut,
             format!(
-                "child never reported exec status within {EXEC_STATUS_BUDGET:?} \
-                 (fail-closed: no confirmed exec, so no master is handed back; \
-                 status carrier: {status_carrier:?})"
+                "`{}` did not start within {} s",
+                exec_target.to_string_lossy(),
+                EXEC_STATUS_BUDGET.as_secs()
             ),
         )),
         ExecStatus::ChannelBroke(err) => Some((
             io::ErrorKind::Other,
             format!(
-                "exec-status channel failed before the child reported ({err}); fail-closed \
-                 (status carrier: {status_carrier:?})"
+                "could not confirm `{}` started ({err})",
+                exec_target.to_string_lossy()
             ),
         )),
     };
@@ -2103,6 +2128,12 @@ pub fn spawn_shell_with_pid_cell_px(
 /// for a non-positive pid (a pgid of <= 1 would target init / every process — we
 /// refuse it). Best-effort: a child that already exited makes `killpg` fail
 /// harmlessly (ESRCH), which is fine — the reader still sees EOF.
+///
+/// UNVERIFIED BY DESIGN: this signals whatever `pid` names right now. Only a
+/// caller that KNOWS `pid` is its own unreaped child (a test, a spawn it has not
+/// handed anywhere yet) may use it. A session's teardown goes through
+/// [`hangup_shell`], which verifies a recorded [`ShellIdentity`] first
+/// (2026-09-26: an adopted shell's pid is freed without us ever reaping it).
 pub fn hangup(pid: i32) {
     if pid <= 1 {
         return;
@@ -2116,26 +2147,213 @@ pub fn hangup(pid: i32) {
     }
 }
 
-/// Reap an exited child WITHOUT ever blocking unboundedly. Runs on the detached
-/// teardown thread AFTER [`hangup`] (the UI thread has already moved on). A
-/// well-behaved child exits on SIGHUP within milliseconds and is reaped on the first
-/// poll. The hazard this guards against: a child that TRAPS or ignores SIGHUP (e.g.
-/// `trap '' HUP`, or one wedged in uninterruptible D-state) would leave a plain
-/// blocking `waitpid(…, 0)` parked here FOREVER — one leaked thread (and the
-/// fd/process slot it pins) per such mid-run close. So poll `WNOHANG`: escalate to an
-/// unignorable SIGKILL after a short grace, and after a hard deadline give up and
-/// return, leaving the kernel to reap the orphan at process exit. Keeps the child
-/// from lingering as a zombie in the common case. Best-effort; a no-op for a
-/// non-positive pid.
+/// The kernel's START TIME for `pid`, as an opaque number that differs between
+/// two processes that held the same pid — the fact a [`ShellIdentity`] records
+/// and re-reads (2026-09-26, backlog item 5).
 ///
-/// NOT-OUR-CHILD SHELLS (the overlap handoff): a seamlessly ADOPTED session's
-/// shell is a child of the PREVIOUS aterm process — after the overlap swap it
-/// reparents to launchd, so `waitpid` here answers `ECHILD` on the FIRST tick.
-/// Treating that as "already gone" (the old behaviour) skipped the SIGKILL
-/// escalation entirely: a HUP-trapping shell closed via Cmd-W after an update
-/// was never force-killed. `ECHILD` now switches to a signal-0 liveness poll
-/// with the SAME grace/escalation schedule (launchd reaps the corpse, so no
-/// zombie risk on this path — only the escalation matters).
+/// macOS: `proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_start_tvsec/usec`, folded to
+/// microseconds. Measured on Darwin 25.6 the same day: libproc answers a live
+/// process (136 bytes) and REFUSES a zombie (0 bytes) — so a zombie reads
+/// `None` here, which is why [`ShellIdentity::verify`] keeps the unreaped-child
+/// proof for that case. Linux: `/proc/<pid>/stat` field 22 (`starttime`, clock
+/// ticks since boot), with a zombie (`Z`) folded to `None` to match. Any other
+/// Unix: `None` — no reader is wired, and nothing is claimed.
+///
+/// `None` also for a non-positive pid, no such process, or a kernel record
+/// about a different pid than the one asked (libproc answering for a pid it
+/// was not asked about would make any comparison meaningless).
+#[must_use]
+pub fn process_birth(pid: i32) -> Option<u64> {
+    if pid <= 1 {
+        return None;
+    }
+    process_birth_platform(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn process_birth_platform(pid: i32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote and
+    // reads nothing through the pointer.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the exact-size success above initialized the whole record.
+    let info = unsafe { info.assume_init() };
+    if u32::try_from(pid).ok()? != info.pbi_pid || info.pbi_status == libc::SZOMB {
+        return None;
+    }
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "linux")]
+fn process_birth_platform(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) is parenthesised and may itself contain spaces or `)`,
+    // so the fields proper start after the LAST `)`: field 3 (`state`) is the
+    // first token there and field 22 (`starttime`) the twentieth.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_ascii_whitespace();
+    if fields.next()? == "Z" {
+        return None;
+    }
+    fields.nth(18)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_birth_platform(_pid: i32) -> Option<u64> {
+    None
+}
+
+/// Whether `pid` is THIS process's child and not yet reaped (alive or a
+/// zombie) — asked without reaping it (`waitid(WNOHANG | WNOWAIT)`). Such a pid
+/// cannot have been reissued by the kernel: the number stays ours until we
+/// wait for it. Measured on Darwin 25.6 (2026-09-26): `0` for a live child and
+/// for a zombie (twice — `WNOWAIT` leaves it collectable), `ECHILD` for pid 1.
+fn is_unreaped_child(pid: i32) -> bool {
+    let Ok(id) = libc::id_t::try_from(pid) else {
+        return false;
+    };
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: `waitid` writes at most one `siginfo_t` through the valid pointer;
+    // `WNOWAIT` leaves any waitable status in place, so this reaps nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    rc == 0
+}
+
+/// Record the identity of a shell THIS process just spawned
+/// ([`spawn_shell_with_pid`]'s `pid`), before anything could have reaped it.
+///
+/// The child is ours and unreaped, so the pid cannot have been reissued yet and
+/// the start time read now is the shell's. A child that already died (an exec
+/// that failed at once) reads no birth; `own_child` still proves it until it is
+/// reaped, which is all teardown needs.
+#[must_use]
+pub fn record_spawned_shell(pid: i32) -> ShellIdentity {
+    ShellIdentity::from_parts(pid, process_birth(pid), true)
+}
+
+/// Record the identity of a shell ADOPTED with its PTY master (the seamless
+/// update handoff), proving first that `pid` is still the shell on that PTY.
+///
+/// The proof is the terminal's own answer: `tcgetsid(master) == pid` — the
+/// session that owns the carried PTY is led by `pid`. Measured on Darwin 25.6
+/// (2026-09-26): the master answers `TIOCGSID` with the shell's pid while it
+/// lives and `-1` once the leader has exited (XNU clears the tty's session at
+/// the leader's exit), so a shell that died before adoption — whose pid may
+/// already name someone else — records NO birth and is never signalled by pid.
+/// The check runs on both sides of the birth read, so a pid that changed hands
+/// in between cannot slip a stranger's start time into the record.
+///
+/// This is also the ONLY identity an adopted shell can have: launchd, not us,
+/// is its parent (`own_child` is `false`), so a pid freed by its exit is never
+/// held for us by a zombie.
+#[must_use]
+pub fn record_adopted_shell(pid: i32, master: i32) -> ShellIdentity {
+    let leads_the_pty = || {
+        // SAFETY: `tcgetsid` is a read-only `TIOCGSID` ioctl on a descriptor the
+        // caller holds; a bad descriptor answers -1.
+        master >= 0 && pid > 1 && unsafe { libc::tcgetsid(master) } == pid
+    };
+    let birth = if leads_the_pty() {
+        process_birth(pid).filter(|_| leads_the_pty())
+    } else {
+        None
+    };
+    ShellIdentity::from_parts(pid, birth, false)
+}
+
+impl ShellIdentity {
+    /// Whether [`Self::pid`] STILL names the shell this identity was recorded
+    /// for — the question every signal sent by pid must ask immediately before
+    /// it is sent (2026-09-26, backlog item 5).
+    ///
+    /// * The pid's current start time is readable: it must equal the recorded
+    ///   one. A reissued pid has a different start time. With nothing
+    ///   recorded, only our own unreaped child passes (another Unix, where no
+    ///   birth reader exists).
+    /// * It is not readable (dead, a zombie — libproc refuses those — or no
+    ///   reader): only our own unreaped child passes, because the kernel cannot
+    ///   reissue a pid we have not waited for. An ADOPTED shell never passes
+    ///   here: launchd reaps it, so its pid is free the moment it exits.
+    ///
+    /// Racy only within the kernel's own pid-reuse window between this check
+    /// and the `kill` that follows it — microseconds, against the minutes-long
+    /// `--hold` window the check exists for.
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        if self.pid <= 1 {
+            return false;
+        }
+        match (process_birth(self.pid), self.birth) {
+            (Some(now), Some(recorded)) => now == recorded,
+            _ => self.own_child && is_unreaped_child(self.pid),
+        }
+    }
+}
+
+/// Teardown's `SIGHUP`, sent only where it provably belongs (2026-09-26,
+/// backlog item 5). Non-blocking and UI-thread-safe like [`hangup`].
+///
+/// * `identity` verifies ([`ShellIdentity::verify`]): `SIGHUP` the shell's
+///   process group — the historical teardown, unchanged, and what
+///   `docs/DESIGN-pty-keeper-2026-09-26.md` F3 relies on.
+/// * It does not: signal ONLY `tcgetpgrp(master)`, the group that is on this
+///   terminal right now (only a process in the terminal's own session can be
+///   its foreground group, so this can never reach a stranger). A shell that
+///   already exited leaves no session on the PTY, so this answers `0` and
+///   nothing is sent; the reader is ended by its wake pipe instead.
+///
+/// * No shell pid at all (`pid <= 1`, a stub): nothing, as before.
+///
+/// Returns what was signalled.
+pub fn hangup_shell(identity: &ShellIdentity, master: i32) -> ShellHangup {
+    // No shell pid at all (a stub or sentinel session): nothing of this
+    // session's is on any terminal, exactly as [`hangup`]'s `pid <= 1` no-op.
+    if identity.pid <= 1 {
+        return ShellHangup::Nothing;
+    }
+    if identity.verify() {
+        hangup(identity.pid);
+        return ShellHangup::Shell(identity.pid);
+    }
+    if master < 0 {
+        return ShellHangup::Nothing;
+    }
+    // SAFETY: `tcgetpgrp` is a read-only ioctl on a descriptor the caller
+    // holds; a bad descriptor answers -1.
+    let foreground = unsafe { libc::tcgetpgrp(master) };
+    if foreground <= 1 {
+        return ShellHangup::Nothing;
+    }
+    // SAFETY: `killpg` posts SIGHUP to the terminal's own foreground group,
+    // read from the master just above; it takes no pointers.
+    unsafe {
+        libc::killpg(foreground, libc::SIGHUP);
+    }
+    ShellHangup::Foreground(foreground)
+}
+
 /// Collect an exited child's status WITHOUT blocking and WITHOUT waiting for
 /// teardown — the one narrow window in which a shell's exit code is still
 /// answerable.
@@ -2160,14 +2378,13 @@ pub fn hangup(pid: i32) {
 /// Never escalate to a blocking wait to "get a real answer": this runs on the
 /// UI thread and an unbounded wait there is the defect, not the unknown.
 ///
-/// INTERACTION WITH [`reap`]. Once this has reaped, `reap`'s own `waitpid`
-/// answers `ECHILD` and takes its not-our-child branch. That branch is safe here
-/// for the same reason it is safe for an adopted shell: it identity-checks with
-/// `getpgid(pid) == pid` before it will signal anything, so a dead child answers
-/// `ESRCH` and returns, and a recycled pid is overwhelmingly not a fresh session
-/// leader and is refused. This must stay on the EXIT edge only — calling it on
-/// the close path would disarm `reap`'s SIGKILL escalation against a
-/// HUP-ignoring shell, which is the whole reason that branch exists.
+/// INTERACTION WITH [`reap_shell`]. Once this has reaped, the caller must latch
+/// that and never hand the pid to teardown again (the GUI's `child_reaped`):
+/// the number is free. `reap_shell` would refuse it anyway — a reaped own child
+/// is neither readable-with-the-recorded-birth nor an unreaped child — but the
+/// latch is the first line. This must stay on the EXIT edge only — calling it
+/// on the close path would disarm `reap_shell`'s SIGKILL escalation against a
+/// HUP-ignoring shell, which is the whole reason that escalation exists.
 #[must_use]
 pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
     if pid <= 1 {
@@ -2192,7 +2409,45 @@ pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
     None
 }
 
+/// Reap an exited child of OURS without ever blocking unboundedly: [`reap_shell`]
+/// for a pid the caller knows is its own unreaped child (a spawn that failed
+/// half-way, a test). A pid that is not our child (`ECHILD`) is left alone —
+/// no signal is ever sent to a pid this process cannot prove it owns
+/// (2026-09-26: the `getpgid(pid) == pid` guard that used to authorize the
+/// not-our-child escalation here is passed by every job-control group leader).
 pub fn reap(pid: i32) {
+    reap_shell(ShellIdentity::from_parts(pid, None, true));
+}
+
+/// Reap a session's shell WITHOUT ever blocking unboundedly, escalating to
+/// `SIGKILL` only against a shell whose identity still verifies. Runs on the
+/// detached teardown thread AFTER [`hangup_shell`] (the UI thread has already
+/// moved on). A well-behaved child exits on SIGHUP within milliseconds and is
+/// reaped on the first poll. The hazard this guards against: a child that TRAPS
+/// or ignores SIGHUP (e.g. `trap '' HUP`, or one wedged in uninterruptible
+/// D-state) would leave a plain blocking `waitpid(…, 0)` parked here FOREVER —
+/// one leaked thread (and the fd/process slot it pins) per such mid-run close.
+/// So poll `WNOHANG`: escalate to an unignorable SIGKILL after a short grace,
+/// and after a hard deadline give up and return, leaving the kernel to reap the
+/// orphan at process exit. Keeps the child from lingering as a zombie in the
+/// common case. Best-effort; a no-op for a non-positive pid.
+///
+/// NOT-OUR-CHILD SHELLS (the overlap handoff): a seamlessly ADOPTED session's
+/// shell is a child of the PREVIOUS aterm process — after the overlap swap it
+/// reparents to launchd, so `waitpid` here answers `ECHILD`. It still gets the
+/// SAME grace/escalation schedule (a HUP-trapping shell closed via Cmd-W after
+/// an update must still be force-killed), polled by identity instead of by
+/// `waitpid` (launchd reaps the corpse, so no zombie risk on this path).
+///
+/// IDENTITY FIRST, EVERY TICK (2026-09-26, backlog item 5): before the
+/// `waitpid` and again immediately before the `SIGKILL`, `identity` must still
+/// [`verify`](ShellIdentity::verify). The moment it does not, this returns
+/// having sent nothing: the pid is somebody else's now. Checking before the
+/// `waitpid` matters too — an adopted shell's freed pid can be reissued to one
+/// of OUR later children (another tab's shell), whose exit status a blind
+/// `waitpid` here would steal.
+pub fn reap_shell(identity: ShellIdentity) {
+    let pid = identity.pid;
     if pid <= 1 {
         return;
     }
@@ -2204,38 +2459,25 @@ pub fn reap(pid: i32) {
     const DEADLINE: u32 = 200;
     let mut status: libc::c_int = 0;
     for tick in 0..DEADLINE {
+        if !identity.verify() {
+            return; // gone, or the pid now names a different process
+        }
         // SAFETY: `WNOHANG` `waitpid`; `&mut status` is a valid out-param.
         // Returns the pid when reaped, 0 if still running as our child, -1
-        // (`ECHILD`) when it is not our child — either already reaped, or an
-        // ADOPTED shell parented to launchd.
+        // (`ECHILD`) when it is not our child — an ADOPTED shell parented to
+        // launchd, whose liveness the identity check above already answered.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r == pid {
             return; // reaped
         }
-        let mut not_ours = false;
-        if r == -1 {
-            not_ours = true;
-            // Not our child. IDENTITY CHECK before anything else: an adopted
-            // shell is a SESSION LEADER (login_tty = setsid), so its pgid == its
-            // pid. A recycled pid (the shell died and the kernel reissued the
-            // number) is overwhelmingly NOT a fresh group leader — treating
-            // `getpgid` mismatch (or `ESRCH`) as "gone" makes the escalation
-            // below unable to SIGKILL an innocent bystander's process group.
-            // SAFETY: getpgid is a read-only probe.
-            if unsafe { libc::getpgid(pid) } != pid {
-                return; // dead (ESRCH) or a recycled non-leader pid
-            }
-        }
-        if tick == KILL_AT {
-            // Still alive past the grace ⇒ it ignored SIGHUP. SIGKILL the group.
-            // Re-verify the not-our-child identity IMMEDIATELY before the kill
-            // (the per-tick probe above may be up to one tick stale).
-            // SAFETY: read-only probe + best-effort signal post to the child's
-            // own process group.
-            if !not_ours || unsafe { libc::getpgid(pid) } == pid {
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+        // Still alive past the grace ⇒ it ignored SIGHUP. SIGKILL the group,
+        // re-verifying IMMEDIATELY before the kill (the check above may be up to
+        // one `waitpid` stale).
+        if tick == KILL_AT && identity.verify() {
+            // SAFETY: best-effort signal post to the verified shell's own
+            // process group; it takes no pointers.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
             }
         }
         std::thread::sleep(POLL);
@@ -2301,6 +2543,54 @@ fn build_sandbox_wrap(
     Ok((wrapper, wrapped))
 }
 
+/// What an exec failure says: the target, what is wrong with it, and `from` — where
+/// a shell came from (empty for a `-e` program or the sandbox wrapper).
+///
+/// Read in the PARENT after the child's `execve` failed, so it may stat. A name with
+/// no `/` is not looked at: `execve` does no PATH search, so a bare shell name is the
+/// fault itself, and a bare `-e` program is one [`resolve_program`] found nowhere on
+/// PATH. A relative path is judged from `cwd`, the folder the child ran it in.
+fn exec_failure(
+    target: &std::ffi::CStr,
+    from: &str,
+    runs_program: bool,
+    cwd: Option<&std::ffi::CStr>,
+) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = target.to_string_lossy();
+    if path.is_empty() {
+        let what = if runs_program {
+            "the command"
+        } else {
+            "the shell path"
+        };
+        return format!("{what} is empty{from}");
+    }
+    let why = if !path.contains('/') {
+        if runs_program {
+            "is not on PATH"
+        } else {
+            "is not a full path"
+        }
+    } else {
+        let at = std::path::Path::new(std::ffi::OsStr::from_bytes(target.to_bytes()));
+        let at = match cwd {
+            Some(dir) if at.is_relative() => {
+                std::path::Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes())).join(at)
+            }
+            _ => at.to_path_buf(),
+        };
+        match std::fs::metadata(&at) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => "does not exist",
+            Err(_) => "could not be run",
+            Ok(m) if m.is_dir() => "is a folder",
+            Ok(m) if m.permissions().mode() & 0o111 == 0 => "is not executable",
+            Ok(_) => "could not be run",
+        }
+    };
+    format!("`{path}` {why}{from}")
+}
+
 /// PATH-resolve a `-e` program name to an absolute path, IN THE PARENT (the child
 /// must stay async-signal-safe, so it cannot do its own `execvp` PATH search). A
 /// name containing `/` is used verbatim (an explicit path). Otherwise each `$PATH`
@@ -2309,7 +2599,10 @@ fn build_sandbox_wrap(
 /// resolver masking a not-found command.
 // Skip: `CString::new` panics only on allocation (interior NUL returns
 // Err) — the audited-alloc class; the argv strings are bounded by the
-// config. Droppable when the CString totality entry lands.
+// config. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed:
+// VIOLATIONS (1 of 5 obligations refuted, 1 unknown). Needed from $HOME/trust, in
+// a promoted seal: a totality entry for `CString::new` (total modulo
+// allocation); then drop this.
 #[cfg_attr(trust_verify, trust::skip)]
 fn resolve_program(name: &str) -> CString {
     // The interior-NUL fallback is a compile-time `c"..."` literal (NUL-free by
@@ -6752,8 +7045,9 @@ mod tests {
 
         // Process identities, read from the PARENT while the session is parked:
         // pid == pgid == sid, and the pty's foreground process group is the
-        // child. These are the exact probes `hangup` (killpg), `reap` (getpgid),
-        // and the GUI's quit_safety/control_input (tcgetpgrp) depend on.
+        // child. These are the exact probes `hangup` (killpg),
+        // `record_adopted_shell` (the session leader of the PTY), and the GUI's
+        // quit_safety/control_input (tcgetpgrp) depend on.
         // SAFETY: read-only identity probes on a live child pid / our master fd.
         let (pgid, sid, fg) = unsafe {
             (
@@ -6801,7 +7095,7 @@ mod tests {
             (sh.pid, sh.pid, sh.pid),
             "the child must be a SESSION LEADER with pid == pgid == sid and be \
              the pty's foreground process group — the identity hangup (killpg), \
-             reap (getpgid) and the GUI's tcgetpgrp all depend on"
+             record_adopted_shell (tcgetsid) and the GUI's tcgetpgrp all depend on"
         );
     }
 
@@ -8032,10 +8326,77 @@ mod tests {
             io::ErrorKind::Other,
             "exec failure before exec must be reported as Other, got: {err}",
         );
-        assert!(
-            err.to_string().contains("127"),
-            "error should describe the _exit(127) exec failure: {err}",
+        assert_eq!(
+            err.to_string(),
+            "`/nonexistent/aterm-pty-no-such-prog-xyz` does not exist",
+            "the error names the missing program",
         );
+    }
+
+    // What the exec-failure line says for each thing that can be wrong with the
+    // target, and whose setting it names. Pure over a scratch folder: no spawn.
+    #[test]
+    fn an_exec_failure_says_what_is_wrong_with_the_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("aterm-pty-exec-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).expect("scratch folder");
+        let plain = dir.join("plain");
+        std::fs::write(&plain, b"#!/bin/sh\n").expect("a non-executable file");
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let runnable = dir.join("runnable");
+        std::fs::write(&runnable, b"not a program").expect("an executable file");
+        std::fs::set_permissions(&runnable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let c = |p: &std::path::Path| CString::new(p.as_os_str().as_bytes()).unwrap();
+        let shell = " (from $SHELL)";
+
+        assert_eq!(
+            exec_failure(&c(&dir.join("zhs")), shell, false, None),
+            format!(
+                "`{}` does not exist (from $SHELL)",
+                dir.join("zhs").display()
+            )
+        );
+        assert_eq!(
+            exec_failure(&c(&dir.join("folder")), shell, false, None),
+            format!(
+                "`{}` is a folder (from $SHELL)",
+                dir.join("folder").display()
+            )
+        );
+        assert_eq!(
+            exec_failure(&c(&plain), shell, false, None),
+            format!("`{}` is not executable (from $SHELL)", plain.display())
+        );
+        assert_eq!(
+            exec_failure(&c(&runnable), "", true, None),
+            format!("`{}` could not be run", runnable.display())
+        );
+        // A bare name is the fault itself: `execve` does no PATH search.
+        assert_eq!(
+            exec_failure(
+                c"fish",
+                " (set by --shell or `shell` in aterm.toml)",
+                false,
+                None
+            ),
+            "`fish` is not a full path (set by --shell or `shell` in aterm.toml)"
+        );
+        assert_eq!(
+            exec_failure(c"nosuch", "", true, None),
+            "`nosuch` is not on PATH"
+        );
+        assert_eq!(
+            exec_failure(c"", shell, false, None),
+            "the shell path is empty (from $SHELL)"
+        );
+        // A relative path is judged from the folder the child ran it in.
+        assert_eq!(
+            exec_failure(c"./plain", "", true, Some(&c(&dir))),
+            "`./plain` is not executable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Contract lock for the exit code the design depends on: a child that writes a
@@ -8631,5 +8992,247 @@ mod writeall_conformance {
              completing write) strictly validated against committed WriteAll.tla; dropped-tail \
              negative control rejected."
         );
+    }
+}
+
+/// TEARDOWN NEVER SIGNALS A RECYCLED PID (robustness audit, 2026-09-26,
+/// backlog item 5).
+///
+/// Closing a tab whose ADOPTED shell had already exited sent `SIGHUP`, then
+/// `SIGKILL`, to whatever process group the shell's pid named by then: nothing
+/// here ever reaps an adopted shell (launchd is its parent), and `reap`'s only
+/// guard, `getpgid(pid) == pid`, is passed by every job-control group leader
+/// and daemon. These tests hand the teardown exactly that shape — a real PTY
+/// whose shell has gone, a recorded identity for it, and the pid now naming a
+/// `setsid`'d `sleep` (a session AND group leader, so the old guard waves it
+/// through) — and require the sleep to live. The positive controls keep the
+/// historical teardown for a shell that IS still the one recorded: its group
+/// is hung up, and a HUP-ignoring one is still force-killed at ~250 ms.
+#[cfg(test)]
+mod shell_identity_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    /// A real PTY session running `script` under `/bin/sh`, returned once it has
+    /// printed `UP` — so its shell is demonstrably alive and leads the PTY.
+    fn parked_session(script: &str) -> SpawnedShell {
+        // SAFETY: test process, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        let sh = spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&exec),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+            None,
+        )
+        .expect("the parked session must spawn");
+        set_nonblocking(sh.master, true).expect("nonblocking master");
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !String::from_utf8_lossy(&seen).contains("UP") {
+            let mut buf = [0u8; 64];
+            let n = read(sh.master, &mut buf);
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains("UP"),
+            "the parked session never announced itself; the test would prove nothing"
+        );
+        sh
+    }
+
+    /// The bystander: a `sleep` in its OWN session (`setsid`), so it is a
+    /// session leader and a group leader — the shape the old
+    /// `getpgid(pid) == pid` guard could not tell from a shell.
+    fn setsid_sleep() -> std::process::Child {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        // SAFETY: `setsid` is async-signal-safe and touches no parent state;
+        // it is the only thing run between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("the bystander sleep must spawn")
+    }
+
+    fn end(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// THE INCIDENT SHAPE. An adopted tab's shell is recorded at adoption, then
+    /// exits (and is reaped by someone else — here the test, standing in for
+    /// launchd); the pid "comes back" as a `setsid`'d `sleep`; the tab closes.
+    /// Teardown must send the bystander nothing — neither the `SIGHUP` nor the
+    /// `SIGKILL` 250 ms later — and must not linger over it either.
+    #[test]
+    fn teardown_leaves_a_setsid_sleep_holding_the_recycled_pid_alive() {
+        let sh = parked_session("printf 'UP\\n'; exec sleep 30");
+        let recorded = record_adopted_shell(sh.pid, sh.master);
+        assert!(
+            recorded.birth.is_some() && !recorded.own_child,
+            "PRECONDITION: a live adopted shell leading its PTY records a birth \
+             ({recorded:?}); without one this test would pass for the wrong reason"
+        );
+        // The shell exits and its pid is freed (launchd's reap, played by us).
+        // SAFETY: signalling and reaping the test's own child.
+        unsafe {
+            libc::kill(sh.pid, libc::SIGKILL);
+            libc::waitpid(sh.pid, std::ptr::null_mut(), 0);
+        }
+
+        let mut bystander = setsid_sleep();
+        let bystander_pid = i32::try_from(bystander.id()).expect("pid fits i32");
+        // SAFETY: read-only identity probe of the test's own child.
+        let pgid = unsafe { libc::getpgid(bystander_pid) };
+        assert_eq!(
+            pgid, bystander_pid,
+            "NON-VACUITY: the bystander must pass the OLD guard (a group leader)"
+        );
+        // The kernel reissued the pid: the session still holds the recorded
+        // birth, but its pid now names the bystander.
+        let stale = ShellIdentity::from_parts(bystander_pid, recorded.birth, false);
+        let verified = stale.verify();
+
+        let hung = hangup_shell(&stale, sh.master);
+        let started = Instant::now();
+        reap_shell(stale);
+        let reap_took = started.elapsed();
+        // Past the old SIGKILL tick (250 ms), with margin.
+        std::thread::sleep(Duration::from_millis(400));
+        let still_running = matches!(bystander.try_wait(), Ok(None));
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        end(bystander);
+
+        assert!(
+            still_running,
+            "teardown SIGNALLED the unrelated process that now holds the shell's pid \
+             (hangup_shell answered {hung:?})"
+        );
+        assert!(!verified, "a reissued pid must not verify");
+        assert_eq!(
+            hung,
+            ShellHangup::Nothing,
+            "the dead shell left no foreground group on its PTY, so nothing may be \
+             hung up — least of all the recycled pid"
+        );
+        assert!(
+            reap_took < Duration::from_millis(100),
+            "reap_shell must give up at once on a pid that is no longer the shell \
+             (took {reap_took:?})"
+        );
+    }
+
+    /// The adoption proof itself: `record_adopted_shell` records a birth only
+    /// for the pid that leads the carried PTY. A pid that does not — the
+    /// bystander, standing in for a shell that died before adoption and whose
+    /// number was reissued — records none and so never verifies.
+    #[test]
+    fn adoption_records_a_birth_only_for_the_ptys_session_leader() {
+        let sh = parked_session("printf 'UP\\n'; exec sleep 30");
+        let bystander = setsid_sleep();
+        let bystander_pid = i32::try_from(bystander.id()).expect("pid fits i32");
+        let leader = record_adopted_shell(sh.pid, sh.master);
+        let stranger = record_adopted_shell(bystander_pid, sh.master);
+        hangup(sh.pid);
+        reap(sh.pid);
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        end(bystander);
+        assert!(
+            leader.birth.is_some(),
+            "the PTY's own leader records a birth"
+        );
+        assert_eq!(
+            stranger,
+            ShellIdentity::from_parts(bystander_pid, None, false),
+            "a pid that does not lead the carried PTY records nothing"
+        );
+        assert!(!stranger.verify(), "and so it never verifies");
+    }
+
+    /// POSITIVE CONTROL — the historical teardown survives for a VERIFIED
+    /// shell (`docs/DESIGN-pty-keeper-2026-09-26.md` F3): its group is hung up,
+    /// and one that ignores `SIGHUP` is still force-killed at the ~250 ms tick.
+    /// Recorded the adopted way, so the escalation is authorized by the start
+    /// time alone.
+    #[test]
+    fn a_verified_hup_ignoring_shell_is_still_hung_up_and_force_killed() {
+        let sh = parked_session("trap '' HUP; printf 'UP\\n'; exec sleep 30");
+        let identity = record_adopted_shell(sh.pid, sh.master);
+        assert!(identity.verify(), "the live leader verifies");
+        let hung = hangup_shell(&identity, sh.master);
+        let started = Instant::now();
+        reap_shell(identity);
+        let took = started.elapsed();
+        // Recorded the ADOPTED way, `reap_shell` stops at the corpse (launchd
+        // reaps an adopted shell's), so the test — its real parent — collects it
+        // here and reads HOW it died.
+        let mut status: libc::c_int = 0;
+        // SAFETY: bounded non-blocking wait on the test's own child.
+        let collected = unsafe { libc::waitpid(sh.pid, &mut status, libc::WNOHANG) };
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        assert_eq!(
+            hung,
+            ShellHangup::Shell(sh.pid),
+            "the verified shell is hung up"
+        );
+        assert!(
+            collected == sh.pid
+                && libc::WIFSIGNALED(status)
+                && libc::WTERMSIG(status) == libc::SIGKILL,
+            "the HUP-ignoring shell must have died by the SIGKILL escalation \
+             (waitpid={collected}, status=0x{status:x})"
+        );
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_millis(1500),
+            "it outlived SIGHUP and died at the ~250 ms escalation (took {took:?})"
+        );
+    }
+
+    /// A spawned shell that has exited but is not yet reaped is a ZOMBIE, whose
+    /// start time libproc refuses (measured 2026-09-26). It is still ours — the
+    /// kernel cannot reissue a pid we have not waited for — so it still
+    /// verifies, and `reap_shell` collects it rather than leaving a zombie.
+    #[test]
+    fn an_unreaped_own_child_zombie_still_verifies_and_is_reaped() {
+        let sh = parked_session("printf 'UP\\n'; exec sleep 30");
+        let identity = record_spawned_shell(sh.pid);
+        assert!(identity.birth.is_some() && identity.own_child);
+        // SAFETY: signalling the test's own child.
+        unsafe { libc::kill(sh.pid, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_birth(sh.pid).is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(process_birth(sh.pid), None, "a zombie reads no birth");
+        assert!(identity.verify(), "an unreaped own child still verifies");
+        reap_shell(identity);
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        assert!(!identity.verify(), "once reaped, the pid is no longer ours");
     }
 }

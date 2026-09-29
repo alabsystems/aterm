@@ -347,7 +347,7 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
              \x20 ✓ GREEN [OB-20] the lazy-init graph is ACYCLIC ({} edge(s) between cells)\n\
              \x20 ✓ GREEN [OB-21] the walk sees the idiom (cells, initializers and touches \
              all non-empty)\n\
-             gate lazyinit: GREEN — {} lazy cell(s) over {file_count} file(s), no \
+             lazy-init census: GREEN — {} lazy cell(s) over {file_count} file(s), no \
              reentrancy cycle.",
             edges.len(),
             d.cells.len()
@@ -355,15 +355,16 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
     } else {
         let _ = writeln!(
             log,
-            "gate lazyinit: FAILED — {failures} obligation violation(s). There is NO \
+            "lazy-init census: FAILED — {failures} obligation violation(s). There is NO \
              waiver channel for a reentrancy cycle: it can only be fixed."
         );
         log.push_str(LAZY_INIT_PRECISION_NOTE);
     }
 
-    CensusOutcome {
-        ok: failures == 0,
-        log,
+    if failures == 0 {
+        CensusOutcome::green(log)
+    } else {
+        CensusOutcome::red(log)
     }
 }
 
@@ -1410,8 +1411,8 @@ pub(crate) fn apply_staged_update_now() -> bool {
             out.log
         );
         assert!(
-            out.log.contains("gate lazyinit: FAILED"),
-            "the verdict line the build gate greps for is missing:\n{}",
+            out.log.contains("lazy-init census: FAILED"),
+            "the FAILED verdict line is missing:\n{}",
             out.log
         );
     }

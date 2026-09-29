@@ -8,7 +8,8 @@
 //! directly (without the terminal FFI layer), catching undefined behavior
 //! that unit tests and Kani cannot detect at runtime.
 //!
-//! Run with:
+//! Run with (STOCK EXCEPTION — Trust ships no cargo-miri and no rust-src; measured
+//! 2026-09-28: `targo --unverified miri --version` → "no such command: `miri`"):
 //!   cargo +nightly miri test -p aterm-grid --test grid_miri -- --test-threads=1
 //!
 //! Covers:

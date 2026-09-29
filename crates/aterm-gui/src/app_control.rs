@@ -565,6 +565,27 @@ impl App {
             .iter()
             .find(|tab| tab.root.contains(view))
             .ok_or_else(|| "view is not attached to the window".to_string())?;
+        // The canonical plan places the view where it is DRAWN: below its
+        // split pane's subtab title row (`reserve_pane_headers`), which the
+        // bare tree layout knows nothing of. The plan is in cells; the viewport
+        // is in pixels. A view the plan does not show (a sibling hidden by a
+        // zoom) keeps the tree layout's rect, as before.
+        let (cw, ch) = self.win_cell_size(wid);
+        let (cw, ch) = (cw as f32, ch as f32);
+        if let Some(leaf) = self
+            .plan_tab(tab, ws.rows, ws.cols)
+            .leaves
+            .into_iter()
+            .find(|leaf| leaf.view == view)
+        {
+            let r = leaf.rect;
+            return Ok(LogicalRect::new(
+                r.origin.x * cw,
+                r.origin.y * ch,
+                r.size.width * cw,
+                r.size.height * ch,
+            ));
+        }
         tab.root
             .layout(self.content_bounds(wid)?, 1.0, 1.0)
             .into_iter()
@@ -1199,6 +1220,54 @@ fn inspection_revision(fingerprint: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A native view's inspected viewport is where the view is DRAWN: in a
+    /// split, below its pane's subtab title row. It was the bare tree layout's
+    /// rect, a row too high and a row too tall, so `inspect` coordinates missed
+    /// the view's own pixels by the header. Checked for both leaves of a
+    /// two-view split against the canonical plan (the one geometry paint,
+    /// input and capture use), with the header row's presence asserted so the
+    /// comparison is not vacuous.
+    #[test]
+    fn a_split_native_views_viewport_is_below_its_subtab_title_row() {
+        use crate::native_app::AppViewState;
+        use crate::native_settings::SettingsRoute;
+        let mut app = App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("a window");
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let (instance, _) = app.active_native_view(wid).expect("a native view");
+        app.split_active_with_native(
+            wid,
+            crate::tab_model::SplitAxis::Horizontal,
+            instance,
+            AppViewState::Settings(Box::new(crate::native_settings::SettingsViewState::new(
+                &app.config,
+            ))),
+        )
+        .expect("split");
+        let plan = app.active_visible_leaf_plan(wid).expect("a plan");
+        assert_eq!(plan.leaves.len(), 2, "two views side by side");
+        let (cw, ch) = app.win_cell_size(wid);
+        let (cw, ch) = (cw as f32, ch as f32);
+        for leaf in &plan.leaves {
+            let header = leaf.header.expect("a split pane reserves its title row");
+            let viewport = app.view_rect(wid, leaf.view).expect("a viewport");
+            assert_eq!(
+                viewport,
+                LogicalRect::new(
+                    leaf.rect.origin.x * cw,
+                    leaf.rect.origin.y * ch,
+                    leaf.rect.size.width * cw,
+                    leaf.rect.size.height * ch,
+                ),
+                "the viewport is the plan's content rect"
+            );
+            assert!(
+                viewport.origin.y >= (header.origin.y + header.size.height) * ch,
+                "the viewport starts below the title row: {viewport:?} / {header:?}"
+            );
+        }
+    }
 
     #[test]
     fn wire_requests_become_stable_owned_targets() {

@@ -1016,6 +1016,10 @@ pub fn model_registry() -> Vec<Model> {
         fabric_refill_retry_model(),
         broadcast_cursor_checkpoint_model(),
         broadcast_head_subscription_model(),
+        output_retention_model(),
+        // Disabling desktop alerts cancels the GUI herald's pending debt
+        // while preserving seen escalations. Tier-1 drives the real herald.
+        desktop_alert_debt_model(),
         // A late say subscriber's gap consumes one shared replay allowance,
         // rotates by sid, and follows control work. Tier-1 in aterm-link's
         // bridge tests drives the real scheduler across many owed sessions.
@@ -1027,10 +1031,27 @@ pub fn model_registry() -> Vec<Model> {
         // The observation kernel's change test across an equal-seq
         // alternate-screen re-entry; Tier-1 in aterm-core's conformance_observe.
         observation_screen_generation_model(),
+        // The resize ledger's render verdict (`status render=`): the engine's
+        // resize journal is the writer, the ledger's verdict the reader, and
+        // the size-difference judge the replayed bug. Tier-1 in aterm-gui's
+        // `resize_ledger` drives a real alternate-screen Terminal through it.
+        resize_render_model(),
+        // Fixed-width row-count changes transfer cell slices between live
+        // rows and PageStore's reusable pool. Tier-1 drives Grid/PageStore.
+        resize_row_reuse_model(),
         // The in-GUI supervisor host's per-session worker lifecycle (one
         // supervisor per session, the restart budget, the held claim); Tier-1
         // in aterm-gui's harness_host conformance.
         harness_worker_lifecycle_model(),
+        // One session's supervisor claim across a seamless update: an
+        // external supervisor is never displaced by the incoming host (round
+        // four, item 9). Tier-1 bound TEST-ONLY — aterm-gui's session_store
+        // test drives the real record, wire, seed and grace decision against
+        // `Commit`, harness_host's the real grace gate — with no `#[refines]`
+        // anchors: `Commit` is a composition of four functions across two
+        // processes, not one seam. Registered so the non-vacuity sweep covers
+        // its invariants.
+        harness_handoff_claim_model(),
         // A process-table miss on an unchanged agent screen owns a bounded
         // name retry; Tier-1 drives StatusObserver's real deadline and guard.
         program_resolution_retry_model(),
@@ -1041,12 +1062,32 @@ pub fn model_registry() -> Vec<Model> {
         // A stopped Claude footer watch must neither reread a dormant session
         // nor erase a replacement group's watch. Tier-1 in the GUI scheduler.
         claude_footer_watch_model(),
+        // The Claude footer names the model the process runs — a choice the
+        // moment its result is written, never the predecessor's, and not lost
+        // to a row larger than the tail window. Tier-1 in aterm-agent's
+        // `conformance_footer_model` over the real transcript reader;
+        // `#[refines]` anchors (`Read`) on `facts_for_entry_from`, the tail
+        // cache's `read_since` and `for_process`, `scan` and `fold_result`,
+        // every other action waived as Claude Code's or a person's (the
+        // crate's `spec-anchors` feature, which aterm-gui's closure gate
+        // links).
+        claude_footer_model_model(),
         // The event loop's run-loop wake timer (the 2026-09-26 freeze): a late
         // timer costs CoreFoundation one catch-up step, and a spent timer is
         // re-armed, never trusted. Tier-1 in aterm-objc's `conformance_wake_timer`
         // over the real CoreFoundation; no `#[refines]` anchors (the crate ships
         // with zero dependencies).
         run_loop_waker_model(),
+        // A main-thread verb is refused at once while the main thread is
+        // stalled, and only then (the 2026-09-28 stall): the watchdog's beat
+        // writes the heartbeat's time, `main_stall` reads it with the count
+        // of hops the main thread has not yet taken. Tier-1 in aterm-gui's
+        // watchdog tests drives the real writer, census reset, hop count,
+        // `take_hop` and reader in lockstep, all three defects replayed. No
+        // `#[refines]` anchors, so spec-link closure does not see this bind:
+        // like `program_resolution_retry_model` and `claude_footer_watch_model`
+        // above, it is a Tier-1 test in the GUI with none.
+        main_thread_stall_refusal_model(),
         // The §3.2 two-way supernova burst mutex over the shared `nova_add`
         // channel. Tier-1 bound TEST-ONLY — aterm-effects' word_decorations test
         // `real_burst_grants_conform_to_the_supernova_mutex_model` drives the
@@ -1101,6 +1142,11 @@ pub fn model_registry() -> Vec<Model> {
         // before retrying a waiting tab. Tier-1 drives the real restored
         // worker with a waiting first tab and a healthy second one.
         harness_restored_first_attempt_model(),
+        // Harness work in flight at a seamless update's Commit (round four,
+        // plan item 7): the restored queue a park freezes and the successor
+        // relaunches, and the restart records its Commit sweeps. Tier-1 drives
+        // the real host's queue and sweep (`harness_host`).
+        harness_restored_carry_model(),
         // The shared API probe's shutdown takes the waiter's mutex so its
         // notification cannot be lost before parking. Tier-1 drives the real
         // loop at this boundary, including the historical unlocked publisher.
@@ -1127,6 +1173,23 @@ pub fn model_registry() -> Vec<Model> {
         // in aterm-agent's upgrade tests over the real `exit_record`/`after_exit`;
         // no `#[refines]` anchors.
         harness_exit_record_model(),
+        // A Codex's exit, read on its shell's word alone (the review of
+        // 2026-09-27): someone's signal is never relaunched, and a crash is
+        // left only when no word came — the thread lock is no witness.
+        // Tier-1 in aterm-agent's `harness::upgrade_codex_drive` tests over
+        // the real `look_at_exit`/`exit_record`/`after_exit`; no `#[refines]`
+        // anchors.
+        harness_codex_exit_witness_model(),
+        // The host hands a worker its agent's exit only for an exit: a name
+        // the roster could not read while the agent still holds its tab is no
+        // exit, an exit that follows is still seen (a short look, the
+        // backstop for one nothing rang for), and the upgrade's own restart
+        // in flight at its exit
+        // is carried on whatever `[harness] relaunch` says (the gate failure
+        // of 32a51a716) — and no other exit in the tab is. Tier-1 in
+        // aterm-gui's harness_host tests over the real host; no `#[refines]`
+        // anchors.
+        harness_leave_model(),
         // The live upgrade's looks at one session: never let go for what a
         // look could not read — a READY answer included — and, from the
         // worker's attach, its note behind asked until the launch's record
@@ -1149,6 +1212,13 @@ pub fn model_registry() -> Vec<Model> {
         // Tier-1 in aterm-agent's `harness::upgrade_drive` tests over the real
         // reducer, gates and record transitions; no `#[refines]` anchors.
         harness_upgrade_never_strands_model(),
+        // The end of the agent's own work is the upgrade's point: the first
+        // idle point after work seen since the notice asks again (or re-arms
+        // a rest and asks), never goes to the loop (2026-09-28, s-692e6), and
+        // no wait there outlives the re-ask's window (a status lagging the
+        // idle screen). Tier-1 in aterm-agent's `harness::upgrade` tests over
+        // the real reducer on every reachable idle point.
+        harness_upgrade_work_end_model(),
         // The login wall (2026-09-27): nothing of the upgrade's typed where
         // the wall shows or stands, no give-up spent on a notice the wall
         // answered, no continuation into a login the supervisor saw gone,
@@ -1173,6 +1243,43 @@ pub fn model_registry() -> Vec<Model> {
         // `harness::upgrade_codex` tests to the real `daemon_step` over every
         // reachable state; no `#[refines]` anchors.
         harness_codex_daemon_update_model(),
+        // The live upgrade's LADDER (the owner's decision of 2026-09-28): the
+        // longer an upgrade has been behind, the less it waits, and no rung
+        // relaxes a floor, nor holds an idle client for another session's
+        // turn once its screen has placed it. Tier-1 in aterm-agent's
+        // `harness::upgrade_drive` ladder tests over every reachable state,
+        // each built into real looks and read by the visit's own assembly
+        // (`ladder_look`, `codex_daemon_turn`, `screen_turn`, `quiet_s`)
+        // through the real `gate`, `rung`, `St::still`, `daemon_turn` and
+        // `daemon_step`, and a replay of the 2026-09-28 incident; `#[refines]`
+        // anchors on those five, the environment's steps and the `Buggy`
+        // members waived (the crate's `spec-anchors` feature, which
+        // aterm-gui's closure gate links). Liveness: `TheUpgradeLands`.
+        harness_upgrade_ladder_model(),
+        // The live upgrade's GOAL PAUSE (the owner's decision of 2026-09-28):
+        // at the Land rung a goal whose own turn is all that holds the move is
+        // paused with `/goal pause` (the Esc only at a goal turn's head), the
+        // move made, and the goal resumed once — never left paused, never
+        // resumed over a person's hand, never under an open save-then-wait
+        // switch. Tier-1 in aterm-agent's `harness::upgrade_drive` goal
+        // tests over every reachable state, through the real
+        // `upgrade_codex::goal_step`, `goal_owed` and `daemon_turn`, the clock
+        // aged through its real readers (`St::rung_at`, `goal_hold_past_bound`,
+        // `goal_rest_until`); `#[refines]` anchors on those three, the world's
+        // steps (the clock's among them) and the `Buggy` members waived.
+        // Liveness: `TheUpgradeLandsUnderAGoal`.
+        harness_upgrade_goal_pause_model(),
+        // The supervisor's done check (2026-09-27): a done report is typed the
+        // check, never a plain continuation; the check's done yield ends the
+        // task until someone else's turn. Tier-1 in aterm-agent's
+        // `supervise_conformance_done_check` over the real decider on every
+        // reachable state; no `#[refines]` anchors.
+        supervisor_done_check_model(),
+        // The stall's remedy (D4, 2026-09-27; cut back by that day's review):
+        // one `signal term` an episode, never under a hand, never a kill.
+        // Tier-1 in aterm-agent's `supervise::stall` tests over the real loop
+        // on every reachable configuration; no `#[refines]` anchors.
+        supervisor_stall_remedy_model(),
         // The live upgrade's model priority list: its writers (the automatic
         // insertion of a model Claude Code recommends, and `upgrade models set`)
         // against its reader (target selection). Tier-1 bound in aterm-agent's
@@ -1201,6 +1308,19 @@ pub fn model_registry() -> Vec<Model> {
         // `tests/supervise_conformance_network_wall.rs` over the real
         // `decide_turn_end`; no `#[refines]` anchors.
         supervisor_network_wall_model(),
+        // Codex's rate-limit nudge and the save-then-wait switch (2026-09-28): the
+        // nudge switched only near the limit, the work saved once on the cheaper
+        // model and nothing else run there (the save's own turn bounded, round 4),
+        // the session held on its own model, no continuation into a pursued goal
+        // or a fallen sandbox. Tier-1 in
+        // aterm-agent's `tests/supervise_conformance_codex_rate_nudge.rs` over the
+        // real approval decider, `decide_turn_end` and `TurnEndState`;
+        // `#[refines]` anchors on the deciders it drives (`rate_nudge`,
+        // `open_switch`, `observe`, `goal_stop`, `goal_told`, `wind_down_act`,
+        // `continue_policy`), Codex's, the clock's and a person's steps and
+        // the `Buggy` members waived (the crate's `spec-anchors` feature,
+        // which aterm-gui's closure gate links).
+        supervisor_codex_rate_nudge_model(),
         // A pending stub waiting for its program against the pass installing it: it reads
         // whether the pass runs before whether the shim resolves. Tier-1 bound to the real
         // decision (`pending_wait_step`) in `atpkg::cli`'s tests.
@@ -1274,6 +1394,30 @@ pub fn model_registry() -> Vec<Model> {
         authorize_soundness_model(),
         // Deep-nesting safety: forwarding needs Owner scope (no transitive authority).
         no_transitive_authority_model(),
+        // An adopted `@<sid>` during a seamless update: the predecessor serves the
+        // id its own candidate published early, and refuses a stranger's. Tier-1
+        // + `#[refines]` anchors in aterm-gui (`control`, `identity_claim`).
+        handoff_address_owner_model(),
+        // A person's grace over a READY answer ends in the upgrade's restart,
+        // never in the loop's `keep going` (2026-09-27 20:28:42). Tier-1 in
+        // aterm-gui's harness_host (the real worker's ownership) and
+        // aterm-agent's turn-end policy (the loop's guard).
+        upgrade_attended_turn_end_model(),
+        // The loop's own act, once the agent took it, never withholds a break
+        // of its background work from the host (2026-09-28: s-d3346 and
+        // s-5c03a had no upgrade look for hours). Tier-1 in aterm-agent's
+        // run_engine_tests over the real loop.
+        supervisor_break_offer_model(),
+        // The point the upgrade acts at next (a READY's restart) is owned
+        // through its settle: every act of the upgrade's, at an idle point or
+        // a break, starts the counts over (2026-09-28 18:21, s-5c03a). Tier-1
+        // in aterm-gui's harness_host over the real worker.
+        upgrade_settle_turn_end_model(),
+        // A notice its own fence refused owns its point for a bounded number
+        // of looks at the first rung, counted on their own and started over
+        // by an act or the owner's word, never renewed by a turn (2026-09-28
+        // 14:52:45, s-d3346). Tier-1 in aterm-gui's harness_host.
+        upgrade_refused_turn_end_model(),
         // GUI native-chrome safety: split-pane tree integrity + session-pool refcount
         // accounting (the Tier-1 conformance + #[refines] anchors live in aterm-gui).
         pane_tree_model(),
@@ -1420,6 +1564,15 @@ pub fn model_registry() -> Vec<Model> {
         cursor_scroll_signal_model(),
         rainbow_landing_pool_model(),
         native_update_overlap_handoff_model(),
+        // The launched successor presents its rendezvous claim only to the
+        // attested outgoing process; Tier-1 in aterm-gui's handoff_rendezvous
+        // drives the real dial gate with real attested processes.
+        native_update_rendezvous_claim_model(),
+        // The successor around its claim (docs/DESIGN-warm-successor-2026-09-29.md):
+        // no environment mutation once a thread exists, nothing owned, shown or
+        // proved before the claim. Tier-1 in aterm-gui's handoff_env drives the
+        // real snapshot and intake (P1); the warm actions are waived until P2-P4.
+        native_update_successor_warm_before_claim_model(),
         native_update_disk_transaction_model(),
         exact_profanity_completion_model(),
         settings_page_scroll_model(),
@@ -1545,6 +1698,13 @@ pub fn model_registry() -> Vec<Model> {
         // Commit and only while aterm is in front. Tier-1 drives the real App
         // carry and proof path in aterm-gui/src/window_show_conformance.rs.
         native_update_window_show_model(),
+        // Where an update's successor rebuilds its layout (warm successor P3,
+        // 2026-09-29): a cold launch only after its first present (RESTORE-1),
+        // the handoff lane in window 0's attach pass, and the proof only once
+        // the rebuild drained and every window painted. Tier-1 drives the real
+        // `restore_pass_due` and paint decision in
+        // aterm-gui/src/restore_pass_conformance.rs.
+        native_update_successor_attach_model(),
         // A self-update's pre-Commit input queue (2026-09-26, gap #33): a focus
         // loss marks it incoherent only when input for that window is already
         // queued ahead of it, so the replay's repair — disarming the ambient
@@ -1562,6 +1722,13 @@ pub fn model_registry() -> Vec<Model> {
         // real successor App over one journal directory in
         // aterm-gui/src/editor_carry_conformance.rs.
         native_update_editor_carry_model(),
+        // A driver's own lease never re-grids the session it may still type
+        // into, so its `if-gen=` fence is never refused by a repaint its own
+        // hand caused (2026-09-27: the live upgrade's notice, refused 121
+        // visits of 121). Tier-1 drives the real `turn` and `lease` verbs on a
+        // real pty against the real presence projection in
+        // aterm-gui/src/driver_geometry_conformance.rs.
+        driver_geometry_model(),
         // An unsaved Settings draft rides a seamless self-update (2026-09-27,
         // plan P2-2): the handoff layout carries each Settings view's field
         // drafts, the successor reopens the view holding them (or says which it
@@ -1572,6 +1739,13 @@ pub fn model_registry() -> Vec<Model> {
         // App over the real layout wire in
         // aterm-gui/src/settings_draft_carry_conformance.rs.
         native_update_settings_draft_carry_model(),
+        // The rendezvous grant across a version boundary (item 13 of the fifth
+        // update-robustness round): the chunked `ATRZ2G` grant is offered only
+        // to a candidate whose verified bundle declares it, claimed only when
+        // offered, sent only to an `ATRZ2C` claim of more than 62 sessions, and
+        // adopted only whole. Tier-1 drives the shipping decisions and a real
+        // chunked grant in aterm-gui's handoff_rendezvous tests.
+        native_update_rendezvous_grant_model(),
         // The crash journal's claim (2026-09-26, PTY keeper P1): a window's
         // layout journal is taken once, never while its owner runs, reopened
         // only after an unclean end the crash marker attests, never when the
@@ -1580,6 +1754,21 @@ pub fn model_registry() -> Vec<Model> {
         // real owner and claim over a real directory, lock and crash markers
         // in aterm-gui/src/crash_journal_conformance.rs.
         crash_journal_claim_model(),
+        // The PTY keeper (2026-09-28, P2): custody of every master outside the
+        // window — never two readers, an offer only with no live holder, a
+        // closed tab never handed on, no relaunch after a quit, and a shell
+        // lost only when the keeper also failed — and the relaunch brake's
+        // writer/reader pair. Tier-1 drives the real KeeperCore and
+        // RelaunchBrake in aterm-keeper/src/conformance_custody.rs.
+        pty_keeper_custody_model(),
+        keeper_relaunch_brake_model(),
+        // The keeper's judgement of one window's end (P3's limits, 2026-09-28):
+        // a quit whose BYE was lost is told from a crash by the kernel's exit
+        // status AND the window's crash marker agreeing, never by either alone,
+        // and an orphan whose shell dies is pruned on its leader's exit. Tier-1
+        // drives the real classifier and KeeperCore in
+        // aterm-keeper/src/conformance_custody.rs.
+        keeper_death_judgement_model(),
         // A shell spawned before the re-key channel is healed by a key its
         // relaunch line reads from a one-use file, and a key whose line never
         // ran is taken back, file and all. Tier-1 drives the real issue and
@@ -1629,6 +1818,37 @@ pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
         (
             native_update_apply_ladder_model(),
             native_update_apply_ladder_liveness(),
+        ),
+        // The driver's geometry (2026-09-28): a row a moved lease holds
+        // catches up with the live want once the wake is handled. Tier-0 in
+        // tests/derived_driver_geometry.rs.
+        (driver_geometry_model(), driver_geometry_liveness()),
+        // An update's successor proves (warm successor P3): the rebuild moved
+        // into window 0's attach pass still ends in the proof. Tier-0 in
+        // tests/derived_update_parallel_attach.rs.
+        (
+            native_update_successor_attach_model(),
+            native_update_successor_attach_liveness(),
+        ),
+        // Codex's save-then-wait switch: the session comes back to its own
+        // model (2026-09-28). Tier-0 in tests/derived_supervise.rs.
+        (
+            supervisor_codex_rate_nudge_model(),
+            supervisor_codex_rate_nudge_liveness(),
+        ),
+        // The live agent upgrade's ladder: the upgrade lands, or a floor no
+        // rung relaxes stands (the owner's decision of 2026-09-28). Tier-0 in
+        // tests/derived_harness_upgrade_ladder.rs, interpreter and `ty` both.
+        (
+            harness_upgrade_ladder_model(),
+            harness_upgrade_ladder_liveness(),
+        ),
+        // The goal pause: the upgrade lands under a goal that never pauses by
+        // itself, and leaves it pursued (2026-09-28). Tier-0 in
+        // tests/derived_harness_upgrade_goal_pause.rs.
+        (
+            harness_upgrade_goal_pause_model(),
+            harness_upgrade_goal_pause_liveness(),
         ),
     ]
 }

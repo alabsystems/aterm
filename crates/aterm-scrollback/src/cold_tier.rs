@@ -563,8 +563,9 @@ impl ColdTier {
     /// them in O(P) total instead of the O(k*P) cost of repeated `pop_front()`.
     // Skip: the eviction walk drives a std iterator whose `next` is an absent
     // body (generic trait path). Pure bookkeeping over owned blocks; the
-    // budget contract is ARENA-SCROLL-exercised. Droppable when the iterator
-    // totality layer lands.
+    // budget contract is ARENA-SCROLL-exercised. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed:
+    // INCONCLUSIVE (1 of 2 obligations unknown). Needed from $HOME/trust, in a
+    // promoted seal: totality for std iterator `next`; then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn evict_bytes(&mut self, target_bytes: usize) -> usize {
         if target_bytes == 0 || self.pages.is_empty() {
@@ -602,8 +603,10 @@ impl ColdTier {
     // Skip: the residual row is `Vec::drain(..k)` under its `k < len` guard —
     // the BLANKET-unmodeled drain class (guards don't chain). Contract
     // debug-asserted, warn+saturate in production (doc above); cold-tier
-    // maintenance exercised by the ARENA-SCROLL harness. Droppable when
-    // resize-aware tracking lands.
+    // maintenance exercised by the ARENA-SCROLL harness. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed:
+    // INCONCLUSIVE (2 of 3 unknown). Needed from $HOME/trust, in a promoted seal:
+    // resize-aware Vec length tracking (trust-vcgen still emits the drain
+    // row as `vec-panic-method-index-unmodeled`); then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_front_lines(&mut self, n: usize) {
         if n == 0 {

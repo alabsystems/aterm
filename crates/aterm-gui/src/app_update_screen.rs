@@ -618,18 +618,29 @@ impl App {
     /// stand-down that retries later, the handoff off) folds the live ready row
     /// — withdrawn, no outcome to claim — and records the words. With no staged
     /// row up, a posture that has just become a DECISION (the lane stopped)
-    /// raises the ready row once ([`Self::ensure_staged_decision`], ruling 119);
+    /// raises the ready row once ([`Self::ensure_staged_decision_in`], ruling 119);
     /// anything else is a no-op.
     pub(crate) fn restate_staged_bar_posture(&mut self, build: u64) {
-        use crate::messages_host::FlowPhase;
         let posture = self.apply_posture_for(build);
+        self.restate_staged_bar_posture_in(build, posture);
+    }
+
+    /// [`Self::restate_staged_bar_posture`] under an explicit `posture` — the
+    /// caller's own `apply_posture_for(build)`, or a test's, since a headless
+    /// App's posture is always the handoff-off record.
+    pub(crate) fn restate_staged_bar_posture_in(
+        &mut self,
+        build: u64,
+        posture: crate::update_words::ApplyPosture,
+    ) {
+        use crate::messages_host::FlowPhase;
         let Some((id, version)) = self
             .live_update_flow()
             .filter(|flow| flow.phase == FlowPhase::Staged { build })
             .map(|flow| (flow.id, flow.version.clone()))
         else {
             if crate::update_words::staged_is_decision(Some(posture)) {
-                self.ensure_staged_decision(build);
+                self.ensure_staged_decision_in(build, posture);
             }
             return;
         };
@@ -831,7 +842,7 @@ impl App {
         target_build: u64,
     ) {
         self.record_apply_outcome_for_target_in_ledger(&outcome, target_build);
-        self.react_to_update_apply_outcome(source, outcome, open_details);
+        self.react_to_update_apply_outcome_for(source, outcome, open_details, Some(target_build));
     }
 
     /// Persist the apply-lane verdict into the updater's own health ledger and
@@ -940,6 +951,23 @@ impl App {
         source: &str,
         outcome: crate::native_app::UpdateOutcome,
         open_details: bool,
+    ) {
+        self.react_to_update_apply_outcome_for(source, outcome, open_details, None);
+    }
+
+    /// [`Self::react_to_update_apply_outcome`] for the build the attempt TRIED
+    /// (`attempted`; `None` where the current stage is that build by
+    /// construction). A returned worker's reconciliation may already have
+    /// imported another stage (a sibling aterm published one while this
+    /// attempt ran, round six, finding 29): its failure is then not that
+    /// stage's, so it is never worded with that stage's version nor offered as
+    /// that stage's `Install now` — the new stage's own posture speaks for it.
+    pub(crate) fn react_to_update_apply_outcome_for(
+        &mut self,
+        source: &str,
+        outcome: crate::native_app::UpdateOutcome,
+        open_details: bool,
+        attempted: Option<u64>,
     ) {
         // ONE ROW PER UPDATE (2026-09-23; ruling 143): a retry the lane has
         // scheduled raises NOTHING on the glass — the flow row, where one is up,
@@ -1052,10 +1080,26 @@ impl App {
             }
             crate::native_app::UpdateOutcome::Failed { message } => {
                 aterm_log::warn!("update apply ({source}) failed safely: {message}");
+                let superseded = attempted.filter(|&tried| {
+                    tried != 0
+                        && staged
+                            .as_ref()
+                            .is_some_and(|(staged_build, _)| *staged_build != tried)
+                });
                 if open_details {
                     self.retire_charging_surge();
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
+                } else if let Some((tried, replacement)) = superseded.zip(staged.as_ref()) {
+                    let replacement = replacement.0;
+                    let posture = self.apply_posture_for(replacement);
+                    self.say_superseded_apply_failure(
+                        source,
+                        &message,
+                        tried,
+                        replacement,
+                        posture,
+                    );
                 } else if let Some((staged_build, version)) = staged {
                     // WHICH ANSWER IS TRUE IS A QUESTION ABOUT SCHEDULING STATE
                     // (`automatic_apply_retry_scheduled` asks every carrier of it:
@@ -1167,6 +1211,60 @@ impl App {
                 aterm_messages::Severity::Warn,
             ),
         }
+    }
+
+    /// A RETURNED ATTEMPT WHOSE BUILD IS NO LONGER THE STAGE (round six,
+    /// finding 29): another download (`replacement`) replaced the build it
+    /// tried (`tried`) while it ran. Three things are said, in this order:
+    ///
+    /// 1. what stood for `tried` leaves — the attempt's own "installing" words
+    ///    are put back first ([`Self::retire_update_installing`]), and a flow
+    ///    row that is then `tried`'s ready row (the row the press came from,
+    ///    or the lane's) is withdrawn: its bytes are gone, and a ready row whose
+    ///    capsule no longer has a stage to press must not stand beside the
+    ///    failure;
+    /// 2. the failure itself, without `replacement`'s version and without a
+    ///    press for bytes nobody tried — a record for an unattended attempt, a
+    ///    row for a person's press;
+    /// 3. how `replacement` installs, in `posture`
+    ///    ([`Self::restate_staged_bar_posture_in`]): the reconcile that
+    ///    imported it on the return was a Refresh, which announces no stage,
+    ///    so where a press is how it installs its ready row is raised here, and
+    ///    where the lane installs it by itself nothing more is said.
+    ///
+    /// `posture` is the caller's `apply_posture_for(replacement)`; a
+    /// parameter so a test can drive the decision a headless App never has.
+    pub(crate) fn say_superseded_apply_failure(
+        &mut self,
+        source: &str,
+        message: &str,
+        tried: u64,
+        replacement: u64,
+        posture: crate::update_words::ApplyPosture,
+    ) {
+        use crate::messages_host::FlowPhase;
+        self.retire_update_installing();
+        if let Some(id) = self
+            .live_update_flow()
+            .filter(|flow| flow.phase == FlowPhase::Staged { build: tried })
+            .map(|flow| flow.id)
+        {
+            self.update_flow = None;
+            self.withdraw_message(id);
+        }
+        aterm_log::info!(
+            "update apply ({source}): build {tried} failed after build {replacement} replaced it"
+        );
+        if source_is_automatic(source) {
+            self.note_update_outcome(crate::update_words::outcome(
+                UPDATE_DIDNT_FINISH,
+                &format!("another download has replaced it \u{b7} {message}"),
+                aterm_messages::Severity::Warn,
+            ));
+        } else {
+            self.note_update_outcome(crate::update_words::failed(UPDATE_DIDNT_FINISH, "", false));
+        }
+        self.restate_staged_bar_posture_in(replacement, posture);
     }
 
     /// One apply-lane OUTCOME (ruling 143): a stopped lane, an install that
@@ -1390,7 +1488,17 @@ impl App {
     /// realized-arrow TTL expiry sweep in `about_to_wait`.
     pub(crate) fn refresh_version_menu(&self) {
         if let Some(handle) = self._menu.as_ref() {
-            let staged = self.relaunch.as_ref().map(|r| (r.build, r.version.clone()));
+            // Only a build strictly newer than the running one is an offer
+            // (`menu::staged_for_version_menu`): the bar must not say `⬆️` over
+            // the build it is already running.
+            let running = self.native_updater_service.snapshot().current_build;
+            let staged = crate::menu::staged_for_version_menu(
+                self.relaunch
+                    .as_ref()
+                    .map(|r| (r.build, r.version.as_str())),
+                running,
+            )
+            .map(|(build, version)| (build, version.to_string()));
             let realized = !self.serious_mode_enabled()
                 && self
                     .upgrade_realized
@@ -1410,6 +1518,29 @@ impl App {
                 realized,
             );
         }
+    }
+
+    /// The OUTGOING side of a seamless handoff whose successor has proven itself:
+    /// retitle this process's Version item to the successor's plain `v<target>`
+    /// ([`crate::menu::handoff_target_bar_title`]), so the menu bar reads the
+    /// running build even when nothing claims it after this process exits — the
+    /// 2026-09-24 `v0.91.0 ⬆️` that stood over a running 0.92.0 for three hours.
+    /// Returns the published title (for the log and the tests); a returned
+    /// attempt re-syncs the item through [`Self::refresh_version_menu`].
+    #[cfg(unix)]
+    pub(crate) fn publish_handoff_target_to_menu_bar(&self) -> Option<String> {
+        let pending = self.pending_update_handoff.as_ref()?;
+        let title = crate::menu::handoff_target_bar_title(
+            pending.target_build,
+            pending.same_image.is_some(),
+            self.relaunch
+                .as_ref()
+                .map(|r| (r.build, r.version.as_str())),
+        )?;
+        if let Some(handle) = self._menu.as_ref() {
+            crate::menu::show_handoff_target_version(handle, &title);
+        }
+        Some(title)
     }
 }
 
@@ -1852,6 +1983,173 @@ pub(crate) mod tests {
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
         });
+    }
+
+    /// A RETURNED FAILURE IS NEVER WORDED FOR THE STAGE THAT REPLACED ITS
+    /// BUILD (round six, finding 29): with a sibling's stage imported while
+    /// the attempt ran, the failure of the attempted build is not offered as
+    /// the new stage's `Couldn't install aterm v<new>` / `Install now`, nor
+    /// folded into the new stage's retry — on either lane. The attempted
+    /// build's own ready row, the one the press came from and the one
+    /// `retire_update_installing` puts back on the return, leaves with it
+    /// (review two: it used to stand, capsule-less, beside the failure), and
+    /// where a press is how the new stage installs, its ready row is raised
+    /// (the Refresh reconcile that imported it announces nothing). Negative
+    /// control: the same failure against the stage it tried keeps main's words.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_returned_failure_is_not_worded_for_the_stage_that_replaced_it() {
+        use crate::messages_host::FlowPhase;
+        use crate::native_updater_service::{
+            ApplyDecision, ApplyPreflightStart, ClosePreflight, ReturnedApplyDisposition,
+            ReturnedApplyFacts,
+        };
+        use crate::update_words::ApplyPosture;
+        let _ledger = super::hold_update_ledger_for_test();
+        let message = "overlap handoff failed safely: candidate exited before its proof; the \
+                       download on disk has since changed";
+        let failed = || UpdateOutcome::Failed {
+            message: message.to_string(),
+        };
+        // `decision`: the new stage's posture is one a press installs — driven
+        // through the reaction's own seam, since a headless App's posture is
+        // always the handoff-off record; otherwise the whole shipping surface.
+        for decision in [false, true] {
+            for source in ["manual handoff", "automatic handoff"] {
+                let case = format!("{source} decision={decision}");
+                let mut app = App::headless_for_test();
+                let running = app.native_updater_service.snapshot().current_build;
+                let tried = running + 77_001;
+                let replacement = tried + 1;
+                stage_build_with_ledger(&mut app, tried);
+                app.clear_messages_for_test();
+                // The attempted build's ready row is up, and the press (or the
+                // lane) re-words it to "installing".
+                app.ensure_staged_decision_in(tried, ApplyPosture::ManualByConfig);
+                assert!(
+                    app.staged_update_row().is_some(),
+                    "{case}: PRECONDITION: its ready row"
+                );
+                app.begin_update_installing(tried, !super::source_is_automatic(source));
+                // The attempt at `tried` returns after a sibling published
+                // `replacement`: the shipping return retires the stage it tried,
+                // and the reconcile imports the replacement.
+                let ApplyPreflightStart::Inspect(preflight) =
+                    app.native_updater_service.begin_apply_preflight()
+                else {
+                    panic!("the stage admits preflight");
+                };
+                let ApplyDecision::Execute(command) = app
+                    .native_updater_service
+                    .finish_apply_preflight(preflight, ClosePreflight::Ready)
+                else {
+                    panic!("preflight mints the attempt");
+                };
+                let attempt = command.attempt();
+                command.execute(|| ());
+                assert_eq!(
+                    app.native_updater_service.finish_returned_apply(
+                        &attempt,
+                        ReturnedApplyFacts::new(
+                            true,
+                            Some(replacement),
+                            Some(attempt.target_commit()),
+                            Some(attempt.target_dmg_sha256()),
+                            None,
+                        ),
+                        "candidate exited before its proof",
+                    ),
+                    ReturnedApplyDisposition::Retired
+                );
+                stage_build_with_ledger(&mut app, replacement);
+                if !decision {
+                    arm_intent(&mut app, replacement);
+                }
+                // `reduce_returned_handoff_completion`'s order: the
+                // "installing" words go back first — to the tried build's
+                // ready row.
+                app.retire_update_installing();
+                assert_eq!(
+                    app.live_update_flow().map(|flow| flow.phase),
+                    Some(FlowPhase::Staged { build: tried }),
+                    "{case}: PRECONDITION: the tried build's ready row is back"
+                );
+                if decision {
+                    app.record_apply_outcome_for_target_in_ledger(&failed(), tried);
+                    app.say_superseded_apply_failure(
+                        source,
+                        message,
+                        tried,
+                        replacement,
+                        ApplyPosture::ManualByConfig,
+                    );
+                } else {
+                    app.surface_update_apply_outcome_for_target(source, failed(), false, tried);
+                }
+                let tried_version = format!("v1.0.{tried}");
+                let new_version = format!("v1.0.{replacement}");
+                for l in app.messages.live_rows() {
+                    let said = format!("{} {}", l.msg.title, l.msg.detail.join(" "));
+                    assert!(!said.contains(&tried_version), "{case}: stale row: {said}");
+                    if l.msg.key.as_deref() == Some(crate::update_words::KEY_OUTCOME) {
+                        assert!(!said.contains(&new_version), "{case}: {said}");
+                        assert!(
+                            !l.msg
+                                .actions
+                                .iter()
+                                .any(|a| matches!(a, aterm_messages::Intent::ApplyUpdate { .. })),
+                            "{case}: no press on the failure for bytes nobody tried"
+                        );
+                    }
+                }
+                if let Some(said) = app.update_record_text() {
+                    assert!(!said.contains(&new_version), "{case}: {said}");
+                }
+                let told = if super::source_is_automatic(source) {
+                    app.update_record_text()
+                } else {
+                    app.messages
+                        .live_by_key(crate::update_words::KEY_OUTCOME)
+                        .map(|l| format!("{} — {}", l.msg.title, l.msg.detail.join("; ")))
+                };
+                assert!(
+                    told.as_deref()
+                        .is_some_and(|t| t.starts_with(super::UPDATE_DIDNT_FINISH)),
+                    "{case}: the failure is said: {told:?}"
+                );
+                // How the new stage installs: its own ready row, with its
+                // own press, where a press is how; nothing where the lane
+                // installs it by itself.
+                let ready = app
+                    .live_update_flow()
+                    .filter(|flow| flow.phase == FlowPhase::Staged { build: replacement })
+                    .and_then(|flow| app.messages.live(flow.id))
+                    .map(|l| (l.msg.title.clone(), l.msg.actions.clone()));
+                if decision {
+                    let (title, actions) = ready.expect("the new stage's decision is raised");
+                    assert!(title.contains(&new_version), "{case}: {title}");
+                    assert!(
+                        actions
+                            .contains(&aterm_messages::Intent::ApplyUpdate { build: replacement }),
+                        "{case}: its own press"
+                    );
+                } else {
+                    assert_eq!(ready, None, "{case}");
+                }
+            }
+        }
+        // The negative control: the stage IS the attempt — main's words.
+        let mut app = App::headless_for_test();
+        let running = app.native_updater_service.snapshot().current_build;
+        let tried = running + 77_101;
+        stage_build_with_ledger(&mut app, tried);
+        app.clear_messages_for_test();
+        app.surface_update_apply_outcome_for_target("manual handoff", failed(), false, tried);
+        let row = app.update_row_text().expect("a stopped lane is a row");
+        assert!(
+            row.starts_with(&format!("Couldn't install aterm v1.0.{tried}")),
+            "{row}"
+        );
     }
 
     #[cfg(target_os = "macos")]

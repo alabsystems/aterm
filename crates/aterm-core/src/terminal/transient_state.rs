@@ -97,6 +97,19 @@ pub(super) struct TransientState {
     ///
     /// [`Terminal::reset`]: super::Terminal::reset
     pub(super) reset_generation: u64,
+    /// Monotonic count of FULL CLEARS processed — ED 2, and ED 0 issued with
+    /// the cursor home (`resize_journal::is_full_clear`; ED 3 only erases the
+    /// history behind the screen, so it is not one). The one signal
+    /// that an app repainted a displaced screen from scratch rather than
+    /// diffing onto it, so each resize report carries its value at the resize
+    /// and a reader compares. Never reset to 0, like `reset_generation`: the
+    /// reader keys on it advancing.
+    pub(super) full_clears: u64,
+    /// Monotonic count of whole-screen REPLACEMENTS — alternate-screen enter
+    /// and exit (47/1047/1049) and full resets, which [`reset`](Self::reset)
+    /// bumps. A screen that was swapped or wiped after a resize no longer
+    /// holds the rows the resize displaced. Never reset to 0.
+    pub(super) screen_replaced: u64,
     /// Whether the CURRENT synchronized-output window has accepted any complete
     /// PTY action since its opening `?2026h`. A host may safely present a
     /// just-closed frame while the mode level already reads true again only
@@ -212,18 +225,46 @@ pub(super) struct TransientState {
     /// ephemeral and re-sent by the application after a restore.
     pub(super) kitty_images: HashMap<u32, Arc<ImageData>>,
     /// Kitty ANIMATION frame store: image id → its frames (frame 0 is the base
-    /// transmit; `a=f` appends). `kitty_images[id]` always mirrors the CURRENT frame,
-    /// so the render path is frame-agnostic; `a=a r=N` re-points it at frame N. Empty
-    /// for non-animated images. Capped by `MAX_KITTY_FRAMES` in the handler.
+    /// transmit; `a=f` appends or edits one, `a=c` composes onto one).
+    /// `kitty_images[id]` always mirrors the CURRENT frame, so the render path is
+    /// frame-agnostic; `a=a c=N` re-points it at frame N, and every placement of
+    /// the image with it. Capped by `MAX_KITTY_FRAMES` in the handler.
     pub(super) kitty_frames: HashMap<u32, Vec<Arc<ImageData>>>,
+    /// Kitty PLACEMENT VARIANTS: image id → re-laid-out copies of its image for
+    /// `a=p` displays whose footprint, z-index or source rectangle differ from
+    /// the stored image's (a footprint lives in `ImageData`, so a different one
+    /// is a different payload). Charged to `kitty_total_bytes` like any slot; a
+    /// variant nothing else holds any more is dropped the next time one is
+    /// added, and all of them go with their id.
+    pub(super) kitty_variants: HashMap<u32, Vec<KittyVariant>>,
+    /// Kitty VIRTUAL placements (`U=1`): image id → its virtual placements,
+    /// newest last. Each is what a Unicode placeholder naming it draws. Holds
+    /// only the stored image or a charged variant, so it adds nothing to the
+    /// budget; capped per image by `MAX_KITTY_VIRTUALS` in the handler.
+    pub(super) kitty_virtual: HashMap<u32, Vec<KittyVirtual>>,
+    /// Kitty RELATIVE placements (`P=`/`Q=`) on screen: each one with its
+    /// parent and its offset. A relative placement moves with its parent and
+    /// is deleted with it. Pruned to the placements still on screen whenever
+    /// one is added.
+    pub(super) kitty_relations: Vec<KittyRelation>,
+    /// Kitty image NUMBERS (`I=`): number → the id of the NEWEST image
+    /// transmitted under it (the terminal picks that id and reports it).
+    pub(super) kitty_numbers: HashMap<u32, u32>,
+    /// The last id the terminal assigned to an `I=` transmission; the next
+    /// assignment probes upward from here past ids already in use.
+    pub(super) kitty_last_assigned_id: u32,
+    /// The last Kitty placement serial handed out (see
+    /// `aterm_grid::KittyPlacementTag::serial`).
+    pub(super) kitty_placement_serial: u32,
     /// Running total of `ImageData.bytes.len()` summed across every stored slot
-    /// in `kitty_images` + `kitty_frames` (each slot counted independently, even
-    /// when a base-transmit Arc is shared between `kitty_images[id]` and
-    /// `kitty_frames[id][0]`). The handler enforces a GLOBAL `MAX_KITTY_STORE_BYTES`
-    /// ceiling against this so the three per-item caps (`MAX_KITTY_IMAGES` count,
-    /// `MAX_KITTY_FRAMES` per id, `MAX_KITTY_IMAGE_BYTES` per image) can no longer
-    /// multiply into a multi-GiB resident OOM — mirroring the DCS / inline-image
-    /// total budgets. Decremented on delete/clear and on base-transmit replacement.
+    /// in `kitty_images` + `kitty_frames` + `kitty_variants` (each slot counted
+    /// independently, even when a base-transmit Arc is shared between
+    /// `kitty_images[id]` and `kitty_frames[id][0]`). The handler enforces a
+    /// GLOBAL `MAX_KITTY_STORE_BYTES` ceiling against this so the per-item caps
+    /// (`MAX_KITTY_IMAGES` count, `MAX_KITTY_FRAMES` and `MAX_KITTY_VARIANTS` per
+    /// id, `MAX_KITTY_IMAGE_BYTES` per image) can no longer multiply into a
+    /// multi-GiB resident OOM — mirroring the DCS / inline-image total budgets.
+    /// Decremented on delete/clear and on base-transmit replacement.
     pub(super) kitty_total_bytes: usize,
     /// In-flight Kitty CHUNKED transmission (`m=1`): the first chunk's command
     /// (control metadata) with its `payload` growing as continuation chunks append,
@@ -269,6 +310,8 @@ impl TransientState {
             sync_start: None,
             sync_end_seq: 0,
             reset_generation: 0,
+            full_clears: 0,
+            screen_replaced: 0,
             sync_open_dirty: false,
             // Placeholders; overwritten at the top of every process_at() before
             // any reader runs, so this value is never observed as state.
@@ -293,6 +336,12 @@ impl TransientState {
             last_osc_bel_terminated: false,
             kitty_images: HashMap::new(),
             kitty_frames: HashMap::new(),
+            kitty_variants: HashMap::new(),
+            kitty_virtual: HashMap::new(),
+            kitty_relations: Vec::new(),
+            kitty_numbers: HashMap::new(),
+            kitty_last_assigned_id: 0,
+            kitty_placement_serial: 0,
             kitty_total_bytes: 0,
             kitty_pending: None,
             bell_pending: false,
@@ -324,6 +373,9 @@ impl TransientState {
         }
         // Never zeroed either: the alt-screen archive keys its wipe on a change.
         self.reset_generation = self.reset_generation.wrapping_add(1);
+        // A full reset replaces the whole screen; the counter itself survives.
+        // `full_clears` is not touched: a reader keys on either advancing.
+        self.screen_replaced = self.screen_replaced.wrapping_add(1);
         self.sync_start = None;
         self.sync_open_dirty = false;
         self.sgr_stack.clear();
@@ -350,6 +402,10 @@ impl TransientState {
         // valid in-budget image, and no stale id can still display post-reset.
         self.kitty_images.clear();
         self.kitty_frames.clear();
+        self.kitty_variants.clear();
+        self.kitty_virtual.clear();
+        self.kitty_relations.clear();
+        self.kitty_numbers.clear();
         self.kitty_total_bytes = 0;
         // Also abandon any IN-FLIGHT chunked transmission (`m=1`) accumulator: a
         // partial pre-reset transfer left here would be silently merged into the FIRST
@@ -359,5 +415,79 @@ impl TransientState {
         // post-reset image and retaining up to MAX_KITTY_IMAGE_BYTES across a reset that
         // must free everything. Matches kitty/xterm dropping partial transfers on RIS.
         self.kitty_pending = None;
+    }
+}
+
+/// One re-laid-out copy of a Kitty image (see `TransientState::kitty_variants`).
+#[derive(Debug)]
+pub(super) struct KittyVariant {
+    /// The image (frame) it was cut from: a variant is reused only for the
+    /// same source and layout.
+    pub(super) source: Arc<ImageData>,
+    /// The copy the put displays.
+    pub(super) image: Arc<ImageData>,
+}
+
+/// One Kitty VIRTUAL placement (see `TransientState::kitty_virtual`).
+#[derive(Debug, Clone)]
+pub(super) struct KittyVirtual {
+    /// Its placement id (`p=`); `0` when the client named none.
+    pub(super) placement_id: u32,
+    /// The image laid out as its put asked (`c=`/`r=`/crop/`z=`), for the
+    /// image's current frame.
+    pub(super) image: Arc<ImageData>,
+}
+
+/// One Kitty RELATIVE placement (see `TransientState::kitty_relations`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct KittyRelation {
+    /// The relative placement: its image, placement id and serial.
+    pub(super) child: aterm_grid::KittyPlacementTag,
+    /// The placement it is relative to.
+    pub(super) parent: KittyParent,
+    /// Its offset from the parent's top-left cell, in columns (`H=`).
+    pub(super) dx: i32,
+    /// Its offset from the parent's top-left cell, in rows (`V=`).
+    pub(super) dy: i32,
+}
+
+/// Which placement a relative placement follows: by `(image id, placement
+/// id)` when the parent has a placement id — a re-put MOVES that placement,
+/// and its children follow it — else by the parent's one-off serial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KittyParent {
+    /// The parent's image id and non-zero placement id.
+    Named {
+        /// The parent's image id.
+        image_id: u32,
+        /// The parent's placement id (never `0`).
+        placement_id: u32,
+    },
+    /// An unnamed parent's serial.
+    Serial(std::num::NonZeroU32),
+}
+
+impl KittyParent {
+    /// The key a relative placement of `parent` follows.
+    pub(super) const fn of(parent: aterm_grid::KittyPlacementTag) -> Self {
+        if parent.placement_id == 0 {
+            Self::Serial(parent.serial)
+        } else {
+            Self::Named {
+                image_id: parent.image_id,
+                placement_id: parent.placement_id,
+            }
+        }
+    }
+
+    /// Whether `tag` is this parent.
+    pub(super) fn names(self, tag: &aterm_grid::KittyPlacementTag) -> bool {
+        match self {
+            Self::Named {
+                image_id,
+                placement_id,
+            } => tag.image_id == image_id && tag.placement_id == placement_id,
+            Self::Serial(serial) => tag.serial == serial,
+        }
     }
 }

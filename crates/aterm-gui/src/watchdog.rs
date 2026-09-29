@@ -79,9 +79,10 @@
 //! none of it — the guard is on, at the coarse bar, and it logs; nothing in the
 //! environment can switch the user's freeze guard off. Everything else logs at
 //! error level and keeps going. [`beat`] is one monotonic clock read and
-//! a handful of relaxed atomic writes in every build either way (negligible on
-//! the hot event path, and the clock read is what buys the turn census below),
-//! and the sampler is one thread asleep 99.99% of the time.
+//! a handful of atomic writes (all relaxed but one release) in every build
+//! either way (negligible on the hot event path, and the clock read is what
+//! buys the turn census below), and the sampler is one thread asleep 99.99% of
+//! the time.
 //!
 //! A stall that PERSISTS is re-reported every [`STALL_REPEAT_INTERVAL`] with
 //! the accumulated frozen duration, so the log distinguishes "wedged for a
@@ -140,15 +141,53 @@
 //! * **Stack.** Each report is followed by the main thread's stack
 //!   ([`crate::main_thread_probe::stack`]): `image + offset` frames with the
 //!   executable's load address and UUID, the same facts a hang report gives,
-//!   in `aterm.log` of a stripped release.
+//!   in `aterm.log` of a stripped release — in as many numbered lines as keep
+//!   every frame ([`stack_lines`]).
 //!
 //! And the trigger itself gets a line: a sampler wake more than
 //! [`PROCESS_GAP`] late on a clock that stops while the Mac sleeps means the
 //! whole process was not running ([`process_gap`]); that is logged and the
 //! sampler starts over, so the gap is never charged to the main thread.
+//!
+//! ## A gap inside the report pass (2026-09-28)
+//!
+//! On 2026-09-28 (0.98.0) the whole process went unscheduled for 3 h 22 m on a
+//! Mac at load 45-151 with its swap full. App Nap is the likely cause (the thaw
+//! came 5 ms after the window server took an App Nap `AppDrawing` assertion on
+//! the process), CPU starvation the other one; neither is proven. The sampler
+//! had just reported a stall — the main thread was in AppKit's
+//! `-[NSSceneStatusItem _setupScene:]`, waiting on a synchronous FrontBoard
+//! scene activation — and its log went wrong three ways:
+//!
+//! * the stack was ONE record, and the logger's 1 KiB cap on an ERROR body
+//!   ([`aterm_log::MAX_ALERT_RECORD_BYTES`]) cut it at frame #11;
+//! * only the sampler's SLEEP was timed, and no gap line was written, so the
+//!   gap fell in the rest of the loop: the report pass that writes the stall
+//!   line, captures the stack and writes it;
+//! * so the `STALL ENDED` line at the thaw charged all 12138 s to the main
+//!   thread.
+//!
+//! So the stack is logged in parts, each under the cap and each stamped with
+//! when it was captured ([`stack_lines`]); every wake is timed from the wake
+//! before it ([`Clocks`]), so a gap anywhere in the loop — the report pass,
+//! the stack capture included — is seen, logged and resynced; and the gap is
+//! read on both clocks ([`classify_gap`]), so its line says whether this
+//! process was not scheduled or the Mac slept.
+//!
+//! ## A verb the main thread cannot take
+//!
+//! In the same incident the main thread was stuck in AppKit before the whole
+//! process stopped running. A control verb that needs the main thread could
+//! only post its hop and wait out the whole reply deadline (30 s, holding a
+//! worker lane) for a thread that could not answer, though the heartbeat
+//! already showed it stuck. [`main_stall`] reads the time [`beat_into`]
+//! stamps, the root, and how long a hop has waited for the main thread to
+//! take it, at the shipped bar in every build. While it finds the thread
+//! stalled, such a verb is refused before anything is posted, with
+//! `ERR main thread stalled <N>s since <root>; retry` (`control_media`).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How often the sampler thread wakes to inspect the heartbeat: HALF the bar
 /// this build judges a stall against ([`threshold`]), so two consecutive
@@ -349,6 +388,122 @@ fn is_stall_at(bc: Breadcrumb, frozen: Duration, threshold: Duration) -> bool {
     !bc.is_park_point() && frozen >= threshold
 }
 
+/// The bar a main-thread control verb is refused at ([`main_stall`]): the
+/// shipped stall bar, in EVERY build. Not [`threshold`]: a debug build's
+/// 500 ms is a developer's tripwire, and turning verbs away at it would fail a
+/// slow-but-live debug turn (a cold first raster) that the reply deadline was
+/// written to wait for. No setting and no environment switch changes it.
+const MAIN_STALL_BAR: Duration = RELEASE_STALL_THRESHOLD;
+
+/// A main thread that cannot take a verb now, as [`main_stall`] reads it. Its
+/// `Display` is the reason a refused verb answers with:
+/// ``main thread stalled <N>s since `<root>`; retry``, with ` returned` after
+/// the root when its handler had returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MainStall {
+    /// How long the main thread has gone without a beat while it had work:
+    /// since its last beat at a work root, or, past its idle park, since the
+    /// oldest waiting hop was posted when that is later than the beat.
+    pub(crate) stalled: Duration,
+    /// The root the heartbeat last named.
+    pub(crate) root: Breadcrumb,
+    /// That root's handler had returned: the thread is in AppKit or
+    /// CoreFoundation, outside every aterm handler (the 2026-09-28 incident's
+    /// `-[NSSceneStatusItem _setupScene:]`, after `NewEvents` returned).
+    pub(crate) returned: bool,
+}
+
+impl std::fmt::Display for MainStall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let returned = if self.returned { " returned" } else { "" };
+        write!(
+            f,
+            "main thread stalled {}s since `{}`{returned}; retry",
+            self.stalled.as_secs(),
+            self.root.name()
+        )
+    }
+}
+
+/// Whether a verb that needs the main thread should be refused NOW rather than
+/// posted, and why: the READER half of the heartbeat contract whose writer is
+/// [`beat_into`] (the derived `MainThreadStallRefusal` machine states both
+/// halves). Pure, so the rule is testable with no thread and no clock.
+///
+/// `last_beat_ns` is the heartbeat's timestamp (0: no beat yet, so no
+/// evidence and no refusal), `root`/`returned` are where the thread last was,
+/// and `hop_since_ns` is when the oldest run of main-thread hops the main
+/// thread has not yet taken began (`None` when none is). A hop it has taken
+/// and whose reply it queued (`settings set`, answered by the config worker)
+/// waits on that worker, not on this thread, and is not in the run
+/// (`control_media::Hops`). Two ways to be stalled, at [`MAIN_STALL_BAR`]:
+///
+/// * the thread sits at a WORK root with no beat for the bar — the sampler's
+///   own verdict ([`is_stall_at`]), whether its handler is still on the stack
+///   or has returned into AppKit;
+/// * or it is past a park point that is not a designed freeze (the idle park,
+///   `AboutToWait`) and a hop it has not taken has waited the bar with no beat
+///   since it was posted: the thread left its event wait for something that is
+///   not aterm's and never came back. The heartbeat alone cannot say this,
+///   because an idle thread's heartbeat is old too. Judged on the heartbeat
+///   alone, the first verb after ten idle minutes would make every verb that
+///   arrives while it is being answered look stalled, so the hop's own wait
+///   is the other half of the test.
+///
+/// A dialog, the update handoff and startup are designed freezes and never
+/// read as stalled here: the dialog has its own refusal, and the other two end
+/// by themselves.
+fn main_stall(
+    now_ns: u64,
+    last_beat_ns: u64,
+    root: Breadcrumb,
+    returned: bool,
+    hop_since_ns: Option<u64>,
+) -> Option<MainStall> {
+    if last_beat_ns == 0 {
+        return None;
+    }
+    let quiet = Duration::from_nanos(now_ns.saturating_sub(last_beat_ns));
+    let stalled = if is_stall_at(root, quiet, MAIN_STALL_BAR) {
+        quiet
+    } else {
+        // Every root but the designed freezes: the set a spin is judged at.
+        let since = hop_since_ns.filter(|_| root.spin_is_a_stall())?;
+        let waited = Duration::from_nanos(now_ns.saturating_sub(since.max(last_beat_ns)));
+        if waited < MAIN_STALL_BAR {
+            return None;
+        }
+        waited
+    };
+    Some(MainStall {
+        stalled,
+        root,
+        returned,
+    })
+}
+
+/// [`main_stall`] now, for a control worker about to post a main-thread hop:
+/// the heartbeat as [`beat`] last stamped it and `hop_since_ns` from the
+/// caller's own hop count (`control_media`).
+///
+/// The root is read FIRST and with `Acquire`: [`beat_into`] stamps the time
+/// before it publishes the root (`Release`), so the time read after a root is
+/// never older than that root's beat. The other order could pair the root a
+/// beat just entered with the stamp of the long idle before it, and refuse a
+/// verb on a thread that had just woken.
+pub(crate) fn main_stall_now(hop_since_ns: Option<u64>) -> Option<MainStall> {
+    let root = Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Acquire));
+    let last_beat_ns = TURNS.last_beat_ns.load(Ordering::Relaxed);
+    let returned = RETURNED.load(Ordering::Relaxed);
+    main_stall(
+        crate::metrics::now_ns(),
+        last_beat_ns,
+        root,
+        returned,
+        hop_since_ns,
+    )
+}
+
 /// A stall the sampler decided to report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Hit {
@@ -487,28 +642,33 @@ impl Sampler {
     }
 
     /// One wake of the sampler thread, as the thread takes it: it asked to
-    /// sleep `requested` and was gone `slept`, and read `beat`, `bc` and `cpu`
-    /// on waking. A [`process_gap`] resyncs and judges nothing else.
+    /// sleep `requested`, was gone `elapsed` since the wake before it (the
+    /// whole report pass counts, not only the sleep), and read `beat`, `bc`
+    /// and `cpu` on waking. A gap of awake time ([`Gap::unscheduled`]) resyncs
+    /// and judges nothing else; a sleep alone ([`Wall::Slept`]) stopped the
+    /// monotonic clock this accounting runs on, so it changes nothing here and
+    /// is only reported.
     fn wake(
         &mut self,
         now: Instant,
         requested: Duration,
-        slept: Duration,
+        elapsed: Elapsed,
         beat: u64,
         bc: Breadcrumb,
         cpu: Option<Duration>,
     ) -> SamplerWake {
-        if let Some(late) = process_gap(requested, slept) {
+        let gap = classify_gap(requested, elapsed);
+        if let Some(late) = gap.and_then(|gap| gap.unscheduled) {
             self.resync(now, beat, late);
             return SamplerWake {
-                gap: Some(late),
+                gap,
                 ended: self.take_ended(),
                 hit: None,
             };
         }
         let hit = self.poll_with(now, beat, bc, cpu);
         SamplerWake {
-            gap: None,
+            gap,
             ended: self.take_ended(),
             hit,
         }
@@ -677,8 +837,8 @@ impl Sampler {
 /// What one [`Sampler::wake`] decided, before anything is logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SamplerWake {
-    /// The process was not running for this long ([`process_gap`]).
-    gap: Option<Duration>,
+    /// The wake was late on either clock ([`classify_gap`]).
+    gap: Option<Gap>,
     /// A reported stall that ended by this wake.
     ended: Option<Ended>,
     /// A stall to report now.
@@ -687,37 +847,195 @@ struct SamplerWake {
 
 impl SamplerWake {
     /// The warn-level lines this wake logs, in order, ahead of any stall
-    /// report: the gap, then a reported stall that ended.
+    /// report: a gap of awake time, then a reported stall that ended.
     fn notices(&self) -> Vec<String> {
         self.gap
-            .map(gap_message)
+            .and_then(|gap| {
+                gap.unscheduled
+                    .map(|late| gap_message(late, gap.wall, gap.pass))
+            })
             .into_iter()
             .chain(self.ended.map(stall_ended_message))
             .collect()
+    }
+
+    /// The info-level line for a wake that found the Mac had slept and this
+    /// process had lost no awake time: routine, so not a warning, and logged
+    /// ahead of [`SamplerWake::notices`].
+    fn sleep_note(&self) -> Option<String> {
+        match self.gap {
+            Some(Gap {
+                unscheduled: None,
+                wall: Wall::Slept(slept),
+                ..
+            }) => Some(slept_message(slept)),
+            _ => None,
+        }
     }
 }
 
 /// How late a sampler wake must be before it means the whole PROCESS was not
 /// running. `Instant` does not advance while the Mac sleeps, so lateness on it
-/// is time the system was awake and this process was not scheduled: stopped
-/// (SIGSTOP), paused under a debugger, suspended, or starved.
+/// is time the system was awake and this process was not scheduled: napped
+/// (App Nap), starved of CPU, stopped (SIGSTOP), paused under a debugger, or
+/// suspended. The wall clock running this much further than `Instant` is the
+/// Mac asleep instead ([`Wall::Slept`]).
 const PROCESS_GAP: Duration = Duration::from_secs(30);
 
 /// The lateness of a sampler wake that asked to sleep `requested` and was gone
-/// `observed`, when it is a [`PROCESS_GAP`].
+/// `observed` on the monotonic clock, when it is a [`PROCESS_GAP`].
 fn process_gap(requested: Duration, observed: Duration) -> Option<Duration> {
     let late = observed.saturating_sub(requested);
     (late >= PROCESS_GAP).then_some(late)
 }
 
-/// The line for a [`process_gap`].
-fn gap_message(late: Duration) -> String {
+/// How long one sampler wake was gone, on both clocks, since the wake before
+/// it — so the report pass between two sleeps is inside the span, the stack
+/// capture included ([`Clocks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Elapsed {
+    /// On the monotonic clock ([`Instant`]), which stops while the Mac sleeps
+    /// (on Apple platforms std reads `CLOCK_UPTIME_RAW`).
+    mono: Duration,
+    /// On the wall clock ([`SystemTime`]), which keeps running while the Mac
+    /// sleeps; `None` when it went backwards (the clock was set back).
+    wall: Option<Duration>,
+    /// Of `mono`, the report pass before the sleep: the stall lines, the
+    /// stack capture and the stack lines when the wake before this one
+    /// reported, next to nothing otherwise.
+    pass: Duration,
+}
+
+/// Both clocks, read together at one sampler wake. The sampler thread keeps
+/// the previous wake's reading and measures the next wake from it, never from
+/// the start of that wake's own sleep: timed from the sleep alone, the
+/// 2026-09-28 gap — after a stall line, in the pass that captures and writes
+/// the stack — left every wake on time and was charged to the main thread.
+#[derive(Clone, Copy)]
+struct Clocks {
+    mono: Instant,
+    wall: SystemTime,
+}
+
+impl Clocks {
+    fn now() -> Self {
+        Self {
+            mono: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    /// The span from `earlier` to this reading, for a sampler thread that
+    /// went to sleep at `asleep`: what came before that was its report pass.
+    fn since(self, earlier: Self, asleep: Instant) -> Elapsed {
+        Elapsed {
+            mono: self.mono.saturating_duration_since(earlier.mono),
+            wall: self.wall.duration_since(earlier.wall).ok(),
+            pass: asleep.saturating_duration_since(earlier.mono),
+        }
+    }
+}
+
+/// What the wall clock says about a span the monotonic clock measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wall {
+    /// It ran at least [`PROCESS_GAP`] further than the monotonic clock,
+    /// which stops while the Mac sleeps: the Mac slept about this long (or its
+    /// clock was set forward this far).
+    Slept(Duration),
+    /// It ran no more than that further: the Mac was awake throughout.
+    Awake,
+    /// It went backwards (the clock was set back), so it says nothing.
+    Unknown,
+}
+
+/// A sampler wake that was late on either clock ([`classify_gap`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Gap {
+    /// Time the system was awake and this process did not run, when it is a
+    /// [`PROCESS_GAP`]: the sampler resyncs over it.
+    unscheduled: Option<Duration>,
+    /// What the wall clock says about the same span.
+    wall: Wall,
+    /// How much of the span was the report pass before the sleep
+    /// ([`Elapsed::pass`]).
+    pass: Duration,
+}
+
+/// Read a wake's `elapsed` span on both clocks: lateness on the monotonic
+/// clock is awake time this process did not run ([`process_gap`]), and the
+/// wall clock's lead over the monotonic one is time the Mac slept. `None`
+/// when neither reaches [`PROCESS_GAP`].
+fn classify_gap(requested: Duration, elapsed: Elapsed) -> Option<Gap> {
+    let unscheduled = process_gap(requested, elapsed.mono);
+    let wall = match elapsed.wall {
+        None => Wall::Unknown,
+        Some(wall) => match wall.checked_sub(elapsed.mono) {
+            Some(ahead) if ahead >= PROCESS_GAP => Wall::Slept(ahead),
+            _ => Wall::Awake,
+        },
+    };
+    (unscheduled.is_some() || matches!(wall, Wall::Slept(_))).then_some(Gap {
+        unscheduled,
+        wall,
+        pass: elapsed.pass,
+    })
+}
+
+/// A report pass at least this long is named in the gap line: it normally
+/// takes milliseconds, so a second of it is part of the gap.
+const PASS_WORTH_NAMING: Duration = Duration::from_secs(1);
+
+/// The warn line for a gap of `late` awake time ([`Gap::unscheduled`]), with
+/// how much of it fell in the watchdog's own report pass and what the wall
+/// clock says about the same span. Time in the pass is named because it is
+/// the weaker evidence: a sleeping thread that wakes late was not scheduled,
+/// but a pass can also have waited on a log write stuck on the disk. It must
+/// never contain `MAIN-THREAD STALL`: the recovery census reads any line that
+/// does as a stall (`recovery_census::STALL_LINE`).
+fn gap_message(late: Duration, wall: Wall, pass: Duration) -> String {
+    let secs = late.as_secs();
+    let pass = if pass >= PASS_WORTH_NAMING {
+        format!(
+            " {}s of it fell in the watchdog's own report pass (the stall lines and the stack \
+             capture), where a log write stuck on the disk would read the same.",
+            pass.as_secs()
+        )
+    } else {
+        String::new()
+    };
+    let wall: String = match wall {
+        Wall::Slept(slept) => format!(
+            "The wall clock ran another {}s past that, so the Mac also slept (or its clock \
+             was set forward).",
+            slept.as_secs()
+        ),
+        Wall::Awake => "The wall clock ran no further, so the Mac did not sleep through it.".into(),
+        Wall::Unknown => {
+            "The wall clock was set back meanwhile, so it cannot say whether the Mac also \
+             slept."
+                .into()
+        }
+    };
     format!(
-        "this process was not running for {}s while the system was awake — stopped \
-         (SIGSTOP), paused under a debugger, suspended, or starved. Every timer it had \
-         armed came due at once; the 2026-09-26 freeze was CoreFoundation walking one \
-         such timer forward after 26.6 hours of this.",
-        late.as_secs()
+        "this process was not running for {secs}s while the system was awake: it was not \
+         scheduled (App Nap or CPU starvation; on 2026-09-28 a window lost 3 h 22 m this way \
+         on a Mac at load 45-151 with its swap full), or it was stopped (SIGSTOP), paused \
+         under a debugger, or suspended.{pass} {wall} The stall accounting starts over here, so \
+         none of this is charged to the main thread. Every timer the process had armed came \
+         due at once; the 2026-09-26 freeze was CoreFoundation walking one such timer \
+         forward after 26.6 hours of this."
+    )
+}
+
+/// The info line for a wake that found only the Mac asleep ([`Wall::Slept`]
+/// with no [`Gap::unscheduled`]).
+fn slept_message(slept: Duration) -> String {
+    format!(
+        "the Mac slept for about {}s: the wall clock ran that much further than the \
+         monotonic clock, which stops in sleep (or the clock was set forward). This process \
+         lost no awake time, so the stall accounting is unchanged.",
+        slept.as_secs()
     )
 }
 
@@ -755,6 +1073,14 @@ struct TurnLedger {
     /// the state at process start and immediately after a reset, both of which
     /// would otherwise book a span that began outside the window.
     open_ns: AtomicU64,
+    /// When the main thread last entered a root, on the same clock: the
+    /// heartbeat's timestamp, which [`main_stall`] reads. Not `open_ns`, which
+    /// [`TurnLedger::reset`] zeroes: a `metrics reset` sent while the main
+    /// thread is stuck would make a reader of that stamp see a thread that
+    /// never beat, and let every verb through to wait out its deadline (the
+    /// defect the `MainThreadStallRefusal` machine replays). `reset` leaves
+    /// this one alone. 0 = no beat yet.
+    last_beat_ns: AtomicU64,
     /// The most recently booked turn.
     last_ns: AtomicU64,
     /// The worst booked turn since reset, the root that owned it, and when it
@@ -787,6 +1113,7 @@ impl TurnLedger {
     const fn new() -> Self {
         Self {
             open_ns: AtomicU64::new(0),
+            last_beat_ns: AtomicU64::new(0),
             last_ns: AtomicU64::new(0),
             max_ns: AtomicU64::new(0),
             max_owner: AtomicU8::new(Breadcrumb::Startup as u8),
@@ -872,7 +1199,8 @@ impl TurnLedger {
 
     /// Clear the window, INCLUDING the open stamp: the turn straddling a reset
     /// began before the window it would be booked to, and a driver that resets,
-    /// drives a workload and reads must see that workload's worst turn.
+    /// drives a workload and reads must see that workload's worst turn. The
+    /// heartbeat's timestamp (`last_beat_ns`) is not a window stat and stays.
     fn reset(&self) {
         self.open_ns.store(0, Ordering::Relaxed);
         self.last_ns.store(0, Ordering::Relaxed);
@@ -906,9 +1234,10 @@ pub(crate) struct TurnCensus {
 }
 
 /// Record that the main thread just entered `bc`, and price the turn that ended.
-/// A monotonic clock read and a handful of relaxed atomic writes — cheap enough
-/// to sit on the hot event path in every build, and the only place in the process
-/// that can price a park OUTSIDE the redraw (see the module header). The
+/// A monotonic clock read and a handful of atomic writes, all relaxed but the
+/// breadcrumb's release (see [`main_stall_now`]) — cheap enough to sit on the
+/// hot event path in every build, and the only place in the process that can
+/// price a park OUTSIDE the redraw (see the module header). The
 /// breadcrumb is stamped BEFORE the heartbeat bumps so the sampler never reads a
 /// fresh count against a stale location, and any announced [`Phase`] is cleared
 /// with it: the work a phase names belongs to the root that announced it.
@@ -933,7 +1262,13 @@ fn beat_at(bc: Breadcrumb, now_ns: u64) -> Option<u64> {
 /// the length of a font seal, and none of them takes this module's beat lock.
 #[inline]
 fn beat_into(turns: &TurnLedger, phase: &AtomicU8, bc: Breadcrumb, now_ns: u64) -> Option<u64> {
-    let previous = Breadcrumb::from_u8(BREADCRUMB.swap(bc as u8, Ordering::Relaxed));
+    // The heartbeat's timestamp, for `main_stall`: the clock value this beat
+    // already read, stamped BEFORE the root is published (the swap below is
+    // `Release`, and `main_stall_now` reads the root with `Acquire` before the
+    // stamp), so a reader never pairs this root with the previous beat's time.
+    // `max(1)` keeps 0 meaning "no beat yet".
+    turns.last_beat_ns.store(now_ns.max(1), Ordering::Relaxed);
+    let previous = Breadcrumb::from_u8(BREADCRUMB.swap(bc as u8, Ordering::Release));
     let booked = turns.close(previous, now_ns);
     // A root entry starts with NO announced phase (see `PHASE`): one more
     // relaxed store on the hot path, the only way a phase ever ends besides its
@@ -1354,7 +1689,7 @@ fn stall_message(
              the main thread is outside every aterm handler, in AppKit or CoreFoundation's \
              own run-loop work (a timer, source or observer; the 2026-09-26 freeze was \
              CoreFoundation's catch-up for a late timer), and the UI is not responding. \
-             The stack line that follows names the frame.",
+             The stack lines that follow name the frame.",
             bc.name()
         ),
         (Locus::Returned, _) => format!(
@@ -1385,6 +1720,109 @@ fn stall_ended_message(ended: Ended) -> String {
             root.name()
         ),
     }
+}
+
+/// The prefix of every stack line. It contains `MAIN-THREAD STALL`, which the
+/// recovery census reads as a stall (`recovery_census::STALL_LINE`), so a
+/// stack is only ever logged after the stall line it belongs to.
+const STACK_LINE: &str = "MAIN-THREAD STALL stack:";
+
+/// Between two frames of a stack line.
+const FRAME_SEPARATOR: &str = " | ";
+
+/// The main thread's stack as log lines, as many as it takes to keep each one
+/// within `cap`, the logger's body cap for the level they are logged at
+/// ([`aterm_log::record_cap`]): the logger cuts a longer body short, and on
+/// 2026-09-28 that cut the stack's one line at frame #11.
+///
+/// Each line is `MAIN-THREAD STALL stack: (part i/n, captured at <stamp>)`
+/// and then its frames in order, ` | ` between them. The stamp is `captured`
+/// in the log's own `<epoch seconds>.<millis>` form, so it reads against each
+/// line's leading timestamp: a part written long after its capture — the
+/// process stopped running in between — says so. A frame too long for a line
+/// of its own is clipped with `…`. No frames, no lines.
+fn stack_lines(frames: &[String], captured: SystemTime, cap: usize) -> Vec<String> {
+    let captured = epoch_stamp(captured);
+    let header = |part: usize, parts: usize| {
+        format!("{STACK_LINE} (part {part}/{parts}, captured at {captured}) ")
+    };
+    // No stack has more parts than frames, so a header numbered with the frame
+    // count is at least as long as any header a part will carry.
+    let widest = frames.len().max(1);
+    let budget = cap.saturating_sub(logged_len(&header(widest, widest)));
+    let mut bodies = Vec::new();
+    let mut body = String::new();
+    let mut used = 0usize;
+    let mut in_body = 0usize;
+    for frame in frames {
+        let frame = clip(frame, budget);
+        let len = logged_len(&frame);
+        if in_body > 0 && used + FRAME_SEPARATOR.len() + len > budget {
+            bodies.push(std::mem::take(&mut body));
+            used = 0;
+            in_body = 0;
+        }
+        if in_body > 0 {
+            body.push_str(FRAME_SEPARATOR);
+            used += FRAME_SEPARATOR.len();
+        }
+        body.push_str(&frame);
+        used += len;
+        in_body += 1;
+    }
+    if in_body > 0 {
+        bodies.push(body);
+    }
+    let parts = bodies.len();
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| format!("{}{body}", header(i + 1, parts)))
+        .collect()
+}
+
+/// `at` as the log writes its own timestamps: Unix seconds, a dot, millis.
+fn epoch_stamp(at: SystemTime) -> String {
+    match at.duration_since(UNIX_EPOCH) {
+        Ok(since) => format!("{}.{:03}", since.as_secs(), since.subsec_millis()),
+        Err(_) => "an unknown time (the clock reads before 1970)".into(),
+    }
+}
+
+/// The bytes `c` takes in a log line: the logger writes every control
+/// character as U+FFFD ([`aterm_log::sanitize_record_for`]).
+fn logged_char_len(c: char) -> usize {
+    if c.is_control() {
+        char::REPLACEMENT_CHARACTER.len_utf8()
+    } else {
+        c.len_utf8()
+    }
+}
+
+/// The bytes `s` takes in a log line ([`logged_char_len`]).
+fn logged_len(s: &str) -> usize {
+    s.chars().map(logged_char_len).sum()
+}
+
+/// `frame` as it fits in `budget` logged bytes: whole when it fits, else cut
+/// on a character boundary and ended with `…` inside the budget.
+fn clip(frame: &str, budget: usize) -> String {
+    if logged_len(frame) <= budget {
+        return frame.to_string();
+    }
+    let room = budget.saturating_sub('…'.len_utf8());
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in frame.chars() {
+        let len = logged_char_len(c);
+        if used + len > room {
+            break;
+        }
+        out.push(c);
+        used += len;
+    }
+    out.push('…');
+    out
 }
 
 /// The `$ATERM_WATCHDOG` development seam's value; `None` in every shipped binary.
@@ -1445,25 +1883,37 @@ pub(crate) fn start() {
             "main-thread stall watchdog armed (sample {sample:?}, threshold \
              {threshold:?}, repeat {STALL_REPEAT_INTERVAL:?}, abort={abort})"
         );
+        // The previous wake on both clocks: each wake is measured from it, not
+        // from the start of its own sleep, so the report pass in between —
+        // the stall line, the stack capture that suspends the main thread,
+        // the stack lines — is inside the span a gap is judged on ([`Clocks`]).
+        // The start of the sleep still marks where the pass ended, so the gap
+        // line can say how much of a gap fell in it.
+        let mut last = Clocks::now();
         let mut sampler =
-            Sampler::with_threshold(Instant::now(), HEARTBEAT.load(Ordering::Relaxed), threshold);
+            Sampler::with_threshold(last.mono, HEARTBEAT.load(Ordering::Relaxed), threshold);
         loop {
             let asleep = Instant::now();
             std::thread::sleep(sample);
-            let now = Instant::now();
+            let here = Clocks::now();
             // A wake far later than asked, on a clock that stops while the
             // Mac sleeps, is the whole process not running: `wake` says so —
             // it is the trigger no other line records — and starts over, since
             // none of the gap was the main thread's doing. A stall reported
             // before the gap stays open across it, and its end is still said.
+            // The wall clock tells that apart from the Mac asleep.
             let wake = sampler.wake(
-                now,
+                here.mono,
                 sample,
-                now.saturating_duration_since(asleep),
+                here.since(last, asleep),
                 HEARTBEAT.load(Ordering::Relaxed),
                 Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed)),
                 crate::main_thread_probe::cpu_time(),
             );
+            last = here;
+            if let Some(line) = wake.sleep_note() {
+                aterm_log::info!("{line}");
+            }
             for line in wake.notices() {
                 aterm_log::warn!("{line}");
             }
@@ -1491,9 +1941,17 @@ pub(crate) fn start() {
                     )
                 );
                 // Where the thread IS, not just which root ran last: the frame
-                // a hang report would have named, in the log, in every build.
+                // a hang report would have named, in the log, in every build —
+                // every frame of it, in parts under the ERROR body cap. Stamped
+                // just BEFORE the capture: `stack` suspends the thread first
+                // and symbolizes after, and symbolizing (dladdr, Mach-O reads
+                // that can page in under swap pressure) is the slower half.
+                let captured = SystemTime::now();
                 if let Some(frames) = crate::main_thread_probe::stack() {
-                    aterm_log::error!("MAIN-THREAD STALL stack: {}", frames.join(" | "));
+                    let cap = aterm_log::record_cap(aterm_log::Level::Error);
+                    for line in stack_lines(&frames, captured, cap) {
+                        aterm_log::error!("{line}");
+                    }
                 }
                 if abort {
                     std::process::abort();
@@ -1792,8 +2250,11 @@ mod tests {
             }
             fn log(&self, record: &aterm_log::Record<'_>) {
                 let line = format!("{}", record.args());
-                if line.starts_with("MAIN-THREAD STALL stack:") {
-                    *self.saw_stack.lock().unwrap() = line;
+                if line.starts_with(STACK_LINE) {
+                    // Every part, in order: the stack is several lines now.
+                    let mut stack = self.saw_stack.lock().unwrap();
+                    stack.push_str(&line);
+                    stack.push('\n');
                 } else if line.contains("MAIN-THREAD STALL") {
                     self.fired.store(true, Ordering::SeqCst);
                     *self.saw_name.lock().unwrap() = line;
@@ -1843,6 +2304,15 @@ mod tests {
             assert!(
                 stack.contains("load address 0x") && stack.contains(" | #1 "),
                 "a stall line is followed by the main thread's stack; got: {stack}"
+            );
+            assert!(
+                stack.starts_with("MAIN-THREAD STALL stack: (part 1/"),
+                "numbered from its first part; got: {stack}"
+            );
+            let cap = aterm_log::record_cap(aterm_log::Level::Error);
+            assert!(
+                stack.lines().all(|part| part.len() <= cap),
+                "every part fits the ERROR body cap; got: {stack}"
             );
         }
     }
@@ -2577,7 +3047,7 @@ mod tests {
         );
         assert_eq!(process_gap(sample, sample + Duration::from_secs(3)), None);
         assert_eq!(process_gap(sample, Duration::ZERO), None);
-        let line = gap_message(Duration::from_secs(95_674));
+        let line = gap_message(Duration::from_secs(95_674), Wall::Awake, Duration::ZERO);
         assert!(
             line.starts_with("this process was not running for 95674s while the system was awake"),
             "{line}"
@@ -2610,6 +3080,7 @@ mod tests {
     }
 
     /// One wake of `s`, driven as the sampler thread drives it (no CPU reading),
+    /// gone `slept` since the wake before it on both clocks (the Mac awake),
     /// with the lines the thread logs for it appended to `lines`: the notices,
     /// then the stall line.
     fn wake_logged(
@@ -2620,7 +3091,25 @@ mod tests {
         beat: u64,
         bc: Breadcrumb,
     ) -> SamplerWake {
-        let wake = s.wake(now, s.threshold / 2, slept, beat, bc, None);
+        let elapsed = Elapsed {
+            mono: slept,
+            wall: Some(slept),
+            pass: Duration::ZERO,
+        };
+        wake_logged_on(s, lines, now, elapsed, beat, bc)
+    }
+
+    /// [`wake_logged`] with the two clocks given apart.
+    fn wake_logged_on(
+        s: &mut Sampler,
+        lines: &mut Vec<String>,
+        now: Instant,
+        elapsed: Elapsed,
+        beat: u64,
+        bc: Breadcrumb,
+    ) -> SamplerWake {
+        let wake = s.wake(now, s.threshold / 2, elapsed, beat, bc, None);
+        lines.extend(wake.sleep_note());
         lines.extend(wake.notices());
         if let Some(hit) = wake.hit {
             lines.push(stall_message(
@@ -2633,6 +3122,383 @@ mod tests {
             ));
         }
         wake
+    }
+
+    /// A gap of `late` awake time with the Mac awake throughout, as
+    /// [`wake_logged`] produces one: all of it in the sleep.
+    fn awake_gap(late: Duration) -> Option<Gap> {
+        Some(Gap {
+            unscheduled: Some(late),
+            wall: Wall::Awake,
+            pass: Duration::ZERO,
+        })
+    }
+
+    /// THE 2026-09-28 GAP. A stall reported after `NewEvents` returned, and then
+    /// the whole process not running for 12130 s in the report pass that
+    /// followed — after the sleep had been timed. Timed from the wake before it,
+    /// as the sampler thread now times it, the next wake is 12130 s late: the
+    /// gap line is written, and the ENDED line gives the main thread its own
+    /// 7.5 s. Timed from its sleep alone, as the thread used to time it, the
+    /// same wake is on time and the ENDED line charges the main thread with all
+    /// of it: the incident's line read 12138 s. The Mac asleep in the same
+    /// place is noted at info and changes nothing: the monotonic clock the
+    /// accounting runs on stopped.
+    #[test]
+    fn the_2026_09_28_gap_inside_a_report_pass_is_not_charged_to_the_main_thread() {
+        let step = RELEASE_STALL_THRESHOLD / 2;
+        let pass = Duration::from_secs(12_130);
+        let t0 = Instant::now();
+        let reported = |lines: &mut Vec<String>| {
+            let mut s = Sampler::with_threshold(t0, 5, RELEASE_STALL_THRESHOLD);
+            let w = wake_logged(&mut s, lines, t0 + step, step, 5, Breadcrumb::NewEvents);
+            assert_eq!(w.hit, None, "under the bar");
+            let w = wake_logged(&mut s, lines, t0 + step * 2, step, 5, Breadcrumb::NewEvents);
+            assert_eq!(w.hit.map(|h| h.root), Some(Breadcrumb::NewEvents));
+            s
+        };
+        // The wake after the frozen pass and one more sleep; the main thread
+        // beat in the meantime.
+        let back = t0 + step * 3 + pass;
+
+        let mut lines = Vec::new();
+        let mut s = reported(&mut lines);
+        let w = wake_logged_on(
+            &mut s,
+            &mut lines,
+            back,
+            Elapsed {
+                mono: pass + step,
+                wall: Some(pass + step),
+                pass,
+            },
+            6,
+            Breadcrumb::AboutToWait,
+        );
+        assert_eq!(
+            w.gap,
+            Some(Gap {
+                unscheduled: Some(pass),
+                wall: Wall::Awake,
+                pass,
+            })
+        );
+        assert_eq!(
+            w.ended.map(|e| e.frozen),
+            Some(step * 3),
+            "the main thread's own 7.5 s, not the pass's 12130 s"
+        );
+        let gap_line = lines
+            .iter()
+            .find(|l| l.starts_with("this process was not running for 12130s"))
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(
+            gap_line.contains(" 12130s of it fell in the watchdog's own report pass"),
+            "the line says where the gap fell: {gap_line}"
+        );
+        assert!(
+            gap_line.contains("so the Mac did not sleep through it"),
+            "{gap_line}"
+        );
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.starts_with("MAIN-THREAD STALL ENDED:")),
+            "{lines:#?}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            crate::recovery_census::stall_at_end(&lines),
+            aterm_update::recovery_ledger::Tri::No,
+            "{lines:#?}"
+        );
+
+        // The negative control: the same wake measured from its sleep alone.
+        let mut lines = Vec::new();
+        let mut s = reported(&mut lines);
+        let w = wake_logged(&mut s, &mut lines, back, step, 6, Breadcrumb::AboutToWait);
+        assert_eq!(w.gap, None, "a gap outside the timed sleep is invisible");
+        assert_eq!(
+            w.ended.map(|e| e.frozen),
+            Some(step * 3 + pass),
+            "and the main thread is charged with all of it"
+        );
+
+        // The Mac asleep in the same place: nothing to take out.
+        let mut lines = Vec::new();
+        let mut s = reported(&mut lines);
+        let before = lines.len();
+        let w = wake_logged_on(
+            &mut s,
+            &mut lines,
+            t0 + step * 3,
+            Elapsed {
+                mono: step,
+                wall: Some(step + pass),
+                pass: Duration::ZERO,
+            },
+            6,
+            Breadcrumb::AboutToWait,
+        );
+        assert_eq!(
+            w.gap,
+            Some(Gap {
+                unscheduled: None,
+                wall: Wall::Slept(pass),
+                pass: Duration::ZERO,
+            })
+        );
+        assert_eq!(w.ended.map(|e| e.frozen), Some(step * 3));
+        assert!(
+            lines[before].starts_with("the Mac slept for about 12130s"),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("this process was not running")),
+            "a sleep is not a gap of awake time: {lines:#?}"
+        );
+    }
+
+    /// Both clocks, read apart: lateness on the monotonic clock is awake time
+    /// the process did not run, the wall clock's lead over it is the Mac
+    /// asleep, and each line says which, fits its level's cap, and never reads
+    /// as a stall to the recovery census.
+    #[test]
+    fn a_gap_is_read_on_both_clocks() {
+        let step = RELEASE_STALL_THRESHOLD / 2;
+        let hour = Duration::from_secs(3_600);
+        let lost = Duration::from_secs(100);
+        let on = |mono: Duration, wall: Option<Duration>| {
+            classify_gap(
+                step,
+                Elapsed {
+                    mono,
+                    wall,
+                    pass: Duration::ZERO,
+                },
+            )
+        };
+        let gap = |unscheduled: Option<Duration>, wall: Wall| {
+            Some(Gap {
+                unscheduled,
+                wall,
+                pass: Duration::ZERO,
+            })
+        };
+        // Not scheduled while awake: the two clocks ran on together.
+        assert_eq!(
+            on(step + hour, Some(step + hour)),
+            gap(Some(hour), Wall::Awake)
+        );
+        // Asleep: only the wall clock ran on.
+        assert_eq!(on(step, Some(step + hour)), gap(None, Wall::Slept(hour)));
+        // Both, one after the other.
+        assert_eq!(
+            on(step + lost, Some(step + lost + hour)),
+            gap(Some(lost), Wall::Slept(hour))
+        );
+        // Scheduling jitter and clock slew are neither.
+        let jitter = Duration::from_secs(3);
+        assert_eq!(on(step + jitter, Some(step + jitter * 4)), None);
+        assert_eq!(
+            on(step, Some(step + PROCESS_GAP - Duration::from_millis(1))),
+            None
+        );
+        // A clock set back says nothing, and hides nothing the monotonic clock saw;
+        // a wall clock BEHIND the monotonic one is no sleep.
+        assert_eq!(on(step, None), None);
+        assert_eq!(on(step + hour, None), gap(Some(hour), Wall::Unknown));
+        assert_eq!(on(step + hour, Some(step)), gap(Some(hour), Wall::Awake));
+
+        // What the sampler thread feeds it: both spans from one pair of
+        // readings, and the report pass up to the start of the sleep.
+        let t0 = Instant::now();
+        let w0 = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let reported_for = Duration::from_millis(2);
+        let earlier = Clocks { mono: t0, wall: w0 };
+        let later = Clocks {
+            mono: t0 + reported_for + step,
+            wall: w0 + reported_for + step + hour,
+        };
+        assert_eq!(
+            later.since(earlier, t0 + reported_for),
+            Elapsed {
+                mono: reported_for + step,
+                wall: Some(reported_for + step + hour),
+                pass: reported_for,
+            }
+        );
+        let set_back = Clocks {
+            mono: t0 + step,
+            wall: w0 - hour,
+        };
+        assert_eq!(
+            set_back.since(earlier, t0),
+            Elapsed {
+                mono: step,
+                wall: None,
+                pass: Duration::ZERO,
+            }
+        );
+
+        // A pass of milliseconds is not named; one that holds the gap is.
+        let awake = gap_message(hour, Wall::Awake, Duration::from_millis(3));
+        assert!(
+            awake.contains("it was not scheduled (App Nap or CPU starvation"),
+            "{awake}"
+        );
+        assert!(
+            awake.contains("so the Mac did not sleep through it"),
+            "{awake}"
+        );
+        assert!(!awake.contains("report pass"), "{awake}");
+        let in_pass = gap_message(hour, Wall::Awake, hour);
+        assert!(
+            in_pass.contains(
+                "suspended. 3600s of it fell in the watchdog's own report pass (the stall \
+                 lines and the stack capture), where a log write stuck on the disk would read \
+                 the same. The wall clock ran no further"
+            ),
+            "{in_pass}"
+        );
+        let both = gap_message(lost, Wall::Slept(hour), Duration::ZERO);
+        assert!(
+            both.starts_with("this process was not running for 100s while the system was awake"),
+            "{both}"
+        );
+        assert!(
+            both.contains("ran another 3600s past that, so the Mac also slept"),
+            "{both}"
+        );
+        let unknown = gap_message(hour, Wall::Unknown, Duration::ZERO);
+        assert!(
+            unknown.contains("cannot say whether the Mac also slept"),
+            "{unknown}"
+        );
+        let asleep = slept_message(hour);
+        assert!(
+            asleep.starts_with("the Mac slept for about 3600s"),
+            "{asleep}"
+        );
+        // The widest figures a line can carry.
+        let huge = Duration::from_secs(u64::MAX);
+        for line in [
+            gap_message(huge, Wall::Slept(huge), huge),
+            gap_message(huge, Wall::Awake, huge),
+            gap_message(huge, Wall::Unknown, huge),
+        ] {
+            assert!(
+                line.len() <= aterm_log::record_cap(aterm_log::Level::Warn),
+                "{} bytes: {line}",
+                line.len()
+            );
+            assert!(!line.contains("MAIN-THREAD STALL"), "{line}");
+        }
+        let asleep = slept_message(huge);
+        assert!(
+            asleep.len() <= aterm_log::record_cap(aterm_log::Level::Info),
+            "{} bytes: {asleep}",
+            asleep.len()
+        );
+        assert!(!asleep.contains("MAIN-THREAD STALL"), "{asleep}");
+    }
+
+    /// THE 2026-09-28 STACK, WHOLE. Written as one line, a deep stack runs past
+    /// the logger's 1 KiB ERROR body cap and is cut short — that day at frame
+    /// #11. In parts, every frame reaches the log in order, every part passes
+    /// the logger untouched, and every part is numbered and says when the stack
+    /// was captured. (A synthetic stack: 64 frames sized so one line is cut
+    /// where that day's was.)
+    #[test]
+    fn the_stack_is_logged_whole_in_numbered_parts_under_the_error_cap() {
+        let cap = aterm_log::record_cap(aterm_log::Level::Error);
+        let mut frames =
+            vec!["load address 0x1004c8000, UUID 4C4C4453-5555-3144-A1B2-C3D4E5F60718".to_string()];
+        frames.extend((0..64).map(|i| {
+            format!(
+                "#{i} AppKit + {} (-[NSSceneStatusItem _setupScene:] + {}) \
+                 [a synthetic AppKit frame]",
+                1_000_000 + 4_096 * i,
+                60 + i
+            )
+        }));
+        let captured = UNIX_EPOCH + Duration::from_millis(1_790_191_963_664);
+
+        // The negative control: the one line the watchdog used to write keeps
+        // frame #10 and loses #11 and everything deeper, as that day's did.
+        let old = format!("{STACK_LINE} {}", frames.join(FRAME_SEPARATOR));
+        let logged = aterm_log::sanitize_record_for(aterm_log::Level::Error, &old);
+        assert!(
+            old.contains("| #11 ") && logged.contains("| #10 ") && !logged.contains("| #11 "),
+            "{logged}"
+        );
+
+        let lines = stack_lines(&frames, captured, cap);
+        let parts = lines.len();
+        assert!(parts > 1, "{lines:#?}");
+        let mut rejoined: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let head = format!(
+                "MAIN-THREAD STALL stack: (part {}/{parts}, captured at 1790191963.664) ",
+                i + 1
+            );
+            let body = line
+                .strip_prefix(head.as_str())
+                .unwrap_or_else(|| panic!("numbered and stamped: {line}"));
+            assert!(line.len() <= cap, "{} bytes: {line}", line.len());
+            assert_eq!(
+                aterm_log::sanitize_record_for(aterm_log::Level::Error, line),
+                line.as_str(),
+                "the logger passes every part untouched"
+            );
+            rejoined.extend(body.split(FRAME_SEPARATOR).map(str::to_string));
+        }
+        assert_eq!(rejoined, frames, "every frame, in order, none split");
+    }
+
+    /// A frame too long for a line of its own is clipped, on a character
+    /// boundary, into a part of its own; control characters are counted at
+    /// the width the logger writes them (U+FFFD), so no part is cut by it;
+    /// no frames make no lines; and the stamp is the log's own form.
+    #[test]
+    fn an_oversized_frame_is_clipped_into_a_part_of_its_own() {
+        let cap = aterm_log::record_cap(aterm_log::Level::Error);
+        let captured = UNIX_EPOCH + Duration::from_millis(1_790_191_963_664);
+        let frames = [
+            "#0 libsystem_kernel.dylib + 4660 (mach_msg2_trap + 8)".to_string(),
+            format!("#1 {}", "é".repeat(1_100)),
+            format!("#2 {}", "\u{1}".repeat(600)),
+            "#3 dyld + 24680 (start + 2360)".to_string(),
+        ];
+        let lines = stack_lines(&frames, captured, cap);
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        for line in &lines {
+            assert!(
+                logged_len(line) <= cap,
+                "{} bytes: {line}",
+                logged_len(line)
+            );
+            assert_eq!(
+                aterm_log::sanitize_record_for(aterm_log::Level::Error, line).len(),
+                logged_len(line),
+                "the logger replaces control characters and cuts nothing: {line}"
+            );
+        }
+        assert!(lines[0].ends_with(") #0 libsystem_kernel.dylib + 4660 (mach_msg2_trap + 8)"));
+        assert!(
+            lines[1].contains("(part 2/4, ") && lines[1].ends_with("é…"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].ends_with("\u{1}…"), "{}", lines[2]);
+        assert!(lines[3].ends_with(") #3 dyld + 24680 (start + 2360)"));
+        assert!(stack_lines(&[], captured, cap).is_empty());
+
+        assert_eq!(epoch_stamp(captured), "1790191963.664");
+        assert_eq!(epoch_stamp(UNIX_EPOCH + Duration::from_millis(5)), "0.005");
+        assert!(epoch_stamp(UNIX_EPOCH - Duration::from_secs(1)).starts_with("an unknown time"));
     }
 
     /// THE PORT (keeper P0 onto the 2026-09-26 gap rule). A stall REPORTED
@@ -2670,7 +3536,7 @@ mod tests {
             5,
             Breadcrumb::UserEvent,
         );
-        assert_eq!((w.gap, w.ended, w.hit), (Some(gap), None, None));
+        assert_eq!((w.gap, w.ended, w.hit), (awake_gap(gap), None, None));
         let w = wake_logged(
             &mut s,
             &mut lines,
@@ -2725,7 +3591,7 @@ mod tests {
             6,
             Breadcrumb::AboutToWait,
         );
-        assert_eq!(w.gap, Some(gap));
+        assert_eq!(w.gap, awake_gap(gap));
         assert_eq!(
             w.ended,
             Some(Ended {
@@ -2805,7 +3671,7 @@ mod tests {
             5,
             Breadcrumb::UserEvent,
         );
-        assert_eq!((w.gap, w.ended, w.hit), (Some(gap), None, None));
+        assert_eq!((w.gap, w.ended, w.hit), (awake_gap(gap), None, None));
         // Still frozen after it, but only for 2.5 s of the main thread's own time.
         let w = wake_logged(
             &mut s,
@@ -2981,5 +3847,429 @@ mod tests {
             })
         );
         assert_eq!(s.take_ended(), None);
+    }
+
+    // ---- The refusal of a verb the main thread cannot take ----
+
+    /// A process-clock reading long after launch, where a stall happens.
+    const REFUSAL_T0: u64 = 40_000_000_000;
+
+    /// One tick of the derived `MainThreadStallRefusal` machine: half the
+    /// refusal bar, so the model's `Bar = 2` ticks is [`MAIN_STALL_BAR`].
+    const REFUSAL_TICK_NS: u64 = 2_500_000_000;
+
+    fn secs(n: u64) -> u64 {
+        n * 1_000_000_000
+    }
+
+    /// THE 2026-09-28 INCIDENT, as the refusal reads it: `NewEvents` returned
+    /// and the main thread went into AppKit's scene setup and did not come
+    /// back. Past the bar every main-thread verb is refused, and the reason
+    /// names the root and says its handler had returned; under the bar it is
+    /// a slow turn and the verb is posted.
+    #[test]
+    fn a_work_root_with_no_beat_for_the_bar_is_refused_and_says_where() {
+        let beat = REFUSAL_T0;
+        assert_eq!(
+            main_stall(beat + secs(4), beat, Breadcrumb::NewEvents, true, None),
+            None,
+            "under the bar is a slow turn, not a stall"
+        );
+        let stall = main_stall(beat + secs(12_138), beat, Breadcrumb::NewEvents, true, None)
+            .expect("a work root frozen past the bar is stalled");
+        assert_eq!(stall.stalled, Duration::from_secs(12_138));
+        assert_eq!(
+            stall.to_string(),
+            "main thread stalled 12138s since `NewEvents` returned; retry"
+        );
+        let inside = main_stall(beat + secs(7), beat, Breadcrumb::UserEvent, false, None)
+            .expect("a handler still on the stack is stalled too");
+        assert_eq!(
+            inside.to_string(),
+            "main thread stalled 7s since `UserEvent`; retry"
+        );
+    }
+
+    /// The idle park is no stall by itself: a thread asleep in its event wait
+    /// has an old heartbeat by design. Nor is a hop that was only just posted
+    /// to it, which is what a verb arriving while the first verb after ten
+    /// idle minutes is answered sees. A hop that has waited the bar with no
+    /// beat since it was posted IS a stall: the thread left its wait for
+    /// something that is not aterm's and did not come back. The negative
+    /// control judges on the heartbeat alone and refuses the fresh hop.
+    #[test]
+    fn the_idle_park_is_refused_only_once_a_hop_has_waited_the_bar() {
+        let beat = REFUSAL_T0;
+        let idle = beat + secs(600);
+        let park = Breadcrumb::AboutToWait;
+        assert_eq!(main_stall(idle, beat, park, true, None), None, "idle");
+        assert_eq!(
+            main_stall(idle, beat, park, true, Some(idle)),
+            None,
+            "a hop just posted"
+        );
+        assert_eq!(
+            main_stall(idle + secs(4), beat, park, true, Some(idle)),
+            None
+        );
+        let stall = main_stall(idle + secs(5), beat, park, true, Some(idle))
+            .expect("a hop that waited the bar on an unmoved heartbeat");
+        assert_eq!(
+            stall.stalled,
+            Duration::from_secs(5),
+            "counted from the hop, not from the idle before it"
+        );
+        assert_eq!(
+            stall.to_string(),
+            "main thread stalled 5s since `AboutToWait` returned; retry"
+        );
+        // A beat after the hop was posted restarts the count from that beat.
+        assert_eq!(
+            main_stall(idle + secs(6), idle + secs(2), park, true, Some(idle)),
+            None
+        );
+        // The heartbeat-only reading: the fresh hop is refused.
+        assert!(main_stall(idle, beat, park, true, Some(1)).is_some());
+    }
+
+    /// The designed freezes never read as stalled, however long and whatever
+    /// waits on them: a dialog has its own refusal, and startup and the update
+    /// handoff end by themselves. Nor does a main thread that has not beaten.
+    #[test]
+    fn a_designed_freeze_or_a_thread_that_never_beat_is_never_refused() {
+        let beat = REFUSAL_T0;
+        let late = beat + secs(3_600);
+        for root in [
+            Breadcrumb::Modal,
+            Breadcrumb::UpdateHandoff,
+            Breadcrumb::Startup,
+        ] {
+            assert_eq!(
+                main_stall(late, beat, root, false, Some(beat)),
+                None,
+                "{root:?}"
+            );
+        }
+        assert_eq!(
+            main_stall(late, 0, Breadcrumb::UserEvent, false, Some(beat)),
+            None,
+            "no beat yet is no evidence"
+        );
+    }
+
+    /// ONE BAR in every build: the shipped 5 s, never the debug lane's 500 ms,
+    /// so a debug build's slow-but-live turn is still waited for.
+    #[test]
+    fn the_refusal_bar_is_the_shipped_stall_bar_in_every_build() {
+        assert_eq!(MAIN_STALL_BAR, Duration::from_secs(5));
+        assert_eq!(MAIN_STALL_BAR, RELEASE_STALL_THRESHOLD);
+        let beat = REFUSAL_T0;
+        assert_eq!(
+            main_stall(beat + secs(1), beat, Breadcrumb::ResizeSettle, false, None),
+            None,
+            "a debug-lane stall line, never a refusal"
+        );
+    }
+
+    /// The real writer, reset, hop count and reader, driven beside the derived
+    /// `MainThreadStallRefusal` machine: [`beat_into`] on this test's own
+    /// ledger (the writer), [`TurnLedger::reset`] (what `metrics reset` runs),
+    /// `control_media::Hops` (what `call_main` counts), `control_media::take_hop`
+    /// (what `user_event` runs first on a posted hop) and [`main_stall`] (the
+    /// reader). One model tick is [`REFUSAL_TICK_NS`] of the clock.
+    struct RefusalLockstep<'a> {
+        ledger: &'a TurnLedger,
+        phase: &'a AtomicU8,
+        /// `'static`, as the process's own is, so a real `Wake::Hop` can
+        /// carry its mark.
+        hops: &'static crate::control::control_media::Hops,
+        /// The worker's side of the posted hop, alive while it waits.
+        hop: Option<crate::control::control_media::HopGuard<'static>>,
+        /// When `hop` was posted.
+        posted: u64,
+        now: u64,
+        root: Breadcrumb,
+        returned: bool,
+        /// The census defect: the reader takes the turn census's open stamp,
+        /// which `reset` zeroes, for the heartbeat's time.
+        census: bool,
+        /// The heartbeat-only defect: a waiting hop is judged as if it had
+        /// waited forever, so only the heartbeat's age counts.
+        beat_only: bool,
+        /// The count-until-reply defect: a hop counts from its post for as
+        /// long as its worker waits, taken by the main thread or not.
+        until_reply: bool,
+    }
+
+    impl RefusalLockstep<'_> {
+        fn enter_root(&mut self, root: Breadcrumb, returned: bool) {
+            beat_into(self.ledger, self.phase, root, self.now);
+            self.root = root;
+            self.returned = returned;
+        }
+
+        /// The main thread takes the posted hop: the real `take_hop` on the
+        /// `Wake::Hop` that `call_main` posts, which hands back the request.
+        fn take(&self) {
+            let hop = self.hop.as_ref().expect("a posted hop to take");
+            let request = crate::control::control_media::take_hop(crate::Wake::Hop {
+                mark: hop.mark(),
+                wake: Box::new(crate::Wake::TitleSummaryReady),
+            });
+            assert!(
+                matches!(request, crate::Wake::TitleSummaryReady),
+                "{request:?}"
+            );
+        }
+
+        /// The stamp the reader under test takes for the heartbeat's time.
+        fn stamp(&self) -> u64 {
+            if self.census {
+                self.ledger.open_ns.load(Ordering::Relaxed)
+            } else {
+                self.ledger.last_beat_ns.load(Ordering::Relaxed)
+            }
+        }
+
+        /// The real reader's verdict.
+        fn refuses(&self) -> bool {
+            let since = if self.until_reply {
+                self.hop.as_ref().map(|_| self.posted)
+            } else {
+                self.hops.since_ns()
+            };
+            let since = since.map(|since| if self.beat_only { 1 } else { since });
+            main_stall(self.now, self.stamp(), self.root, self.returned, since).is_some()
+        }
+
+        /// Take the model's `action` on the real code; `Some` is the reader's
+        /// verdict when the action is `Probe`.
+        fn step(&mut self, action: &str) -> Option<bool> {
+            match action {
+                "BeatIdle" => self.enter_root(Breadcrumb::AboutToWait, true),
+                "BeatWork" => self.enter_root(Breadcrumb::NewEvents, true),
+                "BeatPark" => self.enter_root(Breadcrumb::Modal, false),
+                "Tick" => self.now += REFUSAL_TICK_NS,
+                "Post" => {
+                    let hops: &'static crate::control::control_media::Hops = self.hops;
+                    self.hop = Some(hops.post(self.now));
+                    self.posted = self.now;
+                }
+                // The main thread takes the hop, which is a root entry, and
+                // answers it in the same turn: the worker stops waiting.
+                "Answer" => {
+                    self.enter_root(Breadcrumb::UserEvent, false);
+                    self.take();
+                    self.hop = None;
+                }
+                // The main thread takes the hop and queues its reply (a
+                // `settings set` write): the worker goes on waiting.
+                "Take" => {
+                    self.enter_root(Breadcrumb::UserEvent, false);
+                    self.take();
+                }
+                // The queued reply comes, from a later turn.
+                "Reply" => {
+                    self.enter_root(Breadcrumb::UserEvent, false);
+                    self.hop = None;
+                }
+                // The worker's deadline passes and it stops waiting.
+                "GiveUp" => self.hop = None,
+                "Reset" => self.ledger.reset(),
+                "Probe" => return Some(self.refuses()),
+                other => panic!("no real step for model action `{other}`"),
+            }
+            None
+        }
+    }
+
+    /// One schedule taken on `model` and on the real code in lockstep, with
+    /// `mutation` (a `Buggy = 1` defect) fired on the model first and replayed
+    /// on the real reader. After every action the worker's live guard projects
+    /// onto `waiting`, the hop count onto `hop` and the reader's stamp onto
+    /// `stamp`; at every `Probe` the real verdict must be the model's
+    /// `refused`. Returns `(refused, stalled, real verdict)` per probe. The
+    /// caller holds [`beat_serial`].
+    fn refusal_lockstep(
+        model: &aterm_spec::derive::Model,
+        mutation: Option<&'static str>,
+        schedule: &[&'static str],
+    ) -> Vec<(i64, i64, bool)> {
+        let ledger = TurnLedger::new();
+        let phase = AtomicU8::new(Phase::None as u8);
+        // Leaked, one small count per schedule, for the `'static` a real
+        // `Wake::Hop` needs.
+        let hops: &'static crate::control::control_media::Hops =
+            Box::leak(Box::new(crate::control::control_media::Hops::new()));
+        let mut real = RefusalLockstep {
+            ledger: &ledger,
+            phase: &phase,
+            hops,
+            hop: None,
+            posted: 0,
+            now: REFUSAL_T0,
+            root: Breadcrumb::Startup,
+            returned: false,
+            census: mutation == Some("MutateCensusStamp"),
+            beat_only: mutation == Some("MutateHeartbeatOnly"),
+            until_reply: mutation == Some("MutateCountsUntilReply"),
+        };
+        let mut state = model.init_state();
+        if let Some(mutation) = mutation {
+            assert!(model.fire(mutation, &mut state), "{mutation}");
+        }
+        let mut probes = Vec::new();
+        for &action in schedule {
+            assert!(
+                model.fire(action, &mut state),
+                "{action} is not admitted at {state:?} ({schedule:?})"
+            );
+            let verdict = real.step(action);
+            assert_eq!(
+                state["waiting"],
+                i64::from(real.hop.is_some()),
+                "{action} in {schedule:?}: the worker's live guard projects onto `waiting`"
+            );
+            assert_eq!(
+                state["hop"],
+                i64::from(hops.since_ns().is_some()),
+                "{action} in {schedule:?}: the hop count projects onto `hop`"
+            );
+            assert_eq!(
+                state["stamp"],
+                i64::from(real.stamp() != 0),
+                "{action} in {schedule:?}: the reader's stamp projects onto `stamp`"
+            );
+            if let Some(refuses) = verdict {
+                assert_eq!(
+                    state["refused"],
+                    i64::from(refuses),
+                    "{action} in {schedule:?}: the real reader and the model disagree"
+                );
+                probes.push((state["refused"], state["stalled"], refuses));
+            }
+        }
+        probes
+    }
+
+    /// TIER-1 for `MainThreadStallRefusal`. Each schedule is taken on the
+    /// model and on the genuine writer, reset, hop count, take and reader in
+    /// lockstep ([`refusal_lockstep`]), and at every probe the model proves
+    /// the refusal was exactly the stall (`refused == stalled`). The three
+    /// defects its `Buggy` replays are replayed on the real reader too and
+    /// each is caught: a `metrics reset` under a stall read through the census
+    /// stamp lets the stalled thread's verbs through, a heartbeat-only rule
+    /// refuses a fresh hop after idleness, and a hop counted until its reply
+    /// makes a healthy idle thread behind a queued `settings set` read as
+    /// stuck.
+    #[test]
+    fn main_stall_conforms_to_the_stall_refusal_model() {
+        let model = aterm_spec::derive::main_thread_stall_refusal_model();
+        assert!(model.consts.contains(&("Bar", 2)), "two ticks are the bar");
+        assert_eq!(Duration::from_nanos(2 * REFUSAL_TICK_NS), MAIN_STALL_BAR);
+
+        let _serial = beat_serial();
+        let schedules: &[&[&'static str]] = &[
+            // The incident: a work root, then no beat.
+            &[
+                "BeatWork", "Probe", "Tick", "Probe", "Tick", "Probe", "Post", "Tick", "Probe",
+            ],
+            // Idle past the bar, then a hop: let through until it has waited.
+            &[
+                "BeatIdle", "Tick", "Tick", "Tick", "Post", "Probe", "Tick", "Probe", "Tick",
+                "Probe",
+            ],
+            // The hop is answered, and the loop parks again.
+            &[
+                "BeatIdle", "Tick", "Tick", "Post", "Tick", "Answer", "Probe", "BeatIdle", "Tick",
+                "Tick", "Probe",
+            ],
+            // A dialog stands over a waiting hop: never this refusal.
+            &[
+                "BeatWork", "BeatPark", "Post", "Tick", "Tick", "Tick", "Probe",
+            ],
+            // `metrics reset` under a stall: still refused.
+            &[
+                "BeatWork", "Tick", "Reset", "Tick", "Probe", "Reset", "Probe",
+            ],
+            // A hop given up on stops counting.
+            &[
+                "BeatIdle", "Post", "Tick", "Tick", "Probe", "GiveUp", "Probe",
+            ],
+            // A loop that turns while the hop waits restarts the count.
+            &[
+                "BeatIdle", "Post", "Tick", "BeatIdle", "Tick", "Probe", "Tick", "Probe",
+            ],
+            // No beat yet, however long: nothing is refused.
+            &["Tick", "Tick", "Post", "Tick", "Tick", "Probe"],
+            // A hop taken with its reply queued (`settings set`): the loop
+            // parks while the worker still waits, and nothing waits on the
+            // main thread, however long the write takes.
+            &[
+                "BeatIdle", "Post", "Take", "BeatIdle", "Tick", "Tick", "Probe", "Tick", "Probe",
+                "Reply", "Probe",
+            ],
+            // Taken, then stuck in the handler that took it: a work root.
+            &["BeatIdle", "Post", "Take", "Tick", "Tick", "Probe"],
+        ];
+        let mut refused = 0;
+        for schedule in schedules {
+            for (model_refused, stalled, _) in refusal_lockstep(&model, None, schedule) {
+                assert_eq!(model_refused, stalled, "{schedule:?}");
+                refused += model_refused;
+            }
+        }
+        assert!(refused > 0, "the schedules reach a refusal");
+
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let reset_under_stall: &[&'static str] = &["BeatWork", "Tick", "Reset", "Tick", "Probe"];
+        assert_eq!(
+            refusal_lockstep(&model, None, reset_under_stall),
+            [(1, 1, true)]
+        );
+        assert_eq!(
+            refusal_lockstep(&buggy, Some("MutateCensusStamp"), reset_under_stall),
+            [(0, 1, false)],
+            "read through the census stamp, a reset lets a stalled thread's verbs through"
+        );
+        let fresh_hop: &[&'static str] = &["BeatIdle", "Tick", "Tick", "Tick", "Post", "Probe"];
+        assert_eq!(refusal_lockstep(&model, None, fresh_hop), [(0, 0, false)]);
+        assert_eq!(
+            refusal_lockstep(&buggy, Some("MutateHeartbeatOnly"), fresh_hop),
+            [(1, 0, true)],
+            "judged on the heartbeat alone, a fresh hop after idleness is refused"
+        );
+        let queued_reply: &[&'static str] = &[
+            "BeatIdle", "Post", "Take", "BeatIdle", "Tick", "Tick", "Probe",
+        ];
+        assert_eq!(
+            refusal_lockstep(&model, None, queued_reply),
+            [(0, 0, false)]
+        );
+        assert_eq!(
+            refusal_lockstep(&buggy, Some("MutateCountsUntilReply"), queued_reply),
+            [(1, 0, true)],
+            "counted until its reply, a queued settings write makes a healthy idle thread \
+             read as stuck"
+        );
+
+        // Leave the global breadcrumb where the rest of the suite expects it.
+        beat(Breadcrumb::AboutToWait);
+    }
+
+    /// `metrics reset` clears the turn census and leaves the heartbeat's
+    /// timestamp: the one fact the refusal must not lose to it.
+    #[test]
+    fn a_census_reset_keeps_the_heartbeat_timestamp() {
+        let _serial = beat_serial();
+        let ledger = TurnLedger::new();
+        let phase = AtomicU8::new(Phase::None as u8);
+        beat_into(&ledger, &phase, Breadcrumb::UserEvent, REFUSAL_T0);
+        assert_eq!(ledger.open_ns.load(Ordering::Relaxed), REFUSAL_T0);
+        assert_eq!(ledger.last_beat_ns.load(Ordering::Relaxed), REFUSAL_T0);
+        ledger.reset();
+        assert_eq!(ledger.open_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(ledger.last_beat_ns.load(Ordering::Relaxed), REFUSAL_T0);
+        beat(Breadcrumb::AboutToWait);
     }
 }

@@ -3,9 +3,9 @@
 # The aterm fabric: your inbox, your outbox, and the halt
 
 Every aterm session owns a mailbox in the terminal itself. Peers — other sessions,
-other agents, a human, another machine — put addressed messages in it. **Nothing is
-typed into your terminal.** A message is a row you read with a verb, when you choose.
-That asymmetry is the design: a peer can reach you, and cannot drive you.
+other agents, a human, another machine — put addressed messages in it. **Mail is not
+typed into your terminal**, except one line: a manager's `aterm drive task` types `Inbox:
+task @<off>`. A message is a row you read with a verb, when you choose.
 
 The transport underneath is **astream**, a separate message bus. One `aterm link serve`
 bridge per aterm instance carries records between the bus and this endpoint. The verbs
@@ -100,9 +100,6 @@ post 7 to=@s-9a01…@n-b2f0… kind=ask off=- len=17
 One watermark, and a per-row flag. `seen=` is the only watermark and moves only on
 `inbox seen`. Listing is per row and `--peek` does not do it: an UNLISTED row is what a
 sender's quota counts, so an agent that only ever `--peek`s fills its senders' quotas.
-There is deliberately no *listed* watermark — one existed, and a bounded or
-`since=`-filtered reply advanced it past the rows it had skipped, so `pending=` read 0
-over unread mail.
 
 **Nothing lost: `inbox get @<off>`.** The ring is bounded, so a burst can push a row out
 (`dropped=` counts it), and a long body can arrive cut (`truncated=1`) — but the record is
@@ -141,9 +138,8 @@ Failure tokens that mean opposite things, and are easy to confuse:
   so there is no wait to sit out.
 - `… no-bridge=1` — this instance has **no bridge right now**. Not a verdict on the
   message: `aterm ctl fabric attach <command...>` arms a supervisor and the same outbox
-  drains (measured 2026-09-12, the post landed the moment a bridge attached). Report it as
-  "queued, unpublishable until this instance has a bridge" — never as "not sent", which is
-  how a delivered task gets done twice.
+  drains. Report it as "queued, unpublishable until this instance has a bridge" — never as
+  "not sent", which is how a delivered task gets done twice.
 - `ERR timeout id=<n>` — the **third** outcome, and it means queued too: the wait expired
   with no landing reported. Same rule. Do not re-post.
 - `ERR unroutable|ambiguous|undeliverable id=<n>` — the **fourth**, and the only one that
@@ -166,11 +162,10 @@ not count), a row `kind=expired re=<n> dl=<ms>` lands in *your* inbox (once), a 
 comes after it arrives `late=1` (unless your bridge restarted in between — the `expired`
 row is still there), and `aterm fabric` lists the ask under WARNINGS.
 
-**Receipts: your `inbox seen` acks the sender (R8).** When the fabric runs with receipts on
-(the default `aterm fabric on` writes; `[fabric] receipts = true`, or `--receipts` on the
-bridge), running `inbox seen <id> handled|refused|deferred` on an **ask** or **task** puts
-`kind=ack re=<off> verdict=<v>` in the *sender's* inbox — so a manager knows their task was
-taken. The receipt is owed until it is on the bus, so a verdict given while the broker or
+**Receipts: your `inbox seen` acks the sender** — on unless `[fabric] receipts = false` or
+the bridge runs `--no-receipts`. Running `inbox seen <id> handled|refused|deferred` on an
+**ask** or **task** puts `kind=ack re=<off> verdict=<v>` in the *sender's* inbox — so a
+manager knows their task was taken. The receipt is owed until it is on the bus, so a verdict given while the broker or
 the bridge is down is sent when they return, once; never say it again to resend it. A
 `note` earns none; a session that only `--peek`s acks nothing. From the sending side,
 `post … kind=task --wait-ack` blocks for that receipt and returns `OK <id> off=<n>
@@ -222,7 +217,7 @@ and the physical keyboard is untouched.
 Treat `ERR halted` as a **stop**, not a transient error. Do not retry around it, do not look
 for another verb that still works, and do not lift a local hold on yourself: the token that
 can is the one you were given to do your work, not a licence to override whoever stopped
-it. Read the reason from the `inbox` header, report it, and wait.
+it. Read the reason from the `ERR halted reason=<r>` line, report it, and wait.
 
 ## Nothing wakes you for mail
 
@@ -232,8 +227,7 @@ Nothing wakes you for mail — you are typed to, as a human would type to you: a
 `aterm ctl @self status` shows `fabric=connected` — when you finish or hand off work, or
 park one `await inbox since=<id>`. Do not poll it every turn: with `fabric=absent` nothing
 can arrive. An `ask` or `task` addressed to you is work you were given; unread, it simply
-sits there while you finish. No vendor hook is installed for any of this (decision "B",
-2026-09-22).
+sits there while you finish. No vendor hook is installed for any of this.
 
 - **A sandbox that refuses the control socket** (Codex, by default) — aterm drives such a
   session from outside and it takes no part in messaging; nothing to configure.

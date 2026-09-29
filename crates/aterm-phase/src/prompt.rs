@@ -9,9 +9,48 @@
 //! the numbered options, and ` Esc to cancel · Tab to amend`; the workflow
 //! box ` Run a dynamic workflow?` with `│`-led description rows; the folder
 //! trust dialog ` Accessing workspace:` (2.1.280) with UNNUMBERED options
-//! under a `❯` cursor and ` Enter to confirm · Esc to cancel`. Any other box
+//! under a `❯` cursor and ` Enter to confirm · Esc to cancel`; the
+//! usage-limit options dialog ` What do you want to do?` (2.1.282,
+//! [`PromptKind::UsageLimit`], "THE USAGE-LIMIT DIALOG" below). Any other box
 //! is a prompt of kind [`PromptKind::Other`] — the supervisor hands it to
 //! the manager rather than guess.
+//!
+//! **THE USAGE-LIMIT DIALOG.** At a usage limit Claude Code 2.1.282 opens
+//! its `rate_limit_options_menu` (read from the binary's own source): a
+//! Dialog titled `What do you want to do?` over a numbered Select and
+//! ` Enter to confirm · Esc to cancel`. Its rows, by value: `cancel` (`Stop
+//! and wait for limit to reset`, or `Stop` on usage billing — it STOPS, it
+//! does not continue), `auto-resume` (`Wait here, then continue
+//! automatically` + ` shortly` | ` at <time>` | ` when the limit resets` —
+//! arms the vendor's own continue at the reset), `cancel-auto-resume`
+//! (`Don’t continue automatically`, in place of the wait row when a wait is
+//! already armed), `extra-usage` (`Switch to usage credits`, `Add funds to
+//! continue with …`, `Ask your admin for more usage`), `upgrade` (`Upgrade
+//! your plan`), and the offer rows (`low-priority`, `limit-wall-promo`,
+//! `juniper-tide`, `cedar-ember`: reset claims and promotions). Seen
+//! 2026-09-24 on the owner's Mac: a weekly limit (the vendor's
+//! `autoContinueAtUsageLimit` arms the wait WITHOUT this dialog only when
+//! the reset is under 24 h away) left it up for ~14 h, read as `other`. It
+//! is its own kind when its title is that question AND an option is a row
+//! only this menu draws — the stop row, the wait row or the armed wait's
+//! cancel ([`usage_limit_menu`]); the question alone is any dialog's (the
+//! trial-expired dialog asks it over `Upgrade to Max` and `Add funds …`, so
+//! the spend and upgrade rows are no signal). The wait row alone gets a
+//! role ([`Role::AutoResume`]); every other row is [`Role::Other`], so
+//! nothing spends money by a role. A question dialog is never it: the
+//! question reading is decided first ("EVERY BOX IS NAMED BY ITS TITLE").
+//!
+//! **THE CURSOR.** `❯` — the vendor's `X.pointer`, which its Select draws on
+//! the focused row, the usage-limit menu's included (2.1.282 source) — on
+//! every box. `›` (`X.pointerSmall`, which Claude Code draws as the prefix
+//! of other rows, an async agent's latest activity) is read as a cursor too
+//! ONLY in a box titled `What do you want to do?` ([`cursors`]): the owner's
+//! report of that dialog showed `› 1. Stop and wait for limit to reset`, not
+//! captured as text, and a cursor missed there makes the options unsound
+//! (the first row is no option), which escalates the dialog again. That is a
+//! tolerance of the report, not evidence of the vendor's glyph. A box read
+//! with no title of its own (a footerless option block, a box whose head is
+//! off the screen) reads `❯` alone.
 //!
 //! **DETECTION BY SHAPE** ([`find_box`]). A box is its key-hint FOOTER — a
 //! row of `<key> to <verb>` hints joined by ` · `, one of them `Esc …`, in
@@ -43,7 +82,8 @@
 //! NOT do this" — made the kind a safety fact: a supervisor answers a
 //! tool-permission box with its one-shot allow only when it is POSITIVELY
 //! IDENTIFIED as one, and every other dialog by that dialog's own rule
-//! (aterm-agent's decider), so the reader names each box Claude Code 2.1.282 draws (read from
+//! (aterm-agent's decider; the usage-limit dialog by its wait row alone, "THE
+//! USAGE-LIMIT DIALOG"), so the reader names each box Claude Code 2.1.282 draws (read from
 //! its render code; the anchors in [`crate::anchors`], `since` the earliest
 //! build read) and leaves the rest [`PromptKind::Other`]. The permission
 //! boxes: Bash and PowerShell (one content grammar), Edit (with `Edit
@@ -326,11 +366,38 @@ pub enum PromptKind {
     /// ` Read outside the working directories` — settles a persistent
     /// setting for every project.
     ReadOutsideSetting,
+    /// The usage-limit options dialog, ` What do you want to do?` over the
+    /// limit menu's rows (2.1.282; module header, "THE USAGE-LIMIT DIALOG").
+    UsageLimit,
     /// ` Switch model?` / ` Change effort level?` — the cache-miss
     /// confirmation of a `/model` or `/effort` change the person typed
     /// (module header, "THE MODEL-SWITCH CONFIRMATION"): `Yes, switch to <m>`
     /// ([`Role::Once`]) and `No, go back`, NO footer.
     ModelSwitch,
+    /// Codex's RATE-LIMIT MODEL NUDGE (0.157.1 and 0.158.0 binaries, view
+    /// `rate-limit-switch-prompt`, drawn at a turn end once Codex's usage
+    /// passed its threshold — and measured once firing at 1% right after a
+    /// usage reset, a stale one): `Switch to <model>` ([`Role::Other`], a
+    /// model change the decider matches by its label), `Keep current model`
+    /// ([`Role::Deny`], the refusal that settles nothing) and `Keep current
+    /// model (never show again)` ([`Role::Persist`]: it writes Codex's own
+    /// config, so no rule ever presses it). A choice, never an approval.
+    RateNudge,
+    /// Codex's `/model` PICKER (0.158.0, measured): the model box (`Select
+    /// Model and Effort`), the effort box (`Select Reasoning Level for
+    /// <model>`, whose `More reasoning…` opens the next) and the advanced
+    /// box (`Advanced Reasoning`: Max, Ultra). Every option [`Role::Other`]:
+    /// a choice of model, answered only by the harness's own restore of the
+    /// model it switched away from, by label, never by role.
+    ModelPick,
+    /// Codex's `Resume paused goal?` box (0.157.1 and 0.158.0 binaries,
+    /// `goal_menu.rs`'s `show_resume_paused_goal_prompt`), drawn by a `codex
+    /// resume <thread>` with no prompt over a goal that is paused, blocked or
+    /// usage-limited: `Resume goal` (focused; [`Role::Other`], the resume a
+    /// decider matches by its label — the same `thread/goal/set … active` as
+    /// `/goal resume`) and `Leave paused` ([`Role::Deny`]: the refusal that
+    /// settles nothing, the goal left as it is). A choice, never an approval.
+    GoalResume,
     /// A box this parser has no header for.
     Other,
 }
@@ -360,7 +427,11 @@ impl PromptKind {
             PromptKind::GoalProposal => "goal-proposal",
             PromptKind::ComputerUse => "computer-use",
             PromptKind::ReadOutsideSetting => "read-outside-setting",
+            PromptKind::UsageLimit => "usage-limit",
             PromptKind::ModelSwitch => "model-switch",
+            PromptKind::RateNudge => "rate-nudge",
+            PromptKind::ModelPick => "model-pick",
+            PromptKind::GoalResume => "goal-resume",
             PromptKind::Other => "other",
         }
     }
@@ -577,6 +648,10 @@ pub enum Role {
     Exit,
     /// Trust the folder (`Yes, I trust this folder`).
     Trust,
+    /// Wait at a usage limit and let Claude Code continue by itself when it
+    /// resets (the usage-limit dialog's `Wait here, then continue
+    /// automatically …`, [`is_wait_label`]). Costs nothing.
+    AutoResume,
     /// One of Codex's question answers ([`PromptKind::Question`],
     /// [`crate::codex`]) — never its `None of the above` row, which is
     /// [`Role::Other`], and never an approval: a decider answers a question
@@ -601,6 +676,7 @@ impl Role {
             Role::Deny => "deny",
             Role::Exit => "exit",
             Role::Trust => "trust",
+            Role::AutoResume => "auto-resume",
             Role::Answer => "answer",
             Role::Other => "other",
         }
@@ -1134,12 +1210,19 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
     } else {
         header_kind(title).unwrap_or(PromptKind::Other)
     };
+    // The cursors the box may draw (module header, "THE CURSOR"): its title
+    // decides, so a box read with no title of its own reads `❯` alone.
+    let cur = if b.head_off_screen {
+        ARROW
+    } else {
+        cursors(title)
+    };
     let Options {
         opts: mut options,
         question,
         content_end,
         ..
-    } = options_of(rows, b.options_from, b.options_end, kind);
+    } = options_of(rows, b.options_from, b.options_end, kind, cur);
     let dialog = b
         .question
         .map(|shape| crate::question::dialog(rows, &shape));
@@ -1150,6 +1233,11 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         for o in &mut options {
             o.role = Role::Other;
         }
+    } else if kind == PromptKind::Other && !b.head_off_screen && usage_limit_menu(title, &options) {
+        // The usage-limit dialog (module header): read again as its own
+        // kind, so the wait row alone takes a role.
+        kind = PromptKind::UsageLimit;
+        options = options_of(rows, b.options_from, b.options_end, kind, cur).opts;
     } else if kind == PromptKind::Other
         && !b.head_off_screen
         && is_tool_card(title, footer, question, &options)
@@ -1240,16 +1328,27 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
             v1.description.clone_from(&description);
             v2.description = description;
         }
+        PromptKind::UsageLimit => {
+            // The command is the wait row's label (what choosing does), or
+            // nothing when the menu offers no wait.
+            v2.command = v2
+                .with_role(Role::AutoResume)
+                .map(|o| o.label.clone())
+                .unwrap_or_default();
+            v2.description = prose_of(body, cur);
+            v1.command.clone_from(&v2.command);
+            v1.description.clone_from(&v2.description);
+        }
         PromptKind::ModelSwitch => {
             // The cost warning (or the hook's words) and the sentence under it.
             // What it switches to is its confirm's own label, `Yes, switch to
             // <m>`: a decider names the box by its title and that label.
-            v2.description = prose_of(body);
+            v2.description = prose_of(body, cur);
             v1.description.clone_from(&v2.description);
         }
         PromptKind::Trust => {
             v2.path = trust_path(body);
-            v2.description = prose_of(body);
+            v2.description = prose_of(body, cur);
             v2.command = v2.path.clone().unwrap_or_default();
             v1.command.clone_from(&v2.command);
             v1.description.clone_from(&v2.description);
@@ -1285,7 +1384,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         }
         k if k.is_subject() => {
             v2.command = subject_of(kind, title, body);
-            v2.description = prose_of(body);
+            v2.description = prose_of(body, cur);
             v1.command.clone_from(&v2.command);
             v1.description.clone_from(&v2.description);
         }
@@ -1298,7 +1397,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
             // A question tab read whole is described by its question.
             v2.description = match read_question {
                 Some(Some(text)) => text,
-                _ => prose_of(body),
+                _ => prose_of(body, cur),
             };
         }
     }
@@ -1362,7 +1461,7 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
             ),
             opt(
                 Some(2),
-                &option_row(&rows[cancel.row]).map_or_else(String::new, |(_, l)| l),
+                &option_row(&rows[cancel.row], ARROW).map_or_else(String::new, |(_, l)| l),
                 cancel.focused,
                 cancel.row,
             ),
@@ -1469,7 +1568,7 @@ fn is_tool_card(
 ) -> bool {
     use crate::anchors::anchor_text;
     let t = title.trim();
-    if t.starts_with("Do you want") || option_row(t).is_some() || pointer_row(t) {
+    if t.starts_with("Do you want") || option_row(t, ARROW).is_some() || pointer_row(t, ARROW) {
         return false;
     }
     let permission_footer = footer.is_some_and(|f| {
@@ -1672,8 +1771,8 @@ fn trust_path(body: &[String]) -> Option<String> {
 /// A dialog's prose: its non-blank rows that are not options, not a path
 /// block (a row led by `/` or `~` and the rows wrapped under it) and not a
 /// link label (`Security guide`), joined with one space. The caller passes
-/// the rows above the options.
-fn prose_of(body: &[String]) -> String {
+/// the rows above the options, and the cursors its box draws ([`cursors`]).
+fn prose_of(body: &[String], cur: &[char]) -> String {
     let mut out: Vec<&str> = Vec::new();
     let mut in_path = false;
     for t in body.iter().map(|r| r.trim()) {
@@ -1683,8 +1782,8 @@ fn prose_of(body: &[String]) -> String {
         }
         in_path |= t.starts_with('/') || t.starts_with('~');
         if !in_path
-            && option_row(t).is_none()
-            && !t.starts_with('❯')
+            && option_row(t, cur).is_none()
+            && strip_cursor(t, cur).is_none()
             && t.split_whitespace().count() > 2
         {
             out.push(t);
@@ -1926,7 +2025,7 @@ fn walked_box(rows: &[String], footer: usize) -> Option<Found> {
         && first
             .checked_sub(1)
             .is_some_and(|above| crate::phase::is_rule(&rows[above]))
-        && option_row(&rows[first]).is_some();
+        && option_row(&rows[first], ARROW).is_some();
     let title_column = leading_spaces(&rows[first]) == 1 || divided;
     let head_off_screen = match (top, bare, title_column) {
         (Top::Under(_), _, true) => false,
@@ -1942,9 +2041,11 @@ fn walked_box(rows: &[String], footer: usize) -> Option<Found> {
         // Enter landed in the box).
         (Top::Under(_), true, false) => true,
     };
+    // The cursors its title lets it draw (module header, "THE CURSOR").
+    let cur = cursors(rows[first].trim());
     rows[first..footer]
         .iter()
-        .any(|r| option_row(r).is_some() || pointer_row(r))
+        .any(|r| option_row(r, cur).is_some() || pointer_row(r, cur))
         .then_some(Found {
             footer: Some(footer),
             title: first,
@@ -2023,7 +2124,9 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
         }
         Some(kind) if kind.may_be_footerless() => (nearest, kind),
         Some(_) => return None,
-        None if option_row(&rows[nearest]).is_some() || pointer_row(&rows[nearest]) => {
+        None if option_row(&rows[nearest], ARROW).is_some()
+            || pointer_row(&rows[nearest], ARROW) =>
+        {
             return None;
         }
         None => match plan_above() {
@@ -2045,7 +2148,7 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
         return None;
     }
     let options_from = block_top.max(title + 1);
-    options_of(rows, options_from, end + 1, kind)
+    options_of(rows, options_from, end + 1, kind, ARROW)
         .sound
         .then_some(Found {
             footer: None,
@@ -2080,7 +2183,7 @@ fn plan_approval(rows: &[String]) -> Option<Found> {
         return None;
     }
     let first = (q + 1..rows.len()).find(|&i| !rows[i].trim().is_empty())?;
-    if option_row(&rows[first]).map(|(n, _)| n) != Some(1) {
+    if option_row(&rows[first], ARROW).map(|(n, _)| n) != Some(1) {
         return None;
     }
     let mut last = first;
@@ -2090,7 +2193,7 @@ fn plan_approval(rows: &[String]) -> Option<Found> {
         if t.is_empty() {
             continue;
         }
-        if hint.is_none() && option_row(r).is_some() {
+        if hint.is_none() && option_row(r, ARROW).is_some() {
             last = i;
         } else if hint.is_none() && leading_spaces(r) > leading_spaces(&rows[last]) + 2 {
             // The option's own row (a description under its label).
@@ -2153,7 +2256,7 @@ fn model_switch_box(rows: &[String]) -> Option<Found> {
         return None;
     }
     let options_from = block_top.max(title + 1);
-    options_of(rows, options_from, end + 1, PromptKind::ModelSwitch)
+    options_of(rows, options_from, end + 1, PromptKind::ModelSwitch, ARROW)
         .sound
         .then_some(Found {
             footer: None,
@@ -2206,7 +2309,7 @@ fn footerless_head_cut(
         return None;
     }
     let first = (0..=last).find(|&i| !rows[i].trim().is_empty())?;
-    options_of(rows, block_top, end + 1, PromptKind::Other)
+    options_of(rows, block_top, end + 1, PromptKind::Other, ARROW)
         .sound
         .then_some(Found {
             footer: None,
@@ -2249,15 +2352,18 @@ fn bottom_block(rows: &[String]) -> Option<Block> {
     use crate::phase::is_rule;
     let last = rows.iter().rposition(|r| !r.trim().is_empty())?;
     let mut end = last;
-    if option_row(&rows[end]).is_none() && !pointer_row(&rows[end]) && is_key_hint_row(&rows[end]) {
+    if option_row(&rows[end], ARROW).is_none()
+        && !pointer_row(&rows[end], ARROW)
+        && is_key_hint_row(&rows[end])
+    {
         end = (0..end).rev().find(|&i| !rows[i].trim().is_empty())?;
     }
     let top = (0..=end)
         .rev()
         .take_while(|&i| !rows[i].trim().is_empty())
         .last()?;
-    let first_option =
-        (top..=end).find(|&i| option_row(&rows[i]).is_some() || pointer_row(&rows[i]))?;
+    let first_option = (top..=end)
+        .find(|&i| option_row(&rows[i], ARROW).is_some() || pointer_row(&rows[i], ARROW))?;
     if crate::phase::composer_frame(rows)
         .is_some_and(|f| (f.top..=f.bottom).contains(&first_option))
         || rows[first_option..=end].iter().any(|r| is_rule(r))
@@ -2549,10 +2655,11 @@ fn header_kind(row: &str) -> Option<PromptKind> {
     Some(kind)
 }
 
-/// `❯ 1. Yes` / `  2. No` → `(1, "Yes")`.
-fn option_row(row: &str) -> Option<(u8, String)> {
+/// `❯ 1. Yes` / `  2. No` → `(1, "Yes")`, the cursor one of `cur`
+/// ([`cursors`]).
+fn option_row(row: &str, cur: &[char]) -> Option<(u8, String)> {
     let t = row.trim_start();
-    let t = t.strip_prefix('❯').map(str::trim_start).unwrap_or(t);
+    let t = strip_cursor(t, cur).map(str::trim_start).unwrap_or(t);
     let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() || digits.len() > 2 {
         return None;
@@ -2565,13 +2672,76 @@ fn option_row(row: &str) -> Option<(u8, String)> {
 }
 
 /// An unnumbered option under the cursor: `❯ No, exit` at the box's own
-/// column (the trust dialog, 2.1.280).
-fn pointer_row(row: &str) -> bool {
+/// column (the trust dialog, 2.1.280), the cursor one of `cur`.
+fn pointer_row(row: &str, cur: &[char]) -> bool {
     use crate::phase::leading_spaces;
     let t = row.trim_start();
     leading_spaces(row) <= 3
-        && t.strip_prefix('❯')
-            .is_some_and(|rest| rest.starts_with(' ') && !rest.trim().is_empty())
+        && strip_cursor(t, cur).is_some_and(|rest| rest.starts_with(' ') && !rest.trim().is_empty())
+}
+
+/// The cursor every measured box draws, `❯` ([`cursors`] of any title but
+/// the usage-limit dialog's, and of a box read with no title of its own).
+const ARROW: &[char] = &['❯'];
+
+/// The selection cursors a box titled `title` may draw (module header, "THE
+/// CURSOR"): `❯`, the vendor's `X.pointer`, on every box; `›` as well only
+/// in a box titled the usage-limit dialog's question.
+fn cursors(title: &str) -> &'static [char] {
+    if title == crate::anchors::anchor_text("limit.title") {
+        &['❯', '›']
+    } else {
+        ARROW
+    }
+}
+
+/// `t` after the selection cursor it starts with, one of `cur`
+/// ([`cursors`]); `None` when it starts with none of them.
+fn strip_cursor<'a>(t: &'a str, cur: &[char]) -> Option<&'a str> {
+    t.strip_prefix(cur)
+}
+
+/// Whether `label` is the usage-limit dialog's wait row, in any of the three
+/// spellings the 2.1.282 binary builds (`dt()` in its
+/// `rate_limit_options_menu`): `Wait here, then continue automatically
+/// shortly`, `… at <time>` (a time follows), `… when the limit resets`.
+/// Matched whole, so `Don’t continue automatically` (the cancel of an armed
+/// wait) and any other row is not it.
+#[must_use]
+pub fn is_wait_label(label: &str) -> bool {
+    let Some(rest) = label
+        .trim()
+        .strip_prefix(crate::anchors::anchor_text("limit.wait"))
+    else {
+        return false;
+    };
+    rest == " shortly"
+        || rest == " when the limit resets"
+        || rest
+            .strip_prefix(" at ")
+            .is_some_and(|time| !time.trim().is_empty())
+}
+
+/// Whether a row label is one only the usage-limit menu draws (module
+/// header, "THE USAGE-LIMIT DIALOG"): the stop row `Stop and wait for limit
+/// to reset` (its `cancel`, in every list the menu builds unless the session
+/// bills by usage, where it reads `Stop`), the wait row, or the armed wait's
+/// cancel `Don’t continue automatically`. The spend and upgrade rows are not
+/// signals: other dialogs under the same title draw them (2.1.282's
+/// trial-expired dialog offers `Upgrade to Max` and `Add funds to continue
+/// with usage credits`), and `Stop` alone is any dialog's word.
+fn is_limit_menu_label(label: &str) -> bool {
+    let l = label.trim().replace('’', "'");
+    is_wait_label(&l)
+        || l == crate::anchors::anchor_text("limit.stop")
+        || l == "Don't continue automatically"
+}
+
+/// Whether a box titled `title` with `options` is the usage-limit dialog:
+/// the title is its question and an option is one only its menu draws.
+fn usage_limit_menu(title: &str, options: &[Opt]) -> bool {
+    title == crate::anchors::anchor_text("limit.title")
+        && options.iter().any(|o| is_limit_menu_label(&o.label))
 }
 
 /// A box's question at the box's own column: `Do you want to proceed?`, `Do
@@ -2608,7 +2778,7 @@ fn divider_row(row: &str) -> bool {
 /// under them, or unnumbered with exactly one cursor; and at most one
 /// cursor either way. Otherwise every role is [`Role::Other`], so nothing
 /// approves by a label the model may have written.
-fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind) -> Options {
+fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind, cur: &[char]) -> Options {
     use crate::phase::leading_spaces;
     let question = (from..to).rev().find(|&i| question_row(&rows[i], kind));
     let start = question.map_or(from, |q| q + 1);
@@ -2617,12 +2787,12 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind) -> Opti
     // A row among or under the options that is none of theirs.
     let mut stray = false;
     for (i, r) in rows.iter().enumerate().take(to).skip(start) {
-        if let Some((n, label)) = option_row(r) {
+        if let Some((n, label)) = option_row(r, cur) {
             out.push(Opt {
                 n: Some(n),
                 label,
                 role: Role::Other,
-                focused: r.trim_start().starts_with('❯'),
+                focused: strip_cursor(r.trim_start(), cur).is_some(),
                 row: i,
             });
             number_col = r.chars().position(|c| c.is_ascii_digit());
@@ -2661,7 +2831,7 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind) -> Opti
             .take_while(|&i| !rows[i].trim().is_empty())
             .collect();
         match block.last() {
-            Some(&top) if block.iter().any(|&j| pointer_row(&rows[j])) => {
+            Some(&top) if block.iter().any(|&j| pointer_row(&rows[j], cur)) => {
                 out = block
                     .iter()
                     .rev()
@@ -2670,9 +2840,9 @@ fn options_of(rows: &[String], from: usize, to: usize, kind: PromptKind) -> Opti
                         let t = rows[i].trim();
                         Opt {
                             n: None,
-                            label: t.trim_start_matches('❯').trim().to_string(),
+                            label: strip_cursor(t, cur).unwrap_or(t).trim().to_string(),
                             role: Role::Other,
-                            focused: t.starts_with('❯'),
+                            focused: strip_cursor(t, cur).is_some(),
                             row: i,
                         }
                     })
@@ -2720,6 +2890,15 @@ struct Options {
 /// the working directories` settles a setting for good. A label the table
 /// does not know is [`Role::Other`].
 fn role_of(label: &str, kind: PromptKind) -> Role {
+    if kind == PromptKind::UsageLimit {
+        // The wait row, and nothing else: the stop row stops, and every
+        // other row spends money, allowance or a one-time reset.
+        return if is_wait_label(label) {
+            Role::AutoResume
+        } else {
+            Role::Other
+        };
+    }
     let l = label.replace('’', "'").to_lowercase();
     let l = l
         .strip_suffix(crate::anchors::anchor_text("option.esc"))
@@ -2918,6 +3097,13 @@ pub mod fixtures {
     #[cfg(test)]
     pub const TRUST_AFTER_RESUMES: &str =
         include_str!("fixtures/claude-2.1.280-trust-after-resumes.txt");
+    /// HAND-BUILT from the owner's report (2026-09-24, Claude Code 2.1.282):
+    /// the usage-limit options dialog at a weekly limit, the cursor `›` (as
+    /// reported; the vendor's Select draws `❯`) on `Stop and wait for limit
+    /// to reset`, the wait row second, in the frame the 2.1.282 source
+    /// draws (`ge`/`Do`, its provenance line).
+    pub const LIMIT_OPTIONS_DIALOG: &str =
+        include_str!("fixtures/claude-2.1.282-usage-limit-dialog.txt");
     /// codex 0.156.1: its folder-trust gate (Codex's screens are
     /// [`crate::codex::fixtures`]).
     pub use crate::codex::fixtures::TRUST as CODEX_TRUST;
@@ -2934,6 +3120,99 @@ pub mod fixtures {
     pub const API_ERROR_SLEEP: &str =
         include_str!("fixtures/claude-2.1.283-api-error-sleep-mid-response.txt");
     pub const API_ERROR_529: &str = include_str!("fixtures/claude-2.1.283-api-error-529.txt");
+    /// Claude Code 2.1.283, MEASURED (2026-09-27, a private headless aterm at
+    /// 144x50, Claude launched by path on a scratch config with a dummy API
+    /// key and an unresolvable `ANTHROPIC_BASE_URL`): the SYNTHETIC
+    /// [`API_ERROR_ENOTFOUND`]'s row, drawn live — the `⏺ API Error: …
+    /// (ENOTFOUND)` message word for word, under the turn's echo, over a
+    /// `✻ Cogitated for 0s · done <time>` done row, the auto-mode default's
+    /// footer under the composer.
+    pub const API_ERROR_ENOTFOUND_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-error-enotfound-measured.txt");
+    /// MEASURED on Claude Code 2.1.284 (2026-09-28): a SHORT transcript in a
+    /// TALL pane. The error is on row 8 and the composer pinned on rows
+    /// 45-47 with 36 blank rows between, so the error lies more than 40 rows
+    /// above the last drawn row — outside the live zone as it was cut then.
+    pub const API_ERROR_TALL_PANE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.284-api-error-tall-pane-measured.txt");
+    /// MEASURED on 2.1.284 (2026-09-28): the first idle frame on a fresh
+    /// config, auto mode. The mode row carries `◐ medium · /effort`
+    /// right-aligned beside the pill (gone after the first turn) — the tail
+    /// the footer's chips were drawn flush against. A footer screen, so the
+    /// drift canary reads it.
+    pub const FOOTER_AUTO_EFFORT_HINT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.284-footer-auto-effort-hint-measured.txt");
+    /// MEASURED on 2.1.284 (2026-09-28): `/fast on` submitted MID-RETRY at
+    /// 144 columns, the composer directly under a short transcript. The
+    /// refusal is a notification on the row BELOW the mode row (under the
+    /// composer), right-aligned — where the 80-column capture
+    /// ([`FAST_REFUSED_BUSY_80_MEASURED`]) had it above the composer's top
+    /// rule. `fast_answers` reads both.
+    pub const FAST_REFUSED_BUSY_UNDER_COMPOSER_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.284-fast-refused-busy-under-composer-measured.txt");
+    /// The same screen after `resize 50 80`: `(ENOTFOUND)` wrapped onto a
+    /// second row at column 2, as [`API_ERROR_ENOTFOUND_80`] assumed.
+    pub const API_ERROR_ENOTFOUND_80_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-error-enotfound-80col-measured.txt");
+    /// MID-RETRY (the default ten retries): no `⏺` row yet — the spinner row
+    /// carries the whole formatted error, `✻ Can't reach the API server —
+    /// check your internet or DNS (ENOTFOUND) · Retrying in 1s · attempt
+    /// 5/10`, with no `…` and no `(esc to interrupt)` of its own; `esc to
+    /// interrupt` is on the mode row.
+    pub const API_RETRYING_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-retrying-measured.txt");
+    /// Mid-retry with a draft in the composer: the mode row drops `esc to
+    /// interrupt` (and `← for agents`); only the spinner row says a turn runs.
+    pub const API_RETRYING_DRAFT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-retrying-draft-measured.txt");
+    /// Mid-retry with a message queued: `❯ also say bye` and `ctrl+enter to
+    /// send now` under the turn's echo at the top of the transcript, the
+    /// composer's placeholder `Press up to edit queued messages`.
+    pub const API_RETRYING_QUEUED_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-retrying-queued-measured.txt");
+    /// The queued screen at 80 columns: the spinner row's error is CUT to fit
+    /// (`— check your in… · Retrying in 30s · attempt 7/10`), never wrapped.
+    pub const API_RETRYING_QUEUED_80_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-retrying-queued-80col-measured.txt");
+    /// Mid-retry, one message queued and a second draft typed: the mode row
+    /// drops `esc to interrupt`, as with [`API_RETRYING_DRAFT_MEASURED`].
+    pub const API_RETRYING_QUEUED_DRAFT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-retrying-queued-draft-measured.txt");
+    /// The retries spent with a message queued: the `⏺ API Error` row lands
+    /// and the queued message is sent under it AT ONCE as the next turn,
+    /// which retries in its turn — the error is history on this screen.
+    pub const API_ERROR_QUEUED_SENT_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-error-queued-sent-measured.txt");
+    /// Idle after both turns' retries were spent: two `⏺ API Error` rows,
+    /// the last the turn's end (`✻ Worked for 3m 2s · done <time>`).
+    pub const API_ERROR_TWICE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-api-error-twice-measured.txt");
+    /// Claude Code 2.1.283's answer to `/fast on` at idle, MEASURED on the
+    /// same scratch session (2026-09-27): the echo `❯ /fast on` and the
+    /// refusal on the `⎿` row right under it, no blank row between —
+    /// `Fast mode unavailable: Fast mode unavailable due to network
+    /// connectivity issues`, the vendor's prefix over its own reason.
+    pub const FAST_REFUSED_IDLE_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-fast-refused-idle-measured.txt");
+    /// The idle refusal at 80 columns: `issues` wrapped onto a row at column 5.
+    pub const FAST_REFUSED_IDLE_80_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-fast-refused-idle-80col-measured.txt");
+    /// The same `/fast on` submitted MID-TURN (mid-retry): no echo — the
+    /// refusal is a notification on the row directly ABOVE the composer's top
+    /// rule (not under the composer), for about 8 s. THIS capture was read
+    /// after it had gone: the control, no notice up.
+    pub const FAST_REFUSED_BUSY_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-fast-refused-busy-measured.txt");
+    /// The mid-turn notification at 80 columns: from column 2, cut to fit
+    /// (`… network connectivity is…`).
+    pub const FAST_REFUSED_BUSY_80_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-fast-refused-busy-80col-measured.txt");
+    /// Plan mode (`⏸ plan mode on (shift+tab to cycle) · ← for agents`),
+    /// idle, on an API-key account at medium effort: no effort tag on the
+    /// composer's top rule. A footer screen, so the lights' drift canary
+    /// reads it with the rest of the corpus.
+    pub const FOOTER_PLAN_API_KEY_MEASURED: &str =
+        include_str!("fixtures/claude-2.1.283-footer-plan-api-key-measured.txt");
     /// HAND-BUILT: the same turn ending on the session limit.
     pub const END_SESSION_LIMIT: &str =
         include_str!("fixtures/hand-built-session-limit-end-of-turn.txt");
@@ -2954,6 +3233,12 @@ pub mod fixtures {
     pub const MEMORY_BANNER_BUSY: &str = include_str!("fixtures/memory-banner-busy.txt");
     /// SYNTHETIC and UNCONFIRMED: the same banner row over an idle composer.
     pub const MEMORY_BANNER_IDLE: &str = include_str!("fixtures/memory-banner-idle.txt");
+    /// HAND-BUILT (no capture of the incident screen was kept): Claude Code
+    /// 2.1.271 at rest over two background shells that never end, the upgrade
+    /// strand of 2026-09-21..27 — `2 shells still running` on the done row,
+    /// `· 2 shells ·` in the bypass-mode footer.
+    pub const IDLE_SHELLS_2_1_271: &str =
+        include_str!("fixtures/claude-2.1.271-idle-shells-still-running.txt");
 
     /// Claude Code 2.1.281: the question dialog (the AskUserQuestion tool)
     /// with two questions, the first tab up; `Blue (Recommended)`.
@@ -3272,6 +3557,29 @@ pub mod fixtures {
             None => text,
         };
         body.lines().map(str::to_string).collect()
+    }
+
+    /// [`LIMIT_OPTIONS_DIALOG`] with its option rows replaced by `labels`,
+    /// numbered from 1, the fixture's `›` cursor on option `focus` (0-based).
+    #[must_use]
+    pub fn limit_options_dialog(labels: &[&str], focus: usize) -> Vec<String> {
+        let rows = screen(LIMIT_OPTIONS_DIALOG);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with(" › 1. "))
+            .expect("the fixture's first option row");
+        let mut out: Vec<String> = rows[..first].to_vec();
+        for (k, label) in labels.iter().enumerate() {
+            let cursor = if k == focus { '›' } else { ' ' };
+            out.push(format!(" {cursor} {}. {label}", k + 1));
+        }
+        out.extend(
+            rows[first..]
+                .iter()
+                .skip_while(|r| !r.trim().is_empty())
+                .cloned(),
+        );
+        out
     }
 
     /// A fixture's provenance line (`claude-code 2.1.280 · MEASURED …`).
@@ -4035,6 +4343,7 @@ mod tests {
             (API_ERROR_529, "claude-code 2.1.283 · SYNTHETIC"),
             (END_SESSION_LIMIT, "claude-code (unrecorded) · HAND-BUILT"),
             (END_OFFER, "claude-code (unrecorded) · HAND-BUILT"),
+            (LIMIT_OPTIONS_DIALOG, "claude-code 2.1.282 · HAND-BUILT"),
             (LOGIN_EXPIRED, "claude-code 2.1.281 · HAND-BUILT 2026-09-27"),
             (
                 GOAL_ACTIVE_SUGGESTION,
@@ -4090,6 +4399,78 @@ mod tests {
                 "{line}"
             );
             assert!(!screen(text)[0].starts_with("# "), "{line}");
+        }
+    }
+
+    /// The API-error, retry, `/fast` and footer screens measured on 2.1.283
+    /// (2026-09-27): each names the headless aterm it was read under, the
+    /// launch (a scratch Claude config, a dummy key, an unresolvable base
+    /// URL) and the equal-length redaction on line 1, and is a whole
+    /// 50-row screen with the banner's scratch path redacted.
+    #[test]
+    fn every_2026_09_27_measured_fixture_names_its_provenance() {
+        for text in MEASURED_2026_09_27 {
+            let line = provenance(text).expect("a provenance line");
+            assert!(
+                line.starts_with(
+                    "claude-code 2.1.283 · MEASURED 2026-09-27, `aterm ctl text` of a private headless aterm 0.96.0 ("
+                ) && line.contains("`ANTHROPIC_BASE_URL=https://api.invalid`")
+                    && line.ends_with("· user, host and scratch-path UUID redacted at equal length"),
+                "{line}"
+            );
+            let rows = screen(text);
+            assert_eq!(rows.len(), 50, "{line}");
+            assert!(!rows[0].starts_with("# "), "{line}");
+            assert!(
+                text.contains("-Users-user000-aterm/00000000-0000-0000-0000-000000000000/")
+                    || text.contains("/…/00000000-0000-0000-0000-000000000000/"),
+                "{line}"
+            );
+        }
+    }
+
+    /// Every screen measured on 2.1.283 on 2026-09-27.
+    const MEASURED_2026_09_27: [&str; 14] = [
+        API_ERROR_ENOTFOUND_MEASURED,
+        API_ERROR_ENOTFOUND_80_MEASURED,
+        API_RETRYING_MEASURED,
+        API_RETRYING_DRAFT_MEASURED,
+        API_RETRYING_QUEUED_MEASURED,
+        API_RETRYING_QUEUED_80_MEASURED,
+        API_RETRYING_QUEUED_DRAFT_MEASURED,
+        API_ERROR_QUEUED_SENT_MEASURED,
+        API_ERROR_TWICE_MEASURED,
+        FAST_REFUSED_IDLE_MEASURED,
+        FAST_REFUSED_IDLE_80_MEASURED,
+        FAST_REFUSED_BUSY_MEASURED,
+        FAST_REFUSED_BUSY_80_MEASURED,
+        FOOTER_PLAN_API_KEY_MEASURED,
+    ];
+
+    /// Every screen measured on 2.1.284 on 2026-09-28.
+    const MEASURED_2026_09_28: [&str; 3] = [
+        API_ERROR_TALL_PANE_MEASURED,
+        FAST_REFUSED_BUSY_UNDER_COMPOSER_MEASURED,
+        FOOTER_AUTO_EFFORT_HINT_MEASURED,
+    ];
+
+    /// The 2.1.284 captures name their provenance and are whole 50-row
+    /// screens (2026-09-28).
+    #[test]
+    fn every_2026_09_28_measured_fixture_names_its_provenance() {
+        for text in MEASURED_2026_09_28 {
+            let line = provenance(text).expect("a provenance line");
+            assert!(
+                line.starts_with("claude-code 2.1.284 · MEASURED 2026-09-28, `aterm ctl text` of a private headless aterm (144x50)")
+                    && line.contains("`ANTHROPIC_BASE_URL=https://api.invalid`")
+                    && line.ends_with("· user, host and scratch path redacted"),
+                "{line}"
+            );
+            assert_eq!(screen(text).len(), 50, "{line}");
+            assert!(
+                !text.contains("cutefox") && !text.contains("Isabella"),
+                "{line}"
+            );
         }
     }
 
@@ -4733,6 +5114,115 @@ mod tests {
                 Some("Accessing workspace:")
             );
         }
+    }
+
+    /// THE USAGE-LIMIT DIALOG (module header): the owner's screen of
+    /// 2026-09-24 is a box of its own kind, not `other`; the wait row is the
+    /// one option with a role, in each of its three spellings and wherever
+    /// it sits; a menu with no wait row (or with the armed wait's cancel in
+    /// its place) is still the dialog, with no role to choose; and the same
+    /// question over other rows is not it.
+    #[test]
+    fn the_limit_options_dialog_reads_its_wait_row_by_label() {
+        const STOP: &str = "Stop and wait for limit to reset";
+        const CREDITS: &str = "Switch to usage credits";
+        let r = screen(LIMIT_OPTIONS_DIALOG);
+        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+        let p = parse_prompt_v2(&r).expect("the dialog");
+        assert_eq!(p.kind, PromptKind::UsageLimit);
+        assert_eq!(p.kind.name(), "usage-limit");
+        assert_eq!(p.title, "What do you want to do?");
+        assert_eq!(p.select, Select::Digits);
+        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                STOP,
+                "Wait here, then continue automatically at Sep 27 at 7pm",
+                CREDITS
+            ]
+        );
+        let roles: Vec<Role> = p.options.iter().map(|o| o.role).collect();
+        assert_eq!(roles, [Role::Other, Role::AutoResume, Role::Other]);
+        assert_eq!(p.focused().map(|o| o.label.as_str()), Some(STOP));
+        assert_eq!(
+            p.command,
+            "Wait here, then continue automatically at Sep 27 at 7pm"
+        );
+        assert_eq!(parse_prompt(&r).expect("v1").command, p.command);
+        // The `❯` every measured box draws reads the same.
+        let arrow: Vec<String> = r.iter().map(|x| x.replace('›', "❯")).collect();
+        assert_eq!(parse_prompt_v2(&arrow), Some(p.clone()));
+
+        // The three spellings, and the wait row first.
+        for wait in [
+            "Wait here, then continue automatically shortly",
+            "Wait here, then continue automatically when the limit resets",
+            "Wait here, then continue automatically at 7:30pm",
+        ] {
+            for (labels, at) in [([STOP, wait, CREDITS], 1), ([wait, STOP, CREDITS], 0)] {
+                let d = limit_options_dialog(&labels, 0);
+                let p = parse_prompt_v2(&d).expect("the dialog");
+                assert_eq!(p.kind, PromptKind::UsageLimit, "{labels:?}");
+                let waits: Vec<usize> = (0..p.options.len())
+                    .filter(|&k| p.options[k].role == Role::AutoResume)
+                    .collect();
+                assert_eq!(waits, [at], "{labels:?}");
+                assert_eq!(p.command, wait);
+            }
+        }
+
+        // No wait row, or the armed wait's cancel where it was: the dialog,
+        // and nothing with a role.
+        for labels in [
+            &[STOP, CREDITS][..],
+            &[STOP, "Don’t continue automatically", CREDITS],
+            &[STOP, "Wait here, then continue automatically at ", CREDITS],
+            &["Upgrade your plan", STOP],
+        ] {
+            let d = limit_options_dialog(labels, 0);
+            let p = parse_prompt_v2(&d).expect("the dialog");
+            assert_eq!(p.kind, PromptKind::UsageLimit, "{labels:?}");
+            assert!(
+                p.options.iter().all(|o| o.role == Role::Other),
+                "{labels:?}: {:?}",
+                p.options
+            );
+            assert_eq!(p.command, "", "{labels:?}");
+        }
+
+        // Negative controls: the same question over rows that are not the
+        // limit menu's is any dialog's; the wait label under another title
+        // is not this dialog.
+        let d = limit_options_dialog(&["Keep the branch", "Drop it"], 0);
+        assert_eq!(parse_prompt_v2(&d).map(|p| p.kind), Some(PromptKind::Other));
+        // 2.1.282's trial-expired dialog asks the same question over spend
+        // and upgrade rows: not a usage limit (its badge must not say one).
+        for labels in [
+            &["Upgrade to Max", "Add funds to continue with usage credits"][..],
+            &["Upgrade your plan", CREDITS],
+            &["Stop", "Ask your admin for more usage"],
+        ] {
+            let d = limit_options_dialog(labels, 0);
+            let p = parse_prompt_v2(&d).expect("a box");
+            assert_eq!(p.kind, PromptKind::Other, "{labels:?}");
+            assert!(p.options.iter().all(|o| o.role != Role::AutoResume));
+        }
+        let mut d =
+            limit_options_dialog(&[STOP, "Wait here, then continue automatically shortly"], 0);
+        let title = d
+            .iter()
+            .position(|x| x.trim() == "What do you want to do?")
+            .expect("the title");
+        d[title] = " What would you like?".to_string();
+        let p = parse_prompt_v2(&d).expect("a box");
+        assert_eq!(p.kind, PromptKind::Other);
+        assert!(p.options.iter().all(|o| o.role != Role::AutoResume));
+        assert!(!is_wait_label("Don't continue automatically"));
+        assert!(!is_wait_label("Wait here, then continue automatically"));
+        assert!(!is_wait_label(
+            "Wait here, then continue automatically soon"
+        ));
     }
 
     /// NOT A BOX: a worker's message that says `press Esc to cancel`, a
@@ -5517,12 +6007,63 @@ mod tests {
 
     #[test]
     fn option_rows_need_a_number_a_dot_and_a_space() {
-        assert_eq!(option_row(" ❯ 1. Yes"), Some((1, "Yes".to_string())));
-        assert_eq!(option_row("   12. Many"), Some((12, "Many".to_string())));
-        assert_eq!(option_row("   2.5 GB free"), None);
-        assert_eq!(option_row("   2158    -    let x = 1;"), None);
-        assert_eq!(option_row("  1.Yes"), None);
-        assert_eq!(option_row("  ❯ 3. No"), Some((3, "No".to_string())));
+        assert_eq!(option_row(" ❯ 1. Yes", ARROW), Some((1, "Yes".to_string())));
+        assert_eq!(
+            option_row("   12. Many", ARROW),
+            Some((12, "Many".to_string()))
+        );
+        assert_eq!(option_row("   2.5 GB free", ARROW), None);
+        assert_eq!(option_row("   2158    -    let x = 1;", ARROW), None);
+        assert_eq!(option_row("  1.Yes", ARROW), None);
+        assert_eq!(option_row("  ❯ 3. No", ARROW), Some((3, "No".to_string())));
+    }
+
+    /// THE CURSOR (module header): `›` is a cursor only in a box titled the
+    /// usage-limit dialog's question. Claude Code draws `› ` as a row prefix
+    /// elsewhere (an async agent's latest activity), so an unnumbered `›`
+    /// row over a confirm footer under any other title is no box, as
+    /// before; the same row under the usage-limit title is its option.
+    #[test]
+    fn the_small_pointer_is_a_cursor_only_in_the_usage_limit_dialog() {
+        assert_eq!(cursors("Do you want to proceed?"), ARROW);
+        assert_eq!(cursors("What do you want to do?"), &['❯', '›']);
+        let screen = |title: &str| -> Vec<String> {
+            [
+                "",
+                &"─".repeat(60),
+                &format!(" {title}"),
+                "",
+                " › agent-3 is reading prompt.rs",
+                "",
+                " Enter to confirm · Esc to cancel",
+            ]
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect()
+        };
+        assert_eq!(parse_prompt_v2(&screen("Background agents")), None);
+        let p = parse_prompt_v2(&screen("What do you want to do?")).expect("a box");
+        assert_eq!(p.kind, PromptKind::Other);
+        assert_eq!(
+            p.focused().map(|o| o.label.as_str()),
+            Some("agent-3 is reading prompt.rs")
+        );
+        // The numbered dialog under another title: `›` is text, so its row
+        // is no option and `1.` has no cursor.
+        let mut d = limit_options_dialog(&["Keep the branch", "Drop it"], 0);
+        let t = d
+            .iter()
+            .position(|x| x.trim() == "What do you want to do?")
+            .expect("the title");
+        d[t] = " Pick one".to_string();
+        let p = parse_prompt_v2(&d).expect("a box");
+        let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Drop it"]);
+        assert!(
+            p.options
+                .iter()
+                .all(|o| !o.focused && o.role == Role::Other)
+        );
     }
 
     /// One HAND-BUILT 2.1.282 box and what it must read: its kind, title,

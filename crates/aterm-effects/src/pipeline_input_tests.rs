@@ -67,7 +67,7 @@ impl Host {
             input,
         };
         host.present();
-        assert!(host.pipeline.glow.v2_status().is_some());
+        assert!(host.pipeline.cursor.glow.v2_status().is_some());
         host
     }
 
@@ -90,7 +90,7 @@ impl Host {
     }
 
     fn credits(&self) -> usize {
-        self.pipeline.glow.in_flight_tally().credits
+        self.pipeline.cursor.glow.in_flight_tally().credits
     }
 
     /// Compare emitted content in tests; production `Status::fp` remains the
@@ -106,7 +106,7 @@ fn glow_frame_equality_rejects_equal_count_changed_content() {
     // Replay the count-only observer as the negative control, against a frame
     // genuinely emitted by the pipeline before corrupting one rendered field.
     fn count_only(host: &Host) -> [u64; 7] {
-        let status = host.pipeline.glow.v2_status().unwrap();
+        let status = host.pipeline.cursor.glow.v2_status().unwrap();
         [
             u64::from(status.quads),
             u64::from(status.halos),
@@ -129,7 +129,7 @@ fn glow_frame_equality_rejects_equal_count_changed_content() {
         !expected.under.is_empty(),
         "the real emitter must draw a ribbon"
     );
-    assert_ne!(host.pipeline.glow.v2_status().unwrap().fp, 0);
+    assert_ne!(host.pipeline.cursor.glow.v2_status().unwrap().fp, 0);
     assert_eq!(host.glow_frame(), expected);
     let summary = count_only(&host);
 
@@ -180,17 +180,28 @@ fn web_glyph_classes_reach_the_real_rainbow_renderer() {
                 host.echo(prefix);
             }
         }
-        assert!(web.pipeline.glow.ribbon_segments() > 0);
+        assert!(web.pipeline.cursor.glow.ribbon_segments() > 0);
         let mut differs_from_unclassified = false;
         for _ in 0..16 {
             web.note(ch);
             let width = aterm_grapheme::char_width(ch) as u16;
-            explicit
-                .pipeline
-                .glow
-                .note_typed_glyph(explicit.pipeline.now(), width, shifted, class);
+            // The typing CADENCE is not the class: the web seam heats it on
+            // every committed key (the rainbow block reads that energy), so
+            // both engine-level hosts are fed the same heat and only the
+            // glyph class can tell them apart.
+            for host in [&mut explicit, &mut historical] {
+                let now = host.pipeline.now();
+                host.pipeline.cursor.cadence.on_keystroke(now);
+            }
+            explicit.pipeline.cursor.glow.note_typed_glyph(
+                explicit.pipeline.now(),
+                width,
+                shifted,
+                class,
+            );
             historical
                 .pipeline
+                .cursor
                 .glow
                 .note_typed_cells(historical.pipeline.now(), width);
             for host in [&mut web, &mut explicit, &mut historical] {
@@ -262,9 +273,19 @@ fn web_delete_dispatch_reaches_erase_without_a_typed_replay() {
         host.echo(ch);
     }
     assert_eq!(host.credits(), 0);
-    let before = host.pipeline.glow.erase_momentum(host.pipeline.now());
+    let before = host
+        .pipeline
+        .cursor
+        .glow
+        .erase_momentum(host.pipeline.now());
     host.pipeline.note_console_input(PetInputKind::Delete);
-    assert!(host.pipeline.glow.erase_momentum(host.pipeline.now()) > before);
+    assert!(
+        host.pipeline
+            .cursor
+            .glow
+            .erase_momentum(host.pipeline.now())
+            > before
+    );
     host.term.process(b"\x08\x1b[K");
     host.present();
     assert_eq!(host.term.cursor().col, 9);

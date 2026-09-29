@@ -1599,22 +1599,23 @@ pub(crate) fn acquire_advisory_lock_within(
     }
 }
 
-/// An advisory lock [`acquire_advisory_lock_within`] took, released by `LOCK_UN`
-/// when this drops — not by the close alone. The retry above rides out a PEER'S
-/// fork residue; this removes OUR OWN. A child another thread forks while the lock
-/// is held holds a copy of every descriptor until it execs, so a lock released
-/// only by the close stays taken on that copy for the child's whole fork->execve
-/// window (523 ms at the pathological tail measured above), and the next contender
-/// — the next save, the config thread's `aterm.toml` write, the journal's 25 ms
-/// event-loop take of its own lock — waits out or is refused for a lock nobody
-/// holds. `LOCK_UN` releases the open file description itself, the child's copy
-/// included (the product fd-hygiene sweep of 2026-09-27). One `Drop` covers every
-/// exit, early refusals included.
+/// An advisory lock this crate took — through [`acquire_advisory_lock_within`], or
+/// a single `try_lock` (the Kitty Log's ledger pair, `aterm.log`'s rotation lock)
+/// — released by `LOCK_UN` when this drops, not by the close alone. The retry
+/// above rides out a PEER'S fork residue; this removes OUR OWN. A child another
+/// thread forks while the lock is held holds a copy of every descriptor until it
+/// execs, so a lock released only by the close stays taken on that copy for the
+/// child's whole fork->execve window (523 ms at the pathological tail measured
+/// above), and the next contender — the next save, the config thread's
+/// `aterm.toml` write, the journal's 25 ms event-loop take of its own lock, the
+/// Kitty Log's single-try flush — waits out or is refused for a lock nobody holds.
+/// `LOCK_UN` releases the open file description itself, the child's copy included
+/// (the product fd-hygiene sweep of 2026-09-27). One `Drop` covers every exit,
+/// early refusals included.
 pub(crate) struct HeldAdvisoryLock(File);
 
 impl HeldAdvisoryLock {
-    /// Adopt `lock_file`, which the caller has just locked through
-    /// [`acquire_advisory_lock_within`].
+    /// Adopt `lock_file`, which the caller has just locked.
     pub(crate) fn adopt(lock_file: File) -> Self {
         Self(lock_file)
     }

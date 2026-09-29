@@ -294,6 +294,15 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/consent_retire.rs",
     },
     GuardHelper {
+        // The PTY keeper link's one state lock (P3): `keeper_state()` returns
+        // the guard of the `KEEPER_STATE` static, which no call site locks by
+        // name. Named `keeper_state`, not `state`: a bare `state(` is many
+        // crates' accessor.
+        symbol: "keeper_state",
+        identity: "KEEPER_STATE",
+        def_file: "crates/aterm-gui/src/keeper_link.rs",
+    },
+    GuardHelper {
         symbol: "lock_fonts",
         identity: "chrome_fonts",
         def_file: "crates/aterm-gui/src/tray_raster.rs",
@@ -847,13 +856,17 @@ fn mask_cfg_test_items(text: &str) -> String {
 ///
 /// That one file is this crate's own `lazy_init.rs`, and it is the caveat the
 /// repair does not remove: a RAW STRING containing a line that is exactly
-/// `<indent>}` can still close a body early. It happens only in files that
-/// quote whole Rust programs — in practice this crate's fixtures, which is why
+/// `<indent>}` can still close a body early. It happens in files that quote
+/// Rust source in a raw string: this crate's fixtures, which is why
 /// [`crate::scope_census`] and `lazy_init` exclude `crates/aterm-census/src`
-/// from their scans, and why the lock-order and wasm scan sets (derived from
-/// `aterm-gui`'s and the wasm root's dependency closures) never contain it.
-/// Closing early is the subtractive direction, so it costs at most a false
-/// positive.
+/// from their scans, and since then shipped files' test modules too
+/// (`aterm-gui/src/app_native.rs`'s unix-only-scan PLANT, which the lock-order
+/// scan set reads). Closing early leaves the rest of the item VISIBLE, so to a
+/// reader that takes one line at a time it costs at most a false positive. A
+/// reader that carries literal state ACROSS lines must never run after this
+/// mask: the early end strands the string's closer, whose `"` it then reads as
+/// an opener for the rest of the file. OB-22 is that reader, so it blanks
+/// literals first ([`crate::held_guard::blank_non_code`]) and masks the result.
 pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
     mask_items_where(text, &|attr| gates.contains(&attr))
 }
@@ -2370,7 +2383,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let mut failures = 0usize;
     let _ = writeln!(
         log,
-        "=== gate lockorder (lock-order census: L0-DEADLOCK, lock-graph sense) ===\n\
+        "=== lock-order census (L0 deadlock, lock-graph sense) ===\n\
          \x20   root: {}",
         root.display()
     );
@@ -2387,9 +2400,9 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                  soundly determine the aterm-gui process closure from the workspace \
                  manifests, so it refuses to scan a guessed set (fail-closed).\n\
                  \x20       {e}\n\
-                 gate lockorder: FAILED — 1 obligation violation(s)."
+                 lock-order census: FAILED — 1 obligation violation(s)."
             );
-            return CensusOutcome { ok: false, log };
+            return CensusOutcome::red(log);
         }
     };
     log.push_str(&crate::scan_set::render_scan_set(&scan));
@@ -2507,10 +2520,10 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             log,
             "  ✗ FAIL [OB-7] ZERO lock-acquisition sites found under {} — the census \
              walked nothing (parser broke, or this root is not an aterm checkout?).\n\
-             gate lockorder: FAILED — 1 obligation violation(s).",
+             lock-order census: FAILED — 1 obligation violation(s).",
             scan.scan_dirs.join(", ")
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
 
     // Held calls through a `self.field.…` receiver, split by whether the field's
@@ -2711,10 +2724,10 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         let _ = write!(log, "{LOCK_PRECISION_NOTE}");
         let _ = writeln!(
             log,
-            "gate lockorder: FAILED — {failures} obligation violation(s) (registry/coverage \
+            "lock-order census: FAILED — {failures} obligation violation(s) (registry/coverage \
              stage; the graph stage did not run because its ground truth is broken)."
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
 
     // ---- Assemble the edge set: intra-fn pairs + the one-hop calls. ----
@@ -2937,26 +2950,23 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         let _ = write!(log, "{LOCK_PRECISION_NOTE}");
         let _ = writeln!(
             log,
-            "gate lockorder: FAILED — {failures} obligation violation(s). A lock-order \
+            "lock-order census: FAILED — {failures} obligation violation(s). A lock-order \
              cycle has NO waiver channel (L0-DEADLOCK: none, ever) — it can only be \
              fixed. This census blocks BOTH `targo --unverified run -p aterm-census -- \
              --locks` and the build of tools/freeze-safety-gate."
         );
-        return CensusOutcome { ok: false, log };
+        return CensusOutcome::red(log);
     }
 
     // ---- GREEN summary (with the honesty ledger). ----
     let _ = writeln!(
         log,
-        "gate lockorder: GREEN — {} acquisition site(s) across {} workspace crate(s) + {} \
+        "lock-order census: GREEN — {} acquisition site(s) across {} workspace crate(s) + {} \
          vendored crate(s) ({} blocking, {} try_*, {} OS file-advisory, {} raw-pointer \
          ptr::read); {} resolved identities; {} UNKNOWN-identity site(s) + {} vendored \
          UNKNOWN site(s); {} audited vocabulary-interior site(s); {} held-acquire \
          pair(s) ({} intra-fn, {} via one-hop calls; {} distinct ordered identity \
-         pairs); {} held call(s) through a `self.field.…` receiver NOT followed \
-         (foreign field type, callee name not unique in the corpus, or its one \
-         definition on the far side of a vendored namespace boundary — the \
-         census's second standing honesty gap, alongside UNKNOWN); \
+         pairs); {} held call(s) through a `self.field.…` receiver NOT followed; \
          0 self-edges; global lock graph ACYCLIC.",
         sites.len(),
         scan.scan_dirs.len(),
@@ -3196,7 +3206,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         scan.scan_dirs.join(", "),
         vendored_dirs.join(", ")
     );
-    CensusOutcome { ok: true, log }
+    CensusOutcome::green(log)
 }
 
 /// Iterative Tarjan strongly-connected components. Returns each SCC as a list
@@ -3315,6 +3325,14 @@ mod tests {
             "crates/aterm-gui/src/tray_raster.rs".to_string(),
             "fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {\n    \
              chrome_fonts().lock().unwrap()\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            // The PTY keeper link's state lock, spelled as the shipping helper
+            // is (the static, the poison-recovering adapter).
+            "crates/aterm-gui/src/keeper_link.rs".to_string(),
+            "fn keeper_state() -> std::sync::MutexGuard<'static, State> {\n    \
+             KEEPER_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
         files.push((
@@ -5089,352 +5107,30 @@ mod tests {
             .to_path_buf()
     }
 
+    /// ONE lock-order run over this tree, shared by every real-tree assertion
+    /// below (each used to pay for its own full walk).
+    fn this_tree() -> &'static CensusOutcome {
+        static RUN: std::sync::OnceLock<CensusOutcome> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| run_lock_order_census(&repo_root()))
+    }
+
     #[test]
     fn no_unknown_identities_on_this_tree() {
-        // The UNKNOWN count was driven to ZERO (2026-07-13) by naming every
-        // previously-unresolvable receiver and categorizing the one OS
-        // file-advisory lock — and HELD at zero through the same-day widening
-        // from 8 crates to the full 42-crate GUI-process closure (cfg(kani)
-        // masking, the raw-pointer ptr::read category, the pty-Windows
-        // lock_or_recover refactor, the Sentinel read_state rename). This
-        // pins it there: a new `self.0.lock()` / single-letter receiver
-        // reopens the honesty gap and fails here — name the receiver (see the
-        // UNKNOWN section's guidance), don't suppress the site.
-        let out = run_lock_order_census(&repo_root());
+        // Every receiver is NAMED (driven to zero 2026-07-13 and held there): a
+        // new `self.0.lock()` / single-letter receiver reopens the honesty gap
+        // and fails here — name the receiver, never suppress the site. The
+        // vendored half is held to zero the same way.
+        let out = this_tree();
         assert!(
             out.log.contains("0 UNKNOWN-identity site(s)"),
             "UNKNOWN-identity sites reappeared — resolve them by naming the \
              receiver, never by suppression:\n{}",
             out.log
         );
-    }
-
-    #[test]
-    fn file_advisory_locks_are_categorized_on_this_tree() {
-        // The six real OS file-advisory sites (`restore::with_restore_lock`'s
-        // sibling-lock flock over the restore manifest; the updater's
-        // install-ledger lock in aterm-update-core — its blocking `acquire`
-        // plus the bounded-wait `try_lock` loop `acquire_within` grew for the
-        // launch path; atpkg's `machine_apply_queue` flock; the log
-        // rotation's non-blocking `try_lock` in aterm-gui logging.rs, which
-        // `aterm.log` and `messages.log` both rotate through; and the harness's
-        // live-upgrade `sweep_lock` try_lock in aterm-agent) must be
-        // classified by File EVIDENCE, listed with their binding spans, and
-        // excluded from the mutex graph — existence-checked here so the
-        // classification cannot silently rot into UNKNOWN (or vanish).
-        //
-        // NOTE (2026-07-24): this named `crates/aterm-gui/src/kitty_log.rs` for
-        // the first site long after that flock moved to `restore.rs` — kitty_log
-        // has carried ZERO `.lock()` calls since. The assertion had been failing
-        // on `main` for an unknown span, i.e. this gate was dark. Naming the
-        // ACTUAL site restores its teeth.
-        //
-        // NOTE (2026-08-22): the update flock's constructor moved behind
-        // `FileLock::open_lock_file`, which stripped the binding of its lexical
-        // File evidence and silently GRAPHED the flock as an in-process mutex —
-        // this test is what caught it. The bindings now carry an explicit
-        // `: std::fs::File` ascription (compiler-enforced evidence the census
-        // accepts), and the count includes `acquire_within`'s try_lock loop.
-        //
-        // NOTE (2026-09-22): a FOURTH site — the unified message log's
-        // compaction guard (`messages_store::try_lock`, the sibling
-        // `messages.log.lock` try-lock in the kitty_log idiom; never blocking,
-        // held for one rewrite at load), docs/DESIGN-unified-messages-2026-09-21.md
-        // §3.7. Its binding is a `File` by construction (`OpenOptions::open`),
-        // which the census reads as File evidence.
-        //
-        // NOTE (2026-09-23): a FIFTH site — atpkg's `machine_apply_queue`
-        // (`<prefix>/machine.lock`, b90627b61, "Phase 3 review fixes"), held
-        // BLOCKING for one apply of the `[machine]` settings so the window's
-        // launch apply, a session's and a pass edge never walk `$HOME` renaming
-        // the same build directories together. Cross-process by purpose (each
-        // applier is its own atpkg process); its binding is a `File` by
-        // construction (`OpenOptions::open`). The gate was red on `main` from
-        // that commit until the note that first counted it.
-        //
-        // NOTE (2026-09-23, the ux/status-reporting merge): the SIXTH was
-        // aterm.log's rotation — the non-blocking `try_lock` on the log file
-        // that lets exactly one process rotate it (aterm-gui logging.rs), with
-        // the same explicit `: std::fs::File` ascription. Two branches each
-        // moved this count on the same day.
-        //
-        // NOTE (2026-09-23, design ruling 65): back to FIVE. messages.log now
-        // rotates while running through that same `logging::rotate_if_oversized`
-        // (its lock is `messages.log.lock`, the file the compaction guard took),
-        // so the compaction guard and `messages_store::try_lock` are deleted —
-        // one lock site serves both logs.
-        //
-        // NOTE (2026-09-23, origin/main merged into ux/status-reporting): SIX
-        // again — main added the harness's live-upgrade sweep lock
-        // (`upgrade_drive::sweep_lock`, `<harness state>/upgrade/sweep.lock`),
-        // a non-blocking `try_lock` so the window's host and a hand-run
-        // `aterm harness upgrade` never both type a notice into one session.
-        // Cross-process by purpose; a `File` by its binding's ascription. Main
-        // counted six WITH the message log's compaction guard and this branch
-        // five WITHOUT the sweep lock; the merged tree has the sweep lock and
-        // no compaction guard. The six, as the census lists them: restore.rs's
-        // manifest flock, update-core sys.rs's blocking `acquire` and its
-        // `acquire_within` try_lock loop, atpkg cli.rs's `machine_apply_queue`,
-        // aterm-gui logging.rs's rotation try_lock, and upgrade_drive.rs's
-        // `sweep_lock`.
-        //
-        // NOTE (2026-09-24, fin/integrate merged over origin/main): EIGHT — the
-        // six above plus atpkg's `lock::Flock::try_lock` and `Flock::lock_within`
-        // (fin/deflake 54ec81ca4), the one acquisition path of the store lock,
-        // the index probe's range locks and the head watch's shared file, which
-        // release by `LOCK_UN` on drop. Cross-process by purpose; a `File` by
-        // each binding's ascription. fin/deflake moved the store lock's old
-        // `open_store_lock` site into them. The census, not the notes, says
-        // eight.
-        //
-        // NOTE (2026-09-24, `9f5922003`): NINE — the eight above plus
-        // update-core's THIRD site, `FileLock::lock_open`
-        // (crates/aterm-update-core/src/sys.rs), a blocking `LOCK_EX` on a
-        // file the CALLER opened. It exists because the roster's read-only
-        // claim (atpkg-keys `provision.rs`) must take the rendezvous without
-        // ever creating it, which `acquire` cannot express — it opens the path
-        // itself. Same class as `acquire` in every other respect: blocking,
-        // cross-process by purpose, released by `LOCK_UN` on drop, and a
-        // `File` by the load-bearing ascription that commit deliberately
-        // re-states. That commit did not move this count, so main's gate went
-        // red here until two sessions fixed it the same afternoon — this note
-        // is both of their readings, which agreed. The census, not the notes,
-        // says nine.
-        //
-        // NOTE (2026-09-26, the toolchain leases `52bf9f6bc`): FOURTEEN — the
-        // nine above plus atpkg's `lease.rs`, five non-blocking `try_lock`s:
-        // `take` (a holder's own lease, held exclusive for its run), `probe_file`
-        // (is a lease's holder alive), and `reclaim`, `sweep` and `reap_taking`
-        // (gc's exclusive take of a subject's `.gate` before it deletes, so a
-        // holder arriving mid-delete waits for nothing and finds nothing half
-        // gone). Cross-process by purpose — a lease exists so gc and the trust
-        // flip in ANOTHER process see a run's toolchain in use — and a `File`
-        // by each binding. The leases landed with `gate lockorder` green and
-        // this pin red, because the gate counts and this test pins; the census,
-        // not the notes, says fourteen.
-        let out = run_lock_order_census(&repo_root());
-        assert!(
-            out.log.contains("14 OS file-advisory"),
-            "expected exactly the restore-manifest flock, update-core's three \
-             sites (blocking acquire, the caller-opened `lock_open`, and the \
-             bounded-wait try_lock loop), atpkg's machine-apply queue, the log \
-             rotation's try_lock, the harness's upgrade sweep lock, atpkg's \
-             two Flock acquisitions and its five lease sites in the advisory \
-             category:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("crates/aterm-gui/src/restore.rs")
-                && out.log.contains("crates/aterm-update-core/src/sys.rs")
-                && out.log.contains("fn `lock_open`")
-                && !out.log.contains("crates/aterm-gui/src/messages_store.rs")
-                && out.log.contains("crates/atpkg/src/cli.rs")
-                && out.log.contains("fn `machine_apply_queue`")
-                && out.log.contains("crates/aterm-gui/src/logging.rs")
-                && out
-                    .log
-                    .contains("crates/aterm-agent/src/harness/upgrade_drive.rs")
-                && out.log.contains("fn `sweep_lock`")
-                && out.log.contains("crates/atpkg/src/lock.rs")
-                && out.log.contains("fn `lock_within`")
-                && out.log.contains("crates/atpkg/src/lease.rs")
-                && out.log.contains("fn `take`")
-                && out.log.contains("fn `reclaim`")
-                && out.log.contains("proven std::fs::File by its binding at"),
-            "each advisory listing must carry its audit evidence:\n{}",
-            out.log
-        );
-    }
-
-    #[test]
-    fn raw_pointer_reads_are_categorized_on_this_tree() {
-        // The one real `core::ptr::read` site — the vendored indexmap
-        // `extract.rs` walk (categorized by the PROPAGATED evidence:
-        // `entries.as_mut_ptr()` seeds `base`, `base.add(current)` extends to
-        // `item`) — must be classified by raw-pointer EVIDENCE, listed, and
-        // excluded from the mutex graph — never UNKNOWN, never misread as an
-        // RwLock identity. The lz4 block codec's three sites went with its
-        // never-built unsafe encoder/sink paths (the crate forbids `unsafe`).
-        let out = run_lock_order_census(&repo_root());
-        assert!(
-            out.log.contains("1 raw-pointer ptr::read"),
-            "expected exactly the one indexmap ptr::read site:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("vendor/indexmap/src/inner/extract.rs"),
-            "each raw-pointer listing must name its site:\n{}",
-            out.log
-        );
-        assert!(
-            !out.log.contains("input_ptr(") && !out.log.contains("source_ptr("),
-            "raw pointers must not appear as resolved lock identities:\n{}",
-            out.log
-        );
-        assert!(
-            !out.log.contains("indexmap::item("),
-            "the indexmap ptr walk must not appear as a resolved lock identity:\n{}",
-            out.log
-        );
-    }
-
-    #[test]
-    fn scanned_set_covers_the_full_gui_process_closure() {
-        // The scan set is DERIVED (scan_set::derive_gui_scan_set) — the full
-        // aterm-gui process surface. The exact member list is pinned by
-        // scan_set's derived_closure_matches_the_pinned_canary, and the crate
-        // COUNT the transcript must report is that pin's length — never a
-        // literal retyped here: the literal sat at 51 while the pin (and the
-        // tree) were at 52, so this test failed for a crate the canary had
-        // already been made to review. One reviewed list, one count. This
-        // asserts the census actually WALKS the derived set and reports its
-        // provenance + exclusions in the transcript.
-        // The closure grew as first-party crates replaced third-party ones
-        // (aterm-winit-keymap out of aterm-types, aterm-agent + aterm-ctl with
-        // the embedded operator, aterm-digest for sha2+hmac, aterm-time for
-        // web-time, aterm-regex for regex, aterm-primer with the agent
-        // auto-prime) — which is exactly why the count is derived, not typed.
-        let pinned = crate::scan_set::test_fixtures::PINNED_GUI_CLOSURE.len();
-        // DERIVED for the same reason, and it had drifted the same way: the
-        // vendored half stayed a literal `5` while the winnow fork left the
-        // tree with `toml`/`toml_edit`, so this test failed for a retirement
-        // the registry had already been made to review. Count the registry's
-        // Scanned entries — the build-time-only ones are excluded from the
-        // process and reported separately.
-        let scanned_vendored = crate::scan_set::REVIEWED_VENDORED_CRATES
-            .iter()
-            .filter(|v| matches!(v.mode, crate::scan_set::VendoredMode::Scanned { .. }))
-            .count();
-        let out = run_lock_order_census(&repo_root());
-        assert!(
-            out.log.contains(&format!(
-                "across {pinned} workspace crate(s) + {scanned_vendored} vendored crate(s)"
-            )),
-            "the census must report the full derived closure ({pinned} crates, the \
-             canary's pin) + the {scanned_vendored} scanned vendored crate(s):\n{}",
-            out.log
-        );
-        assert!(
-            out.log
-                .contains("scan set: DERIVED from the workspace manifests"),
-            "the derivation provenance must be printed every run:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("excluded proc-macro crate(s)")
-                && out.log.contains("aterm-error-derive"),
-            "the proc-macro exclusion must be reported, never silent:\n{}",
-            out.log
-        );
-        assert!(
-            out.log
-                .contains("vendored [patch] crate(s) SCANNED in vendored-identity mode")
-                && out.log.contains("winit (vendor/winit"),
-            "the scanned vendored crates must be reported, never silent:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("REVIEWED build-time-only")
-                && out.log.contains("pkg-config (vendor/pkg-config)"),
-            "the build-dep-only classification must be reported, never silent:\n{}",
-            out.log
-        );
-    }
-
-    #[test]
-    fn vendored_identity_mode_covers_the_linked_forks_on_this_tree() {
-        // The vendored-coverage canary (the vendor trees are pinned in-repo,
-        // so these counts are as stable as any other pin; a vendor bump that
-        // changes them is exactly the reviewable diff we want). Survey
-        // 2026-07-13, winit 0.30.13: the macOS GUI process compiles TWO
-        // winit lock sites (event.rs InnerSizeWriter::request_inner_size;
-        // macos/window_delegate.rs scale-factor round-trip) — note they are
-        // the SAME Arc<Mutex> reached through two receiver names, so they
-        // SPLIT (the stated lexical posture, under-reporting the pair as two
-        // identities; harmless here since neither nests). winnow used to
-        // contribute three stderr-stream locks here as `winnow::writer`; that
-        // fork left the tree when `toml`/`toml_edit` were retired for
-        // aterm-toml, so the identity is gone with it and the assertion below
-        // no longer names it. indexmap/libm/smol_str: zero sites, the walker
-        // re-checks that claim every run. The non-macOS winit backends are labeled slices, counted and
-        // never graphed.
-        let out = run_lock_order_census(&repo_root());
-        assert!(
-            out.log
-                .contains("winit (vendor/winit): 2 graphed site(s), 0 UNKNOWN, 0 categorized"),
-            "the winit macOS-slice surface changed — re-audit the vendored \
-             registry entry:\n{}",
-            out.log
-        );
-        assert!(
-            out.log.contains("winit::inner(1)") && out.log.contains("winit::new_inner_size(1)"),
-            "the vendored identities must be namespaced in the ledger:\n{}",
-            out.log
-        );
-        // RE-AUDITED 2026-08-31, linux 107 -> 110. The three new sites arrived
-        // with 48f847478 ("--headless no longer requires the display server it
-        // exists to do without"), which added
-        // `vendor/winit/src/platform_impl/linux/headless.rs` — a 546-line
-        // headless backend whose event queue is one `Arc<Mutex<VecDeque<T>>>`
-        // with exactly three `.lock()` sites (push, is-empty, pop). No other
-        // slice moved, which is itself part of the audit: a change that touched
-        // several slices would mean something other than this commit.
-        //
-        // THEY STAY LABEL-ONLY, and that is the finding rather than the number.
-        // The linux slice is counted and never graphed (macOS is the graphed
-        // one), so these cannot enter the lock graph or form an ordered pair
-        // with any aterm identity — they are unreachable from the artifact this
-        // census judges. Bumping the pin without saying that would make the next
-        // reader think a count was rubber-stamped.
-        //
-        // RE-AUDITED 2026-09-15, linux 110 -> 119. ONE commit moved it:
-        // c5326f2d8 ("a native Wayland clipboard — copy, paste, copy-on-select
-        // and OSC 52 work with no XWayland"), the only commit to touch ANY
-        // registered linux-slice path since the 110 pin (`git log --since
-        // 2026-08-31 -- src/platform_impl/linux src/platform/{x11,wayland,
-        // startup_notify}.rs` returns it and 42b2affd5, whose linux hunks are
-        // six lines carrying no acquisition token). It adds
-        // `platform_impl/linux/wayland/clipboard.rs`, 452 lines holding TEN
-        // `.lock()` tokens — nine counted, the tenth at line 449 inside the
-        // file's own `#[cfg(test)] mod tests`, which `mask_cfg_test_items`
-        // blanks. 110 + 9 = 119, and no other slice moved (windows/web/android/
-        // ios/orbital are byte-identical pins), which is itself part of the
-        // audit: a change touching several slices would mean something other
-        // than this commit.
-        //
-        // THE RE-AUDIT THE PIN ASKS FOR — no new lock EDGE, on either side of
-        // the vendor boundary:
-        //   * The new code owns exactly two mutexes, `WaylandClipboard.sender`
-        //     (`Arc<Mutex<Sender<ClipboardRequest>>>`) and `.shared`
-        //     (`Arc<Mutex<Shared>>`), and NO site holds one while acquiring the
-        //     other, so the pair is never ordered and no ABBA is expressible.
-        //     `copy` closes its `if let Ok(mut shared) = self.shared.lock()`
-        //     block BEFORE `send` takes `sender`; `paste` reads the own slot
-        //     through `paste_owned` (guard dropped with the statement) and only
-        //     then sends; `send` holds `sender` across an UNBOUNDED-channel
-        //     `Sender::send`, which cannot block. Every loop-thread handler
-        //     (`clipboard_disown`, `clipboard_paste`, `clipboard_send_request`,
-        //     `PrimarySelectionSourceHandler::send_request`) takes `shared`
-        //     alone.
-        //   * The one bounded WAIT, `receiver.recv_timeout(PASTE_TIMEOUT)` in
-        //     `paste`, is performed holding NOTHING — the hazard shape this
-        //     census exists to name, and it is not present.
-        //   * The aterm side of the same commit (crates/aterm-gui's
-        //     clipboard.rs, clipboard_wayland.rs, lib.rs, +67 lines) adds ZERO
-        //     acquisition tokens, so the graphed half of the census sees no new
-        //     site at all — OB-7 stays green on its own evidence, not on this
-        //     note's say-so.
-        assert!(
-            out.log
-                .contains("linux 119, windows 47, web 4, android 0, ios 1, orbital 7"),
-            "the per-platform slice counts must be reported (never silent); a \
-             changed count means the vendored winit tree changed — re-audit:\n{}",
-            out.log
-        );
         assert!(
             out.log.contains("+ 0 vendored UNKNOWN site(s)"),
-            "vendored UNKNOWNs reappeared — they are summarized per crate below; \
-             re-audit the new sites:\n{}",
+            "vendored UNKNOWNs reappeared — they are summarized per crate in the \
+             log; re-audit the new sites:\n{}",
             out.log
         );
     }
@@ -5519,7 +5215,7 @@ mod tests {
         // Rot canary: the per-session `term` mutex is aterm's dominant lock.
         // If the walker stops seeing it in force, the census went blind — a
         // GREEN from a blind census is worthless.
-        let out = run_lock_order_census(&repo_root());
+        let out = this_tree();
         let ids_line = out
             .log
             .lines()

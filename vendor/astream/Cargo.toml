@@ -27,16 +27,17 @@ members = [
 # appear in these members — the evidence gate enforces this (see gate.rs).
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+repository = "https://github.com/alabsystems/astream"
+authors = ["Andrew Yates"]
 # 1.89 is the floor `BrokerLog` needs for `File::try_lock`/`unlock` (the exclusive
 # log lock); the toolchain is pinned at 1.95 in rust-toolchain.toml.
 rust-version = "1.89"
 
 [workspace.dependencies]
-astream-wire = { path = "crates/astream-wire" }
+astream-wire = { path = "crates/astream-wire", version = "0.1.0" }
 # Third-party (crates.io only — no git, no path-to-private):
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

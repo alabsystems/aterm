@@ -258,6 +258,14 @@ flags! {
         WUSR = libc::S_IWUSR;
         /// `S_IXUSR` — 0o100.
         XUSR = libc::S_IXUSR;
+        /// `S_IRGRP` — 0o040.
+        RGRP = libc::S_IRGRP;
+        /// `S_IWGRP` — 0o020.
+        WGRP = libc::S_IWGRP;
+        /// `S_IROTH` — 0o004.
+        ROTH = libc::S_IROTH;
+        /// `S_IWOTH` — 0o002.
+        WOTH = libc::S_IWOTH;
     }
 }
 

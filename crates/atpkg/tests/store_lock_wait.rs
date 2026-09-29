@@ -871,6 +871,58 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
     );
 }
 
+/// …AND BEHIND A PASS THAT FAILED ONLY FOR ITS CACHED INDEX IT EXITS AS THAT PASS DID
+/// (2026-09-26). The holder's pass ran on the §14 cache (the listing refused, a rate limit)
+/// and no member failed: it exited 1 with nothing on stderr, and the record says so for that
+/// pass end (`stale_index_only_pass_seq`). The child that waited stands down with its line
+/// on STDOUT and stderr silent, exit 1 — so the window's rule for a markerless exit 1 with
+/// empty stderr over a cached-index record reads a stale index, not "Package update
+/// failed" (until this, the line went to stderr and the window posted the failure). The
+/// holder's record stays the holder's.
+#[test]
+fn a_waiting_update_stands_down_quietly_behind_a_pass_that_failed_only_for_its_cached_index() {
+    use aterm_update_core::pkg_check::PassOutcome;
+    let fx = Fixture::new("behind-cached-index");
+    let guard = fx.hold();
+    let mut child = stream(fx.spawn(&["update", "--wait-lock", "60"]));
+    child.wait_for_line(&waiting_line(), ANNOUNCE_WITHIN);
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ended = aterm_types::rfc3339::format_rfc3339(unix);
+    let layout = fx.layout();
+    let mut record = atpkg::status::read(&layout).unwrap_or_default();
+    record.outcome = format!(
+        "up to date (index build 46) {}GitHub rate limit hit (HTTP 403))",
+        atpkg::status::INDEX_FROM_CACHE_CLAUSE
+    );
+    atpkg::status::write(&layout, &record).unwrap();
+    atpkg::status::stamp_pass_end_recorded(&layout, &ended, PassOutcome::Failed, 0, true).unwrap();
+    drop(guard);
+    let (status, _, stdout, stderr) = child.finish(Duration::from_secs(20));
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "stdout: {stdout:?}; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("the last update failed"),
+        "the holder said nothing on stderr, and neither does this: {stderr}"
+    );
+    assert!(
+        stdout
+            .iter()
+            .any(|l| l.contains("the last update failed") && l.contains("index from cache")),
+        "the line is said, on stdout: {stdout:?}"
+    );
+    let after = atpkg::status::read(&layout).expect("the holder's record");
+    assert!(
+        atpkg::status::stale_index_only_end(&after),
+        "the record is the holder's: {after:?}"
+    );
+}
+
 /// A FULL PASS WITH NOTHING TO CHECK STILL RECORDS ITS END (2026-09-24): with nothing
 /// installed and the set not owed, `update` says so, exits 0 and records `last_pass = ok`
 /// — the end the schedulers count their walk from — and no success, since nothing was

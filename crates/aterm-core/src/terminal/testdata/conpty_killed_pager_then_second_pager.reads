@@ -1,0 +1,78 @@
+# Finding [13] re-verification: 40 history rows, less, less killed with Stop-Process,
+# Write-Output post-kill-A and post-kill-B, less C:\Windows\win.ini, q.
+# One PTY read per line, as the `cast` tap recorded them (2026-09-27, Windows 11 build 26200
+# inbox ConPTY, pwsh 7.6.6 with shell integration, less from Git for Windows, 80 by 24).
+# Escapes: \e ESC, \a BEL, \b BS, \r CR, \n LF, \\ backslash; no other control byte occurs.
+# The first read is conhost's mode requests; the rest starts at the screen Clear-Host
+# blanked. The machine name in OSC 7 is replaced (never displayed: no cell moves).
+\e[?9001h\e[?1004h
+\e[?25l\e[H\e[?25h
+\e[?25l\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\e[H\e[?25h
+\e[?25l\e[3J\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\e[H\e[?25h\e]133;D;0;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]7;file://host/C:/\a\e]0;C:\\\a\e]133;A;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\aPS C:\\> \e]133;B;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e[?25l
+\e[97m1\e[90m..\e[97m40 \e[37m| \e[93m% \e[37m{ \e[36m"clean history \e[92m$_\e[36m" \e[37m}\e[?25h
+\e[m\r\n\e]633;E;1..40\\x20|\\x20%\\x20{\\x20"clean\\x20history\\x20$_"\\x20};id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]0;1..40 | % { "clean history $_" }\a\e]133;C;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+clean history 1\r\nclean history 2\r\nclean history 3\r\nclean history 4\r\nclean history 5\r\nclean history 6\r\nclean history 7\r\nclean history 8\r\nclean history 9\r\nclean history 10\r\nclean history 11\r\nclean history 12\r\nclean history 13\r\nclean history 14\r\nclean history 15\r\nclean history 16\r\nclean history 17\r\nclean history 18\r\nclean history 19\r\nclean history 20\r\nclean history 21\r\nclean history 22\r\nclean history 23\r
+\nclean history 24\r
+\nclean history 25\r
+\n
+clean history 26\r
+\nclean history 27\r
+\nclean history 28\r
+\nclean history 29\r
+\nclean history 30\r
+\nclean history 31\r
+\nclean history 32\r
+\nclean history 33\r
+\nclean history 34\r
+\nclean history 35\r
+\nclean history 36\r
+\nclean history 37\r
+\nclean history 38\r
+\nclean history 39\r
+\nclean history 40\r
+\n\e]133;D;0;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]7;file://host/C:/\a\e]0;C:\\\a\e]133;A;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\aPS C:\\> \e]133;B;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e[?25l
+\e[37m& \e[36m'C:\\Program Files\\Git\\usr\\bin\\less.exe' \e[37mC:\\Users\\Public\\atfx-183c60f6.
+\e[m\r\n\e[37m\e[23;9H& \e[36m'C:\\Program Files\\Git\\usr\\bin\\less.exe' \e[37mC:\\Users\\Public\\atfx-183c60f6.txt\e[?25h
+\e[m
+\r\n\e]633;E;&\\x20'C:\\\\Program\\x20Files\\\\Git\\\\usr\\\\bin\\\\less.exe'\\x20C:\\\\Users\\\\Public\\\\atfx-183c60f6.txt;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e]0;& 'C:\\Program Files\\Git\\usr\\bin\\less.exe' C:\\Users\\Public\\atfx-1\a\e]133;C;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e[?1049h
+\e[?25l\e[H\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\e[?25h\e[22;0;0t
+\e[?1h
+\e=
+long file row 1\r\nlong file row 2\r\nlong file row 3\r\nlong file row 4\r\nlong file row 5\r\nlong file row 6\r\nlong file row 7\r\nlong file row 8\r\nlong file row 9\r\nlong file row 10\r\nlong file row 11\r\nlong file row 12\r\nlong file row 13\r\nlong file row 14\r\nlong file row 15\r\nlong file row 16\r\nlong file row 17\r\nlong file row 18\r\nlong file row 19\r\nlong file row 20\r\nlong file row 21\r\nlong file row 22\r\nlong file row 23
+\r\n\e[7mC:\\Users\\Public\\atfx-183c60f6.txt\e[27m\e[K
+\r
+long file row 24\e[K\r\nlong file row 25\r\nlong file row 26\r\nlong file row 27\r\nlong file row 28\r\nlong file row 29\r\nlong file row 30\r\nlong file row 31\r\nlong file row 32\r\nlong file row 33\r\nlong file row 34\r\nlong file row 35\r\nlong file row 36\r\nlong file row 37\r\nlong file row 38\r\nlong file row 39\r\nlong file row 40\r\nlong file row 41\r\nlong file row 42\r\nlong file row 43\r\nlong file row 44\r\nlong file row 45\r\nlong file row 46
+\r\n:
+\r
+\n\e]133;D;-1;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]7;file://host/C:/\a\e]0;C:\\\a\e]133;A;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\aPS C:\\> \e]133;B;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e[93mWrite-Output \e[37mpost-kill-A
+\e[m
+\r\n\e]633;E;Write-Output\\x20post-kill-A;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]0;Write-Output post-kill-A\a\e]133;C;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+post-kill-A\r
+\n
+\e]133;D;0;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]7;file://host/C:/\a\e]0;C:\\\a\e]133;A;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\aPS C:\\> \e]133;B;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e[93mWrite-Output \e[37mpost-kill-B
+\e[m\r\n\e]633;E;Write-Output\\x20post-kill-B;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]0;Write-Output post-kill-B\a\e]133;C;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+post-kill-B\r
+\n\e]133;D;0;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]7;file://host/C:/\a\e]0;C:\\\a\e]133;A;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\aPS C:\\> \e]133;B;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e[37m&\e[97m\e[2m\e[3m 'C:\\Program Files\\Git\\usr\\bin\\less.exe' C:\\Users\\Public\\atfx-183c60f6.
+\e[?25l\e[m\r\n\e[37m\e[23;9H& \e[36m'C:\\Program Files\\Git\\usr\\bin\\less.exe' \e[37mC:\\Windows\\win.ini            \e[m\r\n\e[23;69H\e[?25h
+\r\n\e]633;E;&\\x20'C:\\\\Program\\x20Files\\\\Git\\\\usr\\\\bin\\\\less.exe'\\x20C:\\\\Windows\\\\win.ini;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e]0;& 'C:\\Program Files\\Git\\usr\\bin\\less.exe' C:\\Windows\\win.ini\a\e]133;C;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a
+\e[?25l\e[H\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\e[?25h\e[?1049h
+\e[?25l\e[H\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\r\n\e[K\e[?25h\e[22;0;0t
+\e[?1h
+\e=
+; for 16-bit app support\r\n[fonts]\r\n[extensions]\r\n[mci extensions]\r\n[files]\r\n[Mail]\r\nMAPI=1
+\r\n\e[7mC:\\Windows\\win.ini (END)\e[27m\e[K
+\r
+\e[?1l
+\e>
+\e[K\e[?1049l
+\e[23;0;0t
+\e[?25l\e[Hclean history 20\e[K\r\nclean history 21\e[K\r\nclean history 22\e[K\r\nclean history 23\e[K\r\nclean history 24\e[K\r\nclean history 25\e[K\r\nclean history 26\e[K\r\nclean history 27\e[K\r\nclean history 28\e[K\r\nclean history 29\e[K\r\nclean history 30\e[K\r\nclean history 31\e[K\r\nclean history 32\e[K\r\nclean history 33\e[K\r\nclean history 34\e[K\r\nclean history 35\e[K\r\nclean history 36\e[K\r\nclean history 37\e[K\r\nclean history 38\e[K\r\nclean history 39\e[K\r\nclean history 40\e[K\r\nPS C:\\> \e[37m& \e[36m'C:\\Program Files\\Git\\usr\\bin\\less.exe' \e[37mC:\\Users\\Public\\atfx-183c60f6.txt\e[K\e[m\r\n\e[K\e[?25h
+\e]133;D;0;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a\e]7;file://host/C:/\a\e]0;C:\\\a\e]133;A;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\aPS C:\\> \e]133;B;id=c2ea8e16b4ea0a1f496ae6be6475472943c112d1e9e2afbf6b9067de72aa23fa\a

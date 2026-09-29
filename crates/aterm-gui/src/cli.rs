@@ -185,7 +185,8 @@ const HELP_HEAD: &str = concat!(
     "                                   [key_sequences], plus bindable actions, then exit.\n",
     "        --show-face [family]       Print the resolved font face (path + metrics)\n",
     "                                   for [family] (or the configured font) and exit.\n",
-    "        --list-themes              List the built-in colour themes and exit.\n",
+    "        --list-themes              List the built-in and custom colour themes\n",
+    "                                   and exit.\n",
     "    -h, --help                     Print this help and exit.\n",
     "    -V, --version                  Print the version and exit.\n\n",
 );
@@ -199,19 +200,21 @@ const KEYS_HELP: &str = concat!(
     "KEYS (in the window):\n",
     "    Cmd-C / Cmd-V     Copy selection / paste (control-stripped, bracketed).\n",
     "    Cmd-= / Cmd--     Zoom the font in / out.   Cmd-0  Reset zoom.\n",
-    "    Cmd-click         Open a hyperlink / detected URL (http/https/mailto).\n",
+    "    Cmd-click         Open a hyperlink / detected URL (http/https/mailto);\n",
+    "                      Cmd-Option-click where the program tracks the mouse.\n",
     "    Cmd-F             Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
     "    Cmd-S / Cmd-R     Emacs search forward / backward; repeat to navigate + wrap.\n",
     "    Cmd-,             Open the native Settings tab; Manual edits aterm.toml.\n",
     "    Cmd-N             Open a new window (same process, same sessions).\n",
     "    Cmd-T             Open a new tab (new shell, same window).\n",
-    "    Cmd-W             Close the active tab; closing the last tab quits.\n",
+    "    Cmd-W             Close the focused pane; the last pane closes the tab,\n",
+    "                      and the last tab its window; the last window quits aterm.\n",
     "    Cmd-Shift-T       Reopen the most recently closed tab.\n",
     "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
     "    Cmd-Shift-P       Command Palette (every action, searchable).\n",
+    "    Cmd-Opt-Arrow     Move focus to the pane in that direction (no menu item).\n",
     "    This is the common set; the menu bar lists them ALL (splits, move-tab, and\n",
-    "    more) with their live chords. Pane focus (focus_pane_*) has no menu item and\n",
-    "    no default macOS chord: bind it under [keybindings].\n\n",
+    "    more) with their live chords.\n\n",
 );
 
 /// See [`KEYS_HELP`] (macOS) — the non-macOS KEYS section, GENERATED from
@@ -249,7 +252,8 @@ fn keys_help() -> String {
         s.push_str(&format!("    {chords:<width$}  {action}\n"));
     }
     // Not a chord, so not in the table: the pointer half of the keymap.
-    s.push_str("    ctrl+click  Open a hyperlink / detected URL (http/https/mailto).\n\n");
+    s.push_str("    ctrl+click  Open a hyperlink / detected URL (http/https/mailto);\n");
+    s.push_str("                ctrl+alt+click where the program tracks the mouse.\n\n");
     s
 }
 
@@ -316,7 +320,8 @@ const HELP_TAIL: &str = concat!(
     "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
     "              shell priority follows window focus; default on),\n",
     "              explain_heavy_load (the band names what slows your typing;\n",
-    "              default on).\n",
+    "              default on), desktop_alerts (aterm's own alerts also as\n",
+    "              system notifications; default off).\n",
     "  Security    allow_window_ops, allow_notifications, allow_palette_reconfigure,\n",
     "              allow_kitty_file_transfer, allow_osc52_query,\n",
     "              secure_keyboard_entry (macOS)  (all opt-in, default off).\n",
@@ -536,6 +541,10 @@ const STARTER_CONFIG: &str = "\
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
 # explain_heavy_load = true        # when typing slows because something else loads the machine, the message band names it
                                    # (\"Typing slowed by cargo in tab 2\"); details go to the log. false: off entirely
+# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, the operator, update health) also as
+                                   # system notifications (macOS: terminal-notifier, else osascript = \"Script Editor\").
+                                   # DEFAULT off: they stay in the band, the menu bar and messages.log. Programs'
+                                   # OSC 9/99/777 notifications are allow_notifications' below
 
 # --- security opt-ins (all default OFF) ---------------------------------------
 # allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
@@ -554,8 +563,7 @@ const STARTER_CONFIG: &str = "\
 # --- sparkle words (purely visual; NEVER affects copied text, logs, or recordings)
 # Decorate matched words: a randomized SPARKLE over profanity (the \"fuck\" family in
 # every major language) and a steady CAT-PAW over cat/kitty words. Both live toys are
-# ON by default. Retained orca/cetacean settings parse for compatibility but are suspended
-# and have no effect. Use the independent Sparkle words and Keyword kitties
+# ON by default. Use the independent Sparkle words and Keyword kitties
 # switches in Settings, or set a live category's `enabled = false` here, to
 # silence either product. The retained master `enabled = false` silences both.
 # [sparkle_words]
@@ -599,7 +607,7 @@ const STARTER_CONFIG: &str = "\
 # ink = { colorway = \"rainbow\" }   # or \"twotone:#RRGGBB,#RRGGBB\"; omit for no ink
 # burst = { kind = \"starburst\", chance = 10 }   # sparkle|nova|supernova|starburst|glow
 # graphic = { collection = \"cats\" }             # the peeking cat on your own word
-# [sparkle_words.ink]              # animated glyph-ink shimmer (all classes but orca)
+# [sparkle_words.ink]              # animated glyph-ink shimmer
 # enabled = true                   # takes effect only when sparkle_words.enabled is on
 # strength = 0.75                  # ink tint vs original fg; clamp 0.0..=1.0
 # sweep_ms = 2200                  # one specular sweep window; clamp 350..=6000
@@ -710,6 +718,93 @@ fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
         .filter(|dimension| (min..=max).contains(dimension))
 }
 
+/// Write a print-and-exit flag's ANSWER to stdout and end the process: with the
+/// flag's own `code`, or 1 when the answer could not be written.
+///
+/// Never `print!`: it PANICS when stdout is a pipe whose reader has gone, and on
+/// Windows that is an ordinary shape of the windowed image's answer. Measured
+/// 2026-09-27 on the installed 0.95.0: pwsh does not wait for a GUI-subsystem
+/// child even while it captures it, so `aterm-gui --version 1>$null` and `$v =
+/// aterm-gui --version` close the pipe before the answer is written, and the
+/// panic banner (`failed printing to stdout: The pipe is being closed. (os error
+/// 232)`) printed after the next prompt; a reader that stops early panicked
+/// both images (`aterm-gui --help | findstr /c:"x" nosuchfile.txt` and `aterm
+/// --window --help | …`: `The pipe has been ended. (os error 109)`). The one
+/// `write_all` also hands the whole answer to the console in as few writes as
+/// the stream allows, where each `println!` was a write of its own.
+fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
+    use std::io::Write as _;
+    let written = {
+        let mut out = std::io::stdout().lock();
+        out.write_all(text.as_bytes()).and_then(|()| out.flush())
+    };
+    let status = answer_status(written, code).unwrap_or_else(|line| {
+        let _ = writeln!(std::io::stderr(), "{line}");
+        1
+    });
+    #[cfg(windows)]
+    if answered_onto_an_unwaited_console() {
+        let _ = writeln!(std::io::stderr(), "{}", unwaited_answer_line(argv));
+    }
+    #[cfg(not(windows))]
+    let _ = argv;
+    std::process::exit(status)
+}
+
+/// The status a print-and-exit flag ends with, from how its answer's write went:
+/// the flag's own `code` when it was written — or when the reader CLOSED the pipe
+/// (`BrokenPipe`, which Windows' "pipe is being closed" and "pipe has been
+/// ended" both map to): a reader that went away has said it wants no more,
+/// aterm-ctl's rule for `| head` — and otherwise the stderr line naming the
+/// failure (a full disk behind `> file`), which ends the process with 1.
+fn answer_status(written: std::io::Result<()>, code: i32) -> Result<i32, String> {
+    match written {
+        Ok(()) => Ok(code),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(code),
+        Err(e) => Err(format!("aterm-gui: the answer was not written ({e})")),
+    }
+}
+
+/// Whether this answer went straight onto a console this process ATTACHED to —
+/// the windowed image (GUI subsystem) typed at a shell prompt with its output not
+/// redirected, which is the one shape whose answer can land after the prompt.
+/// The console image, a redirected or piped answer, and a launch with no console
+/// behind it (Explorer, the console image's own handoff, whose stdio is NUL)
+/// never are.
+#[cfg(windows)]
+fn answered_onto_an_unwaited_console() -> bool {
+    use std::io::IsTerminal as _;
+    crate::win32::attached_a_console() && std::io::stdout().is_terminal()
+}
+
+/// The one stderr line under such an answer. No handoff can make a prompt wait:
+/// the prompt is waiting for no one — it did not wait for THIS process, so it
+/// would not wait for a console image this process started and waited on
+/// either. So the answer stays, and the line names the spelling a prompt does
+/// wait for: the console image, `aterm --window` and the same flags, whose
+/// answer is this parser's, byte for byte. Measured 2026-09-27 on the installed
+/// 0.95.0: `aterm-gui --version; Write-Output AFTER-GUI` printed `AFTER-GUI`
+/// first in pwsh and in an interactive cmd; `cmd /c` and a pwsh pipeline (`|
+/// Out-String`) do wait, which is why the line says "can", not "did".
+#[cfg(any(windows, test))]
+fn unwaited_answer_line(argv: &[String]) -> String {
+    let flags: Vec<String> = argv
+        .iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.chars().any(char::is_whitespace) {
+                format!("\"{arg}\"")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    format!(
+        "aterm-gui: a pwsh or cmd prompt does not wait for the windowed image, so its answer \
+         can print after the prompt; run `aterm --window {}` for one the prompt waits for",
+        flags.join(" ")
+    )
+}
+
 /// CLI: `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`.
 /// `--help`/`--version` print and exit; an unknown option, a `-d` without a valid
 /// directory, `-e` without a command, or a value flag missing its argument prints
@@ -718,11 +813,17 @@ fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
 /// directory. A launch flag is recorded, never exported: the render/font flags in
 /// [`Cli::launch`], the rest in [`LaunchFlags`]. Numeric flags are validated here
 /// for a clean early error; containment is validated by its own fail-closed funnel
-/// in `main`.
+/// in `main`. Every print-and-exit flag answers through [`answer_and_exit`].
 pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     // Lossy conversion mirrors the binary era's `env::args()` UTF-8 boundary
     // (a non-UTF8 flag was a panic there; here it degrades to a usage error).
-    let mut args = argv.into_iter().map(|a| a.to_string_lossy().into_owned());
+    // Kept whole as well as walked: an answer that may print after the prompt
+    // names the command line to type instead (`unwaited_answer_line`).
+    let argv: Vec<String> = argv
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let mut args = argv.clone().into_iter();
     let mut cwd: Option<String> = None;
     let mut hold = false;
     let mut headless = false;
@@ -734,7 +835,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             "-h" | "--help" => {
                 // Title, then the origin line (`by Andrew Yates · ALab ·
                 // alab.systems`), then the body.
-                print!(
+                let help = format!(
                     "{HELP_TITLE}{}\n{HELP_HEAD}{}{}",
                     aterm_types::identity::ORIGIN_LINE,
                     keys_help(),
@@ -748,61 +849,58 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 // who reaches that state on a stripped machine. `--set-...`
                 // refuses in every build, so it is not advertised.
                 #[cfg(windows)]
-                print!("{WINDOWS_HELP_TAIL}");
-                std::process::exit(0);
+                let help = help + WINDOWS_HELP_TAIL;
+                answer_and_exit(&argv, &help, 0);
             }
             "-V" | "--version" => {
                 // The DISPLAY version: semver + the compiler-provenance suffix
                 // (+r.<slug> = upstream Rust, +t.<slug> = Trust fork) — what
                 // the ship tool (aterm-release buildplan.rs) echoes into the
                 // cut transcript as provenance.
-                println!("aterm-gui {}", crate::build_info::version_display());
-                std::process::exit(0);
+                let version = format!("aterm-gui {}\n", crate::build_info::version_display());
+                answer_and_exit(&argv, &version, 0);
             }
             // Diagnostics ("doctor"): print the report and exit (no window). Placed
             // after the env-setting flags so e.g. `--gpu --diagnose` reports the
             // effective renderer.
             "--diagnose" => {
                 crate::launch::install(launch.clone());
-                print!("{}", crate::diagnostics::collect().render());
-                std::process::exit(0);
+                answer_and_exit(&argv, &crate::diagnostics::collect().render(), 0);
             }
             "--list-actions" => {
-                for name in crate::keybinding::ACTION_NAMES {
-                    println!("{name}");
-                }
-                std::process::exit(0);
+                let names: String = crate::keybinding::ACTION_NAMES
+                    .iter()
+                    .map(|name| format!("{name}\n"))
+                    .collect();
+                answer_and_exit(&argv, &names, 0);
             }
             "--validate-config" => {
                 crate::launch::install(launch.clone());
                 let (msg, ok) = crate::diagnostics::validate_config();
-                println!("{msg}");
-                std::process::exit(i32::from(!ok));
+                answer_and_exit(&argv, &format!("{msg}\n"), i32::from(!ok));
             }
             "--list-fonts" => {
-                print!("{}", crate::diagnostics::list_fonts());
-                std::process::exit(0);
+                answer_and_exit(&argv, &crate::diagnostics::list_fonts(), 0);
             }
             "--show-config" => {
                 crate::launch::install(launch.clone());
-                print!("{}", crate::diagnostics::show_config());
-                std::process::exit(0);
+                answer_and_exit(&argv, &crate::diagnostics::show_config(), 0);
             }
             "--write-config" => {
                 // Discoverability: drop a fully-documented starter config (every key
                 // commented, so it changes nothing) where the loader looks for it.
-                match crate::app_config::config_path() {
-                    Some(path) if path.exists() => {
-                        println!("config already exists: {}", path.display());
-                        println!("(edit it directly — settings hot-reload on save)");
-                    }
+                let said = match crate::app_config::config_path() {
+                    Some(path) if path.exists() => format!(
+                        "config already exists: {}\n(edit it directly — settings hot-reload on save)\n",
+                        path.display()
+                    ),
                     Some(path) => {
                         if let Some(dir) = path.parent() {
                             let _ = std::fs::create_dir_all(dir);
                         }
                         match std::fs::write(&path, starter_config_for(&path)) {
                             Ok(()) => {
-                                println!("wrote a documented starter config: {}", path.display());
+                                format!("wrote a documented starter config: {}\n", path.display())
                             }
                             Err(e) => {
                                 eprintln!("could not write {}: {e}", path.display());
@@ -814,12 +912,11 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                         eprintln!("could not resolve the config path ({CONFIG_PATH_VARS} unset)");
                         std::process::exit(1);
                     }
-                }
-                std::process::exit(0);
+                };
+                answer_and_exit(&argv, &said, 0);
             }
             "--list-keybinds" => {
-                print!("{}", crate::diagnostics::list_keybinds());
-                std::process::exit(0);
+                answer_and_exit(&argv, &crate::diagnostics::list_keybinds(), 0);
             }
             "--show-face" => {
                 // Optional family argument; empty falls back to the effective
@@ -827,35 +924,35 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 crate::launch::install(launch.clone());
                 let family = args.next().unwrap_or_default();
                 let (msg, ok) = crate::diagnostics::show_face(&family);
-                print!("{msg}");
-                std::process::exit(i32::from(!ok));
+                answer_and_exit(&argv, &msg, i32::from(!ok));
             }
             "--list-themes" => {
-                print!("{}", crate::diagnostics::list_themes());
-                std::process::exit(0);
+                answer_and_exit(&argv, &crate::diagnostics::list_themes(), 0);
             }
             // Windows: install/remove the "Open aterm here" Explorer context menu
             // (per-user HKCU verb on directories/backgrounds/drives → `aterm-gui -d <path>`).
             #[cfg(windows)]
             "--install-context-menu" => {
-                match crate::explorer_win::install() {
-                    Ok(()) => println!(
-                        "aterm-gui: installed the 'Open aterm here' Explorer context menu (per-user). \
-                         Right-click a folder, its empty background, or a drive \
-                         (on Windows 11 the entry appears under 'Show more options' / Shift+F10)."
-                    ),
-                    Err(e) => {
-                        eprintln!("aterm-gui: context-menu install failed: {e}");
-                        std::process::exit(1);
-                    }
+                if let Err(e) = crate::explorer_win::install() {
+                    eprintln!("aterm-gui: context-menu install failed: {e}");
+                    std::process::exit(1);
                 }
-                std::process::exit(0);
+                answer_and_exit(
+                    &argv,
+                    "aterm-gui: installed the 'Open aterm here' Explorer context menu (per-user). \
+                     Right-click a folder, its empty background, or a drive \
+                     (on Windows 11 the entry appears under 'Show more options' / Shift+F10).\n",
+                    0,
+                );
             }
             #[cfg(windows)]
             "--uninstall-context-menu" => {
                 let _ = crate::explorer_win::uninstall();
-                println!("aterm-gui: removed the 'Open aterm here' Explorer context menu.");
-                std::process::exit(0);
+                answer_and_exit(
+                    &argv,
+                    "aterm-gui: removed the 'Open aterm here' Explorer context menu.\n",
+                    0,
+                );
             }
             // Windows 11 default-terminal (DefTerm) handoff. Opt-in only, and
             // currently REFUSED — see `defterm_win::handoff_server_available`.
@@ -864,38 +961,37 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             // redirected, and "it didn't take" is the one DefTerm failure that
             // looks identical to a wrong registry key.
             #[cfg(windows)]
-            "--set-default-terminal" => {
-                match crate::defterm_win::set_default_terminal() {
-                    Ok(()) => println!(
-                        "aterm-gui: registered aterm as the Windows default terminal. \
+            "--set-default-terminal" => match crate::defterm_win::set_default_terminal() {
+                Ok(()) => answer_and_exit(
+                    &argv,
+                    "aterm-gui: registered aterm as the Windows default terminal. \
                          New consoles (a double-clicked .bat, `Win+R cmd`, an installer's \
-                         console) will open in aterm. Undo with --unset-default-terminal."
-                    ),
-                    Err(e) => {
-                        eprintln!("aterm-gui: cannot become the default terminal: {e}");
-                        let (console, terminal) =
-                            crate::defterm_win::current_delegation().unwrap_or((None, None));
-                        eprintln!(
-                            "  current HKCU\\{}: {}={} {}={}{}",
-                            crate::defterm_win::STARTUP_KEY,
-                            crate::defterm_win::VALUE_CONSOLE,
-                            console.as_deref().unwrap_or("(unset)"),
-                            crate::defterm_win::VALUE_TERMINAL,
-                            terminal.as_deref().unwrap_or("(unset)"),
-                            if crate::defterm_win::is_aterm_default(terminal.as_deref()) {
-                                "  <- already aterm"
-                            } else {
-                                ""
-                            },
-                        );
-                        eprintln!(
-                            "  set the default terminal in Settings > System > For developers > Terminal."
-                        );
-                        std::process::exit(1);
-                    }
+                         console) will open in aterm. Undo with --unset-default-terminal.\n",
+                    0,
+                ),
+                Err(e) => {
+                    eprintln!("aterm-gui: cannot become the default terminal: {e}");
+                    let (console, terminal) =
+                        crate::defterm_win::current_delegation().unwrap_or((None, None));
+                    eprintln!(
+                        "  current HKCU\\{}: {}={} {}={}{}",
+                        crate::defterm_win::STARTUP_KEY,
+                        crate::defterm_win::VALUE_CONSOLE,
+                        console.as_deref().unwrap_or("(unset)"),
+                        crate::defterm_win::VALUE_TERMINAL,
+                        terminal.as_deref().unwrap_or("(unset)"),
+                        if crate::defterm_win::is_aterm_default(terminal.as_deref()) {
+                            "  <- already aterm"
+                        } else {
+                            ""
+                        },
+                    );
+                    eprintln!(
+                        "  set the default terminal in Settings > System > For developers > Terminal."
+                    );
+                    std::process::exit(1);
                 }
-                std::process::exit(0);
-            }
+            },
             // Never GATED on the handoff server: removal is the escape hatch
             // from a broken delegation and must work in every build, including
             // on a machine whose registering exe is already gone. But it is
@@ -906,35 +1002,31 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             #[cfg(windows)]
             "--unset-default-terminal" => {
                 use crate::defterm_win::UnsetOutcome;
-                match crate::defterm_win::unset_default_terminal() {
-                    Ok(UnsetOutcome::Removed) => println!(
-                        "aterm-gui: removed aterm's default-terminal registration \
-                         (consoles go back to the Windows default)."
+                let said = match crate::defterm_win::unset_default_terminal() {
+                    Ok(UnsetOutcome::Removed) => "aterm-gui: removed aterm's default-terminal \
+                                                  registration (consoles go back to the Windows \
+                                                  default).\n"
+                        .to_string(),
+                    Ok(UnsetOutcome::NothingRegistered) => "aterm-gui: no default-terminal \
+                                                            registration to remove (consoles \
+                                                            already use the Windows default).\n"
+                        .to_string(),
+                    Ok(UnsetOutcome::NotOurs { console, terminal }) => format!(
+                        "aterm-gui: nothing changed — the default terminal is not aterm's.\n  \
+                         current HKCU\\{}: {}={} {}={}\n  change it in Settings > System > For \
+                         developers > Terminal.\n",
+                        crate::defterm_win::STARTUP_KEY,
+                        crate::defterm_win::VALUE_CONSOLE,
+                        console.as_deref().unwrap_or("(unset)"),
+                        crate::defterm_win::VALUE_TERMINAL,
+                        terminal.as_deref().unwrap_or("(unset)"),
                     ),
-                    Ok(UnsetOutcome::NothingRegistered) => println!(
-                        "aterm-gui: no default-terminal registration to remove \
-                         (consoles already use the Windows default)."
-                    ),
-                    Ok(UnsetOutcome::NotOurs { console, terminal }) => {
-                        println!(
-                            "aterm-gui: nothing changed — the default terminal is not aterm's."
-                        );
-                        println!(
-                            "  current HKCU\\{}: {}={} {}={}",
-                            crate::defterm_win::STARTUP_KEY,
-                            crate::defterm_win::VALUE_CONSOLE,
-                            console.as_deref().unwrap_or("(unset)"),
-                            crate::defterm_win::VALUE_TERMINAL,
-                            terminal.as_deref().unwrap_or("(unset)"),
-                        );
-                        println!("  change it in Settings > System > For developers > Terminal.");
-                    }
                     Err(e) => {
                         eprintln!("aterm-gui: could not clear the default-terminal keys: {e}");
                         std::process::exit(1);
                     }
-                }
-                std::process::exit(0);
+                };
+                answer_and_exit(&argv, &said, 0);
             }
             "-d" | "--working-directory" => {
                 let dir = flag_value("-d/--working-directory", &mut args);
@@ -1121,6 +1213,96 @@ mod tests {
         "--list-themes",
     ];
 
+    /// A reader that CLOSED the pipe ends the answer quietly with the flag's own
+    /// status — both Windows spellings of it included, the two the installed
+    /// 0.95.0 panicked on (232 under `aterm-gui --version 1>$null` in pwsh, 109
+    /// under `| findstr … nosuchfile.txt`) — and any other failure is said, with
+    /// status 1, never swallowed.
+    #[test]
+    fn a_closed_pipe_ends_the_answer_quietly_and_any_other_failure_is_said() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(super::answer_status(Ok(()), 0), Ok(0));
+        assert_eq!(
+            super::answer_status(Ok(()), 1),
+            Ok(1),
+            "the flag's own verdict"
+        );
+        assert_eq!(
+            super::answer_status(Err(Error::from(ErrorKind::BrokenPipe)), 0),
+            Ok(0)
+        );
+        #[cfg(windows)]
+        for (os_error, what) in [
+            (232, "the pipe is being closed"),
+            (109, "the pipe has been ended"),
+        ] {
+            assert_eq!(
+                super::answer_status(Err(Error::from_raw_os_error(os_error)), 3),
+                Ok(3),
+                "{what} (os error {os_error}) is the reader going away"
+            );
+        }
+        let refused = super::answer_status(Err(Error::from(ErrorKind::StorageFull)), 0)
+            .expect_err("a full disk is a failure to report");
+        assert!(
+            refused.starts_with("aterm-gui: the answer was not written ("),
+            "{refused}"
+        );
+    }
+
+    /// No print-and-exit arm prints with `print!`/`println!` any more: each
+    /// panicked on a closed stdout. `eprintln!` (a usage error) is not an answer.
+    #[test]
+    fn every_answer_goes_through_the_panic_free_writer() {
+        let src = include_str!("cli.rs");
+        let body = src
+            .split_once("pub(crate) fn parse_cli(")
+            .expect("parse_cli exists")
+            .1;
+        let body = &body[..body.find("\nfn lifeline_request(").expect("the next item")];
+        for (at, _) in body.match_indices("print") {
+            let before = body[..at].chars().next_back();
+            let macro_call =
+                body[at..].starts_with("print!(") || body[at..].starts_with("println!(");
+            assert!(
+                !macro_call || before == Some('e'),
+                "parse_cli prints with a panicking macro: {}",
+                &body[at..(at + 40).min(body.len())]
+            );
+        }
+        assert!(body.contains("answer_and_exit(&argv, &help, 0)"));
+    }
+
+    /// The line under an answer that went straight onto a prompt's console names
+    /// the command to type instead — the console image with the same flags — and
+    /// keeps an argument with a space in it one argument.
+    #[test]
+    fn the_unwaited_answer_line_names_the_waited_for_spelling() {
+        let line = super::unwaited_answer_line(&["--version".to_string()]);
+        assert_eq!(
+            line,
+            "aterm-gui: a pwsh or cmd prompt does not wait for the windowed image, so its answer \
+             can print after the prompt; run `aterm --window --version` for one the prompt waits \
+             for"
+        );
+        let line =
+            super::unwaited_answer_line(&["--show-face".to_string(), "Cascadia Code".to_string()]);
+        assert!(
+            line.contains("`aterm --window --show-face \"Cascadia Code\"`"),
+            "{line}"
+        );
+    }
+
+    /// Only the windowed image ATTACHED to a prompt's console adds the line. The
+    /// test harness, like the console image, was handed every std handle, so it
+    /// attached nothing and never does.
+    #[cfg(windows)]
+    #[test]
+    fn a_process_that_attached_no_console_adds_no_line() {
+        assert!(!crate::win32::attached_a_console());
+        assert!(!super::answered_onto_an_unwaited_console());
+    }
+
     #[test]
     fn help_advertises_diagnostic_flags() {
         // Every user-facing diagnostic flag must be discoverable in --help.
@@ -1161,6 +1343,10 @@ mod tests {
             keys.contains("ctrl+click"),
             "the pointer half of the keymap stays documented"
         );
+        assert!(
+            keys.contains("ctrl+alt+click"),
+            "the gesture the link caption names over a mouse-tracking program:\n{keys}"
+        );
     }
 
     /// On macOS the KEYS section is hand-written (macOS ships an empty
@@ -1181,6 +1367,9 @@ mod tests {
             "Cmd-F",
             "Cmd-Shift-T",
             "Cmd-Shift-P",
+            // Pane focus has no menu item, so the menu bar cannot teach it
+            // (`keybinding::BUILTIN_CMD_CHORDS`: cmd+alt+arrow).
+            "Cmd-Opt-Arrow",
         ] {
             assert!(keys.contains(chord), "{chord} must be documented:\n{keys}");
         }
@@ -1191,6 +1380,10 @@ mod tests {
         assert!(
             keys.contains("menu bar lists them ALL"),
             "the section must signal it is not exhaustive:\n{keys}"
+        );
+        assert!(
+            keys.contains("Cmd-Option-click"),
+            "the gesture the link caption names over a mouse-tracking program:\n{keys}"
         );
     }
 
@@ -1776,8 +1969,8 @@ mod tests {
         keys.dedup();
         assert_eq!(
             keys.len(),
-            156,
-            "the starter config's key count moved — update the `156 keys` line in \
+            157,
+            "the starter config's key count moved — update the `157 keys` line in \
              `aterm help config` (crates/aterm-cli/src/manual.rs, CONFIG_PAGE) and \
              this number together"
         );

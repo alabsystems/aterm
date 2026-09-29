@@ -91,8 +91,8 @@ pub mod sbpl;
 pub(crate) mod audit;
 
 pub use actuator::{
-    NO_OS_SANDBOX_REASON, SpawnDecision, decide as decide_spawn, network_sandbox_actuated,
-    os_sandbox_actuated,
+    NO_OS_SANDBOX_REASON, SpawnDecision, applied_posture, decide as decide_spawn,
+    network_sandbox_actuated, os_sandbox_actuated,
 };
 pub use audit::{log_denial, log_posture};
 pub use capability::{FsCapability, NetworkCapability, ProcessCapability};

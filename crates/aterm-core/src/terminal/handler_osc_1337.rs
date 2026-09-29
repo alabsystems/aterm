@@ -30,9 +30,24 @@
 
 use std::sync::Arc;
 
-use aterm_grid::{ImageData, ImageFormat, ImageRef};
+use aterm_grid::{ImageData, ImageFormat, ImageRef, ImageScaling, KittyPlacementTag};
 
 use super::handler::TerminalHandler;
+
+/// Where the cursor ends up after an inline image is placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlacementCursor {
+    /// iTerm2 and sixel: a fresh line at column 0 below the image, so
+    /// following output never overprints its last row.
+    NextLine,
+    /// Kitty's default: the cell just past the image's right edge on its LAST
+    /// row (the next line's column 0 when that is past the right margin) —
+    /// kitty moves the cursor `c` columns right and `r - 1` rows down.
+    AfterImage,
+    /// Kitty `C=1`: the cursor does not move and nothing scrolls; footprint rows
+    /// below the screen's last row are clipped.
+    Unmoved,
+}
 
 /// Maximum decoded image payload accepted (bytes). A single sequence must not be
 /// able to pin an unbounded buffer; 16 MiB comfortably covers a full-screen PNG
@@ -315,9 +330,16 @@ impl TerminalHandler<'_> {
             z_index: 0,
             band_lift_px: 0,
             // iTerm2 names its target in CELLS (`width=`/`height=`), so filling
-            // the cells the program asked for IS the spec: FIT, don't pin pixels.
-            // The sixel sibling below is the opposite case.
-            pixel_exact: false,
+            // the cells the program asked for IS the spec: FIT, don't pin pixels
+            // (the sixel sibling below is the opposite case) — aspect kept,
+            // unless the program said `preserveAspectRatio=0`, iTerm2's "stretch
+            // to fill, ignore the inherent ratio".
+            scaling: if args.preserve_aspect_ratio {
+                ImageScaling::Fit
+            } else {
+                ImageScaling::Stretch
+            },
+            source_rect: None,
         });
         // iTerm2 inline images are LEFT-anchored at the margin (column 0).
         self.place_image(&image, cols, rows, 0);
@@ -342,10 +364,43 @@ impl TerminalHandler<'_> {
         rows: u16,
         start_col: u16,
     ) {
+        self.place_image_as(
+            image,
+            cols,
+            rows,
+            start_col,
+            None,
+            PlacementCursor::NextLine,
+        );
+    }
+
+    /// [`place_image`](Self::place_image) with the Kitty placement tag every
+    /// covered cell carries (`None` for iTerm2 and sixel) and the protocol's
+    /// cursor policy.
+    pub(super) fn place_image_as(
+        &mut self,
+        image: &Arc<ImageData>,
+        cols: u16,
+        rows: u16,
+        start_col: u16,
+        kitty: Option<KittyPlacementTag>,
+        cursor: PlacementCursor,
+    ) {
+        let start_col = start_col.min(self.grid.cols().saturating_sub(1));
+        if cursor == PlacementCursor::Unmoved {
+            // Kitty `C=1`: stamp in place, below the cursor row, without a
+            // single line feed — the cursor and the scroll position are the
+            // caller's to keep.
+            let top = self.grid.cursor_row();
+            let visible = rows.min(self.grid.rows().saturating_sub(top));
+            for cell_row in 0..visible {
+                self.stamp_image_row(image, top + cell_row, cell_row, start_col, cols, kitty);
+            }
+            return;
+        }
         // Anchor at `start_col`; the per-row stamp loop below restores this column
         // after every line_feed so the footprint tiles map cleanly onto whole
         // columns from the anchor.
-        let start_col = start_col.min(self.grid.cols().saturating_sub(1));
         self.grid.set_cursor(self.grid.cursor_row(), start_col);
 
         // Footprint rows in the middle band can never be the FINAL writer of any
@@ -369,27 +424,7 @@ impl TerminalHandler<'_> {
         for cell_row in 0..rows {
             let row = self.grid.cursor_row();
             if cell_row < grid_rows || cell_row >= skip_end {
-                for cell_col in 0..cols {
-                    let col = start_col + cell_col;
-                    if col >= self.grid.cols() {
-                        break;
-                    }
-                    // `set_cell_image`, not `cell_extra_mut(..).set_image(..)`:
-                    // the grid-level setter also arms the extras collection's
-                    // scroll-off image gate, and a picture the gate never heard
-                    // about is one that cannot be carried into history when its
-                    // row scrolls off the top.
-                    self.grid.set_cell_image(
-                        row,
-                        col,
-                        ImageRef {
-                            image: Arc::clone(image),
-                            cell_row,
-                            cell_col,
-                        },
-                    );
-                    self.grid.damage_mut().mark_cell(row, col);
-                }
+                self.stamp_image_row(image, row, cell_row, start_col, cols, kitty);
             }
             // Advance to the next image row (scrolling at the bottom), except after
             // the last row — leave the cursor on the final image row's start so the
@@ -399,10 +434,52 @@ impl TerminalHandler<'_> {
                 self.grid.set_cursor(self.grid.cursor_row(), start_col);
             }
         }
-        // After the image, move to a fresh line at column 0 so subsequent text does
-        // not overprint the last image row.
-        self.grid.line_feed();
-        self.grid.set_cursor(self.grid.cursor_row(), 0);
+        let end_col = start_col.saturating_add(cols);
+        if cursor == PlacementCursor::AfterImage && end_col < self.grid.cols() {
+            // Kitty: continue right after the image, on its last row.
+            self.grid.set_cursor(self.grid.cursor_row(), end_col);
+        } else {
+            // After the image, move to a fresh line at column 0 so subsequent
+            // text does not overprint the last image row (and a Kitty image
+            // that reaches the right margin wraps there, as kitty does).
+            self.grid.line_feed();
+            self.grid.set_cursor(self.grid.cursor_row(), 0);
+        }
+    }
+
+    /// Stamp footprint row `cell_row` of `image` onto grid row `row`, columns
+    /// `start_col..start_col + cols` (clipped at the right edge), damaging each
+    /// stamped cell.
+    fn stamp_image_row(
+        &mut self,
+        image: &Arc<ImageData>,
+        row: u16,
+        cell_row: u16,
+        start_col: u16,
+        cols: u16,
+        kitty: Option<KittyPlacementTag>,
+    ) {
+        for cell_col in 0..cols {
+            let col = start_col.saturating_add(cell_col);
+            if col >= self.grid.cols() {
+                break;
+            }
+            // `set_cell_image`, not `cell_extra_mut(..).set_image(..)`: the
+            // grid-level setter also arms the extras collection's scroll-off
+            // image gate, and a picture the gate never heard about is one that
+            // cannot be carried into history when its row scrolls off the top.
+            self.grid.set_cell_image(
+                row,
+                col,
+                ImageRef {
+                    image: Arc::clone(image),
+                    cell_row,
+                    cell_col,
+                    kitty,
+                },
+            );
+            self.grid.damage_mut().mark_cell(row, col);
+        }
     }
 
     /// Place a decoded sixel raster as an inline image, reusing the OSC 1337
@@ -483,7 +560,8 @@ impl TerminalHandler<'_> {
             // the binding axis (a 4x6 sprite in a 9x17 cell: 2.25x) and blur it
             // through an interpolating resample. The rounded-up remainder is
             // simply left unpainted, as on every other sixel terminal.
-            pixel_exact: true,
+            scaling: ImageScaling::PixelExact,
+            source_rect: None,
         });
 
         // Sixel anchors at the CURRENT cursor column (VT340/xterm), NOT at the

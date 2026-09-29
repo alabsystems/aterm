@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Apple half of `cargo ship provision` — this machine gets its OWN Developer ID
+//! The Apple half of `targo --unverified ship provision` — this machine gets its OWN Developer ID
 //! Application identity, and no private key ever crosses a machine boundary.
 //!
 //! # Why a human is in the middle, and why it is still one command

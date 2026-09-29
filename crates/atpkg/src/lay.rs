@@ -12,7 +12,7 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// One executable to lay: where, and what bytes. Always mode `0755`, always temp+rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,16 +39,16 @@ impl Executable {
 /// destination — a shim on the user's PATH is never briefly absent or half-written. The
 /// discipline the shim, stub and tombstone writers share.
 pub fn write_in_process(file: &Executable) -> io::Result<()> {
-    let name = match crate::call1(Path::file_name, file.path.as_path()) {
-        Some(name) => crate::call1(OsStr::to_str, name),
-        None => None,
-    }
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "executable has no file name"))?;
-    let mut tmp_name = String::from(".");
-    tmp_name.push_str(name);
-    tmp_name.push_str(".lay-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = file.path.with_file_name(tmp_name);
+    let name = file
+        .path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "executable has no file name")
+        })?;
+    let tmp = file
+        .path
+        .with_file_name(format!(".{name}.lay-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let written = (|| -> io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();

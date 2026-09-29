@@ -22,7 +22,7 @@
 //!   program does.
 //! * [`SessionTimeline`] — a bounded, drop-oldest ring of lifecycle events
 //!   (`spawned`, `state-change`, `title-change`, `cwd-change`, `meta-change`,
-//!   `agent-change`, `human`), plus the server's published program and agent verdict
+//!   `agent-change`, `status-change`, `human`), plus the server's published program and agent verdict
 //!   ([`AgentPublication`]),
 //!   modeled on [`crate::turn_ledger::TurnLedger`] (same cap, same monotonic-ms
 //!   clock, same clamp discipline). Read back by the `timeline` verb and scanned
@@ -188,6 +188,31 @@ pub(crate) fn sanitize_metadata_value(field: &str, value: &str) -> Option<String
     }
     let value = sanitize_presentation_line(value, cap);
     (!value.is_empty()).then_some(value)
+}
+
+/// The badge the retired Claude Code hooks left: aterm-link's Notification and
+/// PermissionRequest hooks set the BARE attention to `claude needs approval:
+/// <message>` (their `permission::ATTENTION_PREFIX`), and only the hook's own
+/// clear could unset it. The hooks went in 59c3bee59 and `aterm link hook` is a
+/// tombstone that writes no meta, so nothing clears such a badge any more — and
+/// nothing writes one. Carried as the bare owner's entry, it crossed every
+/// update and restore and came back whenever the supervisor cleared its own:
+/// measured 2026-09-27 on v0.95.0, a busy agent's tab reading `claude needs
+/// approval: Claude needs your permission - permission_prompt` two days after
+/// the box it was raised for was answered.
+pub(crate) const RETIRED_HOOK_BADGE: &str = "claude needs approval:";
+
+/// [`sanitize_metadata_value`] for an attention CARRIED past this process — a
+/// handoff, a restore, the crash journal — or past its shell, when a closed
+/// tab is reopened on a fresh one: the retired hooks' badge
+/// ([`RETIRED_HOOK_BADGE`]) does not travel. Dropping it on the carry is what
+/// clears the last one standing, since no writer produces it. A live `meta set
+/// attention` is not filtered: a person may still write any text, and loses
+/// only this one prefix across a restart.
+#[must_use]
+pub(crate) fn carried_attention(value: &str) -> Option<String> {
+    sanitize_metadata_value("attention", value)
+        .filter(|value| !value.starts_with(RETIRED_HOOK_BADGE))
 }
 
 /// How many timeline events a session retains (drop-oldest past this), sized
@@ -385,15 +410,15 @@ impl SessionMeta {
     /// to a live driver that reached this process's socket; after a handoff
     /// that driver reconnects to the new instance and re-asserts it, and one
     /// carried under the bare owner could never be cleared by its real owner.
+    /// The retired hooks' badge does not travel either ([`carried_attention`]).
     #[must_use]
     pub(crate) fn sanitized(&self) -> Self {
         let attention = if self.attention_owners.is_empty() {
-            self.presentation_value("attention")
+            self.attention.as_deref()
         } else {
-            self.attention_owners
-                .get(BARE_ATTENTION_OWNER)
-                .and_then(|value| sanitize_metadata_value("attention", value))
-        };
+            self.attention_owners.get(BARE_ATTENTION_OWNER)
+        }
+        .and_then(carried_attention);
         Self {
             user_title: self.presentation_value("title"),
             description: self.presentation_value("description"),
@@ -453,6 +478,78 @@ impl SessionMeta {
     #[must_use]
     pub(crate) fn supervisor_expiry(&self) -> Option<u64> {
         self.supervisor.as_ref().and_then(|claim| claim.expires_us)
+    }
+
+    /// THE CLAIM A SEAMLESS UPDATE CARRIES (the round-four plan, item 9), as
+    /// `(row, claim_known)` for the handoff record
+    /// (`SessionRecord::supervisor` / `claim_known`) at `now_us`:
+    ///
+    /// * no live claim, or one held by `own_holder` — this process's in-GUI
+    ///   host, whose claim dies with it and whose successor host takes the
+    ///   session at Commit — is `(None, true)`: nobody else holds it, and the
+    ///   successor may supervise at once;
+    /// * a live `ttl=` lease is `(Some("<holder> <remaining_ms>"), true)`,
+    ///   put back on the successor's session before it is registered, so its
+    ///   holder renews it there as if nothing happened and the successor's
+    ///   host parks behind it;
+    /// * a claim bound to a connection is `(None, false)`: that connection
+    ///   ends with this process, so the claim cannot cross — its holder
+    ///   claims again from the successor, and `false` tells the successor's
+    ///   host to give it the time to ([`crate::harness_host`]'s adopted-claim
+    ///   grace).
+    ///
+    /// Carrying our OWN host's lease would park the successor's host behind
+    /// a dead process's claim for up to its whole lease, after every update.
+    #[must_use]
+    pub(crate) fn handoff_supervisor(
+        &self,
+        now_us: u64,
+        own_holder: &str,
+    ) -> (Option<String>, bool) {
+        let Some(claim) = self
+            .supervisor
+            .as_ref()
+            .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
+        else {
+            return (None, true);
+        };
+        if claim.holder == own_holder {
+            return (None, true);
+        }
+        match claim.expires_us {
+            // Rounded UP to a whole ms, so a live lease never carries as 0.
+            Some(at) => (
+                Some(format!(
+                    "{} {}",
+                    claim.holder,
+                    at.saturating_sub(now_us).div_ceil(1000)
+                )),
+                true,
+            ),
+            None => (None, false),
+        }
+    }
+
+    /// THE KEYED ESCALATIONS A SEAMLESS UPDATE CARRIES (the round-four plan,
+    /// item 9): every owner's attention entry, `"<owner> <pct-text>"`, in
+    /// write order (oldest first, so the successor shows the same one), the
+    /// bare owner's included — but never [`crate::input_stall::SERVER_ATTENTION_OWNER`]'s,
+    /// which the successor's own input watch derives again from the program.
+    ///
+    /// Why carried: an escalation is a request for a person. Before this, an
+    /// update erased every keyed one — a supervisor's "needs you" went from
+    /// the menu bar with nobody having answered it, and nothing re-raised it
+    /// until that supervisor looked at the same point again. A map built as a
+    /// literal (its bare value in [`Self::attention`] alone) carries nothing
+    /// here: that bare value crosses in the restore leaf, as it always has.
+    #[must_use]
+    pub(crate) fn handoff_attention_owners(&self) -> Vec<String> {
+        self.attention_owners
+            .in_write_order()
+            .into_iter()
+            .filter(|(owner, _)| *owner != crate::input_stall::SERVER_ATTENTION_OWNER)
+            .map(|(owner, text)| format!("{owner} {}", crate::control::pct_encode(text)))
+            .collect()
     }
 
     /// The byte cap for a named field, or `None` for an unknown field name.
@@ -569,6 +666,19 @@ impl AttentionOwners {
 
     fn top(&self) -> Option<&AttentionEntry> {
         self.entries.iter().max_by_key(|entry| entry.stamp)
+    }
+
+    /// Every `(owner, text)` in WRITE order, oldest first: the order that,
+    /// written again into an empty map, gives back the same effective entry
+    /// (the most recent is written last) — what a handoff carries
+    /// ([`SessionMeta::handoff_attention_owners`]).
+    fn in_write_order(&self) -> Vec<(&str, &str)> {
+        let mut entries: Vec<&AttentionEntry> = self.entries.iter().collect();
+        entries.sort_by_key(|entry| entry.stamp);
+        entries
+            .into_iter()
+            .map(|entry| (entry.owner.as_str(), entry.text.as_str()))
+            .collect()
     }
 
     /// Store (`Some`) or clear (`None`) `owner`'s entry.
@@ -1047,6 +1157,105 @@ pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
     true
 }
 
+/// The longest `ttl=` a `meta set supervisor` accepts (ms): the verb's own
+/// bound, and the most a carried lease is seeded with.
+pub(crate) const SUPERVISOR_TTL_MAX_MS: u64 = 600_000;
+
+/// A carried supervisor row (`SessionRecord::supervisor`, `"<holder>
+/// <remaining_ms>"`), read as the `meta set supervisor … ttl=` verb reads its
+/// arguments: the holder one owner token and never `-`, the lease at least a
+/// millisecond and cut to [`SUPERVISOR_TTL_MAX_MS`]. `None` for anything else.
+#[must_use]
+pub(crate) fn parse_carried_supervisor(row: &str) -> Option<(&str, u64)> {
+    let (holder, ms) = row.split_once(' ')?;
+    if holder == "-" || !valid_owner_token(holder) {
+        return None;
+    }
+    let ms = ms.parse::<u64>().ok().filter(|ms| *ms > 0)?;
+    Some((holder, ms.min(SUPERVISOR_TTL_MAX_MS)))
+}
+
+/// A carried attention row (`SessionRecord::attention_owners`, `"<owner>
+/// <pct-text>"`): the owner one owner token (the bare `-` included) and
+/// never the server's own; the text decoded and put through the chrome's
+/// presentation sanitizer at its owner's cap (the keyed cap, or the bare
+/// field's). `None` when nothing presentable is left.
+#[must_use]
+pub(crate) fn parse_carried_attention(row: &str) -> Option<(&str, String)> {
+    let (owner, text) = row.split_once(' ')?;
+    if !valid_owner_token(owner) || owner == crate::input_stall::SERVER_ATTENTION_OWNER {
+        return None;
+    }
+    let cap = if owner == BARE_ATTENTION_OWNER {
+        META_ATTENTION_MAX
+    } else {
+        META_ATTENTION_KEYED_MAX
+    };
+    let text = sanitize_presentation_line(&aterm_control::wire::pct_decode(text), cap);
+    (!text.is_empty()).then_some((owner, text))
+}
+
+/// PUT BACK THE CLAIM AND THE ESCALATIONS A SEAMLESS UPDATE CARRIED (the
+/// round-four plan, item 9) onto an ADOPTED session's fresh meta — before
+/// `App::register_session`, so no reader ever sees the session without them
+/// and no second supervisor can claim it in between.
+///
+/// * `supervisor` (a carried `ttl=` lease) becomes the same lease with its
+///   remaining time counted from `now_us`: its holder's next renewal renews
+///   it here, and the successor's own host is refused as it would have been
+///   in the parent. A row that does not read ([`parse_carried_supervisor`])
+///   seeds nothing — the successor's host still waits its grace on that
+///   session (`SessionRecord::claim_grace`).
+/// * each `attention_owners` row is written again in order, so the same
+///   entry is the effective one; a row that does not read
+///   ([`parse_carried_attention`]) is dropped, and past
+///   [`ATTENTION_OWNERS_MAX`] a new owner is refused exactly as a live write
+///   would be.
+///
+/// Nothing here marks [`SessionMeta::driver_writes`]: a seed is no driver's
+/// write, so a restore leaf's identity may still land on top of it. What moved
+/// is recorded as the ordinary `meta-change` events, under the meta guard as
+/// every other recorder takes them.
+pub(crate) fn seed_carried_claims(
+    meta: &std::sync::Mutex<SessionMeta>,
+    timeline: &std::sync::Mutex<SessionTimeline>,
+    supervisor: Option<&str>,
+    attention_owners: &[String],
+    now_us: u64,
+) {
+    let claim = supervisor.and_then(parse_carried_supervisor);
+    if claim.is_none() && attention_owners.is_empty() {
+        return;
+    }
+    let mut meta = meta.lock().unwrap_or_else(|p| p.into_inner());
+    let mut attention_moved = false;
+    for (owner, text) in attention_owners
+        .iter()
+        .filter_map(|row| parse_carried_attention(row))
+    {
+        attention_moved |= meta.set_attention_owned(owner, Some(text)).unwrap_or(false);
+    }
+    if let Some((holder, ms)) = claim {
+        meta.supervisor = Some(SupervisorClaim {
+            holder: holder.to_string(),
+            conn: None,
+            expires_us: Some(now_us.saturating_add(ms.saturating_mul(1000))),
+        });
+    }
+    let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
+    if attention_moved {
+        timeline.record(
+            "meta-change",
+            meta_change_payload(MetaField::Attention, meta.attention.as_deref()),
+        );
+    }
+    if let Some((holder, _)) = claim {
+        timeline.record("meta-change", supervisor_change_payload(Some(holder)));
+    }
+    drop(timeline);
+    drop(meta);
+}
+
 /// The `meta-change` payload for the supervisor key: `field=supervisor
 /// value=<pct|->`, the attention record's shape.
 fn supervisor_change_payload(holder: Option<&str>) -> String {
@@ -1120,13 +1329,45 @@ pub(crate) fn write_session_meta(
     Ok(apply_meta_value(ctx, field, value))
 }
 
+/// THE HANDOFF GAP (round five, item 17): what an ADOPTED session's
+/// recorders say about the time before the seamless update that adopted it.
+/// Nothing of the timeline, the asciicast or the temporal spine crosses an
+/// update — each starts empty in the successor — so each opens with this gap
+/// instead of reading as a session that began at the update: the timeline's
+/// first row is `handoff carried=0 from_build=<n>`, the cast header carries
+/// `aterm_handoff` beside `aterm_truncated`/`aterm_dropped`, and `temporal
+/// status` appends ` carried=0 from_build=<n>` after `dropped_events=`.
+/// `from_build` is the manifest's `outgoing_build`; a producer that wrote
+/// none reads `-` (`null` in the cast's JSON).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HandoffGap {
+    /// The build number of the process that handed the session across.
+    pub(crate) from_build: Option<u64>,
+}
+
+impl HandoffGap {
+    /// The `k=v` tail every text surface prints: `carried=0 from_build=<n|->`.
+    #[must_use]
+    pub(crate) fn payload(self) -> String {
+        match self.from_build {
+            Some(build) => format!("carried=0 from_build={build}"),
+            None => "carried=0 from_build=-".to_string(),
+        }
+    }
+}
+
 /// One recorded lifecycle event. `kind` is a closed vocabulary, in three groups:
 /// the LIFECYCLE kinds this module's own recorders write (`spawned`,
 /// `state-change`, `title-change`, `cwd-change`, `meta-change`,
-/// `agent-change`, `closing`); the
+/// `agent-change`, `closing`, and an adopted session's opening `handoff`
+/// row, [`HandoffGap`]) and the status sweep's `status-change`
+/// (`crate::session_status::STATUS_CHANGE`); the
 /// FABRIC kinds (`inbox`, `inbox-seen`, `post`, `fetch`, `post-landed`, `hold`, `topic` —
 /// `crate::fabric::FABRIC_EVENT_KINDS`, which is also their wire spelling on the
-/// digest); and `in-doubt`, which `crate::pty_idem` writes when an input verb
+/// digest); `render`, the resize ledger's entry into and exit from
+/// `desync-risk` (`desync-risk run= displaced= net= at=` / `healed run=
+/// after_ms=`, pushed as `EVENT <local> render …`; [`crate::resize_ledger`]);
+/// and `in-doubt`, which `crate::pty_idem` writes when an input verb
 /// carrying an `id=` key failed in a way that says nothing about whether its
 /// bytes reached the PTY. That last one has NO wire form on purpose: it is a
 /// per-session record of one driver's unresolved write, not a fabric message,
@@ -1143,7 +1384,8 @@ pub(crate) fn write_session_meta(
 /// The `subscribe … events` digest pushes these lifecycle kinds from this ring:
 /// `meta-change` as `EVENT <local> meta …`, `agent-change` (the server's agent
 /// verdict moved, [`SessionTimeline::publish_agent`]) as `EVENT <local> agent
-/// <word> rev=<n>`, and `closing` as `EVENT <local> closing …` (the dying
+/// <word> rev=<n>`, `status-change` (the classified status moved phase or
+/// outcome) as `EVENT <local> status …`, and `closing` as `EVENT <local> closing …` (the dying
 /// watch's final pass, ahead of its `exited` frame); the
 /// final `state-change` has no wire form of its own — `exited` is that fact.
 /// Afterwards the same reason and actor stay answerable on the instance's
@@ -1179,11 +1421,25 @@ pub(crate) struct SessionTimeline {
     /// `await agent` and the push loop read it from the control threads.
     agent: AgentPublication,
     /// THE CLAUDE CODE FOOTER's facts (`aterm_agent::harness::footer`) and the
-    /// foreground group they were read for. HOST-SIDE ONLY: the window paints
-    /// them in place of Claude Code's permission-mode row
+    /// foreground group they were read for. HOST-SIDE ONLY: the window writes
+    /// them into the rule under Claude Code's input box, on the glass
     /// (`crate::claude_footer`); no verb carries them. Written by the footer
     /// resolver thread, read by the frame compose.
     claude_footer: Option<(i32, Option<u64>, aterm_agent::harness::footer::FooterFacts)>,
+    /// The NEWEST launch card the frame compose read for the process those
+    /// facts are — its group, kernel start and owner (floor and session id):
+    /// the card names the model and effort it started on until the
+    /// transcript or its `--model` decides them (`FooterFacts::filled_from`).
+    /// A newer reading replaces it (a predecessor's card read before the new
+    /// process painted its own); a frame with no card to read does not (the
+    /// card scrolls away, and a message under it hides it, long before the
+    /// transcript decides).
+    claude_card: Option<(
+        i32,
+        Option<u64>,
+        aterm_agent::harness::footer::FactsOwner,
+        aterm_phase::LaunchCard,
+    )>,
     /// THE SHELL'S PATH, MEASURED (gap audit 2026-09-24) from the environment
     /// of a foreground leader whose parent is the session's shell
     /// (`session_status::program::leader_facts`) — a fact about the SHELL, so
@@ -1195,6 +1451,12 @@ pub(crate) struct SessionTimeline {
     /// The live agent upgrade of the conversation in this tab, as the window's
     /// upgrade host last reported it (`upgrade=`), or `None`.
     upgrade: Option<aterm_agent::harness::upgrade_drive::Row>,
+    /// THE RESIZE LEDGER ([`crate::resize_ledger`]): every grid resize this
+    /// session took and whether the app drew over content one displaced. Here,
+    /// beside the ring its verdict transitions are recorded on (`kind=render`),
+    /// for the same reason `agent` is: the one per-session leaf every reader
+    /// reaches lock-disjointly.
+    resizes: crate::resize_ledger::ResizeLedger,
 }
 
 /// One measurement of the shell's PATH ([`SessionTimeline::set_leader`]).
@@ -1430,6 +1692,57 @@ impl SessionTimeline {
         self.record("cwd-change", payload);
     }
 
+    /// The resize ledger, for its readers (`resizes`, the `events` digest).
+    pub(crate) fn resizes(&self) -> &crate::resize_ledger::ResizeLedger {
+        &self.resizes
+    }
+
+    /// Book a resize path's journal copy ([`crate::resize_ledger::ResizeLedger::ingest`])
+    /// and record any verdict transition as a `render` event. Returns whether one
+    /// was recorded (a reason to wake this session's subscribers).
+    pub(crate) fn ingest_resizes(
+        &mut self,
+        copy: &crate::resize_ledger::JournalCopy,
+        attribution: Option<crate::resize_ledger::Attribution>,
+        now_ms: u64,
+    ) -> bool {
+        let transitions = self.resizes.ingest(copy, attribution, now_ms);
+        self.record_render(&transitions)
+    }
+
+    /// Evaluate the resize ledger against `probe` and record any verdict
+    /// transition as a `render` event. Returns whether one was recorded.
+    pub(crate) fn evaluate_resizes(
+        &mut self,
+        probe: crate::resize_ledger::EngineProbe,
+        now_ms: u64,
+    ) -> bool {
+        let transitions = self.resizes.evaluate(probe, now_ms);
+        self.record_render(&transitions)
+    }
+
+    /// `render= resizes= flaps=` for `status`, evaluated against `probe` (`None`:
+    /// the terminal lock was contended, and `render=-`).
+    pub(crate) fn resize_status_fields(
+        &mut self,
+        probe: Option<crate::resize_ledger::EngineProbe>,
+        now_ms: u64,
+    ) -> String {
+        let (fields, transitions) = self.resizes.status_fields(probe, now_ms);
+        self.record_render(&transitions);
+        fields
+    }
+
+    /// Only entry into and exit from `desync-risk` reach the lifecycle ring:
+    /// a healthy flap records nothing, so at one a minute it cannot evict the
+    /// rows other watchers read.
+    fn record_render(&mut self, transitions: &[crate::resize_ledger::Transition]) -> bool {
+        for transition in transitions {
+            self.record("render", transition.payload());
+        }
+        !transitions.is_empty()
+    }
+
     /// Events with `id > after`, oldest-first (ids only ever append increasing,
     /// so this is a suffix). `None` = all retained events.
     ///
@@ -1620,7 +1933,44 @@ impl SessionTimeline {
         if self.claude_footer == next {
             return false;
         }
+        // A card belongs to one process and one owner: new facts for
+        // anything else drop it.
+        if self.claude_card.as_ref().is_some_and(|(p, s, owner, _)| {
+            next.as_ref().is_none_or(|(np, ns, facts)| {
+                (np, ns) != (p, s) || facts.owner.as_ref() != Some(owner)
+            })
+        }) {
+            self.claude_card = None;
+        }
         self.claude_footer = next;
+        true
+    }
+
+    /// Keep the launch `card` the frame compose read for the process whose
+    /// facts are stored — only while they are this group's and theirs is
+    /// `owner`, and only a card of the build they name — in place of any it
+    /// kept before: the newest reading wins. Whether it changed what is kept.
+    pub(crate) fn note_claude_card(
+        &mut self,
+        pgid: i32,
+        owner: &aterm_agent::harness::footer::FactsOwner,
+        card: aterm_phase::LaunchCard,
+    ) -> bool {
+        let Some((p, started, facts)) = self.claude_footer.as_ref() else {
+            return false;
+        };
+        if *p != pgid
+            || self.agent.program_pgid != pgid
+            || facts.owner.as_ref() != Some(owner)
+            || facts.version.as_deref() != Some(card.version.as_str())
+        {
+            return false;
+        }
+        let next = Some((pgid, *started, owner.clone(), card));
+        if self.claude_card == next {
+            return false;
+        }
+        self.claude_card = next;
         true
     }
 
@@ -1637,6 +1987,7 @@ impl SessionTimeline {
     /// group goes stale with it, and stale facts would be painted over the
     /// next Claude Code in this tab.
     pub(crate) fn clear_claude_footer(&mut self) -> bool {
+        self.claude_card = None;
         self.claude_footer.take().is_some()
     }
 
@@ -1647,6 +1998,29 @@ impl SessionTimeline {
             .as_ref()
             .filter(|(pgid, _, _)| *pgid == self.agent.program_pgid)
             .map(|(_, _, facts)| facts)
+    }
+
+    /// The launch card kept for the process whose facts are in front — `None`
+    /// once they are another process's or another owner's.
+    pub(crate) fn claude_card(&self) -> Option<&aterm_phase::LaunchCard> {
+        let (pgid, started, facts) = self
+            .claude_footer
+            .as_ref()
+            .filter(|(pgid, _, _)| *pgid == self.agent.program_pgid)?;
+        self.claude_card
+            .as_ref()
+            .filter(|(p, s, owner, _)| {
+                (p, s) == (pgid, started) && facts.owner.as_ref() == Some(owner)
+            })
+            .map(|(_, _, _, card)| card)
+    }
+
+    /// What the footer SHOWS for the group in front: its facts, filled from
+    /// the kept launch card where nothing newer decided them
+    /// (`FooterFacts::filled_from`).
+    pub(crate) fn claude_footer_shown(&self) -> Option<aterm_agent::harness::footer::FooterFacts> {
+        self.claude_footer()
+            .map(|facts| facts.filled_from(self.claude_card()))
     }
 
     /// The leader read's other two answers for `pgid`
@@ -2624,6 +2998,39 @@ mod keyed_attention_tests {
         );
         assert!(seeded.set_attention_owned("sup", None).unwrap());
         assert_eq!(seeded.attention.as_deref(), Some("seeded"));
+    }
+
+    /// The retired hooks' bare badge stays live where it stands but does not
+    /// travel — as the bare owner's entry, as a literal seed, or under a keyed
+    /// entry that the carry leaves behind anyway. NEGATIVE CONTROL: a bare
+    /// attention without the prefix travels.
+    #[test]
+    fn a_retired_hook_badge_does_not_travel() {
+        let legacy = "claude needs approval: Claude needs your permission - permission_prompt";
+        let mut meta = SessionMeta::default();
+        meta.set("attention", Some(legacy.into()));
+        assert_eq!(
+            meta.attention.as_deref(),
+            Some(legacy),
+            "a live write stands"
+        );
+        assert_eq!(meta.sanitized().attention, None);
+        meta.set_attention_owned("sup", Some("claude bash: ls (x)".into()))
+            .unwrap();
+        assert_eq!(meta.sanitized().attention, None);
+
+        let seeded = SessionMeta {
+            attention: Some(legacy.into()),
+            ..SessionMeta::default()
+        };
+        assert_eq!(seeded.sanitized().attention, None);
+
+        let mut person = SessionMeta::default();
+        person.set("attention", Some("needs approval soon".into()));
+        assert_eq!(
+            person.sanitized().attention.as_deref(),
+            Some("needs approval soon")
+        );
     }
 
     /// A supervisor claim: shown while live, refused to a second holder,

@@ -40,8 +40,15 @@ path = "src/windowed.rs"
 aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
 aterm-gui = { path = "../aterm-gui" }     # the WINDOW (winit/wgpu) + headless engine
 aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
+# `aterm ctl cast drift` computed client-side (a server that predates the verb,
+# or saved files): the replay audit is aterm-control's, the code the server
+# runs, handed to the dependency-free aterm-ctl as a plain fn (`CTL_LOCAL`).
+# Already in the graph through aterm-gui; no new crate reaches the binary.
+aterm-control = { path = "../aterm-control" }
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
+# `aterm keeper serve|status` — the PTY keeper (inert until P3).
+aterm-keeper = { path = "../aterm-keeper" }
 # `aterm link` — the fabric bridge — is a UNIX-ONLY dependency; see the
 # `[target.'cfg(unix)'.dependencies]` table below and the `Link` arms in
 # src/main.rs.

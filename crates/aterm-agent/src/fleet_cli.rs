@@ -23,13 +23,15 @@
 //!
 //! ## Why this shape, and where astream fits
 //!
-//! astream (the agent-native message bus) is at Phase 0: it ships the pure wire
-//! vocabulary (Frame codec, `/`-rooted Subject grammar, partitioner) but no broker
-//! yet. So the transport here is NDJSON over stdio — redirect `events` to a file and
-//! you have astream's own model, an append-only *replay log*. Every record is
-//! addressed by an astream Subject, so when the broker lands the bridge's records
-//! ride it UNCHANGED: `events` becomes a publisher to `/fleet/<pid>/events/<sid>` and
-//! `exec` a subscriber to `/fleet/commands`. Nothing above the transport changes.
+//! astream's broker exists, and aterm's fabric rides it: `crates/aterm-link`
+//! path-depends on `astream-broker` and carries the inbox, the post verbs and the
+//! fleet halt under `/f/<F>/…`. This bridge is deliberately NOT on it. `events` and
+//! `exec` are local glue — NDJSON over stdio, so redirecting `events` to a file gives
+//! an append-only replay log — for an orchestrator on this machine that wants every
+//! instance's stream in one pipe. The `/fleet/<pid>/events/<sid>` and
+//! `/fleet/commands/…` Subjects on the records are address labels in astream's
+//! grammar, not broker subjects: nothing publishes them, and cross-machine traffic
+//! goes through the fabric, not here.
 //!
 //! The bridge holds NO engine state and evaluates NO predicates — it is pure glue
 //! over `aterm-ctl`, so it inherits the control plane's auth, relay, and semantics
@@ -826,21 +828,39 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejected_stream_child_is_killed_and_reaped_promptly() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        // "Terminated, not waited for" is read off the child's own STATUS: a
+        // subscriber cleanup killed ends by SIGKILL, one it waited out exits 0
+        // when its sleep does. So the property needs no stopwatch. The bound is
+        // the child's lifetime again, as in the test below: only a wait for the
+        // child's own exit reaches half of it. It does not time the kill: a
+        // cleanup that killed a bounded while late (under 30 s) would pass. (It
+        // was a 3 s child under a 1 s bound, a kill and a reap timed against the
+        // scheduler.)
+        const CHILD_LIFETIME_S: u64 = 60;
         let mut child = Command::new("sh")
             // Replace the shell so terminating `child` cannot orphan a sleeping
             // grandchild in the test process tree.
-            .args(["-c", "exec sleep 3"])
+            .args(["-c", &format!("exec sleep {CHILD_LIFETIME_S}")])
             .spawn()
             .expect("spawn long-lived fake subscriber");
         let started = std::time::Instant::now();
         terminate_stream_child(&mut child).expect("kill and reap subscriber");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "cleanup waited for the long-lived child instead of terminating it"
+        let elapsed = started.elapsed();
+        let status = child
+            .try_wait()
+            .expect("query reaped child")
+            .expect("the terminated subscriber must already be reaped");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "cleanup waited for the long-lived child instead of terminating it: {status:?}"
         );
         assert!(
-            child.try_wait().expect("query reaped child").is_some(),
-            "the terminated subscriber must already be reaped"
+            elapsed < std::time::Duration::from_secs(CHILD_LIFETIME_S / 2),
+            "cleanup returned after {elapsed:?}, the child's own {CHILD_LIFETIME_S} s \
+             showing through"
         );
     }
 

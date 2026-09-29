@@ -47,7 +47,7 @@ pub fn build_words(build: u64) -> String {
         return build_label(build);
     }
     let mut s = String::from("build ");
-    s.push_str(&crate::dec_u64(build));
+    s.push_str(&build.to_string());
     s
 }
 
@@ -75,19 +75,13 @@ pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u6
 }
 
 /// A store build as a column shows it: the version for a vendor-direct build, the
-/// number for an index build. Hand-built (no `format!`) so `state.rs`, which builds its
-/// strings by hand, can call it.
+/// number for an index build.
 #[must_use]
 pub fn build_label(build: u64) -> String {
-    let Some(v) = Version::from_build_id(build) else {
-        return crate::dec_u64(build);
-    };
-    let mut s = crate::dec_u64(u64::from(v.major()));
-    s.push('.');
-    s.push_str(&crate::dec_u64(u64::from(v.minor())));
-    s.push('.');
-    s.push_str(&crate::dec_u64(u64::from(v.patch())));
-    s
+    match Version::from_build_id(build) {
+        Some(v) => format!("{}.{}.{}", v.major(), v.minor(), v.patch()),
+        None => build.to_string(),
+    }
 }
 
 /// 64 lowercase hex digits: a sha256 as every vendor file spells it.

@@ -18,7 +18,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use aterm_search::TerminalSearch;
+use aterm_search::{BudgetedSearch, SearchIndex, TerminalSearch};
 
 static NET: AtomicI64 = AtomicI64::new(0);
 
@@ -142,4 +142,108 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
         "B returns identical results after A is released",
     );
     drop((a, b));
+
+    // -------- (4) budgeted scans retain matches, not already-read rows ------
+    // A no-match Unicode workload isolates text/map retention from the bounded
+    // result vector. Measure with the engine still live, both mid-scan and
+    // after completion, as Terminal keeps a completed scan for summary reads.
+    // A batch index over the same rows is the historical-retention control.
+    const SCAN_ROWS: usize = 2048;
+    const SCRATCH_ALLOWANCE: i64 = 256 * 1024;
+    let row = "e\u{301} 日本語 👩🏽‍💻 ".repeat(32);
+    for (query, case_sensitive, is_regex) in [
+        ("absent", true, false),
+        ("ABSENT", false, false),
+        ("absent[0-9]+", true, true),
+        ("ABSENT[0-9]+", false, true),
+    ] {
+        let mut search = BudgetedSearch::new(query, case_sensitive, is_regex, 37, SCAN_ROWS)
+            .expect("bounded search construction");
+        // Compilation is deliberately outside the measurement; one-row
+        // matcher scratch may persist, but a growing row cache must not.
+        let base = net();
+        for i in 0..SCAN_ROWS {
+            search.feed_row_owned(row.clone());
+            if i + 1 == SCAN_ROWS / 2 {
+                let retained = net() - base;
+                assert!(
+                    retained < SCRATCH_ALLOWANCE,
+                    "in-flight scan retained {retained} bytes for already-read rows: \
+                     cs={case_sensitive} rx={is_regex}"
+                );
+            }
+        }
+        let retained = net() - base;
+        assert!(search.is_complete());
+        assert!(search.results().matches.is_empty());
+        assert!(
+            retained < SCRATCH_ALLOWANCE,
+            "completed scan retained {retained} bytes beyond matcher scratch: \
+             cs={case_sensitive} rx={is_regex}"
+        );
+    }
+
+    let mut retained_index = SearchIndex::new();
+    let base_index = net();
+    for i in 0..SCAN_ROWS {
+        retained_index.index_line(37 + i, &row);
+    }
+    let retained = net() - base_index;
+    assert!(
+        retained_index
+            .search_results_opts("absent", true, false)
+            .expect("negative-control query")
+            .matches
+            .is_empty()
+    );
+    assert!(
+        retained > 4 * SCRATCH_ALLOWANCE,
+        "negative control must retain enough row data to fail the scan bound: {retained} bytes"
+    );
+    // Text alone exceeds the allowance, independently of batch-only postings:
+    // the old columns-only BudgetedSearch would fail the same live-heap bound.
+    assert!(row.len() * SCAN_ROWS > 4 * SCRATCH_ALLOWANCE as usize);
+
+    // -------- (5) screen refreshes do not inflate the filter's live heap ---
+    // One wide row isolates filter growth from line and posting allocations.
+    // Previously every unchanged refresh counted thousands of duplicate
+    // trigram inserts, growing the filter by hundreds of KiB.
+    let wide = "compiler_worker emitted another build diagnostic ".repeat(100);
+    let mut refreshed = SearchIndex::new();
+    refreshed.index_line(0, &wide);
+    let before_refresh = net();
+    for _ in 0..1000 {
+        refreshed.index_line(0, &wide);
+    }
+    let refresh_growth = net() - before_refresh;
+    assert!(
+        refresh_growth < 16 * 1024,
+        "unchanged screen refreshes grew live heap by {refresh_growth} bytes"
+    );
+    assert_eq!(refreshed.search_with_positions("diagnostic").len(), 100);
+
+    // -------- (6) retained row cap also bounds constructor reservations ----
+    // A very large expected history must not reserve its full hash-table
+    // spines when only a tiny suffix can ever be retained.
+    let before_capped = net();
+    let capped = SearchIndex::with_capacity_and_max(1_000_000, 32);
+    let capped_bytes = net() - before_capped;
+    assert!(
+        capped_bytes < 32 * 1024,
+        "32-row cache reserved {capped_bytes} bytes for evicted history"
+    );
+    drop(capped);
+
+    // Actual allocation control: this asks for the full million-row tables
+    // that the previous constructor reserved even with the 32-row cap. There
+    // is no content allocation, and it is released before the next assertion.
+    let before_full_reservation = net();
+    let full_reservation = SearchIndex::with_capacity_and_max(1_000_000, 1_000_000);
+    let full_bytes = net() - before_full_reservation;
+    drop(full_reservation);
+    assert!(full_bytes > capped_bytes * 100);
+    eprintln!(
+        "search_cache_bounds: unchanged_refresh_growth={refresh_growth} \
+         capped_32_rows={capped_bytes} uncapped_million_row_reservation={full_bytes} bytes"
+    );
 }

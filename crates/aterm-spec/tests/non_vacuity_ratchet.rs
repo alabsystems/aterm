@@ -119,6 +119,11 @@ const SPACE_GUARDS: &[(&str, &[&str])] = &[
     // cross-session design claim is DecisionReadsOnlySelectedSink, which the
     // process-wide ACTIVE mutant falsifies.
     ("PasteOrderSinkIsolation", &["PendingIsBounded"]),
+    // The displacement box the resize ledger's render verdict is explored in;
+    // every verdict claim (`RiskIsFlagged`, `NoSilentPass`, `NoFalseVerdict`)
+    // falls to the size-difference judge, and `QuietFlapIsIdentity` to the
+    // historical append-only grow, all in the one `Buggy = 1` member.
+    ("ResizeRender", &["Bounded"]),
     ("RainbowLandingPool", &["StateBounds"]),
     ("OperatorEventDelivery", &["Bounds"]),
     ("OperatorFleetFault", &["Bounds"]),
@@ -258,6 +263,10 @@ const SPACE_GUARDS: &[(&str, &[&str])] = &[
     // `passes` is the bounded retry phase (first, second, later); the
     // scheduling claim is NoPrematureSameBuildPass, which Buggy falsifies.
     ("AtpkgSessionIndexRetry", &["BoundedRetry"]),
+    // The relaunch count bounds the explored box; the brake's policy is
+    // `KeeperRelaunchBrake`, whose `StreakBounded` is a design claim with a
+    // mutant (docs/DESIGN-pty-keeper-2026-09-26.md §6.1/§6.2).
+    ("PtyKeeperCustody", &["RelaunchSpace"]),
 ];
 
 thread_local! {

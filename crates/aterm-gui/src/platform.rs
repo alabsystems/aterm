@@ -276,10 +276,13 @@ pub(crate) trait AppRt {
     /// Spawn the process-wide notification delivery thread and return the bounded
     /// `SyncSender` each tab clones into its engine callbacks. Off macOS this is the
     /// channel-draining stub (senders never block; nothing is delivered).
+    /// `own_alerts` is the live `desktop_alerts` switch: while it reads `false` the
+    /// thread drops every notice aterm wrote itself ([`NotifyMsg::own`]).
     fn send_notification_init(
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
+        own_alerts: Arc<AtomicBool>,
     ) -> SyncSender<NotifyMsg>;
 
     /// Build + install the native application menu bar, returning the retained
@@ -474,6 +477,18 @@ pub(crate) trait AppRt {
     /// life (AppKit references it weakly). Windows currently samples only at
     /// window attach; other platforms have no query, so both return `None`.
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver>;
+
+    /// Hold App Nap off for the rest of the process's life, and return the
+    /// activity token the caller keeps for that life: the activity ends when
+    /// the token is released. Called once, and only on the WINDOWED lane —
+    /// `App::resumed`, after its headless return — so a headless or
+    /// test-constructed `App` never reaches the platform service (AGENTS.md
+    /// rule 5). macOS: `begin_app_nap_opt_out` below, which carries the
+    /// 2026-09-28 incident. Default `None`: App Nap is macOS's, so there is
+    /// nothing to hold elsewhere.
+    fn hold_off_app_nap(&self) -> Option<AppNapActivity> {
+        None
+    }
 }
 
 /// The colour space a GPU window's CAMetalLayer is tagged with at surface attach
@@ -917,8 +932,9 @@ impl AppRt for AppRtMacOS {
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
+        own_alerts: Arc<AtomicBool>,
     ) -> SyncSender<NotifyMsg> {
-        crate::notify::spawn_delivery(suppress, silent)
+        crate::notify::spawn_delivery(suppress, silent, own_alerts)
     }
 
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {
@@ -1074,6 +1090,10 @@ impl AppRt for AppRtMacOS {
 
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver> {
         reduce_motion::observe(proxy)
+    }
+
+    fn hold_off_app_nap(&self) -> Option<AppNapActivity> {
+        begin_app_nap_opt_out()
     }
 }
 
@@ -1840,8 +1860,9 @@ impl AppRt for AppRtLinux {
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
         silent: Arc<AtomicBool>,
+        own_alerts: Arc<AtomicBool>,
     ) -> SyncSender<NotifyMsg> {
-        crate::notify::spawn_delivery(suppress, silent)
+        crate::notify::spawn_delivery(suppress, silent, own_alerts)
     }
 
     // The branches below delegate to the `menu::`/`toolbar::` modules — the menu is
@@ -1943,6 +1964,98 @@ pub(crate) type ReduceMotionObserver = aterm_objc::Retained<reduce_motion::Reduc
 /// See the macOS variant above — nothing to retain off macOS.
 #[cfg(not(target_os = "macos"))]
 pub(crate) type ReduceMotionObserver = ();
+
+/// The App Nap opt-out's activity token [`AppRt::hold_off_app_nap`] returns: the
+/// retained `NSProcessInfo` activity on macOS, `()` elsewhere (so the `App`
+/// field type is the same name on every platform, like [`ReduceMotionObserver`]).
+#[cfg(target_os = "macos")]
+pub(crate) type AppNapActivity = aterm_objc::Obj;
+
+/// See the macOS variant above — nothing to hold off macOS.
+#[cfg(not(target_os = "macos"))]
+pub(crate) type AppNapActivity = ();
+
+/// App Nap, held off for the life of the windowed app: [`AppRt::hold_off_app_nap`]
+/// on macOS. ONE activity, begun once; no config key and no environment switch.
+///
+/// 2026-09-28 (0.98.0): holding no activity, the whole process went unscheduled for 3 h 22 m on a
+/// saturated Mac — agents alive, control socket dark — and thawed 5 ms after an App Nap assertion.
+///
+/// What the evidence says, and what it does not. aterm held no power or
+/// activity assertion (`pmset -g assertions` listed none), so App Nap was free
+/// to nap it, and a napped app runs every thread at priority 4 (the reflow note
+/// in `app_render.rs` read all 38 of the live app's threads there), which the
+/// machine's load of 45-151 can starve outright. The thaw came 5 ms after
+/// runningboardd logged WindowServer acquiring a `com.apple.appnap` /
+/// `AppDrawing` assertion on the process. App Nap applies to aterm itself and
+/// not to its PTY children, which is why the agents kept running while every
+/// `aterm ctl` (`os error 35`) and every relay client ("timed out waiting for
+/// the server") hit its read deadline after a successful connect. That makes
+/// App Nap the fitting suspect, not a proven cause: an unnapped process can
+/// still be starved by such a load, only no longer from background priority.
+///
+/// THE FLAGS: `appkit::consts::NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP`,
+/// every user-initiated flag (the set that keeps App Nap off) minus the one that
+/// would stop the Mac idle-sleeping — a terminal left open overnight must not
+/// hold the machine awake. Its sudden- and automatic-termination bits change
+/// nothing: `apps/aterm-mac/Info.plist` opts into neither.
+///
+/// THE TOKEN: `-beginActivityWithOptions:reason:` returns it at +0
+/// (autoreleased), and the activity ENDS when it is deallocated
+/// (`NSProcessInfo.h`), so it is retained here and `App` keeps it for the
+/// process's life. No `-endActivity:` is ever sent: the exit seam forgets `App`,
+/// and the activity ends with the process.
+#[cfg(target_os = "macos")]
+fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
+    use aterm_objc::{Obj, autoreleasepool, class, sel};
+
+    use crate::appkit::{self, consts::NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP};
+
+    /// The activity's reason — "a string used in debugging to indicate the
+    /// reason the activity began" (`NSProcessInfo.h`).
+    const REASON: &str =
+        "aterm hosts terminal sessions and the control socket agents drive them over";
+
+    let token = autoreleasepool(|_| {
+        let reason = appkit::nsstring(REASON)?;
+        // SAFETY: `+processInfo` is `-(id)`, the immortal process singleton
+        // (the same send `current_event_queue_age_ns` makes), and
+        // `-beginActivityWithOptions:reason:` is
+        // `-(id<NSObject>)(NSActivityOptions, NSString *)`, `@@:Q@` — the
+        // `uint64_t` options word is `NSUInteger`-wide on every Apple target, so
+        // `send_id_usize_id` is its exact shape. `reason` is a live +1 NSString
+        // this frame owns; the receiver retains or copies whatever it keeps.
+        // The token comes back AUTORELEASED (+0, borrowed inside this pool), so
+        // it is retained before the pool pops. `NSProcessInfo` is thread-safe,
+        // and this runs on the main thread anyway (`App::resumed`).
+        unsafe {
+            let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
+            if info.is_null() {
+                return None;
+            }
+            let token = appkit::send_id_usize_id(
+                info,
+                sel!(beginActivityWithOptions:reason:),
+                NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP,
+                reason.id(),
+            );
+            Obj::retain(token)
+        }
+    });
+    if token.is_some() {
+        aterm_log::info!(
+            "app nap: held off for the life of this process \
+             (NSActivityUserInitiatedAllowingIdleSystemSleep; idle system sleep still allowed): \
+             {REASON}"
+        );
+    } else {
+        aterm_log::warn!(
+            "app nap: NOT held off — -[NSProcessInfo beginActivityWithOptions:reason:] \
+             answered nil, so macOS may nap this process and its control socket with it"
+        );
+    }
+    token
+}
 
 /// How long the Linux motion read may take. It runs once per window attach, on
 /// the main thread, so it is bounded well under a frame budget's worth of
@@ -3632,6 +3745,9 @@ mod platform_cfg_hygiene_tests {
             "lib.rs",
             "an_attached_console_is_released_only_for_a_window",
         ),
+        // The windowed image's answer onto a prompt that did not wait for it
+        // (2026-09-27): the same AttachConsole state, read by the CLI parser.
+        ("cli.rs", "a_process_that_attached_no_console_adds_no_line"),
         (
             "input.rs",
             "wheel_scale_is_the_platform_distance_not_one_line",
@@ -3650,6 +3766,20 @@ mod platform_cfg_hygiene_tests {
         (
             "diagnostics.rs",
             "validate_accepts_the_windows_shell_spellings_a_user_would_write",
+        ),
+        // `ATERM_TAB_SHELL` is handed to a tab only on Windows, where no CLI in
+        // the tab can otherwise see the window's `--shell` (2026-09-27), and the
+        // test pins the Windows shell resolution (`cmd` -> an absolute cmd.exe).
+        (
+            "spawn.rs",
+            "a_shell_tab_is_told_its_shell_and_a_command_is_told_nothing",
+        ),
+        // The ConPTY keyboard posture: the test registers a real ConPTY-backed
+        // master through `aterm_pty::adopt_handoff` (a Windows handle), which is
+        // the only way to make `backend_is_conpty` answer true.
+        (
+            "spawn.rs",
+            "a_conpty_session_does_not_advertise_the_kitty_keyboard_protocol",
         ),
         // The structured-exception crash handler: its formatters and banner are
         // pure, but they exist only in a `#[cfg(windows)]` region of the file.
@@ -3713,7 +3843,14 @@ mod platform_cfg_hygiene_tests {
         ),
         ("quit_safety.rs", "windows_invalid_shell_pid_is_idle"),
         ("quit_safety.rs", "windows_child_walk_detects_a_live_child"),
-        ("quit_safety.rs", "the_two_child_walks_share_one_predicate"),
+        // The vetted walk's FILETIME, image-name and candidate filters are pure,
+        // but they live in the `#[cfg(windows)]` `windows_jobs` module: off
+        // Windows nothing calls them, so ungating them would be dead code.
+        ("quit_safety.rs", "windows_process_facts_units"),
+        (
+            "quit_safety.rs",
+            "the_capture_books_only_candidate_children",
+        ),
         (
             "session_status.rs",
             "an_idle_windows_job_probe_cost_does_not_scale_with_tab_count",

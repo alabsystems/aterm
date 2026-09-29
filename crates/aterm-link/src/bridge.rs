@@ -4877,8 +4877,8 @@ impl Bridge {
     /// with one message and no capability at all, permanently making a peer's
     /// sid `ERR ambiguous` for every sender on the node (or, before the real
     /// host came up, routing its mail onto a lane of the attacker's choosing).
-    /// The table survives every restart and §11.2's `aterm-link pin` override is
-    /// not implemented, so there was no undo.
+    /// The table survives every restart, and the only undo is deleting the file
+    /// (§11.2's `aterm-link pin` override was cut unbuilt in 622e40af6).
     ///
     /// An address that NAMES its node needs no pin — the sender already said
     /// where it is going. So the explicit arm now reads the table and never

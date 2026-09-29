@@ -31,11 +31,10 @@ fn the_kani_script_classifier_and_explicit_lane_hold_without_trust_mc() {
         "verify-kani-proofs.sh --self-test failed:\n{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // The explicit lane is non-empty and names the four SIMD offset/bounds proofs.
+    // The explicit lane is non-empty and names the three SIMD offset/range proofs.
     for name in [
         "simd_avx2_offset_no_overflow",
         "simd_neon_offset_no_overflow",
-        "simd_pointer_within_bounds",
         "simd_scalar_fallback_range_valid",
     ] {
         assert!(

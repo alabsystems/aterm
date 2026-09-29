@@ -187,8 +187,11 @@ pub(crate) struct PaletteLive {
     pub kitty_favourited: bool,
     /// Process-wide serious mode is active (checkmark on Serious Mode).
     pub serious_mode: bool,
-    /// The window is full-screen (checkmark on Enter Full Screen).
+    /// The window is full-screen (the row reads Exit Full Screen).
     pub fullscreen: bool,
+    /// The front tab is split, so ⌘W closes the focused pane (the row reads
+    /// Close Pane).
+    pub front_tab_split: bool,
     /// The front window has more than one tab (gates Next/Previous Tab + Close Tab).
     pub multi_tab: bool,
     /// The active whole tab is a native app rather than a terminal pane tree. Terminal-only
@@ -247,6 +250,30 @@ pub(crate) struct PaletteLive {
     /// string) shows the chord that actually works here. Empty = no hints (the
     /// pure-test default).
     pub menu_accels: Vec<(MenuAction, String)>,
+}
+
+/// The Version section's dynamic row label, or `None` when the row is removed:
+/// the staged install offer, else the post-update row. [`PaletteState::resolve`]
+/// shows it, and the off-macOS `chrome` menu lines print it
+/// (`menu::menu_chrome_lines`), so the two name the same row.
+///
+/// Same label law as the macOS Version menu (`menu::staged_apply_label`): a
+/// staged build may share the running build's display version, so it falls back
+/// to the build number rather than offer to update to the version already on
+/// screen. Plain `↑`, not the colour emoji — the palette is own-rendered text
+/// with no emoji face.
+pub(crate) fn apply_row_label(live: &PaletteLive) -> Option<String> {
+    if let Some((build, v)) = &live.staged {
+        return Some(crate::menu::staged_apply_label(
+            "\u{2191}",
+            *build,
+            v,
+            live.staged_trouble.as_ref(),
+        ));
+    }
+    live.realized
+        .as_ref()
+        .map(|(v, _)| crate::menu::realized_row_label("\u{2191}", v))
 }
 
 impl PaletteState {
@@ -399,23 +426,12 @@ impl PaletteState {
         self.pointer_armed = None;
         self.realized_since = None;
         self.realized_frozen = live.reduced_motion;
-        // Same label law as the menu row (`menu::staged_apply_label`): a staged build
-        // may share the running build's display version, so fall back to the build
-        // number rather than offer to update to the version already on screen. Plain
-        // `↑`, not the colour emoji — this is own-rendered text with no emoji face.
-        let dynamic_label: Option<Cow<'static, str>> = if let Some((build, v)) = &live.staged {
-            Some(Cow::Owned(crate::menu::staged_apply_label(
-                "\u{2191}",
-                *build,
-                v,
-                live.staged_trouble.as_ref(),
-            )))
-        } else if let Some((v, since)) = &live.realized {
+        if live.staged.is_none()
+            && let Some((_, since)) = &live.realized
+        {
             self.realized_since = Some(*since);
-            Some(Cow::Owned(format!("\u{2191} Updated to aterm v{v}")))
-        } else {
-            None
-        };
+        }
+        let dynamic_label: Option<Cow<'static, str>> = apply_row_label(live).map(Cow::Owned);
         let pos = self
             .rows
             .iter()
@@ -473,7 +489,14 @@ impl PaletteState {
             };
             match action {
                 MenuAction::ToggleSettings => row.checked = Some(live.settings_open),
-                MenuAction::ToggleFullScreen => row.checked = Some(live.fullscreen),
+                // The verb carries the state, as the native View item does.
+                MenuAction::ToggleFullScreen => {
+                    row.label = Cow::Borrowed(crate::menu::full_screen_title(live.fullscreen));
+                }
+                // ⌘W closes the focused pane of a split tab; the row says which.
+                MenuAction::CloseTab => {
+                    row.label = Cow::Borrowed(crate::menu::close_row_title(live.front_tab_split));
+                }
                 MenuAction::ToggleSeriousMode => row.checked = Some(live.serious_mode),
                 // Per-session state: the checkmark mirrors the FRONT session's
                 // effective rain; a native whole tab — or no window at all —
@@ -1539,7 +1562,7 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
     }
 
     // Key-hint footer on the last row.
-    let hint = "\u{2191}\u{2193} move   \u{23ce} run   type to filter   esc close";
+    let hint = "\u{2191}\u{2193} move   \u{23ce} run   esc close";
     let fsize = TypeStep::Caption.px(px);
     let hint_w = text_w(hint, fsize.get());
     let fx = card_x + fit((card_w - hint_w) * 0.5, cw, card_w - hint_w - cw);
@@ -1824,6 +1847,40 @@ mod tests {
         });
         assert_eq!(by_action(&s, MenuAction::Copy), "Ctrl+Shift+C");
         assert_eq!(by_action(&s, MenuAction::ToggleFullScreen), "F11");
+        // In full screen the toggle's row names what it does now, and a
+        // re-resolve out of full screen names it back.
+        let label = |s: &PaletteState| {
+            let row = s
+                .rows
+                .iter()
+                .find(|r| r.action == MenuAction::ToggleFullScreen)
+                .expect("row");
+            (row.label.to_string(), row.checked)
+        };
+        let mut full = PaletteState::new();
+        full.resolve(&PaletteLive {
+            fullscreen: true,
+            ..Default::default()
+        });
+        assert_eq!(label(&full), ("Exit Full Screen".to_string(), None));
+        full.resolve(&PaletteLive::default());
+        assert_eq!(label(&full), ("Enter Full Screen".to_string(), None));
+        // ⌘W's row names what it closes: the focused pane of a split tab.
+        let close = |s: &PaletteState| {
+            s.rows
+                .iter()
+                .find(|r| r.action == MenuAction::CloseTab)
+                .expect("row")
+                .label
+                .to_string()
+        };
+        full.resolve(&PaletteLive {
+            front_tab_split: true,
+            ..Default::default()
+        });
+        assert_eq!(close(&full), "Close Pane");
+        full.resolve(&PaletteLive::default());
+        assert_eq!(close(&full), "Close Tab");
         // No hint for Paste in this live set: the row paints its platform
         // default — the ⌘ menu mirror on macOS, blank elsewhere.
         assert_eq!(
@@ -2355,9 +2412,17 @@ mod tests {
         if cfg!(windows) {
             assert!(!enabled, "Windows has no in-app updater");
         }
-        let chrome_offers = crate::menu::menu_chrome_lines()
+        let chrome = crate::menu::menu_chrome_lines(
+            apply_row_label(&PaletteLive::default()).as_deref(),
+            false,
+        );
+        let chrome_offers = chrome
             .iter()
             .any(|line| line.contains("Check for Updates…"));
+        assert!(
+            !chrome.iter().any(|line| line.contains("Install")),
+            "nothing staged: `chrome` lists no install row either: {chrome:?}"
+        );
         assert_eq!(
             chrome_offers, enabled,
             "`chrome` lists the row exactly where `controls menu` enables it"

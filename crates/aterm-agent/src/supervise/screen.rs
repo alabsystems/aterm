@@ -34,6 +34,11 @@ pub struct Screen {
     /// at the read (`"human_ms"`, 2026-09-25): what the question answer waits
     /// on before it keys a dialog a person may be navigating.
     pub human: HumanInput,
+    /// How many person gestures had reached the session at the read
+    /// (`"human_seq"`, 2026-09-27): what a key fenced `if-human=` names, so
+    /// the server writes it only if no person has keyed since. `None` from a
+    /// host that does not send it (the key then carries no person fence).
+    pub human_seq: Option<u64>,
 }
 
 /// The server's person stamp on a read ([`Screen::human`]).
@@ -137,6 +142,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
             Some(Json::Null) => HumanInput::Never,
             Some(h) => h.as_u64().map_or(HumanInput::Unknown, HumanInput::Ago),
         },
+        human_seq: v.get("human_seq").and_then(Json::as_u64),
     })
 }
 

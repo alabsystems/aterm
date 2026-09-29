@@ -136,6 +136,73 @@ impl Terminal {
         self.grid.scrollback()
     }
 
+    /// The tiered store that holds this terminal's HISTORY, whichever grid
+    /// slot it currently sits in — the twin of [`Self::main_grid`] for the
+    /// scrollback store.
+    ///
+    /// [`Self::scrollback`] reads the ACTIVE grid. That is the right answer
+    /// for a viewport, and the wrong one for anything that accounts for or
+    /// reclaims history: entering the alternate screen (`CSI ?1049h`,
+    /// `handler_dec.rs` `enter_alternate_screen_raw`) swaps a fresh
+    /// scrollback-0 alt grid into the active slot and parks the primary grid
+    /// — and with it the only tiered store — in `alt_grid`. On 2026-09-26 the
+    /// audit found every memory-pressure line the owner's live window (pids
+    /// 6874 and 79405) ever logged saying "trimmed scrollback across 0
+    /// session(s)" (53 of 53) while 3 of its 4 tabs ran Claude Code on the
+    /// alternate screen: the shed read this store through
+    /// [`Self::scrollback`], found `None`, and skipped the tab. Read the
+    /// history through this accessor instead.
+    #[must_use]
+    pub fn history_scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
+        self.main_grid().scrollback()
+    }
+
+    /// Reclaimable bytes in the history store ([`Self::history_scrollback`]),
+    /// measured after the history grid's lazily-deferred rows are promoted
+    /// into the store, so the figure is what an eviction pass will see.
+    /// `None` when no tiered store is attached (a ring-only grid, or the
+    /// store detached for an off-thread reflow).
+    pub fn history_scrollback_bytes(&mut self) -> Option<usize> {
+        self.history_grid_mut()
+            .scrollback_mut()
+            .map(|store| store.budgeted_memory_used())
+    }
+
+    /// Evict the history store down to `keep(budget)` bytes, then restore its
+    /// own `budget` so the tab can keep growing history — the
+    /// evict-hard-then-restore idiom of the GUI's memory-pressure shed and
+    /// aggregate-cap lane, which both route through here (2026-09-26).
+    ///
+    /// It acts on the store that HOLDS the history, including while the
+    /// alternate screen is up (see [`Self::history_scrollback`] for the
+    /// incident), and it reports what it measured before and after rather
+    /// than asserting that a store's existence meant bytes were freed —
+    /// those lanes used to count "sessions with a store" as "trimmed".
+    /// Enforcement errors from the budget setter are not surfaced: the hot
+    /// tier can refuse to evict the rows it is actively serving, and the
+    /// measured [`HistoryShed::freed`] is the honest account of what was
+    /// given back either way.
+    ///
+    /// Returns `None` (and changes nothing) when no tiered store is attached.
+    pub fn shed_history_scrollback(
+        &mut self,
+        keep: impl FnOnce(usize) -> usize,
+    ) -> Option<HistoryShed> {
+        let store = self.history_grid_mut().scrollback_mut()?;
+        let budget = store.memory_budget();
+        let before = store.budgeted_memory_used();
+        // `set_memory_budget` applies to BOTH grid slots, so it reaches the
+        // parked primary while the alt screen is up; the alt grid itself has
+        // no tiered store, so the call is a no-op there.
+        let _ = self.set_memory_budget(keep(budget));
+        let _ = self.set_memory_budget(budget);
+        let after = self.history_scrollback().map_or(
+            0,
+            crate::scrollback::ScrollbackStorage::budgeted_memory_used,
+        );
+        Some(HistoryShed { before, after })
+    }
+
     /// Drain deferred scrollback rows into attached tiered storage for all grids.
     ///
     /// The grid keeps recently scrolled rows in a lazy buffer for write-path
@@ -392,9 +459,16 @@ impl Terminal {
     /// `ScrollToBottom`, the ⌘-V and IME snaps, the find bar's restore to a live
     /// view — recording [`crate::terminal::CustodyTransition::SnapToLive`] when the
     /// view actually moved. The highlight is left alone.
+    ///
+    /// One already at live records nothing, but it is still the person saying
+    /// where they want to be, so it counts as a reader gesture
+    /// ([`Self::reader_gesture_count`]).
     pub fn return_to_live(&mut self) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_bottom();
+        if before == 0 {
+            self.reader_gestures = self.reader_gestures.wrapping_add(1);
+        }
         self.note_scroll_custody(before);
     }
 
@@ -1045,5 +1119,25 @@ mod tests {
         u.process(b"\x1bc");
         assert_eq!(u.print_anchor(), None);
         assert_eq!(u.print_anchor_glyph(), None);
+    }
+}
+
+/// What one [`Terminal::shed_history_scrollback`] pass measured on the
+/// history store: reclaimable bytes before the eviction and after the budget
+/// was restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryShed {
+    /// Reclaimable history bytes before the pass (lazy rows promoted first).
+    pub before: usize,
+    /// Reclaimable history bytes after the pass.
+    pub after: usize,
+}
+
+impl HistoryShed {
+    /// Bytes the pass actually gave back — zero when the store was already
+    /// under the target, which is the common case under a WARN-tier shed.
+    #[must_use]
+    pub const fn freed(self) -> usize {
+        self.before.saturating_sub(self.after)
     }
 }

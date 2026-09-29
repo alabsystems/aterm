@@ -725,6 +725,9 @@ struct Watch {
     /// The highest timeline event id already scanned, mirroring `last_turn_id`
     /// — a live stream, seeded to the current high at subscription.
     last_timeline_id: Option<u64>,
+    /// The highest RESIZE LEDGER row already pushed (`EVENT <local> resize`),
+    /// seeded to the ledger's high at subscription — a live stream too.
+    last_resize_id: u64,
     /// The window title as of the last `EVENT … title` we emitted. A title change
     /// (OSC 0/2 — often mirroring the cwd or running command via shell integration)
     /// is a fleet-supervision signal an orchestrator should get on the `events`
@@ -1131,6 +1134,10 @@ fn drain_title_event(
 ///   `await seq|idle|gone`, and it must read the rows anyway to parse the
 ///   approval box, so it classifies those rows with aterm-phase itself and uses
 ///   the verdict only for one bounded `await agent prompt`.
+/// * `EVENT <sid> status phase=<p> outcome=<o> exit_code=<n|-> signal=<n|->
+///   confidence=<c>` for a `status-change` — the session's classified status
+///   moved phase or outcome (`status phase=`), one per transition that survived
+///   dwell.
 /// * `EVENT <sid> human` for a `human` row — a person started typing,
 ///   clicking or scrolling in the session through a window after at least
 ///   [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without (the burst edge;
@@ -1204,13 +1211,62 @@ fn drain_timeline_events(
     high
 }
 
+/// Evaluate the target's RESIZE LEDGER against this wake's engine `probe`
+/// (recording any `render` verdict transition on the timeline, which the
+/// timeline drain pushes; a probe older than what the ledger booked since it
+/// was sampled settles nothing it could misread), then push the resizes booked
+/// since `last_id` as ONE coalesced `EVENT <sid> resize n=<k> id=<last>
+/// to=<CxR> run=<r>` — a window drag's sixty rows a second are one frame per
+/// wake, never a flood. A watermark below the ledger's retained low adds
+/// `dropped=<n>` to that frame (the rows the ring evicted unshown): a count on
+/// this stream's own frame, not a `GAP`, which a consumer of the `events`
+/// stream reads as lost lifecycle frames. Returns the new watermark. An idle
+/// wake is one leaf lock, a scan of the ledger's open runs (none, almost
+/// always) and one integer compare.
+fn drain_resize_events(
+    timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+    sid: &str,
+    last_id: u64,
+    probe: crate::resize_ledger::EngineProbe,
+    out: &mut String,
+) -> u64 {
+    let (dropped, fresh, high) = {
+        let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        tl.evaluate_resizes(probe, crate::turn_ledger::now_ms());
+        let ledger = tl.resizes();
+        let high = ledger.high_row();
+        if high <= last_id {
+            return high;
+        }
+        let dropped = ledger
+            .low_row()
+            .map_or(0, |low| low.saturating_sub(last_id.saturating_add(1)));
+        let n = ledger.rows_since(last_id).count();
+        let fresh = ledger
+            .rows_since(last_id)
+            .next_back()
+            .map(|row| (n, row.id, row.report.to, row.run));
+        (dropped, fresh, high)
+    };
+    if let Some((n, id, (rows, cols), run)) = fresh {
+        out.push_str(&format!(
+            "EVENT {sid} resize n={n} id={id} to={cols}x{rows} run={run}"
+        ));
+        if dropped > 0 {
+            out.push_str(&format!(" dropped={dropped}"));
+        }
+        out.push('\n');
+    }
+    high
+}
+
 /// The `EVENT <sid> <kind>` token a timeline record is pushed under on the
 /// `events` digest, or `None` for a kind the digest does not carry. ONE table,
 /// so the drain's filter and the frame it formats cannot disagree about which
 /// rows leave the process: the `closing` row first shipped recorded-but-never-
 /// pushed, because the filter named `meta-change` and nothing else, and the
 /// verb table claimed a watch could read it — the drift this table forecloses.
-fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
+pub(crate) fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "meta-change" => Some("meta"),
         "closing" => Some("closing"),
@@ -1219,11 +1275,22 @@ fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         // face of `status agent=` — a client that does not need the rows may
         // park on it instead of re-reading screens.
         "agent-change" => Some("agent"),
+        // The session's published status moved phase or outcome
+        // (`session_status::StatusObserver::take_status_event`): `EVENT <local>
+        // status phase=<p> outcome=<o> exit_code=<n|-> signal=<n|->
+        // confidence=<c>`, the push face of `status` — one per transition that
+        // survived dwell, so a spinner cannot flood it.
+        crate::session_status::STATUS_CHANGE => Some("status"),
         // A PERSON started typing, clicking or scrolling in the session through
         // a window after ≥ 30 s without (`crate::app_input::note_person`): `EVENT <local>
         // human`, no payload — `status human_ms=` says how long ago since.
         // The supervisor keeps its hands off for `[harness] human_grace_s`.
         "human" => Some("human"),
+        // The RESIZE LEDGER's verdict moved into or out of `desync-risk`
+        // (`crate::resize_ledger`): `EVENT <local> render desync-risk run=<r>
+        // displaced=<+-k> net=zero at=<ms>` / `EVENT <local> render
+        // healed run=<r> after_ms=<ms>`, the push face of `status render=`.
+        "render" => Some("render"),
         // The FABRIC digest (design §11.2): `inbox`, `inbox-seen`, `post`,
         // `fetch`, `post-landed`, `hold`, `topic`. Their wire name IS the record kind, and the list
         // lives beside the code that WRITES them
@@ -1609,6 +1676,9 @@ struct EngineSample {
     title: Option<String>,
     /// The monotonic fired-bell count.
     bell: u64,
+    /// The RESIZE LEDGER's four engine counters (`crate::resize_ledger`), read
+    /// in this same hold: what the ledger's verdict is evaluated against.
+    resize: crate::resize_ledger::EngineProbe,
 }
 
 fn sample_engine_events(
@@ -1645,6 +1715,7 @@ fn sample_engine_events(
         blocks,
         title: (last_title != Some(t.title())).then(|| t.title().to_string()),
         bell: t.bell_total(),
+        resize: crate::resize_ledger::EngineProbe::sample(&t),
     }
 }
 
@@ -1828,6 +1899,16 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
         watch.last_block_id =
             drain_block_events(&sid, &engine.blocks, watch.last_block_id, &mut out);
         watch.last_turn_id = drain_turn_events(&watch.turns, &sid, watch.last_turn_id, &mut out);
+        // The resize ledger is evaluated first, so a `render` verdict it
+        // records on the timeline this wake is pushed by the timeline drain
+        // right below, in the same frame.
+        watch.last_resize_id = drain_resize_events(
+            &watch.timeline,
+            &sid,
+            watch.last_resize_id,
+            engine.resize,
+            &mut out,
+        );
         watch.last_timeline_id =
             drain_timeline_events(&watch.timeline, &sid, watch.last_timeline_id, &mut out);
         watch.last_title = drain_title_event(&sid, engine.title, watch.last_title.take(), &mut out);
@@ -1895,6 +1976,7 @@ fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions
         // Seed to the live timeline high so only meta changes AFTER
         // subscription push (a live stream, like turns/blocks/title).
         last_timeline_id: initial_timeline_watermark(timeline, streams),
+        last_resize_id: initial_resize_watermark(timeline, streams),
         // Seed to the live title so a fresh `events` subscriber gets title
         // CHANGES from here, not a spurious event for the title already showing.
         last_title: streams
@@ -2353,6 +2435,22 @@ fn initial_timeline_watermark(
         return None;
     }
     timeline.lock().unwrap_or_else(|p| p.into_inner()).high_id()
+}
+
+/// The `events` stream's resize watermark at subscription: the ledger's high,
+/// so only resizes AFTER the subscription push (0 when events are off).
+fn initial_resize_watermark(
+    timeline: &Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+    streams: TargetStreams,
+) -> u64 {
+    if !streams.events {
+        return 0;
+    }
+    timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .resizes()
+        .high_row()
 }
 
 /// Which live sessions this `@*` subscription should ADOPT now — every one it
@@ -2836,6 +2934,13 @@ pub(crate) mod bench_seam {
                 t.bell_total(),
             )
         };
+        // Both timeline watermarks under ONE guard: a `lock()` in each field of
+        // the struct literal below would hold the first guard (a temporary)
+        // across the second and deadlock on this non-reentrant mutex.
+        let (last_timeline_id, last_resize_id) = {
+            let tl = timeline.lock().expect("bench timeline");
+            (tl.high_id(), tl.resizes().high_row())
+        };
         Watch {
             local_id,
             fabric: std::sync::Arc::default(),
@@ -2850,7 +2955,8 @@ pub(crate) mod bench_seam {
             turns: turns.clone(),
             last_turn_id: turns.lock().expect("bench ledger").high_id(),
             timeline: timeline.clone(),
-            last_timeline_id: timeline.lock().expect("bench timeline").high_id(),
+            last_timeline_id,
+            last_resize_id,
             last_title,
             last_bell,
             byte_sub: None,
@@ -2976,6 +3082,7 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             last_timeline_id: None,
+            last_resize_id: 0,
             last_turn_id: None,
             last_title: None,
             last_bell: 0,
@@ -3229,12 +3336,120 @@ mod tests {
                 crate::session_timeline::SessionTimeline::default(),
             )),
             last_timeline_id: None,
+            last_resize_id: 0,
             last_turn_id: None,
             last_title: None,
             last_bell: 0,
             byte_sub: None,
             non_coalesced: false,
         }
+    }
+
+    /// Resize the watch's engine to `rows` and book the journal the way the
+    /// window pass does (copied under the resize's hold, ingested after it), at
+    /// `at_ms` on the ledger's clock.
+    fn ledgered_resize(w: &Watch, rows: u16, at_ms: u64) {
+        let copy = {
+            let mut t = crate::term_lock(&w.term);
+            t.resize(rows, 20);
+            crate::resize_ledger::JournalCopy::take(&t)
+        };
+        w.timeline.lock().unwrap().ingest_resizes(
+            &copy,
+            Some(crate::resize_ledger::Attribution::CTL_CROSS),
+            at_ms,
+        );
+    }
+
+    /// THE RESIZE LEDGER ON THE `events` DIGEST. A net-zero alt-screen flap
+    /// (both halves before the next wake) is ONE `EVENT resize n=2`, not two
+    /// frames; the `render desync-risk` transition is pushed once, from the
+    /// timeline, and a later tick repeats neither. A watermark the ring evicted
+    /// past is said on the frame as `dropped=` (never a `GAP`, which the fabric
+    /// bridge reads as lost lifecycle frames). The flap is booked at a
+    /// far-future ledger time, so the digest's own real-clock evaluation can
+    /// never reach the one-second risk by itself and the test decides the
+    /// instant it does.
+    #[test]
+    fn events_digest_coalesces_resizes_and_pushes_render_once() {
+        let term = Arc::new(Mutex::new(Terminal::new(8, 20)));
+        crate::term_lock(&term).process(
+            b"\x1b[?1049h\x1b[1;1HL0\x1b[2;1HL1\x1b[3;1HL2\x1b[4;1HL3\x1b[5;1HL4\
+              \x1b[6;1HL5\x1b[7;1HL6\x1b[8;1HF0\x1b[6;3H",
+        );
+        let mut w = watch_on(7, &term);
+        w.last_title = Some(crate::term_lock(&term).title().to_string());
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        assert_eq!(wake_text(&mut w, streams, false), "", "nothing yet");
+
+        let far = crate::turn_ledger::now_ms() + 1_000_000_000;
+        ledgered_resize(&w, 7, far);
+        // A mode set between the halves (output that draws nothing) drops the
+        // engine's resize undo without closing the ledger's run, so the grow
+        // appends and the screen stays shifted — a quiet flap is undone and
+        // would never turn.
+        crate::term_lock(&term).process(b"\x1b[?1000h");
+        ledgered_resize(&w, 8, far);
+        // The app's diff frame lands on the shifted rows (it read 8 == 8).
+        crate::term_lock(&term).process(b"\x1b[8;1HF1\x1b[K\x1b[6;3H");
+        let first = wake_text(&mut w, streams, true);
+        assert_eq!(first, "EVENT 7 resize n=2 id=2 to=20x8 run=1\n");
+        assert_eq!(
+            wake_text(&mut w, streams, false),
+            "",
+            "coalesced, not repeated"
+        );
+
+        // A second on the ledger's clock: the verdict turns, recorded once.
+        let probe = crate::resize_ledger::EngineProbe::sample(&crate::term_lock(&term));
+        assert!(
+            w.timeline
+                .lock()
+                .unwrap()
+                .evaluate_resizes(probe, far + 1_000)
+        );
+        let risk = wake_text(&mut w, streams, false);
+        assert_eq!(
+            risk,
+            format!("EVENT 7 render desync-risk run=1 displaced=-1 net=zero at={far}\n")
+        );
+        assert!(
+            !w.timeline
+                .lock()
+                .unwrap()
+                .evaluate_resizes(probe, far + 2_000)
+        );
+        assert_eq!(wake_text(&mut w, streams, false), "", "pushed once");
+
+        // The app clears and repaints: healed, pushed once.
+        crate::term_lock(&term).process(b"\x1b[2J");
+        let probe = crate::resize_ledger::EngineProbe::sample(&crate::term_lock(&term));
+        assert!(
+            w.timeline
+                .lock()
+                .unwrap()
+                .evaluate_resizes(probe, far + 2_500)
+        );
+        assert_eq!(
+            wake_text(&mut w, streams, false),
+            "EVENT 7 render healed run=1 after_ms=2500\n"
+        );
+
+        // A watch that fell behind the ring: the hole is said on the frame.
+        // Seventy flaps a second apart: seventy runs (2..=71).
+        for i in 0..70u64 {
+            ledgered_resize(&w, 7, far + 3_000 + 1_000 * i);
+            ledgered_resize(&w, 8, far + 3_001 + 1_000 * i);
+        }
+        let behind = wake_text(&mut w, streams, false);
+        assert_eq!(
+            behind, "EVENT 7 resize n=128 id=142 to=20x8 run=71 dropped=12\n",
+            "142 booked, rows 15..=142 kept, the watch had seen 2: 3..=14 are gone"
+        );
+        assert!(!behind.contains("GAP"), "no GAP frame: {behind}");
     }
 
     /// The wire bytes a producer's frames carry, concatenated in emission order —

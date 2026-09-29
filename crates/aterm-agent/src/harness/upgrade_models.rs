@@ -607,38 +607,161 @@ pub struct LiveModel {
     pub by_command: bool,
 }
 
-/// The phrase Claude's `/model` result opens with.
-const SET_MODEL: &str = "Set model to ";
+/// What one of Claude Code's model RESULT rows says (its `<local-command-stdout>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelResultKind {
+    /// `Set model to …`: the model was CHOSEN (`/model`, the picker, a
+    /// typed `/model <name>`).
+    Set,
+    /// `Kept model as …`: a `/model` that changed nothing.
+    Kept,
+    /// `<icon> Fast mode ON · model set to …`: `/fast on` moved the model to
+    /// one that runs fast.
+    FastOn,
+}
+
+/// A model RESULT row, read ([`model_result_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelResult {
+    pub(crate) kind: ModelResultKind,
+    /// The model as Claude spelled it, quotes off (`Opus 5.5 (default)`) —
+    /// `None` when the result is not quoted the way any build quotes it:
+    /// a model was set, and which one this build cannot tell.
+    pub(crate) display: Option<String>,
+    /// The effort level a ` with `<level>` effort` clause after it names,
+    /// as written — the top-effort mode by its own name
+    /// ([`aterm_primer::CLAUDE_TOP_EFFORT_KEY`]), not the `xhigh` it runs at.
+    pub(crate) effort: Option<String>,
+}
+
+/// The display a result quotes right at `rest`'s start: in backticks (2.1.267
+/// on) or ANSI bold (2.1.201 to 2.1.222) — the rest after its closing quote
+/// with it. At most 80 chars are kept; a caller judges them.
+fn quoted_display(rest: &str) -> Option<(String, &str)> {
+    let (display, after) = if let Some(quoted) = rest.strip_prefix('`') {
+        let end = quoted.find('`')?;
+        (&quoted[..end], &quoted[end + 1..])
+    } else {
+        let bold = rest.strip_prefix("\u{1b}[1m")?;
+        let end = bold.find("\u{1b}[22m")?;
+        (&bold[..end], &bold[end + "\u{1b}[22m".len()..])
+    };
+    Some((display.chars().take(80).collect(), after))
+}
+
+/// A ` with `<level>` effort` clause in `after`, the level as written.
+fn effort_clause(after: &str) -> Option<String> {
+    let (_, rest) = after.split_once(" with `")?;
+    let (level, tail) = rest.split_once('`')?;
+    tail.starts_with(" effort")
+        .then(|| level.chars().take(16).collect())
+}
+
+/// `text` without ANSI SGR sequences (`\x1b[1m`, `\x1b[38;2;255;106;0m`) —
+/// the vendor's own `enr` (`/\x1b\[[0-9;]*m/g`), which Claude strips before
+/// it classifies a result.
+pub(crate) fn strip_sgr(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("\u{1b}[") {
+        out.push_str(&rest[..at]);
+        let seq = &rest[at + 2..];
+        match seq.find(|c: char| !(c.is_ascii_digit() || c == ';')) {
+            Some(end) if seq[end..].starts_with('m') => rest = &seq[end + 1..],
+            _ => {
+                out.push('\u{1b}');
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.into()
+}
+
+/// How far into a `/fast` result (SGR stripped, in UTF-16 code units, as
+/// JavaScript's `indexOf` counts) Claude's own classifier takes the
+/// `Fast mode ON · model set to `` phrase: its `tnr` (2.1.283) — room for
+/// the icon and a space, no more.
+const FAST_ON_LEAD: usize = 4;
+
+/// What a `type:user` row's CONTENT says about the model, when it is one of
+/// Claude Code's own model results: it OPENS with `<local-command-stdout>`
+/// and then the vendor's own result phrase (anchors `model.set`,
+/// `model.kept`, and `fast.on` + `fast.model_set`, the prefixes Claude's own
+/// result classifier takes), the model quoted after it. The phrase anywhere
+/// else is text, not a result: an answer that quotes it, a tool's output, a
+/// person's prompt, a notification (measured across this machine's
+/// transcripts, 2026-09-27: 36 real results and nine rows of each of those
+/// kinds that a substring match read as `/model` choices — one of them an
+/// answer it then stopped counting as an answer). `Current model: …` and a
+/// cloud session's switch reports are not read: they say nothing this
+/// process chose.
+///
+/// The `/fast` result is read the way the vendor's classifier reads it
+/// (`nnr`, 2.1.283: `e.replace(enr,"").indexOf(`Fast mode ON · model set to
+/// \``) <= 4`): on the text with its SGR STRIPPED — Claude writes the `↯`
+/// icon in its theme's fast-mode colour (`Zoe(!0)` → `Pn("fastMode",…)`),
+/// so the raw row carries a colour sequence before the phrase — and the
+/// quoted model is taken from the stripped text too.
+pub(crate) fn model_result_of(content: &str) -> Option<ModelResult> {
+    let body = content
+        .trim_start()
+        .strip_prefix("<local-command-stdout>")?
+        .trim_start();
+    for (kind, id) in [
+        (ModelResultKind::Set, "model.set"),
+        (ModelResultKind::Kept, "model.kept"),
+    ] {
+        if let Some(rest) = body.strip_prefix(aterm_phase::anchor(id)) {
+            let quoted = quoted_display(rest);
+            return Some(ModelResult {
+                kind,
+                effort: quoted.as_ref().and_then(|(_, after)| effort_clause(after)),
+                display: quoted.map(|(display, _)| display),
+            });
+        }
+    }
+    // `<icon> Fast mode ON · model set to `X` · …`: the vendor takes it only
+    // with the phrase at most [`FAST_ON_LEAD`] units into the STRIPPED text
+    // (its icon and a space), so a longer lead-in (`Kept Fast mode ON`, a
+    // sentence quoting it) is not this result. A `/fast` result without the
+    // `model set to` clause did not move the model: Claude appends it exactly
+    // when it moves one (`willPromote`).
+    let plain = strip_sgr(body);
+    let phrase = format!(
+        "{} \u{00B7} {}",
+        aterm_phase::anchor("fast.on"),
+        aterm_phase::anchor("fast.model_set")
+    );
+    let at = plain
+        .find(&phrase)
+        .filter(|&at| plain[..at].encode_utf16().count() <= FAST_ON_LEAD)?;
+    Some(ModelResult {
+        kind: ModelResultKind::FastOn,
+        display: quoted_display(&plain[at + phrase.len()..]).map(|(display, _)| display),
+        effort: None,
+    })
+}
 
 /// The model display a `/model` RESULT row names: Claude's own `type:user`
-/// row whose content OPENS with `<local-command-stdout>Set model to ` and the
-/// display quoted in backticks (2.1.267 on) or ANSI bold (2.1.201 to 2.1.222).
-/// The phrase anywhere else is text, not a choice: an answer that quotes it,
-/// a tool's output, a person's prompt, a notification (measured across this
-/// machine's transcripts, 2026-09-27: 36 real results and nine rows of each of
-/// those kinds that the old substring match read as `/model` choices — one of
-/// them an answer it then stopped counting as an answer).
+/// row whose content is a `Set model to` result ([`model_result_of`]) —
+/// the choice [`live_model`] reads. A kept model or a fast switch is not a
+/// choice it counts (the footer reads those, `footer::tail_facts`).
 fn model_command_display(line: &str) -> Option<String> {
-    if !line.contains(SET_MODEL) {
+    if !line.contains(aterm_phase::anchor("model.set")) {
         return None;
     }
-    let v: Value = aterm_json::from_str(line).ok()?;
+    let v = super::transcript::command(line).ok()?;
     if v.get("type").and_then(Value::as_str) != Some("user") {
         return None;
     }
     let content = v.get("message")?.get("content")?.as_str()?;
-    let rest = content
-        .trim_start()
-        .strip_prefix("<local-command-stdout>")?
-        .trim_start()
-        .strip_prefix(SET_MODEL)?;
-    let display = if let Some(quoted) = rest.strip_prefix('`') {
-        &quoted[..quoted.find('`')?]
-    } else {
-        let bold = rest.strip_prefix("\u{1b}[1m")?;
-        &bold[..bold.find("\u{1b}[22m")?]
-    };
-    Some(display.chars().take(80).collect())
+    model_result_of(content)
+        .filter(|r| r.kind == ModelResultKind::Set)
+        .and_then(|r| r.display)
 }
 
 /// The live model: the newest `/model` result ([`model_command_display`])
@@ -658,7 +781,7 @@ pub fn live_model(tail: &str, baked: Option<&Baked>) -> Option<LiveModel> {
         if !line.contains("\"assistant\"") {
             continue;
         }
-        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+        let Ok(v) = super::transcript::metadata(line) else {
             continue;
         };
         if v.get("type").and_then(Value::as_str) != Some("assistant")
@@ -688,6 +811,92 @@ pub fn live_model(tail: &str, baked: Option<&Baked>) -> Option<LiveModel> {
         }),
         _ => None,
     }
+}
+
+/// THE MODEL A PERSON CHOSE BY HAND that a relaunch carries in place of the
+/// launch's own `--model` (`launch`), or `None` to keep the launch's flags. A
+/// command-line `--model` overrides the default Claude's `/model` saves, so a
+/// relaunch that kept the launch's flag undid a `/model` made since — on a
+/// memory restart, an exit's relaunch, the live upgrade. Chosen by hand is
+/// the live model a `/model` result newer than the last answer names
+/// ([`LiveModel::by_command`], carried exactly as its display maps, 1M window
+/// included), or — once answers have followed it — the conversation running
+/// the model the person last chose ([`ModelRecord::human`], carried as
+/// recorded) while that is not the launch's. The same model as the launch's
+/// keeps the launch's flags — a launch alias (`--model opus`) read as the
+/// model the build's catalog `baked` names it ([`launch_names`]): a `/model`
+/// pick of exactly that is no choice to pin.
+#[must_use]
+pub fn hand_chosen(
+    live: Option<&LiveModel>,
+    human: &str,
+    launch: &str,
+    baked: Option<&Baked>,
+) -> Option<String> {
+    let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
+    let live = live?;
+    let launch = launch_names(launch, baked);
+    if live.by_command {
+        return (live.id != launch).then(|| live.id.clone());
+    }
+    (!human.is_empty() && base(human) == base(&live.id) && base(&live.id) != base(&launch))
+        .then(|| human.to_string())
+}
+
+/// The model a launch's `--model` value names: a real id as it is; a family
+/// alias (`opus`, `opus[1m]`) as the build's catalog `baked` resolves it
+/// ([`Baked::latest`], the window kept); anything else — no catalog, an alias
+/// it does not know — as written, which no real id equals, so a pick is
+/// carried rather than guessed the alias's.
+#[must_use]
+pub fn launch_names(launch: &str, baked: Option<&Baked>) -> String {
+    let (name, window) = launch
+        .strip_suffix("[1m]")
+        .map_or((launch, ""), |b| (b, "[1m]"));
+    if family_version(name).is_some() {
+        return launch.to_string();
+    }
+    baked
+        .and_then(|b| b.latest(name))
+        .map_or_else(|| launch.to_string(), |id| format!("{id}{window}"))
+}
+
+/// [`hand_chosen`] off a conversation's transcript `tail`, for a process
+/// started at `started_s` with the launch's own `--model` (`launch`) and the
+/// person's recorded choice `human`: what runs now ([`live_model_at`]) — and
+/// none at all while no answer and no `/model` is newer than the process: a
+/// `/model` before it chose for a process before this one, whose relaunch
+/// did not carry it (a launch alias leaves [`live_model_at`] no flag to put
+/// in its place, and the older rows read as a choice of this one's).
+#[must_use]
+pub fn hand_model(
+    tail: &str,
+    baked: Option<&Baked>,
+    human: &str,
+    launch: &str,
+    started_s: Option<u64>,
+) -> Option<String> {
+    if started_s.is_some_and(|s| newest_row_at(tail).is_none_or(|at| at < s)) {
+        return None;
+    }
+    let live = live_model_at(tail, baked, Some(launch), started_s);
+    hand_chosen(live.as_ref(), human, launch, baked)
+}
+
+/// The timestamp of the newest main-chain answer or `/model` result in
+/// `tail` ([`model_command_display`]): what says a process has run since it
+/// started.
+fn newest_row_at(tail: &str) -> Option<u64> {
+    tail.lines()
+        .filter(|l| l.contains("\"assistant\"") || model_command_display(l).is_some())
+        .filter_map(|l| super::transcript::metadata(l).ok())
+        .filter(|v| v.get("isSidechain").and_then(Value::as_bool) != Some(true))
+        .filter_map(|v| {
+            v.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_utc)
+        })
+        .max()
 }
 
 /// Seconds without an answer after which a conversation's prompt cache is
@@ -753,7 +962,7 @@ pub fn last_answer_at(tail: &str) -> Option<u64> {
     tail.lines()
         .rev()
         .filter(|l| l.contains("\"assistant\""))
-        .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+        .filter_map(|l| super::transcript::metadata(l).ok())
         .filter(|v| {
             v.get("type").and_then(Value::as_str) == Some("assistant")
                 && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
@@ -801,18 +1010,7 @@ pub fn live_model_at(
     let (Some(launch), Some(started)) = (launch.filter(real), started_s) else {
         return from_transcript;
     };
-    let newest = tail
-        .lines()
-        .filter(|l| l.contains("\"assistant\"") || model_command_display(l).is_some())
-        .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
-        .filter(|v| v.get("isSidechain").and_then(Value::as_bool) != Some(true))
-        .filter_map(|v| {
-            v.get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(parse_utc)
-        })
-        .max();
-    if newest.is_none_or(|t| t < started) {
+    if newest_row_at(tail).is_none_or(|t| t < started) {
         return Some(LiveModel {
             id: launch.to_string(),
             by_command: false,
@@ -2548,6 +2746,166 @@ mod tests {
             "a subagent is not the conversation"
         );
         assert_eq!(last_answer_at(""), None);
+    }
+
+    /// A model chosen by hand is carried in place of the launch's `--model`:
+    /// a `/model` newer than the last answer exactly as its display maps (the
+    /// 1M window included), or — answers since — the person's recorded choice
+    /// while the conversation runs it. NEGATIVE CONTROLS: the launch's own
+    /// model chosen again, an answer on another model nobody chose, and a
+    /// recorded choice the conversation no longer runs are none.
+    #[test]
+    fn a_model_chosen_by_hand_is_carried_only_where_it_is_not_the_launchs() {
+        let live = |id: &str, by_command: bool| LiveModel {
+            id: id.to_string(),
+            by_command,
+        };
+        let sonnet = "claude-sonnet-5-5";
+        let opus = "claude-opus-5-5";
+        let opus_1m = "claude-opus-5-5[1m]";
+        assert_eq!(
+            hand_chosen(Some(&live(opus, true)), "", sonnet, None).as_deref(),
+            Some(opus)
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(opus_1m, true)), "", opus, None).as_deref(),
+            Some(opus_1m),
+            "the window chosen by hand"
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(opus, false)), opus_1m, sonnet, None).as_deref(),
+            Some(opus_1m),
+            "answered since: the choice as recorded"
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(sonnet, true)), "", sonnet, None),
+            None
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(opus, false)), "", sonnet, None),
+            None
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(opus, false)), opus, opus_1m, None),
+            None
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(sonnet, false)), opus, sonnet, None),
+            None
+        );
+        assert_eq!(hand_chosen(None, opus, sonnet, None), None);
+    }
+
+    /// A LAUNCH ALIAS IS THE MODEL ITS BUILD NAMES: launched `--model opus`,
+    /// a `/model` pick of the model `opus` names today is no choice to pin —
+    /// carried, it pinned the conversation to the full id, off the alias
+    /// the person launched with. NEGATIVE CONTROLS: a pick the alias does
+    /// not name (another model, the 1M window, an older one of the family)
+    /// is carried; with no catalog to resolve the alias, the pick is carried
+    /// rather than guessed the alias's.
+    #[test]
+    fn a_pick_of_what_the_launch_alias_names_is_no_hand_choice() {
+        let live = |id: &str, by_command: bool| LiveModel {
+            id: id.to_string(),
+            by_command,
+        };
+        let b = baked(
+            &["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"],
+            &[("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5")],
+        );
+        let opus = "claude-opus-5-5";
+        assert_eq!(
+            hand_chosen(Some(&live(opus, true)), "", "opus", Some(&b)),
+            None
+        );
+        assert_eq!(
+            hand_chosen(
+                Some(&live("claude-opus-5-5[1m]", true)),
+                "",
+                "opus[1m]",
+                Some(&b)
+            ),
+            None,
+            "the alias's window kept"
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(opus, false)), opus, "opus", Some(&b)),
+            None,
+            "answered since: the recorded pick is the alias's"
+        );
+        assert_eq!(
+            hand_chosen(Some(&live("claude-opus-5", true)), "", "opus", Some(&b)).as_deref(),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            hand_chosen(
+                Some(&live("claude-opus-5-5[1m]", true)),
+                "",
+                "opus",
+                Some(&b)
+            )
+            .as_deref(),
+            Some("claude-opus-5-5[1m]")
+        );
+        assert_eq!(
+            hand_chosen(Some(&live("claude-sonnet-5", true)), "", "opus", Some(&b)).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            hand_chosen(Some(&live(opus, true)), "", "opus", None).as_deref(),
+            Some(opus)
+        );
+        assert_eq!(launch_names("opus[1m]", Some(&b)), "claude-opus-5-5[1m]");
+        assert_eq!(launch_names("claude-opus-5", Some(&b)), "claude-opus-5");
+        assert_eq!(launch_names("opusplan", Some(&b)), "opusplan");
+    }
+
+    /// A `/MODEL` OLDER THAN THE PROCESS CHOSE FOR ANOTHER ONE: a launch alias
+    /// leaves [`live_model_at`] no flag to read in its place, so a `/model`
+    /// made in an earlier process — one its relaunch did not carry — read as
+    /// this process's hand choice, and so did the recorded choice an answer
+    /// before the process ran. NEGATIVE CONTROLS: the same `/model` made
+    /// after the process started is carried; with no process start known the
+    /// newest `/model` stands.
+    #[test]
+    fn a_model_command_older_than_the_process_is_no_hand_choice() {
+        let b = baked(
+            &["claude-opus-5-5", "claude-sonnet-5"],
+            &[("opus", "claude-opus-5-5")],
+        );
+        let set_at = |display: &str, at: &str| {
+            format!(
+                r#"{{"type":"user","timestamp":"{at}","message":{{"content":"<local-command-stdout>Set model to `{display}`</local-command-stdout>"}}}}"#
+            )
+        };
+        let started = parse_utc("2026-09-24T12:00:00Z");
+        let before = set_at("claude-sonnet-5", "2026-09-23T00:00:00Z");
+        let after = set_at("claude-sonnet-5", "2026-09-25T00:00:00Z");
+        assert_eq!(hand_model(&before, Some(&b), "", "opus", started), None);
+        assert_eq!(
+            hand_model(&after, Some(&b), "", "opus", started).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            hand_model(&before, Some(&b), "", "opus", None).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        let answered_before = r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-09-23T00:00:00Z","message":{"model":"claude-sonnet-5","content":[]}}"#;
+        assert_eq!(
+            hand_model(
+                answered_before,
+                Some(&b),
+                "claude-sonnet-5",
+                "opus",
+                started
+            ),
+            None,
+            "the recorded choice, answered before the process"
+        );
+        assert_eq!(
+            hand_model(answered_before, Some(&b), "claude-sonnet-5", "opus", None).as_deref(),
+            Some("claude-sonnet-5")
+        );
     }
 
     #[test]
