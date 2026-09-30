@@ -1969,8 +1969,15 @@ fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions
         // `since-turn=<id>` resumes the turn stream from that id (push turns
         // with id > since_turn); absent it, seed to the live high so only
         // post-subscription turns push. Only meaningful with the events stream.
+        //
+        // AN ANCHOR ABOVE EVERY TURN ID THIS PROCESS HAS MINTED is from
+        // elsewhere (a relay resumed across an update onto a successor that
+        // did not continue the count — round seven of the update audit,
+        // finding 51): it would hide every turn until the count passed it, so
+        // it seeds at the live high instead, as an absent anchor does.
         last_turn_id: opts
             .since_turn
+            .filter(|anchor| *anchor <= crate::control::turn_ids_minted())
             .or_else(|| initial_turn_watermark(turns, streams)),
         timeline: timeline.clone(),
         // Seed to the live timeline high so only meta changes AFTER
@@ -2012,9 +2019,15 @@ fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions
         // Seed the block watermark to the CURRENT high so we only push blocks
         // that COMPLETE after subscription, never the historical backlog —
         // `events` is a live stream, not a replay (matches `since` for screen).
-        last_block_id: opts
-            .since_block
-            .or_else(|| initial_block_watermark(term, streams)),
+        //
+        // A `since-block=` ABOVE the newest completed block is from elsewhere
+        // (a successor that could not carry the session's blocks counts them
+        // afresh — round seven, finding 51): it is lowered to the live high,
+        // so it can never hide a block the engine completes from here.
+        last_block_id: resume_block_watermark(
+            opts.since_block,
+            initial_block_watermark(term, streams),
+        ),
         // Register on the byte fan-out ONLY when `bytes` is requested, so an
         // idle/unsubscribed session pays nothing for the live byte channel.
         byte_sub: if streams.bytes {
@@ -2412,6 +2425,18 @@ fn initial_block_watermark(term: &Arc<Mutex<Terminal>>, streams: TargetStreams) 
     crate::term_lock(term)
         .newest_completed_block()
         .map(|b| b.id)
+}
+
+/// The block watermark a watch starts from: the `since-block=` anchor, never
+/// above the engine's newest completed block (`live`) — an anchor past it names
+/// no block of this engine's (see the seed above). With no block completed yet
+/// such an anchor is dropped altogether.
+fn resume_block_watermark(anchor: Option<u64>, live: Option<u64>) -> Option<u64> {
+    match (anchor, live) {
+        (Some(anchor), Some(live)) => Some(anchor.min(live)),
+        (Some(_), None) => None,
+        (None, live) => live,
+    }
 }
 
 /// Seed the turn watermark to the ledger's current high so the `events` digest
@@ -3062,6 +3087,29 @@ pub(crate) mod bench_seam {
 
 #[cfg(test)]
 mod tests {
+    /// ROUND SEVEN, FINDING 51 (server half): a resumed `since-block=` anchor
+    /// replays the blocks after it, but never one above the engine's newest
+    /// completed block — an anchor from a successor that counted afresh must
+    /// not hide the blocks this engine completes (it seeds at the live high,
+    /// as an absent anchor does).
+    #[test]
+    fn a_resumed_block_anchor_never_rises_above_the_engine() {
+        use super::resume_block_watermark as seed;
+        assert_eq!(seed(Some(12), Some(13)), Some(12), "block 13 is replayed");
+        assert_eq!(
+            seed(Some(40), Some(13)),
+            Some(13),
+            "a foreign anchor is the live high"
+        );
+        assert_eq!(
+            seed(Some(40), None),
+            None,
+            "nothing completed: every block pushes"
+        );
+        assert_eq!(seed(None, Some(13)), Some(13), "no anchor: the live high");
+        assert_eq!(seed(None, None), None);
+    }
+
     use super::*;
     use std::time::Duration;
 

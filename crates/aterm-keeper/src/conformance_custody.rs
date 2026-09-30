@@ -289,6 +289,8 @@ const ENV_MOVES: &[&str] = &[
     "SuccessorCrashes",
     "AdoptA",
     "AdoptB",
+    "RelaunchedLinkDrops",
+    "RelaunchedWindowQuits",
     "RelaunchedWindowCrashes",
     "KeeperCrashes",
     "KeeperRestarts",
@@ -472,15 +474,82 @@ fn env_move(model: &Model, rig: &mut Rig, action: &'static str) -> Vec<Step> {
         "AdoptA" | "AdoptB" => {
             // The relaunched window adopts and REGISTERs (the claim moves).
             let rdev = if action == "AdoptA" { A } else { B };
+            // A record its dropped link's EOF returned to Orphaned is claimed
+            // the same way: REGISTER proves possession, not the offer.
             let offered = rig.core.as_ref().is_some_and(|c| {
                 c.records().get(&rdev).is_some_and(|r| {
-                    matches!(r.state, RecordState::Offered { .. } | RecordState::Claimed)
+                    matches!(
+                        r.state,
+                        RecordState::Offered { .. } | RecordState::Claimed | RecordState::Orphaned
+                    )
                 })
             });
             if offered {
                 let outs = rig.register("r", rdev, &next);
                 assert_eq!(outs, vec![Out::DropDuplicate(rdev)]);
             }
+        }
+        "RelaunchedLinkDrops" => {
+            // The relaunched window's link reads EOF before it registered its
+            // offers, and reconnects (CAP_LINK). Every record offered on the
+            // dropped link is an orphan again, its leader watched again
+            // (round seven's finding 65); the reconnected link is offered
+            // nothing, since the window still holds each descriptor.
+            let now = rig.now;
+            let pids = rig.pids.clone();
+            if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.remove("r")) {
+                let offered: Vec<Rdev> = [A, B]
+                    .into_iter()
+                    .filter(|r| {
+                        core.records()
+                            .get(r)
+                            .is_some_and(|rec| rec.state == RecordState::Offered { to: conn })
+                    })
+                    .collect();
+                assert!(!offered.is_empty(), "{action}: an offer was outstanding");
+                let mut env = World {
+                    st: &next,
+                    pids: &pids,
+                };
+                let outs = core.eof(conn, now, &mut env);
+                let watched: Vec<Out> = offered
+                    .iter()
+                    .map(|r| Out::WatchPid(header(*r).shell_pid))
+                    .collect();
+                assert_eq!(outs, watched, "{action}: the offers return, nothing else");
+                // What it had registered, its reconnected link registers again
+                // (as `LinkDrops`); what it was only offered stays an orphan
+                // until it adopts (`AdoptA`).
+                let held: Vec<Rdev> = [A, B]
+                    .into_iter()
+                    .filter(|r| {
+                        core.records()
+                            .get(r)
+                            .is_some_and(|rec| rec.claimants.contains(&conn))
+                    })
+                    .collect();
+                let outs = rig.connect("r", CAP_LINK, &next);
+                assert_eq!(
+                    outs,
+                    vec![Out::Welcome {
+                        conn: rig.conn["r"],
+                        offers: 0
+                    }]
+                );
+                for rdev in held {
+                    let outs = rig.register("r", rdev, &next);
+                    assert_eq!(outs, vec![Out::DropDuplicate(rdev)], "the claim moves");
+                }
+            }
+        }
+        "RelaunchedWindowQuits" => {
+            // BYE on the relaunched window's current link, then its EOF and
+            // `exit(0)`: the keeper judges every link of the process at that
+            // exit, a dropped one included.
+            if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("r").copied()) {
+                core.bye(conn);
+            }
+            rig.die("r", 0, &next);
         }
         "RelaunchedWindowCrashes" => {
             rig.die("r", 9, &next);
@@ -698,8 +767,15 @@ fn the_real_keeper_conforms_to_the_custody_model() {
     }
     let missing: Vec<&State> = all.iter().filter(|s| !out.reached.contains(*s)).collect();
     for m in &missing {
-        let inside_a_hello =
-            m["r_live"] == 1 && (m["orphan_a"] + m["orphan_b"] > 0 || m["k_faults"] == 1);
+        // An orphan the relaunched window still HOLDS is not inside a HELLO:
+        // it is the return of an offer whose link dropped, which the real
+        // keeper must reach.
+        let unoffered = |x: &str| {
+            m[format!("orphan_{x}").as_str()] == 1 && m[format!("r_holds_{x}").as_str()] == 0
+        };
+        let inside_a_hello = m["r_live"] == 1
+            && (unoffered("a") || unoffered("b") || m["k_faults"] == 1)
+            && m["orphan_a"] * m["r_holds_a"] + m["orphan_b"] * m["r_holds_b"] == 0;
         assert!(
             inside_a_hello,
             "a reachable model state the real keeper never reached: {m:?}"
@@ -728,6 +804,8 @@ fn the_real_keeper_conforms_to_the_custody_model() {
         "OfferA",
         "OfferB",
         "KeeperHonoursBye",
+        "RelaunchedLinkDrops",
+        "RelaunchedWindowQuits",
     ] {
         assert!(
             rejected.get(site).copied().unwrap_or(0) > 0,
@@ -787,6 +865,8 @@ fn the_custody_anchors_are_live() {
         "WindowCrashes",
         "CloseTabA",
         "KeeperHonoursBye",
+        "RelaunchedLinkDrops",
+        "RelaunchedWindowQuits",
     ] {
         assert!(
             anchored.contains(&("PtyKeeperCustody", action)),

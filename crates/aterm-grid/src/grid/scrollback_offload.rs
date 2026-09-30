@@ -1321,10 +1321,10 @@ impl Grid {
     /// WITHDRAWN because stock rustc cannot PARSE `ensures` — `#[cfg]` strips after
     /// parsing, so gating would not help — and stock rustc compiles this crate on
     /// every lane the Trust sysroot cannot serve (it carries only its host std):
-    /// the public snapshot (the stock pin `publish/public-rust-toolchain.toml`),
+    /// the wasm32 lane (`publish/config.sh`'s wasm32 clause),
     /// the release's x86_64-apple-darwin compat slice (`RUSTUP_TOOLCHAIN=stable`
     /// in aterm-release's `buildplan.rs`), and the cross cells of `xtask gate
-    /// cells`, `gate web` and `gate linux`. Measured 2026-09-27 with the clause
+    /// cells` and `gate cells-foreign`. Measured 2026-09-27 with the clause
     /// restored: the stock wasm32 cell stops at "expected one of `->`, `where`, or
     /// `{`, found `ensures`", and xtask's
     /// `a_foreign_cell_under_its_floor_fails_the_cells_verb` goes red. The

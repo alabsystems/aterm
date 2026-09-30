@@ -133,9 +133,9 @@ pub fn pinned_channel(root: &Path) -> Option<String> {
 /// Channels that resolve to an ORDINARY rust release. For those the historical
 /// behaviour is correct — any cargo on PATH is the pinned one, near enough — so
 /// the check below passes them through rather than inventing a driver name that
-/// no upstream toolchain ships. PUBLIC BOUNDARY: this crate ships in the public
-/// snapshot, whose export swaps in a stock pin (publish/transforms.sh); the dev
-/// tree pins `trust`, so this arm is never taken here.
+/// no upstream toolchain ships. The dev tree and, since 2026-09-29, the public
+/// snapshot both pin `trust`, so this arm is taken only for a tree whose pin
+/// names a stock channel.
 fn is_upstream_channel(channel: &str) -> bool {
     matches!(channel, "" | "stable" | "beta" | "nightly")
         || channel.starts_with("nightly-")

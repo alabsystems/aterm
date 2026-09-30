@@ -142,11 +142,8 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     // three constant-time comparators without one, and the asymmetry is a Trust
     // constraint, not an oversight. `aterm_digest::ct_eq` and
     // `aterm_core::terminal::shell_integration_auth::constant_time_eq_32` both
-    // end `black_box(diff) == 0`. This crate's proved count has a floor in
-    // `tools/trust-gate-ratchet.tsv` (since 2026-07; the lane that enforces it
-    // could produce no number from 2026-08-30 to 2026-09-27, and since then holds
-    // every verified library, aterm-gui and aterm-render not yet among them, to
-    // its floor), and
+    // end `black_box(diff) == 0`. This crate's proved count is held to its floor
+    // in `tools/trust-gate-ratchet.tsv` by the Trust advisory lane, and
     // `black_box` is a Rust-ABI callee with no body in the verification bundle
     // — the FATAL absent-callee class (docs/measurements/
     // 2026-07-09-extern-c-absent-callee-totality.md: only non-unwinding

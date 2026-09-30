@@ -1557,58 +1557,39 @@ impl UiTree {
         pressed: Option<&UiKey>,
         focus_visible: bool,
     ) {
-        fn visit(node: &mut UiNode, focus: Option<&UiKey>) {
-            let focused = focus.is_some_and(|key| key == &node.key);
-            match &mut node.content {
-                UiContent::Button(control) => control.state.focused = focused,
-                UiContent::Switch(control) => control.state.focused = focused,
-                UiContent::Slider(control) => control.state.focused = focused,
-                UiContent::TextField(control) => control.state.focused = focused,
-                UiContent::Group(_)
-                | UiContent::Text(_)
-                | UiContent::RichText(_)
-                | UiContent::MarkdownBlock(_)
-                | UiContent::TextViewport(_)
-                | UiContent::SettingsPreview(_)
-                | UiContent::Custom(_) => {}
-            }
-            for child in &mut node.children {
-                visit(child, focus);
-            }
-        }
-
-        visit(&mut self.root, focus);
-        fn transient(
+        fn visit(
             node: &mut UiNode,
+            focus: Option<&UiKey>,
             hovered: Option<&UiKey>,
             pressed: Option<&UiKey>,
             focus_visible: bool,
         ) {
-            let is_hovered = hovered.is_some_and(|key| key == &node.key);
-            let is_pressed = pressed.is_some_and(|key| key == &node.key);
-            let set = |state: &mut ControlState| {
-                state.hovered = is_hovered;
-                state.pressed = is_pressed && is_hovered;
-                state.focus_visible = state.focused && focus_visible;
-            };
-            match &mut node.content {
-                UiContent::Button(control) => set(&mut control.state),
-                UiContent::Switch(control) => set(&mut control.state),
-                UiContent::Slider(control) => set(&mut control.state),
-                UiContent::TextField(control) => set(&mut control.state),
+            let key = &node.key;
+            let state = match &mut node.content {
+                UiContent::Button(control) => Some(&mut control.state),
+                UiContent::Switch(control) => Some(&mut control.state),
+                UiContent::Slider(control) => Some(&mut control.state),
+                UiContent::TextField(control) => Some(&mut control.state),
                 UiContent::Group(_)
                 | UiContent::Text(_)
                 | UiContent::RichText(_)
                 | UiContent::MarkdownBlock(_)
                 | UiContent::TextViewport(_)
                 | UiContent::SettingsPreview(_)
-                | UiContent::Custom(_) => {}
+                | UiContent::Custom(_) => None,
+            };
+            if let Some(state) = state {
+                let is = |target: Option<&UiKey>| target == Some(key);
+                state.focused = is(focus);
+                state.hovered = is(hovered);
+                state.pressed = is(pressed) && state.hovered;
+                state.focus_visible = state.focused && focus_visible;
             }
             for child in &mut node.children {
-                transient(child, hovered, pressed, focus_visible);
+                visit(child, focus, hovered, pressed, focus_visible);
             }
         }
-        transient(&mut self.root, hovered, pressed, focus_visible);
+        visit(&mut self.root, focus, hovered, pressed, focus_visible);
     }
 
     /// Compile all observable UI products from one typed tree.
@@ -2187,12 +2168,16 @@ impl CompiledUi {
 
     /// Assert the cross-observer invariant for every actionable semantic node.
     ///
-    /// Indexed, not nested-scanned: this runs on every native frame, and the
-    /// three per-semantic linear scans it replaces cost `S x (P + 2H)` key
-    /// comparisons — quadratic in page size for a check that answers "OK" every
-    /// frame in practice. One `O(P + H)` sweep builds the tally, then each
-    /// actionable semantic is a single lookup. Semantics are still walked in
-    /// THEIR authored order so the FIRST offending key is the one reported.
+    /// [`Compiler::node`] establishes it by construction (one paint node per
+    /// key, and a hit region exactly when the semantic node is actionable and
+    /// enabled), so the per-frame compile does not re-check it; the structural
+    /// tests and the inspection fallback do.
+    ///
+    /// Indexed, not nested-scanned: the three per-semantic linear scans it
+    /// replaces cost `S x (P + 2H)` key comparisons — quadratic in page size.
+    /// One `O(P + H)` sweep builds the tally, then each actionable semantic is
+    /// a single lookup. Semantics are still walked in THEIR authored order so
+    /// the FIRST offending key is the one reported.
     pub(crate) fn validate_parity(&self) -> Result<(), CompileError> {
         // (paint count, hit count, first hit's action) per key. `Compiler::seen`
         // already rejects duplicate keys before anything is pushed, so a count

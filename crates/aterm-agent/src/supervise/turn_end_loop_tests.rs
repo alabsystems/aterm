@@ -2056,6 +2056,8 @@ struct ReachHost {
     script: std::sync::Mutex<VecDeque<Reach>>,
     last: std::sync::Mutex<Reach>,
     asks: std::sync::atomic::AtomicUsize,
+    /// Every plan the loop told the host, in order ([`IdleHost::waiting`]).
+    told: std::sync::Mutex<Vec<Option<crate::supervise::WaitPlan>>>,
 }
 
 impl ReachHost {
@@ -2069,9 +2071,16 @@ impl ReachHost {
     fn asks(&self) -> usize {
         self.asks.load(Ordering::SeqCst)
     }
+
+    fn told(&self) -> Vec<Option<crate::supervise::WaitPlan>> {
+        self.told.lock().unwrap().clone()
+    }
 }
 
 impl IdleHost for ReachHost {
+    fn waiting(&self, plan: Option<crate::supervise::WaitPlan>) {
+        self.told.lock().unwrap().push(plan);
+    }
     fn wants(&self) -> bool {
         false
     }
@@ -2145,6 +2154,72 @@ fn outage_timed(
         .map(|r| r.summary)
         .collect();
     (lines, host, m, waiting)
+}
+
+/// THE LOOP TELLS THE HOST ITS NEXT TRY (the tab retry plan, 2026-09-29): at
+/// the outage's point, its API's reach unmeasured, the policy stands in a
+/// wait of one rung (here an hour); the host is told the deadline ONCE — as
+/// unix seconds on the loop's clock, the rung from now — however many steps
+/// the wait takes, and told `None` when no wait stands any longer (the wall
+/// left). NEGATIVE CONTROLS: a wait's own steps tell nothing more, and an
+/// ordinary point (no wall) is never told a plan.
+#[test]
+fn the_loop_tells_its_host_the_next_try_once_and_clears_it() {
+    const NOW: i64 = 1_789_660_500;
+    let host = ReachHost::scripted(&[]);
+    let (dir, path) = journal_file("te-plan-told");
+    let mut m = Mock::new(
+        true,
+        vec![busy_screen(), enotfound(), busy_screen(), ended(STOP)],
+    );
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(2);
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        journal: Some(path.clone()),
+        ..hosted(2)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(far_rungs());
+        s.set_clock(NOW, 0);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let told = host.told();
+    let plans: Vec<&crate::supervise::WaitPlan> = told.iter().flatten().collect();
+    assert_eq!(
+        plans.len(),
+        1,
+        "told once, however many steps: {told:#?}\n{lines:#?}"
+    );
+    let rung = plans[0].at_unix - NOW;
+    assert!(
+        (3590..=3600).contains(&rung),
+        "the rung from the loop's clock: {rung}"
+    );
+    assert!(!plans[0].why.is_empty(), "{:?}", plans[0]);
+
+    // The try made (a short rung, the loop continues it): the wait is over,
+    // and the host is told so — the tab does not keep the last try's time.
+    let short = TurnEndTiming {
+        net_backoff: vec![Duration::from_millis(50)],
+        down_hold: Duration::from_millis(50),
+        ..TurnEndTiming::default()
+    };
+    let (lines, host, _, _) = outage_timed(&[], 30, short);
+    let told = host.told();
+    assert!(
+        lines.iter().any(|l| l.starts_with("CONTINUED")),
+        "the try was made: {lines:#?}"
+    );
+    let first = told
+        .iter()
+        .position(Option::is_some)
+        .expect("a plan was told");
+    assert!(
+        told[first..].iter().any(Option::is_none),
+        "cleared once the try was made: {told:#?}"
+    );
 }
 
 /// The `await`s the loop made before its first `turn` (none: every one).

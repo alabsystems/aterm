@@ -479,6 +479,13 @@ fn boot_unix(candidate: bool) -> Recovery {
                 None
             }
         },
+        Err(e) if aterm_keeper::client::refused_identity(&e) => {
+            aterm_log::warn!(
+                "keeper: the keeper at {} is not this build's; nothing is registered with it",
+                socket.display()
+            );
+            None
+        }
         Err(e) => {
             aterm_log::info!(
                 "keeper=absent at {} ({e}); terminals are registered once one answers",
@@ -707,6 +714,8 @@ fn admit_recovered(
         attention_owners: Vec::new(),
         claim_grace: false,
         outgoing_build: None,
+        fabric: Default::default(),
+        timeline_id: 0,
     })
 }
 
@@ -870,9 +879,7 @@ pub(crate) fn bye() {
         if let Some(link) = live_link()
             && !link.send_and_wait(LinkOp::Bye, BYE_WAIT)
         {
-            aterm_log::warn!(
-                "keeper: the BYE was not written; the keeper will judge this quit a crash"
-            );
+            aterm_log::warn!("keeper: the BYE was not written");
         }
     }
 }

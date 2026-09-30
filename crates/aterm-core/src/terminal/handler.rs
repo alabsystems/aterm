@@ -246,6 +246,9 @@ impl TerminalHandler<'_> {
         if self.modes.synchronized_output {
             self.transient.sync_open_dirty = true;
         }
+        if self.transient.app_sync_open {
+            self.transient.app_sync_dirty = true;
+        }
     }
 
     /// Apply any logical-row insertion before a protocol action can create new

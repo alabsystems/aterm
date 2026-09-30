@@ -1119,27 +1119,40 @@ impl ObservedPrompt {
             .trim()
             .strip_prefix("kTCCService")
             .unwrap_or(self.service.trim());
-        // The folder's own name where the service is one of aterm's, the drive
-        // or library in words where aterm knows it, and any other service as
-        // macOS names it.
+        // The folder's own name where the service is one of aterm's, and what
+        // the dialog is about in words where aterm knows the service. The
+        // service id itself ("AddressBook", "ListenEvent") is no name macOS
+        // shows a person: an unknown one is "a permission" here, and stays
+        // whole in `blocked_on=`.
         let what = match Folder::ALL.iter().find(|f| f.tcc_service() == short) {
-            Some(Folder::AppData) => "other applications' data",
-            Some(folder) => folder.label(),
+            Some(Folder::AppData) => Some("other applications' data"),
+            Some(folder) => Some(folder.label()),
             None => match short {
-                "SystemPolicyNetworkVolumes" => "network drives",
-                "SystemPolicyRemovableVolumes" => "removable drives",
-                "MediaLibrary" => "the music and media library",
-                "Photos" => "the Photos library",
-                other => other,
+                "SystemPolicyNetworkVolumes" => Some("network drives"),
+                "SystemPolicyRemovableVolumes" => Some("removable drives"),
+                "SystemPolicyAllFiles" => Some("all your files"),
+                "MediaLibrary" => Some("the music and media library"),
+                "Photos" => Some("the Photos library"),
+                "AddressBook" => Some("your contacts"),
+                "Calendar" => Some("your calendars"),
+                "Reminders" => Some("your reminders"),
+                "Camera" => Some("the camera"),
+                "Microphone" => Some("the microphone"),
+                "ScreenCapture" => Some("your screen"),
+                "ListenEvent" => Some("your keyboard input"),
+                "Accessibility" | "PostEvent" => Some("accessibility features"),
+                "AppleEvents" => Some("another app"),
+                _ => None,
             },
         };
+        let asked = what.map_or_else(
+            || "macOS is asking for a permission.".to_string(),
+            |what| format!("macOS is asking for access to {what}."),
+        );
         AttentionNotice {
             session: self.session,
-            title: ATTENTION_TITLE,
-            body: format!(
-                "macOS is asking for access to {what}. The program that asked waits until \
-                 you answer."
-            ),
+            title: PROMPT_TITLE,
+            body: format!("{asked} The program that asked waits until you answer."),
         }
     }
 }
@@ -1227,7 +1240,8 @@ pub(crate) enum AttentionEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttentionNotice {
     /// The originating session, for `notify.rs`'s focus-aware suppression.
-    /// `0` when the fact is instance-level, which suppresses nothing.
+    /// `u64::MAX` when the fact is instance-level: no session has that id, so
+    /// focus suppresses nothing (session `0` is the first tab).
     pub(crate) session: u64,
     /// Notification title.
     pub(crate) title: &'static str,
@@ -1249,8 +1263,13 @@ pub(crate) struct AttentionOutcome {
     pub(crate) refresh_status_item: bool,
 }
 
-/// The notification title. One string, so a reader recognizes the class.
-const ATTENTION_TITLE: &str = "aterm · file access";
+/// The title of a denial ([`AttentionGate`]): macOS refused aterm's own file
+/// work under a protected folder.
+const DENIED_TITLE: &str = "aterm · file access denied";
+
+/// The title of an observed dialog ([`ObservedPrompt::notice`]): macOS is
+/// asking, for any permission — a file, the camera, another app.
+const PROMPT_TITLE: &str = "aterm · permission waiting";
 
 /// THE RATE LIMIT (§3.6): one notification, never one per `EPERM`.
 ///
@@ -1295,8 +1314,8 @@ impl AttentionGate {
         AttentionOutcome {
             raise_tab: session,
             notice: Some(AttentionNotice {
-                session: session.unwrap_or(0),
-                title: ATTENTION_TITLE,
+                session: session.unwrap_or(u64::MAX),
+                title: DENIED_TITLE,
                 body: format!(
                     "macOS denied aterm access to protected files. Turn on aterm in {} (use + \
                      to add it if it is not listed).",
@@ -1943,6 +1962,7 @@ mod tests {
         );
         let notice = first[0].notice();
         assert_eq!(notice.session, 4);
+        assert_eq!(notice.title, PROMPT_TITLE, "a question, not a denial");
         assert_eq!(
             notice.body,
             "macOS is asking for access to Documents. The program that asked waits until \
@@ -1955,7 +1975,9 @@ mod tests {
                 "kTCCServiceSystemPolicyRemovableVolumes",
                 "removable drives",
             ),
-            ("kTCCServiceAddressBook", "AddressBook"),
+            ("kTCCServiceAddressBook", "your contacts"),
+            ("kTCCServiceListenEvent", "your keyboard input"),
+            ("kTCCServiceAppleEvents", "another app"),
         ] {
             let prompt = ObservedPrompt {
                 session: 4,
@@ -1971,6 +1993,18 @@ mod tests {
                 "{service} is named in words where aterm knows it"
             );
         }
+        // A service aterm does not know is never printed as its id, which
+        // stays whole in `blocked_on=`.
+        let unknown = ObservedPrompt {
+            session: 4,
+            blocked_on: blocked_on_token("kTCCServiceSomethingNew"),
+            service: "kTCCServiceSomethingNew".to_owned(),
+        };
+        assert_eq!(
+            unknown.notice().body,
+            "macOS is asking for a permission. The program that asked waits until you answer."
+        );
+        assert_eq!(unknown.blocked_on, "macos-permission:SomethingNew");
 
         assert!(
             observer.take_new_verdicts(later, sessions, pgid).is_empty(),
@@ -2129,7 +2163,11 @@ mod tests {
         let outcome = gate.note(AttentionEvent::ProtectedEperm { session: None });
         assert_eq!(outcome.raise_tab, None);
         let notice = outcome.notice.expect("instance denials still notify");
-        assert_eq!(notice.session, 0, "0 suppresses nothing in notify.rs");
+        assert_eq!(
+            notice.session,
+            u64::MAX,
+            "an instance-level notice names no session, so focus suppresses nothing"
+        );
         assert!(!notice.body.is_empty());
     }
 
@@ -2166,7 +2204,7 @@ mod tests {
                 "it says how to add aterm when the pane does not list it: {}",
                 notice.body
             );
-            assert_eq!(notice.title, ATTENTION_TITLE);
+            assert_eq!(notice.title, DENIED_TITLE);
         }
     }
 

@@ -330,28 +330,12 @@ impl PetAttention {
     }
 }
 
-/// A producer that KNOWS its edit range can authorize a paw. Arbitrary PTY
-/// redraws are never promoted to this witness by timing or text matching.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PetEditPhase {
-    Vacated,
-    Replaced,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct InputEpisode {
     seq: u64,
     kind: PetInputKind,
     at: Instant,
     target: Option<(f32, f32)>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct EditWitness {
-    seq: u64,
-    stamp: PetWorldStamp,
-    range: PetRect,
-    phase: PetEditPhase,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -366,11 +350,14 @@ struct PerchTrip {
 #[derive(Default)]
 pub(super) struct ConsoleLife {
     world: Option<Box<PetWorld>>,
+    /// The last retired map's buffer, never read: an unfocused surface is
+    /// observed and retired every frame, and reusing this keeps that from
+    /// allocating and dropping the whole bounded map each time.
+    spare_world: Option<Box<PetWorld>>,
     presentable: bool,
     seq: u64,
     input: Option<InputEpisode>,
     consumed: u64,
-    edit: Option<EditWitness>,
     attention: PetAttention,
     reason: &'static str,
     anchor: Option<PetAnchor>,
@@ -421,6 +408,26 @@ pub(super) struct ConsoleLife {
     perched_since: Option<Instant>,
 }
 
+impl ConsoleLife {
+    /// A fresh console life for a retired coordinate space. It keeps only the
+    /// world's buffer, retired exactly as a default map, as the spare the
+    /// next observation fills.
+    pub(super) fn retired(&mut self) -> Self {
+        let spare_world = self
+            .world
+            .take()
+            .map(|mut world| {
+                world.retire();
+                world
+            })
+            .or_else(|| self.spare_world.take());
+        Self {
+            spare_world,
+            ..Self::default()
+        }
+    }
+}
+
 impl PetBrain {
     /// Exactly one note per admitted gesture/bundle. A later output echo
     /// may complete an explicit witness, but never creates another input.
@@ -447,7 +454,6 @@ impl PetBrain {
             at: now,
             target: self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c))),
         });
-        self.console.edit = None;
         // THE KITTY COMMAND'S ONE RE-STAMP. A latched trick waits out the
         // user's OWN typing — text, a delete, the submit — and this note is
         // exactly one per admitted press, so it is the only signal that
@@ -571,7 +577,7 @@ impl PetBrain {
         let world = self
             .console
             .world
-            .get_or_insert_with(|| Box::new(PetWorld::default()));
+            .get_or_insert_with(|| self.console.spare_world.take().unwrap_or_default());
         let prior_stamp = world.stamp();
         let prior_selection = world.selection_target();
         let prior_progress = world.progress();
@@ -678,55 +684,6 @@ impl PetBrain {
             .world
             .as_ref()
             .is_some_and(|w| w.selection_target().is_some())
-    }
-
-    /// Explicitly attributed edit geometry from an application adapter.
-    /// The adapter must supply the current input sequence and surface stamp;
-    /// stale reports and unobserved ranges are refused, never queued.
-    #[cfg(test)]
-    pub fn note_console_edit(
-        &mut self,
-        input_seq: u64,
-        stamp: PetWorldStamp,
-        range: PetRect,
-        phase: PetEditPhase,
-    ) -> bool {
-        let Some(world) = self.console.world.as_ref() else {
-            return false;
-        };
-        if input_seq != self.console.seq
-            || self.console.input.is_none()
-            || world.stamp() != Some(stamp)
-            || !range.valid()
-        {
-            return false;
-        }
-        let coverage = world.coverage();
-        let r1 = range.row + range.rows;
-        let c1 = range.col + range.cols;
-        if !r1.is_finite()
-            || !c1.is_finite()
-            || range.row < coverage.row as f32
-            || range.col < coverage.col as f32
-            || r1 > (coverage.row + coverage.rows) as f32
-            || c1 > (coverage.col + coverage.cols) as f32
-            || !(range.row.floor() as usize..r1.ceil() as usize).all(|r| {
-                (range.col.floor() as usize..c1.ceil() as usize)
-                    .all(|c| world.ink_at(r, c).is_some())
-            })
-        {
-            return false;
-        }
-        if phase == PetEditPhase::Vacated && !world.clear(range, 0.0) {
-            return false;
-        }
-        self.console.edit = Some(EditWitness {
-            seq: input_seq,
-            stamp,
-            range,
-            phase,
-        });
-        true
     }
 
     /// Natural, pixel-rounded sprite coverage in fractional grid cells.
@@ -841,7 +798,6 @@ impl PetBrain {
             self.console.anchor = None;
             self.console.target = None;
             self.console.trip = None;
-            self.console.edit = None;
             self.console.progress_key = None;
             self.console.progress_at = None;
             self.console.result_at = None;
@@ -984,20 +940,6 @@ impl PetBrain {
                 self.console.target = Some(body);
                 self.console.resident = true;
                 self.console.still = true;
-            }
-            if let Some(edit) = self.console.edit
-                && edit.seq == self.console.seq
-                && edit.stamp == stamp
-                && self.console.input.is_some_and(|e| age(e.at) < EDIT_HOLD)
-            {
-                self.console.gaze = Some((edit.range.row, edit.range.col));
-                self.console.pose = Some(match edit.phase {
-                    PetEditPhase::Vacated if world.clear(edit.range, 0.0) => {
-                        PetGlyphId::PetReachPaw
-                    }
-                    _ => PetGlyphId::PetWithdrawPaw,
-                });
-                self.console.reason = "attributed-edit-range";
             }
             // The clearance margin is real contact geometry. Never brace on
             // input alone or on a duplicate frame of the same displayed ink.
@@ -2549,7 +2491,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_holds_its_body_and_only_an_attributed_range_licenses_the_paw() {
+    fn repair_holds_its_body_in_the_inspect_pose() {
         let mut s = Scene::new();
         s.input(PetInputKind::Delete);
         s.term.process(b"\x1b[6;15H");
@@ -2559,34 +2501,6 @@ mod tests {
         let before = (inspect.col, inspect.row);
         s.frame(0.016);
         assert_eq!((s.pet.col, s.pet.row), before);
-        let stamp = s.pet.console.world.as_ref().unwrap().stamp().unwrap();
-        let range = PetRect::new(5.0, 17.0, 1.0, 1.0);
-        let seq = s.pet.console_input_seq();
-        for invalid in [
-            PetRect::new(f32::NAN, 17.0, 1.0, 1.0),
-            PetRect::new(5.0, 1000.0, 1.0, 1.0),
-        ] {
-            assert!(
-                !s.pet
-                    .note_console_edit(seq, stamp, invalid, PetEditPhase::Replaced)
-            );
-        }
-        assert!(
-            !s.pet
-                .note_console_edit(seq + 1, stamp, range, PetEditPhase::Vacated)
-        );
-        assert!(
-            s.pet
-                .note_console_edit(seq, stamp, range, PetEditPhase::Vacated)
-        );
-        assert_eq!(s.frame(0.016).pose, PetGlyphId::PetReachPaw);
-        s.term.process(b"\x1b[6;18Hr\x1b[6;15H");
-        let f = s.frame(0.016);
-        assert_ne!(
-            f.pose,
-            PetGlyphId::PetReachPaw,
-            "replacement ink revokes vacancy witness"
-        );
     }
 
     #[test]

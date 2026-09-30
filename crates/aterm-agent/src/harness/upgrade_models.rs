@@ -36,11 +36,16 @@ use super::upgrade_catalog::{Baked, version_triple};
 /// The owner's list, verbatim order (2026-09-23).
 pub const SEED: [&str; 3] = ["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"];
 
+/// `id` without its 1M-window tag (`[1m]`).
+fn base_id(id: &str) -> &str {
+    id.strip_suffix("[1m]").unwrap_or(id)
+}
+
 /// `claude-<family>-<major>[-<minor>][-<yyyymmdd>]` → family and version.
 /// A date suffix (six or more digits) is not part of the version.
 #[must_use]
 pub fn family_version(id: &str) -> Option<(String, (u32, u32))> {
-    let base = id.strip_suffix("[1m]").unwrap_or(id);
+    let base = base_id(id);
     if !is_model_id(base) {
         return None;
     }
@@ -103,7 +108,7 @@ impl Priority {
     /// Rank of `id` (0 = best), the `[1m]` suffix ignored.
     #[must_use]
     pub fn rank(&self, id: &str) -> Option<usize> {
-        let base = id.strip_suffix("[1m]").unwrap_or(id);
+        let base = base_id(id);
         self.ids.iter().position(|x| x == base)
     }
 
@@ -189,7 +194,7 @@ impl Priority {
         known: &dyn Fn(&str) -> bool,
         now: i64,
     ) -> Option<Change> {
-        let base = id.strip_suffix("[1m]").unwrap_or(id);
+        let base = base_id(id);
         let (family, version) = family_version(base)?;
         if self.rank(base).is_some() || !known(base) {
             return None;
@@ -379,7 +384,7 @@ pub fn parse_claude_json(text: &str) -> (Vec<String>, Vec<String>, Vec<Announcem
             a.iter()
                 .filter(|r| r.get("disabled").and_then(Value::as_bool) == Some(true))
                 .filter_map(|r| r.get("value").and_then(Value::as_str))
-                .map(|s| s.strip_suffix("[1m]").unwrap_or(s).to_string())
+                .map(|s| base_id(s).to_string())
                 .collect()
         })
         .unwrap_or_default();
@@ -468,7 +473,7 @@ pub fn availability(
     ev: &Evidence,
     baked: Option<&Baked>,
 ) -> Availability {
-    let base = id.strip_suffix("[1m]").unwrap_or(id);
+    let base = base_id(id);
     if ev.denied.iter().any(|d| d == base) {
         return Availability::No("modelAccessCache entitled:false".to_string());
     }
@@ -572,22 +577,17 @@ pub const MODEL_SETTLE_S: u64 = 600;
 /// display of a model without a native 1M window gets `[1m]`.
 #[must_use]
 pub fn model_of_display(display: &str, baked: Option<&Baked>) -> Option<String> {
-    let mut name = display.trim().to_string();
+    let mut name = display.trim();
     let mut one_m = false;
-    loop {
-        let before = name.clone();
-        for suffix in [" (default)", " (1M context)", " (recommended)"] {
-            if let Some(s) = name.strip_suffix(suffix) {
-                one_m |= suffix == " (1M context)";
-                name = s.trim().to_string();
-            }
-        }
-        if name == before {
-            break;
-        }
+    while let Some((suffix, rest)) = [" (default)", " (1M context)", " (recommended)"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix).map(|rest| (suffix, rest)))
+    {
+        one_m |= suffix == " (1M context)";
+        name = rest.trim();
     }
-    if is_model_id(&name) && baked.is_some_and(|b| b.model(&name).is_some()) {
-        return Some(name);
+    if is_model_id(name) && baked.is_some_and(|b| b.model(name).is_some()) {
+        return Some(name.to_string());
     }
     let m = baked?.models.iter().find(|m| m.display_name == name)?;
     Some(if one_m && !m.native_1m {
@@ -833,13 +833,13 @@ pub fn hand_chosen(
     launch: &str,
     baked: Option<&Baked>,
 ) -> Option<String> {
-    let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
     let live = live?;
     let launch = launch_names(launch, baked);
     if live.by_command {
         return (live.id != launch).then(|| live.id.clone());
     }
-    (!human.is_empty() && base(human) == base(&live.id) && base(&live.id) != base(&launch))
+    let live_base = base_id(&live.id);
+    (!human.is_empty() && base_id(human) == live_base && live_base != base_id(&launch))
         .then(|| human.to_string())
 }
 
@@ -863,11 +863,10 @@ pub fn launch_names(launch: &str, baked: Option<&Baked>) -> String {
 
 /// [`hand_chosen`] off a conversation's transcript `tail`, for a process
 /// started at `started_s` with the launch's own `--model` (`launch`) and the
-/// person's recorded choice `human`: what runs now ([`live_model_at`]) — and
+/// person's recorded choice `human`: what runs now ([`live_model`]) — and
 /// none at all while no answer and no `/model` is newer than the process: a
 /// `/model` before it chose for a process before this one, whose relaunch
-/// did not carry it (a launch alias leaves [`live_model_at`] no flag to put
-/// in its place, and the older rows read as a choice of this one's).
+/// did not carry it. (Past that check [`live_model_at`] is [`live_model`].)
 #[must_use]
 pub fn hand_model(
     tail: &str,
@@ -879,8 +878,7 @@ pub fn hand_model(
     if started_s.is_some_and(|s| newest_row_at(tail).is_none_or(|at| at < s)) {
         return None;
     }
-    let live = live_model_at(tail, baked, Some(launch), started_s);
-    hand_chosen(live.as_ref(), human, launch, baked)
+    hand_chosen(live_model(tail, baked).as_ref(), human, launch, baked)
 }
 
 /// The timestamp of the newest main-chain answer or `/model` result in
@@ -1002,21 +1000,18 @@ pub fn live_model_at(
     launch: Option<&str>,
     started_s: Option<u64>,
 ) -> Option<LiveModel> {
-    let from_transcript = live_model(tail, baked);
     // A real id (`claude-<family>-<n>…`), not an alias (`opus`), which only
     // the build resolves.
-    let real =
-        |m: &&str| is_model_id(m) && family_version(m.strip_suffix("[1m]").unwrap_or(m)).is_some();
-    let (Some(launch), Some(started)) = (launch.filter(real), started_s) else {
-        return from_transcript;
-    };
-    if newest_row_at(tail).is_none_or(|t| t < started) {
+    let real = |m: &&str| is_model_id(m) && family_version(base_id(m)).is_some();
+    if let (Some(launch), Some(started)) = (launch.filter(real), started_s)
+        && newest_row_at(tail).is_none_or(|t| t < started)
+    {
         return Some(LiveModel {
             id: launch.to_string(),
             by_command: false,
         });
     }
-    from_transcript
+    live_model(tail, baked)
 }
 
 /// The person's own Claude settings that bear on the model
@@ -1075,7 +1070,7 @@ pub fn target_allowed(
 #[must_use]
 pub fn list_target<'a>(list: &'a Priority, offered: &[String]) -> Option<&'a str> {
     list.ids.iter().map(String::as_str).find(|id| {
-        let base = id.strip_suffix("[1m]").unwrap_or(id);
+        let base = base_id(id);
         offered.iter().any(|o| o == base)
     })
 }
@@ -1113,7 +1108,7 @@ pub fn offered(
         .flat_map(|b| b.latest_per_family.iter().map(|(_, id)| id.as_str()));
     let mut out: Vec<String> = Vec::new();
     for id in latest.chain(list.ids.iter().map(String::as_str)) {
-        let base = id.strip_suffix("[1m]").unwrap_or(id);
+        let base = base_id(id);
         if family_version(base).is_some()
             && !out.iter().any(|o| o == base)
             && availability(base, cc_version, ev, baked).ok()
@@ -1144,7 +1139,7 @@ pub fn family_successor(current: &str, one_m: bool, offered: &[String]) -> Optio
     let (_, newest) = offered
         .iter()
         .filter_map(|id| {
-            let base = id.strip_suffix("[1m]").unwrap_or(id);
+            let base = base_id(id);
             family_version(base)
                 .filter(|(f, v)| *f == family && *v > version)
                 .map(|(_, v)| (v, base))
@@ -1336,12 +1331,11 @@ pub fn model_due(
     let Some((family, _)) = family_version(&live.id) else {
         return ModelVerdict::Keep("model-unreadable");
     };
-    let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
     // Never twice, never after a failure — for either step's target.
     let spent = |to: &str| {
-        if record.applied.iter().any(|a| base(a) == base(to)) {
+        if record.applied.iter().any(|a| base_id(a) == base_id(to)) {
             Some(ModelVerdict::Keep("model-applied-before"))
-        } else if record.failed.iter().any(|a| base(a) == base(to)) {
+        } else if record.failed.iter().any(|a| base_id(a) == base_id(to)) {
             Some(ModelVerdict::Keep("model-failed-before"))
         } else {
             None
@@ -1378,15 +1372,15 @@ pub fn model_due(
     if let Some(keep) = spent(target) {
         return keep;
     }
-    let ours = |m: &str| !record.set.is_empty() && base(m) == base(&record.set);
+    let ours = |m: &str| !record.set.is_empty() && base_id(m) == base_id(&record.set);
     let family_of = |m: &str| {
-        family_version(&base(m))
+        family_version(base_id(m))
             .map(|f| f.0)
-            .unwrap_or_else(|| base(m).to_ascii_lowercase())
+            .unwrap_or_else(|| base_id(m).to_ascii_lowercase())
     };
     let chosen = launch_model.is_some_and(|m| !ours(m))
         || (live.by_command && !ours(&live.id))
-        || (!record.human.is_empty() && base(&record.human) == base(&live.id))
+        || (!record.human.is_empty() && base_id(&record.human) == base_id(&live.id))
         || default_model.is_some_and(|d| family_of(d) == family);
     if chosen {
         return ModelVerdict::Keep("model-chosen-by-hand");
@@ -1434,11 +1428,11 @@ impl ModelRecord {
     ///   never types one): remembered ([`ModelRecord::human`]), so the
     ///   answers that follow do not end its protection.
     pub fn settle(&mut self, live: Option<&LiveModel>, now: u64) -> Settled {
-        let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
         let mut out = Settled::default();
-        let applied = |rec: &ModelRecord| rec.applied.iter().any(|a| base(a) == base(&rec.set));
+        let applied =
+            |rec: &ModelRecord| rec.applied.iter().any(|a| base_id(a) == base_id(&rec.set));
         if !self.set.is_empty()
-            && live.is_some_and(|l| base(&l.id) == base(&self.set))
+            && live.is_some_and(|l| base_id(&l.id) == base_id(&self.set))
             && !applied(self)
         {
             self.applied.push(self.set.clone());
@@ -1446,7 +1440,7 @@ impl ModelRecord {
             out.changed = true;
         }
         if !self.set.is_empty()
-            && live.is_none_or(|l| base(&l.id) != base(&self.set))
+            && live.is_none_or(|l| base_id(&l.id) != base_id(&self.set))
             && now.saturating_sub(self.set_at) >= MODEL_SETTLE_S
             && !applied(self)
         {
@@ -1488,11 +1482,11 @@ impl ModelRecord {
     /// Returns the seconds the current move has been due (0 when none is) —
     /// what [`model_moves_now`] bounds — and whether the record changed.
     pub fn due_clock(&mut self, verdict: &ModelVerdict, now: u64) -> (u64, bool) {
-        let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
         match verdict {
             ModelVerdict::Due { to, .. } => {
-                let restart =
-                    base(&self.due_to) != base(to) || self.due_since == 0 || self.due_since > now;
+                let restart = base_id(&self.due_to) != base_id(to)
+                    || self.due_since == 0
+                    || self.due_since > now;
                 if restart {
                     self.due_to.clone_from(to);
                     self.due_since = now;

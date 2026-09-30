@@ -952,26 +952,106 @@ impl MessageLog {
     /// 194).
     fn push_record(&mut self, rec: LogRecord) {
         if self.ring.len() >= LOG_CAP {
-            let wire_full = self.ring.iter().filter(|r| r.wire_owned()).count() >= WIRE_LOG_SHARE;
-            let wire_victim = || {
-                self.ring
-                    .iter()
-                    .position(|r| r.wire_owned() && !r.is_live())
-            };
-            let victim = wire_full
-                .then(wire_victim)
-                .flatten()
-                .or_else(|| self.ring.iter().position(|r| !r.is_live()));
-            match victim {
-                Some(i) => {
-                    self.ring.remove(i);
-                }
-                None => {
-                    self.ring.pop_front();
-                }
-            }
+            self.evict_one();
         }
         self.ring.push_back(rec);
+    }
+
+    /// Make room for one record: the oldest retired wire record once the wire
+    /// holds its share, else the oldest retired record, else the oldest.
+    fn evict_one(&mut self) {
+        let wire_full = self.ring.iter().filter(|r| r.wire_owned()).count() >= WIRE_LOG_SHARE;
+        let wire_victim = || {
+            self.ring
+                .iter()
+                .position(|r| r.wire_owned() && !r.is_live())
+        };
+        let victim = wire_full
+            .then(wire_victim)
+            .flatten()
+            .or_else(|| self.ring.iter().position(|r| !r.is_live()));
+        match victim {
+            Some(i) => {
+                self.ring.remove(i);
+            }
+            None => {
+                self.ring.pop_front();
+            }
+        }
+    }
+
+    /// THE FILE READ AGAIN, merged into the ring (round-seven update audit,
+    /// finding 41). A seamless successor on the late-park lane loads the file
+    /// when it BOOTS, and its parent keeps recording until Commit — posting,
+    /// retiring, pressing — so the boot's load is missing every record the
+    /// parent wrote after it, and reads a row the parent closed after it as
+    /// `Stale` ("nobody folded it"). `disk` is the file loaded again once the
+    /// parent is gone (its last line flushed before Commit):
+    ///
+    /// * ids: never mint at or below the file's top again;
+    /// * a record the ring already holds (the same stamp and tag, and the same
+    ///   id or posted words) that is LIVE here stays as it is — a carried row
+    ///   is this process's now; one the boot read as `Stale` takes the ending
+    ///   the file has (its state, final words and mark), and a press the file
+    ///   records is kept;
+    /// * a record the ring does not hold is inserted in id order — under a
+    ///   fresh id when this process minted that number for a record of its
+    ///   own — unless it is older than everything a full ring keeps.
+    ///
+    /// Idempotent: merging the same file twice changes nothing more.
+    pub(crate) fn merge_reloaded(&mut self, disk: &MessageLog) {
+        self.raise_to(disk.next_id);
+        for rec in &disk.ring {
+            let same = self
+                .ring
+                .iter()
+                .position(|r| r.stamp == rec.stamp && r.tag == rec.tag && r.id == rec.id)
+                .or_else(|| {
+                    self.ring.iter().position(|r| {
+                        r.stamp == rec.stamp && r.tag == rec.tag && r.title == rec.title
+                    })
+                });
+            if let Some(i) = same {
+                let mine = &mut self.ring[i];
+                if mine.is_live() {
+                    continue;
+                }
+                if mine.retired() == Some(&Retired::Stale)
+                    && rec.retired().is_some_and(|how| *how != Retired::Stale)
+                {
+                    mine.state = rec.state.clone();
+                    mine.retired_unix_ms = rec.retired_unix_ms;
+                    mine.title.clone_from(&rec.title);
+                    mine.detail.clone_from(&rec.detail);
+                    mine.repeats = rec.repeats;
+                    mine.severity = rec.severity;
+                    mine.glyph = rec.glyph;
+                }
+                if mine.last_action.is_none() {
+                    mine.last_action.clone_from(&rec.last_action);
+                }
+                continue;
+            }
+            if self.ring.len() >= LOG_CAP && self.ring.front().is_some_and(|r| rec.id < r.id) {
+                continue;
+            }
+            let mut rec = rec.clone();
+            if self.get(rec.id).is_some() {
+                let fresh = self.mint();
+                self.minted_at_replay.insert(fresh.raw());
+                rec.id = fresh;
+            }
+            self.raise(rec.id);
+            if self.ring.len() >= LOG_CAP {
+                self.evict_one();
+            }
+            let at = self
+                .ring
+                .iter()
+                .position(|r| r.id > rec.id)
+                .unwrap_or(self.ring.len());
+            self.ring.insert(at, rec);
+        }
     }
 
     pub(crate) fn push_pending(&mut self, line: LogLine) {
@@ -1856,6 +1936,100 @@ pub(crate) mod tests {
             log.mint().raw(),
             ID_CEILING - 1,
             "just below the ceiling is honoured"
+        );
+    }
+
+    /// THE FILE READ AGAIN AT COMMIT (round-seven update audit, finding 41):
+    /// the late-park successor loaded the file at its boot, and its parent
+    /// kept recording until Commit. Merging the file read again gives the
+    /// row the parent closed after the boot its real ending (never `Stale`),
+    /// brings in the records the parent wrote after the boot, leaves a row
+    /// live here alone, moves a parent record off a number this process
+    /// minted for its own, raises the ids past the file, and is idempotent.
+    #[test]
+    fn a_reloaded_file_merges_what_the_parent_wrote_after_the_boot() {
+        let line = |l: LogLine| LogLine::decode(&l.encode()).unwrap();
+        let retired = |id: u64| LogLine::Retired {
+            id: MessageId::from_raw(id).unwrap(),
+            how: Retired::Resolved(crate::Outcome::Ok),
+            unix_ms: 1_758_470_100_000,
+            title: "done".into(),
+            detail: Vec::new(),
+            repeats: 1,
+            mark: None,
+        };
+        // At the successor's boot: 1 (retired), 2 (open), 3 (open, carried).
+        let boot_lines = vec![
+            line(LogLine::Posted(posted(1))),
+            line(retired(1)),
+            line(LogLine::Posted(posted(2))),
+            line(LogLine::Posted(posted(3))),
+        ];
+        let mut ring = MessageLog::empty();
+        ring.replay_all(boot_lines.clone());
+        assert_eq!(
+            ring.get(MessageId::from_raw(2).unwrap()).unwrap().retired(),
+            Some(&Retired::Stale),
+            "the boot reads the parent's open row as nobody's"
+        );
+        // Row 3 is carried and live here again.
+        let mut carried = posted(3);
+        carried.title = "restated".into();
+        ring.raise_to(5);
+        ring.adopt_carried(carried);
+        // This process mints 5 for a record of its own before Commit.
+        let mut own = posted(5);
+        own.stamp.unix_ms = 1_758_470_900_000;
+        own.title = "the successor's own".into();
+        ring.record_posted(own);
+        // The parent, after the boot: retired 2, recorded 4 and 5 (its 5 is
+        // not ours), retired nothing else.
+        let mut disk_lines = boot_lines;
+        disk_lines.push(line(retired(2)));
+        disk_lines.push(line(LogLine::Posted(posted(4))));
+        disk_lines.push(line(retired(4)));
+        disk_lines.push(line(LogLine::Posted(posted(5))));
+        let mut disk = MessageLog::empty();
+        disk.replay_all(disk_lines);
+
+        ring.merge_reloaded(&disk);
+        let two = ring.get(MessageId::from_raw(2).unwrap()).unwrap();
+        assert!(
+            matches!(two.retired(), Some(Retired::Resolved(_))),
+            "the parent's ending, not Stale: {:?}",
+            two.state
+        );
+        assert_eq!(two.title, "done");
+        let three = ring.get(MessageId::from_raw(3).unwrap()).unwrap();
+        assert!(three.is_live(), "a row live here stays live");
+        assert_eq!(three.title, "restated");
+        assert!(
+            ring.get(MessageId::from_raw(4).unwrap())
+                .is_some_and(|r| matches!(r.retired(), Some(Retired::Resolved(_)))),
+            "a record the parent wrote after the boot is in the history"
+        );
+        let fives: Vec<&LogRecord> = ring
+            .records()
+            .filter(|r| r.stamp == posted(5).stamp || r.title == "the successor's own")
+            .collect();
+        assert_eq!(fives.len(), 2, "both records numbered 5 are kept");
+        assert_eq!(
+            ring.get(MessageId::from_raw(5).unwrap()).unwrap().title,
+            "the successor's own",
+            "this process's own number stays its own"
+        );
+        let ids: Vec<u64> = ring.records().map(|r| r.id.raw()).collect();
+        let unique: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "one id, one record: {ids:?}");
+        assert!(ring.next_id().raw() > *unique.last().unwrap());
+        // Idempotent.
+        let before: Vec<LogRecord> = ring.records().cloned().collect();
+        ring.merge_reloaded(&disk);
+        assert_eq!(ring.records().cloned().collect::<Vec<_>>(), before);
+        assert_eq!(
+            ring.pending_len(),
+            1,
+            "a merge queues no line: only the own post"
         );
     }
 

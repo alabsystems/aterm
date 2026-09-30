@@ -326,6 +326,35 @@ pub(crate) struct SessionRecord {
     /// always did. In neither proof digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport_from_bottom: Option<u32>,
+    /// THE MAILBOX'S OUTBOUND HALF AND ITS ID COUNTERS (additive, absent ⇒
+    /// none; round seven of the update audit, findings 6, 8 and 28): the posts
+    /// still waiting for a bridge, the receipts still owed, and the last inbox,
+    /// post and receipt ids this session handed out
+    /// (`crate::fabric::FabricCarry`). The successor puts them back before the
+    /// session is registered (`SessionFabric::seed_carry`), so nothing a sender
+    /// was told is queued dies with the old process, and no id is handed out
+    /// twice under the sid the update keeps. Per record, like `topics`, so it
+    /// survives every later handoff; in neither proof digest; not written when
+    /// empty, so an older reader sees the wire it always saw, and a value that
+    /// does not read is dropped ([`lenient_fabric`]), never the manifest.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::fabric::FabricCarry::is_empty",
+        deserialize_with = "lenient_fabric"
+    )]
+    pub fabric: crate::fabric::FabricCarry,
+    /// THE TIMELINE'S LAST ID (additive, absent ⇒ 0; round seven of the update
+    /// audit, finding 50): the newest `timeline` event id this session recorded.
+    /// The successor's timeline counts on above it
+    /// (`SessionTimeline::continue_ids`), so a `timeline since=<id>` anchor
+    /// taken before the update still sees the `handoff` row and every event
+    /// after it. `0` is not written.
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero",
+        deserialize_with = "lenient_count"
+    )]
+    pub timeline_id: u64,
 }
 
 impl SessionRecord {
@@ -348,6 +377,46 @@ impl SessionRecord {
     pub(crate) fn claim_grace(&self) -> bool {
         !self.claim_known || self.supervisor.is_some()
     }
+}
+
+/// Read a carried mailbox ([`SessionRecord::fabric`]); a value that does not
+/// read as one is none at all, never an error that would fail the whole
+/// manifest and adopt nothing.
+fn lenient_fabric<'de, D>(deserializer: D) -> Result<crate::fabric::FabricCarry, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Carry {
+        Read(crate::fabric::FabricCarry),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Carry as serde::Deserialize>::deserialize(deserializer)? {
+            Carry::Read(carry) => carry,
+            Carry::Unreadable(_) => crate::fabric::FabricCarry::default(),
+        },
+    )
+}
+
+/// Read a carried count; anything but a non-negative integer reads as `0`.
+fn lenient_count<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Count {
+        Read(u64),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Count as serde::Deserialize>::deserialize(deserializer)? {
+            Count::Read(n) => n,
+            Count::Unreadable(_) => 0,
+        },
+    )
 }
 
 /// Read a carried one-line row; a value that is not a string reads as an
@@ -867,6 +936,30 @@ pub(crate) struct SessionHandoff {
     /// "not carried" placeholder when it cannot (`seamless::take_held_panes`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<HeldPaneCarry>,
+    /// THE EXIT LEDGER'S LAST ID (additive, absent tolerated; round seven of
+    /// the update audit, finding 49): the outgoing store's roster journal
+    /// sequence — the row id `exits since=` pages by. The successor's store
+    /// counts on above it (`SessionStore::continue_roster_seq`) before it
+    /// registers a session, so a pre-update `exits since=<id>` still means
+    /// "after that row" and sees every exit the successor records. A plain
+    /// scalar an older reader skips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_seq: Option<u64>,
+    /// THE BRIDGE ARMED AT RUNTIME (additive, absent tolerated; round seven of
+    /// the update audit, finding 7): the argv `fabric attach` armed the
+    /// outgoing process's bridge supervisor with, when it is not the configured
+    /// `[fabric] command` (`fabric_launch::handoff_attached`). The successor
+    /// arms it when it has no command configured (`fabric_launch::
+    /// carry_attached`), so an update does not leave the instance
+    /// `fabric=absent` with its carried fleet holds unliftable. Not written
+    /// when empty; an older reader skips it; a value that does not read is
+    /// none ([`lenient_rows`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_rows"
+    )]
+    pub fabric_attached: Vec<String>,
 }
 
 /// One held pane's final screen on the wire (round five, item 19): the
@@ -940,6 +1033,10 @@ impl SessionHandoff {
         // left behind (its successor's host takes the session at Commit).
         let now_us = crate::metrics::now_us();
         let own_holder = crate::harness_host::holder();
+        // One budget for every session's carried mail (posts and owed
+        // receipts, at their escaped TOML cost): the rows ride the
+        // manifest, whose cap the successor enforces whole.
+        let mut post_budget = crate::fabric::CARRY_MAIL_BYTES;
         Self {
             schema: Self::SCHEMA,
             window: None,
@@ -953,6 +1050,15 @@ impl SessionHandoff {
             // without git — either way the field is there.
             outgoing_build: Some(crate::running_build_number()),
             held: Vec::new(),
+            // The exit ledger's row id, so the successor's count goes on above
+            // it (round seven, finding 49). Clamped to what TOML can write.
+            roster_seq: Some(store.roster_seq().min(i64::MAX as u64)),
+            // The bridge `fabric attach` armed, if it is not the configured one
+            // (round seven, finding 7).
+            #[cfg(unix)]
+            fabric_attached: crate::fabric_launch::handoff_attached(),
+            #[cfg(not(unix))]
+            fabric_attached: Vec::new(),
             sessions: handles
                 .into_iter()
                 .map(|h| {
@@ -1023,6 +1129,18 @@ impl SessionHandoff {
                         // Stamped with the history carry, from the park's head
                         // (`handoff_history::stamp_manifest`).
                         viewport_from_bottom: None,
+                        // The outbound mailbox and the id counters, under the
+                        // fabric's leaf lock (round seven, findings 6/8/28).
+                        fabric: h.ctx.fabric.handoff_carry(&mut post_budget),
+                        // The id the successor's timeline counts on from:
+                        // the newest one plus the overlap's reserve (round
+                        // seven, finding 50, and its review's item 2).
+                        timeline_id: h
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .handoff_id(),
                     }
                 })
                 .collect(),
@@ -1873,6 +1991,17 @@ impl SessionStore {
         self.roster_seq
     }
 
+    /// COUNT ON FROM A SEAMLESS UPDATE'S ROSTER (round seven of the update
+    /// audit, finding 49): raise the journal's sequence to the outgoing
+    /// store's ([`SessionHandoff::roster_seq`]), before the first session is
+    /// registered, so every row this store records has an id above every row
+    /// the old process recorded — a driver's `exits since=<id>` from before
+    /// the update still means "after that row". Never lowers the count, and
+    /// never past what a manifest can carry.
+    pub(crate) fn continue_roster_seq(&mut self, carried: u64) {
+        self.roster_seq = self.roster_seq.max(carried.min(i64::MAX as u64));
+    }
+
     /// The LOWEST retained journal seq, or `None` when nothing is retained.
     ///
     /// A consumer whose watermark `w` satisfies `w + 1 < low_seq` has fallen
@@ -2105,6 +2234,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
         human_input: Default::default(),
         generation_look: Default::default(),
         reset_lane: Default::default(),
+        update_parked: Default::default(),
     });
     SessionHandle {
         sid,
@@ -2299,6 +2429,7 @@ title = \"zsh\"
                 &fresh.ctx.timeline,
                 &rec.topics,
                 rec.hold.as_deref(),
+                &rec.fabric,
             );
             assert_eq!(fresh.ctx.fabric.hold().as_ref(), before, "{rec:?}");
             let refused = crate::fabric::halt_refusal(&fresh.ctx, "send");

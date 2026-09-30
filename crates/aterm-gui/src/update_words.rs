@@ -1229,12 +1229,29 @@ pub(crate) fn health_recovered(said_title: &str, said_line0: &str) -> Message {
 /// The OS notification's body for the same warning: when it started and where
 /// the rest is. The updater's whole sentence — the count, a raw timestamp, the
 /// cause and a command — is the log's and Software Update's, never a banner's.
+/// "aterm Settings", never a bare "Settings ▸ Software Update", which is also
+/// where macOS keeps its own updates.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn health_notification_body(body: &str) -> String {
     match health_since(body) {
-        Some(since) => format!("Since {since}. Details are in Settings \u{25b8} Software Update."),
-        None => "Details are in Settings \u{25b8} Software Update.".to_string(),
+        Some(since) => format!("Since {since}. Details: aterm Settings \u{25b8} Software Update."),
+        None => "Details: aterm Settings \u{25b8} Software Update.".to_string(),
     }
+}
+
+/// The OS notification's title for the same warning: the warning's own title
+/// under aterm's name, as the herald's and the consent path's notices read
+/// ("aterm · couldn't install updates"). A bare "Couldn't install updates" names
+/// no app — without terminal-notifier macOS shows the banner as Script Editor's
+/// — and reads as macOS's own updater.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn health_notification_title(title: &str) -> String {
+    let mut chars = title.chars();
+    let lowered: String = chars
+        .next()
+        .map(|first| first.to_lowercase().chain(chars).collect())
+        .unwrap_or_default();
+    format!("aterm \u{00b7} {lowered}")
 }
 
 /// "Sep 14": the day the updater's sentence dates the failure from
@@ -2666,11 +2683,21 @@ mod tests {
         assert_eq!(undated.detail, vec!["no date here"]);
         assert_eq!(
             health_notification_body(body),
-            "Since Sep 14. Details are in Settings \u{25b8} Software Update."
+            "Since Sep 14. Details: aterm Settings \u{25b8} Software Update."
         );
         assert_eq!(
             health_notification_body("no date"),
-            "Details are in Settings \u{25b8} Software Update."
+            "Details: aterm Settings \u{25b8} Software Update."
+        );
+        // The banner's title names aterm: a bare "Couldn't install updates"
+        // reads as macOS's own updater.
+        assert_eq!(
+            health_notification_title(aterm_update::health_failing_title("apply")),
+            "aterm \u{00b7} couldn't install updates"
+        );
+        assert_eq!(
+            health_notification_title(CHECKER_STALLED_TITLE),
+            "aterm \u{00b7} update check stopped"
         );
         let healed = health_recovered("Couldn't install updates", "since Sep 14");
         assert_eq!(healed.title, "aterm updates work again");

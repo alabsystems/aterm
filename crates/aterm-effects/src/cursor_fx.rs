@@ -115,11 +115,9 @@ pub struct CursorFxInput {
     /// wake) — the `focused=` `trail status` prints.
     pub focused: bool,
     /// The motion policy's amplitude for the cursor family (0 under reduced
-    /// motion or an unfocused demotion). Never a load term.
+    /// motion or an unfocused demotion). Never a load term. Whether the family
+    /// may animate at all is [`CursorFx::begin`]'s argument.
     pub amplitude: f32,
-    /// Whether the motion policy lets the cursor family ANIMATE (the engine's
-    /// own step-fade seam).
-    pub animate: bool,
     /// The SOFT load-shed envelope, `0..=1`: applied to the bodies' amplitude
     /// and, after the tick, to the comet's presentation and the caret fill.
     pub shed_envelope: f32,
@@ -523,8 +521,8 @@ impl CursorFx {
 
     /// Retire every body engine, the comet, the momentum rate and the typing
     /// cadence — the Serious Mode drain's cursor half, and the web pipeline's
-    /// all-off arm (the aurora is the caller's, because its drain is a
-    /// `reset` that keeps the engine's cumulative sensors).
+    /// all-off arm and hidden-page edge (the aurora is the caller's, because
+    /// its drain is a `reset` that keeps the engine's cumulative sensors).
     pub fn retire_bodies(&mut self) {
         self.retire_body_geometry();
         self.momentum.reset();
@@ -1070,7 +1068,6 @@ mod tests {
             },
             focused: true,
             amplitude: 1.0,
-            animate: true,
             shed_envelope: 1.0,
             body_allowed: true,
             master: true,

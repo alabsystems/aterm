@@ -227,6 +227,20 @@ mod tests {
         AtermTerminal::new_from_system(6, 40, 14.0)
     }
 
+    /// The module-global budget is process-wide: while
+    /// `global_budget_caps_the_effective_share` holds it at 8 KiB, a pane
+    /// another test drains is cut to its share (measured 2026-09-29:
+    /// `pane_budget_evicts_and_reports` read `95 -> 95` under the whole
+    /// suite, and passed alone). A test that counts what its store kept holds
+    /// this read guard; the one that sets the global holds the write guard.
+    static GLOBAL_BUDGET: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    fn global_budget_unset() -> std::sync::RwLockReadGuard<'static, ()> {
+        GLOBAL_BUDGET
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn feed_lines(t: &mut AtermTerminal, n: usize) {
         let mut buf = Vec::new();
         for i in 0..n {
@@ -251,6 +265,7 @@ mod tests {
 
     #[test]
     fn ingest_stages_and_render_promotes() {
+        let _global = global_budget_unset();
         let Some(mut t) = term() else { return };
         // Well past the ring cap: scroll-off must STAGE (no inline promote).
         feed_lines(&mut t, 4_000);
@@ -284,6 +299,7 @@ mod tests {
         // new cut behind them — one marker per frame. As a trickle
         // opportunity the frame drain skips while the flood outruns it, and
         // the drains after the flood promote ONE marker.
+        let _global = global_budget_unset();
         let Some(mut t) = term() else { return };
         t.set_scrollback_budget(2_000_000);
         for _ in 0..8 {
@@ -302,6 +318,7 @@ mod tests {
 
     #[test]
     fn set_scrollback_limit_caps_the_total_across_tiers() {
+        let _global = global_budget_unset();
         let Some(mut t) = term() else { return };
         t.set_scrollback_limit(1_500);
         feed_lines(&mut t, 5_000);
@@ -320,6 +337,7 @@ mod tests {
 
     #[test]
     fn pane_budget_evicts_and_reports() {
+        let _global = global_budget_unset();
         let Some(mut t) = term() else { return };
         feed_lines(&mut t, 3_000);
         while t.drain_scrollback_backlog(0) > 0 {}
@@ -343,6 +361,9 @@ mod tests {
 
     #[test]
     fn global_budget_caps_the_effective_share() {
+        let _global = GLOBAL_BUDGET
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut t) = term() else { return };
         // Robust under parallel tests (other live panes shift the divisor):
         // the effective share can never exceed the global cap itself, and
@@ -363,6 +384,7 @@ mod tests {
 
     #[test]
     fn truncation_and_pressure_are_observable_out_of_band() {
+        let _global = global_budget_unset();
         let Some(mut t) = term() else { return };
         assert_eq!(t.scrollback_truncated_lines(), 0.0);
         // Squeeze the pane budget, then keep feeding + draining: the store
@@ -399,7 +421,7 @@ mod tests {
     /// So pin every combination against the pure renderer — no arm can go dead —
     /// and separately assert the exported method reports THIS build faithfully. The
     /// shipped module's lz4/no-spill shape is enforced structurally instead: the
-    /// wasm builds are `-p`-scoped (`xtask gate web`, `tools/wasm-bench/run.sh`) and
+    /// wasm builds are `-p`-scoped (the wasm cells, `tools/wasm-bench/run.sh`) and
     /// `disk-tier` drags in libc mmap + zstd-sys C, which cannot target
     /// wasm32-unknown-unknown — so it fails to BUILD long before any assertion.
     #[test]

@@ -207,6 +207,21 @@ impl App {
         // screen itself, so the band, the rim, `status agent=` and `EVENT
         // agent` all say the same thing.
         let (agent_seq, agent) = self.session_status.agent_reading(session);
+        // THE LOOP'S NEXT TRY, laid on an API wall (`with_retry_plan`): the
+        // tab says `→ 14:05 · 3m` beside `can't reach the API`. The wall, its
+        // band word and `status agent=` stay the screen's.
+        let agent = match self.harness_waits.get(ctx.self_id.as_str()) {
+            None => agent,
+            Some(&at) => presence::with_retry_plan(
+                agent,
+                Some(at),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
+                now,
+                presence::local_offset_s,
+            ),
+        };
         // The published input stall (`input_stall::InputWatches`): the fact
         // the frozen program's unmoving screen cannot carry.
         let input_stall = self.session_status.input_stall(session).cloned();
@@ -215,7 +230,9 @@ impl App {
             attention,
             attention_told_elsewhere,
             shell,
-            agent_seq,
+            // The plan's changes count as news to the engine (see
+            // `App::harness_wait_epoch`).
+            agent_seq: agent_seq + self.harness_wait_epoch,
             agent,
             hand,
             lease_until,
@@ -281,6 +298,24 @@ impl App {
     /// `submitted` marks a turn's submit keypress — the ripple's edge.
     pub(crate) fn refresh_presence_session(&mut self, session: u64, submitted: bool) {
         drive::refresh_session(self, session, submitted);
+    }
+
+    /// The harness loop's NEXT TRY for `sid` ([`crate::Wake::HarnessWait`]):
+    /// kept, and the tab's words re-read where it changed — a plan told
+    /// after the wall was already on the tab must reach it, and a cleared one
+    /// must not linger.
+    pub(crate) fn apply_harness_wait(&mut self, sid: &str, at_unix: Option<i64>) {
+        let changed = match at_unix {
+            Some(at) => self.harness_waits.insert(sid.to_string(), at) != Some(at),
+            None => self.harness_waits.remove(sid).is_some(),
+        };
+        if !changed {
+            return;
+        }
+        self.harness_wait_epoch += 1;
+        if let Some(session) = self.local_session_of(&SessionId::new(sid)) {
+            self.refresh_presence_session(session, false);
+        }
     }
 
     /// The wake arms: resolve the fabric sid to the pool's local id.
@@ -1308,6 +1343,61 @@ mod tests {
         assert_eq!(app.presence_deadline(due), None, "a quiet desk again");
         let _ = app.presence_tick(due + FOLD_QUIET);
         assert_eq!(presence_regrids(), regrids + 2, "folded once");
+    }
+
+    /// THE TAB RETRY PLAN, THROUGH THE WINDOW (2026-09-29): the status sweep
+    /// publishes an API wall for the front session (the measured tall-pane
+    /// screen, `agent=wall:api-error`); the loop's next try, told over
+    /// `Wake::HarnessWait`, lands on THAT tab's words — `→ <clock> · <left>`
+    /// on the band, `next try` in the sentence — and clearing it, or a plan
+    /// already in the past, takes it away again. CONTROLS: the wall's band
+    /// word is the screen's either way, and a plan told for another session
+    /// changes this tab's row not at all.
+    #[test]
+    fn the_loops_next_try_reaches_the_tab_beside_an_api_wall_and_only_there() {
+        crate::fabric::with_link_reset(|| {
+            let (mut app, _wid, sid, ctx) = app_with_stub();
+            let now = Instant::now();
+            let rows = aterm_phase::prompt::fixtures::screen(
+                aterm_phase::prompt::fixtures::API_ERROR_TALL_PANE_MEASURED,
+            );
+            app.session_status.agent_observe(
+                sid,
+                crate::control::ScreenGen { epoch: 0, seq: 1 },
+                Some(rows),
+                crate::presence::Cursor::Unknown,
+                Some("claude".into()),
+                42,
+                false,
+                now,
+            );
+            app.refresh_presence_session(sid, false);
+            let mine = ctx.self_id.as_str().to_string();
+            let bare = app.presence_chrome_line();
+            assert!(bare.contains("can't reach the API"), "{bare}");
+            assert!(
+                !bare.contains("next try") && !bare.contains('\u{2192}'),
+                "{bare}"
+            );
+
+            let unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+            app.apply_harness_wait(&mine, Some(unix + 180));
+            let told = app.presence_chrome_line();
+            assert!(told.contains("can't reach the API"), "{told}");
+            assert!(told.contains('\u{2192}'), "the band has the try: {told}");
+            assert!(told.contains("next try"), "the sentence says it: {told}");
+
+            // Cleared, or already past: the row is as the screen alone made it.
+            app.apply_harness_wait(&mine, None);
+            assert_eq!(app.presence_chrome_line(), bare);
+            app.apply_harness_wait(&mine, Some(unix - 60));
+            assert_eq!(app.presence_chrome_line(), bare, "a past try shows nothing");
+            // A plan for another session is not this tab's.
+            app.apply_harness_wait("s-not-this-one", Some(unix + 180));
+            assert_eq!(app.presence_chrome_line(), bare);
+        });
     }
 
     /// THE REPAINT INVARIANT (§7): on a quiet window `presence_fp` is exactly 0

@@ -1861,8 +1861,17 @@ fn export_content(ctx: &Ctx, r: &mut Report) {
 ///   passes with those checks alone and says so — the scan's own stage is then
 ///   a named skip on that machine.
 ///
+/// AND THE ONE RELEASE COMMAND'S, joined 2026-09-29 with the command:
+///
+/// * `test-release.sh` — tools/release.sh's step logic over a scratch origin,
+///   engine, prover and gate lock, every tool a stub that files what its real
+///   twin files: the order, the one prover and its lease, the lock held from the
+///   MEASURE run through the cut, the skip-what-is-done rule and each refusal,
+///   under /bin/bash 3.2 and a bash 5 when one is installed. About 36 CPU-seconds
+///   for both shells (measured 2026-09-29: 59 s wall at load 15-40 on 18 cores).
+///
 /// A suite no gate runs is a test that passes forever.
-pub const DELIVERY_SUITES: [&str; 22] = [
+pub const DELIVERY_SUITES: [&str; 23] = [
     "test-install-channel.sh",
     "test-publish-export.sh",
     "test-release-preflight.sh",
@@ -1885,6 +1894,7 @@ pub const DELIVERY_SUITES: [&str; 22] = [
     "test-atpkg-pack-toolchain.sh",
     "test-bootstrap-publisher.sh",
     "test-export-content-scan.sh",
+    "test-release.sh",
 ];
 
 /// One delivery suite's command. With a `SIGTERM` grace, because each suite
@@ -2026,10 +2036,12 @@ fn trust_contract_probe(ctx: &Ctx, r: &mut Report) {
 //    every obligation verified and reported. The run FAILS when a library's
 //    proved count falls below the floor its prover recorded in
 //    `tools/trust-gate-ratchet.tsv`, when a verified library has no floor, or
-//    when its verification broke. In order: the script's own verdict self-test
-//    (seconds, stubbed); the ratchet's UP-ONLY check against the shared branch
-//    ([`lowered_floors`] — a floor goes down only onto a new prover, or with its
-//    reason written in the row); the lane.
+//    when its verification broke; a drop below a floor that trustd's refusals
+//    cover is COULD NOT RUN. In order: the script's own verdict self-test (seconds,
+//    stubbed); the ratchet's UP-ONLY check against the shared branch
+//    ([`lowered_floors`] — a floor goes down only onto the prover the lane runs,
+//    or with its reason written in the row and its total down at least as far,
+//    a total the lane then holds to the one it measures); the lane.
 //
 //    WHICH LIBRARIES, in every mode. Measured 2026-09-27 on the store seal
 //    (trustc 321aaeda7; docs/measured/trust-advisory-lane-2026-09-27.md): the
@@ -2111,21 +2123,31 @@ pub fn trust_selection(
 /// THE UP-ONLY FLOOR (2026-09-27, review): every floor `tree` lowers against
 /// `base` — each a line naming the library — as two `tools/trust-gate-ratchet.tsv`
 /// texts (`<crate>\t<proved>\t<total>\t<prover>[\t<why>]`). A floor goes DOWN
-/// in exactly two ways: onto another prover (a re-base, which
-/// `trust-gate-all.sh --update-ratchet` writes with the new prover's line), or
-/// by a hand edit that says WHY in the row's fifth column — a change that
-/// removed proved obligations along with the code that carried them (the same
-/// day's aterm-session fix made its paste-cut arithmetic checked: 304
-/// obligations became 300, and one of the four was proved). A lowering under
-/// the same prover with no new reason is the edit the ratchet exists to refuse.
-/// A row removed while `gated(name)` still holds — the library is still one the
-/// lane verifies — lowers it to nothing. A floor that is not a count is named
+/// in exactly two ways. A RE-BASE onto `driver` — the `--version` line of the
+/// prover this lane runs, the one `trust-gate-all.sh --update-ratchet` writes;
+/// a prover column changed to anything else names nothing the lane measured
+/// (review, 2026-09-29), and with no driver line no re-base is admitted. Or a
+/// hand edit that says WHY in the row's fifth column AND whose proved count fell
+/// by no more than its total — the proved obligations left with the code that
+/// carried them (aterm-session's paste-cut arithmetic made checked: 304
+/// obligations became 300, one of the four proved). Decided 2026-09-29 under the
+/// owner's standing direction: a reason alone let a floor drop by any amount with
+/// the obligations still there, which is the lowering the ratchet exists to
+/// refuse; and the lane holds such a row's total to the one it measures. A row
+/// removed while `gated(name)` still holds — the library is still one the lane
+/// verifies — lowers it to nothing. A floor or total that is not a count is named
 /// too: a typo must not pass.
 #[must_use]
-pub fn lowered_floors(base: &str, tree: &str, gated: &dyn Fn(&str) -> bool) -> Vec<String> {
+pub fn lowered_floors(
+    base: &str,
+    tree: &str,
+    gated: &dyn Fn(&str) -> bool,
+    driver: Option<&str>,
+) -> Vec<String> {
     struct Row<'a> {
         name: &'a str,
         proved: &'a str,
+        total: &'a str,
         prover: &'a str,
         why: &'a str,
     }
@@ -2136,12 +2158,13 @@ pub fn lowered_floors(base: &str, tree: &str, gated: &dyn Fn(&str) -> bool) -> V
                 let mut f = l.split('\t');
                 let name = f.next()?;
                 let proved = f.next().unwrap_or("");
-                let _total = f.next();
+                let total = f.next().unwrap_or("");
                 let prover = f.next().unwrap_or("");
                 let why = f.next().unwrap_or("").trim();
                 Some(Row {
                     name,
                     proved,
+                    total,
                     prover,
                     why,
                 })
@@ -2154,6 +2177,9 @@ pub fn lowered_floors(base: &str, tree: &str, gated: &dyn Fn(&str) -> bool) -> V
         if r.proved.parse::<u64>().is_err() {
             out.push(format!("{}: floor `{}` is not a count", r.name, r.proved));
         }
+        if r.total.parse::<u64>().is_err() {
+            out.push(format!("{}: total `{}` is not a count", r.name, r.total));
+        }
     }
     for was in rows(base) {
         let Ok(was_n) = was.proved.parse::<u64>() else {
@@ -2161,15 +2187,45 @@ pub fn lowered_floors(base: &str, tree: &str, gated: &dyn Fn(&str) -> bool) -> V
         };
         match now.iter().find(|r| r.name == was.name) {
             Some(is) => {
-                if let Ok(is_n) = is.proved.parse::<u64>()
-                    && is_n < was_n
-                    && is.prover == was.prover
-                    && (is.why.is_empty() || is.why == was.why)
-                {
+                let Ok(is_n) = is.proved.parse::<u64>() else {
+                    continue;
+                };
+                if is_n >= was_n {
+                    continue;
+                }
+                if is.prover != was.prover {
+                    if driver != Some(is.prover) {
+                        out.push(format!(
+                            "{}: floor {was_n} -> {is_n} re-based onto `{}`, which is not the \
+                             prover this lane runs ({})",
+                            was.name,
+                            is.prover,
+                            driver.unwrap_or("its `targo --version` did not answer")
+                        ));
+                    }
+                    continue;
+                }
+                if is.why.is_empty() || is.why == was.why {
                     out.push(format!(
                         "{}: floor {was_n} -> {is_n} under the same prover ({}) and no new \
                          reason in the row's fifth column",
                         was.name, was.prover
+                    ));
+                    continue;
+                }
+                // The reason must be true of the row: the proved obligations
+                // that went, went with their code, so the total fell at least
+                // as far. A total that is not a count shows nothing.
+                let gone = match (was.total.parse::<u64>(), is.total.parse::<u64>()) {
+                    (Ok(w), Ok(i)) => Some(w.saturating_sub(i)),
+                    _ => None,
+                };
+                if gone.is_none_or(|g| was_n - is_n > g) {
+                    out.push(format!(
+                        "{}: floor {was_n} -> {is_n} under the same prover ({}), but the \
+                         total went {} -> {}: a reason covers only proved obligations that \
+                         left with their code",
+                        was.name, was.prover, was.total, is.total
                     ));
                 }
             }
@@ -2185,8 +2241,13 @@ pub fn lowered_floors(base: &str, tree: &str, gated: &dyn Fn(&str) -> bool) -> V
 
 /// The lane's exit status and its `GATED:` line, as a ladder row — the script's
 /// contract: `0` every verified library held its floor, `1` a library fell below
-/// its floor, had none, or its verification broke (the rows above name which),
-/// `2` the lane could not run. The `GATED:` line says how many of the selected
+/// its floor, had none, its hand-lowered row's total is not the tree's, or its
+/// verification broke (the rows above name which), `2` nothing was decided — the
+/// lane could not run, or trustd, Trust's memory jobserver, refused work that
+/// covers a library's drop below its floor. The script's own `COULD NOT RUN — …`
+/// words, when it printed them, are the row's reason (a target root under a
+/// group- or world-writable directory, which `targo trust` refuses, reads as
+/// that, never as a crate's verdict). The `GATED:` line says how many of the selected
 /// libraries it verified and which it did not, so a run that skipped everything
 /// it was asked about reads as that, never as a floor held.
 #[must_use]
@@ -2227,10 +2288,24 @@ pub fn trust_lane_outcome(code: Option<i32>, scope: &str, output: &str) -> (Outc
                  had none, or its verification broke — the rows above name it ({scope})"
             ),
         ),
-        Some(2) => (
-            Outcome::Fail(Severity::CouldNotRun),
-            format!("trust advisory lane: NOT RUN — the script could not start its lane ({scope})"),
-        ),
+        Some(2) => {
+            // Its `trust-gate-all: COULD NOT RUN — …` (the lane could not start)
+            // or its `VERDICT: COULD NOT RUN — …` (trustd refused work that
+            // covers a drop): the last one it printed.
+            let why = output
+                .lines()
+                .rev()
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("trust-gate-all: COULD NOT RUN — ")
+                        .or_else(|| l.strip_prefix("VERDICT: COULD NOT RUN — "))
+                })
+                .map_or("the script could not start its lane", str::trim);
+            (
+                Outcome::Fail(Severity::CouldNotRun),
+                format!("trust advisory lane: NOT RUN — {why} ({scope})"),
+            )
+        }
         Some(c) => (
             Outcome::Fail(Severity::GateFailed),
             format!("trust advisory lane: unexpected exit {c} (the script answers only 0/1/2)"),
@@ -2246,10 +2321,13 @@ pub fn trust_lane_outcome(code: Option<i32>, scope: &str, output: &str) -> (Outc
 /// The lane's command: the script in its per-commit tier (the scope list's
 /// `full-only` libraries are named and skipped — the release's whole-tree run
 /// verifies them), its target root, the slot count left to the script's own
-/// `--jobs auto` (one slot per six cores and per 32 GiB, heavy libraries one at a
-/// time), and every `ATERM_GATE_*` input pinned — an empty value is the script's
+/// `--jobs auto` (one slot per six cores and per 32 GiB, heavy libraries one per
+/// 64 GiB), and every `ATERM_GATE_*` input pinned — an empty value is the script's
 /// default — so a caller's exported override can neither narrow the run, point
-/// the ratchet somewhere else, nor size the slots.
+/// the ratchet somewhere else, nor size or order the slots. Ended with `SIGTERM`
+/// first ([`Cmd::term_grace`]): the script's trap is what ends its checks, each in
+/// a process group of its own, and a bare `SIGKILL` of its group left them
+/// verifying on, orphaned (measured 2026-09-29).
 #[must_use]
 pub fn trust_lane_cmd(ctx: &Ctx, only: &[String]) -> Cmd {
     let root = lane_dir(ctx, Lane::TrustTarget).unwrap_or_else(|| ctx.root.join("target-trust"));
@@ -2262,12 +2340,16 @@ pub fn trust_lane_cmd(ctx: &Ctx, only: &[String]) -> Cmd {
         .env("ATERM_GATE_FORKS", "")
         .env("ATERM_GATE_SCOPE", "")
         .env("ATERM_GATE_LOGDIR", "")
-        .env("ATERM_GATE_MACHINE", "");
+        .env("ATERM_GATE_COSTS", "")
+        .env("ATERM_GATE_MACHINE", "")
+        .env("ATERM_GATE_TRUSTD", "")
+        .env("ATERM_GATE_NO_PATH_CHECK", "");
     match lane_jobs(Lane::TrustTarget, ctx.env.cargo_build_jobs.as_deref()) {
         Some(jobs) => cmd.env("CARGO_BUILD_JOBS", jobs.to_string()),
         None => cmd,
     }
     .demoted()
+    .term_grace(exec::TERM_GRACE)
 }
 
 /// The lane's two scripts, under `tools/`: the verdict self-test, then the lane.
@@ -2357,7 +2439,7 @@ fn trust_floors_up_only(ctx: &Ctx, r: &mut Report, base: &str) {
     // An unread member table cannot say a library is gone, so every removed row
     // counts as a library the lane still verifies — the direction that refuses.
     let still = |name: &str| gated.as_ref().is_none_or(|g| g.contains(name));
-    let lowered = lowered_floors(&base_text, &tree, &still);
+    let lowered = lowered_floors(&base_text, &tree, &still, lane_driver_row(ctx).as_deref());
     if lowered.is_empty() {
         r.pass(format!(
             "trust ratchet up-only against {base}: no floor lowered under its own prover"
@@ -2370,12 +2452,31 @@ fn trust_floors_up_only(ctx: &Ctx, r: &mut Report, base: &str) {
             Outcome::Fail(Severity::GateFailed),
             format!(
                 "trust ratchet up-only against {base}: {} floor(s) lowered by hand — a floor \
-                 goes down only onto a new prover (`tools/trust-gate-all.sh --update-ratchet` \
-                 re-bases it) or with the reason in the row's fifth column",
+                 goes down only onto the prover this lane runs (`tools/trust-gate-all.sh \
+                 --update-ratchet` re-bases it), or with its reason in the row's fifth column \
+                 and its total down at least as far",
                 lowered.len()
             ),
         );
     }
+}
+
+/// The `--version` line of the `targo` the lane runs — the prover column
+/// `trust-gate-all.sh --update-ratchet` writes, its tabs and carriage returns
+/// made spaces as the script makes them — or `None` when it does not answer.
+fn lane_driver_row(ctx: &Ctx) -> Option<String> {
+    let out = std::process::Command::new(&ctx.tools.targo)
+        .arg("--version")
+        .current_dir(&ctx.root)
+        .env("PATH", &ctx.path_env)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let line = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .replace(['\t', '\r'], " ");
+    (!line.trim().is_empty()).then_some(line)
 }
 
 /// The ref a whole-tree run's change is measured against: the shared branch as
@@ -3520,14 +3621,28 @@ mod tests {
                 .1
                 .contains("the scope")
         );
+        // Exit 2 is also trustd refusing work that covers a library's drop: the
+        // lane's VERDICT line is the reason, never a finding about the tree.
+        let trustd = "VERDICT: COULD NOT RUN — trustd refused work, so nothing was decided \
+                      about: aterm-session; re-run once trustd admits it\n";
+        let (outcome, label) = trust_lane_outcome(Some(2), "s", trustd);
+        assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun));
+        assert!(
+            label.starts_with("trust advisory lane: NOT RUN — trustd refused work"),
+            "{label}"
+        );
     }
 
     /// THE UP-ONLY FLOOR (review, 2026-09-27: a hand-lowered floor touched no
     /// library, so the stage passed "nothing to verify"). Lowered under the same
-    /// prover with no new reason: named. With a reason in the fifth column, or
-    /// re-based onto another prover: allowed. Raised, unchanged, or a new row:
-    /// allowed. A removed row: named while the library is still gated, allowed
-    /// once it is gone. A floor that is not a count: named.
+    /// prover with no new reason: named. With a reason in the fifth column and a
+    /// total that fell at least as far, or re-based onto the prover the lane
+    /// runs: allowed; a reason over a drop the total does not cover, or a
+    /// re-base onto any other prover column (review, 2026-09-29): named. Raised,
+    /// unchanged, or a new row: allowed. A removed row: named while the library
+    /// is still gated, allowed once it is gone. A floor or total that is not a
+    /// count: named. (That an admitted reason's total is the tree's is the
+    /// lane's to check: tools/test-trust-gate-verdict.sh, TOTAL-ABOVE-ROW.)
     #[test]
     fn a_floor_goes_down_only_onto_a_new_prover() {
         let a = "targo 1.99.0-dev (aaaaaaaaa 2026-09-17) (targo 0.1.0)";
@@ -3536,58 +3651,234 @@ mod tests {
             "aterm-grid\t987\t3806\t{a}\naterm-core\t936\t3265\t{a}\nold-crate\t5\t9\t{a}\n"
         );
         let all = |_: &str| true;
-        assert!(lowered_floors(&base, &base, &all).is_empty(), "unchanged");
+        // The lane runs prover `b`.
+        let low = |base: &str, tree: &str, gated: &dyn Fn(&str) -> bool| {
+            lowered_floors(base, tree, gated, Some(b))
+        };
+        assert!(low(&base, &base, &all).is_empty(), "unchanged");
         let raised = base.replace("987\t3806", "990\t3806");
-        assert!(lowered_floors(&base, &raised, &all).is_empty(), "raised");
+        assert!(low(&base, &raised, &all).is_empty(), "raised");
         let hand = base.replace("987\t3806", "900\t3806");
-        let got = lowered_floors(&base, &hand, &all);
+        let got = low(&base, &hand, &all);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].starts_with("aterm-grid: floor 987 -> 900 under the same prover"));
         // …unless the row says why, in its fifth column — a change that removed
-        // proved obligations with the code that carried them. The same reason
-        // again is not a new one.
-        let said = hand.replace(
-            &format!("900\t3806\t{a}\n"),
-            &format!("900\t3800\t{a}\tthe cut's arithmetic is checked now\n"),
+        // proved obligations with the code that carried them, so the total fell
+        // at least as far as the floor. The same reason again is not a new one.
+        let said = base.replace(
+            &format!("987\t3806\t{a}\n"),
+            &format!("985\t3800\t{a}\tthe cut's arithmetic is checked now\n"),
         );
         assert!(
-            lowered_floors(&base, &said, &all).is_empty(),
-            "a named reason"
+            low(&base, &said, &all).is_empty(),
+            "a named reason, the obligations gone with their code"
         );
-        let again = said.replace("900\t3800", "890\t3800");
+        let again = said.replace("985\t3800", "984\t3799");
         assert_eq!(
-            lowered_floors(&said, &again, &all).len(),
+            low(&said, &again, &all).len(),
             1,
             "an old reason is not a new one"
         );
+        // A reason does not cover proved obligations that are still there: 87
+        // fewer proved of only 6 fewer in all (2026-09-29), nor a drop against a
+        // total that is not a count.
+        let excuse = base.replace(
+            &format!("987\t3806\t{a}\n"),
+            &format!("900\t3800\t{a}\tthe cut's arithmetic is checked now\n"),
+        );
+        let got = low(&base, &excuse, &all);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0].starts_with("aterm-grid: floor 987 -> 900 under the same prover")
+                && got[0].contains("total went 3806 -> 3800"),
+            "{got:?}"
+        );
+        let untotalled = excuse.replace("900\t3800", "900\t38x0");
+        assert!(
+            low(&base, &untotalled, &all)
+                .iter()
+                .any(|l| l == "aterm-grid: total `38x0` is not a count")
+        );
         let rebased = base.replace(&format!("987\t3806\t{a}"), &format!("900\t3806\t{b}"));
         assert!(
-            lowered_floors(&base, &rebased, &all).is_empty(),
+            low(&base, &rebased, &all).is_empty(),
             "a re-base onto a new prover"
         );
         let removed = base.replace(&format!("old-crate\t5\t9\t{a}\n"), "");
         assert_eq!(
-            lowered_floors(&base, &removed, &all),
+            low(&base, &removed, &all),
             ["old-crate: floor 5 removed while the lane still verifies it"]
         );
         assert!(
-            lowered_floors(&base, &removed, &|n| n != "old-crate").is_empty(),
+            low(&base, &removed, &|n| n != "old-crate").is_empty(),
             "gone"
         );
         let typo = base.replace("936\t3265", "93x\t3265");
         assert!(
-            lowered_floors(&base, &typo, &all)
+            low(&base, &typo, &all)
                 .iter()
                 .any(|l| l == "aterm-core: floor `93x` is not a count")
         );
+        // A re-base is onto the prover this lane runs, never onto any other
+        // prover column — "something else" with a floor of 0 was admitted.
+        let elsewhere = base.replace(&format!("987\t3806\t{a}"), "0\t3806\tsomething else");
+        let got = low(&base, &elsewhere, &all);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0].starts_with("aterm-grid: floor 987 -> 0 re-based onto `something else`")
+                && got[0].contains(b),
+            "{got:?}"
+        );
+        assert_eq!(
+            lowered_floors(&base, &rebased, &all, None).len(),
+            1,
+            "no driver line, no re-base"
+        );
         // No base ratchet: nothing to lower.
-        assert!(lowered_floors("", &base, &all).is_empty());
+        assert!(low("", &base, &all).is_empty());
+    }
+
+    /// A lane that could not run names the script's own reason: the refusal
+    /// of a writable target root is a COULD NOT RUN row naming the component
+    /// and the fix — never a crate's NOT-VERIFIED — and an exit 2 with no
+    /// reason line keeps the generic one.
+    #[test]
+    fn a_lane_that_could_not_run_names_the_scripts_reason() {
+        let refusal = "trust-gate-all: COULD NOT RUN — the target root /tmp/co/target-trust has a \
+                       path component, /private/tmp, that `targo trust` refuses for every verified \
+                       runtime-library directory under it (mode 1777: group- or world-writable); \
+                       nothing was verified (fix: a checkout outside /private/tmp, or --target-root \
+                       <dir> whose every component, and every directory holding a symlink on its \
+                       path, is owned by root or you and writable by its owner alone)\n";
+        let (outcome, label) = trust_lane_outcome(Some(2), "the scope", refusal);
+        assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun));
+        assert!(
+            label.starts_with("trust advisory lane: NOT RUN — the target root"),
+            "{label}"
+        );
+        assert!(label.contains("component, /private/tmp,"), "{label}");
+        assert!(label.contains("--target-root <dir>"), "{label}");
+        assert!(label.ends_with("(the scope)"), "{label}");
+        let (_, bare) = trust_lane_outcome(Some(2), "s", "some other noise\n");
+        assert!(
+            bare.contains("the script could not start its lane"),
+            "{bare}"
+        );
+    }
+
+    /// THE PATH CHECK, run in the real `tools/trust-gate-all.sh` — the one place
+    /// both entry points pass through (this stage runs that script). A target
+    /// root under a world-writable directory (1777: the sticky bit exempts
+    /// nothing, as `targo trust` exempts nothing) or a group-writable one stops
+    /// the script with exit 2 before anything is gated, naming the DEEPEST such
+    /// directory; so does a root reached through a symlink that sits in a
+    /// world-writable directory, although the physical path never passes
+    /// through it (targo holds the directory holding each symlink to the same
+    /// rule). An owner-only chain is blamed on no directory this test made, and
+    /// on nothing at all when every ancestor of the test's directory is owned by
+    /// root or the caller and writable by its owner alone. The check runs before
+    /// the script looks for `targo`, so no driver is needed; modes are restored
+    /// before the directory is removed.
+    #[cfg(unix)]
+    #[test]
+    fn the_lane_script_refuses_a_writable_target_root_by_name() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::path::Path;
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/trust-gate-all.sh");
+        let base = std::env::temp_dir().join(format!("atv-trust-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b, real) = (base.join("a"), base.join("a/b"), base.join("real"));
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, a.join("link")).unwrap();
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        for d in [&base, &a, &b, &real] {
+            set(d, 0o700);
+        }
+        let phys = |p: &Path| std::fs::canonicalize(p).unwrap().display().to_string();
+        let (base_p, a_p, b_p) = (phys(&base), phys(&a), phys(&b));
+        let run_at = |root: &Path| {
+            let o = std::process::Command::new("bash")
+                .arg(&script)
+                .arg("--target-root")
+                .arg(root.join("target-trust"))
+                .env("PATH", "/usr/bin:/bin")
+                .env("ATERM_GATE_NO_PATH_CHECK", "")
+                .env("ATERM_GATE_LOGDIR", base.join("logs"))
+                .output()
+                .expect("run trust-gate-all.sh");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            (o.status.code(), text)
+        };
+        let run = || run_at(&b);
+        let clean = run();
+        let via_link_clean = run_at(&a.join("link"));
+        set(&a, 0o1777);
+        let world = run();
+        let via_link = run_at(&a.join("link"));
+        set(&a, 0o700);
+        set(&b, 0o770);
+        let group = run();
+        set(&a, 0o777);
+        let deepest = run();
+        for d in [&base, &a, &b, &real] {
+            set(d, 0o700);
+        }
+        // Would targo refuse an ancestor of the test's directory on its own?
+        // Owned by neither root nor the caller, or group/world-writable.
+        let me = std::fs::metadata(&base).unwrap().uid();
+        let ancestors_clean = std::fs::canonicalize(&base)
+            .unwrap()
+            .ancestors()
+            .skip(1)
+            .all(|p| {
+                std::fs::metadata(p)
+                    .map(|m| (m.uid() == 0 || m.uid() == me) && m.mode() & 0o022 == 0)
+                    .unwrap_or(false)
+            });
+        let _ = std::fs::remove_dir_all(&base);
+
+        let names = |t: &str, p: &str| t.contains(&format!("path component, {p},"));
+        for (what, (_, text)) in [("direct", &clean), ("via a symlink", &via_link_clean)] {
+            assert!(
+                !text.contains(&format!("path component, {base_p}")),
+                "{what}: an owner-only chain is blamed on nothing this test made: {text}"
+            );
+            if ancestors_clean {
+                assert!(
+                    !text.contains("COULD NOT RUN — the target root"),
+                    "{what}: an owner-only chain throughout is refused nowhere: {text}"
+                );
+            }
+        }
+        for (what, (code, text), dir) in [
+            ("1777 (the sticky bit exempts nothing)", &world, &a_p),
+            ("a symlink held in a 1777 directory", &via_link, &a_p),
+            ("group-writable", &group, &b_p),
+            ("the deepest of two", &deepest, &b_p),
+        ] {
+            assert_eq!(*code, Some(2), "{what}: COULD NOT RUN is exit 2: {text}");
+            assert!(text.contains("COULD NOT RUN"), "{what}: {text}");
+            assert!(names(text, dir), "{what}: names {dir}: {text}");
+            assert!(
+                text.contains("--target-root <dir>"),
+                "{what}: names the fix: {text}"
+            );
+            assert!(!text.contains("NOT-VERIFIED"), "{what}: {text}");
+        }
     }
 
     /// The lane's command pins every `ATERM_GATE_*` input — an exported
     /// `ATERM_GATE_ONLY` must not widen or narrow the run, an exported ratchet
     /// path move the floor, nor an exported machine size the slots — always runs
-    /// the per-commit tier, and runs in its own lane, demoted.
+    /// the per-commit tier, runs in its own lane, demoted, and is ended with
+    /// `SIGTERM` first.
     #[test]
     fn the_trust_lane_command_pins_its_inputs_and_its_lane() {
         let env = |cmd: &Cmd, k: &str| {
@@ -3617,12 +3908,20 @@ mod tests {
                 "ATERM_GATE_FORKS",
                 "ATERM_GATE_SCOPE",
                 "ATERM_GATE_LOGDIR",
+                "ATERM_GATE_COSTS",
                 "ATERM_GATE_MACHINE",
+                "ATERM_GATE_TRUSTD",
+                "ATERM_GATE_NO_PATH_CHECK",
             ] {
                 assert_eq!(env(&cmd, k).as_deref(), Some(""), "{k} is pinned empty");
             }
             assert_eq!(env(&cmd, "CARGO_BUILD_JOBS").as_deref(), Some("4"));
             assert!(cmd.demoted);
+            assert_eq!(
+                cmd.term_grace,
+                Some(exec::TERM_GRACE),
+                "SIGTERM first: the script's trap ends its checks, whose groups are their own"
+            );
         }
     }
 

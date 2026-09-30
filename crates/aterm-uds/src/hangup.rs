@@ -107,7 +107,7 @@ mod tests {
         );
 
         drop(client);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !peer_closed(&server) {
             assert!(
                 std::time::Instant::now() < deadline,

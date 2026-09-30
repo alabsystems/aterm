@@ -63,6 +63,8 @@ fn record(local_id: u64) -> SessionRecord {
         claim_known: false,
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
+        fabric: Default::default(),
+        timeline_id: 0,
     }
 }
 
@@ -75,6 +77,8 @@ fn manifest(ids: &[u64]) -> SessionHandoff {
         next_turn_id: None,
         outgoing_build: None,
         held: Vec::new(),
+        roster_seq: None,
+        fabric_attached: Vec::new(),
     }
 }
 
@@ -1706,6 +1710,19 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
     adopted.watch_input(&input);
     // The tab closes: its session context — the sink with it — is dropped.
     drop(sink);
+    // EOF within a bound, not at once: a child forked between `pipe` and the
+    // close-on-exec above holds the write end until it execs. The defect held
+    // it until the history dropped, which no bound outlasts.
+    let mut hup = libc::pollfd {
+        fd: pipe[0],
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(
+        unsafe { libc::poll(&raw mut hup, 1, 5_000) },
+        1,
+        "no EOF in 5 s"
+    );
     let mut byte = [0u8; 1];
     let n = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) };
     assert_eq!(

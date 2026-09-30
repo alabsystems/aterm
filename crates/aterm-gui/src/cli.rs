@@ -541,10 +541,11 @@ const STARTER_CONFIG: &str = "\
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
 # explain_heavy_load = true        # when typing slows because something else loads the machine, the message band names it
                                    # (\"Typing slowed by cargo in tab 2\"); details go to the log. false: off entirely
-# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, the operator, update health) also as
-                                   # system notifications (macOS: terminal-notifier, else osascript = \"Script Editor\").
-                                   # DEFAULT off: they stay in the band, the menu bar and messages.log. Programs'
-                                   # OSC 9/99/777 notifications are allow_notifications' below
+# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, a macOS permission, the operator, update
+                                   # health) also as system notifications (macOS: terminal-notifier, else osascript =
+                                   # \"Script Editor\"). DEFAULT off: they stay in the band, the menu bar and messages.log,
+                                   # the operator's only in `aterm fleet status` and `next`. Programs' OSC 9/99/777
+                                   # notifications are allow_notifications' below
 
 # --- security opt-ins (all default OFF) ---------------------------------------
 # allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen

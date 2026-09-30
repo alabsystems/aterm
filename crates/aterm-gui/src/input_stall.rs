@@ -1504,6 +1504,7 @@ pub(crate) fn menu_row(
     crate::status_item::InputStallRow {
         text: attention_now(fact, program, after, sid, now),
         key: episode_key(fact),
+        stopped: fact.stopped,
     }
 }
 

@@ -1536,8 +1536,9 @@ pub(crate) fn process_main_start() -> Option<Instant> {
 static CLAIM_AT: OnceLock<Instant> = OnceLock::new();
 /// When this successor dialled the rendezvous (before the grant hold).
 static CLAIM_DIALLED_AT: OnceLock<Instant> = OnceLock::new();
-/// How long this successor spent warming BEFORE its dial. Recorded beside the
-/// claim; zero until a warm stage exists (the design's P2).
+/// How long this successor spent warming BEFORE its dial (the design's P2):
+/// recorded beside the claim; zero on a launch whose warm prologue ran after
+/// its intake.
 static CLAIM_WARM_PRE_DIAL: OnceLock<std::time::Duration> = OnceLock::new();
 static CLAIM_STAMPS: [OnceLock<Instant>; ClaimStamp::COUNT] =
     [const { OnceLock::new() }; ClaimStamp::COUNT];
@@ -1570,6 +1571,9 @@ struct ClaimTimelineInputs {
     claim: Instant,
     /// [`process_main_start`].
     exec: Option<Instant>,
+    /// Where the warm prologue started, on a launch that warmed before its
+    /// dial (P2): the dial minus [`claim_warm_pre_dial`]. `None` otherwise.
+    warm: Option<Instant>,
     dial: Option<Instant>,
     own: [Option<Instant>; ClaimStamp::COUNT],
     worker_spawn: Option<Instant>,
@@ -1601,8 +1605,11 @@ fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
     let own = |stamp: ClaimStamp| inputs.own[stamp as usize];
     let attach = inputs.attach.map(|milestones| milestones.points);
     let attach_point = |index: usize| attach.map(|points| points[index]);
-    let ordered: [(&'static str, Option<Instant>); 22] = [
+    let ordered: [(&'static str, Option<Instant>); 23] = [
         ("main", inputs.exec),
+        // Before the dial on the launched lane (P2): the worker's spawn below
+        // then reads negative too, which is the point.
+        ("warm", inputs.warm),
         ("dial", inputs.dial),
         ("intake", own(ClaimStamp::Intake)),
         ("worker_spawn", inputs.worker_spawn),
@@ -1652,10 +1659,15 @@ fn claim_timeline_inputs() -> Option<ClaimTimelineInputs> {
     for (slot, stamp) in own.iter_mut().zip(CLAIM_STAMPS.iter()) {
         *slot = stamp.get().copied();
     }
+    let dial = CLAIM_DIALLED_AT.get().copied();
+    let warm = dial
+        .zip(CLAIM_WARM_PRE_DIAL.get().copied())
+        .and_then(|(dial, warm)| (!warm.is_zero()).then(|| dial.checked_sub(warm)).flatten());
     Some(ClaimTimelineInputs {
         claim,
         exec: process_main_start(),
-        dial: CLAIM_DIALLED_AT.get().copied(),
+        warm,
+        dial,
         own,
         worker_spawn: BACKEND_WORKER_SPAWN.get().copied(),
         worker_done: BACKEND_WORKER_DONE.get().copied(),
@@ -4949,6 +4961,7 @@ mod claim_timeline_tests {
         ClaimTimelineInputs {
             claim,
             exec: Some(exec),
+            warm: None,
             dial: Some(dial),
             own,
             worker_spawn: Some(claim + ms(32)),
@@ -5021,6 +5034,26 @@ mod claim_timeline_tests {
             assert!(points.iter().all(|(l, _)| *l != gone), "{gone}");
         }
         assert!(claim_worker_vs_join(&boot).is_none());
+    }
+
+    /// P2: a successor that warmed before its dial prints where the warm
+    /// started, and its worker spawn reads before the claim.
+    #[test]
+    fn a_warm_before_the_dial_is_a_negative_point_before_it() {
+        let mut boot = a_boot();
+        boot.warm = Some(boot.claim - ms(30));
+        boot.worker_spawn = Some(boot.claim - ms(28));
+        let points = claim_timeline_points(&boot);
+        let labels: Vec<_> = points.iter().map(|(label, _)| *label).collect();
+        assert_eq!(labels[..3], ["main", "warm", "dial"]);
+        let at = |label: &str| points.iter().find(|(l, _)| *l == label).unwrap().1;
+        assert_eq!(at("warm"), -30_000);
+        assert_eq!(at("worker_spawn"), -28_000);
+        assert!(
+            render_claim_timeline_log(&boot).starts_with("main -36.0, warm -30.0, dial -5.0,"),
+            "{}",
+            render_claim_timeline_log(&boot)
+        );
     }
 
     #[test]

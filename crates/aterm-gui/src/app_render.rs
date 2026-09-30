@@ -25,9 +25,8 @@ use winit::window::Window;
 // the flying head it still owns.
 use aterm_effects::companion::{
     CompanionDuty, cursor_cat_color_key, cursor_companion_duty, cursor_companion_on_glass,
-    cursor_companion_presentable, flying_kitty_admitted, pet_hit_rect_win, pin_pet_mode_exit,
-    resident_pet_owner_present, shed_companion_alpha, shed_companion_presentable,
-    shed_envelope_transitioning,
+    cursor_companion_presentable, pet_hit_rect_win, pin_pet_mode_exit, resident_pet_owner_present,
+    shed_companion_alpha, shed_companion_presentable, shed_envelope_transitioning,
 };
 
 use crate::app_input::{Deliveries, DeliveryTicket};
@@ -7265,126 +7264,6 @@ mod resident_pet_presentation_tests {
     }
 }
 
-#[cfg(test)]
-mod cursor_cat_context_tests {
-    use super::*;
-    use aterm_core::terminal::UnderlineStyle;
-
-    fn cell(ch: char, fg: [u8; 3], bg: [u8; 3]) -> RenderCell {
-        RenderCell {
-            ch,
-            fg,
-            bg,
-            wide: false,
-            emoji_presentation: false,
-            text_presentation: false,
-            bold: false,
-            italic: false,
-            underline: UnderlineStyle::None,
-            strikethrough: false,
-            overline: false,
-            underline_color: None,
-            overline_color: None,
-        }
-    }
-
-    #[test]
-    fn cursor_companion_samples_its_actual_multiline_footprint() {
-        let geom = aterm_effects::word_decorations::EffectGeom {
-            cell_w: 10,
-            cell_h: 20,
-            rows: 2,
-            cols: 3,
-        };
-        let footprint = aterm_effects::word_decorations::CatFootprint {
-            x: 0,
-            y: 0,
-            w: 30,
-            h: 40,
-        };
-        let make = |neighbor, top_bg, bottom_bg| {
-            vec![
-                vec![cell('x', neighbor, top_bg); 3],
-                vec![cell(' ', [240, 240, 240], bottom_bg); 3],
-            ]
-        };
-        let red = cursor_cat_color_key(
-            &make([255, 20, 20], [8, 8, 8], [8, 8, 8]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
-        let blue = cursor_cat_color_key(
-            &make([20, 80, 255], [8, 8, 8], [8, 8, 8]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
-        let light = cursor_cat_color_key(
-            &make([255, 20, 20], [248, 248, 248], [248, 248, 248]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
-        let mixed = cursor_cat_color_key(
-            &make([255, 20, 20], [4, 4, 4], [248, 248, 248]),
-            geom,
-            footprint,
-            0,
-            0x00FF_FFFF,
-            0,
-        );
-        assert_ne!(
-            red.accent, blue.accent,
-            "neighbor text changes the hue family"
-        );
-        assert_ne!(
-            red.background, light.background,
-            "backgrounds across the sprite footprint change contrast ink"
-        );
-        assert_eq!(
-            mixed.background, 4,
-            "a dark+light footprint must not collapse to its RGB-average band"
-        );
-    }
-
-    #[test]
-    fn cursor_companion_ignores_alternating_backgrounds_outside_its_footprint() {
-        let geom = aterm_effects::word_decorations::EffectGeom {
-            cell_w: 10,
-            cell_h: 10,
-            rows: 2,
-            cols: 4,
-        };
-        let footprint = aterm_effects::word_decorations::CatFootprint {
-            x: 20,
-            y: 0,
-            w: 20,
-            h: 20,
-        };
-        let cells = vec![
-            vec![
-                cell('x', [255, 0, 0], [255, 255, 255]),
-                cell('x', [255, 0, 0], [255, 255, 255]),
-                cell('x', [0, 0, 255], [4, 4, 4]),
-                cell('x', [0, 0, 255], [4, 4, 4]),
-            ];
-            2
-        ];
-        let sampled = cursor_cat_color_key(&cells, geom, footprint, 0, 0, 0);
-        assert!(
-            sampled.dark(),
-            "only the dark right-hand footprint is sampled"
-        );
-    }
-}
-
 /// The redraw early-out decision (D-1), as a PURE function so it is unit
 /// testable without a window/event loop.
 ///
@@ -10947,19 +10826,12 @@ pub(crate) fn sparkle_words_presentable(word_focus: bool, suspended: bool) -> bo
 
 #[cfg(test)]
 mod pet_sing_swap_tests {
-    use super::{
-        CursorFxInputs, cursor_companion_presentable, forward_kitty_cursor_motion,
-        pin_pet_mode_exit, retire_kitty_cursor_without_owner,
-    };
-    use crate::kitty_cursor::{CatExit, CatFrame, CatPose, CatReaction};
+    use super::{CursorFxInputs, forward_kitty_cursor_motion, retire_kitty_cursor_without_owner};
     use crate::{App, WindowId};
-    use aterm_effects::companion::{
-        pet_caret_admitted, pet_companion_admitted, pet_hit_rect_for_frame,
-    };
     use aterm_effects::cursor_glow::{
         BlockFill, BlockFillOwner, CursorCatMotionKind, CursorCatMotionPulse,
     };
-    use aterm_effects::kitty_pet::{PetBrain, PetSense};
+    use aterm_effects::kitty_pet::PetSense;
     use std::time::{Duration, Instant};
 
     /// The grid the hit-box cases below resolve against — the same 10x20 cell on
@@ -11063,7 +10935,7 @@ mod pet_sing_swap_tests {
                         PetSense {
                             caret_drawn: true,
                             now,
-                            caret: pet_caret_admitted(true, drive, reduced).then_some(caret),
+                            caret: Some(caret),
                             rows: geom.rows,
                             cols: geom.cols,
                             cell_w: geom.cell_w,
@@ -11090,13 +10962,12 @@ mod pet_sing_swap_tests {
                     assert!(
                         (body.3 - 5 * i32::from(geom.cell_h)).abs() <= 5 * i32::from(geom.cell_h)
                     );
-                    assert!(pet_hit_rect_for_frame(true, drive, &frame, geom, (0, 0)).is_some());
                     let mut head = ws.cursor_cat.static_frame(now);
                     head.sing = drive;
                     head.alpha = 211; // a stale head must lose the final custody tie
                     ws.free_scratch.clear();
                     ws.word_decos.begin_host_frame();
-                    assert_eq!(pet.on_glass, pet_companion_admitted(true, drive));
+                    assert!(pet.on_glass);
                     let fp = super::emit_single_cursor_companion(
                         ws,
                         geom,
@@ -11273,23 +11144,13 @@ mod pet_sing_swap_tests {
         );
     }
 
-    #[test]
-    fn history_suppresses_both_cursor_companions_without_suspending_decorations() {
-        assert!(cursor_companion_presentable(true, true));
-        assert!(
-            !cursor_companion_presentable(true, false),
-            "a presentable decoration surface still suppresses cursor-owned bodies in history"
-        );
-        assert!(!cursor_companion_presentable(false, true));
-    }
-
     /// Tier 1 for the cursor-viewport lifecycle: genuine charged Glow/Trail
     /// and cursor-body state are retired on the first history snapshot. The
-    /// resident pet remains lifecycle-live (it receives hidden-caret ticks),
-    /// but its body and hit target disappear immediately and its scheduler
-    /// eventually settles instead of sticking at animation cadence.
+    /// resident pet's half (a lifecycle-live brain that settles in history)
+    /// is the engine's: `aterm_effects::companion`'s
+    /// `history_lets_the_fading_pet_brain_settle`.
     #[test]
-    fn history_retires_cursor_pixels_and_pet_hit_target_while_the_brain_settles() {
+    fn history_retires_cursor_pixels_and_cursor_bodies() {
         let mut app = App::headless_for_test();
         app.config.motion = Some("full".into());
         app.config.cursor_trail = Some(true);
@@ -11354,48 +11215,6 @@ mod pet_sing_swap_tests {
             "every cursor-body family is dark in history"
         );
 
-        let sense = |now, caret| PetSense {
-            caret_drawn: true,
-            now,
-            caret,
-            rows: 24,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let mut pet = PetBrain::default();
-        let _ = pet.tick(sense(t0, Some((4, 12))));
-        let live_pet = pet.tick(sense(t0 + Duration::from_millis(500), Some((4, 12))));
-        assert!(live_pet.alpha > 0, "negative control owns a resident pet");
-        assert!(
-            pet_hit_rect_for_frame(true, 0.0, &live_pet, hit_geom(), (0, 0)).is_some(),
-            "the live pet owns a clickable body"
-        );
-        let hidden_pet = pet.tick(sense(t0 + Duration::from_millis(600), None));
-        assert!(
-            hidden_pet.alpha > 0,
-            "the brain is still fading on the first history frame"
-        );
-        assert_eq!(
-            pet_hit_rect_for_frame(false, 0.0, &hidden_pet, hit_geom(), (0, 0)),
-            None,
-            "history clears the hit target before the brain's fade completes"
-        );
-        for step in 1..=300 {
-            let _ = pet.tick(sense(t0 + Duration::from_millis(600 + step * 100), None));
-            if !pet.needs_frames() {
-                break;
-            }
-        }
-        assert!(
-            !pet.needs_frames(),
-            "hidden-caret ticks let the pet release the animation scheduler"
-        );
-
         let model = aterm_spec::derive::cursor_viewport_lifecycle_model();
         let charged = model.successors("ChargeLive", &model.init_state())[0].clone();
         let mut projected = charged.clone();
@@ -11428,33 +11247,6 @@ mod pet_sing_swap_tests {
             "App history Forge/body negative control",
         );
         assert!(!ok, "history may not retain a cursor fill/body");
-    }
-
-    /// A pet-mode summon EXITS PLAIN: whatever flourish the machine rolled,
-    /// the pinned frame keeps the plain fade — and outside pet mode the roll
-    /// is untouched.
-    #[test]
-    fn pet_mode_summons_exit_plain() {
-        let frame = |exit| CatFrame {
-            alpha: 128,
-            exit,
-            fade_out: 0.5,
-            look: aterm_effects::kitty_registry::KittyLook::default(),
-            reaction: CatReaction::Cruise,
-            discovery: false,
-            collection_hello: false,
-            bob: 0.0,
-            sing: 0.4,
-            pose: CatPose::STILL,
-        };
-        for rolled in [CatExit::StarWink, CatExit::HeartMeow, CatExit::Plain] {
-            let mut f = frame(rolled);
-            pin_pet_mode_exit(true, &mut f);
-            assert_eq!(f.exit, CatExit::Plain, "pet-mode episodes exit Plain");
-            let mut f = frame(rolled);
-            pin_pet_mode_exit(false, &mut f);
-            assert_eq!(f.exit, rolled, "earned flights keep their roll");
-        }
     }
 }
 
@@ -21821,7 +21613,9 @@ pub(crate) struct CursorFxInputs {
     /// viewport; the composed, focus and headless paths also give `None` for
     /// a DECTCEM-hidden caret, while the single-pane present hands it over
     /// (a hidden cursor is still a caret, for the pet) and says so in
-    /// [`Self::cursor_visible`].
+    /// [`Self::cursor_visible`]. The motion engines read it through
+    /// [`aterm_effects::host::motion_caret`], which withholds a hidden one
+    /// on a frame the program has not finished ([`Self::frame_unfinished`]).
     pub cur: Option<(u16, u16)>,
     /// Whether this frame presents the active grid rather than retained
     /// scrollback. Cursor-owned geometry is invalid in history coordinates and
@@ -21830,6 +21624,20 @@ pub(crate) struct CursorFxInputs {
     /// Raw cursor visibility (DECTCEM): feeds the `ATERM_TRACE_SPAWN`
     /// diagnostic and the glow engine's `observe_caret_drawn`.
     pub cursor_visible: bool,
+    /// [`aterm_core::terminal::Terminal::sync_frame_unfinished`], read under
+    /// the same lock as [`Self::cur`]: the program's DEC-2026 bracket is
+    /// still open by its OWN account and has been written into. A frame that
+    /// reaches the tick with it set shows the program's frame half-written:
+    /// the SYNC-1 hold ran out at `SYNC_HOLD_CAP` with the mode still set, or
+    /// the terminal's `sync_timeout_ms` force-cleared the mode mid-frame (no
+    /// hold at all then). A hidden cursor on it is the program's write
+    /// position, which [`aterm_effects::host::motion_caret`] withholds from
+    /// every motion engine. It is NOT the mode level: a present of a bracket
+    /// closed and reopened clean (`sync_frame_hold`'s close+reopen release)
+    /// reads `false`, because that grid is the finished frame, and a
+    /// timed-out bracket reads `true`, because it is not. The pet reads
+    /// [`Self::cur`] beside this struct, not through it, and keeps it.
+    pub frame_unfinished: bool,
     /// Live cursor shape (the rainbow cursor requires a BLOCK).
     pub cursor_style: CursorStyle,
     /// This window's GUI blink phase — the rainbow twinkle's flip source (its
@@ -21922,6 +21730,7 @@ impl CursorFxInputs {
             cur: Some((0, 0)),
             live_viewport: true,
             cursor_visible: true,
+            frame_unfinished: false,
             cursor_style: CursorStyle::SteadyBlock,
             blink_phase: true,
             live_cursor_rgb: [255, 255, 255],
@@ -22023,6 +21832,120 @@ mod sync_cursor_fx_hold_tests {
         assert!(
             !ws.cursor_fx.trail.is_active(),
             "RainbowKitty owns the glow engine; the classic comet remains disabled"
+        );
+    }
+
+    /// A TORN PRESENT'S HIDDEN CURSOR REACHES NO MOTION ENGINE (the owner's
+    /// tab-2 gap, 2026-09-28). The frame hold released a DEC-2026 bracket at
+    /// its cap with Claude Code's cursor hidden rows up in the transcript,
+    /// and the glow seam judged that write position as the caret. Here a
+    /// typed key is in flight, and one torn present parks the hidden cursor
+    /// eight rows up. Neither engine's anchor moves and no move is judged.
+    /// The key's licence survives to the shown caret's return, which lays
+    /// its one cell. NEGATIVE CONTROL: the same hidden cursor on a frame
+    /// whose bracket has CLOSED is still handed over (the single-pane
+    /// contract for a finished frame), and both engines take it as their
+    /// anchor, so the pass is the bracket's doing and not the fixture's.
+    #[test]
+    fn a_torn_presents_hidden_cursor_moves_no_engine_and_spends_no_key() {
+        let run = |frame_unfinished: bool| {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".into());
+            app.config.motion = Some("full".into());
+            app.config.trail_sounds = Some(false);
+            app.windows.get_mut(&wid).expect("window").focused = true;
+
+            let t0 = Instant::now();
+            let origin = (10, 3);
+            let write_cursor = (2, 40);
+            let mut seed = CursorFxInputs::sample_for_test(t0);
+            seed.cur = Some(origin);
+            assert!(app.tick_cursor_fx_for_present(wid, false, seed).is_some());
+
+            let key_at = t0 + Duration::from_millis(16);
+            {
+                let ws = app.windows.get_mut(&wid).expect("window");
+                ws.cursor_fx.glow.note_typed_cells(key_at, 1);
+                ws.cursor_fx.trail.note_typed(key_at);
+            }
+            let before = {
+                let ws = &app.windows[&wid];
+                (
+                    ws.cursor_fx.glow.spawns(),
+                    ws.cursor_fx.glow.admission_tally(),
+                )
+            };
+
+            let mut torn = CursorFxInputs::sample_for_test(key_at + Duration::from_millis(16));
+            torn.cur = Some(write_cursor);
+            torn.cursor_visible = false;
+            torn.frame_unfinished = frame_unfinished;
+            assert!(
+                app.tick_cursor_fx_for_present(wid, false, torn).is_some(),
+                "past the hold the frame presents"
+            );
+            let ws = &app.windows[&wid];
+            let anchors = (
+                ws.cursor_fx.glow.cursor_anchor(),
+                ws.cursor_fx.trail.cursor_anchor(),
+            );
+            let after = (
+                ws.cursor_fx.glow.spawns(),
+                ws.cursor_fx.glow.admission_tally(),
+            );
+            (
+                app,
+                wid,
+                key_at,
+                origin,
+                write_cursor,
+                before,
+                after,
+                anchors,
+            )
+        };
+
+        // The torn present.
+        let (mut app, wid, key_at, origin, write_cursor, before, after, anchors) = run(true);
+        assert_eq!(
+            anchors.0,
+            Some(origin),
+            "the glow keeps the last caret it saw as its anchor"
+        );
+        assert_ne!(
+            anchors.1,
+            Some(write_cursor),
+            "the classic trail does not take the write cursor either"
+        );
+        assert_eq!(after, before, "nothing judged, nothing spent");
+        let mut shown = CursorFxInputs::sample_for_test(key_at + Duration::from_millis(48));
+        shown.cur = Some((origin.0, origin.1 + 1));
+        assert!(app.tick_cursor_fx_for_present(wid, false, shown).is_some());
+        let ws = &app.windows[&wid];
+        assert_eq!(
+            ws.cursor_fx.glow.spawns(),
+            before.0 + 1,
+            "the key's licence survives to lay its own cell"
+        );
+        assert_eq!(
+            ws.cursor_fx.glow.admission_tally().licensed,
+            before.1.licensed + 1
+        );
+        assert_eq!(
+            ws.cursor_fx.glow.cursor_anchor(),
+            Some((origin.0, origin.1 + 1))
+        );
+        assert!(ws.cursor_fx.glow.ribbon_segments() > 0);
+
+        // NEGATIVE CONTROL: the bracket closed, the hidden cursor is handed over.
+        let (_app, _wid, _key_at, _origin, write_cursor_b, _before, _after, anchors) = run(false);
+        assert_eq!(write_cursor_b, write_cursor);
+        assert_eq!(
+            anchors,
+            (Some(write_cursor), Some(write_cursor)),
+            "a finished frame's hidden caret still reaches the engines"
         );
     }
 
@@ -24718,6 +24641,7 @@ impl App {
             cur,
             live_viewport,
             cursor_visible,
+            frame_unfinished,
             cursor_style,
             blink_phase,
             live_cursor_rgb,
@@ -24729,6 +24653,18 @@ impl App {
             print_anchor,
             print_anchor_glyph,
         } = fx;
+        // A TORN PRESENT'S HIDDEN CURSOR IS NO CARET (2026-09-28, the owner's
+        // tab-2 gap): every motion engine below judges `cur`, and a hidden
+        // cursor on a frame the program has not finished (its DEC-2026
+        // bracket still open by its own account — the terminal's 1 s timeout
+        // does not finish it) is where the program's half-finished write
+        // stopped. Claude Code's transcript redraw held
+        // one open ~280 ms, and the glow seam spent the owner's in-flight
+        // keys on `(40,28)->(18,57)->(29,0)->(40,32)`, leaving the space
+        // dark and the band restarted. Withheld here, the engines judge the
+        // move when the caret is shown again, as every other host already
+        // does. The caller's pet keeps the unfiltered caret.
+        let cur = aterm_effects::host::motion_caret(cur, cursor_visible, frame_unfinished);
         // MOTION POLICY (W11): the one resolved gate for every decorative
         // animation this present composes — config `motion` × the live OS
         // "Reduce Motion" flag × THIS window's focus (unfocused demotes to
@@ -24990,7 +24926,6 @@ impl App {
                 geom: glow_geom,
                 focused: win_focused,
                 amplitude: cursor_motion.amplitude(crate::motion::MotionEffect::CursorGlow),
-                animate: cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
                 shed_envelope: shed_env,
                 body_allowed: cursor_body_allowed,
                 master: self.config.cursor_trail_or_default(),
@@ -25704,6 +25639,9 @@ impl App {
                 cur: effect_cursor,
                 live_viewport: display_offset == 0,
                 cursor_visible,
+                // Not sampled on this path, and nothing to withhold:
+                // `effect_cursor` already hands no hidden caret over.
+                frame_unfinished: false,
                 cursor_style,
                 blink_phase,
                 live_cursor_rgb,
@@ -28725,6 +28663,10 @@ impl App {
             // one snapshot. Diffed against the pet's per-window latch below.
             let wrap_serial = term.wrap_serial();
             let cursor_visible = term.cursor_visible();
+            // Whether that caret sits on a frame the program has not
+            // finished (its hidden cursor is then the write position — see
+            // `CursorFxInputs::frame_unfinished`), from the same hold.
+            let frame_unfinished = term.sync_frame_unfinished();
             let cursor_style = term.cursor_style();
             // The ECHO ANCHOR, from the same lock hold as the caret it stands
             // in for when a TUI hides/parks that caret (single pane → no pane
@@ -29121,6 +29063,12 @@ impl App {
                     cur,
                     live_viewport: display_offset == 0,
                     cursor_visible,
+                    // Read under the lock `cur` was: the program's frame is
+                    // unfinished (past the hold with the bracket open, or
+                    // past the terminal's timeout), so its hidden cursor is
+                    // the write position and is withheld from the motion
+                    // engines (the pet below still reads `cur`).
+                    frame_unfinished,
                     cursor_style,
                     blink_phase,
                     live_cursor_rgb,
@@ -29488,7 +29436,7 @@ impl App {
             // The head's own gated alpha BEFORE the shed, for the custody law
             // the pet's owner evaluates (it applies the shed itself).
             let flying_alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
-            let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
+            let kitty_alpha = if kitty_enabled && !pet_mode {
                 shed_companion_alpha(cat_frame.alpha, shed_envelope)
             } else {
                 0
@@ -35108,6 +35056,9 @@ impl App {
                 cur: win_cur,
                 live_viewport: !focus_scrolled,
                 cursor_visible: focus_vis,
+                // Not sampled on this path, and nothing to withhold:
+                // `win_cur` already hands no hidden caret over.
+                frame_unfinished: false,
                 cursor_style: focus_style,
                 blink_phase,
                 live_cursor_rgb,
@@ -35328,7 +35279,7 @@ impl App {
             // The shared gate keeps the full resident through every song
             // phase and gives no pixel custody to a replacement head.
             let flying_alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
-            let alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
+            let alpha = if kitty_enabled && !pet_mode {
                 shed_companion_alpha(cat_frame.alpha, shed_envelope)
             } else {
                 0
@@ -53794,6 +53745,176 @@ pub(crate) mod redraw_hold_hook {
                 hook();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod torn_present_motion_caret_tests {
+    //! THE SINGLE-PANE PRESENT WITHHOLDS AN UNFINISHED FRAME'S HIDDEN CURSOR
+    //! FROM THE MOTION ENGINES, end to end through the real `redraw_window`
+    //! (the owner's tab-2 trail gap, 2026-09-28; review round 1 asked for
+    //! this). The effects crate's harness and the `tick_cursor_fx` unit test
+    //! prove `motion_caret`'s logic, but only the present's own
+    //! `CursorFxInputs` construction decides what reaches it — written
+    //! `frame_unfinished: false` there, as on the composed and focus paths,
+    //! every other test stays green and the gap is back. These drive a real
+    //! terminal through a torn DEC-2026 repaint with a typed key in flight.
+    use crate::scripted_redraw_fixture::{feed, scripted_app};
+    use crate::{App, WindowId};
+    use aterm_core::terminal::ClockReading;
+    use std::time::{Duration, Instant};
+
+    /// The composer caret the hand is typing at, and the cell Ink's
+    /// half-finished repaint parks its hidden write cursor on.
+    const CARET: (u16, u16) = (10, 3);
+    const WRITE_CURSOR: (u16, u16) = (2, 47);
+
+    fn lit_app() -> App {
+        let mut app = scripted_app();
+        app.config.serious_mode = Some(false);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        app.config.motion = Some("full".into());
+        app.config.trail_sounds = Some(false);
+        app.kitty_cursor_enabled_cache = None;
+        app.recompute_sparkle();
+        app.windows.get_mut(&WindowId(0)).expect("window").focused = true;
+        app
+    }
+
+    fn feed_at(app: &App, bytes: &[u8], monotonic: Instant) {
+        let term = app
+            .front_terminal(WindowId(0))
+            .expect("front terminal")
+            .term
+            .clone();
+        crate::term_lock(&term).process_at(
+            bytes,
+            ClockReading {
+                monotonic,
+                wall_ms: None,
+            },
+        );
+    }
+
+    /// How the repaint reaches the glass.
+    #[derive(Clone, Copy, Debug)]
+    enum Tear {
+        /// The bracket stays open past the GUI's `SYNC_HOLD_CAP` hold (the
+        /// owner's measured ~280 ms bracket).
+        PastTheHoldCap,
+        /// The terminal's 1 s `sync_timeout_ms` force-clears the mode while
+        /// the program is still writing — no hold at all.
+        PastTheTerminalTimeout,
+        /// CONTROL: the program closes the bracket, leaving the cursor hidden
+        /// at the same cell — a finished frame, whose hidden caret the
+        /// single-pane present hands over.
+        Finished,
+    }
+
+    /// `(glow anchor, glow spawns, licensed)` after the repaint presents,
+    /// with the same triple from just before it.
+    type Facts = (Option<(u16, u16)>, u64, u64);
+
+    fn run(tear: Tear) -> (Facts, Facts) {
+        let wid = WindowId(0);
+        let mut app = lit_app();
+        let t0 = Instant::now();
+        feed_at(
+            &app,
+            format!("\x1b[2J\x1b[{};{}H", CARET.0 + 1, CARET.1 + 1).as_bytes(),
+            t0,
+        );
+        app.redraw_window(wid);
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            let now = Instant::now();
+            ws.cursor_fx.glow.note_typed_cells(now, 1);
+            ws.cursor_fx.trail.note_typed(now);
+        }
+        let facts = |app: &App| -> Facts {
+            let glow = &app.windows[&wid].cursor_fx.glow;
+            (
+                glow.cursor_anchor(),
+                glow.spawns(),
+                glow.admission_tally().licensed,
+            )
+        };
+        let before = facts(&app);
+        let repaint = format!(
+            "\x1b[?2026h\x1b[?25l\x1b[H\x1b[{};1Htranscript row\x1b[{};{}H",
+            WRITE_CURSOR.0 + 1,
+            WRITE_CURSOR.0 + 1,
+            WRITE_CURSOR.1 + 1
+        );
+        match tear {
+            Tear::PastTheHoldCap => {
+                feed(&app, repaint.as_bytes());
+                app.redraw_window(wid); // the rising edge arms the hold
+                assert_eq!(facts(&app), before, "{tear:?}: the held frame runs nothing");
+                std::thread::sleep(super::SYNC_HOLD_CAP + Duration::from_millis(20));
+            }
+            Tear::PastTheTerminalTimeout => {
+                feed_at(&app, repaint.as_bytes(), t0);
+                feed_at(&app, b"x\x08", t0 + Duration::from_millis(1_200));
+            }
+            Tear::Finished => feed(&app, format!("{repaint}\x1b[?2026l").as_bytes()),
+        }
+        {
+            let term = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            let t = crate::term_lock(&term);
+            let c = t.cursor();
+            assert_eq!((c.row, c.col), WRITE_CURSOR, "{tear:?}: the write cursor");
+            assert!(!t.cursor_visible(), "{tear:?}: hidden");
+            match tear {
+                Tear::PastTheHoldCap => assert!(t.modes().synchronized_output()),
+                Tear::PastTheTerminalTimeout => assert!(
+                    !t.modes().synchronized_output(),
+                    "the terminal's timeout cleared the mode"
+                ),
+                Tear::Finished => assert!(!t.sync_frame_unfinished()),
+            }
+        }
+        app.redraw_window(wid);
+        assert!(
+            app.windows[&wid].last_present.is_some(),
+            "{tear:?}: the frame presented"
+        );
+        (before, facts(&app))
+    }
+
+    /// The owner's shape, both ways a half-written frame reaches the glass:
+    /// the glow keeps the composer caret as its anchor, and the key in
+    /// flight is neither judged nor spent on the write cursor.
+    #[test]
+    fn an_unfinished_frames_hidden_write_cursor_moves_no_engine_through_the_present() {
+        for tear in [Tear::PastTheHoldCap, Tear::PastTheTerminalTimeout] {
+            let (before, after) = run(tear);
+            assert_eq!(before.0, Some(CARET), "{tear:?}: seeded at the caret");
+            assert_eq!(
+                after, before,
+                "{tear:?}: the write cursor is no caret (anchor, spawns, licensed)"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL: a FINISHED frame's hidden caret at the same cell
+    /// does reach the glow through the same present — so the present path
+    /// here does hand hidden carets over, and the pass above is the
+    /// unfinished frame's doing, not a fixture that never feeds the engine.
+    #[test]
+    fn a_finished_frames_hidden_caret_still_reaches_the_glow_through_the_present() {
+        let (before, after) = run(Tear::Finished);
+        assert_eq!(before.0, Some(CARET));
+        assert_eq!(
+            after.0,
+            Some(WRITE_CURSOR),
+            "the hidden caret is the anchor"
+        );
     }
 }
 

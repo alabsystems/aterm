@@ -16,8 +16,9 @@
 //! * logs it (WARN, with the generation, the phase and how long),
 //! * raises the update-health warning through main's messages system
 //!   ([`App::note_update_health`], under its own title,
-//!   [`crate::update_words::CHECKER_STALLED_TITLE`], with the OS banner an
-//!   announcement owes) — and heals it the first time a check completes after it,
+//!   [`crate::update_words::CHECKER_STALLED_TITLE`], with the OS banner only
+//!   while no check can run) — and heals it the first time a check completes
+//!   after it,
 //! * starts a replacement checker under a new generation
 //!   (`aterm_update::respawn_stalled_checker`), which retires the stalled thread
 //!   the moment it wakes, and
@@ -53,6 +54,13 @@ pub(crate) struct CheckerWatchState {
     /// the first check completed after it heals the warning. `None` while no
     /// warning of this watchdog's is up.
     announced_at_checks: Option<u64>,
+    /// This stall episode's OS banner is out. Set by the first stall of the
+    /// episode that stops updates, which need not be the one that announced
+    /// it: a replacement that runs posts nothing, and if it stalls in turn
+    /// with no successor left, that later stall owes the banner, though the
+    /// latched warning is not said again. Cleared when a new episode is
+    /// announced, whichever proof healed the last one.
+    stall_banner_posted: bool,
     /// The warning that a sibling holds `checker.lock` without making progress
     /// is up ([`lock_held_look`]): healed when the deferral streak ends, never
     /// by a check — the loop checks without the lock while it stands.
@@ -328,8 +336,10 @@ impl App {
 
     /// Say a stall: the log line, and the update-health warning through the one
     /// door every producer shares ([`App::note_update_health`], which latches a
-    /// title once per launch) under this watchdog's own title, with the OS banner
-    /// an announcement owes.
+    /// title once per launch) under this watchdog's own title. The OS banner is
+    /// owed only while updates are really stopped: no fresh checker, or one the
+    /// stuck one still blocks. A fresh checker that runs asks nothing of the
+    /// person, so the band row alone says it.
     pub(crate) fn announce_update_checker_stall(
         &mut self,
         stall: CheckerStall,
@@ -373,20 +383,26 @@ impl App {
             self.note_update_health_as(crate::update_words::HealthKind::Stalled, title, &body);
         if announced {
             self.update_checker_watch.announced_at_checks = Some(stall.checks);
+            self.update_checker_watch.stall_banner_posted = false;
         }
-        // The OS notification a health announcement owes, through the one door
-        // `Wake::UpdateHealth` and the automatic lane's convergence share (which
-        // holds `desktop_alerts`, and never posts from a unit test).
-        if announced {
-            self.post_update_health_banner(title, &body);
+        // The OS notification, through the one door `Wake::UpdateHealth` and
+        // the automatic lane's convergence share (which holds `desktop_alerts`,
+        // and never posts from a unit test): only while no check can run, and
+        // once per episode, whether or not this stall announced it.
+        if (replacement.is_none() || stall.holds_lane)
+            && !self.update_checker_watch.stall_banner_posted
+        {
+            self.update_checker_watch.stall_banner_posted =
+                self.post_update_health_banner(title, &body);
         }
     }
 
     /// Say that a sibling aterm holds the machine's update check without making
     /// progress ([`lock_held_look`]): the update-health warning under this
-    /// watchdog's title, through the one door every producer shares, with the OS
-    /// banner an announcement owes. The log already named the holder's pid (the
-    /// check loop's line).
+    /// watchdog's title, through the one door every producer shares. No OS
+    /// banner: this aterm checks without waiting for the sibling, so nothing has
+    /// stopped here and the band row says the whole of it. The log already named
+    /// the holder's pid (the check loop's line).
     ///
     /// Under its own kind ([`crate::update_words::HealthKind::LockHeld`], round
     /// six): a heartbeat stall's warning standing beside it neither swallows it
@@ -394,11 +410,7 @@ impl App {
     pub(crate) fn announce_checker_lock_held(&mut self, cycles: u64) {
         let title = crate::update_words::CHECKER_STALLED_TITLE;
         let body = crate::update_words::checker_lock_held_body(cycles);
-        let announced =
-            self.note_update_health_as(crate::update_words::HealthKind::LockHeld, title, &body);
-        if announced {
-            self.post_update_health_banner(title, &body);
-        }
+        self.note_update_health_as(crate::update_words::HealthKind::LockHeld, title, &body);
     }
 
     /// THE SIBLING LET GO: the deferral streak the lock-held warning stood for
@@ -707,7 +719,9 @@ mod tests {
     /// update-health DESKTOP BANNER and nothing else: the stall's ⚠ row is on
     /// the band either way. NEGATIVE CONTROL: with `desktop_alerts = true` the
     /// same announcement records exactly one banner, in the banner's words —
-    /// so the silence is the setting's, not a missing announcement.
+    /// so the silence is the setting's, not a missing announcement. The stall
+    /// holds the lane, so no check runs: a case a banner is owed (the other:
+    /// no fresh checker).
     #[test]
     fn desktop_alerts_off_withholds_only_the_update_health_banner() {
         use crate::messages_host::UPDATE_HEALTH_BANNERS;
@@ -716,7 +730,7 @@ mod tests {
             generation: 1,
             for_secs: 3_000,
             phase: CheckerPhase::LockWait,
-            holds_lane: false,
+            holds_lane: true,
             checks: 0,
         };
         for (alerts, banners) in [(None, 0), (Some(false), 0), (Some(true), 1)] {
@@ -731,15 +745,97 @@ mod tests {
             let posted = take();
             assert_eq!(posted.len(), banners, "{alerts:?}: {posted:?}");
             if let Some((title, _)) = posted.first() {
-                assert_eq!(title, crate::update_words::CHECKER_STALLED_TITLE);
+                assert_eq!(title, "aterm \u{00b7} update check stopped");
             }
-            // The checker-lock warning shares the door under its own kind: the
-            // same setting decides its banner, and once said it is latched.
+            // The checker-lock warning shares the door under its own kind, and
+            // posts no banner at all: this aterm still checks.
             app.announce_checker_lock_held(9);
-            assert_eq!(take().len(), banners, "{alerts:?}: its own announcement");
-            app.announce_checker_lock_held(10);
-            assert!(take().is_empty(), "{alerts:?}: latched, no second banner");
+            assert!(take().is_empty(), "{alerts:?}: updates go on, no banner");
         }
+    }
+
+    /// A STALL THAT STOPS NOTHING POSTS NO BANNER: a fresh checker started in
+    /// the stuck one's place and outside its lane checks at once, and the
+    /// sibling-held lock is checked around — the band row says either, and
+    /// the desktop is not told "Update check stopped" while updates go on.
+    /// NEGATIVE CONTROLS: no fresh checker, or one the stuck one blocks, is
+    /// a real stop, and posts the banner.
+    #[test]
+    fn only_a_stall_that_stops_updates_posts_the_banner() {
+        use crate::messages_host::UPDATE_HEALTH_BANNERS;
+        let take = || UPDATE_HEALTH_BANNERS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        for (holds_lane, replacement, banners) in [
+            (false, Some(2), 0),
+            (true, Some(2), 1),
+            (false, None, 1),
+            (true, None, 1),
+        ] {
+            let mut app = App::headless_for_test();
+            app.config.desktop_alerts = Some(true);
+            let _ = take();
+            let stall = CheckerStall {
+                generation: 1,
+                for_secs: 3_000,
+                phase: CheckerPhase::Checking,
+                holds_lane,
+                checks: 0,
+            };
+            app.announce_update_checker_stall(stall, replacement);
+            assert!(
+                app.messages.live_health().is_some(),
+                "{holds_lane} {replacement:?}: the band row is up either way"
+            );
+            assert_eq!(
+                take().len(),
+                banners,
+                "holds_lane={holds_lane} replacement={replacement:?}"
+            );
+        }
+        let mut app = App::headless_for_test();
+        app.config.desktop_alerts = Some(true);
+        let _ = take();
+        app.announce_checker_lock_held(9);
+        assert!(app.messages.live_health().is_some(), "its row is up");
+        assert!(
+            take().is_empty(),
+            "a sibling's held lock stops nothing here"
+        );
+    }
+
+    /// A LATER STALL THAT STOPS UPDATES STILL POSTS: the first stall is replaced
+    /// outside its lane (no banner; the warning is latched), and the
+    /// replacement stalls before completing a check with no successor left.
+    /// Updates have now stopped, so the banner is owed although the latched
+    /// warning is not said again — once: a further stall of the same episode
+    /// posts none. A completed check ends the episode, and the next stop posts
+    /// again. NEGATIVE CONTROL: the replaced first stall posts nothing.
+    #[test]
+    fn a_later_stall_with_no_checker_left_posts_the_banner_once() {
+        use crate::messages_host::UPDATE_HEALTH_BANNERS;
+        let take = || UPDATE_HEALTH_BANNERS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        let stall = |generation, checks| CheckerStall {
+            generation,
+            for_secs: 3_000,
+            phase: CheckerPhase::Checking,
+            holds_lane: false,
+            checks,
+        };
+        let mut app = App::headless_for_test();
+        app.config.desktop_alerts = Some(true);
+        let _ = take();
+        app.announce_update_checker_stall(stall(1, 0), Some(2));
+        assert!(take().is_empty(), "a fresh checker runs: no banner");
+        app.announce_update_checker_stall(stall(2, 0), None);
+        assert_eq!(take().len(), 1, "no checker is left: the banner");
+        app.announce_update_checker_stall(stall(3, 0), None);
+        assert!(take().is_empty(), "one banner per episode");
+        // A completed check heals the warning and ends the episode.
+        let mut healthy = beat(3, CheckerPhase::Waiting, 100);
+        healthy.checks = 1;
+        app.look_at_update_checker(Some(healthy), 110);
+        assert!(app.messages.live_health().is_none(), "healed");
+        app.announce_update_checker_stall(stall(4, 1), None);
+        assert_eq!(take().len(), 1, "a new episode's stop posts again");
     }
 
     /// A STALL INSIDE THE LANE IS SAID AS ONE: the fresh checker cannot check

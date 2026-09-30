@@ -137,7 +137,10 @@ fn a_verdict_on_an_ask_acks_the_sender_once_and_a_note_acks_nothing() {
     );
 
     // `await inbox re=<off>` latches on the receipt already sitting in A's inbox.
-    let latched = w.verb(&format!("@{a} await inbox re={} timeout=5000", off[0]));
+    // The timeout is a hang detector: a latch answers at once, and one that
+    // missed the present receipt would sit out the whole minute and answer
+    // `OK timeout`.
+    let latched = w.verb(&format!("@{a} await inbox re={} timeout=60000", off[0]));
     assert!(
         latched.header().starts_with("OK inbox "),
         "await inbox re= latches on the ack: {}",

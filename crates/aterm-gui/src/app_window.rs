@@ -919,6 +919,14 @@ impl App {
         );
         self.backend = BackendSlot::Ready(backend);
         self.use_gpu = use_gpu;
+        // A WARM MISS (warm successor P2): the worker built this backend before
+        // the dial at the launch hint's size, and the authenticated carry
+        // selected another. Select it now, before anything measures a cell —
+        // the light size switch every zoom takes (`activate_px`), which keeps
+        // the sealed faces and the warm glyphs at the hinted size resident.
+        if let Some(px) = self.warm_miss_px.take() {
+            self.backend.activate_px(px);
+        }
         // The worker is the thread that resolved the configured family (the
         // one resolve at startup); a family it rejected was seeded
         // optimistically in `main_entry` and must not survive as the live

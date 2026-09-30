@@ -27,7 +27,7 @@ impl Grid {
     /// so the visible-grid reflow runs against a clean history that this
     /// function's rewrapped output is later prepended to.
     // COST: UNBOUNDED(ring+tiered-history-lines) — materializes the ENTIRE
-    // off-screen scrollback. See `xtask gate mainloop` (MAIN-LOOP COMPLETENESS
+    // off-screen scrollback. See `aterm-census --mainloop` (MAIN-LOOP COMPLETENESS
     // CENSUS): must stay behind the `resize_offloading_scrollback` detach on any
     // main-thread-reachable path.
     pub(super) fn take_scrollback_lines(&mut self) -> Vec<Line> {
@@ -306,7 +306,7 @@ struct Unit<'a> {
 /// The display-cell scratch buffer is reused across logical lines, so the slow
 /// path allocates once for the widest logical line.
 // COST: UNBOUNDED(session-history-cells) — rewraps O(total cells) of history.
-// See `xtask gate mainloop` (MAIN-LOOP COMPLETENESS CENSUS): the 42s freeze sink;
+// See `aterm-census --mainloop` (MAIN-LOOP COMPLETENESS CENSUS): the 42s freeze sink;
 // must stay off the main thread (behind `resize_offloading_scrollback`/a worker).
 #[must_use]
 pub(super) fn reflow_scrollback_lines(lines: &[Line], new_cols: u16) -> Vec<Line> {

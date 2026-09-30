@@ -439,6 +439,11 @@ mod handoff_env;
 mod handoff_history;
 #[cfg(target_os = "macos")]
 mod handoff_rendezvous;
+/// The advisory launch-time warm hint (warm successor P2): the zoom the
+/// outgoing window will carry, named at launch so the warm prologue builds
+/// the backend at it before the dial. Never authenticated; a guess.
+#[cfg(target_os = "macos")]
+mod handoff_warm_hint;
 /// The in-GUI supervisor host: every Claude Code session this instance owns
 /// is supervised under aterm.toml's `[harness]` policy, with nothing typed.
 mod harness_host;
@@ -5547,6 +5552,14 @@ enum Wake {
         ask: upgrade_host::WordAsk,
         result: Result<aterm_agent::harness::upgrade_drive::Row, String>,
     },
+    /// The harness loop's NEXT TRY at one tab's wall, sent by the host's
+    /// worker thread when the deadline of the wait it stands in moves
+    /// ([`aterm_agent::supervise::IdleHost::waiting`]): unix seconds, or
+    /// `None` once no wait stands or the worker ended. The window keeps it
+    /// per session and lays it on an API wall's reading
+    /// (`App::apply_harness_wait`, `presence::with_retry_plan`), so the tab
+    /// says `→ 14:05 · 3m`. A fact only; no authority crosses it.
+    HarnessWait { sid: String, at_unix: Option<i64> },
     /// One report from inside aterm's OWN update check
     /// ([`aterm_update::Progress`]: a container download's bytes, the verify /
     /// stage that follows, and how it ended) — posted by the process-wide observer
@@ -8835,6 +8848,16 @@ pub(crate) struct SessionCtx {
     /// stream order. A LEAF lock, taken only for a non-blocking `try_send`
     /// or an install/remove, never while holding another.
     pub(crate) reset_lane: Arc<manual_reset::ResetLane>,
+    /// THIS SESSION'S OUTPUT IS NOT BEING CONSUMED: its PTY reader is parked
+    /// for a seamless update (`spawn::park_reader` raises it, the next reader
+    /// attach — Commit's successor has its own, a rollback's resume here —
+    /// lowers it). The program may be printing into the kernel queue the
+    /// whole time, so a control wait must not read the silence as the
+    /// program's (round seven of the update audit, findings 62 and 63): an
+    /// idle watcher's clock is held (`Terminal::watch_restart_idle`) and a
+    /// `turn`'s submit window neither closes nor re-presses Enter while it
+    /// stands.
+    pub(crate) update_parked: std::sync::atomic::AtomicBool,
 }
 
 struct Session {
@@ -15285,6 +15308,14 @@ enum HandoffReaperOwner {
 struct HandoffAttemptArbiterInner {
     phase: std::sync::atomic::AtomicU8,
     reaper: std::sync::atomic::AtomicU8,
+    /// The turn-id count THIS attempt's manifest told its successor to count
+    /// on from (`control::turn_ids_for_handoff`), stored by the worker where
+    /// `prepare_outgoing_artifacts` writes `manifest.next_turn_id`; 0 until
+    /// then, and 0 is no ceiling. The Commit compares this process's mints
+    /// against it (`control::turn_ids_past_handoff_ceiling`) — the ceiling of
+    /// the manifest the successor consumed, never of whichever attempt last
+    /// wrote one in this process (round seven, finding 22, review).
+    turn_id_ceiling: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -15297,7 +15328,24 @@ impl HandoffAttemptArbiter {
         Self(std::sync::Arc::new(HandoffAttemptArbiterInner {
             phase: std::sync::atomic::AtomicU8::new(HandoffAttemptPhase::Waiting as u8),
             reaper: std::sync::atomic::AtomicU8::new(HandoffReaperOwner::Unclaimed as u8),
+            turn_id_ceiling: std::sync::atomic::AtomicU64::new(0),
         }))
+    }
+
+    /// Record the turn-id count this attempt's manifest carries
+    /// ([`HandoffAttemptArbiterInner::turn_id_ceiling`]).
+    fn set_turn_id_ceiling(&self, ceiling: u64) {
+        self.0
+            .turn_id_ceiling
+            .store(ceiling, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The turn-id count this attempt's manifest carries; 0 before its
+    /// manifest was written, which is no ceiling.
+    fn turn_id_ceiling(&self) -> u64 {
+        self.0
+            .turn_id_ceiling
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn phase(&self) -> HandoffAttemptPhase {
@@ -16348,6 +16396,11 @@ struct App {
     /// Current and launch-default font size (physical px), for live Cmd-+/-/0 zoom.
     font_px: f32,
     default_font_px: f32,
+    /// A WARM MISS to correct at the backend join (warm successor P2,
+    /// [`warm_miss_px`]): the backend worker was built before the dial at the
+    /// launch hint's size, and the authenticated carry selected this one.
+    /// Taken once by [`Self::finalize_backend`]; `None` on every other launch.
+    warm_miss_px: Option<f32>,
     /// Whether the live backend is the GPU one, so a zoom rebuilds the same kind.
     /// While the slot is still `Pending` this holds the build's INTENT (`want_gpu`);
     /// [`Self::finalize_backend`] overwrites it with the build's actual outcome
@@ -17590,6 +17643,18 @@ struct App {
     /// resumes it in the successor. `None` when this instance has no control
     /// socket for its workers to use.
     harness: Option<harness_host::HostHandle>,
+    /// Each session's NEXT TRY as the harness loop last told it
+    /// (`Wake::HarnessWait`): its fabric sid to unix seconds. Laid on an API
+    /// wall's reading for the tab's words (`presence::with_retry_plan`); a
+    /// plan in the past, or none, shows nothing.
+    harness_waits: std::collections::HashMap<String, i64>,
+    /// How many times a plan in [`Self::harness_waits`] changed. Added to the
+    /// status sweep's agent-reading sequence in `presence_facts`: the
+    /// presence engine folds a reading only when its sequence is NEWER, and a
+    /// plan changes the reading's words without the screen changing. Two
+    /// non-decreasing counters' sum rises whenever either does, so the order
+    /// of real readings is kept.
+    harness_wait_epoch: u64,
     /// Monotonic user/output activity identity. A handoff captures it after
     /// parking; any later input/window activity invalidates final Commit and
     /// signals the worker to kill/reap the child before readers resume.
@@ -20805,6 +20870,7 @@ impl App {
             introspect_gpu: aterm_gpu::WindowGpu::new(),
             font_px: FONT_PX,
             default_font_px: FONT_PX,
+            warm_miss_px: None,
             font_px_explicit: false,
             use_gpu: false,
             // No intent to redeem: the test App is handed a built CPU backend.
@@ -21042,6 +21108,8 @@ impl App {
             update_handoff_prelaunch: None,
             operator_control: None,
             harness: None,
+            harness_waits: std::collections::HashMap::new(),
+            harness_wait_epoch: 0,
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
             last_keystroke_at: None,
@@ -23649,6 +23717,7 @@ impl App {
             let expected = adopted;
             let expected_count = expected.len();
             let waiter_gate = reader_gate.clone();
+            let harness = self.harness.clone();
             // The adopted shells' re-key files, held since adoption: written
             // only once the update has committed (`shell_rekey::Deferred`).
             let rekeys = self.session_factory.rekey_deferred.clone();
@@ -23665,6 +23734,14 @@ impl App {
                     // Commit is irreversible. Activate readers directly,
                     // before the fallible diagnostic/UI wake.
                     waiter_gate.release();
+                    // …and the supervisor: the predecessor suspended its own
+                    // host at Commit, so a wake lost below must not leave no
+                    // process answering the sessions' boxes (owner ruling of
+                    // 2026-09-25). `resume` is idempotent — the wake's own is
+                    // then a no-op.
+                    if let Some(host) = harness.as_ref() {
+                        host.resume();
+                    }
                     // The old process takes nothing back now: the re-keys go.
                     if let Some(rekeys) = rekeys {
                         rekeys.release();
@@ -27068,6 +27145,13 @@ impl ApplicationHandler<Wake> for App {
             #[cfg(unix)]
             Wake::ActivateCommittedHandoff { mut expected } => {
                 self.incoming_handoff_pending = false;
+                // THE PARENT'S RECORD SINCE THIS PROCESS BOOTED, FIRST (round-
+                // seven update audit, findings 41 and 18): the parent flushed
+                // its last line before Commit and is gone, so the file is its
+                // whole record. Merged before anything below can mint an id
+                // (the landing's record among them) or a reader can see this
+                // ring, so ids continue above every one the parent handed out.
+                self.reload_messages_log_at_commit();
                 // The predecessor leaves at Commit without its graceful cleanup; its
                 // per-process files go once it has.
                 control::sweep_after_handoff(self.sock_plan.as_ref());
@@ -27613,6 +27697,7 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::AgentUpgrade { rows } => self.apply_host_upgrades(rows),
             Wake::AgentUpgradeWord { ask, result } => self.apply_upgrade_word(&ask, result),
+            Wake::HarnessWait { sid, at_unix } => self.apply_harness_wait(&sid, at_unix),
             Wake::PkgSeed { installed } => {
                 if !installed.is_empty() {
                     // The ledger entry reads the RUNTIME shell-integration outcome
@@ -33003,6 +33088,7 @@ mod pass_verdict_tests {
             atpkg: std::path::Path::new("atpkg"),
             child_path: "",
             layout: None,
+            private_state_root: false,
             post: move |e| sink.lock().unwrap().push(e),
             wait_row_open: true,
             backoff: ContentionBackoff::default(),
@@ -33140,6 +33226,20 @@ impl std::fmt::Display for PassVerb {
             None => Ok(()),
         }
     }
+}
+
+/// What every pass child the window spawns carries AHEAD OF ITS VERB (ruling 410): under a
+/// private state root ([`aterm_types::dirs::runs_under_private_state_root`]),
+/// [`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]; nothing otherwise, so a shipped window, which
+/// reads no seam, spawns the argv it always did. The `atpkg` beside a development build is
+/// a separate build ([`co_located_atpkg`]) that may compile no seam, and then reads the
+/// inherited `ATERM_STATE_HOME` as unset; the window knows, and says so. A child that knows
+/// the flag carries no `[machine]` edit; one built before it answers the lead as an unknown
+/// verb (exit 2) before its `[machine]` edge, so the pass fails loudly instead of applying
+/// the instance's table to the owner's Mac. Taken by the lanes' passes ([`PkgLane::run`])
+/// and Settings' Check and Install. Pure for the test.
+pub(crate) fn pass_lead(private_state_root: bool) -> Option<&'static str> {
+    private_state_root.then_some(atpkg::cli::PRIVATE_STATE_ROOT_FLAG)
 }
 
 /// A launch child's argv: the verb, and for a targeted pass its program and
@@ -33311,7 +33411,8 @@ impl PassRun {
 }
 
 /// Run one `atpkg <verb>` launch child and wait for it — the seed pass, every tick
-/// of the update loop and every head-watch pass are this ONE shape ([`pass_args`]):
+/// of the update loop and every head-watch pass are this ONE shape ([`pass_args`];
+/// `argv` is the lane's whole argv, [`pass_lead`] then [`lane_pass_args`]):
 /// spawned with `--wait-lock` ([`ATPKG_WAIT_LOCK_SECS`]), `--progress-file` when
 /// there is a store, the spawner's pid ([`atpkg::cli::SPAWNER_PID_ENV`]) and the
 /// login shell's PATH (`child_path`); stdout STREAMED line by line through
@@ -33352,8 +33453,7 @@ impl PassRun {
 /// `Err` is a failed SPAWN — a bundle whose co-located atpkg cannot exec — which
 /// [`PkgLane::run`] gives its voice. The incidents: CHANGELOG 2026-09-10/13.
 fn run_atpkg_pass<P: Fn(Wake) + Clone + Send + 'static>(
-    verb: PassVerb,
-    published_index: Option<u64>,
+    argv: Vec<std::ffi::OsString>,
     atpkg: &std::path::Path,
     child_path: &str,
     layout: Option<&atpkg::store::Layout>,
@@ -33364,7 +33464,7 @@ fn run_atpkg_pass<P: Fn(Wake) + Clone + Send + 'static>(
     // NO STDIN: a window started from a terminal would hand its tty to the pass, which then
     // announced itself as a PERSON's verb holding the store (`store.lock.holder`), and a
     // Settings Check failed at once behind the window's own pass.
-    cmd.args(lane_pass_args(verb, layout, published_index))
+    cmd.args(argv)
         .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
         .env("PATH", child_path)
         .stdin(std::process::Stdio::null())
@@ -33649,6 +33749,11 @@ struct PkgLane<'a, P> {
     /// `--progress-file` points, where the bump watch stats. `None` (no
     /// resolvable home) runs the children untailed.
     layout: Option<&'a atpkg::store::Layout>,
+    /// Whether this window runs under a private state root, read once where the live lane
+    /// is built ([`aterm_types::dirs::runs_under_private_state_root`]): every child the lane
+    /// spawns then leads with [`pass_lead`] (ruling 410). A field, so a test's lane is the
+    /// owner's whatever the test runner inherited.
+    private_state_root: bool,
     post: P,
     /// Whether a `lock-waiting:` line marked a child of this lane as having queued
     /// behind another pass ([`carry_wait_row`]): at that child's exit the lane's
@@ -33677,9 +33782,13 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
     /// refused pass (`None`).
     fn run(&mut self, verb: PassVerb, published_index: Option<u64>) -> Option<PassRun> {
         let first_run = pass_is_first_run(self.layout);
+        let mut argv: Vec<std::ffi::OsString> = pass_lead(self.private_state_root)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        argv.extend(lane_pass_args(verb, self.layout, published_index));
         let run = run_atpkg_pass(
-            verb,
-            published_index,
+            argv,
             self.atpkg,
             self.child_path,
             self.layout,
@@ -33997,14 +34106,20 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
 /// the user owns), and its stdout runs through
 /// [`read_seed_markers`] so the `machine-settings:` line lands where a pass's would.
 /// Never joined (`consent_warmup.rs` rule): a wedged `defaults` must not hold a launch.
+///
+/// NOT UNDER A PRIVATE STATE ROOT (ruling 409, 2026-09-29): a development build given its
+/// own `ATERM_STATE_HOME` shares the owner's prefix and Mac, so the claim stands aside
+/// before it takes the owner's slot ([`atpkg::machine::LaunchApply::PrivateStateRoot`],
+/// read inside the claim), and this logs its one line.
 fn spawn_machine_settings_once(atpkg: std::path::PathBuf, proxy: EventLoopProxy<Wake>) {
     let spawned = std::thread::Builder::new()
         .name("atpkg-machine".into())
         .spawn(move || {
             crate::qos::set_self(crate::qos::Role::Background);
             let now = unix_secs(std::time::SystemTime::now());
-            let due = atpkg::store::resolve_configured()
-                .is_some_and(|layout| atpkg::machine::launch_apply_due(&layout, now));
+            let due = atpkg::store::resolve_configured().is_some_and(|layout| {
+                atpkg::machine::launch_apply_due(&layout, now).runs(|why| aterm_log::info!("{why}"))
+            });
             if !due {
                 return;
             }
@@ -35798,6 +35913,7 @@ mod head_watch_park_tests {
             atpkg: atpkg.as_path(),
             child_path: "",
             layout: Some(&layout),
+            private_state_root: false,
             post: |_| {},
             wait_row_open: false,
             backoff: ContentionBackoff::default(),
@@ -35874,6 +35990,7 @@ mod head_watch_park_tests {
             atpkg: atpkg.as_path(),
             child_path: "",
             layout: None,
+            private_state_root: false,
             post: |_| {},
             wait_row_open: false,
             backoff: ContentionBackoff::default(),
@@ -35910,6 +36027,82 @@ mod head_watch_park_tests {
         lane.run_vendor_moved(&["claude"], None);
         assert_eq!(runs(), "", "the loop's own pass takes it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PRIVATE WINDOW'S PASSES LEAD WITH ITS FLAG (ruling 410): the `atpkg` beside a
+    /// development build may compile no seam, so every child the lane spawns under a
+    /// private state root carries [`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`] ahead of its
+    /// verb — the seed, the whole update and a targeted one alike — and the owner's lane
+    /// carries nothing new. Driven through the lane's real spawn, over a fake `atpkg` that
+    /// logs its argv; the live lane reads the answer once, from the helper.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(pass_lead(false), None);
+        assert_eq!(pass_lead(true), Some("--private-state-root"));
+        let dir = std::env::temp_dir().join(format!("aterm-private-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv_log = dir.join("argv");
+        let atpkg = dir.join("atpkg");
+        std::fs::write(
+            &atpkg,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n",
+                argv_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for private_state_root in [true, false] {
+            let _ = std::fs::remove_file(&argv_log);
+            let mut lane = PkgLane {
+                atpkg: atpkg.as_path(),
+                child_path: "",
+                layout: None,
+                private_state_root,
+                post: |_| {},
+                wait_row_open: false,
+                backoff: ContentionBackoff::default(),
+                ran_at: None,
+                switch: LiveSwitch::new(None, LoopGate::On),
+            };
+            for verb in [
+                PassVerb::Seed,
+                PassVerb::Update,
+                PassVerb::UpdateProgram("codex"),
+            ] {
+                assert!(lane.run(verb, None).is_some(), "{verb}: the child ran");
+            }
+            let lead = if private_state_root {
+                "--private-state-root "
+            } else {
+                ""
+            };
+            assert_eq!(
+                std::fs::read_to_string(&argv_log).unwrap(),
+                format!(
+                    "{lead}seed --wait-lock 1800\n\
+                     {lead}update --defer-busy-flip --wait-lock 1800\n\
+                     {lead}update codex --head-watch --wait-lock 1800\n"
+                ),
+                "private_state_root = {private_state_root}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // The live lane asks the helper, once, where it is built.
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("\nfn spawn_pkg_update_check(")
+            .expect("the live lane");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert_eq!(
+            body.matches("private_state_root: aterm_types::dirs::runs_under_private_state_root(),")
+                .count(),
+            1,
+            "{body}"
+        );
     }
 
     /// THE FIRST RUN, DEFINED BY THE STORE AT THE PASS'S START (2026-09-22), and
@@ -35986,6 +36179,7 @@ mod head_watch_park_tests {
                 atpkg: atpkg.as_path(),
                 child_path: "",
                 layout: Some(layout),
+                private_state_root: false,
                 post: move |e| sink.lock().unwrap().push(e),
                 wait_row_open: false,
                 backoff: ContentionBackoff::default(),
@@ -36081,6 +36275,7 @@ mod head_watch_park_tests {
                 atpkg: missing.as_path(),
                 child_path: "",
                 layout: None,
+                private_state_root: false,
                 post: move |e| sink.lock().unwrap().push(e),
                 wait_row_open: false,
                 backoff: ContentionBackoff::default(),
@@ -36591,6 +36786,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 atpkg: &atpkg,
                 child_path: &child_path,
                 layout: layout.as_ref(),
+                private_state_root: aterm_types::dirs::runs_under_private_state_root(),
                 post: move |event| {
                     let _ = proxy.send_event(event);
                 },
@@ -37401,6 +37597,17 @@ impl App {
     /// (`message_reporters::harness_note`, a `harness`-tagged record) and every other
     /// text, a RECORD tagged with the named lane (R34, design §10.5 H7, ruling 147).
     /// Never a row: [`AppNoticeTaken::Recorded`].
+    ///
+    /// TAKEN WHILE PARKED, unlike `notice` (round-seven update audit, finding
+    /// 32, as reviewed): every lane only RECORDS — no row, nothing the carry
+    /// holds, nothing a Commit could undo. The record goes to messages.log,
+    /// which this process flushes before Commit `_exit`s it
+    /// ([`App::flush_messages_log_within`]) and the successor merges first at
+    /// Commit ([`App::reload_messages_log_at_commit`]); its id lies in the band
+    /// the successor leaves the parked parent
+    /// ([`crate::messages_host::PARKED_PARENT_ID_RESERVE`]). So `OK recorded`
+    /// stays true across the switch, and a toolchain pass or a harness is not
+    /// told to retry for a line that would have landed anyway.
     fn take_app_notice(&mut self, lane: &str, text: &str) -> Result<AppNoticeTaken, &'static str> {
         match lane {
             "toolchain" => {
@@ -37891,10 +38098,25 @@ mod seed_marker_tests {
         let claim = spawner_body
             .find("atpkg::machine::launch_apply_due(&layout, now)")
             .expect("the one-shot claims the shared daily slot");
+        // NOT UNDER A PRIVATE STATE ROOT (ruling 409): the claim's answer goes through
+        // `runs`, which logs the skip's one line — the skip itself precedes the claim
+        // inside atpkg (`launch_apply_decision`, pinned there) — and only a claim that ran
+        // reaches the verb.
+        let skip = spawner_body
+            .find(".runs(|why| aterm_log::info!(\"{why}\"))")
+            .expect("the claim's answer logs a private root's skip");
         let verb = spawner_body
             .find(r#".arg("machine")"#)
             .expect("{spawner_body}");
-        assert!(thread < claim && claim < verb, "{thread} {claim} {verb}");
+        assert!(
+            thread < claim && claim < skip && skip < verb,
+            "{thread} {claim} {skip} {verb}"
+        );
+        assert_eq!(
+            spawner_body.matches("launch_apply_due(").count(),
+            1,
+            "one claim, through the gated answer: {spawner_body}"
+        );
         assert!(spawner_body.contains(r#".arg("apply")"#), "{spawner_body}");
         assert!(
             spawner_body.contains("read_seed_markers("),
@@ -38609,806 +38831,154 @@ pub fn mark_rust_main_start() {
     metrics::mark_rust_main_start();
 }
 
-/// The whole windowed terminal as a callable: `argv[1..]` in, runs the window
-/// (or headless engine) to completion. Called by the ONE `aterm` binary when
-/// the launch is window-shaped (no TTY, `--window`, `--headless`, a Finder
-/// launch, or the `aterm-gui` argv0 alias) and by the thin dev-only
-/// `aterm-gui` bin. Verb routing happens in the caller — this entry is purely
-/// the window.
-pub fn main_entry(argv: Vec<std::ffi::OsString>) {
-    // Compatibility-stable GUI-entry clock. The one-binary router separately
-    // anchors its broader Rust-main boundary before dispatch.
-    metrics::mark_process_start();
-    // Before any window exists: every present from here on reports its
-    // compositor leg (`metrics::install_present_glass_sink`).
-    metrics::install_present_glass_sink();
-    // THE HANDOFF ENVIRONMENT SNAPSHOT (docs/DESIGN-warm-successor-2026-09-29.md
-    // §1): every `ATERM_SEAMLESS_*` / `ATERM_HANDOFF_*` name is read AND CLEARED
-    // here, once, while this process has exactly one thread. That is the only
-    // process-env mutation the handoff makes in a successor; every reader below
-    // — the prearm, the boot apply's re-exec, the rendezvous claim, the intakes —
-    // works on `handoff_env`, so where the claim sits no longer matters to env
-    // soundness (`tools/grep_guard.sh` B20 fences the rest of the crate).
-    let mut handoff_env = handoff_env::HandoffEnv::capture();
-    // Child-copy fd posture must be repaired before the updater spawns any
-    // codesign/PlistBuddy/spctl helper. The updater receives this exact list
-    // solely for its final same-process exec and re-arms it on exec failure.
-    let incoming_exec_fds = seamless::prearm_incoming_fds_from(&mut handoff_env);
-    if incoming_exec_fds.rejects_boot() {
-        // A malformed but recognizable inherited handoff is neither a cold
-        // start nor safe update authority. `prearm_incoming_fds` has already
-        // closed every enumerable named descriptor exactly once and cleared the
-        // authority environment. Stop before helpers, sessions, or user code can
-        // reuse one of those descriptor numbers.
-        crate::logging::stderr_line!("aterm-gui: rejected malformed inherited handoff");
-        return;
-    }
-    // A GUI-subsystem exe (see the binaries' `windows_subsystem` attribute) has
-    // no console; reattach to the parent's FIRST — before any print — so
-    // `--help`/`--version` and startup diagnostics reach a launching console.
-    // The LATCH, not this call's answer, says whether the process attached: the
-    // ONE binary's router attached before dispatching here, and this call then
-    // finds the handles it installed and attaches nothing.
-    #[cfg(windows)]
-    let _ = win32::attach_parent_console();
-    #[cfg(windows)]
-    let attached_console = win32::attached_a_console();
-    // Windows app identity: set the process AUMID before any window shows so the
-    // taskbar groups aterm under one button and matches the Start-Menu shortcut's
-    // AppUserModelID (design §6). Harmless on a console `--version` run.
-    #[cfg(windows)]
-    win32::set_app_user_model_id();
-    // Windows lifecycle: opt into OS-driven relaunch (update reboot / "restart
-    // apps after sign-in" / post-crash), paired with the end-session manifest
-    // save in `platform_win` so the relaunched process restores the session.
-    #[cfg(windows)]
-    win32::register_application_restart();
-    // Raise the timer resolution to 1ms so the winit `WaitUntil` deadlines that pace
-    // every animation (the cursor-trail comet, blink) land on a steady cadence instead
-    // of Windows' coarse ~15.6ms default grid — the fix for the "gappy/laggy" trail and
-    // tighter input→present timing. See `win32::raise_timer_resolution`.
-    #[cfg(windows)]
-    win32::raise_timer_resolution();
-    // CLI first: `-e <cmd>` to run a command instead of $SHELL, `-d <dir>` to set
-    // the working directory; `--help`/`--version` print and exit before any setup.
-    // A Finder/.app launch passes no args, so this is a no-op there and a normal
-    // interactive shell starts.
-    let Cli {
-        exec_command,
-        cwd,
-        hold,
-        headless: headless_flag,
-        lifeline_fd,
-        launch,
-    } = parse_cli(argv);
-    // A harness's lifeline (`--lifeline-fd`, headless only — the parser refused it
-    // anywhere else): taken over NOW, while nothing has been spawned that could
-    // inherit the number, and watched once the event loop exists (below).
-    #[cfg(unix)]
-    let lifeline = lifeline_fd.map(lifeline::adopt_or_exit);
-    #[cfg(not(unix))]
-    let _ = lifeline_fd;
-    // Before anything resolves a renderer, a font or a scale.
-    crate::launch::install(launch);
-    // THE CLI PARSE WAS THE LAST THING THE LAUNCHING CONSOLE WAS OWED. Every
-    // print-and-exit flag has exited above; what follows opens a window (or the
-    // headless engine). A windowed image launched from a shell ATTACHED to
-    // that shell's console — which has already returned to its prompt, since
-    // a GUI-subsystem child is not waited for — and every line it printed
-    // from here on landed on the line being edited (2026-09-22 audit, defect c:
-    // `aterm-gui: GPU rendering on …`, `control socket listening at …`). Give
-    // the console back now, for a WINDOW launch only: a headless launch's
-    // announcement and socket path are read by whoever ran it. Headless is the
-    // `--headless` flag alone (the `$ATERM_HEADLESS` spelling is gone). The
-    // console image running a window in-process (dev `cargo run`) inherited a
-    // real console, attached nothing, and keeps printing.
-    #[cfg(windows)]
-    if win32::attached_console_is_released_for(attached_console, headless_flag) {
-        win32::release_attached_console();
-    }
-    // Diagnostics first, before any thread spawns: without a logger every
-    // aterm_log record — including containment_audit denials — is discarded.
-    // The crash marker is armed here too, and it has to know what this start
-    // is: only the installed app running windowed — once past its Commit, when
-    // it came through an update handoff — leaves a marker whose empty corpse is
-    // reported as "aterm was killed" (`crash_signal::Arming`). Headless is the
-    // `--headless` flag alone — the one spelling, armed further down.
-    let launch_arming = crash_signal::Arming::for_launch(
-        aterm_update::which_copy::running_kind() == aterm_update::which_copy::Running::InstalledApp,
-        headless_flag,
-        incoming_exec_fds.parent_pid().is_some(),
-    );
-    logging::init(launch_arming);
-    // atpkg's unasked notices (a config it cannot read, a prefix it will not use, a lay
-    // that is not provenance-clean) are aterm.log records here, before the first atpkg
-    // call: a window typed into a shell must not print into it.
-    atpkg::notice::to_host_log();
-    // THE MESSAGE LOG (docs/DESIGN-unified-messages-2026-09-21.md §3.7): the
-    // tail of `messages.log` is read right after the logger, so a reporter
-    // that speaks before `App` exists (the crash reporter, Phase 3) posts into
-    // a loaded ring and its ids continue from the file's. The writer opens at
-    // construction, after the compaction check. A `--headless` run records
-    // too (design §3.7): it is a real process under the person's log dir,
-    // driven by `aterm ctl appnotice` and the socket tests; only a test's
-    // `App::headless_for_test` has no writer.
-    let messages_loaded =
-        messages_store::path().map(|path| (messages_store::load_for_launch(&path), path));
-    // The event-loop thread never waits for an iCloud Drive download (macOS;
-    // no-op elsewhere): a dataless read on THIS thread fails fast as
-    // `NotDownloaded` instead of stalling into the watchdog. Thread-scoped, so
-    // the document admission workers that opt back in are unaffected.
-    if let Err(errno) = dataless_files::main_thread_never_materializes() {
-        logging::stderr_line!(
-            "aterm-gui: could not disable dataless-file materialization on the main \
-             thread (errno {errno}); an evicted iCloud file may still stall it"
-        );
-    }
-    // And the Objective-C exception-containment sink right behind it, so a
-    // contained NSException lands in aterm.log with its method, name, reason
-    // and call stack from the first turn of the run loop.
-    #[cfg(target_os = "macos")]
-    logging::install_objc_containment_sink();
-    // B3 — PROCESS-GROUP CONTAINMENT, successor side (see
-    // `tests/handoff_launchd_job.rs` and `app_update_handoff`). A process that
-    // arrived through an update handoff is a CANDIDATE: the parent that started
-    // it may reject it and reap it with `kill(-pid)`, and that sweep reaches the
-    // ditto/codesign/spctl helpers the update logic forks only while this process
-    // leads its own process group. A candidate we were FORKED as already leads
-    // one — `run_handoff_worker`'s `pre_exec` established it before this image
-    // ran, so the call below is a second, no-op success — but a candidate LAUNCHED
-    // through LaunchServices is launchd's child, where no pre-exec hook of the
-    // parent's can run, so it has to contain ITSELF.
-    //
-    // ORDERING, which is the obligation `contain_own_process_group` names: the
-    // NEXT statement is the boot apply, and that is the first point at which this
-    // process runs another program at all (`aterm_update::install` runs
-    // /usr/bin/ditto, /usr/bin/hdiutil and codesign, then re-execs). Nothing
-    // ahead of it does: the one-binary router that dispatched here matches argv0,
-    // resolves a store shim by readlink and probes the TTY; this entry then marks
-    // the clock, repairs fd/env posture, parses the CLI and starts the logger. So
-    // there is no instant at which an updater helper of ours is outside the group
-    // — which is the whole of what the parent's sweep has to reach.
-    //
-    // GATE: `parent_pid()` is `Some` exactly for a recognized AND validated
-    // incoming handoff (the malformed shape already returned at `rejects_boot`),
-    // which is exactly the set of processes somebody may `kill(-pid)`. A cold
-    // start keeps whatever group its launcher chose: moving one out would take a
-    // shell-launched window out of its job-control group — out of reach of that
-    // terminal's Ctrl-C, and out of a test harness's group cleanup — and buys
-    // nothing, since nobody sweeps a group for a process that is not a candidate.
-    // A future lane that names the candidate over the control socket instead of
-    // through the environment (B4) has to extend this gate with it.
-    //
-    // FAIL CLOSED: a candidate that cannot lead its own group would fork helpers
-    // that no reaper could sweep, so it does not run the update logic at all. It
-    // returns here — before the boot apply, with no helper forked and no adopted
-    // descriptor consumed — and the parked parent sees proof EOF (`ChildDied`),
-    // rejects, and resumes its own readers. That is the same shape as the
-    // malformed-handoff refusal above, and it keeps the property by making the
-    // set of helpers empty rather than by claiming a sweep that would not work.
-    #[cfg(unix)]
-    if incoming_exec_fds.parent_pid().is_some()
-        && let app_update_handoff::ProcessGroupContainment::Foreign { group, own } =
-            app_update_handoff::contain_own_process_group()
-    {
-        // Both destinations deliberately: the log file is all a launchd-launched
-        // app leaves behind, and stderr is what a developer running the binary
-        // from a shell actually sees. A silent refusal here would present as an
-        // update that simply never happened.
-        aterm_log::error!(
-            "handoff candidate cannot lead its own process group (kernel reports pgid {group} for \
-             pid {own}); refusing to start update logic whose helpers no reaper could sweep"
-        );
-        crate::logging::stderr_line!(
-            "aterm-gui: handoff candidate could not contain its own process group"
-        );
-        return;
-    }
-    // Self-update apply, BEFORE any thread spawn or window: if a previous run
-    // staged a verified, strictly-newer build, swap aterm.app in place and re-exec
-    // the new binary (never returns on success). A no-op for dev/`cargo run`
-    // builds, when nothing is staged, or when the updater is disabled/unpinned —
-    // see crate aterm-update. Running here keeps the env-var loop-guard single-
-    // threaded and avoids swapping a bundle with the engine already live.
-    // The successor half of the park->dial split (the worker logs the other half).
-    // The parent's readers are still parked for every millisecond spent in here.
-    //
-    // WHAT THIS NUMBER IS NOT. It is only the POST-SWAP prologue. On a download
-    // lane the parent launches the current binary, so the FIRST image dittos the
-    // bundle and `execve`s from inside `apply_staged_if_ready_*` — which never
-    // returns — and therefore never reaches this line. The image that logs here
-    // is the re-exec'd one, whose apply is a fast `NoUpdate`. The swap's own
-    // cost is logged by the image that pays it, from `aterm-update`'s
-    // `install.rs` ("applied update … in N ms … → re-launching").
-    let boot_apply_at = std::time::Instant::now();
-    // THE SNAPSHOT THE FORGIVE IS MEASURED AGAINST (2026-09-19, review round 1).
-    // The two refusals below hand this launch's counted boot-trial back, and
-    // under the late park that is the ROUTINE end of an attempt (the outgoing
-    // process stands a held successor down whenever the terminal never goes
-    // quiet, a teardown arrives, or its park misses), not the rare give-up it
-    // was. `check_boot_health` does not always count: `launch_is_burst`
-    // suppresses the count when the sentinel already stands above zero inside
-    // the burst window, so a successor booting seconds after a genuinely CRASHED
-    // candidate of the same build would have given back the crash's launch — the
-    // one signal the sentinel exists to keep. Take the count before the apply and
-    // forgive only a launch that provably moved, exactly as the parent does.
-    #[cfg(unix)]
-    let trial_launches_before_boot =
-        aterm_update::trial_launch_count(build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0));
-    // Read once, before the apply: the apply's own gate and the refusal's exit
-    // status below (`seamless::passing_refusal_exit`) must agree on whether this
-    // image is the authorized target.
-    let target_names_this_build = seamless::target_identity_names_this_build(&handoff_env);
-    let boot_apply = if incoming_exec_fds.blocks_boot_apply() {
-        aterm_update::ApplyOutcome::NotApplicable
-    } else if linux_launch_without_a_window(headless_flag) {
-        aterm_update::ApplyOutcome::NoUpdate
-    } else {
-        // WHEN WE ARE THE AUTHORIZED CANDIDATE (the outgoing process's target names
-        // this build — an activation successor, or a download successor already
-        // swapped and re-exec'd into its target) the updater still runs its whole
-        // startup prologue — consuming the re-exec nonce and stamp, counting the
-        // boot-trial launch, settling startup authority — but refuses to SWAP: a
-        // newer stage on disk re-exec'd from here would be a build the parent did
-        // not authorize, and that image would refuse the target, drop the adopted
-        // PTYs and be booked as ChildDied against a healthy candidate. Skipping the
-        // call outright was tried and left ATERM_UPDATE_REEXEC and its stamp
-        // unconsumed, which made the NEXT apply from the survivor a silent no-op.
-        aterm_update::apply_staged_if_ready_preserving_fds_exact(
-            build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-            build_info::GIT_COMMIT,
-            incoming_exec_fds.final_exec_fds(),
-            // The snapshot's names ride the re-exec exactly as they rode
-            // `environ` before it existed, then the attested parent's pair.
-            &incoming_exec_fds.final_exec_env_with(&handoff_env),
-            target_names_this_build,
-        )
-    };
-    // Logged for EVERY outcome, the quiet ones included: a `NoUpdate` that took a
-    // second is exactly the finding that would justify moving this work, and the
-    // arm below is silent about it by design.
-    if incoming_exec_fds.parent_pid().is_some() {
-        // WHOSE TIME THIS SPENDS depends on the lane, and the sentence used to
-        // name only one of them. On the FORK lane the outgoing process parked
-        // before it spawned, so every millisecond here is frozen terminal. Under
-        // the LATE PARK it is the opposite: this runs before the dial, with every
-        // one of the outgoing process's readers live, which is the whole point of
-        // moving the park — so reporting it as freeze would send the next reader
-        // of this log after the wrong second.
-        // The rendezvous is the late park's marker and it is macOS-only, like the
-        // launched lane itself; every other unix has only the fork lane, where
-        // the park always precedes the spawn.
-        #[cfg(target_os = "macos")]
-        let late_park = handoff_rendezvous::rendezvous_present(&handoff_env);
-        #[cfg(not(target_os = "macos"))]
-        let late_park = false;
-        let lane = if late_park {
-            "with the outgoing process's readers still LIVE (the late park; before the dial)"
-        } else {
-            "with the outgoing process's readers parked"
-        };
-        aterm_log::info!(
-            "update apply (boot): {boot_apply:?} in {} ms — this ran {lane}",
-            boot_apply_at.elapsed().as_millis(),
-        );
-    }
-    match boot_apply {
-        aterm_update::ApplyOutcome::NotApplicable | aterm_update::ApplyOutcome::NoUpdate => {}
-        // BOTH sinks, deliberately. `eprintln!` alone put every boot-lane refusal on a
-        // stderr nobody reads: a Finder-launched .app has no terminal attached, so
-        // "Deferred/Blocked/Failed at boot" — the exact outcomes that explain why an
-        // update the user can SEE staged never applied — left no durable trace anywhere.
-        // The log is the durable one; stderr stays for a TTY launch.
-        ref other => {
-            aterm_log::warn!("update apply (boot): {other:?}");
-            crate::logging::stderr_line!("aterm-gui: update apply: {other:?}");
-        }
-    }
-    // Post-update handoff: `ATERM_UPDATED_FROM` is set by the
-    // in-session handoff lane on the successor it launches (`app_update_handoff`)
-    // and, since 2026-09-14, by the boot apply's own re-exec
-    // (`install::boot_reexec_command`), so its presence means "this run is the
-    // result of an update apply" on every lane. Record that
-    // fact for the landing record and CLEAR the env HERE
-    // — still single-threaded, before any session/shell spawn — so it never leaks to the
-    // user's shell children.
-    let updated_from = std::env::var_os("ATERM_UPDATED_FROM");
-    // A SAME-IMAGE handoff (the QA seam's) is not a level-up, and must not claim one: its
-    // successor is the build it replaced. Narrowed to "present AND naming a different
-    // build".
-    let just_updated = updated_from
-        .as_deref()
-        .is_some_and(|from| from != std::ffi::OsStr::new(crate::build_info::BUILD_NUMBER));
-    if updated_from.is_some() {
-        // The launcher is still single-threaded here (this runs before any thread or
-        // session spawn); routed through the workspace's one lock-scoped env helper.
-        aterm_log::env::unset("ATERM_UPDATED_FROM");
-    }
-    let _ = JUST_UPDATED.set(just_updated);
-    // OUT-OF-BAND HANDOFF INTAKE. A successor LaunchServices started is launchd's
-    // child, not the outgoing process's, and inherits NO descriptors — so the PTY
-    // masters, the readiness pipe and the Commit pipe cannot be named by number in
-    // this process's environment. They arrive over the single-use rendezvous the
-    // parent bound before launching us (`crate::handoff_rendezvous`), and the dial
-    // happens HERE for two reasons that both matter:
-    //
-    // * AFTER THE BOOT APPLY. That apply swaps the staged bundle and re-execs, and
-    //   every received descriptor is `FD_CLOEXEC` — dialing earlier would mean
-    //   carrying them across an `execve` through the same clear-and-re-arm dance
-    //   the fork lane needs, for no benefit. The re-exec'd image dials fresh
-    //   instead, and the parent's readiness deadline already budgets for exactly
-    //   this interval (it is what the fork lane waits out too).
-    // * BEFORE `take_incoming`. Publishing the claimed descriptors as the
-    //   ordinary `ATERM_SEAMLESS_FDS` / `ATERM_HANDOFF_*_FD` shape lets the
-    //   existing, unchanged intake do every authentication it already does — the
-    //   manifest join, the exact bijection, the tty backstop, the screen-carry
-    //   digest, the parent birth record. The TRANSPORT changed; nothing that
-    //   decides whether a handoff is legitimate did.
-    //
-    // A FAILED CLAIM EXITS. It does not fall through to a fresh window: the parent
-    // still owns every session this process was going to adopt, and presenting an
-    // empty terminal over them would look to the user exactly like the update
-    // having eaten their work. The parent, meanwhile, never sent a descriptor, so
-    // it rolls back with its readers intact — this is the same fail-closed shape
-    // as the malformed-handoff refusal above, and it is what makes a late dial (one
-    // that arrives after the parent gave up and unlinked the socket) safe.
-    // When this successor's rendezvous claim was GRANTED, on the lane that has
-    // one. `None` on the fork lane (no rendezvous) and off macOS.
-    #[cfg(target_os = "macos")]
-    let mut handoff_claimed_at: Option<std::time::Instant> = None;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let handoff_claimed_at: Option<std::time::Instant> = None;
-    #[cfg(target_os = "macos")]
-    let out_of_band_handoff = handoff_rendezvous::rendezvous_present(&handoff_env);
-    // The proof term the PARENT hashed its expectation over — stated on the wire,
-    // because a launched attempt that fell back to the fork lane still expects
-    // device terms while the descriptors arrived by inheritance. An older parent
-    // says nothing and the lane decides, as before.
-    #[cfg(target_os = "macos")]
-    let device_proof_term =
-        handoff_rendezvous::take_device_proof_term(&mut handoff_env).unwrap_or(out_of_band_handoff);
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let device_proof_term = false;
-    #[cfg(target_os = "macos")]
-    if out_of_band_handoff {
-        /// How long this process will wait on the DIAL itself — connect, uid
-        /// check, the claim write. Short because the parent is holding the
-        /// listener open and answers immediately, or it has given up and the
-        /// connect fails at once.
-        const CLAIM_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-        /// How long this process will HOLD its claim waiting for the grant (the
-        /// one descriptor message). THE HOLD (2026-09-19, the late park): the
-        /// outgoing process accepts this dial with every one of its readers still
-        /// live and grants only once it has parked — at once for an explicit
-        /// apply, at the next quiet moment for the automatic lane, bounded by its
-        /// own hold cap (120 s) and its worker's backstop (4 min). Longer than
-        /// both, so the parent is always the one that ends a hold — by EOF, which
-        /// this side reads at once and exits on.
-        const GRANT_HOLD_BUDGET: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-        // Read, do not consume: `seamless::take_incoming_from` owns consuming
-        // this, and consuming it here would leave that call unable to
-        // authenticate the manifest it is about to read.
-        let nonce = handoff_env.string(seamless::ENV_NONCE).unwrap_or_default();
-        let dialled_at = std::time::Instant::now();
-        match handoff_rendezvous::claim_incoming(
-            &mut handoff_env,
-            &nonce,
-            handoff_rendezvous::ClaimDeadlines {
-                dial: dialled_at + CLAIM_DIAL_BUDGET,
-                grant: dialled_at + GRANT_HOLD_BUDGET,
-            },
-            // The claim goes only to the process `prearm_incoming_fds` attested
-            // (always `Some` here: a rendezvous-bearing environment that failed
-            // attestation already stopped at `rejects_boot`).
-            incoming_exec_fds.parent_pid(),
-        ) {
-            Ok(claimed) => {
-                aterm_log::info!(
-                    "overlap handoff: claimed {} PTY(s) plus the readiness and Commit channels \
-                     over the rendezvous after holding the dial {} ms; this successor owns a \
-                     launchd application job of its own",
-                    claimed.session_count(),
-                    dialled_at.elapsed().as_millis()
-                );
-                // Into the snapshot, where the fork lane's descriptors arrive:
-                // the unchanged intakes below authenticate them.
-                claimed.into_intake().install(&mut handoff_env);
-                // THE INSTANT THE FREEZE BECOMES THIS PROCESS'S PROBLEM. Under
-                // the late park the outgoing terminal froze just before this
-                // grant; everything from here to the proof is this successor's
-                // own boot, and it is the residual the next train attacks.
-                let claimed_now = std::time::Instant::now();
-                handoff_claimed_at = Some(claimed_now);
-                // THE WARM BEFORE THE DIAL (warm successor P0): what this build
-                // did ahead of its dial to shorten the freeze. Nothing yet —
-                // every part of the GUI boot still runs after the claim — so it
-                // is zero, said out loud so the phase that moves work ahead of
-                // the dial has a baseline line to change.
-                let warm_pre_dial = std::time::Duration::ZERO;
-                crate::metrics::mark_handoff_claimed(dialled_at, claimed_now, warm_pre_dial);
-                aterm_log::info!(
-                    "overlap handoff: warm {} ms pre-dial (main->dial {} ms); the claim-relative \
-                     stamps follow on the claim->proof line",
-                    warm_pre_dial.as_millis(),
-                    crate::metrics::process_main_start().map_or(0, |exec| dialled_at
-                        .saturating_duration_since(exec)
-                        .as_millis()),
-                );
-            }
-            Err(error) => {
-                // Both destinations deliberately: a launchd-launched app leaves
-                // only the log behind, and stderr is what a developer running the
-                // binary from a shell actually sees.
-                aterm_log::error!(
-                    "overlap handoff: this launch carries a rendezvous but could not claim it \
-                     ({error}); exiting before any window so the outgoing process keeps every \
-                     session"
-                );
-                crate::logging::stderr_line!(
-                    "aterm-gui: overlap handoff could not be claimed: {error}"
-                );
-                // This launch may have COUNTED a boot-trial launch for its build
-                // moments ago (`check_boot_health`, inside the boot apply above),
-                // and it is now exiting BY RULE — the outgoing process gave up
-                // before the transfer — not crashing. Give THAT launch back here,
-                // in the one process that knows it observed it (a parent-side
-                // forgive could race ahead of the observation); left counted,
-                // three such pre-transfer failures on a busy machine revert and
-                // permanently poison a healthy build. IF IT MOVED, and only then:
-                // `launch_is_burst` can suppress the count, and forgiving a
-                // launch this process did not observe erases an earlier, real
-                // crash of the same build.
-                aterm_update::forgive_trial_launch_if_advanced(
-                    build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-                    trial_launches_before_boot,
-                );
-                return;
-            }
-        }
-    }
-    // PROOF-CARRYING DSU Rung 1b — SEAMLESS adopt: if this run is an update apply that
-    // handed off a live shell (`ATERM_SEAMLESS_*`), authenticate + consume the manifest
-    // HERE while single-threaded (env mutation is only sound pre-spawn), and RE-ADOPT the
-    // still-running shell below instead of forking a fresh one. Fail-closed to a fresh
-    // spawn on any mismatch. See `crate::seamless`. The handoff also carries the
-    // outgoing window's frame (grid size + position) and each session's screen
-    // checkpoint, so the swap is visually continuous, not just process-continuous.
-    // Read before `take_incoming` consumes it: whether this launch was offered a
-    // handoff's sessions at all, which decides — once the overlap channels are
-    // judged below — whether a refused intake exits or boots fresh.
-    // THE LAUNCHER'S DESCRIPTOR LIMIT a fork-lane parent carried (round seven,
-    // item 107), recorded before any shell is spawned, so a tab this successor
-    // opens gets the launcher's soft limit rather than the raise it inherited.
-    #[cfg(target_os = "macos")]
-    if let Some(limit) = handoff_rendezvous::adopt_carried_launcher_limit(&handoff_env) {
-        aterm_log::info!(
-            "overlap handoff: new shells get the launcher's soft descriptor limit {limit}, \
-             carried by the outgoing process"
-        );
-    }
-    let incoming_offered = seamless::incoming_offered_in(&handoff_env);
-    let incoming_handoff = seamless::take_incoming_from(&mut handoff_env);
-    crate::metrics::stamp_claim(crate::metrics::ClaimStamp::Intake);
-    // Handoff files a CRASHED sender left behind (its screens, turn text and
-    // scrolled-off rows) are retired here, once, now that ours are consumed. A
-    // live sender's — a handoff in flight elsewhere — are never touched.
-    seamless::sweep_dead_handoff_leftovers();
-    // THE REPAINT COUNT, before any field moves out: the seamless landing row
-    // names the tabs adopted onto a blank screen (the 2026-09-22/23 update
-    // audit, plan P1-5), and the restore drains the set it would count.
-    let handoff_repainted_tabs = incoming_handoff.repainted_tabs();
-    let seamless_nonce = incoming_handoff.nonce.clone();
-    let seamless_layout = incoming_handoff.layout.clone();
-    // BOTH digests come from `take_incoming`, which computed them over the exact
-    // bytes it consumed from the outgoing process. Recomputing either one here
-    // from the parsed value would reintroduce the cross-version `AdoptionMismatch`
-    // (this binary's codec is not a byte fixed point on the previous binary's wire).
-    let seamless_layout_digest = incoming_handoff.layout_digest;
-    let seamless_screen_digest = incoming_handoff.screen_digest;
-    // Prove we are the binary the outgoing process authorized BEFORE any proof is
-    // computed, so a wrong-build candidate refuses loudly instead of silently
-    // producing a digest the parent cannot match.
-    let seamless_target = seamless::take_target_identity_from(&mut handoff_env);
-    #[cfg(unix)]
-    let seamless_target_admitted = seamless_target.is_some();
-    let seamless_window = incoming_handoff.window;
-    // Tokenless carried connection triples (design §1.4#6): parked on the App
-    // and re-minted once every handed-off session is registered (`about_to_wait`
-    // runs `remint_carried_connections` after the restore drains).
-    let seamless_conn_carry = incoming_handoff.connections;
-    // The drafts of a layout this build could not place: said, with their
-    // text, once the restore is done (`App::settle_carried_settings_drafts`).
-    let seamless_unplaced_drafts = incoming_handoff.unplaced_settings_drafts;
-    let mut seamless_adopt: Vec<crate::spawn::Adopted> = incoming_handoff.adopted;
-    // The held panes' final screens (round five, item 19): no descriptor, no
-    // proof — shown read-only where the layout's placeholders name them.
-    let seamless_held = incoming_handoff.held;
-    // Whose content a whole-handoff refusal was about: the refusing exit's
-    // status below (`seamless::refused_intake_exit`).
-    #[cfg(unix)]
-    let incoming_refusal = incoming_handoff.refusal;
-    // THE ADOPTED-CLAIM GRACE (round four, item 9): the adopted sessions whose
-    // claim the outgoing process could not vouch for, named now — before the
-    // restore takes session 0's shell out of the list — and handed to the
-    // supervisor host once it exists, which holds them off from its Commit
-    // resume until an external supervisor that held one has claimed it again.
-    let adopted_claim_grace: Vec<String> = seamless_adopt
-        .iter()
-        .filter(|adopted| adopted.claim_grace)
-        .map(|adopted| adopted.sid.as_str().to_string())
-        .collect();
-    // OVERLAP HANDOFF: the parked parent's readiness-pipe write fd (consume +
-    // clear, same single-threaded env discipline as `take_incoming` above). Its
-    // presence flips the boot into overlap mode: adopted readers are DEFERRED
-    // until every carried window has presented and proves exact adoption. A
-    // second private channel carries the parent's irreversible Commit; readers
-    // remain disabled between proof and Commit. Missing either half disables the
-    // protocol so a partial/spoofed wire can never authorize PTY consumption.
-    // A LAUNCH THAT CARRIES A HANDOFF IS A CANDIDATE UNTIL IT IS COMMITTED. Declared
-    // before any thread (the background check reads it), cleared by
-    // `Wake::ActivateCommittedHandoff`.
-    let ready_env_present = handoff_env.present(seamless::ENV_READY_FD);
-    let commit_env_present = handoff_env.present(seamless::ENV_COMMIT_FD);
-    aterm_update::set_uncommitted_handoff_candidate(ready_env_present || commit_env_present);
-    let overlap_channels_present = ready_env_present || commit_env_present;
-    let adopted_fds = seamless_adopt
-        .iter()
-        .map(|adopted| adopted.master.raw())
-        .collect::<Vec<_>>();
-    let ready = seamless::take_ready_fd_from(
-        &mut handoff_env,
-        seamless_nonce.clone(),
-        seamless_layout_digest,
-        seamless_screen_digest,
-        seamless_target,
-        &adopted_fds,
-    );
-    let ready_raw_fd = ready.as_ref().map(seamless::ReadySignal::raw_fd);
-    let commit = seamless::take_commit_fd_from(
-        &mut handoff_env,
-        seamless_nonce,
-        &adopted_fds,
-        ready_raw_fd,
-        incoming_exec_fds.parent_pid(),
-    );
-    // Recorded BEFORE the match consumes them: which half was refused is the
-    // entire diagnosis when a candidate exits here, and the parent can never see
-    // it (all it observes is the readiness pipe closing).
-    let (ready_admitted, commit_admitted) = (ready.is_some(), commit.is_some());
-    let (handoff_ready, handoff_commit, overlap_degraded) = match (ready, commit) {
-        (Some(ready), Some(commit)) => (Some(ready), Some(commit), false),
-        _ => (None, None, overlap_channels_present),
-    };
-    // Both halves admitted: this launch is an update's candidate, waiting for
-    // a Commit that can come.
-    let overlap_admitted = handoff_commit.is_some();
-    let handoff_reader_gate = handoff_ready
-        .is_some()
-        .then(crate::spawn::DeferredReaderGate::closed);
-    // Consume the parent's bound-endpoint witness while startup is still single
-    // threaded. A fixed-path candidate must validate it before it can paint or
-    // emit ProofReady, so malformed/missing ownership cannot become a cold bind.
-    let incoming_socket_identity = control_socket_identity::consume_incoming_from(&mut handoff_env);
-    // Every handoff name has been consumed or refused; nothing reads the
-    // snapshot past this point.
-    drop(handoff_env);
-    // Only the identity needs a use off unix: `handoff_commit` is read on every
-    // platform by `launch_posture` below (moving it here broke that read).
-    #[cfg(not(unix))]
-    let _ = &incoming_socket_identity;
-    #[cfg(unix)]
-    if handoff_reader_gate.is_some()
-        && let control_auth::SocketResolution::Enabled(plan) = control_auth::resolve_socket_plan()
-        && plan.latest_link.is_none()
-        && !incoming_socket_identity
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .is_some_and(|identity| {
-                // SAFETY: both overlap channels were admitted above. The logger
-                // is synchronous (FileLogger + Mutex<File>); the first resident
-                // worker, CommitReceiver::start_watch, starts below this check.
-                // The witness validates the original files before restoring a
-                // relative endpoint's binding directory.
-                unsafe { identity.prepare_incoming_directory(&plan) }
-            })
-    {
-        aterm_log::error!(
-            "incoming fixed-socket handoff has no matching endpoint ownership; preserving the parent"
-        );
-        crate::logging::stderr_line!(
-            "aterm-gui: incoming fixed-socket handoff has no matching endpoint ownership; preserving the parent"
-        );
-        // Boot apply may have observed this candidate's trial launch. An
-        // intentional refusal before transfer is not a crash of the build;
-        // return the observation — if there was one — just as the rendezvous
-        // refusal above does.
-        aterm_update::forgive_trial_launch_if_advanced(
-            build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-            trial_launches_before_boot,
-        );
-        // Only this uncommitted candidate exits. Its parent retains every PTY.
-        crate::crash_signal::clean_exit_now(74)
-    }
-
-    // A REFUSED INTAKE OF AN OFFERED HANDOFF EXITS TOO (round six of the update
-    // audit, item 18): with nothing adopted it used to fall through to the cold
-    // boot below while the parked parent still owned every session
-    // (`seamless::overlap_intake_exits`).
-    if seamless::overlap_intake_exits(overlap_degraded, seamless_adopt.len(), incoming_offered) {
-        // SAY WHY, DURABLY. This is the exit the parked parent reads as
-        // `ChildDied`, and a LaunchServices-launched successor has no stderr, so
-        // without this line the whole failure is a verdict with no evidence
-        // anywhere on the machine — which is exactly how it reached the field.
-        aterm_log::error!(
-            "overlap handoff: this candidate holds {} adopted session(s){} but the overlap \
-             authority is incomplete (readiness channel {}, Commit channel {}); closing every \
-             adopted master and exiting before any window so the outgoing process keeps every \
-             session. This binary is build {} commit {}.",
-            seamless_adopt.len(),
-            if seamless_adopt.is_empty() {
-                " (the intake refused the whole handoff it was offered; the reason is logged \
-                 above)"
-            } else {
-                ""
-            },
-            if ready_admitted {
-                "admitted"
-            } else {
-                "REFUSED"
-            },
-            if commit_admitted {
-                "admitted"
-            } else {
-                "REFUSED"
-            },
-            build_info::BUILD_NUMBER,
-            build_info::GIT_COMMIT
-        );
-        // Recognizable overlap plus malformed/partial authority must never
-        // fall through to eager adopted readers. Close every child duplicate
-        // (each `Adopted` closes its master as it drops) and exit this
-        // candidate before any session/thread spawn; the parked parent observes
-        // proof EOF/child death and resumes its sole readers.
-        #[cfg(unix)]
-        let adopted_count = seamless_adopt.len();
-        drop(seamless_adopt);
-        // …AND SAYS WHY WITH ITS STATUS when the refusal was a moment (round
-        // four, plan item 2): a boot swap deferred on a held lock or a
-        // verification that ran out of time left this image the old build, so
-        // the target was refused — which the parent must retry, not converge.
-        // The masters are closed above; `_exit` is the fail-stop the fixed-socket
-        // refusal above already takes, and nothing past this point has started.
-        #[cfg(unix)]
-        if let Some(code) = seamless::passing_refusal_exit(
-            &boot_apply,
-            target_names_this_build,
-            seamless_target_admitted,
-        ) {
-            aterm_log::warn!(
-                "overlap handoff: the boot swap into the authorized build was deferred for a \
-                 passing reason ({boot_apply:?}); exiting {code} so the outgoing process \
-                 retries on its transient schedule instead of filing a verdict on the build"
-            );
-            crate::crash_signal::clean_exit_now(code)
-        }
-        // …AND WHEN THE REFUSAL WAS THE OUTGOING BUILD'S CONTENT (round six,
-        // item 18, review round two): an unreadable or over-cap manifest, a
-        // nonce for another attempt, missing channel or layout variables. Not
-        // this candidate's bytes, so not a structural verdict on them.
-        #[cfg(unix)]
-        if let Some(code) = seamless::refused_intake_exit(adopted_count, incoming_refusal) {
-            aterm_log::warn!(
-                "overlap handoff: the intake refused the outgoing build's handoff artifacts; \
-                 exiting {code} so the outgoing process retries on its transient schedule \
-                 instead of filing a verdict on this build"
-            );
-            crate::crash_signal::clean_exit_now(code)
-        }
-        return;
-    }
-    // SEC-1: establish the containment mode ONCE, here in the trusted launcher,
-    // before any subsystem (the spawn seam, the control socket) queries it. The
-    // launcher owns the mode (ATERM_DESIGN §5): `--containment` / `--sandbox` /
-    // `--no-sandbox` select it, defaulting to `User` (standard safeguards). A
-    // bad/unparseable value fails closed to `Containment`, the most restrictive
-    // mode, and says so rather than silently widening.
-    let containment_mode = aterm_containment::init_mode_from_flag(
-        cli::launch_flags().containment.as_deref(),
-        ContainmentMode::User,
+/// Where the warm prologue runs (warm successor P2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the launched lane (macOS) warms before its dial"
     )
-    .unwrap_or_else(|e| {
-        // The session's words (aterm-cli `session_main`): the accepted values, not an
-        // echo of what was typed.
-        if matches!(e, aterm_containment::InitModeFromFlagError::Parse(_)) {
-            crate::logging::stderr_line!(
-                "aterm-gui: --containment takes master, user, safety or containment; \
-                 using containment"
-            );
-        } else {
-            crate::logging::stderr_line!("aterm-gui: {e}; using containment");
-        }
-        // The parse error happened before init_mode ran, so the OnceLock is
-        // still unset — set it to the fail-closed default now and proceed.
-        let _ = aterm_containment::init_mode(ContainmentMode::Containment);
-        ContainmentMode::Containment
-    });
-    if verbose() {
-        crate::logging::stderr_line!("aterm-gui: containment mode = {containment_mode}");
-    }
-    // --headless: bind the control socket and run the engine + offscreen
-    // renderer without ever opening a window (clean automated introspection).
-    // The flag is the one spelling and nothing is exported, so a nested `aterm`
-    // typed inside this instance is a SESSION (or its own explicit window) —
-    // never a surprise headless engine.
-    //
-    // The announcement is the point. A harness that arms headless and then waits
-    // for a control socket has exactly two failure modes — the socket never binds,
-    // or the mode never armed — and they are indistinguishable from an empty log,
-    // so an armed launch SAYS it is headless.
-    let headless = headless_flag;
-    if headless {
-        crate::logging::stderr_line!(
-            "aterm-gui: headless mode (--headless): no window; engine + control socket only"
-        );
-    }
-    // Process-wide, before anything could raise a modal or any session
-    // spawns: a headless process presents no OS UI (`menu::os_ui_refused`),
-    // whatever path asks, and never runs the agent primer against the `$HOME`
-    // it inherited.
-    if headless {
-        menu::mark_process_headless();
-        spawn::mark_headless_instance();
-    }
-    // Every process-environment mutation is now complete. Start the modern
-    // Commit channel's parent-liveness watcher before any session/helper spawn:
-    // parent EOF at preproof, ProofReady, or pre-Commit fail-stops this
-    // readerless candidate. A watcher allocation failure rejects the candidate
-    // before it can consume or expose an adopted PTY.
-    #[cfg(unix)]
-    let handoff_commit = if let Some(commit) = handoff_commit {
-        let Some(watched) = commit.start_watch() else {
-            // Same sink discipline as the degraded exit above: this is another
-            // silent `ChildDied` from the parent's side unless it is written down.
-            aterm_log::error!(
-                "overlap handoff: the parent-liveness watcher for the Commit channel could not \
-                 start; closing every adopted master and exiting before any window so the \
-                 outgoing process keeps every session"
-            );
-            drop(seamless_adopt);
-            return;
-        };
-        Some(watched)
+)]
+pub(crate) enum WarmOrder {
+    /// Before the rendezvous dial: the launched lane. The prologue overlaps the
+    /// outgoing process's live terminal, and the dial — which the outgoing
+    /// process parks on — comes once the successor is warm.
+    BeforeDial,
+    /// After the intake, where it always ran: a cold launch, the fork lane,
+    /// and the one launched shape whose intake must still find the process
+    /// single-threaded (below).
+    AfterIntake,
+}
+
+/// THE ONE SWITCH for P2's order. `false` puts every launch back on
+/// [`WarmOrder::AfterIntake`] — the order before P2, byte for byte.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the launched lane (macOS) warms before its dial"
+    )
+)]
+const WARM_BEFORE_DIAL: bool = true;
+
+/// Where this launch runs its warm prologue.
+///
+/// `rendezvous`: this launch carries a rendezvous (the launched lane, macOS).
+/// `explicit_socket`: the `--control-sock` path, when one was given.
+///
+/// BEFORE THE DIAL only on the launched lane, and NOT when the control socket
+/// is an explicit RELATIVE path: that intake restores the parent's binding
+/// directory with a `chdir` (`ControlSocketIdentity::prepare_incoming_directory`),
+/// whose safety contract is a single-threaded process — a warm thread reading
+/// a relative font or feed path would be redirected under it
+/// (`NoCwdChangeAfterSpawn`). That shape keeps today's order. A cold launch and
+/// the fork lane have no dial, and keep it too.
+#[must_use]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the launched lane (macOS) warms before its dial"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "native_update_successor_warm_before_claim",
+        action = "SpawnWarm",
+        project = "aterm_gui::seamless::handoff_env_conformance::project"
+    )
+)]
+pub(crate) fn warm_order(rendezvous: bool, explicit_socket: Option<&str>) -> WarmOrder {
+    let relative_socket =
+        explicit_socket.is_some_and(|path| std::path::Path::new(path).is_relative());
+    if WARM_BEFORE_DIAL && rendezvous && !relative_socket {
+        WarmOrder::BeforeDial
     } else {
-        None
-    };
-    // Block SIGUSR1 process-wide FIRST — before spawning ANY thread (the font-warm
-    // thread just below, the backend-build thread, and the per-tab reader/clipboard
-    // threads later all inherit the calling thread's mask AT SPAWN TIME). A dedicated
-    // thread sigwait()s SIGUSR1 for a self-introspection snapshot; its default action
-    // is to terminate the process, so if the block does not precede these spawns a
-    // `kill -USR1` landing in the ~200 ms startup window could be delivered to a
-    // worker thread that never blocked it and kill aterm instead of snapshotting.
-    // unix-only: Windows has no SIGUSR1 — the snapshot stays reachable there via
-    // the control-socket `image` verb (introspection convenience, not a posture).
-    // SAFETY: async signal-mask setup on a stack-local, sigemptyset-initialized set.
-    #[cfg(unix)]
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGUSR1);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
+        WarmOrder::AfterIntake
     }
-    // NOTE (thread-safety floor): the font-warm spawn that used to live HERE was the
-    // process's first thread. It moved to the first-present hook in `app_render.rs`
-    // and was then DELETED there: every GUI generation is sealed before its first
-    // pixel, and a sealed generation never consults the coverage index the warm
-    // built (see the note in `app_render.rs` where the spawn used to be). The
-    // single-threaded-process requirement of the env mutations above
-    // (`HandoffEnv::capture`, the `ATERM_UPDATED_FROM` clear) still holds: NO
-    // process-env mutation past this line, and no thread spawns before it. The
-    // handoff intake itself no longer mutates the environment at all (it reads
-    // the snapshot), so it is not what pins this floor.
+}
+
+/// The px the backend join must re-select because the backend was built at a
+/// different one — a warm MISS (warm successor P2): the prologue ran before
+/// the dial at the launch hint's zoom, and the authenticated carry's differs.
+/// `None` when the build size is the launch size (every cold launch, every
+/// late-order launch, and every hint that was right).
+#[must_use]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "native_update_successor_warm_before_claim",
+        action = "Reshape",
+        project = "aterm_gui::seamless::handoff_env_conformance::project"
+    )
+)]
+pub(crate) fn warm_miss_px(built_px: f32, launch_px: f32) -> Option<f32> {
+    ((built_px - launch_px).abs() >= 0.5).then_some(launch_px)
+}
+
+/// What the warm prologue built, handed back to `main_entry` (warm successor
+/// P2, docs/DESIGN-warm-successor-2026-09-29.md §2). Every field is claim-
+/// independent: read-only state or state this process owns alone.
+struct WarmPrologue {
+    native_config_service: native_config_service::VersionedConfigService,
+    startup_config_snapshot: native_config_service::ConfigSnapshot,
+    config: app_config::Config,
+    tab_strip_rows: u16,
+    resolved_font: (f32, bool),
+    build_font: app_config::LaunchFont,
+    headless_scale: f64,
+    want_gpu: bool,
+    defer_gpu: bool,
+    defer_seal: bool,
+    theme: Theme,
+    font_family: Option<String>,
+    backend_handle: std::thread::JoinHandle<(Backend, bool, bool)>,
+    font_config: app_config::FontConfig,
+    font_cfg_warns: Vec<String>,
+    font_variations: Vec<(u32, f32)>,
+    vf_warns: Vec<String>,
+    raster_knobs: app_config::GlyphRasterKnobs,
+    config_runtime_handle:
+        std::io::Result<std::thread::JoinHandle<app_config::PreparedPathFeedGeneration>>,
+    env_add: Vec<(String, String)>,
+    integrate: bool,
+    sandbox_wrap: Option<String>,
+    spawn_cap: aterm_cap::Cap<aterm_cap::effects::Spawn>,
+    sandbox_cap: aterm_cap::Cap<aterm_sandbox::Sandbox>,
+    document_write_cap: aterm_cap::Cap<aterm_buffer::BufferWrite>,
+}
+
+/// THE WARM PROLOGUE (warm successor P2, docs/DESIGN-warm-successor-2026-09-29.md
+/// §2): every claim-independent part of the boot that needs no event loop —
+/// the config service snapshot and theme, the font resolution, the backend
+/// worker (device, pipelines, font seal, the first window's ASCII warm), the
+/// chrome-font warm, the config-runtime worker, the reroute and agents
+/// directories, the spawn environment, the containment decision and the
+/// launcher's capability mint.
+///
+/// `main_entry` runs it at ONE of two points ([`warm_order`]): before the
+/// rendezvous dial on the launched lane, so it overlaps the outgoing process's
+/// live terminal instead of its freeze; else after the intake, where it always
+/// ran. It takes nothing the outgoing process owns — the control socket, the
+/// keeper, the crash journal, the restore manifest, the update service and
+/// the message-log writer all stay after the claim (`NothingOwnedBeforeClaim`
+/// in `NativeUpdateSuccessorWarmBeforeClaim`) — and it mutates no process
+/// environment: every such mutation precedes the first thread it spawns.
+///
+/// `zoom` is the font zoom pair the backend is built at: the authenticated
+/// carry's on the late order, the advisory launch hint's before the dial.
+#[allow(
+    clippy::too_many_lines,
+    reason = "moved verbatim out of `main_entry` (warm successor P2); splitting it further \
+              would re-thread two dozen launch values through more signatures"
+)]
+fn warm_prologue(
+    headless: bool,
+    runs_a_command: bool,
+    zoom: (Option<u32>, Option<u32>),
+) -> WarmPrologue {
     // Capture user config ONCE. The service validates the text and resolves the
     // bounded theme/rainbow kitty portion; the parallel config-runtime worker below
     // admits Trail/Sparkle feeds as one exact generation before publication.
@@ -39418,7 +38988,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // (the table's one reader reads a file that is not TOML line by line), so
     // a limit the owner wrote there holds from the first frame.
     let mut launch_harness = None;
-    let mut native_config_service = native_config_service::VersionedConfigService::load_current()
+    let native_config_service = native_config_service::VersionedConfigService::load_current()
         .unwrap_or_else(|error| {
             crate::logging::stderr_line!("aterm-gui: native config service: {error}");
             launch_harness = Some(app_config::HarnessPolicy::read_path(
@@ -39432,38 +39002,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     if let Some(harness) = launch_harness {
         config.harness = harness;
     }
-    // Initial grid size: `--columns`/`--lines` win, else config `columns`/`lines`,
-    // else 24×80 — all clamped sane. This is the TERMINAL grid; the window is
-    // grown by `tab_strip_rows` extra pixel rows for the tab strip (`resumed`), so
-    // the terminal keeps its configured `lines`.
-    // SEAMLESS WINDOW CARRY: an update re-exec's first window reappears at the
-    // OUTGOING window's grid size (and, below at window creation, its position)
-    // instead of config defaults — the frame half of "the update looks like
-    // nothing happened". THE CARRY OUTRANKS THE FLAGS on a handoff boot: the
-    // successor inherits the parent's LAUNCH argv (`--columns` included), and
-    // resurrecting the launch size over the user's current resized grid is a
-    // visible frame jump at the swap instant. `carry_frame` is `Some` only after
-    // an authenticated `take_incoming`, so fresh launches keep flag > config >
-    // default exactly.
-    let carry_frame = seamless_window.clone();
-    let cols = carry_frame
-        .as_ref()
-        .map(|w| w.cols)
-        .unwrap_or_else(|| app_config::resolve_initial_columns(&config))
-        .clamp(20, 500);
-    let rows = carry_frame
-        .as_ref()
-        .map(|w| w.rows)
-        .unwrap_or_else(|| app_config::resolve_initial_lines(&config))
-        .clamp(5, 300);
-    // THE CARRIED STATUS-BAR ROWS (2026-09-07): the outgoing window reserved
-    // these above its grid, so this window reserves the same BEFORE it is
-    // sized — the grid rows above are the same either way, but without this the
-    // window itself came up one row shorter per bar at the swap instant.
-    // `chrome_rows` reads the committed count from the first frame on.
-    let carried_status_bar_rows = carry_frame
-        .as_ref()
-        .map_or(0, |w| w.status_bar_rows.min(aterm_messages::MAX_ROWS));
     // Rows reserved at the TOP of the window for the visible tab strip (env > config
     // > default 1). `0` is the byte-identical no-strip path.
     let tab_strip_rows = resolve_tab_strip_rows(&config);
@@ -39490,17 +39028,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .round()
             .clamp(FONT_PX_MIN, FONT_PX_MAX);
     }
-    // THE CARRIED FONT ZOOM (round four, item 15): a successor draws at the
-    // px its parent's person had zoomed to, pinned as a live zoom pins it, and
-    // Cmd-0 goes back to the parent's reset size — decided HERE, before the
-    // backend is built and the first window sized, because the carried
-    // `rows`/`cols` above are that zoomed grid. Fresh launches (no carry) and
-    // unzoomed parents keep exactly the size derived above.
+    // THE BUILD FONT (warm successor P2). The backend worker below builds and
+    // pre-warms at this size. On the late order it is the carried zoom exactly
+    // as before (`zoom` is the authenticated carry's pair); before the dial the
+    // carry does not exist yet, and `zoom` is the advisory launch hint's pair
+    // (`handoff_warm_hint`) — a guess the intake corrects: `main_entry` derives
+    // the launch font from the carry again after the intake and, on a miss,
+    // re-selects the carried size at the backend join (`App::warm_miss_px`).
+    // The flag/config size it starts from is returned beside it for that.
+    let resolved_font = (font_px, font_px_explicit);
+    let build_font = app_config::launch_font_for_zoom(font_px, font_px_explicit, zoom.0, zoom.1);
     let app_config::LaunchFont {
         px: font_px,
         explicit: font_px_explicit,
-        reset_px: default_font_px,
-    } = app_config::successor_font_px(font_px, font_px_explicit, carry_frame.as_ref());
+        reset_px: _,
+    } = build_font;
     // GPU (Metal) is the DEFAULT on macOS: the CPU renderer re-rasterizes every
     // glyph on heavy full-screen colour output (the dominant per-frame cost for
     // streaming TUIs like Claude Code), while the GPU path re-encodes cached glyph
@@ -39627,7 +39169,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // its return; `font_family` is seeded optimistically and corrected at the
     // join (`finalize_backend` windowed, the early join headless) before any
     // rebuild can read it.
-    let mut font_family = requested_font_family;
+    let font_family = requested_font_family;
     // Cold-launch overlap (#7): the backend build — GPU adapter/device init + font
     // resolve/raster, the two dominant serial startup costs — shares NO state with
     // the PTY spawn / engine / event loop, so build it on a background thread and
@@ -40115,7 +39657,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // rc and adds the marks; its loader vars are appended per session. No shell
     // integration when `-e` runs a command directly: there is no interactive shell to
     // inject OSC 133/633 marks into.
-    let integrate = exec_command.is_none() && !cli::launch_flags().no_shell_integration;
+    let integrate = !runs_a_command && !cli::launch_flags().no_shell_integration;
     // NESTED ATERM (aterm launched from a shell that itself runs inside aterm —
     // every dev/verification probe rig, and any user nesting terminals): the
     // parent terminal's integration script `export`s its load-once guard
@@ -40196,6 +39738,1024 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // only through this cap (see `document_store.rs`).
     let document_write_cap = authority.grant::<aterm_buffer::BufferWrite>(aterm_cap::Tier::Trusted);
 
+    WarmPrologue {
+        native_config_service,
+        startup_config_snapshot,
+        config,
+        tab_strip_rows,
+        resolved_font,
+        build_font,
+        headless_scale,
+        want_gpu,
+        defer_gpu,
+        defer_seal,
+        theme,
+        font_family,
+        backend_handle,
+        font_config,
+        font_cfg_warns,
+        font_variations,
+        vf_warns,
+        raster_knobs,
+        config_runtime_handle,
+        env_add,
+        integrate,
+        sandbox_wrap,
+        spawn_cap,
+        sandbox_cap,
+        document_write_cap,
+    }
+}
+
+/// The whole windowed terminal as a callable: `argv[1..]` in, runs the window
+/// (or headless engine) to completion. Called by the ONE `aterm` binary when
+/// the launch is window-shaped (no TTY, `--window`, `--headless`, a Finder
+/// launch, or the `aterm-gui` argv0 alias) and by the thin dev-only
+/// `aterm-gui` bin. Verb routing happens in the caller — this entry is purely
+/// the window.
+pub fn main_entry(argv: Vec<std::ffi::OsString>) {
+    // Compatibility-stable GUI-entry clock. The one-binary router separately
+    // anchors its broader Rust-main boundary before dispatch.
+    metrics::mark_process_start();
+    // Before any window exists: every present from here on reports its
+    // compositor leg (`metrics::install_present_glass_sink`).
+    metrics::install_present_glass_sink();
+    // THE HANDOFF ENVIRONMENT SNAPSHOT (docs/DESIGN-warm-successor-2026-09-29.md
+    // §1): every `ATERM_SEAMLESS_*` / `ATERM_HANDOFF_*` name is read AND CLEARED
+    // here, once, while this process has exactly one thread. That is the only
+    // process-env mutation the handoff makes in a successor; every reader below
+    // — the prearm, the boot apply's re-exec, the rendezvous claim, the intakes —
+    // works on `handoff_env`, so where the claim sits no longer matters to env
+    // soundness (`tools/grep_guard.sh` B20 fences the rest of the crate).
+    let mut handoff_env = handoff_env::HandoffEnv::capture();
+    // Child-copy fd posture must be repaired before the updater spawns any
+    // codesign/PlistBuddy/spctl helper. The updater receives this exact list
+    // solely for its final same-process exec and re-arms it on exec failure.
+    let incoming_exec_fds = seamless::prearm_incoming_fds_from(&mut handoff_env);
+    if incoming_exec_fds.rejects_boot() {
+        // A malformed but recognizable inherited handoff is neither a cold
+        // start nor safe update authority. `prearm_incoming_fds` has already
+        // closed every enumerable named descriptor exactly once and cleared the
+        // authority environment. Stop before helpers, sessions, or user code can
+        // reuse one of those descriptor numbers.
+        crate::logging::stderr_line!("aterm-gui: rejected malformed inherited handoff");
+        return;
+    }
+    // A GUI-subsystem exe (see the binaries' `windows_subsystem` attribute) has
+    // no console; reattach to the parent's FIRST — before any print — so
+    // `--help`/`--version` and startup diagnostics reach a launching console.
+    // The LATCH, not this call's answer, says whether the process attached: the
+    // ONE binary's router attached before dispatching here, and this call then
+    // finds the handles it installed and attaches nothing.
+    #[cfg(windows)]
+    let _ = win32::attach_parent_console();
+    #[cfg(windows)]
+    let attached_console = win32::attached_a_console();
+    // Windows app identity: set the process AUMID before any window shows so the
+    // taskbar groups aterm under one button and matches the Start-Menu shortcut's
+    // AppUserModelID (design §6). Harmless on a console `--version` run.
+    #[cfg(windows)]
+    win32::set_app_user_model_id();
+    // Windows lifecycle: opt into OS-driven relaunch (update reboot / "restart
+    // apps after sign-in" / post-crash), paired with the end-session manifest
+    // save in `platform_win` so the relaunched process restores the session.
+    #[cfg(windows)]
+    win32::register_application_restart();
+    // Raise the timer resolution to 1ms so the winit `WaitUntil` deadlines that pace
+    // every animation (the cursor-trail comet, blink) land on a steady cadence instead
+    // of Windows' coarse ~15.6ms default grid — the fix for the "gappy/laggy" trail and
+    // tighter input→present timing. See `win32::raise_timer_resolution`.
+    #[cfg(windows)]
+    win32::raise_timer_resolution();
+    // CLI first: `-e <cmd>` to run a command instead of $SHELL, `-d <dir>` to set
+    // the working directory; `--help`/`--version` print and exit before any setup.
+    // A Finder/.app launch passes no args, so this is a no-op there and a normal
+    // interactive shell starts.
+    let Cli {
+        exec_command,
+        cwd,
+        hold,
+        headless: headless_flag,
+        lifeline_fd,
+        launch,
+    } = parse_cli(argv);
+    // A harness's lifeline (`--lifeline-fd`, headless only — the parser refused it
+    // anywhere else): taken over NOW, while nothing has been spawned that could
+    // inherit the number, and watched once the event loop exists (below).
+    #[cfg(unix)]
+    let lifeline = lifeline_fd.map(lifeline::adopt_or_exit);
+    #[cfg(not(unix))]
+    let _ = lifeline_fd;
+    // Before anything resolves a renderer, a font or a scale.
+    crate::launch::install(launch);
+    // THE CLI PARSE WAS THE LAST THING THE LAUNCHING CONSOLE WAS OWED. Every
+    // print-and-exit flag has exited above; what follows opens a window (or the
+    // headless engine). A windowed image launched from a shell ATTACHED to
+    // that shell's console — which has already returned to its prompt, since
+    // a GUI-subsystem child is not waited for — and every line it printed
+    // from here on landed on the line being edited (2026-09-22 audit, defect c:
+    // `aterm-gui: GPU rendering on …`, `control socket listening at …`). Give
+    // the console back now, for a WINDOW launch only: a headless launch's
+    // announcement and socket path are read by whoever ran it. Headless is the
+    // `--headless` flag alone (the `$ATERM_HEADLESS` spelling is gone). The
+    // console image running a window in-process (dev `cargo run`) inherited a
+    // real console, attached nothing, and keeps printing.
+    #[cfg(windows)]
+    if win32::attached_console_is_released_for(attached_console, headless_flag) {
+        win32::release_attached_console();
+    }
+    // Diagnostics first, before any thread spawns: without a logger every
+    // aterm_log record — including containment_audit denials — is discarded.
+    // The crash marker is armed here too, and it has to know what this start
+    // is: only the installed app running windowed — once past its Commit, when
+    // it came through an update handoff — leaves a marker whose empty corpse is
+    // reported as "aterm was killed" (`crash_signal::Arming`). Headless is the
+    // `--headless` flag alone — the one spelling, armed further down.
+    let launch_arming = crash_signal::Arming::for_launch(
+        aterm_update::which_copy::running_kind() == aterm_update::which_copy::Running::InstalledApp,
+        headless_flag,
+        incoming_exec_fds.parent_pid().is_some(),
+    );
+    logging::init(launch_arming);
+    // atpkg's unasked notices (a config it cannot read, a prefix it will not use, a lay
+    // that is not provenance-clean) are aterm.log records here, before the first atpkg
+    // call: a window typed into a shell must not print into it.
+    atpkg::notice::to_host_log();
+    // THE MESSAGE LOG (docs/DESIGN-unified-messages-2026-09-21.md §3.7): the
+    // tail of `messages.log` is read right after the logger, so a reporter
+    // that speaks before `App` exists (the crash reporter, Phase 3) posts into
+    // a loaded ring and its ids continue from the file's. The writer opens at
+    // construction, after the compaction check. A `--headless` run records
+    // too (design §3.7): it is a real process under the person's log dir,
+    // driven by `aterm ctl appnotice` and the socket tests; only a test's
+    // `App::headless_for_test` has no writer.
+    let messages_loaded =
+        messages_store::path().map(|path| (messages_store::load_for_launch(&path), path));
+    // The event-loop thread never waits for an iCloud Drive download (macOS;
+    // no-op elsewhere): a dataless read on THIS thread fails fast as
+    // `NotDownloaded` instead of stalling into the watchdog. Thread-scoped, so
+    // the document admission workers that opt back in are unaffected.
+    if let Err(errno) = dataless_files::main_thread_never_materializes() {
+        logging::stderr_line!(
+            "aterm-gui: could not disable dataless-file materialization on the main \
+             thread (errno {errno}); an evicted iCloud file may still stall it"
+        );
+    }
+    // And the Objective-C exception-containment sink right behind it, so a
+    // contained NSException lands in aterm.log with its method, name, reason
+    // and call stack from the first turn of the run loop.
+    #[cfg(target_os = "macos")]
+    logging::install_objc_containment_sink();
+    // B3 — PROCESS-GROUP CONTAINMENT, successor side (see
+    // `tests/handoff_launchd_job.rs` and `app_update_handoff`). A process that
+    // arrived through an update handoff is a CANDIDATE: the parent that started
+    // it may reject it and reap it with `kill(-pid)`, and that sweep reaches the
+    // ditto/codesign/spctl helpers the update logic forks only while this process
+    // leads its own process group. A candidate we were FORKED as already leads
+    // one — `run_handoff_worker`'s `pre_exec` established it before this image
+    // ran, so the call below is a second, no-op success — but a candidate LAUNCHED
+    // through LaunchServices is launchd's child, where no pre-exec hook of the
+    // parent's can run, so it has to contain ITSELF.
+    //
+    // ORDERING, which is the obligation `contain_own_process_group` names: the
+    // NEXT statement is the boot apply, and that is the first point at which this
+    // process runs another program at all (`aterm_update::install` runs
+    // /usr/bin/ditto, /usr/bin/hdiutil and codesign, then re-execs). Nothing
+    // ahead of it does: the one-binary router that dispatched here matches argv0,
+    // resolves a store shim by readlink and probes the TTY; this entry then marks
+    // the clock, repairs fd/env posture, parses the CLI and starts the logger. So
+    // there is no instant at which an updater helper of ours is outside the group
+    // — which is the whole of what the parent's sweep has to reach.
+    //
+    // GATE: `parent_pid()` is `Some` exactly for a recognized AND validated
+    // incoming handoff (the malformed shape already returned at `rejects_boot`),
+    // which is exactly the set of processes somebody may `kill(-pid)`. A cold
+    // start keeps whatever group its launcher chose: moving one out would take a
+    // shell-launched window out of its job-control group — out of reach of that
+    // terminal's Ctrl-C, and out of a test harness's group cleanup — and buys
+    // nothing, since nobody sweeps a group for a process that is not a candidate.
+    // A future lane that names the candidate over the control socket instead of
+    // through the environment (B4) has to extend this gate with it.
+    //
+    // FAIL CLOSED: a candidate that cannot lead its own group would fork helpers
+    // that no reaper could sweep, so it does not run the update logic at all. It
+    // returns here — before the boot apply, with no helper forked and no adopted
+    // descriptor consumed — and the parked parent sees proof EOF (`ChildDied`),
+    // rejects, and resumes its own readers. That is the same shape as the
+    // malformed-handoff refusal above, and it keeps the property by making the
+    // set of helpers empty rather than by claiming a sweep that would not work.
+    #[cfg(unix)]
+    if incoming_exec_fds.parent_pid().is_some()
+        && let app_update_handoff::ProcessGroupContainment::Foreign { group, own } =
+            app_update_handoff::contain_own_process_group()
+    {
+        // Both destinations deliberately: the log file is all a launchd-launched
+        // app leaves behind, and stderr is what a developer running the binary
+        // from a shell actually sees. A silent refusal here would present as an
+        // update that simply never happened.
+        aterm_log::error!(
+            "handoff candidate cannot lead its own process group (kernel reports pgid {group} for \
+             pid {own}); refusing to start update logic whose helpers no reaper could sweep"
+        );
+        crate::logging::stderr_line!(
+            "aterm-gui: handoff candidate could not contain its own process group"
+        );
+        return;
+    }
+    // Self-update apply, BEFORE any thread spawn or window: if a previous run
+    // staged a verified, strictly-newer build, swap aterm.app in place and re-exec
+    // the new binary (never returns on success). A no-op for dev/`cargo run`
+    // builds, when nothing is staged, or when the updater is disabled/unpinned —
+    // see crate aterm-update. Running here keeps the env-var loop-guard single-
+    // threaded and avoids swapping a bundle with the engine already live.
+    // The successor half of the park->dial split (the worker logs the other half).
+    // The parent's readers are still parked for every millisecond spent in here.
+    //
+    // WHAT THIS NUMBER IS NOT. It is only the POST-SWAP prologue. On a download
+    // lane the parent launches the current binary, so the FIRST image dittos the
+    // bundle and `execve`s from inside `apply_staged_if_ready_*` — which never
+    // returns — and therefore never reaches this line. The image that logs here
+    // is the re-exec'd one, whose apply is a fast `NoUpdate`. The swap's own
+    // cost is logged by the image that pays it, from `aterm-update`'s
+    // `install.rs` ("applied update … in N ms … → re-launching").
+    let boot_apply_at = std::time::Instant::now();
+    // THE SNAPSHOT THE FORGIVE IS MEASURED AGAINST (2026-09-19, review round 1).
+    // The two refusals below hand this launch's counted boot-trial back, and
+    // under the late park that is the ROUTINE end of an attempt (the outgoing
+    // process stands a held successor down whenever the terminal never goes
+    // quiet, a teardown arrives, or its park misses), not the rare give-up it
+    // was. `check_boot_health` does not always count: `launch_is_burst`
+    // suppresses the count when the sentinel already stands above zero inside
+    // the burst window, so a successor booting seconds after a genuinely CRASHED
+    // candidate of the same build would have given back the crash's launch — the
+    // one signal the sentinel exists to keep. Take the count before the apply and
+    // forgive only a launch that provably moved, exactly as the parent does.
+    #[cfg(unix)]
+    let trial_launches_before_boot =
+        aterm_update::trial_launch_count(build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0));
+    // Read once, before the apply: the apply's own gate and the refusal's exit
+    // status below (`seamless::passing_refusal_exit`) must agree on whether this
+    // image is the authorized target.
+    let target_names_this_build = seamless::target_identity_names_this_build(&handoff_env);
+    let boot_apply = if incoming_exec_fds.blocks_boot_apply() {
+        aterm_update::ApplyOutcome::NotApplicable
+    } else if linux_launch_without_a_window(headless_flag) {
+        aterm_update::ApplyOutcome::NoUpdate
+    } else {
+        // WHEN WE ARE THE AUTHORIZED CANDIDATE (the outgoing process's target names
+        // this build — an activation successor, or a download successor already
+        // swapped and re-exec'd into its target) the updater still runs its whole
+        // startup prologue — consuming the re-exec nonce and stamp, counting the
+        // boot-trial launch, settling startup authority — but refuses to SWAP: a
+        // newer stage on disk re-exec'd from here would be a build the parent did
+        // not authorize, and that image would refuse the target, drop the adopted
+        // PTYs and be booked as ChildDied against a healthy candidate. Skipping the
+        // call outright was tried and left ATERM_UPDATE_REEXEC and its stamp
+        // unconsumed, which made the NEXT apply from the survivor a silent no-op.
+        aterm_update::apply_staged_if_ready_preserving_fds_exact(
+            build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+            build_info::GIT_COMMIT,
+            incoming_exec_fds.final_exec_fds(),
+            // The snapshot's names ride the re-exec exactly as they rode
+            // `environ` before it existed, then the attested parent's pair.
+            &incoming_exec_fds.final_exec_env_with(&handoff_env),
+            target_names_this_build,
+        )
+    };
+    // Logged for EVERY outcome, the quiet ones included: a `NoUpdate` that took a
+    // second is exactly the finding that would justify moving this work, and the
+    // arm below is silent about it by design.
+    if incoming_exec_fds.parent_pid().is_some() {
+        // WHOSE TIME THIS SPENDS depends on the lane, and the sentence used to
+        // name only one of them. On the FORK lane the outgoing process parked
+        // before it spawned, so every millisecond here is frozen terminal. Under
+        // the LATE PARK it is the opposite: this runs before the dial, with every
+        // one of the outgoing process's readers live, which is the whole point of
+        // moving the park — so reporting it as freeze would send the next reader
+        // of this log after the wrong second.
+        // The rendezvous is the late park's marker and it is macOS-only, like the
+        // launched lane itself; every other unix has only the fork lane, where
+        // the park always precedes the spawn.
+        #[cfg(target_os = "macos")]
+        let late_park = handoff_rendezvous::rendezvous_present(&handoff_env);
+        #[cfg(not(target_os = "macos"))]
+        let late_park = false;
+        let lane = if late_park {
+            "with the outgoing process's readers still LIVE (the late park; before the dial)"
+        } else {
+            "with the outgoing process's readers parked"
+        };
+        aterm_log::info!(
+            "update apply (boot): {boot_apply:?} in {} ms — this ran {lane}",
+            boot_apply_at.elapsed().as_millis(),
+        );
+    }
+    match boot_apply {
+        aterm_update::ApplyOutcome::NotApplicable | aterm_update::ApplyOutcome::NoUpdate => {}
+        // BOTH sinks, deliberately. `eprintln!` alone put every boot-lane refusal on a
+        // stderr nobody reads: a Finder-launched .app has no terminal attached, so
+        // "Deferred/Blocked/Failed at boot" — the exact outcomes that explain why an
+        // update the user can SEE staged never applied — left no durable trace anywhere.
+        // The log is the durable one; stderr stays for a TTY launch.
+        ref other => {
+            aterm_log::warn!("update apply (boot): {other:?}");
+            crate::logging::stderr_line!("aterm-gui: update apply: {other:?}");
+        }
+    }
+    // Post-update handoff: `ATERM_UPDATED_FROM` is set by the
+    // in-session handoff lane on the successor it launches (`app_update_handoff`)
+    // and, since 2026-09-14, by the boot apply's own re-exec
+    // (`install::boot_reexec_command`), so its presence means "this run is the
+    // result of an update apply" on every lane. Record that
+    // fact for the landing record and CLEAR the env HERE
+    // — still single-threaded, before any session/shell spawn — so it never leaks to the
+    // user's shell children.
+    let updated_from = std::env::var_os("ATERM_UPDATED_FROM");
+    // A SAME-IMAGE handoff (the QA seam's) is not a level-up, and must not claim one: its
+    // successor is the build it replaced. Narrowed to "present AND naming a different
+    // build".
+    let just_updated = updated_from
+        .as_deref()
+        .is_some_and(|from| from != std::ffi::OsStr::new(crate::build_info::BUILD_NUMBER));
+    if updated_from.is_some() {
+        // The launcher is still single-threaded here (this runs before any thread or
+        // session spawn); routed through the workspace's one lock-scoped env helper.
+        aterm_log::env::unset("ATERM_UPDATED_FROM");
+    }
+    let _ = JUST_UPDATED.set(just_updated);
+    // SEC-1: establish the containment mode ONCE, here in the trusted launcher,
+    // before any subsystem (the spawn seam, the control socket) queries it. The
+    // launcher owns the mode (ATERM_DESIGN §5): `--containment` / `--sandbox` /
+    // `--no-sandbox` select it, defaulting to `User` (standard safeguards). A
+    // bad/unparseable value fails closed to `Containment`, the most restrictive
+    // mode, and says so rather than silently widening.
+    let containment_mode = aterm_containment::init_mode_from_flag(
+        cli::launch_flags().containment.as_deref(),
+        ContainmentMode::User,
+    )
+    .unwrap_or_else(|e| {
+        // The session's words (aterm-cli `session_main`): the accepted values, not an
+        // echo of what was typed.
+        if matches!(e, aterm_containment::InitModeFromFlagError::Parse(_)) {
+            crate::logging::stderr_line!(
+                "aterm-gui: --containment takes master, user, safety or containment; \
+                 using containment"
+            );
+        } else {
+            crate::logging::stderr_line!("aterm-gui: {e}; using containment");
+        }
+        // The parse error happened before init_mode ran, so the OnceLock is
+        // still unset — set it to the fail-closed default now and proceed.
+        let _ = aterm_containment::init_mode(ContainmentMode::Containment);
+        ContainmentMode::Containment
+    });
+    if verbose() {
+        crate::logging::stderr_line!("aterm-gui: containment mode = {containment_mode}");
+    }
+    // --headless: bind the control socket and run the engine + offscreen
+    // renderer without ever opening a window (clean automated introspection).
+    // The flag is the one spelling and nothing is exported, so a nested `aterm`
+    // typed inside this instance is a SESSION (or its own explicit window) —
+    // never a surprise headless engine.
+    //
+    // The announcement is the point. A harness that arms headless and then waits
+    // for a control socket has exactly two failure modes — the socket never binds,
+    // or the mode never armed — and they are indistinguishable from an empty log,
+    // so an armed launch SAYS it is headless.
+    let headless = headless_flag;
+    if headless {
+        crate::logging::stderr_line!(
+            "aterm-gui: headless mode (--headless): no window; engine + control socket only"
+        );
+    }
+    // Process-wide, before anything could raise a modal or any session
+    // spawns: a headless process presents no OS UI (`menu::os_ui_refused`),
+    // whatever path asks, and never runs the agent primer against the `$HOME`
+    // it inherited.
+    if headless {
+        menu::mark_process_headless();
+        spawn::mark_headless_instance();
+    }
+    // Block SIGUSR1 process-wide FIRST — before spawning ANY thread (the font-warm
+    // thread just below, the backend-build thread, and the per-tab reader/clipboard
+    // threads later all inherit the calling thread's mask AT SPAWN TIME). A dedicated
+    // thread sigwait()s SIGUSR1 for a self-introspection snapshot; its default action
+    // is to terminate the process, so if the block does not precede these spawns a
+    // `kill -USR1` landing in the ~200 ms startup window could be delivered to a
+    // worker thread that never blocked it and kill aterm instead of snapshotting.
+    // unix-only: Windows has no SIGUSR1 — the snapshot stays reachable there via
+    // the control-socket `image` verb (introspection convenience, not a posture).
+    // SAFETY: async signal-mask setup on a stack-local, sigemptyset-initialized set.
+    #[cfg(unix)]
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut());
+    }
+    // NOTE (thread-safety floor): the font-warm spawn that used to live HERE was the
+    // process's first thread (the block above now precedes the warm prologue,
+    // which may run before the dial — warm successor P2). It moved to the
+    // first-present hook in `app_render.rs` and was then DELETED there: every GUI generation is sealed before its first
+    // pixel, and a sealed generation never consults the coverage index the warm
+    // built (see the note in `app_render.rs` where the spawn used to be). The
+    // single-threaded-process requirement of the env mutations above
+    // (`HandoffEnv::capture`, the `ATERM_UPDATED_FROM` clear) still holds: NO
+    // process-env mutation past this line, and no thread spawns before it. The
+    // handoff intake itself no longer mutates the environment at all (it reads
+    // the snapshot), so it is not what pins this floor.
+    // WHERE THE WARM PROLOGUE RUNS (warm successor P2): before the dial on the
+    // launched lane, after the intake everywhere else (`warm_order`). Decided
+    // from the snapshot and the flags alone: nothing claim-dependent.
+    #[cfg(target_os = "macos")]
+    let warm_order = warm_order(
+        handoff_rendezvous::rendezvous_present(&handoff_env),
+        match cli::launch_flags().socket_directive() {
+            aterm_types::control_socket::SocketDirective::Explicit(path) => Some(path),
+            _ => None,
+        }
+        .as_deref(),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let warm_order = WarmOrder::AfterIntake;
+    // The advisory launch hint (`handoff_warm_hint`): the zoom the outgoing
+    // window will carry, named at launch. Taken out of the snapshot on every
+    // order, read only before the dial.
+    #[cfg(target_os = "macos")]
+    let warm_hint = match handoff_warm_hint::take_from(&mut handoff_env) {
+        Ok(hint) => hint,
+        Err(raw) => {
+            aterm_log::warn!(
+                "overlap handoff: the launch's warm hint is unreadable ({raw:?}); warming at \
+                 this launch's own font size — a guess, so the intake loses nothing"
+            );
+            None
+        }
+    };
+    // THE WARM BEFORE THE DIAL. Everything `warm_prologue` does is read-only or
+    // this process's own; the outgoing process's readers stay live throughout,
+    // and its dial budget (`handoff_ready_deadline`, 30 s) is unchanged.
+    #[cfg(target_os = "macos")]
+    let warm_started = std::time::Instant::now();
+    let warm = if warm_order == WarmOrder::BeforeDial {
+        #[cfg(target_os = "macos")]
+        let zoom = warm_hint.map_or((None, None), |hint| hint.zoom_milli());
+        #[cfg(not(target_os = "macos"))]
+        let zoom = (None, None);
+        Some(warm_prologue(headless, exec_command.is_some(), zoom))
+    } else {
+        None
+    };
+    // Every exit from here to the event loop leaves through this: with the
+    // warm prologue's threads alive (the backend worker may be inside the GPU
+    // driver), returning from `main_entry` would run the process's static
+    // destructors underneath them — the launch-fatal terminator's rule
+    // (`exit_without_process_teardown`). Status 0, as the return was.
+    let warmed_before_dial = warm.is_some();
+    let leave_after_warm = move || {
+        if warmed_before_dial {
+            crate::exit_without_process_teardown(0)
+        }
+    };
+    // OUT-OF-BAND HANDOFF INTAKE. A successor LaunchServices started is launchd's
+    // child, not the outgoing process's, and inherits NO descriptors — so the PTY
+    // masters, the readiness pipe and the Commit pipe cannot be named by number in
+    // this process's environment. They arrive over the single-use rendezvous the
+    // parent bound before launching us (`crate::handoff_rendezvous`), and the dial
+    // happens HERE — after the warm prologue on the launched lane (P2), just
+    // before the intake — for two reasons that both matter:
+    //
+    // * AFTER THE BOOT APPLY. That apply swaps the staged bundle and re-execs, and
+    //   every received descriptor is `FD_CLOEXEC` — dialing earlier would mean
+    //   carrying them across an `execve` through the same clear-and-re-arm dance
+    //   the fork lane needs, for no benefit. The re-exec'd image dials fresh
+    //   instead, and the parent's readiness deadline already budgets for exactly
+    //   this interval (it is what the fork lane waits out too).
+    // * BEFORE `take_incoming`. Publishing the claimed descriptors as the
+    //   ordinary `ATERM_SEAMLESS_FDS` / `ATERM_HANDOFF_*_FD` shape lets the
+    //   existing, unchanged intake do every authentication it already does — the
+    //   manifest join, the exact bijection, the tty backstop, the screen-carry
+    //   digest, the parent birth record. The TRANSPORT changed; nothing that
+    //   decides whether a handoff is legitimate did.
+    //
+    // A FAILED CLAIM EXITS. It does not fall through to a fresh window: the parent
+    // still owns every session this process was going to adopt, and presenting an
+    // empty terminal over them would look to the user exactly like the update
+    // having eaten their work. The parent, meanwhile, never sent a descriptor, so
+    // it rolls back with its readers intact — this is the same fail-closed shape
+    // as the malformed-handoff refusal above, and it is what makes a late dial (one
+    // that arrives after the parent gave up and unlinked the socket) safe.
+    // When this successor's rendezvous claim was GRANTED, on the lane that has
+    // one. `None` on the fork lane (no rendezvous) and off macOS.
+    #[cfg(target_os = "macos")]
+    let mut handoff_claimed_at: Option<std::time::Instant> = None;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let handoff_claimed_at: Option<std::time::Instant> = None;
+    #[cfg(target_os = "macos")]
+    let out_of_band_handoff = handoff_rendezvous::rendezvous_present(&handoff_env);
+    // The proof term the PARENT hashed its expectation over — stated on the wire,
+    // because a launched attempt that fell back to the fork lane still expects
+    // device terms while the descriptors arrived by inheritance. An older parent
+    // says nothing and the lane decides, as before.
+    #[cfg(target_os = "macos")]
+    let device_proof_term =
+        handoff_rendezvous::take_device_proof_term(&mut handoff_env).unwrap_or(out_of_band_handoff);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let device_proof_term = false;
+    #[cfg(target_os = "macos")]
+    if out_of_band_handoff {
+        /// How long this process will wait on the DIAL itself — connect, uid
+        /// check, the claim write. Short because the parent is holding the
+        /// listener open and answers immediately, or it has given up and the
+        /// connect fails at once.
+        const CLAIM_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        /// How long this process will HOLD its claim waiting for the grant (the
+        /// one descriptor message). THE HOLD (2026-09-19, the late park): the
+        /// outgoing process accepts this dial with every one of its readers still
+        /// live and grants only once it has parked — at once for an explicit
+        /// apply, at the next quiet moment for the automatic lane, bounded by its
+        /// own hold cap (120 s) and its worker's backstop (4 min). Longer than
+        /// both, so the parent is always the one that ends a hold — by EOF, which
+        /// this side reads at once and exits on.
+        const GRANT_HOLD_BUDGET: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        // Read, do not consume: `seamless::take_incoming_from` owns consuming
+        // this, and consuming it here would leave that call unable to
+        // authenticate the manifest it is about to read.
+        let nonce = handoff_env.string(seamless::ENV_NONCE).unwrap_or_default();
+        let dialled_at = std::time::Instant::now();
+        match handoff_rendezvous::claim_incoming(
+            &mut handoff_env,
+            &nonce,
+            handoff_rendezvous::ClaimDeadlines {
+                dial: dialled_at + CLAIM_DIAL_BUDGET,
+                grant: dialled_at + GRANT_HOLD_BUDGET,
+            },
+            // The claim goes only to the process `prearm_incoming_fds` attested
+            // (always `Some` here: a rendezvous-bearing environment that failed
+            // attestation already stopped at `rejects_boot`).
+            incoming_exec_fds.parent_pid(),
+        ) {
+            Ok(claimed) => {
+                aterm_log::info!(
+                    "overlap handoff: claimed {} PTY(s) plus the readiness and Commit channels \
+                     over the rendezvous after holding the dial {} ms; this successor owns a \
+                     launchd application job of its own",
+                    claimed.session_count(),
+                    dialled_at.elapsed().as_millis()
+                );
+                // Into the snapshot, where the fork lane's descriptors arrive:
+                // the unchanged intakes below authenticate them.
+                claimed.into_intake().install(&mut handoff_env);
+                // THE INSTANT THE FREEZE BECOMES THIS PROCESS'S PROBLEM. Under
+                // the late park the outgoing terminal froze just before this
+                // grant; everything from here to the proof is this successor's
+                // own boot, and it is the residual the next train attacks.
+                let claimed_now = std::time::Instant::now();
+                handoff_claimed_at = Some(claimed_now);
+                // THE WARM BEFORE THE DIAL (warm successor P2): how long this
+                // successor warmed ahead of its dial — the prologue that no
+                // longer sits inside the freeze. Zero on the late order.
+                let warm_pre_dial = if warmed_before_dial {
+                    dialled_at.saturating_duration_since(warm_started)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                crate::metrics::mark_handoff_claimed(dialled_at, claimed_now, warm_pre_dial);
+                aterm_log::info!(
+                    "overlap handoff: warm {} ms pre-dial (main->dial {} ms); the claim-relative \
+                     stamps follow on the claim->proof line",
+                    warm_pre_dial.as_millis(),
+                    crate::metrics::process_main_start().map_or(0, |exec| dialled_at
+                        .saturating_duration_since(exec)
+                        .as_millis()),
+                );
+            }
+            Err(error) => {
+                // Both destinations deliberately: a launchd-launched app leaves
+                // only the log behind, and stderr is what a developer running the
+                // binary from a shell actually sees.
+                aterm_log::error!(
+                    "overlap handoff: this launch carries a rendezvous but could not claim it \
+                     ({error}); exiting before any window so the outgoing process keeps every \
+                     session"
+                );
+                crate::logging::stderr_line!(
+                    "aterm-gui: overlap handoff could not be claimed: {error}"
+                );
+                // This launch may have COUNTED a boot-trial launch for its build
+                // moments ago (`check_boot_health`, inside the boot apply above),
+                // and it is now exiting BY RULE — the outgoing process gave up
+                // before the transfer — not crashing. Give THAT launch back here,
+                // in the one process that knows it observed it (a parent-side
+                // forgive could race ahead of the observation); left counted,
+                // three such pre-transfer failures on a busy machine revert and
+                // permanently poison a healthy build. IF IT MOVED, and only then:
+                // `launch_is_burst` can suppress the count, and forgiving a
+                // launch this process did not observe erases an earlier, real
+                // crash of the same build.
+                aterm_update::forgive_trial_launch_if_advanced(
+                    build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                    trial_launches_before_boot,
+                );
+                leave_after_warm();
+                return;
+            }
+        }
+    }
+    // PROOF-CARRYING DSU Rung 1b — SEAMLESS adopt: if this run is an update apply that
+    // handed off a live shell (`ATERM_SEAMLESS_*`), authenticate + consume the manifest
+    // HERE while single-threaded (env mutation is only sound pre-spawn), and RE-ADOPT the
+    // still-running shell below instead of forking a fresh one. Fail-closed to a fresh
+    // spawn on any mismatch. See `crate::seamless`. The handoff also carries the
+    // outgoing window's frame (grid size + position) and each session's screen
+    // checkpoint, so the swap is visually continuous, not just process-continuous.
+    // Read before `take_incoming` consumes it: whether this launch was offered a
+    // handoff's sessions at all, which decides — once the overlap channels are
+    // judged below — whether a refused intake exits or boots fresh.
+    // THE LAUNCHER'S DESCRIPTOR LIMIT a fork-lane parent carried (round seven,
+    // item 107), recorded before any shell is spawned, so a tab this successor
+    // opens gets the launcher's soft limit rather than the raise it inherited.
+    #[cfg(target_os = "macos")]
+    if let Some(limit) = handoff_rendezvous::adopt_carried_launcher_limit(&handoff_env) {
+        aterm_log::info!(
+            "overlap handoff: new shells get the launcher's soft descriptor limit {limit}, \
+             carried by the outgoing process"
+        );
+    }
+    let incoming_offered = seamless::incoming_offered_in(&handoff_env);
+    let incoming_handoff = seamless::take_incoming_from(&mut handoff_env);
+    crate::metrics::stamp_claim(crate::metrics::ClaimStamp::Intake);
+    // Handoff files a CRASHED sender left behind (its screens, turn text and
+    // scrolled-off rows) are retired here, once, now that ours are consumed. A
+    // live sender's — a handoff in flight elsewhere — are never touched.
+    seamless::sweep_dead_handoff_leftovers();
+    // THE REPAINT COUNT, before any field moves out: the seamless landing row
+    // names the tabs adopted onto a blank screen (the 2026-09-22/23 update
+    // audit, plan P1-5), and the restore drains the set it would count.
+    let handoff_repainted_tabs = incoming_handoff.repainted_tabs();
+    let seamless_nonce = incoming_handoff.nonce.clone();
+    let seamless_layout = incoming_handoff.layout.clone();
+    // BOTH digests come from `take_incoming`, which computed them over the exact
+    // bytes it consumed from the outgoing process. Recomputing either one here
+    // from the parsed value would reintroduce the cross-version `AdoptionMismatch`
+    // (this binary's codec is not a byte fixed point on the previous binary's wire).
+    let seamless_layout_digest = incoming_handoff.layout_digest;
+    let seamless_screen_digest = incoming_handoff.screen_digest;
+    // Prove we are the binary the outgoing process authorized BEFORE any proof is
+    // computed, so a wrong-build candidate refuses loudly instead of silently
+    // producing a digest the parent cannot match.
+    let seamless_target = seamless::take_target_identity_from(&mut handoff_env);
+    #[cfg(unix)]
+    let seamless_target_admitted = seamless_target.is_some();
+    let seamless_window = incoming_handoff.window;
+    // Tokenless carried connection triples (design §1.4#6): parked on the App
+    // and re-minted once every handed-off session is registered (`about_to_wait`
+    // runs `remint_carried_connections` after the restore drains).
+    let seamless_conn_carry = incoming_handoff.connections;
+    // The exit ledger's count, which the store goes on above (round seven,
+    // finding 49) — applied where the store is made, before session 0.
+    let seamless_roster_seq = incoming_handoff.roster_seq;
+    // The bridge the outgoing process was attached to at runtime (round seven,
+    // finding 7): kept for the control server's supervisor start, which arms it
+    // when no `[fabric] command` is configured.
+    #[cfg(unix)]
+    crate::fabric_launch::carry_attached(incoming_handoff.fabric_attached);
+    // The drafts of a layout this build could not place: said, with their
+    // text, once the restore is done (`App::settle_carried_settings_drafts`).
+    let seamless_unplaced_drafts = incoming_handoff.unplaced_settings_drafts;
+    let mut seamless_adopt: Vec<crate::spawn::Adopted> = incoming_handoff.adopted;
+    // The held panes' final screens (round five, item 19): no descriptor, no
+    // proof — shown read-only where the layout's placeholders name them.
+    let seamless_held = incoming_handoff.held;
+    // Whose content a whole-handoff refusal was about: the refusing exit's
+    // status below (`seamless::refused_intake_exit`).
+    #[cfg(unix)]
+    let incoming_refusal = incoming_handoff.refusal;
+    // THE ADOPTED-CLAIM GRACE (round four, item 9): the adopted sessions whose
+    // claim the outgoing process could not vouch for, named now — before the
+    // restore takes session 0's shell out of the list — and handed to the
+    // supervisor host once it exists, which holds them off from its Commit
+    // resume until an external supervisor that held one has claimed it again.
+    let adopted_claim_grace: Vec<String> = seamless_adopt
+        .iter()
+        .filter(|adopted| adopted.claim_grace)
+        .map(|adopted| adopted.sid.as_str().to_string())
+        .collect();
+    // OVERLAP HANDOFF: the parked parent's readiness-pipe write fd (consume +
+    // clear, same single-threaded env discipline as `take_incoming` above). Its
+    // presence flips the boot into overlap mode: adopted readers are DEFERRED
+    // until every carried window has presented and proves exact adoption. A
+    // second private channel carries the parent's irreversible Commit; readers
+    // remain disabled between proof and Commit. Missing either half disables the
+    // protocol so a partial/spoofed wire can never authorize PTY consumption.
+    // A LAUNCH THAT CARRIES A HANDOFF IS A CANDIDATE UNTIL IT IS COMMITTED. Declared
+    // before the thread that reads it (the background update check, spawned
+    // with the event loop — no warm-prologue thread reads it), cleared by
+    // `Wake::ActivateCommittedHandoff`.
+    let ready_env_present = handoff_env.present(seamless::ENV_READY_FD);
+    let commit_env_present = handoff_env.present(seamless::ENV_COMMIT_FD);
+    aterm_update::set_uncommitted_handoff_candidate(ready_env_present || commit_env_present);
+    let overlap_channels_present = ready_env_present || commit_env_present;
+    let adopted_fds = seamless_adopt
+        .iter()
+        .map(|adopted| adopted.master.raw())
+        .collect::<Vec<_>>();
+    let ready = seamless::take_ready_fd_from(
+        &mut handoff_env,
+        seamless_nonce.clone(),
+        seamless_layout_digest,
+        seamless_screen_digest,
+        seamless_target,
+        &adopted_fds,
+    );
+    let ready_raw_fd = ready.as_ref().map(seamless::ReadySignal::raw_fd);
+    let commit = seamless::take_commit_fd_from(
+        &mut handoff_env,
+        seamless_nonce,
+        &adopted_fds,
+        ready_raw_fd,
+        incoming_exec_fds.parent_pid(),
+    );
+    // Recorded BEFORE the match consumes them: which half was refused is the
+    // entire diagnosis when a candidate exits here, and the parent can never see
+    // it (all it observes is the readiness pipe closing).
+    let (ready_admitted, commit_admitted) = (ready.is_some(), commit.is_some());
+    let (handoff_ready, handoff_commit, overlap_degraded) = match (ready, commit) {
+        (Some(ready), Some(commit)) => (Some(ready), Some(commit), false),
+        _ => (None, None, overlap_channels_present),
+    };
+    // Both halves admitted: this launch is an update's candidate, waiting for
+    // a Commit that can come.
+    let overlap_admitted = handoff_commit.is_some();
+    let handoff_reader_gate = handoff_ready
+        .is_some()
+        .then(crate::spawn::DeferredReaderGate::closed);
+    // Consume the parent's bound-endpoint witness while startup is still single
+    // threaded. A fixed-path candidate must validate it before it can paint or
+    // emit ProofReady, so malformed/missing ownership cannot become a cold bind.
+    let incoming_socket_identity = control_socket_identity::consume_incoming_from(&mut handoff_env);
+    // Every handoff name has been consumed or refused; nothing reads the
+    // snapshot past this point.
+    drop(handoff_env);
+    // Only the identity needs a use off unix: `handoff_commit` is read on every
+    // platform by `launch_posture` below (moving it here broke that read).
+    #[cfg(not(unix))]
+    let _ = &incoming_socket_identity;
+    #[cfg(unix)]
+    if handoff_reader_gate.is_some()
+        && let control_auth::SocketResolution::Enabled(plan) = control_auth::resolve_socket_plan()
+        && plan.latest_link.is_none()
+        && !incoming_socket_identity
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|identity| {
+                // SAFETY: both overlap channels were admitted above. The logger
+                // is synchronous (FileLogger + Mutex<File>); the first resident
+                // worker, CommitReceiver::start_watch, starts below this check.
+                // The warm prologue's threads do not exist here whenever this
+                // can change the directory: only a RELATIVE explicit socket
+                // carries one (`directory` is `None` otherwise), and that shape
+                // is `WarmOrder::AfterIntake` (`warm_order`).
+                // The witness validates the original files before restoring a
+                // relative endpoint's binding directory.
+                unsafe { identity.prepare_incoming_directory(&plan) }
+            })
+    {
+        aterm_log::error!(
+            "incoming fixed-socket handoff has no matching endpoint ownership; preserving the parent"
+        );
+        crate::logging::stderr_line!(
+            "aterm-gui: incoming fixed-socket handoff has no matching endpoint ownership; preserving the parent"
+        );
+        // Boot apply may have observed this candidate's trial launch. An
+        // intentional refusal before transfer is not a crash of the build;
+        // return the observation — if there was one — just as the rendezvous
+        // refusal above does.
+        aterm_update::forgive_trial_launch_if_advanced(
+            build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+            trial_launches_before_boot,
+        );
+        // Only this uncommitted candidate exits. Its parent retains every PTY.
+        crate::crash_signal::clean_exit_now(74)
+    }
+
+    // A REFUSED INTAKE OF AN OFFERED HANDOFF EXITS TOO (round six of the update
+    // audit, item 18): with nothing adopted it used to fall through to the cold
+    // boot below while the parked parent still owned every session
+    // (`seamless::overlap_intake_exits`).
+    if seamless::overlap_intake_exits(overlap_degraded, seamless_adopt.len(), incoming_offered) {
+        // SAY WHY, DURABLY. This is the exit the parked parent reads as
+        // `ChildDied`, and a LaunchServices-launched successor has no stderr, so
+        // without this line the whole failure is a verdict with no evidence
+        // anywhere on the machine — which is exactly how it reached the field.
+        aterm_log::error!(
+            "overlap handoff: this candidate holds {} adopted session(s){} but the overlap \
+             authority is incomplete (readiness channel {}, Commit channel {}); closing every \
+             adopted master and exiting before any window so the outgoing process keeps every \
+             session. This binary is build {} commit {}.",
+            seamless_adopt.len(),
+            if seamless_adopt.is_empty() {
+                " (the intake refused the whole handoff it was offered; the reason is logged \
+                 above)"
+            } else {
+                ""
+            },
+            if ready_admitted {
+                "admitted"
+            } else {
+                "REFUSED"
+            },
+            if commit_admitted {
+                "admitted"
+            } else {
+                "REFUSED"
+            },
+            build_info::BUILD_NUMBER,
+            build_info::GIT_COMMIT
+        );
+        // Recognizable overlap plus malformed/partial authority must never
+        // fall through to eager adopted readers. Close every child duplicate
+        // (each `Adopted` closes its master as it drops) and exit this
+        // candidate before any session/thread spawn; the parked parent observes
+        // proof EOF/child death and resumes its sole readers.
+        #[cfg(unix)]
+        let adopted_count = seamless_adopt.len();
+        drop(seamless_adopt);
+        // …AND SAYS WHY WITH ITS STATUS when the refusal was a moment (round
+        // four, plan item 2): a boot swap deferred on a held lock or a
+        // verification that ran out of time left this image the old build, so
+        // the target was refused — which the parent must retry, not converge.
+        // The masters are closed above; `_exit` is the fail-stop the fixed-socket
+        // refusal above already takes, and nothing past this point has started.
+        #[cfg(unix)]
+        if let Some(code) = seamless::passing_refusal_exit(
+            &boot_apply,
+            target_names_this_build,
+            seamless_target_admitted,
+        ) {
+            aterm_log::warn!(
+                "overlap handoff: the boot swap into the authorized build was deferred for a \
+                 passing reason ({boot_apply:?}); exiting {code} so the outgoing process \
+                 retries on its transient schedule instead of filing a verdict on the build"
+            );
+            crate::crash_signal::clean_exit_now(code)
+        }
+        // …AND WHEN THE REFUSAL WAS THE OUTGOING BUILD'S CONTENT (round six,
+        // item 18, review round two): an unreadable or over-cap manifest, a
+        // nonce for another attempt, missing channel or layout variables. Not
+        // this candidate's bytes, so not a structural verdict on them.
+        #[cfg(unix)]
+        if let Some(code) = seamless::refused_intake_exit(adopted_count, incoming_refusal) {
+            aterm_log::warn!(
+                "overlap handoff: the intake refused the outgoing build's handoff artifacts; \
+                 exiting {code} so the outgoing process retries on its transient schedule \
+                 instead of filing a verdict on this build"
+            );
+            crate::crash_signal::clean_exit_now(code)
+        }
+        leave_after_warm();
+        return;
+    }
+    // Every process-environment mutation is now complete. Start the modern
+    // Commit channel's parent-liveness watcher before any session/helper spawn:
+    // parent EOF at preproof, ProofReady, or pre-Commit fail-stops this
+    // readerless candidate. A watcher allocation failure rejects the candidate
+    // before it can consume or expose an adopted PTY.
+    #[cfg(unix)]
+    let handoff_commit = if let Some(commit) = handoff_commit {
+        let Some(watched) = commit.start_watch() else {
+            // Same sink discipline as the degraded exit above: this is another
+            // silent `ChildDied` from the parent's side unless it is written down.
+            aterm_log::error!(
+                "overlap handoff: the parent-liveness watcher for the Commit channel could not \
+                 start; closing every adopted master and exiting before any window so the \
+                 outgoing process keeps every session"
+            );
+            drop(seamless_adopt);
+            leave_after_warm();
+            return;
+        };
+        Some(watched)
+    } else {
+        None
+    };
+    // WHAT THE WARM PROLOGUE BUILT (warm successor P2): taken as it stands when
+    // it ran before the dial; on THE LATE ORDER it runs here, where it always
+    // ran — with the authenticated carry's zoom, so its build font is the
+    // launch font.
+    let WarmPrologue {
+        mut native_config_service,
+        startup_config_snapshot,
+        config,
+        tab_strip_rows,
+        resolved_font,
+        build_font,
+        headless_scale,
+        want_gpu,
+        defer_gpu,
+        defer_seal,
+        theme,
+        mut font_family,
+        backend_handle,
+        font_config,
+        font_cfg_warns,
+        font_variations,
+        vf_warns,
+        raster_knobs,
+        config_runtime_handle,
+        env_add,
+        integrate,
+        sandbox_wrap,
+        spawn_cap,
+        sandbox_cap,
+        document_write_cap,
+    } = warm.unwrap_or_else(|| {
+        let zoom = seamless_window.as_ref().map_or((None, None), |carry| {
+            (carry.font_px_milli, carry.font_reset_px_milli)
+        });
+        warm_prologue(headless, exec_command.is_some(), zoom)
+    });
+    // Initial grid size: `--columns`/`--lines` win, else config `columns`/`lines`,
+    // else 24×80 — all clamped sane. This is the TERMINAL grid; the window is
+    // grown by `tab_strip_rows` extra pixel rows for the tab strip (`resumed`), so
+    // the terminal keeps its configured `lines`.
+    // SEAMLESS WINDOW CARRY: an update re-exec's first window reappears at the
+    // OUTGOING window's grid size (and, below at window creation, its position)
+    // instead of config defaults — the frame half of "the update looks like
+    // nothing happened". THE CARRY OUTRANKS THE FLAGS on a handoff boot: the
+    // successor inherits the parent's LAUNCH argv (`--columns` included), and
+    // resurrecting the launch size over the user's current resized grid is a
+    // visible frame jump at the swap instant. `carry_frame` is `Some` only after
+    // an authenticated `take_incoming`, so fresh launches keep flag > config >
+    // default exactly.
+    let carry_frame = seamless_window.clone();
+    let cols = carry_frame
+        .as_ref()
+        .map(|w| w.cols)
+        .unwrap_or_else(|| app_config::resolve_initial_columns(&config))
+        .clamp(20, 500);
+    let rows = carry_frame
+        .as_ref()
+        .map(|w| w.rows)
+        .unwrap_or_else(|| app_config::resolve_initial_lines(&config))
+        .clamp(5, 300);
+    // THE CARRIED STATUS-BAR ROWS (2026-09-07): the outgoing window reserved
+    // these above its grid, so this window reserves the same BEFORE it is
+    // sized — the grid rows above are the same either way, but without this the
+    // window itself came up one row shorter per bar at the swap instant.
+    // `chrome_rows` reads the committed count from the first frame on.
+    let carried_status_bar_rows = carry_frame
+        .as_ref()
+        .map_or(0, |w| w.status_bar_rows.min(aterm_messages::MAX_ROWS));
+    // THE CARRIED FONT ZOOM (round four, item 15): a successor draws at the
+    // px its parent's person had zoomed to, pinned as a live zoom pins it, and
+    // Cmd-0 goes back to the parent's reset size — decided from the
+    // AUTHENTICATED carry, because the carried `rows`/`cols` above are that
+    // zoomed grid. Fresh launches (no carry) and unzoomed parents keep exactly
+    // the size the prologue derived from the flags and config.
+    let app_config::LaunchFont {
+        px: font_px,
+        explicit: font_px_explicit,
+        reset_px: default_font_px,
+    } = app_config::successor_font_px(resolved_font.0, resolved_font.1, carry_frame.as_ref());
+    // THE WARM HIT OR MISS (warm successor P2). The backend was built at
+    // `build_font` — before the dial, the launch hint's guess. A size the
+    // carry disagrees with is re-selected at the backend join
+    // (`App::warm_miss_px`, the light `activate_px` every zoom uses); nothing
+    // else read the guess. Said either way, so a stale hint is visible.
+    let warm_miss_px = warm_miss_px(build_font.px, font_px);
+    if warmed_before_dial {
+        #[cfg(target_os = "macos")]
+        let hinted = warm_hint.map_or_else(
+            || "no hint (an older outgoing build)".to_string(),
+            |hint| {
+                format!(
+                    "hint {} window(s), {} session(s), window 0 {}x{}",
+                    hint.windows, hint.sessions, hint.cols, hint.rows
+                )
+            },
+        );
+        #[cfg(not(target_os = "macos"))]
+        let hinted = String::new();
+        let carried = carry_frame.as_ref().map_or_else(
+            || "no carried window".to_string(),
+            |w| format!("carried {}x{}", w.cols, w.rows),
+        );
+        match warm_miss_px {
+            None => aterm_log::info!(
+                "overlap handoff: warm HIT — the backend was built before the dial at {:.1} px, \
+                 the size the intake selected ({hinted}; {carried})",
+                build_font.px
+            ),
+            Some(px) => aterm_log::info!(
+                "overlap handoff: warm MISS — the backend was built before the dial at {:.1} px \
+                 and the intake selected {px:.1} px; the join re-selects it (a stale hint costs \
+                 only this warm: {hinted}; {carried})",
+                build_font.px
+            ),
+        }
+    }
     // (SIGUSR1 is already blocked process-wide near the top of main(), before any
     // thread spawn, so the sigwait() snapshot thread is the sole SIGUSR1 recipient.)
 
@@ -40871,6 +41431,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         if !font_family_admitted {
             font_family = None;
         }
+        // A warm miss (P2): built at the hint's size, selected at the carry's.
+        if let Some(px) = warm_miss_px {
+            backend.activate_px(px);
+        }
         // Two-way, not one-way: the publication contract is that the worker's
         // seal state is EXACTLY the launch's `defer_font_seal` decision. A
         // deferred launch that arrived sealed anyway would be paying the 15.7 MB
@@ -41004,6 +41568,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // — the root of the family tree (no parent) — before the control thread starts,
     // so a `@<selector>` is resolvable from the first request.
     let store = session_store::new_store();
+    // EXIT-LEDGER IDS GO ON (round seven of the update audit, finding 49):
+    // above the outgoing store's, before the first registration journals a
+    // row, so an `exits since=<id>` anchor from before the update still means
+    // "after that row".
+    if let Some(carried) = seamless_roster_seq {
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .continue_roster_seq(carried);
+    }
     App::register_session(&store, &session0, None);
     // P1.3: the process-wide subscriber registry. A `subscribe` connection
     // registers here; the GUI's `Wake::Output` hook notifies it. Created BEFORE
@@ -41064,6 +41638,18 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 });
             #[cfg(not(unix))]
             let control_handoff = None;
+            // A PER-PROCESS candidate binds early — its socket cannot collide —
+            // but publishes nothing until the Commit releases this gate (round
+            // seven of the update audit, findings 13 and 14): no `graph/<sid>`
+            // entry, no `latest` alias, no request served, while the parent
+            // still owns every session and may yet roll back.
+            #[cfg(unix)]
+            let publish_gate = handoff_reader_gate
+                .as_ref()
+                .filter(|_| handoff_commit.is_some() && plan.latest_link.is_some())
+                .cloned();
+            #[cfg(not(unix))]
+            let publish_gate = None;
             let preparation = control::spawn(
                 active_handle.clone(),
                 store.clone(),
@@ -41080,6 +41666,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 // A fixed endpoint stays with the parent until exact Commit.
                 // Share the admitted reader gate and the parent's bound-endpoint witness.
                 control_handoff,
+                publish_gate,
             );
             if handoff_reader_gate.is_some() {
                 handoff_control_preparation = Some(preparation);
@@ -41326,6 +41913,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // composes a band of its own (`aterm ctl image` paints it), but nobody is
     // sitting in front of it — it must not eat the one crash record the next
     // windowed launch would put in front of a person.
+    // The crash or kill evidence the keeper's recovery row carries for the
+    // row it replaces (none headless, where nothing is consumed).
+    let mut keeper_evidence = (None, None);
     if !headless {
         // The killed-run scan consumes too, so it runs on every windowed launch;
         // the crash row wins the one `crash.last` slot when both are there.
@@ -41347,8 +41937,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             recovery_census::record(aterm_update::recovery_ledger::LaunchKind::Cold);
         }
         // THE KEEPER'S RECOVERY takes the slot (design §5.3 step 7): its row
-        // is queued below, for headless launches too; the crash or kill
-        // evidence it replaces is said on stderr.
+        // is queued below, for headless launches too, and carries the crash
+        // or kill evidence of the row it replaces, as stderr does.
         if !keeper_recovered_shells.is_empty() {
             for sentence in crash
                 .iter()
@@ -41357,6 +41947,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             {
                 crate::logging::stderr_line!("aterm-gui: {sentence}");
             }
+            keeper_evidence = (crash, killed);
         }
         // A REOPENED CRASH JOURNAL takes the slot (PTY keeper design §5.3 step
         // 7): one row says what came back and what did not — the layout and
@@ -41413,6 +42004,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         message_inbox::queue_message(message_reporters::keeper_recovered_message(
             keeper_recovered_shells.len(),
             keeper_recovery.refused.len(),
+            keeper_evidence.0.as_ref(),
+            keeper_evidence.1.as_ref(),
         ));
     }
     // Seed the process-global search index depth cap (config `search_history_lines`)
@@ -41520,6 +42113,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // The launch size — or, on a successor, the size Cmd-0 reset to in its
         // parent (`app_config::successor_font_px`), never the carried zoom.
         default_font_px,
+        // The headless join below corrects its own backend; only the windowed
+        // join (`finalize_backend`) reads this.
+        warm_miss_px: if headless { None } else { warm_miss_px },
         font_px_explicit,
         use_gpu,
         deferred_gpu: defer_gpu,
@@ -41809,6 +42405,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         update_handoff_prelaunch: None,
         operator_control: operator_control.clone(),
         harness: harness.clone(),
+        harness_waits: std::collections::HashMap::new(),
+        harness_wait_epoch: 0,
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
         last_keystroke_at: None,
@@ -42006,8 +42604,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         crate::owned_endpoint::release(plan);
         // Un-publish our recursion discovery entry so a parent does not dial a
         // dead socket (crash exits are swept at the next spawn — see S1 sweep).
+        //
+        // ONLY AN ENTRY THAT NAMES THIS INSTANCE (round seven of the update
+        // audit, finding 13): a rolled-back update candidate carries the
+        // PARENT's session ids, and the parent — still live, still serving
+        // them — owns their entries. Unlinking them unconditionally left every
+        // carried session unresolvable (an in-session client's redial exited
+        // 75 against a live parent; a flagless call fell back to whichever
+        // instance held the alias).
         let dir = control_auth::dir_of_socket(&plan.sock_path);
-        proxy::remove_graph_entry(&dir, &root_sid);
+        proxy::remove_own_graph_entry(&dir, &root_sid, &plan.sock_path);
         // Also retire every still-registered session's sibling-discovery entry
         // (tabs/panes publish one each) so siblings stop resolving them without
         // waiting for the next instance's stale sweep.
@@ -42017,7 +42623,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .unwrap_or_else(|p| p.into_inner())
             .snapshot()
         {
-            proxy::remove_graph_entry(&dir, &h.sid);
+            proxy::remove_own_graph_entry(&dir, &h.sid, &plan.sock_path);
         }
     }
     // QUIT-HANG FIX (final-exit path). Do NOT fall off `main` and let `app` drop
@@ -42177,6 +42783,7 @@ fn ptyless_session(id: u64, term: Terminal, sink: Arc<SinkWriter>) -> Session {
         human_input: Default::default(),
         generation_look: Default::default(),
         reset_lane: Default::default(),
+        update_parked: Default::default(),
     });
     Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),
@@ -54108,6 +54715,7 @@ mod session_pool_tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         });
         Session {
             child_reaped: std::sync::atomic::AtomicBool::new(false),

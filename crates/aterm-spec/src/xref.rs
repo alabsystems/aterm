@@ -1830,6 +1830,13 @@ pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
             native_update_successor_attach_model(),
             native_update_successor_attach_liveness(),
         ),
+        // The warm successor proves or exits (P2): the warm prologue before
+        // the dial delays the dial, never withholds it. Tier-0 in
+        // tests/derived_successor_warm_before_claim.rs.
+        (
+            native_update_successor_warm_before_claim_model(),
+            native_update_successor_warm_before_claim_liveness(),
+        ),
         // Codex's save-then-wait switch: the session comes back to its own
         // model (2026-09-28). Tier-0 in tests/derived_supervise.rs.
         (

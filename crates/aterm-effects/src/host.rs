@@ -193,6 +193,53 @@ impl TerminalFacts {
     }
 }
 
+/// THE CARET THE MOTION ENGINES MAY JUDGE — [`TerminalFacts::caret`] less
+/// the one reading of it that is not a caret at all: a HIDDEN cursor on a
+/// frame the program has not finished
+/// ([`Terminal::sync_frame_unfinished`]: its DEC-2026 bracket still open, by
+/// its own account, and written into).
+///
+/// A hidden caret still travels to the pet (it chases a caret a TUI hid for
+/// its repaint — [`TerminalFacts::caret`]), and the single-pane window hands
+/// one to the cursor-motion engines too. On an unfinished frame it is not
+/// the caret, though. The program has said the frame is unfinished, hidden
+/// the cursor, and is walking it through the screen as its WRITE position.
+/// A host shows such a frame only when it stops waiting for the close:
+/// its own hold runs out (`SYNC_HOLD_CAP`, 150 ms, with the mode still set),
+/// or the terminal's `sync_timeout_ms` (1 s) force-clears the mode while
+/// the program is still writing. Either way the cursor is caught wherever
+/// the partial write happened to stop. The mode level alone misses the
+/// second case, which is why the input is the program's account.
+///
+/// Measured on the owner's installed v0.98.0, tab 2, 2026-09-28. Claude
+/// Code 2.1.284's fullscreen composer redrew its whole transcript in ONE
+/// bracket that stayed open ~280 ms over four PTY reads, while the owner
+/// typed ` bu` into `…there was a`. The torn presents showed the hidden
+/// cursor at (18,57) and then (29,0), rows up in the transcript. The glow
+/// seam judged both as caret moves: the keys in flight licensed
+/// `(40,28)->(18,57)`, then `(18,57)->(29,0)`, then the return
+/// `(29,0)->(40,32)`. The space those keys paid for was laid by nobody,
+/// and the band restarted at `bug`, with one dark cell before it.
+///
+/// Withheld (`None`), the engines read that frame the way every other host
+/// already reads a hidden caret (the composed and focus paths and
+/// `EffectsPipeline` hand none over at all). The move is judged when the
+/// caret is SHOWN again, from the last cell it was seen at, through the
+/// hidden-bridge lanes built for exactly that reappearance. A shown caret
+/// passes through even on an unfinished frame, and so does a hidden one on
+/// a finished frame — including a bracket closed and reopened with nothing
+/// written since. `frame_unfinished` is
+/// [`Terminal::sync_frame_unfinished`], read under the same lock as the
+/// caret.
+#[must_use]
+pub fn motion_caret(
+    caret: Option<(u16, u16)>,
+    cursor_visible: bool,
+    frame_unfinished: bool,
+) -> Option<(u16, u16)> {
+    caret.filter(|_| cursor_visible || !frame_unfinished)
+}
+
 /// The sing-along coupling made explicit as an INPUT, so the custody law
 /// (which companion owns the frame) is evaluated engine-side even while
 /// `CursorCat`/`KittySing` stay in the GUI (until Phase 5; then internal).
@@ -302,6 +349,71 @@ mod tests {
         let alt = TerminalFacts::read(&term, 1, false);
         assert!(alt.alt_screen);
         assert!(alt.caret.is_some() && alt.cursor_visible);
+    }
+
+    /// The motion engines' caret is the facts' caret, less a hidden cursor
+    /// on a frame the program has not finished. That cursor is the
+    /// program's write position, read off a real emulator here — including
+    /// after the terminal's timeout force-clears the mode mid-frame (review
+    /// round 1: the first fix read the mode level and handed that cursor
+    /// over). A finished frame's hidden caret, a close+reopen with nothing
+    /// written, and an unfinished frame's shown caret all pass through.
+    #[test]
+    fn a_hidden_cursor_on_an_unfinished_frame_is_no_caret_for_the_motion_engines() {
+        use aterm_core::terminal::ClockReading;
+        let mut term = Terminal::new(10, 40);
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| ClockReading {
+            monotonic: t0 + std::time::Duration::from_millis(ms),
+            wall_ms: None,
+        };
+        term.process_at(b"\x1b[8;5H", at(0));
+        let read = |term: &Terminal| {
+            let f = TerminalFacts::read(term, 1, false);
+            (
+                f.caret,
+                motion_caret(f.caret, f.cursor_visible, term.sync_frame_unfinished()),
+            )
+        };
+        assert_eq!(read(&term), (Some((7, 4)), Some((7, 4))), "a shown caret");
+
+        // Ink's repaint: open, hide, home, a transcript row part-written.
+        term.process_at(b"\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[2Btranscript", at(10));
+        let (facts, motion) = read(&term);
+        assert_eq!(facts, Some((2, 10)), "the pet still reads the cursor");
+        assert_eq!(motion, None, "the write position is no caret");
+
+        // Past the terminal's 1 s timeout the MODE is force-cleared while the
+        // program is still writing its frame: still no caret.
+        term.process_at(b"\r\x1b[3Bmore", at(1_200));
+        assert!(
+            !term.modes().synchronized_output(),
+            "control: the mode level reads closed"
+        );
+        let (facts, motion) = read(&term);
+        assert_eq!(facts, Some((5, 4)), "the pet still reads the cursor");
+        assert_eq!(
+            motion, None,
+            "a timed-out frame's write position is no caret"
+        );
+
+        // Shown inside the program's bracket: a program that does not hide.
+        term.process_at(b"\x1b[?25h", at(1_210));
+        assert_eq!(read(&term), (Some((5, 4)), Some((5, 4))));
+
+        // Hidden after the program closes: a finished frame's hidden caret
+        // keeps the single-pane window's reading.
+        term.process_at(b"\x1b[?25l\x1b[8;5H\x1b[?2026l", at(1_220));
+        assert_eq!(read(&term), (Some((7, 4)), Some((7, 4))));
+
+        // Closed and reopened in one batch with nothing written since: the
+        // grid is the finished frame, and its hidden caret passes.
+        term.process_at(b"\x1b[?2026h\x1b[9;2H\x1b[?2026l\x1b[?2026h", at(1_230));
+        assert!(term.modes().synchronized_output());
+        assert_eq!(read(&term), (Some((8, 1)), Some((8, 1))));
+
+        // History still withdraws the caret from everyone.
+        assert_eq!(motion_caret(None, true, false), None);
     }
 
     /// The pointer-free defaults and the `u8` face of a press outcome — what

@@ -15,7 +15,7 @@
 //!   CONTROL: the shell status FSM's `revision=` — the gate the verdict used to
 //!   hang on — does not move across the busy→prompt change, so a classifier
 //!   still gated on it would never have seen the box.
-//! * A SHELL running `echo "…?"; sleep 30` reads `program=sleep` (the
+//! * A SHELL running `echo "…?"; sleep 300` reads `program=sleep` (the
 //!   foreground group's argv[0], no shell integration needed) and `agent=-`
 //!   with no attention — a trailing `?` is not a question from a shell.
 //!
@@ -51,7 +51,19 @@ fn boot_rows(tag: &str, lines: u16) -> Option<Instance> {
     )
 }
 
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(60);
+/// A client that has not exited by now is hung: past every [`HANG`] wait a
+/// call makes, so a wait that times out answers before it is killed.
+const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a wait for something that MUST happen may take before it is read
+/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
+const HANG: Duration = Duration::from_secs(60);
+const HANG_MS: &str = "timeout=60000";
+
+/// An `await agent` whose verdict already holds answers at once: the fastest
+/// of [`LATCH_TRIES`] asks, `aterm ctl`'s spawn included, within this.
+const LATCHED_PROMPTLY: Duration = Duration::from_secs(2);
+const LATCH_TRIES: usize = 3;
 
 fn client_command(inst: &Instance, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
@@ -255,16 +267,12 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
             go.display()
         ),
     );
-    let busy = status_until(&inst, &sid, Duration::from_secs(10), "agent=busy", |s| {
+    let busy = status_until(&inst, &sid, HANG, "agent=busy", |s| {
         field(s, "agent") == Some("busy")
     });
-    let program = status_until(
-        &inst,
-        &sid,
-        Duration::from_secs(10),
-        "program=claude",
-        |s| field(s, "program") == Some("claude"),
-    );
+    let program = status_until(&inst, &sid, HANG, "program=claude", |s| {
+        field(s, "program") == Some("claude")
+    });
     // Pin the revision once the FSM has PUBLISHED the running job, never on
     // a timer. `agent=busy` is the timeline's verdict and can lead the FSM's
     // `running` — held for its 750 ms dwell, then published on a sweep — by
@@ -278,7 +286,7 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let before = status_until(
         &inst,
         &sid,
-        Duration::from_secs(20),
+        HANG,
         "phase=running with content_activity",
         |s| {
             field(s, "phase") == Some("running")
@@ -293,13 +301,7 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let waiter = std::thread::spawn({
         let mut cmd = client_command(
             &inst,
-            &[
-                &format!("@{sid}"),
-                "await",
-                "agent",
-                "prompt",
-                "timeout=8000",
-            ],
+            &[&format!("@{sid}"), "await", "agent", "prompt", HANG_MS],
         );
         move || cmd.output().expect("await agent")
     });
@@ -318,7 +320,7 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let prompt = status_until(
         &inst,
         &sid,
-        Duration::from_secs(10),
+        HANG,
         "agent=prompt agent_detail=bash:not-read-only",
         |s| {
             field(s, "agent") == Some("prompt")
@@ -363,23 +365,34 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         waited.contains("OK agent prompt rev="),
         "await agent: {waited}"
     );
-    // Already true: a fresh await answers at once.
-    let t1 = Instant::now();
-    let latched = ctl_ok(
-        &inst,
-        &[
-            &format!("@{sid}"),
-            "await",
-            "agent",
-            "busy,prompt",
-            "timeout=5000",
-        ],
-    );
+    // Already true: a fresh await answers at once, on the same revision. A
+    // wait that parked answers only at its timeout (exit 124, which fails
+    // `ctl_ok`); one answered late — by a later re-check or publication rather
+    // than the latch — is late every time it is asked. So it is asked up to
+    // [`LATCH_TRIES`] times and the FASTEST, `aterm ctl`'s spawn included,
+    // must be within [`LATCHED_PROMPTLY`]: a loaded gate's one slow spawn is
+    // asked again (it was one ask within 2 s, then within 30 s).
+    let mut fastest = Duration::MAX;
+    for _ in 0..LATCH_TRIES {
+        let t1 = Instant::now();
+        let latched = ctl_ok(
+            &inst,
+            &[&format!("@{sid}"), "await", "agent", "busy,prompt", HANG_MS],
+        );
+        let took = t1.elapsed();
+        assert!(
+            latched.contains(&format!("OK agent prompt rev={rev}")),
+            "{latched}"
+        );
+        fastest = fastest.min(took);
+        if fastest < LATCHED_PROMPTLY {
+            break;
+        }
+    }
     assert!(
-        latched.contains(&format!("OK agent prompt rev={rev}")),
-        "{latched}"
+        fastest < LATCHED_PROMPTLY,
+        "latched, not parked: the fastest of {LATCH_TRIES} answered in {fastest:?}"
     );
-    assert!(t1.elapsed() < Duration::from_secs(2), "latched, not parked");
     // An unknown word is a usage error, not a wait.
     let bad = ctl(&inst, &[&format!("@{sid}"), "await", "agent", "promtp"]);
     assert!(
@@ -393,7 +406,9 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     // `T <local> <t_us>` opens every wake that writes to this channel, on the
     // server's subscriber thread; the frames after it carry that instant.
     let stamp = format!("T {local} ");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Collected until both ends are seen (the loop breaks then): the deadline
+    // only ends a stream that never carries one.
+    let deadline = Instant::now() + HANG;
     let mut seen = Vec::new();
     let mut wake_us: Option<u64> = None;
     let mut boxed_at: Option<u64> = None;
@@ -442,9 +457,11 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     assert_eq!(field(row, "agent"), Some("prompt"), "{row}");
 }
 
-/// INT-4 + INT-5, live: a plain shell running `echo "…?"; sleep 30` is named
+/// INT-4 + INT-5, live: a plain shell running `echo "…?"; sleep 300` is named
 /// by its foreground program (`program=sleep`, no shell integration) and is
-/// NOT an agent: `agent=-`, never `level=attention`.
+/// NOT an agent: `agent=-`, never `level=attention`. The `sleep` outlives every
+/// wait on it by far (it was 30 s, under a one-minute wait), so the sample
+/// below is taken while it still runs; the instance's hangup ends it.
 #[test]
 fn a_shell_question_is_not_an_agent_and_its_program_is_named() {
     let Some(inst) = boot("s") else { return };
@@ -452,9 +469,9 @@ fn a_shell_question_is_not_an_agent_and_its_program_is_named() {
     type_line(
         &inst,
         &sid,
-        "echo \"Checking whether the disk is full?\"; sleep 30",
+        "echo \"Checking whether the disk is full?\"; sleep 300",
     );
-    let rec = status_until(&inst, &sid, Duration::from_secs(10), "program=sleep", |s| {
+    let rec = status_until(&inst, &sid, HANG, "program=sleep", |s| {
         field(s, "program") == Some("sleep")
     });
     // Sample for two seconds: never an agent, never attention.
@@ -514,7 +531,7 @@ fn a_shell_that_cats_a_claude_capture_is_not_an_agent() {
             "await",
             "match",
             "for.shortcuts",
-            "timeout=10000",
+            HANG_MS,
         ],
     );
     assert!(
@@ -609,7 +626,7 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
     });
 
     type_line(&inst, &sid, "/bin/bash --norc --noprofile -i");
-    status_until(&inst, &sid, Duration::from_secs(10), "program=bash", |s| {
+    status_until(&inst, &sid, HANG, "program=bash", |s| {
         field(s, "program") == Some("bash")
     });
     type_line(&inst, &sid, "PS1='$ '");
@@ -623,16 +640,10 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
                 die.display()
             ),
         );
-        let running = status_until(
-            &inst,
-            &sid,
-            Duration::from_secs(10),
-            "program=claude, read as an agent",
-            |s| {
-                field(s, "program") == Some("claude")
-                    && matches!(field(s, "agent"), Some("idle" | "question"))
-            },
-        );
+        let running = status_until(&inst, &sid, HANG, "program=claude, read as an agent", |s| {
+            field(s, "program") == Some("claude")
+                && matches!(field(s, "agent"), Some("idle" | "question"))
+        });
         let rev = settled_agent_rev(&inst, &sid);
         // Everything pushed so far is the fake's life; the stream is read from
         // its exit on.
@@ -656,7 +667,7 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
             if program == "bash" && agent == "-" {
                 break true;
             }
-            if t0.elapsed() > Duration::from_secs(20) {
+            if t0.elapsed() > HANG {
                 break false;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -689,7 +700,7 @@ fn settled_agent_rev(inst: &Instance, sid: &str) -> u64 {
             .and_then(|r| r.parse().ok())
             .expect("agent_rev")
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + HANG;
     let mut last = read();
     loop {
         std::thread::sleep(Duration::from_millis(600));
@@ -824,7 +835,7 @@ fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
     status_until(
         &inst,
         &sid,
-        Duration::from_secs(10),
+        HANG,
         "the first run exited to its shell",
         |s| field(s, "program") != Some("claude") && field(s, "agent") == Some("-"),
     );
@@ -867,13 +878,7 @@ fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path
     // person makes before typing.
     ctl_ok(
         inst,
-        &[
-            &format!("@{sid}"),
-            "await",
-            "match",
-            r"[$#]\s*$",
-            "timeout=15000",
-        ],
+        &[&format!("@{sid}"), "await", "match", r"[$#]\s*$", HANG_MS],
     );
     type_line(
         inst,
@@ -892,24 +897,14 @@ fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path
 /// `go` is created, the REPL is drawn, and the wait latches on it. Returns
 /// the screen it answered on, which holds the REPL.
 fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> String {
-    let named = status_until(
-        inst,
-        sid,
-        Duration::from_secs(10),
-        "program=claude, read as an agent",
-        |s| field(s, "program") == Some("claude") && field(s, "agent") != Some("-"),
-    );
+    let named = status_until(inst, sid, HANG, "program=claude, read as an agent", |s| {
+        field(s, "program") == Some("claude") && field(s, "agent") != Some("-")
+    });
     // A waiter parked on idle while nothing of the REPL is drawn.
     let waiter = std::thread::spawn({
         let mut cmd = client_command(
             inst,
-            &[
-                &format!("@{sid}"),
-                "await",
-                "agent",
-                "idle",
-                "timeout=15000",
-            ],
+            &[&format!("@{sid}"), "await", "agent", "idle", HANG_MS],
         );
         move || cmd.output().expect("await agent idle")
     });
@@ -947,7 +942,7 @@ fn exit_to_no_agent(rx: &std::sync::mpsc::Receiver<String>, local: u64, round: u
     let stamp = format!("T {local} ");
     let screen = format!("DELTA {local} seq=");
     let gone = format!("EVENT {local} agent - rev=");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + HANG;
     let (mut wake_us, mut exited_at, mut gone_at) = (None::<u64>, None, None);
     let mut seen = Vec::new();
     while exited_at.is_none() || gone_at.is_none() {
@@ -968,7 +963,7 @@ fn exit_to_no_agent(rx: &std::sync::mpsc::Receiver<String>, local: u64, round: u
             let mut footer = false;
             for _ in 0..rows {
                 let row = rx
-                    .recv_timeout(Duration::from_secs(20))
+                    .recv_timeout(HANG)
                     .expect("a screen DELTA's rows follow its header");
                 footer |= row.contains("? for shortcuts");
             }

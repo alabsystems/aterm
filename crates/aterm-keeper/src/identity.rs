@@ -35,6 +35,25 @@ pub enum IdentityPolicy {
     Designated,
 }
 
+/// Why [`Identity::check`] did not admit a peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckError {
+    /// The peer was checked and refused: another uid, or code that does not
+    /// satisfy this build's requirement.
+    Refused(String),
+    /// The check could not run: the kernel did not name the peer, or its code
+    /// could not be looked up (it may have exited).
+    Unchecked(String),
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::Unchecked(why) => f.write_str(why),
+        }
+    }
+}
+
 /// The identity check in force.
 #[derive(Debug)]
 pub struct Identity {
@@ -81,7 +100,7 @@ impl Identity {
 
     #[cfg(not(target_vendor = "apple"))]
     fn designated() -> Result<Self, String> {
-        Err("code identity is checked on macOS only; use the same-uid floor".to_string())
+        Err("code identity is checked on macOS only".to_string())
     }
 
     /// The policy in force.
@@ -99,26 +118,33 @@ impl Identity {
     /// Check the peer on `stream`: same uid, then (Designated) its code.
     ///
     /// # Errors
-    /// Why the peer is refused.
-    pub fn check(&self, stream: &CtlStream) -> Result<(), String> {
+    /// Why the peer is refused, or why it could not be checked.
+    pub fn check(&self, stream: &CtlStream) -> Result<(), CheckError> {
         #[cfg(unix)]
         {
             let ours = aterm_uds::peer::our_uid();
             match aterm_uds::peer::peer_uid(stream) {
                 Some(uid) if uid == ours => {}
-                Some(uid) => return Err(format!("peer uid {uid} is not ours")),
-                None => return Err("the kernel did not name the peer's uid".to_string()),
+                Some(uid) => {
+                    return Err(CheckError::Refused(format!("peer uid {uid} is not ours")));
+                }
+                None => {
+                    return Err(CheckError::Unchecked(
+                        "the kernel did not name the peer's uid".to_string(),
+                    ));
+                }
             }
         }
         #[cfg(not(unix))]
         {
             let _ = stream;
-            return Err("the keeper is Unix-only".to_string());
+            return Err(CheckError::Unchecked("the keeper is Unix-only".to_string()));
         }
         #[cfg(target_vendor = "apple")]
         if let Some(req) = &self.requirement {
-            let token = aterm_uds::peer::peer_audit_token(stream)
-                .ok_or_else(|| "the kernel did not give the peer's audit token".to_string())?;
+            let token = aterm_uds::peer::peer_audit_token(stream).ok_or_else(|| {
+                CheckError::Unchecked("the kernel did not give the peer's audit token".to_string())
+            })?;
             sec::check_guest(&token, req)?;
         }
         #[allow(unreachable_code)]
@@ -247,10 +273,31 @@ mod sec {
         Ok((req, text))
     }
 
-    /// Whether the process `token` names runs code satisfying `req`.
+    /// Whether the process `token` names runs code satisfying `req`: a failed
+    /// lookup of its code is [`CheckError::Unchecked`], code that fails `req`
+    /// [`CheckError::Refused`].
+    ///
+    /// [`CheckError::Unchecked`]: super::CheckError::Unchecked
+    /// [`CheckError::Refused`]: super::CheckError::Refused
     // Skip: bottoms out at Security.framework FFI.
     #[cfg_attr(trust_verify, trust::skip)]
-    pub fn check_guest(token: &aterm_uds::peer::AuditToken, req: &Owned) -> Result<(), String> {
+    pub fn check_guest(
+        token: &aterm_uds::peer::AuditToken,
+        req: &Owned,
+    ) -> Result<(), super::CheckError> {
+        let guest = copy_guest(token).map_err(super::CheckError::Unchecked)?;
+        // SAFETY: both objects are live.
+        status(
+            unsafe { SecCodeCheckValidity(guest.0, 0, req.0) },
+            "the peer's code does not satisfy this build's requirement",
+        )
+        .map_err(super::CheckError::Refused)
+    }
+
+    /// The code object of the process `token` names.
+    // Skip: bottoms out at Security.framework FFI.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn copy_guest(token: &aterm_uds::peer::AuditToken) -> Result<Owned, String> {
         let bytes = token.to_bytes();
         // SAFETY: `bytes` is 32 live bytes, copied by CFDataCreate.
         let data = owned(
@@ -282,12 +329,7 @@ mod sec {
             unsafe { SecCodeCopyGuestWithAttributes(std::ptr::null(), attrs.0, 0, &mut guest) },
             "the peer's code (SecCodeCopyGuestWithAttributes)",
         )?;
-        let guest = owned(guest, "SecCodeCopyGuestWithAttributes")?;
-        // SAFETY: both objects are live.
-        status(
-            unsafe { SecCodeCheckValidity(guest.0, 0, req.0) },
-            "the peer's code does not satisfy this build's requirement",
-        )
+        owned(guest, "SecCodeCopyGuestWithAttributes")
     }
 }
 
@@ -332,7 +374,10 @@ mod tests {
         let (stream, _) = listener.accept().expect("accept");
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let refused = id.check(&stream);
-        assert!(refused.is_err(), "nc passed this binary's requirement");
+        assert!(
+            matches!(refused, Err(CheckError::Refused(_))),
+            "nc was not refused as other code: {refused:?}"
+        );
         Identity::same_uid().check(&stream).expect("nc is our uid");
         let _ = nc.kill();
         let _ = nc.wait();

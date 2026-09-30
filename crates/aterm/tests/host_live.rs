@@ -134,7 +134,24 @@ fn boot(tag: &str, harness: &str) -> Option<Instance> {
 /// fixture world written ([`headless_boot::boot_with`]: `None` is an
 /// environment refusal; a product that cannot start fails the test), and read
 /// its one session's sid.
+///
+/// `tag` names the scratch root (`athh<tag>-<pid>`, its socket included), so
+/// it is this binary's alone: two tests on one tag ran in one root at once,
+/// each killing the other's instance (2026-09-29: `t` and `u` were each
+/// taken twice, and two tests failed in every whole-file run and passed
+/// alone). A reused tag fails here, before it can boot.
 fn boot_sized(tag: &str, harness: &str, lines: u16) -> Option<Instance> {
+    static TAKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut taken = TAKEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !taken.iter().any(|t| t == tag),
+            "boot tag `{tag}` is taken: two boots would share one scratch root"
+        );
+        taken.push(tag.to_owned());
+    }
     let live = headless_boot::boot_with(
         &format!("athh{tag}"),
         |tmp, cmd| {
@@ -744,6 +761,33 @@ fn the_host_answers_every_box_by_default() {
     assert!(text.contains("did not read whole"), "{text}");
 }
 
+/// THE OWNER RULING OF 2026-09-25, end to end in a real headless aterm:
+/// only an explicit setting stops the harness answering. A `[harness]` table
+/// carrying a misspelled key, a key a newer aterm might add, and `approve` and
+/// `enabled` values no reading makes sense of — the last two of which were
+/// read as their limits before the ruling, `approve = none` and the harness
+/// off — still gets `1` on the rm circuit breaker over `S=/usr` in a bypass
+/// session. NEGATIVE CONTROL: the same box under an explicit off spelled
+/// `approve = "no"` is handed over with nothing typed.
+#[test]
+fn a_typo_in_the_harness_table_never_stops_the_answers() {
+    let noisy = "approve = \"maybe\"\nenabled = \"sometimes\"\nrm_breakr = false\n\
+                 some_future_key = true\n";
+    let Some(inst) = boot("t", noisy) else {
+        return;
+    };
+    run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
+    keys_until(&inst, "k1", &["1"], Duration::from_secs(25));
+    program_is(&inst, "sh", Duration::from_secs(10));
+    drop(inst);
+
+    let Some(inst) = boot("u", "approve = \"no\"\n") else {
+        return;
+    };
+    run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
+    escalated_and_quiet(&inst, "k1", "S=/usr; rm -rf $S/a");
+}
+
 /// ON A SCREEN TALLER THAN THE 40 ROWS THE WINDOW READS (the validate
 /// drive of 2026-09-24, a private headless aterm at 130x49): the measured
 /// Yes/No question drawn at the top of a 49-row screen reached the reader
@@ -758,7 +802,7 @@ fn the_host_answers_every_box_by_default() {
 /// `1`.
 #[test]
 fn a_49_row_screen_is_read_whole_and_the_instance_lives() {
-    let Some(mut inst) = boot_sized("t", "", 49) else {
+    let Some(mut inst) = boot_sized("w", "", 49) else {
         return;
     };
     run_fake(&inst, "k0", &["q-one-top.txt"]);
@@ -1483,7 +1527,7 @@ fn journal(inst: &Instance) -> String {
 #[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
 #[test]
 fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
-    let Some(inst) = boot("u", "relaunch = false\n") else {
+    let Some(inst) = boot("v", "relaunch = false\n") else {
         return;
     };
     write_upgrade_fake(&inst, "2.1.281", true);

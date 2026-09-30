@@ -202,6 +202,8 @@ pub(crate) use control_media::image_payload;
 mod control_session;
 // The turn-id counter a self-update handoff carries (`crate::seamless`).
 pub(crate) use control_session::{raise_turn_ids, turn_ids_minted};
+#[cfg(any(unix, test))]
+pub(crate) use control_session::{turn_ids_for_handoff, turn_ids_past_handoff_ceiling};
 // The two reads a handoff's end-to-end test drives `aterm drive report` through
 // (the handoff is unix-only, and so is that test).
 #[cfg(all(test, unix))]
@@ -1314,6 +1316,24 @@ impl Drop for UpdateCheckAsked<'_> {
 /// platforms report `enabled=false`. Manual checks resolve the current GUI configuration,
 /// with the same compiled-channel policy as menu/background checks, then notify the
 /// GUI reducer after every completed check, including failures and retirement.
+/// Whether a control server may publish and serve now: at once for every
+/// launch but a per-process update candidate, which waits for the Commit to
+/// release its gate (`publish_gate`, round seven of the update audit, findings
+/// 13 and 14). `false` only for a gate that is never released — an attempt
+/// that stood down, whose candidate is reaped.
+fn await_commit_to_publish(gate: Option<&crate::spawn::DeferredReaderGate>) -> bool {
+    gate.is_none_or(|gate| gate.wait_until_released(&AtomicBool::new(false)))
+}
+
+/// `update check`'s answer when the main thread refuses the settings read
+/// (finding 40): the refusal in its own words behind the verb's prefix —
+/// `ERR update check: aterm is showing a dialog; answer it, then retry`, or
+/// `… main thread stalled <N>s since <root>; retry`, which the harness rides
+/// out as a request turned away.
+fn update_check_refused(refusal: &crate::control::control_media::MainHopError) -> String {
+    format!("ERR update check: {refusal}\n")
+}
+
 fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String {
     let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
     // `update` is AnyScopeMeta so `""`/`status` (a pure read of updater state) answers
@@ -1336,6 +1356,17 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let st = match rest.trim() {
         "" | "status" => aterm_update::status(build),
         "check" => {
+            // A MAIN THREAD THAT CANNOT ANSWER IS THE ANSWER (round seven of the
+            // update audit, finding 40). The check reads the live settings on
+            // the main thread, and under a dialog or a stall that hop is
+            // refused at once — a refusal the provider could only turn into
+            // "no settings", which the updater then reported as an EMPTY
+            // status: `OK … staged_build=- relaunch_ready=false`, hiding a
+            // stage on disk behind an `OK` no driver retries. Refused here,
+            // typed, before anything is checked.
+            if let Some(refusal) = crate::control::control_media::main_thread_refusal() {
+                return update_check_refused(&refusal);
+            }
             let provider = crate::update_control::check_settings_provider(proxy.clone());
             // A person asked: what this check downloads is work they are waiting
             // on, and takes the animated row (design ruling 220). The guard says
@@ -3894,6 +3925,10 @@ pub(crate) fn spawn(
     operator: Option<crate::operator_host::ControlHandle>,
     // Only fixed-path incoming candidates wait: per-process sockets cannot collide.
     handoff: Option<IncomingControlHandoff>,
+    // A PER-PROCESS update candidate's Commit gate: it binds at once, but
+    // publishes and serves only once the Commit releases this (round seven,
+    // findings 13 and 14). `None` for every other launch.
+    publish_gate: Option<crate::spawn::DeferredReaderGate>,
 ) -> ControlPreparation {
     let preparation = ControlPreparation::default();
     let preparation_guard = ControlPreparationGuard {
@@ -4002,6 +4037,23 @@ pub(crate) fn spawn(
         crate::owned_endpoint::publish(&plan);
         if handoff.is_none() {
             preparation_guard.ready();
+        }
+        // A PER-PROCESS UPDATE CANDIDATE PUBLISHES AT COMMIT, NOT AT BOOT (round
+        // seven of the update audit, findings 13 and 14). It used to point the
+        // `latest` alias and every carried session's `graph/<sid>` at itself
+        // 191–272 ms before the parent committed — and longer under a slow
+        // proof — while the parent still owned those sessions: every
+        // in-session `aterm ctl` in that window reached the candidate, whose
+        // main thread swallows every hop before Commit (`key`/`send` answered
+        // `ERR … main-thread reply dropped`, the keystroke lost), and whose
+        // `OK` to an off-thread write (`meta set`, `post`, `inbox seen`) died
+        // with it on a rollback. A rollback also left every entry naming the
+        // reaped candidate, with nothing to republish the parent's. Held here
+        // until the Commit releases the gate the adopted readers wait on — the
+        // order a fixed-path candidate always had — and never published at
+        // all when the attempt stands down (the process is reaped).
+        if !await_commit_to_publish(publish_gate.as_ref()) {
+            return;
         }
         if let Some(link) = &plan.latest_link {
             control_auth::publish_latest_link(link, &sock_path);
@@ -10629,7 +10681,7 @@ fn handle(
         // `ready [timeout_ms]`: block until the target is Alive AND idle (at an
         // OSC-133 prompt, or the kernel idle-settle window), so an agent can chain
         // sessions without busy-polling. Read-side (observes lifecycle/blocks).
-        "ready" => control_session::cmd_ready(term, store, session, rest, subscribers),
+        "ready" => control_session::cmd_ready(term, store, session, ctx, rest, subscribers),
         // `await <idle|seq|match|gone|block>`: block until the Observation Kernel (L0)
         // latches the predicate. The event-driven, no-silent-loss generalization of
         // `ready`/`wait`: it adds the OSC-133-independent `idle`/`match`/`gone`/`seq`
@@ -17962,6 +18014,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         });
         let handle = SessionHandle {
             sid,
@@ -18575,6 +18628,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         });
         let before = ctx.cast.lock().unwrap().event_count();
 
@@ -18866,6 +18920,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         })
     }
 
@@ -20882,6 +20937,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         });
         SessionHandle {
             sid,
@@ -24548,7 +24604,7 @@ mod tests {
         // A fresh prompt (OSC 133 A) -> PromptOnly -> ready immediately.
         term.lock().unwrap().process(b"\x1b]133;A\x07$ ");
         assert_eq!(
-            cmd_ready(term, &store, 0, "2000", &subscribe::new_registry()),
+            cmd_ready(term, &store, 0, &h.ctx, "2000", &subscribe::new_registry()),
             "OK ready prompt\n",
             "fresh prompt is ready"
         );
@@ -24558,7 +24614,7 @@ mod tests {
             .unwrap()
             .process(b"\x1b]133;B\x07sleep\n\x1b]133;C\x07");
         assert_eq!(
-            cmd_ready(term, &store, 0, "0", &subscribe::new_registry()),
+            cmd_ready(term, &store, 0, &h.ctx, "0", &subscribe::new_registry()),
             "OK timeout\n",
             "executing is not ready"
         );
@@ -24566,7 +24622,7 @@ mod tests {
         // The command completes -> Complete -> ready again (prompt-end).
         term.lock().unwrap().process(b"\x1b]133;D;0\x07");
         assert_eq!(
-            cmd_ready(term, &store, 0, "2000", &subscribe::new_registry()),
+            cmd_ready(term, &store, 0, &h.ctx, "2000", &subscribe::new_registry()),
             "OK ready prompt\n",
             "completed is ready"
         );
@@ -24577,7 +24633,7 @@ mod tests {
             .unwrap()
             .set_state(0, session_store::SessionState::Exited);
         assert_eq!(
-            cmd_ready(term, &store, 0, "2000", &subscribe::new_registry()),
+            cmd_ready(term, &store, 0, &h.ctx, "2000", &subscribe::new_registry()),
             "ERR exited\n",
             "exited fails closed"
         );
@@ -24593,7 +24649,14 @@ mod tests {
         store.write().unwrap().register(h.clone());
         // No OSC-133 at all: the settle heuristic fires (content_seq holds steady).
         assert_eq!(
-            cmd_ready(&h.term, &store, 0, "2000", &subscribe::new_registry()),
+            cmd_ready(
+                &h.term,
+                &store,
+                0,
+                &h.ctx,
+                "2000",
+                &subscribe::new_registry()
+            ),
             "OK ready idle\n",
             "idle plain shell"
         );
@@ -26003,6 +26066,51 @@ mod tests {
             "OK lease none\n",
             "the wedged turn lease is cleared"
         );
+    }
+
+    /// A FORCED preemption of a DRIVEN turn wakes the driving session too
+    /// (`DriverGeometry`'s `EveryMovedLeaseOwesAWake`): the driver's band reads
+    /// the peer's lease (`▸ @<sid>`), and the wedged turn's own guard finds the
+    /// slot taken or empty when it drops and posts nothing — so without the
+    /// driver's wake its window's row holds on a lease mark that has moved. A
+    /// refused release posts nothing, and an undriven turn wakes only itself.
+    #[test]
+    fn force_preempting_a_driven_turn_wakes_its_driver_too() {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let driver = aterm_session::SessionId::generate();
+        let own = h.ctx.self_id.clone();
+        let _ = crate::presence::take_lease_wakes();
+
+        *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+            id: 78,
+            driver: Some(driver.clone()),
+            typing: true,
+        });
+        let refused = cmd_lease(&h.ctx, "release");
+        assert!(refused.starts_with("ERR busy turn=78"), "{refused}");
+        assert_eq!(
+            crate::presence::take_lease_wakes(),
+            [],
+            "a refused release moves no lease and wakes nobody"
+        );
+
+        assert_eq!(cmd_lease(&h.ctx, "release force"), "OK lease released\n");
+        assert_eq!(
+            crate::presence::take_lease_wakes(),
+            [(own.clone(), false), (driver, false)],
+            "the preempted turn's session AND its driving session are woken"
+        );
+
+        // An undriven turn: its own session alone.
+        *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+            id: 79,
+            driver: None,
+            typing: true,
+        });
+        assert_eq!(cmd_lease(&h.ctx, "release force"), "OK lease released\n");
+        assert_eq!(crate::presence::take_lease_wakes(), [(own, false)]);
     }
 
     /// `turn` on a dead session fails closed with `ERR exited`, and a bad submit
@@ -29016,3 +29124,81 @@ mod control_socket_handoff_tests;
 #[cfg(all(test, unix))]
 #[path = "publish_ordering_conformance.rs"]
 mod publish_ordering_conformance;
+
+/// ROUND SEVEN OF THE UPDATE AUDIT, FINDING 40: `update check` under a dialog
+/// or a stalled main thread answers the main thread's typed refusal — never an
+/// `OK` line whose empty status hides a staged build.
+#[cfg(test)]
+mod update_check_refusal_tests {
+    use super::control_media::MainHopError;
+
+    /// The refusal in its own words, behind the verb's prefix, which is what
+    /// the harness's turned-away rule reads (`ERR <what>: main thread stalled`).
+    #[test]
+    fn a_refused_settings_read_is_answered_err_in_its_own_words() {
+        let dialog = MainHopError::Reason("aterm is showing a dialog; answer it, then retry");
+        assert_eq!(
+            super::update_check_refused(&dialog),
+            "ERR update check: aterm is showing a dialog; answer it, then retry\n"
+        );
+    }
+
+    /// The check arm consults the refusal BEFORE it builds the provider (whose
+    /// `None` is all a refused hop could say). Pinned by source: the arm has no
+    /// unit seam without an event loop, and deleting the early return would
+    /// leave the test above green while the `OK` came back.
+    #[test]
+    fn the_check_arm_refuses_before_it_reads_the_settings() {
+        let src = include_str!("control.rs");
+        let arm = &src[src.find("        \"check\" => {").expect("the check arm")..];
+        let refusal = arm
+            .find("control_media::main_thread_refusal()")
+            .expect("the arm consults the main thread's refusal");
+        let provider = arm
+            .find("check_settings_provider(")
+            .expect("the arm builds the provider");
+        assert!(refusal < provider, "refused before the settings are read");
+        assert!(arm[refusal..provider].contains("update_check_refused("));
+    }
+
+    /// ROUND SEVEN, FINDINGS 13 AND 14: a per-process update candidate
+    /// publishes nothing — no `latest` alias, no `graph/<sid>` entry, no served
+    /// request — until the Commit releases its gate. The wait is real (it
+    /// returns only on the release), and the control server takes it BEFORE
+    /// either publication; every other launch passes at once. Pinned by
+    /// source for the order, since `spawn` needs an event loop.
+    #[test]
+    fn a_per_process_candidate_publishes_only_after_the_commit() {
+        assert!(super::await_commit_to_publish(None), "an ordinary launch");
+        let gate = crate::spawn::DeferredReaderGate::closed();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || super::await_commit_to_publish(Some(&gate)))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !waiter.is_finished(),
+            "nothing is published before the Commit"
+        );
+        gate.release();
+        assert!(
+            waiter.join().unwrap(),
+            "the Commit releases the publication"
+        );
+
+        let src = include_str!("control.rs");
+        let body = &src[src.find("pub(crate) fn spawn(").expect("spawn")..];
+        let wait = body.find("await_commit_to_publish(").expect("spawn waits");
+        let alias = body.find("publish_latest_link(").expect("the alias");
+        let graph = body.find("publish_discovery(").expect("the graph entries");
+        assert!(wait < alias && wait < graph, "the wait comes first");
+        let lib = include_str!("lib.rs");
+        let gate_at = lib
+            .find("let publish_gate = handoff_reader_gate")
+            .expect("lib.rs");
+        assert!(
+            lib[gate_at..gate_at + 200].contains("plan.latest_link.is_some()"),
+            "the per-process plan is the one gated"
+        );
+    }
+}

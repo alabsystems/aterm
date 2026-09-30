@@ -33,11 +33,12 @@
 // cfg-validation build are CROSS builds on upstream stable by design. An
 // x86_64 host cutting that slice would see TARGET == HOST and be refused, and
 // that is fine: buildplan hardcodes aarch64 as the native Trust slice and lipo
-// cannot join two x86_64 slices, so no release is ever cut there. The THIRD
-// sanctioned lane is the PUBLIC SNAPSHOT: its export swaps rust-toolchain.toml
-// for the stock pin (publish/transforms.sh), so the gate reads the tree's own
-// committed pin and stands down only when it explicitly names a non-trust
-// channel (gate::tree_pins_trust — fail-closed on a missing or channelless pin).
+// cannot join two x86_64 slices, so no release is ever cut there. The gate also
+// reads the tree's own committed pin and stands down only when it explicitly
+// names a non-trust channel (gate::tree_pins_trust — fail-closed on a missing
+// or channelless pin). That stand-down was made for the PUBLIC SNAPSHOT, whose
+// export swapped in a stock pin until 2026-09-29; the export now keeps
+// `channel = "trust"`, so both sanctioned trees enforce.
 //
 // Ends with `cargo:` directives only where they matter: the script re-runs when
 // cargo resolves a different compiler (RUSTC); a toolchain SWAP behind the same
@@ -55,13 +56,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUSTC");
 
     // The tree's OWN pin decides whether this gate is armed. The dev workspace
-    // pins `channel = "trust"` (the 2026-08-30 standing directive — enforce);
-    // the PUBLIC SNAPSHOT's export deliberately swaps this file for the stock
-    // pin (publish/transforms.sh), and its committed stock-Rust gate
-    // (publish/DECISIONS.md) then builds with upstream rustc under anonymous
-    // git — enforcing the trust marker there made the public snapshot
-    // unbuildable by its own gate. Fail-closed: missing/unreadable pin, or no
-    // channel line, still enforces (gate::tree_pins_trust).
+    // and, since 2026-09-29, the public snapshot pin `channel = "trust"` (the
+    // 2026-08-30 standing directive — enforce); only a tree whose committed pin
+    // explicitly names another channel stands it down. Fail-closed:
+    // missing/unreadable pin, or no channel line, still enforces
+    // (gate::tree_pins_trust).
     let pin_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rust-toolchain.toml");
     println!("cargo:rerun-if-changed={}", pin_path.display());

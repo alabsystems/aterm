@@ -13,7 +13,7 @@ use aterm_core::terminal::{AltArchiveImport, Terminal, TerminalCheckpoint};
 
 use super::tests::{
     ENV_LOCK, RestoreVar, StageCarry, StagedHandoff, child_proof_from, pipe_pair,
-    stage_carry_handoff, stage_history_handoff,
+    stage_carry_handoff, stage_history_handoff, stage_ladder_handoff,
 };
 use super::*;
 use crate::handoff_carry::{self, ControlCarry};
@@ -109,8 +109,12 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 claim_known: false,
                 attention_owners: Vec::new(),
                 viewport_from_bottom: None,
+                fabric: Default::default(),
+                timeline_id: 0,
             })
             .collect(),
+        roster_seq: None,
+        fabric_attached: Vec::new(),
     })
 }
 
@@ -512,6 +516,92 @@ fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
     staged.teardown();
 }
 
+/// Round seven, finding 24: a session carried with a repainted screen (the
+/// producer lowered it to Sanitized or Repaint, or this receiver degraded
+/// it) goes without the differ's state only. Its turn ledger and archive
+/// rows are not about the screen: `history` and `offscreen` read on across
+/// the update, where the whole carry used to be dropped unread.
+#[test]
+fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = env_guard();
+    let mut app = FakeApp::new();
+    let (term, turns) = old_session(&mut app, 60);
+    let mark = turns.lock().unwrap().records().last().unwrap().arch;
+    let since = format!("since={}:{} max=5000", mark.origin, mark.last);
+    let carry = outgoing(&term, &turns, None);
+    let staged = stage_ladder_handoff("carry-repaint", &carry, &[0]);
+    let mut adopted = as_successor(&staged, |_| take_incoming().adopted);
+    let control = adopted[0]
+        .control
+        .take()
+        .expect("the ledger and rows still come");
+    let archive = control.archive.as_ref().expect("the archive came");
+    assert!(archive.differ.is_none(), "the differ's state stays behind");
+    assert!(!archive.rows.is_empty(), "the rows came");
+    assert_eq!(control.turns.len(), 2, "the whole ledger came");
+    let (t, ledger, _) = adopt(&carry.screens[0], Some(control));
+    let h = host(t, ledger);
+    let history = crate::control::cmd_history(&h.ctx, "since=40");
+    assert!(history.starts_with("OK 1\nturn 41 "), "{history}");
+    let after = crate::control::cmd_offscreen(&h.term, &since);
+    assert!(after.contains(&format!("origin={ORIGIN}")), "{after}");
+    assert!(ctl_files(&staged).is_empty(), "nothing left behind");
+    staged.teardown();
+}
+
+/// Round seven, finding 44: every way a control carry is lost at adoption
+/// has a cause, which `take_incoming` logs by session — a lost carry no
+/// longer reads like a session nobody drove.
+#[test]
+fn a_lost_control_carry_names_its_cause() {
+    let mut app = FakeApp::new();
+    let (term, turns) = old_session(&mut app, 30);
+    let bytes = outgoing(&term, &turns, None).controls.remove(0).1;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("s0.ctl");
+    let take = |written: Option<&[u8]>, stamp: &str, budget: u64| {
+        let _ = std::fs::remove_file(&path);
+        if let Some(written) = written {
+            std::fs::write(&path, written).unwrap();
+        }
+        let mut remaining = budget;
+        take_control_sidecar(&path, dir.path(), stamp, &mut remaining).map(|_| ())
+    };
+    let stamp = handoff_carry::stamp(&bytes);
+    let all = handoff_carry::MAX_AGGREGATE_BYTES;
+    assert_eq!(take(Some(&bytes), &stamp, all), Ok(()));
+    let mut flipped = bytes.clone();
+    let at = flipped.len() / 2;
+    flipped[at] ^= 0x20;
+    let cause = take(Some(&flipped), &stamp, all).unwrap_err();
+    assert!(cause.contains("sha"), "{cause}");
+    assert!(take(None, &stamp, all).unwrap_err().contains("missing"));
+    assert!(
+        take(Some(&bytes), &stamp, 1)
+            .unwrap_err()
+            .contains("budget")
+    );
+    assert!(
+        take(Some(&bytes), "12 nope", all)
+            .unwrap_err()
+            .contains("malformed")
+    );
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let newer = text.replacen("\"version\":1", "\"version\":2", 1);
+    assert_ne!(newer, text);
+    let cause = take(
+        Some(newer.as_bytes()),
+        &handoff_carry::stamp(newer.as_bytes()),
+        all,
+    )
+    .unwrap_err();
+    assert!(cause.contains("version"), "{cause}");
+    let junk = b"not json";
+    let cause = take(Some(junk), &handoff_carry::stamp(junk), all).unwrap_err();
+    assert!(cause.contains("JSON"), "{cause}");
+}
+
 /// Design test 8: a sidecar that is missing, cut short, of another sha, or
 /// bigger than a sidecar may be, costs the carry and nothing else — the
 /// session adopts, and the proof checks out.
@@ -730,7 +820,11 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             claim_known: false,
             attention_owners: Vec::new(),
             viewport_from_bottom: None,
+            fabric: Default::default(),
+            timeline_id: 0,
         }],
+        roster_seq: None,
+        fabric_attached: Vec::new(),
     };
     let wire = new.to_toml().unwrap();
     assert!(new.roundtrips());
@@ -1075,6 +1169,78 @@ fn a_report_after_a_dropped_carry_starts_afresh() {
         })
         .expect("report");
     assert!(r.reasons.contains(&Reason::ArchiveReset), "{}", r.header());
+}
+
+/// Round seven, finding 58: `history` on a ledger a handoff could not
+/// carry whole says its floor, so `OK 0` there no longer reads as "no turn
+/// landed" — and says nothing for an anchor at or past the floor, or for a
+/// ledger carried whole.
+#[test]
+fn history_after_a_dropped_ledger_says_its_floor() {
+    let minted = crate::control::turn_ids_minted() + 50;
+    crate::control::raise_turn_ids(minted);
+    let h = host(live_engine(1), handoff_carry::adopted_ledger(None));
+    let floor = h.ctx.turns.lock().unwrap().unheld_below();
+    assert!(floor > minted);
+    let reply = crate::control::cmd_history(&h.ctx, "since=40");
+    assert_eq!(reply, format!("OK 0 unheld_below={floor}\n"));
+    assert_eq!(
+        crate::control::cmd_history(&h.ctx, ""),
+        format!("OK 0 unheld_below={floor}\n")
+    );
+    let past = format!("since={}", floor - 1);
+    assert_eq!(crate::control::cmd_history(&h.ctx, &past), "OK 0\n");
+    let whole = handoff_carry::adopted_ledger(Some(&mut ControlCarry::default()));
+    let h = host(live_engine(1), whole);
+    assert_eq!(crate::control::cmd_history(&h.ctx, ""), "OK 0\n");
+}
+
+/// Round seven, finding 58's review: the floor is said only while it lies
+/// inside the window the ledger answers for. A supervisor's worker that runs
+/// past `LEDGER_CAP` more turns after the update has evicted every record
+/// under it, and `history` — and so every `drive ledger` report — goes back
+/// to a plain `OK <n>`.
+#[test]
+fn history_stops_saying_a_floor_the_ledger_has_evicted_past() {
+    let minted = crate::control::turn_ids_minted() + 50;
+    crate::control::raise_turn_ids(minted);
+    let h = host(live_engine(1), handoff_carry::adopted_ledger(None));
+    let floor = h.ctx.turns.lock().unwrap().unheld_below();
+    assert!(floor > minted);
+    let rec = |id: u64| TurnRecord {
+        id,
+        started_ms: 1,
+        dur_ms: 1,
+        submitted: true,
+        status: "settled",
+        text: "t".to_string(),
+        screen_hash: 1,
+        seq: 1,
+        arch: ArchMark::default(),
+        carried: false,
+    };
+    // The control: a record held under the floor keeps it said.
+    h.ctx.turns.lock().unwrap().push(rec(floor - 1));
+    let reply = crate::control::cmd_history(&h.ctx, "");
+    assert!(
+        reply.starts_with(&format!("OK 1 unheld_below={floor}\n")),
+        "{reply}"
+    );
+    let cap = crate::turn_ledger::LEDGER_CAP as u64;
+    for id in floor + 1..=floor + cap {
+        h.ctx.turns.lock().unwrap().push(rec(id));
+    }
+    let reply = crate::control::cmd_history(&h.ctx, "");
+    assert!(
+        reply.starts_with(&format!("OK {cap}\n")),
+        "{}",
+        &reply[..40]
+    );
+    assert_eq!(
+        h.ctx.turns.lock().unwrap().carry_floor(),
+        0,
+        "not carried on"
+    );
 }
 
 /// A `subscribe … events since-turn=<n>` resumed after a handoff that could

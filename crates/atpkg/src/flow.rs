@@ -1499,7 +1499,7 @@ pub struct RollbackReport {
 ///
 /// ONCE *PER CALL*, which is not once per PASS: a caller that runs a second lane after
 /// this one (`atpkg update`'s attestation repair and set completion) must hand the index
-/// it already holds to [`apply_channel_with`] rather than call this and resolve again.
+/// it already holds to [`apply_channel_gated`] rather than call this and resolve again.
 #[allow(
     clippy::too_many_arguments,
     reason = "every input is an irreducible dependency of a verified channel apply: the \
@@ -1522,13 +1522,24 @@ pub fn apply_channel(
     // 1–2. Resolve + verify-select the index ONCE + freshness (§8) — the shared
     //      [`resolve_verified_index`] prologue (cached-fallback, §14).
     let index = resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
-    apply_channel_with(
-        fetcher, layout, &index, channel, triple, installed, excluded,
+    apply_channel_gated(
+        fetcher,
+        layout,
+        &index,
+        channel,
+        triple,
+        installed,
+        excluded,
+        &crate::quiet::FlipGate::NOW,
     )
 }
 
 /// [`apply_channel`] over a CALLER-RESOLVED, already-verified index — the shape
-/// [`bootstrap_group`] has always had, for a caller whose pass has more than one lane.
+/// [`bootstrap_group`] has always had, for a caller whose pass has more than one lane —
+/// under `flip`, the unattended lanes' form: the coherence group holding the Trust
+/// toolchain stages its new builds and holds its flip while that toolchain is in use
+/// ([`crate::quiet`], [`TxnOutcome::Deferred`]). Every other group, and every group under
+/// [`crate::quiet::FlipGate::NOW`] (what `aterm pkg update` runs), applies at once.
 ///
 /// `atpkg update` is that caller. One pass applies the channel, repairs a missing
 /// attestation and then completes the default set, and every lane used to resolve the
@@ -1546,35 +1557,10 @@ pub fn apply_channel(
 /// [`resolve_verified_index`] (anti-rollback floor, roster admission, machine signature,
 /// freshness), and a caller holding one across a long pass re-checks its freshness window
 /// before handing it to the next lane.
-pub fn apply_channel_with(
-    fetcher: &dyn Fetcher,
-    layout: &Layout,
-    index: &TrustedIndex,
-    channel: &str,
-    triple: &str,
-    installed: &BTreeMap<String, u64>,
-    excluded: &[String],
-) -> Result<ChannelApplyReport, FlowError> {
-    apply_channel_gated(
-        fetcher,
-        layout,
-        index,
-        channel,
-        triple,
-        installed,
-        excluded,
-        &crate::quiet::FlipGate::NOW,
-    )
-}
-
-/// [`apply_channel_with`] under `flip`, the unattended lanes' form: the coherence group
-/// holding the Trust toolchain stages its new builds and holds its flip while that
-/// toolchain is in use ([`crate::quiet`], [`TxnOutcome::Deferred`]). Every other group,
-/// and every group under [`crate::quiet::FlipGate::NOW`], applies exactly as
-/// [`apply_channel_with`] does.
 #[allow(
     clippy::too_many_arguments,
-    reason = "apply_channel_with's inputs plus the flip gate the unattended lanes hand in"
+    reason = "apply_channel's inputs, with the resolved index in place of its resolve \
+              inputs, plus the flip gate the unattended lanes hand in"
 )]
 pub fn apply_channel_gated(
     fetcher: &dyn Fetcher,
@@ -6971,9 +6957,18 @@ mod tests {
         let person = layout(&dir);
         let installed = live_toolchain(&person);
         let index = resolve_verified_index(&fake, &person, &anchor(), fl(0), 0).unwrap();
-        // `apply_channel_with` is `FlipGate::NOW`: what `aterm pkg update` runs.
-        let report =
-            apply_channel_with(&fake, &person, &index, "stable", TRIPLE, &installed, &[]).unwrap();
+        // `FlipGate::NOW`: what `aterm pkg update` runs.
+        let report = apply_channel_gated(
+            &fake,
+            &person,
+            &index,
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            &crate::quiet::FlipGate::NOW,
+        )
+        .unwrap();
         assert!(matches!(report.groups[0].1, TxnOutcome::Applied(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }

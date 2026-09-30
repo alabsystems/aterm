@@ -2861,13 +2861,8 @@ impl App {
                 },
             )
             .map_err(|error| format!("native render failed: {error:?}"))?;
-        let compiled = tree
-            .compile(viewport)
-            .map_err(|error| format!("native compile failed: {error:?}"))?;
-        compiled
-            .validate_parity()
-            .map_err(|error| format!("native observer parity failed: {error:?}"))?;
-        Ok(compiled)
+        tree.compile(viewport)
+            .map_err(|error| format!("native compile failed: {error:?}"))
     }
 
     /// Build one independently cacheable native leaf scene. No active/focused
@@ -5613,6 +5608,13 @@ impl App {
         if let Err(message) = packages_request_admissible(&request) {
             return PackagesOutcome::Failed { message };
         }
+        // Apply now writes the Mac, not the instance (ruling 409): refused, by name, before
+        // any child, under a private state root. The same answer leads the passes below
+        // (`crate::pass_lead`, ruling 410).
+        let private_state_root = aterm_types::dirs::runs_under_private_state_root();
+        if let Some(message) = packages_request_refusal(&request, private_state_root) {
+            return PackagesOutcome::Blocked { message };
+        }
         let argv = packages_argv(&request);
         // `atpkg machine apply` is a LOCAL verb: no store, no index, no root key —
         // it works in a build whose manager is inert, so the manager gate below does
@@ -5732,8 +5734,11 @@ impl App {
                     // mid-check hands the child to the orphan watch instead of killing it
                     // at its next print — and it is run the lanes' way below, so its
                     // waiting row streams like any pass's.
+                    // Both passes lead with the private window's flag (ruling 410): the
+                    // `atpkg` beside a development build may compile no seam.
                     if check {
                         child
+                            .args(crate::pass_lead(private_state_root))
                             .args(crate::pass_args(
                                 crate::PassVerb::Update,
                                 layout.as_ref(),
@@ -5746,6 +5751,7 @@ impl App {
                         // progress file, so it queues like a pass and its row reads the
                         // plan — minutes and ~3 GB, the longest wait Settings can start.
                         child
+                            .args(crate::pass_lead(private_state_root))
                             .args(verb)
                             .args(crate::pass_wait_and_progress_args(layout.as_ref()))
                             .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
@@ -10960,6 +10966,31 @@ pub(crate) fn packages_request_admissible(request: &PackagesRequest) -> Result<(
     }
 }
 
+/// Why this process refuses `request` right now for what it IS, or `None`.
+///
+/// UNDER A PRIVATE STATE ROOT, APPLY NOW IS REFUSED (ruling 409, 2026-09-29). A
+/// development build given its own `ATERM_STATE_HOME`
+/// ([`aterm_types::dirs::runs_under_private_state_root`]) keeps its own state, but the
+/// `[machine]` settings are the Mac's: Universal Control is written for the account's host
+/// and Spotlight's renames walk the account's `$HOME`. So the page's button applies
+/// nothing there, the launch's daily apply stands aside
+/// ([`atpkg::machine::LaunchApply::PrivateStateRoot`]) and a pass carries no `[machine]`
+/// edit. `aterm pkg machine apply`, typed in a terminal, is the one way left, on purpose.
+/// The other verbs pass: they are package work, not the Mac's settings. A pressed Check,
+/// Install or Uninstall acts on the shared package prefix whatever `[packages]` says (that
+/// switch is Automatic updates alone), and the Check and the Install lead with
+/// [`crate::pass_lead`], so the pass they start carries no `[machine]` edit (ruling 410).
+pub(crate) fn packages_request_refusal(
+    request: &PackagesRequest,
+    private_state_root: bool,
+) -> Option<String> {
+    (private_state_root && matches!(request, PackagesRequest::MachineApply)).then(|| {
+        "this instance runs under a private state root (ATERM_STATE_HOME), and the [machine] \
+         settings are this Mac's \u{2014} `aterm pkg machine apply` in a terminal applies them"
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod packages_argv_tests {
     use super::*;
@@ -11464,6 +11495,83 @@ mod packages_argv_tests {
                     .as_ref()
                     .is_err_and(|m| m.contains("macOS host settings")),
                 "{machine:?}"
+            );
+        }
+    }
+
+    /// UNDER A PRIVATE STATE ROOT, APPLY NOW IS REFUSED BY NAME (ruling 409), and nothing
+    /// else is: the `[machine]` settings are the Mac's, the other verbs are package work.
+    /// Unset, every request passes, as before. The Check and the Install then lead with
+    /// the private window's flag (ruling 410), from the same live answer.
+    #[test]
+    fn apply_now_is_refused_under_a_private_state_root_and_nothing_else_is() {
+        let all = [
+            PackagesRequest::CheckUpdate,
+            PackagesRequest::InstallDefaultSet,
+            PackagesRequest::UninstallAll,
+            PackagesRequest::MachineApply,
+        ];
+        for request in &all {
+            assert_eq!(
+                packages_request_refusal(request, false),
+                None,
+                "{request:?}"
+            );
+        }
+        for request in &all[..3] {
+            assert_eq!(packages_request_refusal(request, true), None, "{request:?}");
+        }
+        let refused = packages_request_refusal(&PackagesRequest::MachineApply, true)
+            .expect("Apply now under a private state root");
+        assert!(
+            refused.contains("private state root (ATERM_STATE_HOME)")
+                && refused.contains("`aterm pkg machine apply` in a terminal"),
+            "it names why and the way left: {refused}"
+        );
+        // The host asks it with the LIVE answer, as a refusal (not a failure), before the
+        // busy gate and the worker thread — so no child is spawned.
+        let src = include_str!("app_native.rs");
+        let start = src
+            .find("pub(crate) fn execute_native_packages(")
+            .expect("the host executor");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        // Whitespace out, so the formatter's line breaks cannot move the needles.
+        let flat: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let live = flat
+            .find("letprivate_state_root=aterm_types::dirs::runs_under_private_state_root();")
+            .expect("the executor reads the live answer once");
+        let ask = flat
+            .find("packages_request_refusal(&request,private_state_root)")
+            .expect("the executor asks with it");
+        assert!(live < ask, "{body}");
+        let blocked = flat[ask..]
+            .find("returnPackagesOutcome::Blocked{message};")
+            .map(|at| ask + at)
+            .expect("a refusal is Blocked");
+        let busy = flat
+            .find("self.native_packages_service.busy()")
+            .expect("the busy gate");
+        let worker = flat.find(".spawn(move||").expect("the worker");
+        assert!(ask < blocked && blocked < busy && busy < worker, "{body}");
+        // Both passes lead with it, ahead of their verb (ruling 410): the `atpkg` beside a
+        // development build may compile no seam, and one built before the flag refuses
+        // the lead as an unknown verb instead of applying.
+        for (branch, verb) in [
+            ("ifcheck{", ".args(crate::pass_args("),
+            ("}elseifinstall{", ".args(verb)"),
+        ] {
+            let at = worker + flat[worker..].find(branch).expect(branch);
+            let lead = at
+                + flat[at..]
+                    .find("child.args(crate::pass_lead(private_state_root))")
+                    .expect("the lead");
+            let args = at + flat[at..].find(verb).expect(verb);
+            assert!(lead < args, "{branch}: the lead comes first");
+            assert_eq!(
+                args,
+                lead + "child.args(crate::pass_lead(private_state_root))".len(),
+                "{branch}: nothing between the lead and the verb"
             );
         }
     }

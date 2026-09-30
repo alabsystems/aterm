@@ -4799,6 +4799,31 @@ mod tests {
     /// A reload burst is bounded to one worker plus its latest one-slot job. A
     /// superseded generation cannot install even when it was already waiting to
     /// parse, and the current result disarms after landing.
+    /// Poll `fonts` until its pending semantic candidate LANDS (the worker's
+    /// result disarms `semantic_pending`), then poll once more. The wait ends
+    /// on that fact, 5 ms after it at most; its bound is a hang detector and
+    /// measures nothing. It was 20 s, and the worker's first job settles the
+    /// whole Unicode specimen in a debug build: at background QoS beside 72
+    /// spinners (the merge gate's utility lane at load 100-170, reproduced)
+    /// that outran 20 s in 2 of 3 runs, and
+    /// `rapid_candidate_replacement_carries_base_and_cached_views_do_not_cross_contaminate`
+    /// then read the pre-landing identity as a wrong one.
+    fn await_semantic_landing(fonts: &mut ChromeFonts) {
+        const HANG: std::time::Duration = std::time::Duration::from_secs(600);
+        let started = std::time::Instant::now();
+        while fonts.semantic_pending.is_some() && started.elapsed() < HANG {
+            fonts.poll_semantic_renderer();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fonts.poll_semantic_renderer();
+        assert!(
+            fonts.semantic_pending.is_none(),
+            "the semantic worker never landed its candidate ({:?})",
+            started.elapsed()
+        );
+        eprintln!("semantic candidate landed after {:?}", started.elapsed());
+    }
+
     #[test]
     fn semantic_prewarm_coalesces_and_installs_only_latest_generation() {
         let renderer = || {
@@ -4852,14 +4877,9 @@ mod tests {
         drop(serial);
 
         // Debug builds can spend several seconds settling the complete Unicode
-        // specimen on a cold font cache. This is a bounded completion wait, not
-        // a timing assertion; correctness is the landed generation below.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while fonts.semantic_pending.is_some() && std::time::Instant::now() < deadline {
-            fonts.poll_semantic_renderer();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        fonts.poll_semantic_renderer();
+        // specimen on a cold font cache. This is a completion wait, not a
+        // timing assertion; correctness is the landed generation below.
+        await_semantic_landing(&mut fonts);
         assert_eq!(fonts.semantic_generation, 2);
         assert!(fonts.semantic_pending.is_none(), "land disarms");
         assert!(fonts.semantic.is_some(), "latest exact fork installs");
@@ -5093,15 +5113,7 @@ mod tests {
         assert!(fonts.ensure_semantic_candidate(&second));
         drop(serial);
 
-        let wait = |fonts: &mut ChromeFonts| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while fonts.semantic_pending.is_some() && std::time::Instant::now() < deadline {
-                fonts.poll_semantic_renderer();
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            fonts.poll_semantic_renderer();
-        };
-        wait(&mut fonts);
+        await_semantic_landing(&mut fonts);
         assert_eq!(fonts.semantic_identity.as_ref(), Some(&second));
         assert_ne!(
             fonts.semantic_ready_epoch, initial_ready_epoch,
@@ -5125,7 +5137,7 @@ mod tests {
             fonts.semantic.is_none(),
             "B cannot paint A while A resolves"
         );
-        wait(&mut fonts);
+        await_semantic_landing(&mut fonts);
         assert_eq!(fonts.semantic_identity.as_ref(), Some(&first));
         assert!(
             !fonts.ensure_semantic_candidate(&second),

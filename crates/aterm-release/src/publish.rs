@@ -8579,15 +8579,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     step(
         "",
-        &match &gr.handoff_fixtures {
-            Some(f) => format!(
-                "handoff fixtures of v{} checked in: {} desks, {} pinned",
-                f.release,
-                f.desks.len(),
-                f.pinned.len()
-            ),
-            None => "handoff fixtures: the ledger records no earlier release".to_string(),
-        },
+        &gates::handoff_fixtures_line(gr.handoff_fixtures.as_ref()),
     );
     step(
         "",
@@ -9744,8 +9736,11 @@ fn run_gate_script(repo: &Path) -> Result<()> {
         ),
     ] {
         step("gate", &format!("{what} (opt-in deep gate)"));
+        // The trust lane's self-test seam turns off its refused-path check
+        // (COULD NOT RUN, never NOT-VERIFIED); an exported one must not reach a cut.
         let status = Command::new(repo.join(script))
             .args(args)
+            .env_remove("ATERM_GATE_NO_PATH_CHECK")
             .current_dir(repo)
             .stdin(std::process::Stdio::null())
             .status()

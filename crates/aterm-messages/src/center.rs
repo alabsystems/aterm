@@ -2402,6 +2402,15 @@ impl MessageCenter {
         }
     }
 
+    /// Never mint an id below `raw` from now on (ids only rise; a `raw` at or
+    /// past the id ceiling is ignored). A seamless successor leaves its still
+    /// running parent a band of ids to record in until Commit
+    /// (round-seven update audit, finding 18: the host's
+    /// `PARKED_PARENT_ID_RESERVE`).
+    pub fn raise_next_id(&mut self, raw: u64) {
+        self.log.raise_to(raw);
+    }
+
     /// Re-seed the carry: each row keeps its id, words and hold, and takes
     /// the handoff staleness cap ([`STALE_HANDOFF`]) in place of its
     /// anchors until [`MessageCenter::after_handoff_commit`]; unknown
@@ -2474,6 +2483,18 @@ impl MessageCenter {
         self.committed_rows = self.committed_rows.max(self.wanted_rows());
         self.revision += 1;
         self.rebalance(now);
+    }
+
+    /// THE PARENT'S RECORD, read again after the handoff committed (round-seven
+    /// update audit, finding 41): `disk` is the message log loaded from the
+    /// file once the parent — which flushed its last line before Commit — is
+    /// gone. A successor that booted before its parent's last write (the late
+    /// park) merges in what that parent recorded after the boot's load, and
+    /// the true ending of each row the boot read as `Stale`
+    /// ([`MessageLog::merge_reloaded`]); a row live here is untouched.
+    pub fn merge_reloaded_log(&mut self, disk: &MessageLog) {
+        self.log.merge_reloaded(disk);
+        self.revision += 1;
     }
 
     /// The handoff committed: every carried row still saying its carried

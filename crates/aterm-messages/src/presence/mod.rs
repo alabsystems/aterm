@@ -83,6 +83,13 @@ pub trait Host: Copy + Eq + Debug {
     /// The word the row prints for a wall: `limited` for a usage wall, the
     /// cause of a network error, else the state it leaves the session in.
     fn wall_band(kind: Self::Wall) -> &'static str;
+    /// Whether the wall is one the harness RETRIES on its own clock (an API
+    /// error, an overload): the time a row prints beside it is the loop's
+    /// NEXT TRY, spoken so (`next try 14:05`), never a reset. Default: no.
+    fn wall_retries(kind: Self::Wall) -> bool {
+        let _ = kind;
+        false
+    }
     /// When the stall's oldest unread byte was accepted.
     fn stall_since(stall: &Self::Stall) -> Instant;
     /// The foreground job is stopped with input queued (not frozen).

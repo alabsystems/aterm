@@ -2,11 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! ERASE A/B — the audition bench for what a DELETE sounds like, the way
-//! `typing_voice_ab` is the bench for the keystroke and `bed_audition` is the
-//! bench for the bed. Neither of those can answer the question this one exists
-//! for, because a delete is not one event: it is a keystroke bell and the erase
-//! POOF'S OWN NOISE landing inside the same 45 ms, and the only thing that
-//! settles whether that pair reads as *one gesture* or as *two keys* is an ear.
+//! `typing_voice_ab` is the bench for the keystroke. That one cannot answer
+//! the question this one exists for, because a delete is not one event: it
+//! is a keystroke bell and the erase POOF'S OWN NOISE landing inside the same
+//! 45 ms, and the only thing that settles whether that pair reads as *one
+//! gesture* or as *two keys* is an ear.
 //!
 //! It renders the SAME four delete shapes a shell user actually deletes with —
 //! plain Backspace, a held Backspace run, Ctrl-W, Ctrl-U — through the real

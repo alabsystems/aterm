@@ -160,12 +160,9 @@ pub(super) struct Launch<'a> {
     pub(super) argv: &'a [String],
     /// What the line executes: an absolute path.
     pub(super) exe: &'a Path,
-    /// The model the relaunch asks for — the model rule's (the newest of the
-    /// conversation's own family, else up the list: [`super::upgrade_models`]),
-    /// or a bucket's fallback and its way back
-    /// ([`restart_here`]): the launch's own `--model`, every spelling, is
-    /// replaced by it; an EMPTY one drops it (Claude's default). `None`
-    /// keeps the launch's flags.
+    /// The model the relaunch asks for ([`with_model`]): the launch's own
+    /// `--model`, every spelling, is replaced by it; an EMPTY one drops it
+    /// (Claude's default). `None` keeps the launch's flags.
     pub(super) model: Option<&'a str>,
     /// The permission mode to resume in ([`resume_mode`]): the relaunch
     /// names it ([`with_permission_mode`]) rather than carrying the launch's.
@@ -309,11 +306,10 @@ const PERMISSION_MODES: [&str; 7] = [
 ];
 
 /// The permission mode `session` last ran in: its transcript's newest
-/// `{"type":"permission-mode"}` row — Claude writes one as the mode changes
-/// (mid-turn too) and with each prompt, so a crash's conversation has it as
-/// well as a live one's. `None` when the tail names none, or a mode this
-/// module does not know.
-pub(super) fn last_permission_mode(home: &Path, session: &str) -> Option<String> {
+/// `{"type":"permission-mode"}` row, which a crash's conversation has as well
+/// as a live one's. `None` when the tail names none, or a mode this module
+/// does not know.
+fn last_permission_mode(home: &Path, session: &str) -> Option<String> {
     let path = transcript(home, session)?;
     let (tail, _) = tail_to_end(&path, TAIL_BYTES);
     permission_mode_of(&tail)
@@ -333,30 +329,28 @@ pub(super) fn permission_mode_of(tail: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The permission mode to resume `session` in: the pill on the tab's screen
-/// where it reads one — the live mode, exactly the person's choice — else the
-/// transcript's newest `permission-mode` row ([`last_permission_mode`]).
-/// Claude writes that row only when it re-appends its session metadata (about
-/// every 32 KiB of transcript, a compaction, a resume, its exit), not as the
-/// mode changes, so a mode chosen at idle — a shift+tab, an aterm light — is
-/// on the screen long before it is in the file. An exited agent's last frame
-/// usually still shows its pill; a graceful exit re-stamps the file.
-///
-/// The live upgrade reads no screen of its own for it: its exchanges with the
-/// host are fenced and counted. It takes the pill from the screen its look
-/// already read ([`screen_mode`]), and this same fallback.
-pub(super) fn resume_mode(opts: &Opts, tab: &str, session: &str) -> Option<String> {
-    connect(opts, tab)
-        .ok()
-        .and_then(|mut c| screen(&mut c, tab))
-        .and_then(|scr| screen_mode(&scr.rows))
-        .or_else(|| last_permission_mode(&opts.home, session))
+/// The permission mode to resume `session` in: the pill the tab shows
+/// (`shown`, [`screen_mode`]) — the live mode, exactly the person's choice —
+/// else the transcript's newest `permission-mode` row
+/// ([`last_permission_mode`]). Claude writes that row only when it re-appends
+/// its session metadata (about every 32 KiB of transcript, a compaction, a
+/// resume, its exit), not as the mode changes, so a mode chosen at idle — a
+/// shift+tab, an aterm light — is on the screen long before it is in the
+/// file. An exited agent's last frame usually still shows its pill.
+pub(super) fn resume_mode(opts: &Opts, session: &str, shown: Option<String>) -> Option<String> {
+    shown.or_else(|| last_permission_mode(&opts.home, session))
+}
+
+/// The pill `tab` shows now ([`screen_mode`]), for a restart with no look of
+/// its own.
+fn tab_mode(opts: &Opts, tab: &str) -> Option<String> {
+    let mut c = connect(opts, tab).ok()?;
+    screen_mode(&screen(&mut c, tab)?.rows)
 }
 
 /// The `--permission-mode` value of the pill Claude draws under its composer
 /// on `rows` ([`super::lights::read_screen`]), or `None` where no composer or
-/// no pill this build knows is drawn — the half of [`resume_mode`] that reads
-/// a screen already in hand.
+/// no pill this build knows is drawn.
 pub(super) fn screen_mode(rows: &[String]) -> Option<String> {
     super::lights::read_screen(rows)
         .and_then(|shown| shown.mode)
@@ -1705,7 +1699,7 @@ fn outcome_line(st: &St, to: &str, after: Option<&str>) -> String {
 }
 
 /// A recorded field, `None` when it is empty (nothing was recorded).
-fn recorded(s: &str) -> Option<&str> {
+pub(super) fn recorded(s: &str) -> Option<&str> {
     (!s.is_empty()).then_some(s)
 }
 
@@ -1775,18 +1769,14 @@ pub(super) const CAUSE_MODEL_BACK: &str = "model-back:";
 
 /// What a restart in place ([`restart_from`]) asks for and records, by
 /// `why`: the model its line asks for, its [`St::cause`], the launch's own
-/// `--model` (`launched`) and the model the launch named before a fallback
-/// still standing ([`St::fallback_from`]), read off the conversation's last
-/// record `prior` ([`fallback_origin`]). The memory banner's restart asks for
-/// the model riding it (`riding`), else the model a person chose by hand
-/// (`hand`), and keeps that origin — or, asking for the hand choice, makes it
-/// the origin ([`fallback_carried`]); a fallback asks for its model and sets
-/// the origin where none stands — the model a person chose by hand since the
-/// launch (`hand`), else the launch's own (a second fallback keeps the
-/// first's, a launch that named no model included); the way back asks for a
-/// model chosen by hand since the fallback, else that origin, else the model the
-/// bucket's notice named, else for none (the launch's `--model` dropped), and
-/// spends it.
+/// `--model` (`launched`) and the fallback origin ([`St::fallback_from`]),
+/// read off the conversation's last record `prior` ([`fallback_origin`]).
+/// The memory banner's restart asks for the model riding it (`riding`), else
+/// the model a person chose by hand (`hand`), and carries the origin
+/// ([`fallback_carried`]); a fallback asks for its model and keeps the origin
+/// standing, else sets it — the hand choice, else the launch's own; the way
+/// back asks for a hand choice made since, else the origin, else the model
+/// the bucket's notice named, else none (`--model` dropped), and spends it.
 pub(super) fn model_restart(
     why: &Restart,
     prior: Option<&St>,
@@ -1794,10 +1784,10 @@ pub(super) fn model_restart(
     riding: Option<String>,
     hand: Option<String>,
 ) -> ModelRestart {
-    let origin = fallback_origin(prior);
+    let origin = prior.and_then(fallback_origin);
     match why {
         Restart::Memory => ModelRestart {
-            fallback_from: fallback_carried(origin.as_deref(), riding.as_deref(), hand.as_deref()),
+            fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
             model: riding.or(hand),
             cause: CAUSE_MEMORY.to_string(),
             launch_model: launched,
@@ -1805,23 +1795,18 @@ pub(super) fn model_restart(
         Restart::Model { to } => ModelRestart {
             model: Some(to.clone()),
             cause: format!("{CAUSE_MODEL}{to}"),
-            fallback_from: fallback_record(Some(
-                origin.as_deref().or(hand.as_deref()).unwrap_or(&launched),
-            )),
+            fallback_from: Some(origin.or(hand).unwrap_or_else(|| launched.clone())),
             launch_model: launched,
         },
         Restart::ModelBack { to } => {
-            // A model chosen by hand since the fallback first, then the
-            // model the conversation had before it (exact: a carried hand
-            // choice, a `[1m]` window), and only then the alias the
-            // bucket's notice named — the notice names the family, not what
-            // the person was on.
+            // The notice names the family, not what the person was on: the
+            // exact model (a hand choice, a `[1m]` window) comes first.
             let back = hand.or(origin).or_else(|| to.clone()).unwrap_or_default();
             ModelRestart {
                 model: Some(back.clone()),
                 cause: format!("{CAUSE_MODEL_BACK}{back}"),
                 launch_model: launched,
-                fallback_from: String::new(),
+                fallback_from: None,
             }
         }
     }
@@ -1837,59 +1822,34 @@ pub(super) struct ModelRestart {
     /// [`St::launch_model`].
     pub(super) launch_model: String,
     /// [`St::fallback_from`].
-    pub(super) fallback_from: String,
+    pub(super) fallback_from: Option<String>,
 }
 
-/// [`St::fallback_from`] of a fallback standing whose launch named no model:
-/// the way back drops `--model`, Claude's default. Never a model id.
-pub(super) const FALLBACK_NO_MODEL: &str = "-";
-
-/// The model the launch named before a bucket's fallback that still stands,
-/// as the conversation's last record `prior` keeps it: its
-/// [`St::fallback_from`], carried over every restart since the fallback's —
-/// or, for a fallback's own record an older build wrote, the launch model
-/// that record kept. `Some("")`: a fallback stands, and the launch named no
-/// model — the way back drops `--model`, Claude's default. `None`: no
-/// fallback stands.
-pub(super) fn fallback_origin(prior: Option<&St>) -> Option<String> {
-    let st = prior?;
-    if st.fallback_from == FALLBACK_NO_MODEL {
-        Some(String::new())
-    } else if !st.fallback_from.is_empty() {
-        Some(st.fallback_from.clone())
-    } else if st.cause.starts_with(CAUSE_MODEL) {
-        Some(st.launch_model.clone())
-    } else {
-        None
-    }
-}
-
-/// [`St::fallback_from`] as a record keeps `origin` ([`fallback_origin`]'s
-/// reading): empty for none, [`FALLBACK_NO_MODEL`] for a launch that named
-/// no model.
-pub(super) fn fallback_record(origin: Option<&str>) -> String {
-    match origin {
-        None => String::new(),
-        Some("") => FALLBACK_NO_MODEL.to_string(),
-        Some(m) => m.to_string(),
-    }
+/// The fallback origin standing on `st` ([`St::fallback_from`]) — or, for a
+/// fallback's own record an older build wrote, the launch model that record
+/// kept. `None`: no fallback stands.
+pub(super) fn fallback_origin(st: &St) -> Option<String> {
+    st.fallback_from.clone().or_else(|| {
+        st.cause
+            .starts_with(CAUSE_MODEL)
+            .then(|| st.launch_model.clone())
+    })
 }
 
 /// The fallback origin a restart made for another reason — a memory
-/// banner's, an exit's relaunch — records ([`St::fallback_from`]): the one
-/// standing (`origin`), carried — or, where the line asks for a model a
-/// person chose by hand (`hand`, nothing `riding`), that model: the `/model`
-/// since the fallback is what the person has now, and the way back at the
-/// bucket's reset returning to the launch's model would undo it.
+/// banner's, an exit's relaunch, the upgrade's — records: the one standing
+/// (`origin`), carried — or, where the line asks for a model a person chose
+/// by hand (`hand`, nothing `riding`), that model, which the way back at the
+/// bucket's reset would otherwise undo.
 pub(super) fn fallback_carried(
-    origin: Option<&str>,
+    origin: Option<String>,
     riding: Option<&str>,
     hand: Option<&str>,
-) -> String {
-    match (riding, hand) {
-        (None, Some(hand)) if origin.is_some() => fallback_record(Some(hand)),
-        _ => fallback_record(origin),
-    }
+) -> Option<String> {
+    origin.map(|origin| match (riding, hand) {
+        (None, Some(hand)) => hand.to_string(),
+        _ => origin,
+    })
 }
 
 /// Whether a record of `cause` is a relaunch's — its continuation says why
@@ -2066,34 +2026,27 @@ pub(super) fn restart_with(
     if is_our_ancestor(snap.pid, &t) {
         return said(r, "refused:self");
     }
-    // The model the line asks for: none for the memory banner (the launch's
-    // own flags); the bucket's fallback; at its reset a model chosen by hand
-    // since, else the model the launch named before the fallback's relaunch
-    // replaced it (every record since kept it, [`model_restart`]), else the
-    // bucket's model, else none.
+    // The model the line asks for and the fallback origin it records
+    // ([`model_restart`]): the memory banner's restart carries the model the
+    // rule moves the conversation to, when one is due; every restart reads a
+    // `/model` made since the launch, which the launch's `--model` would undo.
+    let (riding, hand) = restart_models(
+        opts,
+        Some(&sf),
+        &snap.start,
+        &session,
+        &snap.argv,
+        matches!(why, Restart::Memory),
+    );
+    let model_list = riding.clone().unwrap_or_default();
     let launched = upgrade::launch_model(&snap.argv).unwrap_or_default();
-    // The memory banner's restart carries the model the rule moves the
-    // conversation to, when one is due: every restart is its moment.
-    // And a model a person chose by hand since the launch, asked for when
-    // nothing rides it: the launch's `--model` would undo that `/model`.
-    // A fallback reads the hand choice too: made before it, it is what the
-    // way back at the bucket's reset returns to, not the launch's `--model`.
-    let (riding, hand) = match why {
-        Restart::Memory => restart_models(opts, Some(&sf), &snap.start, &session, &snap.argv, true),
-        // The way back reads it as well: a `/model` since the fallback is
-        // the model the person has now, and the bucket's reset must not
-        // replace it.
-        Restart::Model { .. } | Restart::ModelBack { .. } => {
-            restart_models(opts, Some(&sf), &snap.start, &session, &snap.argv, false)
-        }
-    };
     let ModelRestart {
         model,
         cause,
         launch_model,
         fallback_from,
-    } = model_restart(why, prior.as_ref(), launched, riding.clone(), hand);
-    let mode = resume_mode(opts, &tab, &session);
+    } = model_restart(why, prior.as_ref(), launched, riding, hand);
+    let mode = resume_mode(opts, &session, tab_mode(opts, &tab));
     let launch = Launch {
         session: &session,
         resume: transcript_exists(&opts.home, &session) != Some(false),
@@ -2111,7 +2064,7 @@ pub(super) fn restart_with(
         cause,
         salt: now_s(),
         launch_model,
-        model_list: riding.clone().unwrap_or_default(),
+        model_list,
         fallback_from,
         ..St::default()
     };
@@ -2174,9 +2127,7 @@ pub(super) fn restart_with(
         st.line = line;
         st.phase = upgrade::Phase::Exiting { at_s: now_s() };
         save(opts, &session, &st);
-        if let Some(m) = &riding {
-            record_asked(opts, &session, m);
-        }
+        record_asked(opts, &session, &st.model_list);
         match terminate(&mut c, &tab, pid, opts.human_grace_s) {
             Terminated::Sent => None,
             // Nothing was sent: no restart is in flight, and the record is
@@ -2926,10 +2877,9 @@ fn after_exit_as(
     // transcripts cannot be read is resumed (Claude says if it cannot).
     let resume = transcript_exists(&opts.home, &session) != Some(false);
     // The model the rule moves the conversation to rides the relaunch when
-    // one is due — read off the crash's own record (a graceful
-    // exit left none to read it by).
-    // A model a person chose by hand since the launch rides it when nothing
-    // else does: the launch's `--model` would undo that `/model`.
+    // one is due — read off the crash's own record (a graceful exit left none
+    // to read it by) — else a `/model` made since the launch, which the
+    // launch's `--model` would undo.
     let (riding, hand) = if resume {
         restart_models(
             opts,
@@ -2942,7 +2892,7 @@ fn after_exit_as(
     } else {
         (None, None)
     };
-    let mode = resume_mode(opts, &snap.tab, &session);
+    let mode = resume_mode(opts, &session, tab_mode(opts, &snap.tab));
     let launch = Launch {
         session: &session,
         resume,
@@ -3002,9 +2952,7 @@ fn after_exit_as(
     st.line = line;
     st.phase = upgrade::Phase::Exiting { at_s: now_s() };
     save(opts, &session, &st);
-    if let Some(m) = &riding {
-        record_asked(opts, &session, m);
-    }
+    record_asked(opts, &session, &st.model_list);
     ledger(opts, &said(r.clone(), "exited"), &st.line);
     let r = relaunch(opts, r, &mut st, &mut c, &session, &Live);
     save(opts, &session, &st);
@@ -3012,21 +2960,15 @@ fn after_exit_as(
 }
 
 /// The fallback origin an exit's relaunch of `session` records
-/// ([`St::fallback_from`]): the one its last record keeps, carried — or the
-/// model a person chose by hand that the line asks for (`hand`, nothing
-/// `riding`), which the way back to the launch's would undo
-/// ([`fallback_carried`]).
+/// ([`fallback_carried`] of the one its last record keeps).
 pub(super) fn exit_fallback(
     opts: &Opts,
     session: &str,
     riding: Option<&str>,
     hand: Option<&str>,
-) -> String {
-    fallback_carried(
-        fallback_origin(load(opts, session).as_ref()).as_deref(),
-        riding,
-        hand,
-    )
+) -> Option<String> {
+    let origin = load(opts, session).as_ref().and_then(fallback_origin);
+    fallback_carried(origin, riding, hand)
 }
 
 /// A relaunch in flight — this module's or the upgrade's, left between the

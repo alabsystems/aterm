@@ -301,7 +301,7 @@ pub(crate) fn call_main_within<T>(
 /// out as it does `ERR control server busy`. Then a standing dialog
 /// ([`dialog_refusal`]); a dialog is a designed freeze and never reads as a
 /// stall.
-fn main_thread_refusal() -> Option<MainHopError> {
+pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
     if let Some(stall) = crate::watchdog::main_stall_now(HOPS.since_ns()) {
         return Some(MainHopError::Stalled(stall));
     }

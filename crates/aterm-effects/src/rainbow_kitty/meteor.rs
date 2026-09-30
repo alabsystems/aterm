@@ -198,7 +198,10 @@ use super::ribbon::{
     BED_INK_LUT_LEN, BED_SAT_FLOOR, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink,
     walk_pace, walk_t,
 };
-use super::stardust::{FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust};
+// `mix32`/`hash01`: the family's one integer mixer (`lowbias32`) and its
+// `[0, 1)` draw. The meteor hashes only what it decides itself — the spawn
+// seed and the shed STATIONS; every per-star draw is the sky's.
+use super::stardust::{FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust, hash01, mix32};
 use super::timing::{
     CHROMA_CULL_ALPHA, FLIGHT_ENTER_EXP, FLIGHT_MAX_LIVE, FLIGHT_OFF_GLASS_MS, FLIGHT_P0,
     FLIGHT_RETIRE_MS, JUMP_COV_CEIL, JUMP_MIN_CELLS, MINI_FAN_MAX_CELLS, MINI_FAN_MIN_CELLS,
@@ -4868,23 +4871,6 @@ fn segments_cross(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)
     (d1 * d2 < 0.0) && (d3 * d4 < 0.0)
 }
 
-/// `lowbias32` — the crate's own integer mixer (`cursor_glow/emit.rs`'s
-/// water-bead deal and `stardust.rs`'s deals use this exact pair of constants; the
-/// sky's copy is private to its module, so this is the meteor's spelling of
-/// the same function, not a second hash). Deterministic, cheap, and with no
-/// per-frame RNG anywhere near it (§18). This file hashes only what the
-/// meteor itself decides — the spawn seed and the shed STATIONS; every
-/// per-star draw (angle, jitter, phase, rate, tint deal) is the sky's, made
-/// from the seed handed over.
-#[inline]
-fn mix32(mut x: u32) -> u32 {
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7FEB_352D);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x846C_A68B);
-    x ^ (x >> 16)
-}
-
 /// The spawn seed — §18's `(row, col, born)`, with the spawn ORDINAL standing
 /// in for `born` (see [`Meteors::ord`]).
 #[inline]
@@ -4896,7 +4882,7 @@ fn seed_of(row: u16, col: u16, ord: u32) -> u32 {
 /// number (the shed stations), so no draw rolls its own bias.
 #[inline]
 fn unit01(seed: u32, salt: u32) -> f32 {
-    (mix32(seed ^ salt) >> 8) as f32 / 16_777_216.0
+    hash01(mix32(seed ^ salt))
 }
 
 /// **THE LIGHT INK** (§3.3, L6): `rgb` scaled down — hue and saturation intact,
@@ -8518,7 +8504,8 @@ mod tests {
         );
         // The cool half is lifted to the hot edge's one heat — "yes we need
         // blue and violet" — and the warm half is carried pure.
-        use super::super::ribbon::{HOT_EDGE_LUMA_FLOOR, relative_luminance};
+        use super::super::ribbon::HOT_EDGE_LUMA_FLOOR;
+        use crate::color_math::relative_luminance;
         for i in 0..SPECTRUM_STOPS {
             // `landing_ink` reads a WALK position; the anchor is an ARC
             // position, so it comes back through the pace's inverse.

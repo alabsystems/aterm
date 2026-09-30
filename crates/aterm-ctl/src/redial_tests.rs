@@ -164,17 +164,231 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
 
 #[test]
 fn a_resumed_subscribe_drops_its_old_process_anchors() {
+    let none = EventAnchors::default();
     assert_eq!(
         resume_request(
             "@s-a subscribe screen,events since=41 since-turn=7 since-block=3 every-frame\n",
-            &[]
+            &[],
+            &none,
         )
         .as_deref(),
-        Some("@s-a subscribe screen,events every-frame\n")
+        Some("@s-a subscribe screen,events every-frame since-block=3 since-turn=7\n"),
+        "`since=` goes; the carried event anchors stay"
     );
     assert_eq!(
-        resume_request("subscribe @* sessions\n", &[]).as_deref(),
+        resume_request("subscribe @* sessions\n", &[], &none).as_deref(),
         Some("subscribe @* sessions\n")
+    );
+}
+
+/// ROUND SEVEN, FINDING 51: a resumed `events` stream asks the successor for
+/// what comes AFTER the newest `block-complete` and `turn` it relayed — ids the
+/// handoff carries — instead of starting at the successor's live high, which
+/// lost a block that completed there before the resubscribe with no `GAP`.
+/// NEGATIVE CONTROLS: a multi-target stream carries none (the server takes
+/// resume anchors for one target only), and a stream that relayed nothing
+/// keeps the anchor it was opened with.
+#[test]
+fn a_resumed_events_stream_keeps_its_carried_anchors() {
+    let mut t = FrameTracker::new("subscribe @s-a events\n");
+    t.feed(
+        b"sub 1 s-a\nEVENT 1 block-complete 12 exit=0\n\
+          EVENT 1 turn 7 submitted=1 status=settled dur_ms=5\n",
+    );
+    t.new_leg();
+    assert_eq!(
+        resume_request("subscribe @s-a events\n", &t.sids(), &t.anchors()).as_deref(),
+        Some("subscribe @s-a events since-block=12 since-turn=7\n"),
+        "the anchors outlive the leg that relayed them"
+    );
+    assert_eq!(
+        resume_request(
+            "subscribe @s-a events since-block=20\n",
+            &[],
+            &EventAnchors {
+                block: Some(12),
+                turn: None
+            }
+        )
+        .as_deref(),
+        Some("subscribe @s-a events since-block=20\n"),
+        "never below the anchor the stream was opened with"
+    );
+    assert_eq!(
+        resume_request(
+            "subscribe @s-a,@s-b events\n",
+            &[],
+            &EventAnchors {
+                block: Some(12),
+                turn: Some(7)
+            }
+        )
+        .as_deref(),
+        Some("subscribe @s-a,@s-b events\n"),
+        "a multi-target stream carries no anchor"
+    );
+}
+
+/// ROUND SEVEN'S REVIEW, ITEM 4: a `post` cut by its server going away is
+/// reported as a replacement — exit 75 with a note that it may already be
+/// queued and carried — never the bare exit-1 error a caller retries, which
+/// sent a duplicate beside the carried copy. It is never asked again.
+/// FAILS WITHOUT THE FIX: `reports_replacement` was false for `post`.
+#[test]
+fn a_cut_post_is_reported_as_a_replacement_and_never_asked_again() {
+    let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+    for post in [
+        "post to=@s-b hi",
+        "post to=h-andrew kind=ask --wait=30000 which?",
+        "@s-a post to=@s-b kind=task --wait-ack=60000 go",
+    ] {
+        assert!(reports_replacement(&parts(post)), "{post}");
+        assert!(!retries_across_replacement(&parts(post)), "{post}");
+        let note = not_asked_again_note(&parts(post));
+        assert!(note.contains("never post it again blind"), "{post}");
+        assert!(note.contains("key="), "{post}");
+    }
+}
+
+/// THE FALLBACK FOR A PINNED RESUME THE SUCCESSOR REFUSES (found by
+/// `ctl_redial_live_headless`, red on main since the pin landed): a
+/// REPLACEMENT that is not an update names its sessions afresh, so the sid the
+/// `sub` line named is one it does not have (`ERR no such session`) and the
+/// subscription used to go silent. The request asked once more is the self
+/// target AS WRITTEN and NO anchors — resolved on the successor, its own
+/// session, as before the pin. Only where there is a pin to give up: a sid
+/// target, an unpinnable self target (no sid tied) and a multi-target stream
+/// have no other request to ask.
+#[test]
+fn a_refused_pin_falls_back_to_self_as_written_without_anchors() {
+    let seen = EventAnchors {
+        block: Some(12),
+        turn: Some(7),
+    };
+    let tied = [("1".to_string(), "s-aaaa".to_string())];
+    for (request, pinned, fallback) in [
+        (
+            "subscribe @. events\n",
+            "subscribe @s-aaaa events since-block=12 since-turn=7\n",
+            "subscribe @. events\n",
+        ),
+        (
+            "subscribe events\n",
+            "subscribe @s-aaaa events since-block=12 since-turn=7\n",
+            "subscribe events\n",
+        ),
+        (
+            "@ subscribe screen,events since=4\n",
+            "@s-aaaa subscribe screen,events since-block=12 since-turn=7\n",
+            "@ subscribe screen,events\n",
+        ),
+    ] {
+        assert_eq!(
+            resume_request(request, &tied, &seen).as_deref(),
+            Some(pinned),
+            "{request}"
+        );
+        assert_eq!(
+            unpinned_resume_request(request, &tied, &seen).as_deref(),
+            Some(fallback),
+            "{request}"
+        );
+    }
+    // NEGATIVE CONTROLS: nothing else to ask.
+    for (request, sids) in [
+        // A sid target keeps its anchors and has no self to fall back to.
+        ("subscribe @s-bbbb events\n", &tied[..]),
+        // Nothing tied: the selector already stays, with no anchors.
+        ("subscribe @. events\n", &[][..]),
+        // Several targets: the anchors never ride.
+        ("subscribe @.,@s-cccc events\n", &tied[..]),
+    ] {
+        assert_eq!(
+            unpinned_resume_request(request, sids, &seen),
+            None,
+            "{request}"
+        );
+    }
+}
+
+/// THE FALLBACK OUTLIVES AN UPDATE: after an update's successor took the
+/// pinned request, the next leg's request names the sid (`@s-a`), and a
+/// fallback derived from THAT was `None`. A stream that rode one update and
+/// was later replaced by a fresh instance had nothing but the refused pin to
+/// ask, and exited 75. The fallback is the ORIGINAL request's self as written.
+/// FAILS WITHOUT THE FIX: the NEGATIVE CONTROL below is that derivation (the
+/// last leg's request as the original), one line. A stream that named its
+/// session by sid has no fallback on any leg.
+#[test]
+fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
+    let seen = EventAnchors {
+        block: Some(5),
+        turn: None,
+    };
+    let tied = [("1".to_string(), "s-a".to_string())];
+    let original = "subscribe @. cursor,events\n";
+    // What the relay asks next after an update's successor took the pin.
+    let after_update = "subscribe @s-a cursor,events since-block=5\n";
+    assert_eq!(
+        resume_lines(original, after_update, &tied, &seen),
+        Some(vec![after_update.to_string(), original.to_string()])
+    );
+    assert_eq!(
+        resume_lines(after_update, after_update, &tied, &seen),
+        Some(vec![after_update.to_string()]),
+        "NEGATIVE CONTROL: from the last leg's request, no fallback"
+    );
+    // The first leg: the same two lines as the pin and its fallback.
+    assert_eq!(
+        resume_lines(original, original, &tied, &seen),
+        Some(vec![after_update.to_string(), original.to_string()])
+    );
+    let by_sid = "subscribe @s-a cursor,events\n";
+    assert_eq!(
+        resume_lines(by_sid, by_sid, &tied, &seen),
+        Some(vec![after_update.to_string()])
+    );
+}
+
+/// ROUND SEVEN'S REVIEW, ITEM 3: a SELF target (`@.`, `@`, or none) is
+/// resolved again on the successor — for a client outside every session, the
+/// active tab — so the carried anchors ride only once it is pinned to the sid
+/// the stream's `sub` line named. With no such sid they are left off (the
+/// successor seeds at its live high). FAILS WITHOUT THE FIX: `@.` and the bare
+/// form kept the selector and sent the anchors, and another tab's finished
+/// blocks came back as fresh events.
+#[test]
+fn a_resumed_self_stream_is_pinned_to_its_sid_before_it_carries_anchors() {
+    let seen = EventAnchors {
+        block: Some(12),
+        turn: Some(7),
+    };
+    let tied = [("1".to_string(), "s-aaaa".to_string())];
+    assert_eq!(
+        resume_request("subscribe @. events\n", &tied, &seen).as_deref(),
+        Some("subscribe @s-aaaa events since-block=12 since-turn=7\n")
+    );
+    assert_eq!(
+        resume_request("subscribe events\n", &tied, &seen).as_deref(),
+        Some("subscribe @s-aaaa events since-block=12 since-turn=7\n")
+    );
+    assert_eq!(
+        resume_request("@ subscribe screen,events since=4\n", &tied, &seen).as_deref(),
+        Some("@s-aaaa subscribe screen,events since-block=12 since-turn=7\n")
+    );
+    // Nothing to pin it to: the selector stays and the anchors do not ride.
+    assert_eq!(
+        resume_request("subscribe @. events since-block=3\n", &[], &seen).as_deref(),
+        Some("subscribe @. events\n")
+    );
+    assert_eq!(
+        resume_request("subscribe events\n", &[], &seen).as_deref(),
+        Some("subscribe events\n")
+    );
+    // NEGATIVE CONTROL: a sid target carries its anchors as before.
+    assert_eq!(
+        resume_request("subscribe @s-bbbb events\n", &[], &seen).as_deref(),
+        Some("subscribe @s-bbbb events since-block=12 since-turn=7\n")
     );
 }
 
@@ -191,15 +405,25 @@ fn a_resumed_subscribe_names_a_local_target_by_its_sid() {
         ("5".to_string(), "s-bbbb".to_string()),
     ];
     assert_eq!(
-        resume_request("subscribe @3 screen,events since=9\n", &tied).as_deref(),
+        resume_request(
+            "subscribe @3 screen,events since=9\n",
+            &tied,
+            &EventAnchors::default()
+        )
+        .as_deref(),
         Some("subscribe @s-aaaa screen,events\n")
     );
     assert_eq!(
-        resume_request("subscribe @3,@s-cccc,@.,@5 events\n", &tied).as_deref(),
+        resume_request(
+            "subscribe @3,@s-cccc,@.,@5 events\n",
+            &tied,
+            &EventAnchors::default()
+        )
+        .as_deref(),
         Some("subscribe @s-aaaa,@s-cccc,@.,@s-bbbb events\n")
     );
     assert_eq!(
-        resume_request("subscribe @4 events\n", &tied),
+        resume_request("subscribe @4 events\n", &tied, &EventAnchors::default()),
         None,
         "a local number the stream never tied to a session"
     );
@@ -223,14 +447,20 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "inbox",
         "await idle 500",
         "await match prompt",
-        "await seq",
-        "await seq timeout=0",
         "await inbox",
     ] {
         assert!(retries_across_replacement(&parts(yes)), "{yes}");
         assert!(is_blocking_read(&parts(yes)), "{yes}");
     }
     for no in [
+        // Anchored at the moment of the arm (round seven, finding 16): what
+        // they wait for may have happened on the successor before a retry
+        // could arm, and a retry would wait for a SECOND event.
+        "await seq",
+        "await seq timeout=0",
+        "await block",
+        "@s-a await block timeout=600000",
+        "await consent",
         "await seq 40",
         "await inbox since=12",
         "inbox get 4",
@@ -254,6 +484,35 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         assert!(!retries_across_replacement(&parts(never)), "{never}");
     }
     assert!(!is_blocking_read(&parts("send hi")));
+}
+
+/// ROUND SEVEN, FINDING 17: a `turn` cut by its server going away is reported as
+/// a replacement — exit 75 with a note that its text may already have been
+/// typed — never the bare exit-1 transport error a caller retries (typing the
+/// prompt twice). It is a write, so it is never asked again. NEGATIVE CONTROL:
+/// the other writes keep their old error.
+#[test]
+fn a_cut_turn_is_reported_as_a_replacement_and_never_asked_again() {
+    let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+    for turn in [
+        "turn hi",
+        "@s-a turn timeout=1800000 implement X",
+        "@3 turn go",
+    ] {
+        assert!(reports_replacement(&parts(turn)), "{turn}");
+        assert!(!retries_across_replacement(&parts(turn)), "{turn}");
+        assert!(
+            not_asked_again_note(&parts(turn)).contains("may already have been typed"),
+            "{turn}"
+        );
+    }
+    for write in ["send hi", "key enter"] {
+        assert!(!reports_replacement(&parts(write)), "{write}");
+    }
+    assert!(reports_replacement(&parts("await block")));
+    assert!(not_asked_again_note(&parts("await block")).contains("before waiting again"));
+    assert!(not_asked_again_note(&parts("await seq")).contains("before waiting again"));
+    assert!(not_asked_again_note(&parts("await seq 4")).contains("re-issue it"));
 }
 
 /// A listener that accepts but never answers — a process mid-exit, whose
@@ -281,6 +540,14 @@ fn only_a_server_that_answers_counts_as_serving() {
     server.join().unwrap();
 }
 
+/// A successor bound for a verdict that must be REACHED — the fake server's
+/// thread answering the probe. The short bounds below are only for `Gone`,
+/// where waiting the bound out is the verdict: under a 300-400 ms bound a
+/// loaded box could leave the fake server unscheduled past the probe's
+/// timeout, and a server that answers read as gone.
+#[cfg(unix)]
+const REACHED: Duration = Duration::from_secs(20);
+
 /// The four verdicts, each against a real socket.
 #[cfg(unix)]
 #[test]
@@ -290,6 +557,7 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
     let own = std::process::id();
     let gone = gone_pid();
     let follow = Redial::new(Follow::Path(path.clone())).with_bound(Duration::from_millis(300));
+    let served = Redial::new(Follow::Path(path.clone())).with_bound(REACHED);
 
     assert_eq!(follow.after_hangup(&path, None, None), Hangup::Unknown);
     // Nothing answers: the server is gone and nobody replaced it.
@@ -316,12 +584,12 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
     );
     // The SAME process still answers: it ended the exchange on purpose.
     assert_eq!(
-        follow.after_hangup(&path, Some(own), None),
+        served.after_hangup(&path, Some(own), None),
         Hangup::StillServing
     );
     // A DIFFERENT live process answers on the path: the successor.
     assert_eq!(
-        follow.after_hangup(&path, Some(gone), None),
+        served.after_hangup(&path, Some(gone), None),
         Hangup::Successor {
             path: path.clone(),
             pid: own
@@ -329,7 +597,8 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
     );
     stop(&sock);
     server.join().unwrap();
-    // A `--pid` pin follows nothing, and says so at once.
+    // A `--pid` pin follows nothing, and says so at once: well under the
+    // successor bound a follow would wait.
     let started = Instant::now();
     assert_eq!(
         Redial::none().after_hangup(&path, Some(gone), None),
@@ -338,7 +607,11 @@ fn a_hangup_is_classified_by_who_serves_the_path_now() {
             by_deadline: false
         }
     );
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        started.elapsed() < SUCCESSOR_BOUND / 2,
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// A successor that binds AFTER the hang-up — the handoff's successor comes up
@@ -533,6 +806,121 @@ fn a_subscription_by_local_number_follows_its_session_not_the_number() {
     }
 }
 
+/// [`serve`] for a successor that answers by what it is asked: every request
+/// but `version` and `stop` is recorded in `seen` and answered with
+/// `answer(request)`, its connection then closed, until a `stop` ([`stop`]).
+#[cfg(unix)]
+fn serve_by(
+    listener: &aterm_uds::CtlListener,
+    answer: impl Fn(&str) -> &'static str,
+    seen: &std::sync::mpsc::Sender<String>,
+) {
+    loop {
+        let Ok((conn, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = std::io::BufReader::new(&conn);
+        let mut request = String::new();
+        if reader.read_line(&mut request).unwrap_or(0) == 0 {
+            continue;
+        }
+        if request.starts_with("version") {
+            let _ = (&conn).write_all(b"OK aterm test\n");
+            continue;
+        }
+        if request.starts_with("stop") {
+            return;
+        }
+        let reply = answer(&request);
+        let _ = seen.send(request);
+        let _ = (&conn).write_all(reply.as_bytes());
+    }
+}
+
+/// ONLY A SUCCESSOR WITHOUT THE SESSION IS ASKED FOR ITS OWN SELF. A pinned
+/// resume refused any other way (`ERR busy …` from a saturated socket, a
+/// halt, a denial) came from a successor that may well hold the session, an
+/// update's. Falling back there moved the stream to whichever tab was active
+/// and dropped its anchors, silently. It ends 75 "did not resume", as before
+/// the fallback. FAILS WITHOUT THE FIX: the busy case asked the successor's
+/// `@.` too, and relayed it with exit 0. CONTROL: `ERR no such session` (a
+/// fresh instance) is followed to that instance's own session, with no
+/// anchors.
+#[cfg(unix)]
+#[test]
+fn only_a_successor_without_the_session_is_asked_for_its_own_self() {
+    let request = "subscribe @. cursor,events\n";
+    let pinned = "subscribe @s-a cursor,events since-block=5\n";
+    for (case, refusal, expect, code) in [
+        (
+            "busy",
+            "ERR busy 3\n",
+            &[pinned][..],
+            ExitCode::from(EXIT_REPLACED),
+        ),
+        (
+            "fresh",
+            "ERR no such session\n",
+            &[pinned, request][..],
+            ExitCode::SUCCESS,
+        ),
+    ] {
+        let (_dir, sock) = scratch_sock(&format!("rd-refused-{case}"));
+        let path = sock.to_str().unwrap().to_string();
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        let old = fake_server(
+            aterm_uds::CtlListener::bind(&sock).unwrap(),
+            sock.clone(),
+            "OK subscribe 1\nsub 1 s-a\nEVENT 1 block-complete 5 exit=0\n",
+            true,
+            seen_tx.clone(),
+        );
+        let stream = CtlStream::connect(&sock).expect("connect");
+        let mut reader = BufReader::new(&stream);
+        handshake(&stream, &mut reader, request);
+        old.join().unwrap();
+        let successor_path = sock.clone();
+        let successor = std::thread::spawn(move || {
+            let listener = aterm_uds::CtlListener::bind(&successor_path).unwrap();
+            serve_by(
+                &listener,
+                move |asked| {
+                    if asked.contains("@s-a") {
+                        refusal
+                    } else {
+                        "OK subscribe 1\nsub 1 s-z\nEVENT 1 exited\n"
+                    }
+                },
+                &seen_tx,
+            );
+        });
+        let mut out = Vec::new();
+        let got = relay_subscription(
+            FirstLeg {
+                stream: &stream,
+                reader: &mut reader,
+                dialed: &path,
+                server: Some(gone_pid()),
+            },
+            request,
+            None,
+            &Redial::new(Follow::Path(path.clone())).with_bound(Duration::from_secs(20)),
+            &mut out,
+        )
+        .expect("relay");
+        stop(&sock);
+        successor.join().unwrap();
+        let requests: Vec<String> = seen.try_iter().skip(1).collect();
+        assert_eq!(requests, expect, "{case}");
+        assert_eq!(got, code, "{case}");
+        assert_eq!(
+            String::from_utf8(out).unwrap().contains("sub 1 s-z\n"),
+            code == ExitCode::SUCCESS,
+            "{case}: the successor's own stream relayed only when followed"
+        );
+    }
+}
+
 /// No successor: the relay says so and exits 75 — never 0.
 #[cfg(unix)]
 #[test]
@@ -600,12 +988,13 @@ fn a_deliberate_end_by_a_live_server_is_still_exit_0_and_immediate() {
         },
         request,
         None,
-        &Redial::new(Follow::Path(path.clone())).with_bound(Duration::from_secs(20)),
+        &Redial::new(Follow::Path(path.clone())).with_bound(REACHED),
         &mut out,
     )
     .unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // At once: well under the bound a missed StillServing would wait out.
+    assert!(started.elapsed() < REACHED / 2, "{:?}", started.elapsed());
     stop(&sock);
     server.join().unwrap();
 }
@@ -621,6 +1010,10 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
     let path = sock.to_str().unwrap().to_string();
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
     let redial = Redial::new(Follow::Path(path.clone())).with_bound(Duration::from_millis(300));
+    // Every case below with a live server on the path must REACH it: under the
+    // short bound a slow fake server reads as gone, which exits 75 too — so
+    // an anchored wait asked again (the defect) would pass unseen.
+    let served = Redial::new(Follow::Path(path.clone())).with_bound(REACHED);
     let gone = gone_pid();
 
     // Nothing answers: 75, and `again` never runs.
@@ -650,7 +1043,7 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
         &path,
         Some(gone),
         &parts("@s-a await idle 500"),
-        &redial,
+        &served,
         None,
         |next| {
             asked = Some(next.to_string());
@@ -670,7 +1063,7 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
         &path,
         Some(gone),
         &parts("await seq 40"),
-        &redial,
+        &served,
         None,
         |_| panic!("a seq anchor means nothing to the successor"),
         None,
@@ -683,19 +1076,34 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
         &path,
         Some(gone),
         &parts("@s-a inbox get 4"),
-        &redial,
+        &served,
         None,
         |_| panic!("an inbox id means nothing to the successor"),
         None,
     )
     .unwrap();
     assert_eq!(code, ExitCode::from(EXIT_REPLACED));
+    // Nor a wait whose anchor is its own arm (round seven, finding 16), nor a
+    // `turn`, which types (finding 17): 75, never asked again.
+    for cut in ["@s-a await block timeout=600000", "@s-a turn implement X"] {
+        let code = super::super::replaced_before_reply(
+            &path,
+            Some(gone),
+            &parts(cut),
+            &redial,
+            None,
+            |_| panic!("`{cut}` is not asked again"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::from(EXIT_REPLACED), "{cut}");
+    }
     // The same server still answering: the original error, as before.
     let err = super::super::replaced_before_reply(
         &path,
         Some(std::process::id()),
         &parts("await idle 500"),
-        &redial,
+        &served,
         None,
         |_| panic!("not replaced"),
         None,
@@ -873,7 +1281,7 @@ fn a_flagless_call_follows_its_session_to_the_successors_own_socket() {
         dir: dir.clone(),
         self_sid: Some(sid.to_string()),
     })
-    .with_bound(Duration::from_secs(5));
+    .with_bound(REACHED);
     assert_eq!(
         in_session.after_hangup(old, Some(gone), None),
         Hangup::Successor {
@@ -888,7 +1296,7 @@ fn a_flagless_call_follows_its_session_to_the_successors_own_socket() {
         dir: dir.clone(),
         self_sid: None,
     })
-    .with_bound(Duration::from_secs(5));
+    .with_bound(REACHED);
     assert_eq!(
         outside.after_hangup(old, Some(gone), None),
         Hangup::Successor {
@@ -959,7 +1367,7 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
         dir: dir.clone(),
         self_sid: None,
     })
-    .with_bound(Duration::from_millis(400));
+    .with_bound(REACHED);
     assert!(matches!(
         outside.after_hangup(old, Some(gone), None),
         Hangup::Successor { pid, .. } if pid == own
@@ -967,8 +1375,13 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
     std::fs::remove_file(&alias).unwrap();
 
     publish_graph_entry(&dir, sid, &stranger_sock);
+    let reached = Redial::new(Follow::Flagless {
+        dir: dir.clone(),
+        self_sid: Some(sid.to_string()),
+    })
+    .with_bound(REACHED);
     assert_eq!(
-        follow.after_hangup(old, Some(gone), None),
+        reached.after_hangup(old, Some(gone), None),
         Hangup::Successor {
             path: stranger_sock.to_str().unwrap().to_string(),
             pid: own

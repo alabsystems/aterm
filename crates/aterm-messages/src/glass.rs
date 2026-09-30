@@ -66,9 +66,14 @@
 //!    as the row narrows. The extras, in allocation order — (a) the ETA
 //!    slot, `1 + ETA_W` (else `1 + ETA_SHORT_W`), when a moving determinate
 //!    row asks for one; (b) the excerpt (`detail[0]`): whole if `3 + width ≤
-//!    room`, else shaped to `room − 3` CELLS if `room ≥ 3 + DETAIL_FLOOR`,
-//!    else dropped — never a stub (an action excerpt adds its reserved
-//!    floor to the room, and a starved one keeps just the floor); (b′) an
+//!    room`, else shaped to `room − 3` CELLS if `room ≥ 3 + DETAIL_FLOOR`
+//!    (its whole lead clause where that cut says no word past it, ruling
+//!    404), else its whole LEAD CLAUSE if `3 +` its width fits and the
+//!    floor's cut begins with it (`behind for 7 h` of `behind for 7 h: its
+//!    turn…`, `tab 1 for 7 h` of `tab 1 for 7 h · tab 3…`;
+//!    [`crate::text::lead_clause`], rulings 402 and 404), else dropped —
+//!    never a stub (an action excerpt adds its reserved floor to the room,
+//!    and a starved one keeps just the floor); (b′) an
 //!    action excerpt's row's load slot, `3 +` its widest load words, beside a
 //!    WHOLE excerpt when it fits; (c) stats if `2 + len` fits after the
 //!    excerpt, else their short form ([`short_stats`]: `3 of 10 programs` →
@@ -77,7 +82,7 @@
 //!    every extra after it.
 //!
 //! Sacrifice order, therefore, as the row narrows: stats (short, then gone) → excerpt (shaped,
-//! then dropped) → ETA (long, then short) → the implicit `Details ›` →
+//! then its lead clause, then dropped) → ETA (long, then short) → the implicit `Details ›` →
 //! capsule short forms → title
 //! elision → the activity words with the load words; on a row with an ETA
 //! the load words go before the short ETA does — where no ETA fits the room
@@ -101,7 +106,7 @@ use std::cmp::Reverse;
 
 use crate::center::Live;
 use crate::model::{ActionIndex, Hold, Intent, Load, Loads, MessageId, Severity};
-use crate::text::{shape_detail, truncate};
+use crate::text::{lead_clause, shape_detail, truncate};
 use crate::{
     BEFORE_CAPSULES, CAPSULE_GAP, DETAIL_FLOOR, ELAPSED_SHORT_W, ELAPSED_W, ETA_SHORT_W, ETA_W,
     GLYPH_COL, Instant, MARGIN, PCT_W, TITLE_COL, TITLE_MIN,
@@ -1083,6 +1088,41 @@ fn shape_to_cells(detail0: &str, target: usize, width: &dyn Fn(&str) -> usize) -
     }
 }
 
+/// The excerpt's lead clause where the floor would drop it (design ruling
+/// 402): [`lead_clause`], narrower than [`DETAIL_FLOOR`], kept only where
+/// the floor's own cut begins with it — so the words a narrow row shows,
+/// every wider row shows too, and the excerpt never grows as the row
+/// narrows.
+fn floor_clause(detail0: &str, width: &dyn Fn(&str) -> usize) -> Option<String> {
+    let lead = lead_clause(detail0)?;
+    let floor = shape_to_cells(detail0, DETAIL_FLOOR, width)?;
+    (width(&lead) < DETAIL_FLOOR && floor.starts_with(&lead)).then_some(lead)
+}
+
+/// An excerpt that is not whole in `cells` (its joint included): shaped to
+/// the cells at or above the floor — its whole lead clause where the cut
+/// says no word past it (ruling 404: `behind for 26 h`, never `behind for
+/// 26 h:…` with its joint dangling) — else, under the floor, where a cut
+/// would be a stub, its whole lead clause ([`floor_clause`], ruling 402:
+/// `behind for 7 h` where `behind for 7 h: its…` no longer fits), else
+/// nothing.
+fn excerpt_cut(detail0: &str, cells: usize, width: &dyn Fn(&str) -> usize) -> Option<String> {
+    if cells >= 3 + DETAIL_FLOOR
+        && let Some(shaped) = shape_to_cells(detail0, cells - 3, width)
+    {
+        let said = shaped
+            .trim_end_matches('\u{2026}')
+            .trim_end()
+            .trim_end_matches([':', '\u{00b7}'])
+            .trim_end();
+        return Some(match lead_clause(detail0) {
+            Some(lead) if said == lead => lead,
+            _ => shaped,
+        });
+    }
+    floor_clause(detail0, width).filter(|lead| 3 + width(lead) <= cells)
+}
+
 /// What the extras won, in cells, before placement.
 struct Extras {
     /// The elapsed slot's cells ([`ELAPSED_W`] or [`ELAPSED_SHORT_W`]); 0
@@ -1213,11 +1253,9 @@ fn allocate_extras(
         if detail_whole {
             detail = Some(d.to_string());
             cells -= 3 + dw;
-        } else if cells >= 3 + DETAIL_FLOOR
-            && let Some(shaped) = shape_to_cells(d, cells - 3, width)
-        {
-            cells -= 3 + width(&shaped);
-            detail = Some(shaped);
+        } else if let Some(cut) = excerpt_cut(d, cells, width) {
+            cells -= 3 + width(&cut);
+            detail = Some(cut);
         }
         if fit.action_excerpt {
             // What the excerpt left is the row's again only beside a WHOLE
@@ -2004,10 +2042,11 @@ pub(crate) mod tests {
         assert!(failures.is_empty(), "re-pin:\n{}", failures.join("\n"));
     }
 
-    /// Invariant 13: cols 8..=200 over the five fixtures and the live
-    /// indicator's — every row exactly `cols` wide, no panic; the sacrifices
-    /// land in order (stats, the excerpt shaped then dropped below the
-    /// floor, the ETA, then the capsules go short, then the title, then the
+    /// Invariant 13: cols 8..=200 over the five fixtures, the live
+    /// indicator's and day ten's overdue upgrade rows (rulings 402 and 404) —
+    /// every row exactly `cols` wide, no panic; the sacrifices land in order
+    /// (stats, the excerpt shaped, then its whole lead clause, then dropped
+    /// below the floor, the ETA, then the capsules go short, then the title, then the
     /// activity's words whole with their load words); authored capsules
     /// present at every width; the METER (or a busy row's track) is the
     /// whole row at every width (ruling 136); a moving row's percent or
@@ -2015,7 +2054,72 @@ pub(crate) mod tests {
     /// exactly as long as it.
     #[test]
     fn width_law_degrades_in_order() {
-        for (name, spec) in fixtures().into_iter().chain(motion_fixtures()) {
+        // Day ten's overdue upgrade rows: one tab's excerpt's lead clause
+        // stands below the floor at 97..=102 columns (ruling 402), the
+        // agent's row's first ` · ` piece likewise, and a 26-hour lead
+        // stands whole where the floor's cut would add no word to it
+        // (ruling 404).
+        use crate::model::UpgradeWord::{NotToday, Now, Skip};
+        let upgrade = |word| Intent::AgentUpgrade {
+            tab: "s-1".into(),
+            to: "2.1.283".into(),
+            word,
+        };
+        let tabs = |word| Intent::AgentUpgradeTabs {
+            word,
+            moves: vec![
+                ("s-1".into(), "2.1.283".into()),
+                ("s-3".into(), "2.1.283".into()),
+            ],
+        };
+        let overdue = |name, title, detail0, capsules| {
+            (
+                name,
+                RowSpec {
+                    kind: RowKind::Message(id(9)),
+                    severity: Severity::Warn,
+                    live: true,
+                    glyph: '\u{26a0}',
+                    title,
+                    detail0: Some(detail0),
+                    meter: None,
+                    animated: false,
+                    level: false,
+                    busy: false,
+                    eta: false,
+                    load: None,
+                    load_slot: Loads::NONE,
+                    capsules,
+                },
+            )
+        };
+        let one_tab = "Couldn't upgrade Claude in tab 1 yet";
+        let overdue_rows = [
+            overdue(
+                "overdue-upgrade",
+                one_tab,
+                "behind for 7 h: its turn is still running",
+                caps(&[upgrade(NotToday), upgrade(Skip)]),
+            ),
+            overdue(
+                "overdue-upgrade-26h",
+                one_tab,
+                "behind for 26 h: its turn is still running",
+                caps(&[upgrade(NotToday), upgrade(Skip)]),
+            ),
+            overdue(
+                "overdue-tabs",
+                "Couldn't upgrade Claude in 2 tabs yet",
+                "tab 1 for 7 h \u{b7} tab 3 for 2 h",
+                caps(&[tabs(Now), tabs(NotToday)]),
+            ),
+        ];
+        let mut clause_seen = std::collections::BTreeSet::new();
+        for (name, spec) in fixtures()
+            .into_iter()
+            .chain(motion_fixtures())
+            .chain(overdue_rows)
+        {
             let authored = spec
                 .capsules
                 .iter()
@@ -2257,9 +2361,32 @@ pub(crate) mod tests {
                 // The floor governs the ROOM: an excerpt is shaped only when
                 // `3 + DETAIL_FLOOR` cells were free for it (a word-boundary
                 // cut may then land a few cells under the floor — "Full Disk
-                // Access…" is whole words, not a stub); below that it is
-                // dropped. Non-metered rows expose the room exactly.
+                // Access…" is whole words, not a stub), and a cut that says
+                // no word past the lead clause is the clause (ruling 404);
+                // below that it is its whole lead clause, with no ellipsis,
+                // where that fits (ruling 402), else dropped. Non-metered
+                // rows expose the room exactly.
+                let clause = spec.detail0.and_then(crate::text::lead_clause);
                 if let Some((dcol, d)) = &row.detail
+                    && clause.as_ref() == Some(d)
+                {
+                    clause_seen.insert(name);
+                    assert!(
+                        !d.contains('\u{2026}') && *dcol == row.title.0 + chars(&row.title.1) + 3,
+                        "{name}@{cols}: {d:?}"
+                    );
+                    // Under the floor only where the floor's own cut would
+                    // not carry it — or at or above the floor, in place of a
+                    // cut that adds no word to it.
+                    let room = row
+                        .capsules
+                        .first()
+                        .and_then(|c| c.col.checked_sub(BEFORE_CAPSULES + *dcol - 3));
+                    assert!(
+                        chars(d) < DETAIL_FLOOR || room.is_some_and(|r| r >= 3 + DETAIL_FLOOR),
+                        "{name}@{cols}: a clause the floor's cut would carry: {d:?}"
+                    );
+                } else if let Some((dcol, d)) = &row.detail
                     && d != spec.detail0.unwrap()
                     && row.meter.is_none()
                     && row.pct.is_none()
@@ -2286,6 +2413,18 @@ pub(crate) mod tests {
                 prev = Some(row);
             }
         }
+        // The config row's `skipping "cmd+shift+k"` stands, too, where its
+        // cut was `skipping "cmd+shift+k":…` (ruling 404).
+        assert_eq!(
+            clause_seen.into_iter().collect::<Vec<_>>(),
+            [
+                "config",
+                "overdue-tabs",
+                "overdue-upgrade",
+                "overdue-upgrade-26h"
+            ],
+            "the control: each overdue row painted its lead clause somewhere"
+        );
     }
 
     /// Invariant 17: every capsule column range maps back to its

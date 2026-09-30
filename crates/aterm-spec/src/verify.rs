@@ -2440,15 +2440,19 @@ mod tests {
             head.resize(320, b'#');
             assert!(head.len() as u64 > super::PENDING_STUB_HEAD);
             let _ = w.write_all(&head);
-            // Hold the pipe open: no EOF until the check has answered.
-            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+            // Hold the pipe open: no EOF until the check has answered. The
+            // cap outlasts the answer's wait below, or a whole-file read
+            // would see EOF inside it and pass.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(120));
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let reader_path = fifo.clone();
         std::thread::spawn(move || {
             let _ = tx.send(is_pending_stub(&reader_path));
         });
-        let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
+        // A hang detector: the bounded read answers at once; a whole-file one
+        // never does while the writer holds the pipe.
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(60));
         let _ = release_tx.send(());
         let _ = writer.join();
         let _ = std::fs::remove_dir_all(&dir);

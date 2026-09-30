@@ -96,7 +96,7 @@ pub fn slice_copy(src: &[u8], dst: &mut [u8]) {
     // Linux and Windows lanes take the tier too: the shipped Linux release
     // (`ship linux-build` on an x86_64 host) and the x86_64-pc-windows-gnu
     // cfg-validation build now inline the SSE2 copies where they called
-    // `memcpy`, and `xtask gate linux` (a `cargo check`) type-checks the tier.
+    // `memcpy`, and `xtask gate cells`' linux cell type-checks the tier.
     // The numbers above are from macOS on the i7-7920HQ only; the tier's speed
     // on those lanes is unmeasured.
     #[cfg(any(target_feature = "avx", target_arch = "x86_64"))]

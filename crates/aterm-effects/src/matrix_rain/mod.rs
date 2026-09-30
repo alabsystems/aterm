@@ -1927,6 +1927,9 @@ impl MatrixRain {
         if !cycle_active(cv.hk, density) {
             return true;
         }
+        // The output-tape walk's start is a function of the column alone:
+        // hashed once here, not once per lit row.
+        let material_start = (!self.material.is_empty()).then(|| self.material_start(col));
         let r_hi = cv.head_row.min(rows.saturating_sub(1));
         let r_lo = cv.head_row.saturating_sub(cp.l);
         if r_lo <= r_hi && r_lo < rows {
@@ -1942,14 +1945,14 @@ impl MatrixRain {
                 let Some(lvl) = self.drained_level(ctx, &cp, lvl0, r, is_head) else {
                     continue;
                 };
-                if !self.cell_eligible(r, col, ctx.input) {
+                if !self.cell_unmasked(r, col, ctx.input) {
                     continue;
                 }
                 if quads.len() >= ctx.cap {
                     return false;
                 }
                 let head_flash = is_head && lvl == 15;
-                quads.push(self.cell_quad(ctx, col, r, lvl, head_flash));
+                quads.push(self.cell_quad(ctx, col, r, lvl, head_flash, material_start));
                 if head_flash && cv.bright {
                     self.halo_cands.push((r as u16, col));
                 }
@@ -1966,7 +1969,7 @@ impl MatrixRain {
             if quads.len() >= ctx.cap {
                 return false;
             }
-            quads.push(self.cell_quad(ctx, col, wr, lvl, true));
+            quads.push(self.cell_quad(ctx, col, wr, lvl, true, material_start));
         }
         true
     }
@@ -1997,14 +2000,24 @@ impl MatrixRain {
     /// chooses a deterministic starting point and `glyph_epoch` advances it,
     /// so supported codepoints retain their sampled adjacency rather than
     /// becoming a randomized lookalike bag. Literal glyphs are never mirrored.
-    fn cell_quad(&self, ctx: &EmitCtx<'_>, col: u16, row: u32, lvl: u32, head: bool) -> SpriteQuad {
+    /// `material_start` is the column's [`Self::material_start`] — `Some`
+    /// exactly while the material table is live.
+    fn cell_quad(
+        &self,
+        ctx: &EmitCtx<'_>,
+        col: u16,
+        row: u32,
+        lvl: u32,
+        head: bool,
+        material_start: Option<usize>,
+    ) -> SpriteQuad {
         let (cw, ch) = (u32::from(ctx.geom.cell_w), u32::from(ctx.geom.cell_h));
-        let (g, flip_x) = glyph_from_epoch(self.seed32, row, u32::from(col), ctx.glyph_epoch);
-        let (g, flip_x) = if self.material.is_empty() {
-            (g, flip_x)
-        } else {
-            let ix = self.semantic_material_index(col, row, ctx.glyph_epoch);
-            (u32::from(self.material[ix]), false)
+        let (g, flip_x) = match material_start {
+            None => glyph_from_epoch(self.seed32, row, u32::from(col), ctx.glyph_epoch),
+            Some(start) => {
+                let ix = self.semantic_material_index(start, col, row, ctx.glyph_epoch);
+                (u32::from(self.material[ix]), false)
+            }
         };
         let (ax, ay) = self.baker.tile_origin(g);
         let alpha = if head {
@@ -2033,34 +2046,10 @@ impl MatrixRain {
     /// columns into a small coherent lane and changes only the tape traversal:
     /// inspect pairs scout together, modify pairs counterflow, execute groups
     /// advance briskly, network groups form two-cell packets, and waiting holds.
-    fn semantic_material_index(&self, col: u16, row: u32, glyph_epoch: u32) -> usize {
+    /// `start` is the column's [`Self::material_start`].
+    fn semantic_material_index(&self, start: usize, col: u16, row: u32, glyph_epoch: u32) -> usize {
         let len = self.material.len();
         debug_assert!(len > 0);
-        if self.semantic_phase == RainSignal::AssistantStream {
-            let start = field::rain_hash32(u32::from(col) ^ self.seed32 ^ 0x00C0_FFEE) as usize;
-            return start
-                .wrapping_add(row as usize)
-                .wrapping_add(glyph_epoch as usize)
-                % len;
-        }
-
-        let base_width = match self.semantic_phase {
-            RainSignal::Inspect | RainSignal::Modify => 2,
-            RainSignal::Network | RainSignal::Branch => 3,
-            RainSignal::Execute
-            | RainSignal::Waiting
-            | RainSignal::Success
-            | RainSignal::Failure
-            | RainSignal::Interrupted
-            | RainSignal::TurnStart => 4,
-            RainSignal::AssistantStream => 1,
-        };
-        let lane_width =
-            (base_width + u16::from(self.semantic_energy.saturating_sub(1) / 3)).min(8);
-        let lane = u32::from(col / lane_width.max(1));
-        let start = field::rain_hash32(
-            lane ^ self.seed32 ^ self.semantic_seq.wrapping_mul(0x9E37_79B9) ^ 0x005E_A11C,
-        ) as usize;
         let row = row as usize;
         let epoch = glyph_epoch as usize;
         let offset = match self.semantic_phase {
@@ -2080,6 +2069,32 @@ impl MatrixRain {
             RainSignal::AssistantStream => row.wrapping_add(epoch),
         };
         start.wrapping_add(offset) % len
+    }
+
+    /// Where column `col`'s walk starts on the output tape: a hash of the
+    /// column (or, under a semantic pulse, of its lane) — constant for every
+    /// row of the column this frame.
+    fn material_start(&self, col: u16) -> usize {
+        if self.semantic_phase == RainSignal::AssistantStream {
+            return field::rain_hash32(u32::from(col) ^ self.seed32 ^ 0x00C0_FFEE) as usize;
+        }
+        let base_width = match self.semantic_phase {
+            RainSignal::Inspect | RainSignal::Modify => 2,
+            RainSignal::Network | RainSignal::Branch => 3,
+            RainSignal::Execute
+            | RainSignal::Waiting
+            | RainSignal::Success
+            | RainSignal::Failure
+            | RainSignal::Interrupted
+            | RainSignal::TurnStart => 4,
+            RainSignal::AssistantStream => 1,
+        };
+        let lane_width =
+            (base_width + u16::from(self.semantic_energy.saturating_sub(1) / 3)).min(8);
+        let lane = u32::from(col / lane_width.max(1));
+        field::rain_hash32(
+            lane ^ self.seed32 ^ self.semantic_seq.wrapping_mul(0x9E37_79B9) ^ 0x005E_A11C,
+        ) as usize
     }
 
     /// Body coverage for a trail level: linear in level, capped at the
@@ -2281,7 +2296,8 @@ impl MatrixRain {
     /// The Tier-A occupancy bit alone (bounds-checked) — the CHEAPEST reject,
     /// hoisted ahead of the per-cell trail math in [`Self::emit_column`] so a
     /// text-heavy screen skips level/dither work for occupied cells (pure
-    /// conjunction reorder; `cell_eligible` still re-verifies).
+    /// conjunction reorder; the trail loop then asks only
+    /// [`Self::cell_unmasked`]).
     #[inline]
     fn occ_bit(&self, row: u32, col: u16) -> bool {
         let (r, c) = (row as usize, usize::from(col));
@@ -2294,10 +2310,12 @@ impl MatrixRain {
 
     /// Tier-A + Tier-B mask: occupancy bit, cursor band, live selection.
     fn cell_eligible(&self, row: u32, col: u16, input: &RainTickInput<'_>) -> bool {
+        self.occ_bit(row, col) && self.cell_unmasked(row, col, input)
+    }
+
+    /// The Tier-B half of [`Self::cell_eligible`]: cursor band, live selection.
+    fn cell_unmasked(&self, row: u32, col: u16, input: &RainTickInput<'_>) -> bool {
         let r = row as usize;
-        if !self.occ_bit(row, col) {
-            return false;
-        }
         // Cursor band: visible cursor row ± 2; hidden cursor masks the
         // host-fed recently-damaged band — and with an UNKNOWN band (empty
         // ring: first enable / resize / full-damage frames) the BOTTOM K rows
@@ -4027,8 +4045,9 @@ mod tests {
             glyph_epoch: 0,
             dither_epoch: 0,
         };
-        let a = e.cell_quad(&ctx, 3, 2, 10, false);
-        let b = e.cell_quad(&ctx, 3, 3, 10, false);
+        let start = Some(e.material_start(3));
+        let a = e.cell_quad(&ctx, 3, 2, 10, false, start);
+        let b = e.cell_quad(&ctx, 3, 3, 10, false, start);
         let slot_a = usize::from(a.ax) / 8;
         let slot_b = usize::from(b.ax) / 8;
         assert_eq!(slot_b, (slot_a + 1) % 3);
@@ -4059,17 +4078,20 @@ mod tests {
             "repeated evidence extends one phase without reseeding its lanes"
         );
         assert_eq!(rain.semantic_ticks_left, SEMANTIC_HOLD_TICKS);
+        let index = |rain: &MatrixRain, col, row, epoch| {
+            rain.semantic_material_index(rain.material_start(col), col, row, epoch)
+        };
         assert_eq!(
-            rain.semantic_material_index(0, 3, 2),
-            rain.semantic_material_index(1, 3, 2),
+            index(&rain, 0, 3, 2),
+            index(&rain, 1, 3, 2),
             "inspect forms a coherent two-column scout lane"
         );
 
         rain.note_signal(RainSignal::Modify as u32, 1);
         rain.apply_pending_notes();
         assert_ne!(
-            rain.semantic_material_index(0, 2, 1),
-            rain.semantic_material_index(1, 2, 1),
+            index(&rain, 0, 2, 1),
+            index(&rain, 1, 2, 1),
             "modify counterflows adjacent real-output sequences"
         );
 

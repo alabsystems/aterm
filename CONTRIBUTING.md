@@ -12,17 +12,22 @@ packets.
 
 ## Build and test
 
-The snapshot pins a stock Rust toolchain, so no ALab tooling is needed to build
-it: `rust-toolchain.toml` names the pinned version and rustup will fetch it. On
-macOS you also need the Xcode Command Line Tools; Linux and Windows build and
-test from source too, though only macOS has released binaries, an installer,
-and the self-updater. From the workspace root:
+The snapshot pins the Trust toolchain in `rust-toolchain.toml`, as the private
+development line does. Install aterm ([README ▸ Install](README.md#install));
+atpkg installs Trust (`aterm pkg install trust` does it by hand, and
+`aterm help rust` explains the toolchain). atpkg ships Trust for Apple-silicon
+macOS today; elsewhere, build Trust from
+[source](https://github.com/alabsystems/trust). On macOS you also need the Xcode
+Command Line Tools; Linux and Windows build and test from source too, though
+only macOS has released binaries, an installer, and the self-updater. Every
+command names its lane — `targo --unverified <verb>` builds with no proof
+claim, `targo trust <verb>` verifies. From the workspace root:
 
 ```sh
-cargo check --locked -p aterm
-cargo test --locked -p aterm-grid --test conformance_offload
-cargo build --locked -p aterm
-cargo run --quiet --locked -p aterm -- --version
+targo --unverified check --locked -p aterm
+targo --unverified test --locked -p aterm-grid --test conformance_offload
+targo --unverified build --locked -p aterm
+targo --unverified run --quiet --locked -p aterm -- --version
 ```
 
 The final command should report `[workspace.package] version` from the root
@@ -31,17 +36,16 @@ published to crates.io and their APIs are not stable yet; see
 [README ▸ Build from source](README.md#build-from-source) for why
 `cargo install aterm` is the wrong move.
 
-The private development line builds on the Trust toolchain instead. Every
-derived-model obligation is discharged in-process, so a stock clone verifies
-for real. Where the Trust tools add an analysis the in-process checker cannot
-express, that analysis is skipped on machines without them: the test still
-reports `ok`, and the reason is printed to stderr — run
-`cargo test -- --nocapture` to see it. Nothing here requires those tools to go
-green.
+Every derived-model obligation is discharged in-process, so a clone verifies
+for real. Where the other ALab tools (`ty`, `ay`) add an analysis the
+in-process checker cannot express, that analysis is skipped on machines
+without them: the test still reports `ok`, and the reason is printed to
+stderr — run `targo --unverified test -- --nocapture` to see it. Nothing here
+requires those tools to go green.
 
 ### If `cargo` says `error: toolchain 'trust' is not installed`
 
-That is rustup speaking, and it means the private line's `trust` toolchain link
+That is rustup speaking, and it means the `trust` toolchain link
 (`~/.rustup/toolchains/trust`) no longer reaches the atpkg-managed store that
 holds the compiler. Run `aterm pkg doctor`: it names the seam that broke, and
 `aterm pkg doctor --fix` re-points the link at `store/trust/current`. Do not
@@ -50,7 +54,8 @@ rebuild a toolchain from source to answer that message, and do not add a
 The one place those names exist as files aterm lays is the session-scoped
 reroute directory (`<prefix>/reroute`, `docs/DESIGN-toolchain-reroute-2026-09-07.md`),
 which only an aterm session puts first on its own PATH — and it is not `bin/`.
-On this public snapshot the message cannot occur: it pins a stock toolchain.
+With no aterm installed at all, `aterm pkg install trust` is not available yet:
+install aterm first.
 
 Run the focused tests for every crate you change; they are expected to pass on
 a fresh clone of this tree.
@@ -63,7 +68,7 @@ whether a change lands is `tools/verify.sh` — a local ladder of stages
 (`crates/aterm-verify`) that a maintainer runs on the rebased branch, on
 the development line, at land time. You are not expected to run it, and this
 file does not ask you to: that ladder drives the development line's own
-toolchain, while this snapshot deliberately pins a stock Rust release (see
+toolchain and private configuration, which this snapshot does not carry (see
 [PUBLICATION.md](PUBLICATION.md)). This paragraph used to call
 `cargo run -q -p xtask -- gate <check>` "the local gate ladder the project uses
 in place of CI", which read as though the verb you can run here were the
@@ -72,9 +77,9 @@ symmetry.
 
 What you *can* run on this snapshot, all on the pinned toolchain:
 
-* `cargo test --locked` for every crate you touched. This is the one that
+* `targo --unverified test --locked` for every crate you touched. This is the one that
   matters, and the expectation is that it is green on a fresh clone.
-* `cargo run -q -p aterm-census -- . [--mainloop|--locks|--wasm|--scope|--lazy-init]`
+* `targo --unverified run -q -p aterm-census -- . [--mainloop|--locks|--wasm|--scope|--lazy-init]`
   for the source-walk censuses: main-loop reach, the lock-order graph, the
   wasm process, scope cardinality and lazy-init reentrancy. They shell out to
   nothing — they are in-process walks of the checked-in tree — so they run

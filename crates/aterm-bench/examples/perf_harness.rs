@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Wall-clock THROUGHPUT harness for the `xtask gate perf` baseline (PERF-WALLCLOCK
+// Wall-clock THROUGHPUT harness for the `xtask perf` baseline (PERF-WALLCLOCK
 // -BASELINE lane). Feeds a deterministic, sizeable, representative VT workload
 // through the engine's parse/process hot path (`Terminal::process`) and reports a
 // median-of-N throughput in MB/s as a single JSON line on stdout.
 //
-// This is a RELEASE binary on purpose: `xtask gate perf` spawns it with
+// This is a RELEASE binary on purpose: `xtask perf` spawns it with
 // `cargo run --release` so timing reflects the shipped build, never the debug
 // xtask interpreter. The gate owns the compare/threshold/record logic; this
 // harness owns only the measurement (warmup, N timed iters, median).

@@ -4144,11 +4144,20 @@ mod tests {
     /// The call must answer at the bound (plus the drain grace), not when the
     /// helper exits, and the helper must be dead: before the fix a 40 s helper
     /// held a 10 s bound for 40.06 s.
+    ///
+    /// The helper's life is the ceiling of every wait here: the call's slack
+    /// and the wait for the helper to go are a minute each (hang detectors, a
+    /// loaded box can take seconds to reap a group), so the helper sleeps
+    /// `HELPER_LIFE` — past both together, or a helper that outlived the
+    /// bound would have exited by itself and passed.
     #[cfg(unix)]
     #[test]
     fn a_bounded_git_call_ends_at_its_bound_and_takes_its_helper_with_it() {
+        const SLACK: Duration = Duration::from_secs(60);
+        const GONE_WITHIN: Duration = Duration::from_secs(60);
+        const HELPER_LIFE: u64 = 300;
         let root = crate::mktemp_dir("atv-bounded-helper").expect("mktemp");
-        let marker = format!("47.{}", std::process::id());
+        let marker = format!("{HELPER_LIFE}.{}", std::process::id());
         let url = format!("ext::sh -c sleep% {marker}");
         let bound = Duration::from_secs(2);
         let started = Instant::now();
@@ -4159,7 +4168,11 @@ mod tests {
         );
         let took = started.elapsed();
         assert!(
-            took < bound + DRAIN_GRACE + Duration::from_secs(3),
+            bound + DRAIN_GRACE + SLACK + GONE_WITHIN < Duration::from_secs(HELPER_LIFE),
+            "every wait here must end before the helper would exit by itself"
+        );
+        assert!(
+            took < bound + DRAIN_GRACE + SLACK,
             "the bound did not hold: {took:?} ({got:?})"
         );
         let e = got.expect_err("a call that overran is an error");
@@ -4173,7 +4186,7 @@ mod tests {
                 .status()
                 .is_ok_and(|s| s.success())
         };
-        let gone_by = Instant::now() + Duration::from_secs(3);
+        let gone_by = Instant::now() + GONE_WITHIN;
         while alive() && Instant::now() < gone_by {
             std::thread::sleep(Duration::from_millis(50));
         }

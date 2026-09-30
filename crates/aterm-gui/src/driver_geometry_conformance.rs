@@ -734,3 +734,240 @@ fn a_pending_fold_never_lands_between_a_drivers_read_and_its_fenced_turn() {
         });
     }
 }
+
+/// THE PEER'S HOLD (review of the integration, 2026-09-29): a SECOND session
+/// the window shows — a background tab — takes a drive lease and lets it go
+/// before either of its wakes runs. Its lease held the front session's birth
+/// (`Desk::driver_may_type` reads every session the window shows), its wakes
+/// read facts identical to its slot and project nothing, and the row the
+/// front's words want is owed a commit no wake will make: the presence
+/// timer's owed birth (`rows_deadline`, the model's `Catch`) is what commits
+/// it. Every step is a real verb or a real wake on the real App, projected
+/// onto the model's `hand`, `other`, `peer`, `ps`, `rows` and `gen` (the
+/// size changes the program was sent — the only thing that moves the
+/// generation in this schedule, which runs no `Output`), and each action it
+/// stands for is enabled in the model when it fires. The model's `sensed`,
+/// `snap`, `snap_want`, `woke` and `pw` — the refresh's private
+/// bookkeeping — are not projected; an action that moves them is checked by
+/// being enabled when it fires and by what it does to the projected ones.
+///
+/// NEGATIVE CONTROLS, both on the real App: under the peer's live lease the
+/// timer's tick commits nothing (the model's `Catch` and `Commit` disabled
+/// while `peer = 1`); and once the lease is gone, every wake it posted
+/// delivered and the rig pumped, the row still stands unborn — the defect the
+/// `Catch` exists for. In the model no wake-driven action is left (`woke` and
+/// `pw` are 0; `Sense`, `Commit` and `PeerSense` are disabled) and `Catch` is
+/// enabled. The model's atomic `Regrid` is enabled too: it is the unsplit
+/// refresh, a wake's sense and commit in one step, which the real App never
+/// runs — its refresh is the split `Sense`/`Commit`, and with no wake owed
+/// only the timer's `Catch` starts one.
+#[test]
+fn a_peers_lease_let_go_before_its_wakes_ran_is_caught_up_by_the_timer() {
+    crate::fabric::with_link_reset(|| {
+        let mut rig = Rig::driver_geometry_rig(false);
+        let wid = rig.wid;
+        // The peer: a background tab of the same window, its slot sensed at
+        // rest (the model's `ps = 0`), the rig's session front again. Its
+        // shell status is published as a live session's is (the status
+        // sweep's): a slot that has never read one counts every sense as its
+        // first (`Table::absorb`) and projects on every wake, which no
+        // running session does.
+        let peer_id = rig.app.next_session_id;
+        rig.app.push_stub_tab(wid, crate::stub_session(peer_id));
+        rig.app.switch_tab_in(wid, 0);
+        let peer = rig
+            .app
+            .pool
+            .get(peer_id)
+            .expect("the peer pooled")
+            .ctx
+            .clone();
+        {
+            use crate::session_status::{ActivitySample, Evidence};
+            let t0 = Instant::now();
+            let ev = Evidence {
+                shell: None,
+                completed_block: None,
+                lifecycle: None,
+                foreground_job: Some(true),
+                activity: ActivitySample {
+                    alt_screen: false,
+                    content_seq: 1,
+                    last_input: None,
+                    last_output: Some(t0),
+                },
+            };
+            rig.app.session_status.observe(peer_id, &ev, t0);
+            rig.app
+                .session_status
+                .observe(peer_id, &ev, t0 + Duration::from_millis(800));
+            assert!(
+                rig.app.session_status.status(peer_id).is_some(),
+                "the peer's shell status is published"
+            );
+        }
+        rig.app.on_presence_wake(&peer.self_id, false);
+        assert!(
+            rig.app
+                .presence
+                .slot(peer_id)
+                .is_some_and(|s| s.shell.is_some()),
+            "the peer's slot has read its shell"
+        );
+        rig.settle();
+        assert_eq!(
+            rig.app.focused_session_id(wid),
+            Some(0),
+            "the rig's session is front"
+        );
+        assert_eq!(rig.rows(), 0, "a quiet window has no band row");
+        // The tab switch away and back reported focus out and in to the
+        // program (focus reporting is on): the setup's bytes, not the
+        // schedule's. From here the program must be sent nothing but the
+        // birth's one size change.
+        assert!(rig.winches().is_empty(), "{:?}", rig.seen);
+        rig.seen.clear();
+
+        let model = interp::with_buggy(&driver_geometry_model(), 0);
+        let mut state = model.init_state();
+        let front_sid = rig.ctx.self_id.clone();
+        let project = |rig: &Rig| -> [(&'static str, i64); 6] {
+            let now_us = crate::metrics::now_us();
+            let may_type = |ctx: &SessionCtx| {
+                i64::from(
+                    ctx.turn_lease
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|l| l.driver_may_type(now_us)),
+                )
+            };
+            let ps = rig
+                .app
+                .presence
+                .slot(peer_id)
+                .is_some_and(|s| s.lease != crate::presence::LeaseMark::Free);
+            [
+                ("hand", may_type(&rig.ctx)),
+                ("other", i64::from(rig.ctx.fabric.hold().is_some())),
+                ("peer", may_type(&peer)),
+                ("ps", i64::from(ps)),
+                ("rows", i64::from(rig.rows())),
+                (
+                    "gen",
+                    i64::try_from(rig.winches().len()).expect("a handful of winches"),
+                ),
+            ]
+        };
+        let fire = |state: &mut std::collections::BTreeMap<&'static str, i64>, actions: &[&str]| {
+            for action in actions {
+                assert!(
+                    model.fire(action, state),
+                    "model {action} disabled: {state:?}"
+                );
+            }
+        };
+        let modelled = |state: &std::collections::BTreeMap<&'static str, i64>| {
+            ["hand", "other", "peer", "ps", "rows", "gen"].map(|v| (v, state[v]))
+        };
+        assert_eq!(project(&rig), modelled(&state), "init");
+
+        // `Note`: a fact other than the hand wants the row — a hold on the
+        // front session (its wake not yet delivered).
+        assert!(crate::fabric::apply_hold_for_test(
+            &rig.ctx,
+            Some(crate::fabric::Hold {
+                reason: "pause".into(),
+                origin: "fleet".into(),
+            })
+        ));
+        fire(&mut state, &["Note"]);
+        assert_eq!(project(&rig), modelled(&state), "after Note");
+
+        // `PeerTake`: the peer's real `lease acquire`; its wake pends.
+        let acquired = crate::control::cmd_lease(&peer, "acquire holder=peer ttl=60000");
+        assert!(
+            acquired.starts_with("OK lease acquired holder=peer"),
+            "{acquired}"
+        );
+        fire(&mut state, &["PeerTake"]);
+        assert_eq!(project(&rig), modelled(&state), "after PeerTake");
+
+        // `Sense`: the front's wake senses the hold; the peer's live lease
+        // turns the commit away (`Commit` disabled, `Turned`).
+        rig.app.on_presence_wake(&front_sid, false);
+        rig.settle();
+        fire(&mut state, &["Sense"]);
+        assert!(!model.action_enabled("Commit", &state), "{state:?}");
+        fire(&mut state, &["Turned"]);
+        assert_eq!(
+            project(&rig),
+            modelled(&state),
+            "the peer's lease holds the birth"
+        );
+        assert_eq!(
+            rig.app.presence_level(wid),
+            Level::Hold,
+            "the words say hold"
+        );
+
+        // NEGATIVE CONTROL 1: the timer under the peer's live lease commits
+        // nothing — `Catch` is disabled while `peer = 1`.
+        assert!(!model.action_enabled("Catch", &state), "{state:?}");
+        let _ = rig.app.presence_tick(Instant::now());
+        rig.settle();
+        assert_eq!(
+            project(&rig),
+            modelled(&state),
+            "a tick under the peer's hold"
+        );
+
+        // `PeerDrop`: the peer's real `lease release`, before either of its
+        // wakes ran.
+        let released = crate::control::cmd_lease(&peer, "release holder=peer");
+        assert_eq!(released, "OK lease released\n");
+        fire(&mut state, &["PeerDrop"]);
+        assert_eq!(project(&rig), modelled(&state), "after PeerDrop");
+
+        // `PeerSense`: both of the peer's wakes, delivered late: its slot's
+        // copy never moved, so neither projects the window.
+        rig.app.on_presence_wake(&peer.self_id, false);
+        rig.app.on_presence_wake(&peer.self_id, false);
+        rig.settle();
+        fire(&mut state, &["PeerSense"]);
+        assert_eq!(project(&rig), modelled(&state), "after PeerSense");
+
+        // NEGATIVE CONTROL 2: every wake delivered, the rig pumped — the row
+        // the words want is still unborn. In the model no wake is owed and no
+        // wake-driven action is enabled; the timer's `Catch` is. (`Regrid`,
+        // the unsplit refresh, is enabled as well: it is a wake's sense and
+        // commit in one step, which the real App never runs, so it stands for
+        // nothing here — the real refresh is `Sense`/`Commit`, and with no
+        // wake owed only `Catch` starts it.)
+        assert_eq!(rig.rows(), 0, "a wake re-projected the window after all");
+        assert_eq!((state["woke"], state["pw"]), (0, 0), "no wake owed");
+        for action in ["Sense", "Commit", "PeerSense"] {
+            assert!(!model.action_enabled(action, &state), "{action}: {state:?}");
+        }
+        assert!(model.action_enabled("Catch", &state), "{state:?}");
+        assert!(model.action_enabled("Regrid", &state), "{state:?}");
+
+        // `Catch`, `Commit`: the timer's owed birth, due now.
+        let now = Instant::now();
+        assert!(
+            rig.app.presence_deadline(now).is_some_and(|x| x <= now),
+            "the owed birth arms the presence timer now"
+        );
+        let _ = rig.app.presence_tick(now);
+        rig.settle();
+        fire(&mut state, &["Catch", "Commit"]);
+        assert_eq!(
+            project(&rig),
+            modelled(&state),
+            "the timer caught the row up"
+        );
+        assert_eq!(rig.rows(), 1);
+        assert_eq!(rig.winches(), [ROWS - 1], "one re-grid, the birth");
+        rig.no_focus_byte();
+    });
+}

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aterm_spec::derive::fabric_outbox_wake_model;
-use harness::{until, until_within, World, FLEET};
+use harness::{until, World, FLEET};
 
 /// A newly parked bus fetch wakes the bridge through its `fetch` timeline
 /// event. The test fault disables only the periodic outbox drain, so the reply
@@ -111,8 +111,10 @@ fn a_lost_post_event_is_delivered_by_the_roster_backstop() {
     });
     assert!(model.fire("LoseEvent", &mut state));
     let _ = std::fs::remove_file(w.state.join("drop-post-event"));
-    let row = until_within(
-        Duration::from_secs(5),
+    // A hang detector: the backstop is the only path left, and it runs every
+    // roster round (2 s), so a minute is dozens of rounds — and the wait ends at
+    // the first one that delivers.
+    let row = until(
         "the roster backstop to deliver a post without its event",
         || {
             w.inbox(&b)

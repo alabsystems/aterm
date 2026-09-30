@@ -323,8 +323,9 @@ pub(crate) fn main() -> ExitCode {
             // and its silent exit 0 (decision "B").
             aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
             // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md): `serve` is
-            // what launchd will run (P4) and `status` is typed at a prompt, so it
-            // is routed above the mode fork like every verb. Inert in P2.
+            // what the launchd job from `aterm keeper start` runs, and the other
+            // verbs are typed at a prompt, so it is routed above the mode fork
+            // like every verb.
             aterm_cli::Verb::Keeper => aterm_keeper::cli::main_entry(forwarded),
             // `agents` is parsed by aterm-cli itself (it prints and exits), so routing
             // it means handing the WHOLE operand list back to that parser.
@@ -703,14 +704,16 @@ pub(crate) fn main() -> ExitCode {
     // `$HOME`, so they run ONCE A DAY, on the slot a window's launch claims too
     // (`atpkg::machine::launch_apply_due`), not at every launch. Interactive launches only,
     // for the same reason the pass above is gated that way: a harness driving a session
-    // over pipes must not touch the real machine.
+    // over pipes must not touch the real machine. Nor a development build under a private
+    // state root (ruling 409): the claim stands aside before it takes the owner's slot,
+    // and the session's log gets the one line saying why.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     if cfg!(target_os = "macos")
         && session_lane_is_interactive()
         && let Some(layout) = layout.as_ref()
-        && atpkg::machine::launch_apply_due(layout, now)
+        && atpkg::machine::launch_apply_due(layout, now).runs(|why| aterm_log::info!("{why}"))
     {
         spawn_detached_machine_apply();
     }
@@ -3162,6 +3165,22 @@ mod tests {
         assert!(
             !src[daily..call].contains("packages.enabled()"),
             "the daily claim is the only gate between it and the call"
+        );
+        // NOT UNDER A PRIVATE STATE ROOT (ruling 409): the claim's answer goes through
+        // `runs`, which logs the skip's one line; the skip precedes the claim inside atpkg
+        // (`launch_apply_decision`, pinned there), which reads the seam itself.
+        assert!(
+            src[daily..call].contains(".runs(|why| aterm_log::info!(\"{why}\"))"),
+            "the claim's answer logs a private root's skip: {}",
+            &src[daily..call]
+        );
+        // ONE claim in the whole router, and it is that one (ruling 410): a second lane
+        // claiming the day's slot would have to be pinned here too.
+        let production = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert_eq!(
+            production.matches("launch_apply_due(").count(),
+            1,
+            "one claim, through the gated answer"
         );
         // And the argv is the lock-free verb, not a pass.
         let spawner = src

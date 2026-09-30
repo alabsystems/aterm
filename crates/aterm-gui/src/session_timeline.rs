@@ -1457,7 +1457,21 @@ pub(crate) struct SessionTimeline {
     /// for the same reason `agent` is: the one per-session leaf every reader
     /// reaches lock-disjointly.
     resizes: crate::resize_ledger::ResizeLedger,
+    /// The id a seamless update's manifest told its successor to count on
+    /// from ([`Self::handoff_id`]): this process may hand out ids up to it
+    /// without either process naming one event twice. `None` until a park
+    /// draws a manifest.
+    handoff_ceiling: Option<u64>,
 }
+
+/// How many ids a seamless update leaves this process between the park's
+/// draw and its `_exit` ([`SessionTimeline::handoff_id`]). Events keep being
+/// recorded in that overlap — the control threads serve every verb until the
+/// Commit — so the successor counts on from above them; `timeline since=`
+/// filters by id, so the jump is invisible to a reader. A process that
+/// records more than this in one overlap refuses its Commit (a lossless
+/// retry) rather than hand an id out twice.
+pub(crate) const HANDOFF_ID_RESERVE: u64 = 1 << 16;
 
 /// One measurement of the shell's PATH ([`SessionTimeline::set_leader`]).
 ///
@@ -1773,6 +1787,43 @@ impl SessionTimeline {
             }),
         };
         self.events.range(start..)
+    }
+
+    /// THE ID A SEAMLESS UPDATE'S MANIFEST CARRIES (`SessionRecord::
+    /// timeline_id`, round seven's review, item 2): the last id handed out
+    /// PLUS [`HANDOFF_ID_RESERVE`], remembered as this process's ceiling. The
+    /// park draws the manifest while this process still records — a
+    /// control-thread event in the overlap got the id the successor gave its
+    /// `handoff` row, and a driver anchored on the old id never saw that row.
+    /// Clamped to what TOML can write.
+    #[cfg(any(unix, test))]
+    pub(crate) fn handoff_id(&mut self) -> u64 {
+        let carried = self
+            .next_id
+            .saturating_add(HANDOFF_ID_RESERVE)
+            .min(i64::MAX as u64);
+        self.handoff_ceiling = Some(carried);
+        carried
+    }
+
+    /// Whether this process has handed out an id past the one the last
+    /// manifest carried ([`Self::handoff_id`]) — the successor would hand it
+    /// out again, so the Commit stands down.
+    #[cfg(any(unix, test))]
+    pub(crate) fn past_handoff_ceiling(&self) -> bool {
+        self.handoff_ceiling
+            .is_some_and(|ceiling| self.next_id > ceiling)
+    }
+
+    /// COUNT ON FROM A SEAMLESS UPDATE (round seven of the update audit,
+    /// finding 50): the adopted session's timeline starts empty in the
+    /// successor, but its ids go on above the last one the old process handed
+    /// out, so a `timeline since=<id>` anchor taken before the update sees the
+    /// `handoff` row and every event after it — not `OK 0` until the new
+    /// count passed the anchor. Called before the first record; never lowers
+    /// the count, and never past what a manifest can carry.
+    pub(crate) fn continue_ids(&mut self, carried: u64) {
+        self.next_id = self.next_id.max(carried.min(i64::MAX as u64));
     }
 
     /// The highest recorded event id, or `None` when empty — the events digest

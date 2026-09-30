@@ -32,8 +32,9 @@ clone. Historical private labels are not public releases.
 
 The publication transform makes only reviewable boundary changes:
 
-- pins the public build to a stock Rust release — `rust-toolchain.toml` names
-  it — and omits the private Trust-only Cargo configuration;
+- keeps the development line's Trust toolchain pin (`rust-toolchain.toml`; a
+  public user installs aterm, and atpkg installs Trust) and omits the private
+  Cargo configuration;
 - points repository and update defaults at the public `alabsystems` namespace;
 - anonymizes local-machine paths in test fixtures without changing the
   behavior they test; and

@@ -228,10 +228,14 @@ fn a_refused_state_root_is_said_not_silent() {
         .take()
         .expect("piped")
         .read_to_string(&mut stderr);
+    // The refusal is SAID, naming the variable and that what depends on the
+    // state root is off; the list of what is off grows with the product
+    // (d034733c6 added session restore, the crash journal and the cell-metrics
+    // cache), so the test pins the sentence's head and its verdict, not the list.
     assert!(
-        stderr.contains(
-            "ATERM_STATE_HOME is not an absolute path; crash reports and aterm.log are off"
-        ),
+        stderr.contains("ATERM_STATE_HOME is not an absolute path; crash reports")
+            && stderr.contains("aterm.log")
+            && stderr.contains("are off"),
         "{stderr}"
     );
     assert!(

@@ -210,6 +210,9 @@ pub(crate) struct InputStallRow {
     /// The EPISODE's identity (a hash of when its oldest unread byte was
     /// accepted): one notification per stall, however its text moves.
     pub key: u64,
+    /// The job is STOPPED with input queued (`signal cont` resumes it), not
+    /// frozen: the notification's title says which ([`Escalation::headline`]).
+    pub stopped: bool,
 }
 
 /// The published agent verdict one [`SessionRow`] carries — the
@@ -248,6 +251,8 @@ pub(crate) enum EscalationKind {
     Question,
     /// An agent's turn ended on a wall (`agent=wall:<kind>`): a usage limit,
     /// a model bucket, a full context, a lost login, an API error, overload.
+    /// Also Claude Code's critical-memory banner (`wall:memory`), which it
+    /// draws while the agent still RUNS — its own headline says so.
     Wall,
     /// The legacy `⚠`-title convention. Its text is program output (an OSC
     /// title), so it badges and lists but never notifies.
@@ -260,7 +265,9 @@ impl EscalationKind {
         !matches!(self, Self::Title)
     }
 
-    /// The notification's title for this kind — aterm's own words.
+    /// The notification's title for this kind — aterm's own words. Two rows
+    /// of a kind read otherwise ([`Escalation::headline`]): a stopped job and
+    /// the memory banner.
     pub(crate) fn headline(self) -> &'static str {
         match self {
             Self::Unresponsive => "aterm · program frozen",
@@ -305,6 +312,11 @@ pub(crate) struct Escalation {
     pub label: String,
     /// The notification body: `<tab title>: <what>`.
     pub body: String,
+    /// The notification title: the kind's ([`EscalationKind::headline`]),
+    /// except where the kind's would be false — a STOPPED job is not frozen
+    /// ([`STOPPED_HEADLINE`]), and an agent under the memory banner has not
+    /// stopped ([`MEMORY_HEADLINE`]).
+    pub headline: &'static str,
     /// A fact about the MACHINE, not the tab: an agent that cannot reach
     /// its API ([`crate::presence::API_UNREACHABLE`]). Every tab on the
     /// same network meets it at once, so the herald notifies it once for
@@ -480,6 +492,14 @@ fn outlives_supervision(word: &str) -> bool {
 /// remedy instead ([`memory_remedy`], resume-hint review 2026-09-26).
 const SUPERVISED_MEMORY: &str = "memory critical \u{2014} restarting it at its next idle point";
 
+/// The title of a stall row whose job is STOPPED with input queued
+/// ([`InputStallRow::stopped`]): `signal cont` resumes it, so it is not frozen.
+const STOPPED_HEADLINE: &str = "aterm \u{00b7} program stopped";
+
+/// The title of a `wall:memory` row: Claude Code draws the banner while the
+/// agent still runs, so "agent stopped" would be false.
+const MEMORY_HEADLINE: &str = "aterm \u{00b7} agent memory critical";
+
 /// The ONE escalation a session row carries, or `None`. A published input
 /// stall wins over everything, supervised or not
 /// ([`EscalationKind::Unresponsive`]: whatever a box or a badge asks, the
@@ -520,6 +540,11 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: stall.key,
             label: format!("⚠ {body}"),
             body,
+            headline: if stall.stopped {
+                STOPPED_HEADLINE
+            } else {
+                EscalationKind::Unresponsive.headline()
+            },
             shared: false,
         });
     }
@@ -541,6 +566,7 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: text_key(message),
             label,
             body: body_for(&what),
+            headline: EscalationKind::Attention.headline(),
             shared: false,
         });
     }
@@ -576,6 +602,11 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: fact.rev,
             label: format!("⚠ {body}"),
             body,
+            headline: if fact.word == "wall:memory" {
+                MEMORY_HEADLINE
+            } else {
+                kind.headline()
+            },
             shared: fact.word == "wall:api-error"
                 && fact.subject.as_deref() == Some(crate::presence::API_UNREACHABLE),
         });
@@ -589,6 +620,7 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: text_key(&text),
             body: fold_clip(&text, ROW_WHAT_MAX),
             label: text,
+            headline: EscalationKind::Title.headline(),
             shared: false,
         });
     }
@@ -651,7 +683,7 @@ pub(crate) const NOTIFY_RETRY: std::time::Duration = std::time::Duration::from_s
 pub(crate) struct HeraldNotice {
     /// The session it is about (the delivery thread's focus suppression).
     pub session: u64,
-    /// aterm's own headline for the kind ([`EscalationKind::headline`]).
+    /// aterm's own headline for the row ([`Escalation::headline`]).
     pub title: &'static str,
     /// `<tab title>: <what>`.
     pub body: String,
@@ -670,7 +702,7 @@ pub(crate) struct HeraldOutcome {
     /// escalates.
     pub transition: bool,
     /// The transitions awaiting a notice when this note decided, its own
-    /// included: what a post pays (`n` for `… (+n-1 more)`), what
+    /// included: what a post pays (`aterm.log`'s `(+n-1 more)`), what
     /// [`HeraldQuiet::Limited`] still owes (`1` on the FIRST hold), what
     /// [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], [`HeraldQuiet::Silent`] or
     /// [`HeraldQuiet::Shared`] spent. `0` when there was nothing to decide
@@ -794,7 +826,8 @@ impl HeraldSlot {
 /// [`NOTIFY_SESSION_FLOOR`] and per instance by [`NOTIFY_BURST`]; a held-back
 /// transition is OWED, not spent: when the limit allows ([`Self::due`], the
 /// App's timer), and only while that session still escalates, ONE notice
-/// pays every transition it held back (`… (+2 more)`). Several boxes in a
+/// pays every transition it held back, naming the box shown NOW (the count
+/// is `aterm.log`'s: the boxes it replaced are gone). Several boxes in a
 /// few seconds therefore page twice, not once and then never — and never
 /// for a box already gone. A post the notifier's queue refuses told nobody:
 /// it is taken back ([`Self::refused`]) and owed again, and THAT session —
@@ -949,14 +982,13 @@ impl Herald {
         if Self::free_at(&self.recent, notified_at, retry_at, now) > now {
             // Only the FIRST hold can be the line: a re-read while the notice
             // is owed recurs at change rate, and a further box held behind it
-            // is counted by the notice that pays it (`… (+n more)`).
+            // is counted by the post that pays it (`aterm.log`'s `(+n more)`).
             let first_quiet = transition && owed == 1 && slot.first_quiet(now);
             return quiet(self, HeraldQuiet::Limited, first_quiet);
         }
         let Some(slot) = self.slots.get_mut(&session) else {
             return HeraldOutcome::default();
         };
-        let more = slot.owed.saturating_sub(1);
         slot.owed = 0;
         slot.told = true;
         slot.notified_before = slot.notified_at;
@@ -968,17 +1000,15 @@ impl Herald {
         // is news, however recently the last one was logged.
         slot.quiet_logged_at = None;
         self.recent.push_back(now);
-        let body = if more == 0 {
-            esc.body.clone()
-        } else {
-            format!("{} (+{more} more)", esc.body)
-        };
+        // The box on screen now, alone: a transition the limit held back was
+        // REPLACED by it (one escalation per session), so a count here would
+        // read as a second box waiting. `aterm.log` keeps the count.
         HeraldOutcome {
             row_moved,
             notice: Some(HeraldNotice {
                 session,
-                title: esc.kind.headline(),
-                body,
+                title: esc.headline,
+                body: esc.body.clone(),
             }),
             transition,
             owed,
@@ -1125,7 +1155,8 @@ pub(crate) enum HeraldPost {
 /// * a post the queue took says `queued`, never "posted": the delivery
 ///   thread may still drop it on its own focus check. A notice the limit held
 ///   back and the App's timer paid ([`Herald::due`]) says `queued after the
-///   rate limit`; a coalesced one carries the notice's own `(+N more)`. Posts
+///   rate limit`; a coalesced one adds `(+N more)`, the transitions it paid
+///   (the notice itself names only the box shown now). Posts
 ///   are rate-limited, so these lines are too.
 /// * a post the queue REFUSED (full — it is shared with program
 ///   notifications and drained one notifier subprocess at a time — or its
@@ -2271,6 +2302,15 @@ mod tests {
         let esc = escalation(&agent_row(9, "worker", "wall:memory", 1)).expect("a row");
         assert_eq!(esc.kind, EscalationKind::Wall);
         assert_eq!(esc.label, label);
+        // The banner is drawn under a RUNNING spinner: its title never says
+        // the agent stopped. NEGATIVE CONTROL: a wall that ends the turn does.
+        assert_eq!(esc.headline, "aterm \u{00b7} agent memory critical");
+        assert_eq!(
+            escalation(&agent_row(9, "worker", "wall:context", 1))
+                .expect("a row")
+                .headline,
+            "aterm \u{00b7} agent stopped"
+        );
         // The tab's own resume line: named whole, past the `<kind>
         // <command>` budget a cut id would not survive; the bare line where
         // the flags do not fit the stall budget; never a cut one.
@@ -2304,6 +2344,7 @@ mod tests {
         };
         let hosted = escalation(&supervised).expect("a row");
         assert_eq!(hosted.kind, EscalationKind::Wall);
+        assert_eq!(hosted.headline, "aterm \u{00b7} agent memory critical");
         assert_eq!(
             hosted.label,
             "\u{26a0} worker: memory critical \u{2014} restarting it at its next idle point"
@@ -2402,6 +2443,7 @@ mod tests {
                 waited,
             ),
             key: crate::input_stall::episode_key(fact),
+            stopped: fact.stopped,
         }
     }
 
@@ -2442,7 +2484,7 @@ mod tests {
         ));
         let esc = escalation(&worker).expect("a stall row");
         assert_eq!(esc.kind, EscalationKind::Unresponsive);
-        assert_eq!(esc.kind.headline(), "aterm \u{00b7} program frozen");
+        assert_eq!(esc.headline, "aterm \u{00b7} program frozen");
         assert!(esc.kind.notifies());
         assert_eq!(
             esc.label,
@@ -2521,6 +2563,10 @@ mod tests {
         })
         .expect("a stopped row");
         assert_eq!(esc.kind, EscalationKind::Unresponsive);
+        assert_eq!(
+            esc.headline, "aterm \u{00b7} program stopped",
+            "a stopped job is not frozen"
+        );
         assert!(
             esc.body.ends_with(
                 "claude is stopped with input queued since 14:02 \u{2014} resume it: \
@@ -2537,6 +2583,7 @@ mod tests {
         };
         let esc = escalation(&bare).expect("the verdict's row");
         assert_eq!(esc.kind, EscalationKind::Unresponsive);
+        assert_eq!(esc.headline, "aterm \u{00b7} program frozen");
         assert_eq!(esc.body, "worker: frozen: not reading input");
         // NEGATIVE CONTROL: no stall — the supervisor's badge is the row.
         worker.input_stall = None;
@@ -2859,14 +2906,16 @@ mod tests {
     /// floor — `notified_at` is its last post before the refused one again,
     /// neither the refused one's nor cleared — and not the instance's burst
     /// place, which another session posts in. The refused notice is paid when
-    /// the limit next allows, still coalesced (`(+1 more)`). NEGATIVE
-    /// CONTROL: the same notice queued spends both.
+    /// the limit next allows, still coalesced (one notice pays both boxes,
+    /// naming the one shown). NEGATIVE CONTROL: the same notice queued spends
+    /// both.
     #[test]
     fn a_refused_notice_spends_no_floor_and_no_burst_place() {
         let t0 = std::time::Instant::now();
         let t1 = t0 + NOTIFY_SESSION_FLOOR;
         let retry = t1 + NOTIFY_RETRY;
-        let coalesced = Some("a: bash rm -rf build (+1 more)".to_string());
+        // The box shown now, alone: rev 3 was replaced by rev 5.
+        let coalesced = Some("a: bash rm -rf build".to_string());
         // Sessions 1 and 2 post at t0 (one burst place left); session 1's two
         // next boxes are held by its floor, and paid at t1 by one notice —
         // which the queue refuses, or (the control) takes.
@@ -2882,6 +2931,7 @@ mod tests {
             }
             assert_eq!(h.due(t1).0, vec![1]);
             let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, t1);
+            assert_eq!(paid.owed, 2, "one notice pays both held boxes");
             assert_eq!(paid.notice.map(|n| n.body), coalesced);
             if refuse {
                 h.refused(1, paid.owed, t1);
@@ -2902,6 +2952,7 @@ mod tests {
         let freed = t0 + NOTIFY_BURST_WINDOW;
         assert_eq!(h.due(retry), (vec![], Some(freed)));
         let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, freed);
+        assert_eq!(paid.owed, 2, "coalesced as it was");
         assert_eq!(paid.notice.map(|n| n.body), coalesced);
         assert_eq!(h.due(freed), (vec![], None));
 
@@ -2958,9 +3009,10 @@ mod tests {
         assert_eq!(h.due(t1), (vec![], Some(retry)));
         assert_eq!(h.due(retry), (vec![1], Some(retry_two)));
         let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, retry);
+        assert_eq!(paid.owed, 2, "the retry pays both, coalesced");
         assert_eq!(
             paid.notice.map(|n| n.body),
-            Some("a: bash rm -rf build (+1 more)".to_string())
+            Some("a: bash rm -rf build".to_string())
         );
         assert_eq!(h.slots[&1].retry_at, None, "a post ends the wait");
         assert_eq!(h.due(retry), (vec![], Some(retry_two)));
@@ -3120,9 +3172,11 @@ mod tests {
         let after = t0 + NOTIFY_SESSION_FLOOR;
         assert_eq!(h.due(after), (vec![1], None));
         let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, after);
+        assert_eq!(paid.owed, 2, "one notice pays both held boxes");
         assert_eq!(
             paid.notice.map(|n| n.body),
-            Some("a: bash rm -rf build (+1 more)".to_string())
+            Some("a: bash rm -rf build".to_string()),
+            "it names the box shown now, never a count of boxes it replaced"
         );
         // Paid once: nothing more is owed, and a re-read stays quiet.
         assert_eq!(h.due(after), (vec![], None));
@@ -3179,8 +3233,9 @@ mod tests {
     /// while its re-read, a box answered and redrawn inside the floor (the
     /// flap — a clear does not reopen the log's window, so one line per
     /// window, never one per flap) and a second box held behind it stay
-    /// `debug`, and the paid notice's line carries the notice's own `(+N
-    /// more)`; a post reopens the window, so the next box the human sees is
+    /// `debug`, and the paid notice's line carries the count it paid, `(+N
+    /// more)`, which the notice itself does not; a post reopens the window, so
+    /// the next box the human sees is
     /// `not queued: looking` though a hold was logged a moment before, its
     /// flap is `debug`, and a floor later it is `info` again; a legacy title
     /// and a machine's fact another tab told are `debug`. The key is
@@ -3298,12 +3353,12 @@ mod tests {
             line,
             Some((Debug, format!("{head}16): not queued: limited, 2 owed")))
         );
-        // The App's timer pays it past the floor: `queued`, with the NOTICE's
-        // own coalesced count — and so does a refusal's `warn`.
+        // The App's timer pays it past the floor: `queued`, with the count it
+        // paid — and so does a refusal's `warn`. The notice names only the box.
         assert_eq!(h.due(s(20)).0, vec![4]);
         let (out, line) = step(&mut h, "prompt", 16, false, 20);
         assert!(!out.transition);
-        assert!(out.notice.as_ref().unwrap().body.ends_with(" (+1 more)"));
+        assert!(!out.notice.as_ref().unwrap().body.contains("more"));
         assert_eq!(
             line,
             Some((
@@ -3416,6 +3471,7 @@ mod tests {
             input_stall: Some(InputStallRow {
                 text: "claude is frozen: not reading input".to_string(),
                 key: 0xbeef,
+                stopped: false,
             }),
             ..SessionRow::default()
         };

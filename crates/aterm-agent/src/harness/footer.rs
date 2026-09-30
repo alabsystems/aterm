@@ -349,11 +349,9 @@ pub fn claude_dir_of(config_dir: Option<&str>, home: Option<&str>) -> Option<Pat
     home.is_absolute().then(|| home.join(".claude"))
 }
 
-/// Open `path` for reading only if it is a REGULAR file, judged on the open
-/// handle (no check-then-open race). The open itself is non-blocking, so a
-/// FIFO planted where a `HEAD` or a transcript should be cannot park the
-/// reader thread forever.
-pub(crate) fn open_regular(path: &Path) -> Option<File> {
+/// Open `path` for reading, non-blocking, so a FIFO planted where a `HEAD`
+/// or a transcript should be cannot park the reader thread forever.
+fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -361,18 +359,30 @@ pub(crate) fn open_regular(path: &Path) -> Option<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options.open(path).ok()?;
+    options.open(path)
+}
+
+/// `file` if it is a REGULAR file, judged on the open handle (no
+/// check-then-open race).
+fn regular(file: File) -> Option<File> {
     file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Open `path` for reading only if it is a regular file ([`regular`]).
+pub(crate) fn open_regular(path: &Path) -> Option<File> {
+    regular(open_nonblocking(path).ok()?)
+}
+
+/// At most `cap` bytes of `file`, as text.
+fn read_capped(file: File, cap: u64) -> Option<String> {
+    let mut text = String::new();
+    file.take(cap).read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// At most `cap` bytes of the regular file at `path`, as text.
 pub(crate) fn read_small(path: &Path, cap: u64) -> Option<String> {
-    let mut text = String::new();
-    open_regular(path)?
-        .take(cap)
-        .read_to_string(&mut text)
-        .ok()?;
-    Some(text)
+    read_capped(open_regular(path)?, cap)
 }
 
 /// The registry entry for Claude Code process `pid`, or `None` when that pid
@@ -944,7 +954,7 @@ impl TailCache {
             }
         } else {
             TailRead {
-                facts: newer.over(carry.facts.facts.clone()),
+                facts: newer.over(std::mem::take(&mut carry.facts.facts)),
                 resumed: carry.facts.resumed,
             }
         };
@@ -1603,12 +1613,8 @@ impl FooterCache {
 fn read_tail(path: &Path) -> Option<Vec<u8>> {
     let mut file = open_regular(path)?;
     let len = file.metadata().ok()?.len();
-    read_tail_open(&mut file, len)
-}
-
-fn read_tail_open(file: &mut File, len: u64) -> Option<Vec<u8>> {
     let start = len.saturating_sub(TAIL_BYTES);
-    let mut bytes = read_range(file, start, len)?;
+    let mut bytes = read_range(&mut file, start, len)?;
     // A tail that starts mid-file starts mid-line: that first fragment is
     // never a whole row.
     if start > 0 {
@@ -1628,9 +1634,7 @@ fn read_range(file: &mut File, from: u64, to: u64) -> Option<Vec<u8>> {
 
 /// Bytes `from..to` of `file` (fewer, if it shrank meanwhile), then `then`
 /// — in a walk back, the head of the row the newer window cut — in ONE
-/// buffer sized for both: allocated once, never grown after the read (until
-/// 2026-09-29 it was sized to the window alone, and every window but the
-/// newest was allocated, then grown to twice its size to take the head).
+/// buffer sized for both, never grown after the read.
 fn read_range_then(file: &mut File, from: u64, to: u64, then: &[u8]) -> Option<Vec<u8>> {
     file.seek(SeekFrom::Start(from)).ok()?;
     let want = to.saturating_sub(from);
@@ -1789,11 +1793,6 @@ impl TailFacts {
     /// and a switch in them that named no effort takes the older effort only
     /// when the older rows' model is the one it switched to.
     fn over(self, older: Self) -> Self {
-        let model = if self.model.decided() {
-            self.model
-        } else {
-            older.model.clone()
-        };
         let (effort, effort_for) = match self.effort_for {
             None if self.effort.decided() => (self.effort, None),
             None => (older.effort, older.effort_for),
@@ -1817,6 +1816,11 @@ impl TailFacts {
                 // Another model, or one this build cannot read, ran before.
                 Said::Is(_) | Said::Unread => (Said::Unread, None),
             },
+        };
+        let model = if self.model.decided() {
+            self.model
+        } else {
+            older.model
         };
         Self {
             model,
@@ -2066,10 +2070,9 @@ fn scan(body: &[u8], since: Option<u64>) -> (TailFacts, bool) {
         if !wants_model && !wants_effort {
             continue;
         }
-        // Main's 6be8652d3 projections: only a row that may be a command or
-        // its result keeps its string content (`command`); every other row
-        // keeps the metadata this scan reads (`type`, `isSidechain`,
-        // `timestamp`, `effort`, `message.model`).
+        // Only a row that may be a command or its result keeps its string
+        // content (`command`); every other row keeps the metadata this scan
+        // reads (`type`, `isSidechain`, `timestamp`, `effort`, `message.model`).
         let value = if command {
             super::transcript::command(line)
         } else {
@@ -2256,27 +2259,11 @@ pub fn read_git_head(cwd: &Path) -> GitHeadRead {
 /// The `HEAD` file's text (bounded, regular files only, like [`read_small`]);
 /// `Err(())` when the open was refused with `EPERM`.
 fn read_head(path: &Path) -> Result<Option<String>, ()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+    match open_nonblocking(path) {
+        Ok(file) => Ok(regular(file).and_then(|file| read_capped(file, MAX_GIT_FILE_BYTES))),
+        Err(error) if is_eperm(&error) => Err(()),
+        Err(_) => Ok(None),
     }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if is_eperm(&error) => return Err(()),
-        Err(_) => return Ok(None),
-    };
-    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
-        return Ok(None);
-    }
-    let mut text = String::new();
-    Ok(file
-        .take(MAX_GIT_FILE_BYTES)
-        .read_to_string(&mut text)
-        .ok()
-        .map(|_| text))
 }
 
 /// The git directory `.git` names: itself when it is a directory, the
@@ -2657,9 +2644,7 @@ pub struct ReadClock<'a> {
 /// launch facts ([`launch_facts`]) and its argv, `argv[0]` first (the host
 /// reads them again when the entry names a new image).
 ///
-/// ONE read of `sessions/<pid>.json` feeds all of it (main's 5bebdcf36,
-/// ported into this one function by the review of 2026-09-28 so that the
-/// torn-read tests below guard the path the window runs): the fold follows
+/// ONE read of `sessions/<pid>.json` feeds all of it: the fold follows
 /// the transcript the same parse named that model and effort were read
 /// from, and the resume line names that same conversation, so after
 /// `/clear` or `/resume` the footer never pairs one conversation's model
@@ -2707,10 +2692,19 @@ pub fn read_pid(
 /// the mode from it (`harness::lights`), and the launch card is read only
 /// under one ([`launch_card`]).
 pub fn mode_row(rows: &[String]) -> Option<usize> {
-    let bottom = aterm_phase::phase::composer_bottom(rows)?;
-    (bottom + 1..rows.len())
-        .take_while(|&i| !rows[i].trim().is_empty())
-        .find(|&i| is_mode_row(&rows[i]))
+    mode_row_under(rows, aterm_phase::phase::composer_bottom(rows)?)
+}
+
+/// [`mode_row`] under the composer bottom rule the caller has found (row
+/// `bottom`), so a reader that has it does not look for it again.
+#[must_use]
+pub fn mode_row_under(rows: &[String], bottom: usize) -> Option<usize> {
+    under_composer(rows, bottom).find(|&i| is_mode_row(&rows[i]))
+}
+
+/// The rows under the composer's bottom rule `bottom`, before the first blank.
+fn under_composer(rows: &[String], bottom: usize) -> impl Iterator<Item = usize> + '_ {
+    (bottom + 1..rows.len()).take_while(|&i| !rows[i].trim().is_empty())
 }
 
 /// Where a LIVE REPL's own footer row is, under the composer's bottom rule:
@@ -2724,13 +2718,9 @@ pub fn mode_row(rows: &[String]) -> Option<usize> {
 /// `Press Ctrl-C again to exit` there instead.
 #[must_use]
 pub fn live_repl_row(rows: &[String]) -> Option<usize> {
-    if let Some(row) = mode_row(rows) {
-        return Some(row);
-    }
     let bottom = aterm_phase::phase::composer_bottom(rows)?;
-    (bottom + 1..rows.len())
-        .take_while(|&i| !rows[i].trim().is_empty())
-        .find(|&i| is_bare_footer_row(&rows[i]))
+    mode_row_under(rows, bottom)
+        .or_else(|| under_composer(rows, bottom).find(|&i| is_bare_footer_row(&rows[i])))
 }
 
 /// Whether `row` is Claude Code's pill-less footer row: after its two-space
@@ -2751,26 +2741,32 @@ pub fn is_bare_footer_row(row: &str) -> bool {
 /// this build knows (`  ⏵⏵ bypass permissions on`, [`pill_indicator`]), and
 /// a `(<key> to cycle)` hint after it, when there is one, is closed — or cut
 /// BETWEEN WORDS, the way a narrow pane cuts it (`(shift+tab`, `(shift+tab
-/// to`; NARROW PANES, module doc, [`cycle_hint_len`]). Until 2026-09-28 a cut
-/// hint read as no mode row at all, so at 39–48 columns in bypass mode the
-/// lights read no mode (main's 0885b3465 found it in the painter's planner
-/// this reader replaced). A hint cut mid-word is no shape the vendor draws,
-/// and stays no mode row. The pill-less row — default mode's `? for
-/// shortcuts`, `esc to clear` with a draft — is no mode row: it says no mode.
+/// to`; NARROW PANES, module doc, [`cycle_hint_len`]). A hint cut mid-word
+/// is no shape the vendor draws, and stays no mode row. The pill-less row —
+/// default mode's `? for shortcuts`, `esc to clear` with a draft — is no
+/// mode row: it says no mode.
 #[must_use]
 pub fn is_mode_row(row: &str) -> bool {
     let Some(rest) = row.strip_prefix("  ") else {
         return false;
     };
-    PILLS.iter().any(|(glyph, indicator)| {
-        rest.strip_prefix(&format!("{glyph} {indicator} on"))
-            .is_some_and(|after| {
-                after
-                    .strip_prefix(" (")
-                    .is_none_or(|hint| hint.contains(')'))
-                    || cycle_hint_len(after) > 0
-            })
+    PILLS.iter().any(|pill| {
+        after_pill(rest, pill).is_some_and(|after| {
+            after
+                .strip_prefix(" (")
+                .is_none_or(|hint| hint.contains(')'))
+                || cycle_hint_len(after) > 0
+        })
     })
+}
+
+/// `rest` past the pill (`<glyph> <indicator> on`) it opens with, if it
+/// opens with that one.
+fn after_pill<'a>(rest: &'a str, (glyph, indicator): &(&str, &str)) -> Option<&'a str> {
+    rest.strip_prefix(glyph)?
+        .strip_prefix(' ')?
+        .strip_prefix(indicator)?
+        .strip_prefix(" on")
 }
 
 /// How many chars of `after` — the row past a pill — are the dim
@@ -2823,7 +2819,7 @@ pub fn pill_indicator(row: &str) -> Option<&'static str> {
     let rest = row.strip_prefix("  ")?;
     PILLS
         .iter()
-        .find(|(glyph, indicator)| rest.starts_with(&format!("{glyph} {indicator} on")))
+        .find(|pill| after_pill(rest, pill).is_some())
         .map(|(_, indicator)| *indicator)
 }
 
@@ -2860,44 +2856,36 @@ pub fn is_cut_pill(row: &str) -> bool {
 /// a narrow row gives up. A value the facts lack is left out, not shown as a
 /// placeholder.
 pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
-    let mut out = Vec::with_capacity(5);
     let usage = facts.usage.as_ref();
-    if let Some(wall) = usage.and_then(|u| u.wall.as_ref()) {
-        out.push(Segment {
-            mark: WALL_MARK,
-            text: super::session_usage::wall_text(wall),
-        });
-    }
     let model_effort = match (&facts.model, &facts.effort) {
         (Some(model), Some(effort)) => Some(format!("{model} {effort}")),
         (Some(one), None) | (None, Some(one)) => Some(one.clone()),
         (None, None) => None,
     };
-    if let Some(text) = model_effort {
-        out.push(Segment {
-            mark: MODEL_MARK,
-            text,
-        });
-    }
-    if let Some(path) = &facts.path {
-        out.push(Segment {
-            mark: PATH_MARK,
-            text: path.clone(),
-        });
-    }
-    if let Some(branch) = &facts.branch {
-        out.push(Segment {
-            mark: BRANCH_MARK,
-            text: branch.clone(),
-        });
-    }
-    if let Some(text) = usage.and_then(super::session_usage::usage_text) {
-        out.push(Segment {
-            mark: USAGE_MARK,
-            text,
-        });
-    }
-    out
+    [
+        (
+            WALL_MARK,
+            usage
+                .and_then(|u| u.wall.as_ref())
+                .map(super::session_usage::wall_text),
+        ),
+        (MODEL_MARK, model_effort),
+        (PATH_MARK, facts.path.clone()),
+        (BRANCH_MARK, facts.branch.clone()),
+        (USAGE_MARK, usage.and_then(super::session_usage::usage_text)),
+    ]
+    .into_iter()
+    .filter_map(|(mark, text)| Some(Segment { mark, text: text? }))
+    .collect()
+}
+
+/// The model alone as a segment — the rung a narrow rule gives up last
+/// ([`facts_ladder`]).
+fn model_alone(facts: &FooterFacts) -> Option<Segment> {
+    facts.model.as_ref().map(|model| Segment {
+        mark: MODEL_MARK,
+        text: model.clone(),
+    })
 }
 
 /// The cells `text` takes on the glass: a wide char two, a combining mark
@@ -2995,31 +2983,41 @@ pub struct RuleFit {
 }
 
 impl RuleFit {
-    /// The fewest cells it takes: ` <chips>  <title> `, [`RULE_SEP`] glyphs,
-    /// ` <facts> ` — each group padded by one space a side, a title with its
-    /// own two cells of gap, the separator only between two groups. The
-    /// lights stand at the rule's LEFT end and the facts at its right, rule
-    /// glyphs between.
+    /// The fewest cells it takes ([`rule_width`]).
     #[must_use]
     pub fn width(&self, lights: Option<LightsWidth>) -> usize {
-        let facts = if self.segments.is_empty() {
-            0
-        } else {
-            segments_width(&self.segments) + 2
-        };
-        let lights = match lights.filter(|_| self.chips) {
-            Some(l) => {
-                let title = match self.title {
-                    TitleFit::Full => l.title,
-                    TitleFit::Short => l.short,
-                    TitleFit::None => 0,
-                };
-                title + l.chips + 2
-            }
-            None => 0,
-        };
-        facts + lights + if facts > 0 && lights > 0 { RULE_SEP } else { 0 }
+        rule_width(&self.segments, self.title, self.chips, lights)
     }
+}
+
+/// The fewest cells a rule of `segments`, `title` and (with `chips`) the
+/// lights takes: ` <chips>  <title> `, [`RULE_SEP`] glyphs, ` <facts> ` —
+/// each group padded by one space a side, a title with its own two cells of
+/// gap, the separator only between two groups. The lights stand at the
+/// rule's LEFT end and the facts at its right, rule glyphs between.
+fn rule_width(
+    segments: &[Segment],
+    title: TitleFit,
+    chips: bool,
+    lights: Option<LightsWidth>,
+) -> usize {
+    let facts = if segments.is_empty() {
+        0
+    } else {
+        segments_width(segments) + 2
+    };
+    let lights = match lights.filter(|_| chips) {
+        Some(l) => {
+            let title = match title {
+                TitleFit::Full => l.title,
+                TitleFit::Short => l.short,
+                TitleFit::None => 0,
+            };
+            title + l.chips + 2
+        }
+        None => 0,
+    };
+    facts + lights + if facts > 0 && lights > 0 { RULE_SEP } else { 0 }
 }
 
 /// The facts as a narrow rule gives them up: the session's tokens first,
@@ -3028,43 +3026,53 @@ impl RuleFit {
 /// rule too narrow for the wall itself gives up the WALL, not everything
 /// behind it: the same rungs follow without it, so a narrow pane keeps the
 /// model it showed before a limit was hit (Claude's own screen carries the
-/// live notice) — the model alone, with no wall, is the last rung.
+/// live notice) — the model alone, with no wall, is the last rung
+/// ([`model_alone`]). Never empty: the whole facts are the first rung.
 fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
-    let short = facts.path.as_deref().and_then(elide_path);
     let whole = segments(facts);
-    let wall = whole.iter().find(|s| s.mark == WALL_MARK).cloned();
-    let with = |wall: Option<&Segment>, path: Option<&str>, branch: bool, effort: bool| {
-        let mut rung: Vec<Segment> = wall.into_iter().cloned().collect();
-        rung.extend(segments(&FooterFacts {
-            model: facts.model.clone(),
-            effort: facts.effort.clone().filter(|_| effort),
-            path: path.map(str::to_owned),
-            branch: facts.branch.clone().filter(|_| branch),
-            ..FooterFacts::default()
-        }));
-        rung
-    };
-    let path = facts.path.as_deref();
-    let mut rungs = vec![whole];
-    for wall in [wall.as_ref(), None] {
-        rungs.push(with(wall, path, true, true));
-        if short.is_some() {
-            rungs.push(with(wall, short.as_deref(), true, true));
-        }
-        rungs.push(with(wall, path, false, true));
-        if short.is_some() {
-            rungs.push(with(wall, short.as_deref(), false, true));
-        }
-        rungs.push(with(wall, None, false, true));
-        rungs.push(with(wall, None, false, false));
-        if let Some(wall) = wall {
-            rungs.push(vec![wall.clone()]);
-        }
-    }
-    let mut out: Vec<Vec<Segment>> = Vec::new();
-    for rung in rungs {
+    let mark = |mark: char| whole.iter().find(|s| s.mark == mark).cloned();
+    let (wall, model_effort, path, branch) = (
+        mark(WALL_MARK),
+        mark(MODEL_MARK),
+        mark(PATH_MARK),
+        mark(BRANCH_MARK),
+    );
+    let short = facts
+        .path
+        .as_deref()
+        .and_then(elide_path)
+        .map(|text| Segment {
+            mark: PATH_MARK,
+            text,
+        });
+    let model = model_alone(facts);
+    let mut out = vec![whole];
+    let mut push = |rung: Vec<Segment>| {
         if !out.contains(&rung) {
             out.push(rung);
+        }
+    };
+    for wall in [wall.as_ref(), None] {
+        let rung = |model: Option<&Segment>, path: Option<&Segment>, branch: Option<&Segment>| {
+            [wall, model, path, branch]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect()
+        };
+        let model_effort = model_effort.as_ref();
+        push(rung(model_effort, path.as_ref(), branch.as_ref()));
+        if let Some(short) = &short {
+            push(rung(model_effort, Some(short), branch.as_ref()));
+        }
+        push(rung(model_effort, path.as_ref(), None));
+        if let Some(short) = &short {
+            push(rung(model_effort, Some(short), None));
+        }
+        push(rung(model_effort, None, None));
+        push(rung(model.as_ref(), None, None));
+        if let Some(wall) = wall {
+            push(vec![wall.clone()]);
         }
     }
     out
@@ -3097,67 +3105,49 @@ fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 /// their title right of them, the facts right-aligned at its right end: so
 /// the chips never move for a title, nor for the facts — a title comes and
 /// goes under the pointer, and the chip it names stays under it.
+///
+/// The tries are measured in place and only the one that fits is copied out.
 #[must_use]
 pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -> RuleFit {
-    let ladder = facts_ladder(facts);
-    let chips = lights.is_some();
-    let whole = ladder.first().cloned().unwrap_or_default();
-    let model = ladder.last().cloned().unwrap_or_default();
     // The model-and-effort segment and a limit wall: what a reason never
     // takes the room of.
-    let top = |rung: &[Segment]| {
+    fn top(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
         rung.iter()
             .filter(|s| s.mark == MODEL_MARK || s.mark == WALL_MARK)
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    let mut tries = Vec::new();
-    if chips {
-        for title in [TitleFit::Full, TitleFit::Short] {
-            tries.push(RuleFit {
-                segments: whole.clone(),
-                title,
-                chips,
-            });
-        }
-        if lights.is_some_and(|l| l.reason) {
-            for rung in ladder.iter().skip(1).filter(|r| top(r) == top(&whole)) {
-                tries.push(RuleFit {
-                    segments: rung.clone(),
-                    title: TitleFit::Short,
-                    chips,
-                });
-            }
-        }
     }
-    for segments in ladder {
-        tries.push(RuleFit {
-            segments,
-            title: TitleFit::None,
-            chips,
-        });
-    }
-    if chips {
-        tries.push(RuleFit {
-            segments: model,
-            title: TitleFit::None,
-            chips: false,
-        });
-        // Chips narrower than the model still draw where the model cannot.
-        tries.push(RuleFit {
-            segments: Vec::new(),
-            title: TitleFit::None,
-            chips,
-        });
-    }
-    tries
+    let ladder = facts_ladder(facts);
+    let model = model_alone(facts);
+    let chips = lights.is_some();
+    let reason = lights.is_some_and(|l| l.reason);
+    let whole = ladder[0].as_slice();
+    let titled = [TitleFit::Full, TitleFit::Short]
         .into_iter()
-        .find(|fit| fit.width(lights) <= room)
-        .unwrap_or(RuleFit {
-            segments: Vec::new(),
-            title: TitleFit::None,
-            chips: false,
-        })
+        .filter(|_| chips)
+        .map(|title| (whole, title, chips));
+    let reasons = ladder[1..]
+        .iter()
+        .filter(|rung| reason && top(rung).eq(top(whole)))
+        .map(|rung| (rung.as_slice(), TitleFit::Short, chips));
+    let bare = ladder
+        .iter()
+        .map(|rung| (rung.as_slice(), TitleFit::None, chips));
+    // Then the model without the chips, and chips narrower than the model
+    // still drawn where the model cannot be.
+    let last = [(model.as_slice(), false), (&[][..], true)]
+        .into_iter()
+        .filter(|_| chips)
+        .map(|(segments, chips)| (segments, TitleFit::None, chips));
+    let (segments, title, chips) = titled
+        .chain(reasons)
+        .chain(bare)
+        .chain(last)
+        .find(|&(segments, title, chips)| rule_width(segments, title, chips, lights) <= room)
+        .unwrap_or((&[], TitleFit::None, false));
+    RuleFit {
+        segments: segments.to_vec(),
+        title,
+        chips,
+    }
 }
 
 /// The most cells the lights' chips may take in a rule of `room` cells and
@@ -3166,12 +3156,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
 /// block is built to it, and the keyboard selects only a chip that fits it.
 #[must_use]
 pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
-    let model: Vec<Segment> = facts_ladder(facts).pop().unwrap_or_default();
-    let model_w = if model.is_empty() {
-        0
-    } else {
-        segments_width(&model) + 2
-    };
+    let model_w = rule_width(model_alone(facts).as_slice(), TitleFit::None, false, None);
     let beside = if model_w > 0 && model_w <= room {
         model_w + RULE_SEP
     } else {

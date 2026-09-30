@@ -3530,7 +3530,7 @@ mod tests {
                 .write_frame_with_receipt(b"A")
                 .expect("delayed blocking receipt")
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while sink.input_epoch() == initial_epoch {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -3726,7 +3726,10 @@ mod tests {
             ImmediateWrite::BusyZero
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            // Failure bound only: nothing drains the peer until after this call,
+            // so a refusal that waited for it would never return. A tight bound
+            // only lets scheduler preemption on a loaded box fake a failure.
+            started.elapsed() < std::time::Duration::from_secs(60),
             "immediate refusal must not wait for the wedged peer"
         );
 
@@ -3736,7 +3739,7 @@ mod tests {
             .expect("drain fill and older frame");
         assert_eq!(&got[filled..], b"OLDER");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let settled = {
                 let spill = sink.shared.spill.lock().unwrap();
@@ -3841,7 +3844,7 @@ mod tests {
             // Failure bound only: the genuine regression is an UNBOUNDED park, so any
             // finite deadline catches it. A tight one only lets scheduler preemption
             // on a loaded box fake a failure.
-            t0.elapsed() < std::time::Duration::from_secs(5),
+            t0.elapsed() < std::time::Duration::from_secs(60),
             "small writes below a fresh spill cap must not wait for the wedge to clear"
         );
 
@@ -3875,7 +3878,7 @@ mod tests {
         assert_eq!(&got[wedged..], b"AAAABBBBCCCC", "spill delivered in order");
         assert!(
             completion_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(std::time::Duration::from_secs(60))
                 .expect("completion fence settles after drain")
         );
         completion_thread.join().expect("completion thread");
@@ -3976,7 +3979,7 @@ mod tests {
             sink_bytes.extend_from_slice(&chunk[..n]);
         }
         // The drainer runs on its own thread; poll the predicate until it settles.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !sink.egress_drained_to_kernel() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4052,21 +4055,36 @@ mod tests {
     /// the UI thread may spin PAUSE hints hoping the mid-frame holder releases (the
     /// alternative — conceding — makes a keystroke pay `dup(2)` + `pthread_create`
     /// for the drainer), but it must concede while the lock stays held. The holder
-    /// here keeps the lock far longer than any real frame, so the write has to
-    /// concede and spill; it must return in a small fraction of that hold.
+    /// here keeps the lock until the write has RETURNED, so the write has to concede
+    /// and spill: it must come back while the lock is still held.
+    ///
+    /// The hold is an event, not a nap. It used to be a 300 ms sleep under a 1 s
+    /// bound, and a write that blocked on the lock returned at ~300 ms and passed
+    /// (sweep 4, 2026-09-29). Now the holder releases only when told to, or after
+    /// `HOLD_CAP` — a hang detector for the defect, which then returns after the
+    /// release and fails on `released`.
     #[test]
     fn contended_nonparking_write_concedes_within_a_bounded_spin() {
+        /// How long the holder keeps the lock if nobody tells it to let go:
+        /// only a write that waits on the holder ever sees it.
+        const HOLD_CAP: std::time::Duration = std::time::Duration::from_secs(120);
         let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
 
         let holding = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
             let sink = Arc::clone(&sink);
             let holding = Arc::clone(&holding);
+            let released = Arc::clone(&released);
             thread::spawn(move || {
                 let guard = sink.shared.lock.lock().unwrap_or_else(|p| p.into_inner());
                 holding.store(true, Ordering::SeqCst);
-                thread::sleep(std::time::Duration::from_millis(300));
+                let _ = release_rx.recv_timeout(HOLD_CAP);
+                // Published BEFORE the unlock, so a write that got the lock
+                // only through this release reads it set.
+                released.store(true, Ordering::SeqCst);
                 drop(guard);
             })
         };
@@ -4076,15 +4094,18 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         assert_eq!(sink.write_frame_nonparking(b"K").expect("accepted"), 1);
+        let took = t0.elapsed();
         assert!(
-            // 150ms against a 300ms hold is a 2x discriminator wrapped around a dup(2)
-            // and a thread creation with ~40 runnable threads. The concede-vs-park
-            // distinction is unbounded on the failing side, so widen rather than race.
-            t0.elapsed() < std::time::Duration::from_secs(1),
-            "the retry budget must be a bounded spin, not a wait on the holder (took {:?})",
-            t0.elapsed()
+            !released.load(Ordering::SeqCst),
+            "the write returned only after the holder let go: a wait on the holder, not a \
+             bounded spin (took {took:?})"
+        );
+        assert!(
+            took < HOLD_CAP / 4,
+            "the retry budget must be a bounded spin, not a wait on the holder (took {took:?})"
         );
 
+        release_tx.send(()).expect("holder alive");
         holder.join().expect("holder thread");
         // Conceded to the spill: the drainer delivers once the holder releases.
         let mut buf = [0u8; 4];
@@ -4120,7 +4141,7 @@ mod p04_direct_receipt_and_deferred_drainer_tests {
     fn sink_and_reader() -> (Arc<SinkWriter>, UnixStream) {
         let (reader, writer) = UnixStream::pair().expect("socketpair");
         reader
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
             .expect("timeout");
         let owned: OwnedFd = writer.into();
         (Arc::new(SinkWriter::new_owned(owned)), reader)
@@ -4208,7 +4229,7 @@ mod p04_direct_receipt_and_deferred_drainer_tests {
         let t0 = std::time::Instant::now();
         while sink.try_egress_drained_to_kernel() != Some(true) {
             assert!(
-                t0.elapsed() < std::time::Duration::from_secs(5),
+                t0.elapsed() < std::time::Duration::from_secs(60),
                 "drainer never emptied"
             );
             std::thread::yield_now();
@@ -4248,7 +4269,7 @@ mod bulk_meter_tests {
     fn sink_and_reader() -> (Arc<SinkWriter>, UnixStream) {
         let (reader, writer) = UnixStream::pair().expect("socketpair");
         reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .expect("timeout");
         let owned: OwnedFd = writer.into();
         (Arc::new(SinkWriter::new_owned(owned)), reader)
@@ -4318,7 +4339,7 @@ mod bulk_meter_tests {
         };
         let mut got = vec![0u8; 64 * 1024];
         reader.read_exact(&mut got).expect("read a prefix");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let progress = loop {
             let p = meter.progress();
             if p.sent >= got.len() as u64 || Instant::now() > deadline {
@@ -4520,7 +4541,7 @@ mod input_io_tests {
     fn wedged() -> (Arc<SinkWriter>, UnixStream, usize) {
         let (reader, writer) = UnixStream::pair().expect("socketpair");
         reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .expect("timeout");
         writer.set_nonblocking(true).expect("nonblocking master");
         let mut filled = 0usize;
@@ -4558,7 +4579,7 @@ mod input_io_tests {
             }
         }
         reader
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .expect("timeout");
         got
     }
@@ -4623,7 +4644,7 @@ mod input_io_tests {
         // The program reads the fill and a little of the paste, then stops.
         let mut head = vec![0u8; filled + 64 * 1024];
         reader.read_exact(&mut head).expect("the fill and a head");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while meter.progress().sent == 0 {
             assert!(Instant::now() < deadline, "the paste never began");
             std::thread::sleep(Duration::from_millis(1));
@@ -4636,7 +4657,7 @@ mod input_io_tests {
 
         meter.request_stop();
         let accepted = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the stop reached the parked writer")
             .expect("a stop is not an error");
         writer.join().expect("writer");
@@ -4656,15 +4677,31 @@ mod input_io_tests {
             });
         }
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).expect("K queued"),
+            rx.recv_timeout(Duration::from_secs(60)).expect("K queued"),
             Ok(1)
         );
         std::thread::sleep(Duration::from_millis(300));
 
-        // The program resumes: the paste's head, CLOSED, then the key.
+        // The program resumes: the paste's head, CLOSED, then the key. Read up
+        // to the key (the one `K` in the stream) under the reader's hang
+        // detector, not until a 300 ms silence: the close and the key come from
+        // the drainer, which a loaded box can leave unscheduled for longer
+        // than that. The silence is then only the check that nothing follows.
         let mut delivered = head.split_off(filled);
-        delivered.extend(read_until_quiet(&mut reader, Duration::from_millis(300)));
-        assert_eq!(delivered.last(), Some(&b'K'), "the key arrives last");
+        let mut chunk = [0u8; 65536];
+        while delivered.last() != Some(&b'K') {
+            let n = reader
+                .read(&mut chunk)
+                .expect("the key reaches the program");
+            assert!(n > 0, "peer closed early");
+            delivered.extend_from_slice(&chunk[..n]);
+        }
+        let after = read_until_quiet(&mut reader, Duration::from_millis(300));
+        assert!(
+            after.is_empty(),
+            "the key arrives last, yet {} bytes followed it",
+            after.len()
+        );
         delivered.pop();
         assert_eq!(delivered.len(), accepted, "exactly the accepted bytes");
         assert!(delivered.starts_with(PASTE_OPEN));
@@ -4701,7 +4738,7 @@ mod input_io_tests {
         );
         meter.request_stop();
         let accepted = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the stop ended the room wait")
             .expect("a stop is not an error");
         writer.join().expect("writer");
@@ -4740,7 +4777,7 @@ mod input_io_tests {
             });
         }
         let (is_refused, accepted_bytes, order) = rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the interactive egress did not park");
         assert!(is_refused);
         assert_eq!(accepted_bytes, 0, "no byte of a refused key is accepted");
@@ -4775,7 +4812,7 @@ mod input_io_tests {
             .read_exact(&mut got)
             .expect("everything accepted arrives");
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)).expect("unparked"),
+            rx.recv_timeout(Duration::from_secs(60)).expect("unparked"),
             Ok(1)
         );
         parked.join().expect("parked writer");
@@ -4788,7 +4825,7 @@ mod input_io_tests {
         assert_eq!(&got[at..], b"P");
         assert!(!got.contains(&b'K'), "the refused key was never delivered");
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !sink.egress_drained_to_kernel() {
             assert!(Instant::now() < deadline, "the spill drained");
             std::thread::sleep(Duration::from_millis(1));
@@ -4824,7 +4861,7 @@ mod input_io_tests {
             });
         }
         let (accepted, direct) = rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the large interactive frame did not park");
         assert_eq!(accepted, frame.len());
         assert!(!direct);
@@ -4875,7 +4912,7 @@ mod input_io_tests {
         let mut returned = Vec::new();
         for _ in 0..2 {
             let (name, _) = rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(Duration::from_secs(60))
                 .expect("the sever unblocked a waiter");
             returned.push(name);
         }
@@ -4883,7 +4920,7 @@ mod input_io_tests {
         assert_eq!(returned, ["paste", "room"]);
         paste.join().expect("paste");
         waiter.join().expect("waiter");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !sink.egress_drained_to_kernel() || sink.shared.spill.lock().unwrap().draining {
             assert!(Instant::now() < deadline, "the drainer exited");
             std::thread::sleep(Duration::from_millis(5));
@@ -4949,7 +4986,7 @@ mod input_io_tests {
             .expect("the spill drained through a drainer the waiter arranged");
         assert_eq!(got.last(), Some(&b'W'));
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5))
+            rx.recv_timeout(Duration::from_secs(60))
                 .expect("the waiter returned"),
             Ok(1)
         );

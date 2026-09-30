@@ -60,7 +60,8 @@
 //! predecessor EXITS (its lock dies with it), and only then does the successor bind and
 //! publish its own graph entry — so between the two, neither gate above answered, and a
 //! launch landing in exactly that window adopted the id. (A PER-PROCESS socket's
-//! successor publishes BEFORE the Commit instead; see the fourth section below.) Closed
+//! successor used to publish BEFORE the Commit; since round seven of the update
+//! audit it publishes at the Commit too — see the fourth section below.) Closed
 //! (2026-09-25) without touching the proof-carrying fd protocol: at
 //! Commit, before `_exit`, the predecessor writes `claims/<sid>.successor` naming the
 //! attested successor pid for each carried id ([`mark_successor`]), and
@@ -75,10 +76,14 @@
 //! ## The other order: a successor that publishes before the Commit
 //!
 //! A successor on a PER-PROCESS socket (`aterm-<pid>.sock`, every ordinary launch)
-//! does not wait for the Commit to bind: two per-process sockets cannot collide, so it
-//! binds and publishes `graph/<sid>` for every carried id as soon as it has booted —
-//! measured on every update since the in-GUI supervisor host shipped, 191–272 ms
-//! BEFORE the predecessor commits. For that window the entry names a live process
+//! does not wait for the Commit to bind: two per-process sockets cannot collide. Until
+//! round seven of the update audit (findings 13 and 14) it also PUBLISHED at once —
+//! `graph/<sid>` for every carried id and the `latest` alias, measured on every update
+//! since the in-GUI supervisor host shipped 191–272 ms BEFORE the predecessor
+//! committed — and served what reached it there, which a rollback then lost; it now
+//! waits for the Commit to publish (`control::spawn`'s `publish_gate`). What follows
+//! is the exemption that early publication needed, kept for any successor that still
+//! publishes early. For that window the entry names a live process
 //! that is not this one while THIS process still owns the sessions, decides the
 //! Commit, and rolls back if it rejects. The `@<sid>` dispatch probe
 //! ([`live_holder`]) read that as a second holder and refused the predecessor's own

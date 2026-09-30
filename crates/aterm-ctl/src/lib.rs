@@ -266,17 +266,23 @@ EXIT CODES:
     75   the aterm instance went away mid-exchange and nothing replaced it
          within 30 s, or within what an explicit --timeout had left (an
          update that did not come back, a crash, a quit): a `subscribe`
-         stream or a blocking read (`await`, `wait`, `ready`, `text`,
-         `inbox`) could not be resumed. An aterm SELF-UPDATE is followed
-         instead: `subscribe` keeps relaying from the successor (a stderr
-         line says so; its new `sub` lines start a new stream, each target
-         sending its current state, and a target named by local number
+         stream, a blocking read (`await`, `wait`, `ready`, `text`,
+         `inbox`), a `turn` or a `post` could not be resumed. An aterm SELF-UPDATE is
+         followed instead: `subscribe` keeps relaying from the successor (a
+         stderr line says so; its new `sub` lines start a new stream, each
+         target sending its current state, its block and turn events going
+         on after the last ones relayed, and a target named by local number
          `@<n>` is followed by the session id its `sub` line gave), and a
-         blocking read is asked once more — except `await seq <n>`, `await
-         inbox since=`, `inbox get <id>` and any request naming its session
-         `@<n>`, whose anchor names a position in the old process (a
-         successor numbers its sessions afresh): those exit 75 too. Never 0:
-         a pipeline must not read an update as \"session over\".
+         blocking read is asked once more — except `await seq`, `await
+         block`, `await consent` (each waits for a change after its arm,
+         which the update may have made), `await inbox since=`, `inbox get
+         <id>` and any request naming its session `@<n>`, whose anchor names
+         a position in the old process (a successor numbers its sessions
+         afresh): those exit 75 too, and so does a `turn`, which is never
+         asked again — its text may already have been typed — and a `post`,
+         which may already be queued and carried to the successor under its
+         id: re-post it only with the same `key=`, or after `outbox`. Never
+         0: a pipeline must not read an update as \"session over\".
 
 STDIN PAYLOADS (multi-line, whitespace-preserving; each <= 256 KiB):
     feed-bin      read the raw binary payload from STDIN and feed it to the PTY
@@ -5825,7 +5831,7 @@ fn exchange_on(
         Ok(_) => false,
         Err(e) => redial::is_hangup(e),
     };
-    if hung_up && redial::is_blocking_read(&request_parts) {
+    if hung_up && redial::reports_replacement(&request_parts) {
         return replaced_before_reply(
             path,
             server,
@@ -6047,7 +6053,14 @@ fn exchange_on(
             // `cast drift`'s header IS the verdict (`verdict=`, `culprit=`, …): it
             // leads its rows on stdout, as the `drift` module prints it.
             print_stdout_line(status_line)?;
-        } else if verb == "inbox" || verb == "offscreen" || verb == "resizes" {
+        } else if verb == "inbox"
+            || verb == "offscreen"
+            || verb == "resizes"
+            // `history`'s header carries ` unheld_below=<id>` when an update
+            // could not carry the ledger whole: the rows alone would read as
+            // every turn there is.
+            || (verb == "history" && tail.split_whitespace().nth(1).is_some())
+        {
             stderr_line(status_line)?;
         } else if count == 0 {
             let mut msg = String::from(status_line);
@@ -6115,9 +6128,8 @@ fn replaced_before_reply(
                 again(&path)
             } else {
                 stderr_line(&format!(
-                    "aterm was replaced (pid {old} -> {pid}, an update) before it answered; this \
-                     request's anchor (`seq <n>`, `since=`, an inbox id, a local `@<n>`) names a \
-                     position in the old process — re-issue it"
+                    "aterm was replaced (pid {old} -> {pid}, an update) before it answered; {}",
+                    redial::not_asked_again_note(request_parts)
                 ))?;
                 Ok(ExitCode::from(redial::EXIT_REPLACED))
             }
@@ -6143,7 +6155,7 @@ mod tests {
         if cfg!(not(unix)) {
             return;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let answer = CtlStream::connect(path).map(drop).map_err(|e| e.kind());
             if answer == Err(io::ErrorKind::ConnectionRefused) {
@@ -6151,7 +6163,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the abandoned socket {} still answers {answer:?} after 10 s",
+                "the abandoned socket {} still answers {answer:?} after 60 s",
                 path.display()
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -6483,16 +6495,18 @@ mod tests {
                 "dial myhost text\n",
                 "text",
                 "text",
-                Some(std::time::Duration::from_secs(5)),
+                Some(std::time::Duration::from_secs(30)),
                 false,
                 &redial::Redial::none(),
             );
             let _ = tx.send(res.is_ok());
         });
 
-        // The whole exchange must finish well within the deadline — proof of no hang.
+        // The exchange must finish, and inside its own deadline — proof of no
+        // hang: a client that waited for the mock to close would run the 30 s
+        // deadline out and report an error. The recv outlasts that deadline.
         let ok = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("dial exchange must not block indefinitely");
         assert!(
             ok,
@@ -6544,7 +6558,7 @@ mod tests {
             seen
         });
         let path = sock.to_str().expect("utf8 path").to_string();
-        let deadline = Some(std::time::Duration::from_secs(10));
+        let deadline = Some(std::time::Duration::from_secs(60));
         let ask = |name: &str| {
             help_with_fallback(
                 &path,
@@ -6613,14 +6627,17 @@ mod tests {
                 "dial far cast drift\n",
                 "cast",
                 "cast drift",
-                Some(std::time::Duration::from_secs(30)),
+                // Longer than the recv below: a client reading lines of the
+                // byte body waits on the open connection, and it is the recv
+                // that must report that, not this deadline.
+                Some(std::time::Duration::from_secs(120)),
                 false,
                 &redial::Redial::none(),
             );
             let _ = tx.send(res.map_err(|e| e.to_string()));
         });
         let res = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("the refusal must not wait for the connection to close");
         let err = res.expect_err("an older remote's bare cast is refused");
         assert!(err.contains("predates `cast drift`"), "{err}");
@@ -7083,7 +7100,7 @@ mod tests {
         )
         .unwrap();
         acked_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("wire ACK must complete before the caller can block on stdout");
         match output {
             GuardedArtifactOutput::Lines(lines) => {
@@ -9142,7 +9159,9 @@ mod tests {
         let (_, error) = read_token_at(socket_text).expect_err("FIFO token must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            // A parked open of a FIFO with no writer never returns at all; this
+            // bound catches only a finite stall, so it is loose.
+            started.elapsed() < std::time::Duration::from_secs(30),
             "the token FIFO parked discovery"
         );
 

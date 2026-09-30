@@ -241,64 +241,6 @@ pub fn resident_pet_owner_present(
     pet_mode && cursor_trail_enabled && matches!(style, GlowStyle::RainbowKitty)
 }
 
-/// The resident pet's presentation law, shared by glass and explicit capture.
-/// Unlike the earned flying kitty, the pet does not require animation or
-/// typing momentum: it sleeps and watches at the caret whenever its surface is
-/// presentable and the selected rainbow-kitty-pet style owns the trail.
-#[inline]
-#[must_use]
-pub fn resident_pet_presentation_enabled(
-    pet_mode: bool,
-    cursor_companion_presentable: bool,
-    cursor_trail_enabled: bool,
-    style: GlowStyle,
-) -> bool {
-    cursor_companion_presentable
-        && resident_pet_owner_present(pet_mode, cursor_trail_enabled, style)
-}
-
-/// NOTHING THE RESIDENT PET OWNS MAY OUTLIVE ITS SWITCH: drop it all the moment its
-/// trail owner goes away.
-///
-/// The exact twin of the flying kitty's `retire_kitty_cursor_without_owner`, which
-/// the earned flying kitty has always had and the resident pet never did. Without
-/// it the only lever a host had was to stop feeding the brain a caret, and that is
-/// a graceful EXIT rather than a switch — `PetBrain::tick`'s no-caret arm fades
-/// over `FADE_OUT` and keeps the MOTE lane drifting on its own clock.
-///
-/// WHAT LEAKED, stated precisely (the pixel story is NOT the story). Every pet emitter
-/// — single-pane, composed, and the three capture arms — already gates on
-/// [`resident_pet_presentation_enabled`], the same predicate this switch moves, so the
-/// very first frame after `cursor_trail = false` draws no pet and no mote: the glass is
-/// clean. What survived was the BRAIN, and through it the frame train.
-/// `PetBrain::needs_frames()` stays true for the whole `FADE_OUT` ramp and for every
-/// mote left in the lane, and the native scheduler consumes that directly — it takes
-/// `animate_cursor_cat && companion.needs_frames()` and does NOT take the trail
-/// master as a term. So the switch the user threw to make the terminal quieter left
-/// the window presenting at 60 fps, for a second or more, to animate a companion it
-/// had already stopped drawing. On the owner's minimal-fast Windows directive that
-/// is the whole point of the switch, undone.
-///
-/// The law's statement for the tests. Production runs it as the first step of
-/// [`CompanionOwner::prepare`] (`if !owned { pet.retire_unowned() }`), which every
-/// path that ticks the brain — live and capture, on every host — goes through, so
-/// startup-with-the-trail-off, a hot config reload, a style change and a
-/// serious-mode toggle all retire through that one line.
-/// [`crate::kitty_pet::PetBrain::retire_unowned`] no-ops on an already-retired
-/// brain, so "off" costs one predicate per frame.
-#[inline]
-#[cfg(test)]
-pub fn retire_pet_without_owner(
-    pet_mode: bool,
-    cursor_trail_enabled: bool,
-    style: GlowStyle,
-    pet: &mut PetBrain,
-) {
-    if !resident_pet_owner_present(pet_mode, cursor_trail_enabled, style) {
-        pet.retire_unowned();
-    }
-}
-
 /// Describe the one cursor companion actually drawn on this frame, for the
 /// ambient word-cats' pixel yield.
 ///
@@ -428,29 +370,6 @@ pub fn pet_hit_rect_win(
     })
 }
 
-/// Resolve the per-frame pet hit target from the exact presentation decision.
-/// A still-fading brain frame can retain non-zero alpha after its caret was
-/// hidden; presentation must win so history clears the old clickable body on
-/// the very first suppressed frame.
-///
-/// The four grid metrics `body_px` needs ride in as one [`EffectGeom`] rather
-/// than four scalars: they are one thing (this surface's grid), the emitter that
-/// must agree with this rect already speaks that type, and four positional `u16`s
-/// in a row are exactly the shape a `cols`/`rows` swap hides in.
-#[must_use]
-pub fn pet_hit_rect_for_frame(
-    pet_visible: bool,
-    sing: f32,
-    frame: &PetFrame,
-    geom: EffectGeom,
-    origin: (i32, i32),
-) -> Option<(i32, i32, i32, i32)> {
-    let body = (pet_companion_admitted(pet_visible, sing) && frame.alpha > 0)
-        .then(|| frame.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows))
-        .flatten();
-    pet_hit_rect_win(body, origin)
-}
-
 /// PERK-AND-WATCH (wave 2): the burst conjunction, in one pure function so
 /// the law is testable without a terminal. A frame is a BURST only when the
 /// pane visibly gained output (`scrolled` — new scrollback rows — or
@@ -518,13 +437,6 @@ pub fn sing_face_live(drive: f32) -> bool {
     drive >= 0.33
 }
 
-/// A presentable resident keeps tracking the caret throughout a song.
-/// Singing effects never change its caret or pixel ownership.
-#[must_use]
-pub fn pet_caret_admitted(pet_visible: bool, _drive: f32, _reduced_motion: bool) -> bool {
-    pet_visible
-}
-
 /// The flying companion is admitted outside pet mode. In pet mode the full
 /// resident owns the frame throughout the song and its tail.
 #[must_use]
@@ -578,12 +490,11 @@ pub fn resident_pet_reduced_motion(policy_reduced: bool, shed_active: bool, enve
 #[must_use]
 pub fn resident_pet_surface_presentable(
     focused: bool,
-    companions_allowed: bool,
     unobscured: bool,
     live_viewport: bool,
     reading_interest: bool,
 ) -> bool {
-    focused && companions_allowed && unobscured && (live_viewport || reading_interest)
+    focused && unobscured && (live_viewport || reading_interest)
 }
 
 /// The load-shed half of flying-head admission: a presentable head stays
@@ -858,13 +769,6 @@ impl Default for CompanionOwner {
 }
 
 impl CompanionOwner {
-    /// [`resident_pet_owner_present`] — the ownership law, one copy.
-    #[must_use]
-    #[cfg(test)]
-    pub fn owner_present(pet_mode: bool, trail_master: bool, style: GlowStyle) -> bool {
-        resident_pet_owner_present(pet_mode, trail_master, style)
-    }
-
     /// An owner its host dresses every frame through [`Self::set_look`] —
     /// the native verdict (favourite > program with tenure > launch kitty),
     /// which already carries the launch look — instead of through the seed
@@ -1005,23 +909,21 @@ impl CompanionOwner {
         // The full pet is a resident. Real focus/visibility gates decide
         // whether it is presentable; load pressure only reduces its motion.
         // Reading owns a certified content surface, never a fabricated caret.
-        let pet_surface_presentable = resident_pet_surface_presentable(
-            focused,
-            true,
-            host.visibility != Visibility::Hidden && !obscured,
-            facts.live_viewport,
-            self.pet.has_reading_interest(),
-        );
         let visible = owned
-            && resident_pet_presentation_enabled(
-                pet_mode,
-                pet_surface_presentable,
-                trail_master,
-                glow.style,
+            && resident_pet_surface_presentable(
+                focused,
+                host.visibility != Visibility::Hidden && !obscured,
+                facts.live_viewport,
+                self.pet.has_reading_interest(),
             );
         // THE SWITCH, BEFORE THE TICK. An unowned pet is retired outright here
         // (motes and all) rather than left to fade, because the tick is the
-        // last one the scheduler owes it — see `retire_pet_without_owner`.
+        // last one the scheduler owes it: a fading brain keeps `needs_frames()`
+        // true through `FADE_OUT` and every drifting mote, and the scheduler
+        // reads exactly that — so a switch thrown to quiet the terminal would
+        // keep it presenting at 60 fps for a companion it no longer draws.
+        // `PetBrain::retire_unowned` no-ops on a retired brain, so "off"
+        // costs one predicate per frame.
         if !owned {
             self.pet.retire_unowned();
         }
@@ -1126,13 +1028,11 @@ impl CompanionOwner {
         // (there is no caret it could be chasing on this surface): it fades
         // out, settles, and releases the lane on its own. A HIDDEN caret is
         // still chased: `caret_drawn` carries the hide.
-        let caret_live = pet_caret_admitted(visible, sing.drive, reduced_motion);
-        let admitted = pet_companion_admitted(visible, sing.drive);
         PetTick {
             sense: PetSense {
-                caret_drawn: facts.cursor_visible && caret_live,
+                caret_drawn: facts.cursor_visible && visible,
                 now,
-                caret: if caret_live { facts.caret } else { None },
+                caret: if visible { facts.caret } else { None },
                 wrapped,
                 rows: geom.rows,
                 cols: geom.cols,
@@ -1142,7 +1042,7 @@ impl CompanionOwner {
                 output_burst: burst,
                 // Pointer contact requires the last drawn body and current
                 // pixel custody, including while the resident is static.
-                pointer: if self.hit_rect.is_some() && admitted {
+                pointer: if self.hit_rect.is_some() && visible {
                     pointer
                 } else {
                     None
@@ -1181,17 +1081,16 @@ impl CompanionOwner {
     /// every frame the pet is not drawn).
     pub fn tick(&mut self, t: PetTick) -> CompanionFrame {
         let geom = self.geom;
-        let admitted = pet_companion_admitted(t.visible, t.sing.drive);
-        self.pet.set_console_presentable(admitted);
+        self.pet.set_console_presentable(t.visible);
         let pet_frame = match t.capture {
             CaptureMode::Present | CaptureMode::LiveCapture => self.pet.tick(t.sense),
             CaptureMode::StaticCapture => self.pet.tick_static_capture(t.sense),
         };
         self.last_static = t.sense.reduced_motion;
         // The resident owns every pet-mode frame, including song and tail.
-        let on_glass = admitted && pet_frame.alpha > 0;
+        let on_glass = t.visible && pet_frame.alpha > 0;
         // The flying head is admitted only outside pet mode.
-        let kitty_alpha = if flying_kitty_admitted(t.pet_mode, t.sing.drive) {
+        let kitty_alpha = if !t.pet_mode {
             shed_companion_alpha(t.sing.flying_alpha, t.shed_envelope)
         } else {
             0
@@ -1210,7 +1109,7 @@ impl CompanionOwner {
         // FRAME px, for the press seam's hit test — and CLEAR it on every
         // frame the pet is not drawn, so a stale rect can never eat a click
         // after a style switch or a fade-out. Post-tick by construction.
-        self.hit_rect = pet_hit_rect_for_frame(t.visible, t.sing.drive, &pet_frame, geom, t.origin);
+        self.hit_rect = pet_hit_rect_win(body_px, t.origin);
         self.last_alpha = if on_glass { pet_frame.alpha } else { 0 };
         self.last_visible = t.visible;
         let companion = cursor_companion_on_glass(duty, t.painted_caret, None, body_px);
@@ -1608,50 +1507,28 @@ mod law_tests {
     use aterm_core::terminal::UnderlineStyle;
     use aterm_time::Duration;
 
-    #[test]
-    fn resident_pet_does_not_depend_on_flying_kitty_animation() {
-        assert!(resident_pet_presentation_enabled(
-            true,
-            true,
-            true,
-            GlowStyle::RainbowKitty,
-        ));
-        for denied in [
-            resident_pet_presentation_enabled(false, true, true, GlowStyle::RainbowKitty),
-            resident_pet_presentation_enabled(true, false, true, GlowStyle::RainbowKitty),
-            resident_pet_presentation_enabled(true, true, false, GlowStyle::RainbowKitty),
-            resident_pet_presentation_enabled(true, true, true, GlowStyle::Lumen),
-        ] {
-            assert!(!denied, "every resident-pet owner gate is necessary");
-        }
-    }
-
     /// The ownership law, one copy: pet mode AND the trail master AND the pet
     /// style — and nothing that merely hides a pet (focus, history, the shed)
     /// is a term.
     #[test]
     fn the_owner_is_present_only_with_pet_mode_the_master_and_the_pet_style() {
-        assert!(CompanionOwner::owner_present(
+        assert!(resident_pet_owner_present(
             true,
             true,
             GlowStyle::RainbowKitty
         ));
-        assert!(!CompanionOwner::owner_present(
+        assert!(!resident_pet_owner_present(
             false,
             true,
             GlowStyle::RainbowKitty
         ));
-        assert!(!CompanionOwner::owner_present(
+        assert!(!resident_pet_owner_present(
             true,
             false,
             GlowStyle::RainbowKitty
         ));
-        assert!(!CompanionOwner::owner_present(true, true, GlowStyle::Lumen));
-        assert!(!CompanionOwner::owner_present(
-            true,
-            true,
-            GlowStyle::Sparkle
-        ));
+        assert!(!resident_pet_owner_present(true, true, GlowStyle::Lumen));
+        assert!(!resident_pet_owner_present(true, true, GlowStyle::Sparkle));
     }
 
     #[test]
@@ -1824,96 +1701,6 @@ mod law_tests {
             sibling.row, 2.0,
             "negative control: the sibling's blank map leaves the same pet on the caret row"
         );
-    }
-
-    /// A pet that is awake, visible and owes frames — the state a switch has to be
-    /// able to interrupt. Returns the brain and the clock it stopped at.
-    fn a_live_pet() -> (PetBrain, Instant) {
-        let sense = |now, caret| PetSense {
-            caret_drawn: true,
-            now,
-            caret,
-            rows: 24,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let mut pet = PetBrain::default();
-        let mut t = Instant::now();
-        // Walk the caret so the resident is genuinely mid-motion, not merely faded in.
-        for step in 0u16..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((4, 10 + step % 8))));
-        }
-        assert!(pet.is_active(), "fixture: a visible resident");
-        assert!(pet.needs_frames(), "fixture: it is claiming the lane");
-        (pet, t)
-    }
-
-    /// THE HOST HALF OF THE RESIDENT'S SWITCH — [`retire_pet_without_owner`],
-    /// verdict by verdict. Ownership is `pet_mode && trail && the pet style`;
-    /// anything less retires, and the owned case must not be disturbed.
-    #[test]
-    fn every_missing_owner_retires_the_pet_and_a_present_one_never_does() {
-        // OWNED — the negative control. Nothing is taken away.
-        let (mut owned, _) = a_live_pet();
-        retire_pet_without_owner(true, true, GlowStyle::RainbowKitty, &mut owned);
-        assert!(
-            owned.is_active() && owned.needs_frames(),
-            "an owned resident must survive the level call it takes every frame"
-        );
-
-        // …and each way of losing the owner, one at a time.
-        for (what, pet_mode, trail, style) in [
-            (
-                "the trail master went off",
-                true,
-                false,
-                GlowStyle::RainbowKitty,
-            ),
-            (
-                "the style stopped being the pet",
-                true,
-                true,
-                GlowStyle::Lumen,
-            ),
-            (
-                "pet mode resolved off",
-                false,
-                true,
-                GlowStyle::RainbowKitty,
-            ),
-        ] {
-            let (mut pet, _) = a_live_pet();
-            retire_pet_without_owner(pet_mode, trail, style, &mut pet);
-            assert!(!pet.is_active(), "{what}: the pet must paint nothing");
-            assert!(
-                !pet.needs_frames(),
-                "{what}: …and must release the host's frame lane at once — \
-                 the scheduler reads exactly this"
-            );
-        }
-    }
-
-    /// LEVEL, NOT EDGE: hosts call this on every frame the pet has no owner, so the
-    /// steady "off" state must be a no-op that keeps owing nothing. (A switch that
-    /// only fired on an edge would miss a surface that STARTED with the trail off.)
-    #[test]
-    fn retiring_an_already_retired_pet_is_a_no_op() {
-        let (mut pet, _) = a_live_pet();
-        for _ in 0..4 {
-            retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut pet);
-            assert!(!pet.is_active() && !pet.needs_frames());
-        }
-        // A fresh brain — the startup-with-the-trail-already-off case — is
-        // untouched and still owes nothing.
-        let mut fresh = PetBrain::default();
-        retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut fresh);
-        assert!(!fresh.is_active() && !fresh.needs_frames());
     }
 
     fn cell(ch: char, fg: [u8; 3], bg: [u8; 3]) -> RenderCell {
@@ -2188,7 +1975,6 @@ mod law_tests {
         }
         let mut pet_frame = pet.tick(sense(now, Some((4, 12))));
         assert_eq!(pet_frame.alpha, 255);
-        assert!(pet_caret_admitted(true, 1.0, true));
 
         let mut singer = CursorCat::default();
         let singer_run = now;
@@ -2244,7 +2030,7 @@ mod law_tests {
             &handoff_model.init_state(),
             "StartReducedSong",
             held.alpha > 0 && flying_kitty_admitted(true, held.sing),
-            pet_frame.alpha == 255 && pet_caret_admitted(true, 1.0, true),
+            pet_frame.alpha == 255,
             pet_companion_admitted(true, held.sing) && pet_frame.alpha > 0,
         );
 
@@ -2288,7 +2074,7 @@ mod law_tests {
                 &started,
                 action,
                 kitty_alpha > 0,
-                pet_frame.alpha == 255 && pet_caret_admitted(true, drive, true),
+                pet_frame.alpha == 255,
                 pet_alpha > 0,
             );
             let mut forged_blackout = observed;
@@ -2332,7 +2118,7 @@ mod law_tests {
                 &cadenced,
                 action,
                 kitty_alpha > 0,
-                pet_frame.alpha == 255 && pet_caret_admitted(true, drive, true),
+                pet_frame.alpha == 255,
                 pet_alpha > 0,
             );
         }
@@ -2349,48 +2135,10 @@ mod law_tests {
         for _ in 0..20 {
             now += Duration::from_millis(16);
             let frame = cold_pet.tick(sense(now, Some((4, 12))));
-            assert!(pet_caret_admitted(true, 1.0, true));
-            assert!(pet_companion_admitted(true, 1.0));
             assert_eq!(frame.alpha, 255, "the reduced still stays opaque");
             pet_frame = frame;
         }
         assert_eq!(pet_frame.alpha, 255, "the resident remains on glass");
-
-        // Full motion preserves the same caret ownership at every threshold.
-        assert!(pet_caret_admitted(true, 0.4, false));
-        assert!(pet_caret_admitted(true, 0.329, false));
-        assert!(pet_caret_admitted(true, f32::NAN, true));
-    }
-
-    /// Songs retain the full resident in both motion postures, through held
-    /// song and tail. Real visibility gates still suppress a hidden pet, and
-    /// outside pet mode the earned flying episode remains admitted.
-    #[test]
-    fn armed_song_and_drain_keep_the_full_resident_in_pet_mode() {
-        for reduced_motion in [false, true] {
-            for drive in [0.0, 0.1, 0.3299, 0.33, 0.5, 1.0, f32::NAN] {
-                assert!(pet_caret_admitted(true, drive, reduced_motion));
-                assert!(pet_companion_admitted(true, drive));
-                assert!(!flying_kitty_admitted(true, drive));
-                assert!(!pet_caret_admitted(false, drive, reduced_motion));
-                assert!(!pet_companion_admitted(false, drive));
-                assert!(flying_kitty_admitted(false, drive));
-            }
-        }
-    }
-
-    /// Single-pane rendering used to admit both companions during wind-down.
-    #[test]
-    fn pet_and_flying_face_are_never_admitted_together() {
-        for sing in [0.0, 0.1, 0.3299, 0.33, 1.0, f32::NAN] {
-            let flying = flying_kitty_admitted(true, sing);
-            let pet = pet_companion_admitted(true, sing);
-            assert_ne!(
-                pet, flying,
-                "pet mode must choose exactly one companion at sing={sing:?}"
-            );
-        }
-        assert!(!pet_companion_admitted(false, 0.0));
     }
 
     #[test]
@@ -2404,11 +2152,13 @@ mod law_tests {
     }
 
     /// The pet half of the cursor-viewport lifecycle: the resident remains
-    /// lifecycle-live in history (it receives hidden-caret ticks), but its
-    /// hit target disappears on the very first suppressed frame and its
+    /// lifecycle-live in history (it receives hidden-caret ticks) and its
     /// scheduler eventually settles instead of sticking at animation cadence.
+    /// Its hit target disappears on the very first suppressed frame because
+    /// [`CompanionOwner::tick`] derives it from custody, not alpha
+    /// (`an_obscured_surface_keeps_the_pet_owned_but_off_glass`).
     #[test]
-    fn history_clears_the_pet_hit_target_while_the_brain_settles() {
+    fn history_lets_the_fading_pet_brain_settle() {
         let t0 = Instant::now();
         let sense = |now, caret| PetSense {
             caret_drawn: true,
@@ -2427,19 +2177,17 @@ mod law_tests {
         let _ = pet.tick(sense(t0, Some((4, 12))));
         let live_pet = pet.tick(sense(t0 + Duration::from_millis(500), Some((4, 12))));
         assert!(live_pet.alpha > 0, "negative control owns a resident pet");
+        let g = hit_geom();
         assert!(
-            pet_hit_rect_for_frame(true, 0.0, &live_pet, hit_geom(), (0, 0)).is_some(),
+            live_pet
+                .body_px(g.cell_w, g.cell_h, g.cols, g.rows)
+                .is_some(),
             "the live pet owns a clickable body"
         );
         let hidden_pet = pet.tick(sense(t0 + Duration::from_millis(600), None));
         assert!(
             hidden_pet.alpha > 0,
             "the brain is still fading on the first history frame"
-        );
-        assert_eq!(
-            pet_hit_rect_for_frame(false, 0.0, &hidden_pet, hit_geom(), (0, 0)),
-            None,
-            "history clears the hit target before the brain's fade completes"
         );
         for step in 1..=300 {
             let _ = pet.tick(sense(t0 + Duration::from_millis(600 + step * 100), None));

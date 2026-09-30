@@ -67,7 +67,8 @@
 //!
 //! * The retired `hook` and `statusline` **always exit 0** and print nothing:
 //!   a bridge script an older `install` wrote still runs them, and Claude Code
-//!   reads a failing hook command as a block (CHANGELOG.md:3495-3502).
+//!   reads a failing hook command as a block (CHANGELOG.md, 0.92.0, "The Claude
+//!   Code hooks.").
 //! * Every other subcommand exits 0 on success, 1 on a refusal it can
 //!   explain (`limits` with no session answering, an `upgrade` the master
 //!   switch stands down), 2 on a usage error (the retired

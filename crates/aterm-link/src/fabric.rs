@@ -1889,6 +1889,9 @@ pub struct Report {
     pub source: Source,
     /// The command itself.
     pub command: String,
+    /// Whether its program lies in a cargo target directory
+    /// ([`in_cargo_target_dir`]).
+    pub program_in_target_dir: bool,
     /// The config file looked in, if any.
     pub config_path: Option<PathBuf>,
     /// The parsed bridge config.
@@ -2036,9 +2039,14 @@ pub fn gather() -> Result<Report, Off> {
         .flatten()
         .filter(|r| r.broker == cfg.broker)
         .and_then(|r| r.serves_tcp);
+    let program_in_target_dir = command
+        .split_whitespace()
+        .next()
+        .is_some_and(|p| in_cargo_target_dir(Path::new(p)));
     let mut report = Report {
         source,
         command,
+        program_in_target_dir,
         config_path,
         cfg,
         presence,
@@ -2104,6 +2112,20 @@ pub fn gather() -> Result<Report, Off> {
     report.warnings = warnings(&report, &ages, &halts);
     report.warnings.extend(bus_errors);
     Ok(report)
+}
+
+/// Whether `program` lies in a cargo target directory, whose root cargo marks
+/// with `CACHEDIR.TAG`: a development build, which the next build there
+/// replaces and a `targo clean` removes. On 2026-09-29 the owner's Mac ran its
+/// bridge and its launchd broker from a checkout's `target/debug/aterm`, which
+/// an `aterm fabric on` made from that build on 2026-09-10 had recorded, and
+/// nothing in this report said so.
+fn in_cargo_target_dir(program: &Path) -> bool {
+    program.is_absolute()
+        && program
+            .ancestors()
+            .skip(1)
+            .any(|d| d.join("CACHEDIR.TAG").is_file())
 }
 
 /// Every standing fleet halt: `(human, reason)` for each `Last{/f/<F>/fleet/*/halt}`
@@ -3148,6 +3170,22 @@ pub fn render_text(r: &Report) -> String {
 
     out.push_str("CONFIG\n");
     let mut kvs: Vec<(&str, String)> = vec![("source", r.source.describe())];
+    if let Some(program) = r.command.split_whitespace().next() {
+        let program = safe(program, 256);
+        kvs.push((
+            "program",
+            if r.program_in_target_dir {
+                format!(
+                    "{program} — a DEVELOPMENT build in a cargo target dir: the bridge, and a \
+                     broker enabled from it, run whatever is built there next and nothing after \
+                     a `targo clean`; `aterm fabric on` run from the installed aterm records \
+                     that one instead"
+                )
+            } else {
+                program
+            },
+        ));
+    }
     kvs.push(("fleet", safe(&r.cfg.fleet, 64)));
     kvs.push((
         "node",
@@ -4577,6 +4615,37 @@ mod tests {
     }
 
     /// The `ATERM_FABRIC_COMMAND` seam WINS over the file, as it does for the app
+    /// THE PROGRAM ROW names the bridge's binary, and says DEVELOPMENT BUILD only
+    /// for one under a directory cargo tagged (`CACHEDIR.TAG`) — never for an
+    /// untagged tree, a bare name, or a relative path.
+    #[test]
+    fn the_program_row_names_a_development_build_by_cargos_tag() {
+        let dir = std::env::temp_dir().join(format!("atfab-prog-{}", std::process::id()));
+        let debug = dir.join("target").join("debug");
+        std::fs::create_dir_all(&debug).expect("scratch");
+        let aterm = debug.join("aterm");
+        assert!(!in_cargo_target_dir(&aterm), "untagged");
+        std::fs::write(dir.join("target").join("CACHEDIR.TAG"), "Signature: x\n").expect("tag");
+        assert!(in_cargo_target_dir(&aterm), "tagged");
+        assert!(!in_cargo_target_dir(Path::new("aterm")), "a bare name");
+        assert!(
+            !in_cargo_target_dir(Path::new("target/debug/aterm")),
+            "relative"
+        );
+
+        let mut r = healthy();
+        let plain = render_text(&r);
+        assert!(plain.contains("  program    aterm\n"), "{plain}");
+        r.program_in_target_dir = true;
+        let dev = render_text(&r);
+        assert!(
+            dev.contains("  program    aterm — a DEVELOPMENT build"),
+            "{dev}"
+        );
+        assert_eq!(exit_of(&r), 0, "informational, never a warning");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (a development build's; a shipped one never passes it); a blank one is
     /// absent; a missing file is "off", not an error.
     #[test]
@@ -4880,6 +4949,7 @@ mod tests {
         Report {
             source: Source::File(PathBuf::from("/c/aterm.toml")),
             command: CMD.to_string(),
+            program_in_target_dir: false,
             config_path: Some(PathBuf::from("/c/aterm.toml")),
             cfg: bridge_config(CMD).expect("a bridge command"),
             presence: crate::presence::Mode::Meta,

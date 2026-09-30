@@ -833,7 +833,7 @@ pub(crate) const RESIZE_TIERED_SYNC_WORST_CAP_MS: f64 = 100.0;
 /// cap on the post-`wasm-opt -O3` `aterm_wasm_bg.wasm` that
 /// `tools/wasm-bench/bench.mjs` reports as `wasm_cpu_module_bytes`.
 ///
-/// Decided 2026-09-25 (docs/DESIGN-host-boundary-2026-08-30.md §9 decision 5,
+/// Decided 2026-09-25 (docs/DESIGN-host-boundary-2026-08-30.md §7 decision 5,
 /// §8.4): the pre-pet baseline module is 3,792,917 B and the ceiling is +25% of
 /// it. Unlike the ratio floors this needs no committed baseline and no same-box
 /// history: it holds on a fresh checkout. When it trips, `xtask perf` fails and

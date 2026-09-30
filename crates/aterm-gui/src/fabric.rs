@@ -88,7 +88,6 @@
 //! compares the serial again, so one answered in that stretch would be lost.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-#[cfg(any(unix, test))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
@@ -646,6 +645,17 @@ struct Inbox {
     /// Cleared when the attempt stands down; never cleared on a Commit that
     /// lands, because the process that set it is gone.
     hold_fenced: bool,
+    /// Whether the fence ([`Self::hold_fenced`]) holds back the bridge's
+    /// RETIREMENTS too — `outbox sent` and `deliver … receipt=` — which it
+    /// does only when the successor is known to read the carry
+    /// ([`SessionFabric::fence_hold`]'s `successor_reads_carry`). An older
+    /// successor ignores [`FabricCarry`] and restarts the post and receipt ids
+    /// at zero under the same sid, so a retirement left unanswered keeps the
+    /// bridge's durable sequence pin for an id that successor hands out again,
+    /// and its post (or receipt) with that id is deduplicated into the old
+    /// record (round seven, finding 28). For that pairing the retirement is
+    /// answered, as every earlier build answered it.
+    retirements_fenced: bool,
     /// The `inbox get @<off>` reads parked for the bridge (`Pending`, listed on
     /// the `outbox` peek as `fetch sid= off=`) and the ones it answered
     /// (`Done`/`Failed`, kept so a second read of an immutable record costs no
@@ -659,6 +669,17 @@ struct Inbox {
     receipts: VecDeque<OwedReceipt>,
     /// The last [`OwedReceipt::rid`] handed out. Monotone per session.
     next_receipt_id: u64,
+    /// How many times what a handoff CARRIES of the outbound half has moved —
+    /// a post queued or retired, a receipt owed or retired ([`FabricCarry`]).
+    /// Read with the hold serial by the Commit
+    /// ([`SessionFabric::carry_serial`]).
+    outbox_moves: u64,
+    /// The inbox row id the last handoff manifest told its successor to count
+    /// on from ([`SessionFabric::handoff_carry`]: [`Self::last_msg_id`] plus
+    /// [`INBOX_ID_RESERVE`]): rows this process numbers up to it can never
+    /// share an id with one the successor numbers. `None` until a park draws
+    /// a manifest. See [`SessionFabric::past_handoff_ceiling`].
+    msg_id_ceiling: Option<u64>,
 }
 
 /// One receipt a session owes a sender (R8), HELD HERE — in the one process
@@ -693,6 +714,7 @@ struct OwedReceipt {
 
 /// Queue one receipt, handing out its `rid` and keeping the bound.
 fn owe_receipt(inbox: &mut Inbox, off: u64, verdict: &str, kind: &str, from: &str) {
+    inbox.outbox_moves += 1;
     inbox.next_receipt_id += 1;
     let rid = inbox.next_receipt_id;
     inbox.receipts.push_back(OwedReceipt {
@@ -704,6 +726,277 @@ fn owe_receipt(inbox: &mut Inbox, off: u64, verdict: &str, kind: &str, from: &st
     });
     while inbox.receipts.len() > RECEIPTS_OWED_MAX {
         inbox.receipts.pop_front();
+    }
+}
+
+/// THE MAILBOX A SEAMLESS UPDATE CARRIES beside the topics and the hold (round
+/// seven of the update audit, findings 6, 8 and 28): the three per-session id
+/// counters, every post still waiting for a bridge, and every receipt still
+/// owed — on the session's handoff record (`SessionRecord::fabric`), put back
+/// by [`SessionFabric::seed_carry`] before the adopted session is registered.
+///
+/// WHY EACH PART:
+///
+/// * THE POSTS AND THE RECEIPTS were held only here, "in the one process that
+///   outlives both a broker outage and a bridge relaunch" ([`OwedReceipt`]) —
+///   and a seamless update was the one exit it did not outlive: a post answered
+///   `OK <id>` or `queued=1` while the broker was down, and a verdict's receipt,
+///   were gone with the old process's `_exit`, and nobody was told. The sender
+///   had been told never to post again.
+/// * THE COUNTERS: the sid survives the update, so an id minted from zero again
+///   named something else. A pre-update `await inbox since=<id>` waited for a
+///   count the successor had not reached, `inbox seen <id>` could decide (and
+///   receipt) another row, and — worse — the bridge's durable `(sid, post-id)`
+///   and `(sid, rid)` sequence pins, which outlive both processes, published a
+///   NEW post at an OLD post's sequence, which the broker deduplicated into the
+///   old record and answered as landed.
+///
+/// WHAT KEEPS IT EXACT: every change to the posts or the receipts moves
+/// [`Inbox::outbox_moves`], which the Commit compares with the park's reading
+/// ([`SessionFabric::carry_serial`]) exactly as it compares the holds — so a
+/// post queued, published or retired after the manifest was drawn refuses the
+/// Commit (a lossless retry) rather than being carried stale (a retired post
+/// carried as queued would go on the bus twice) — and from the Commit's
+/// reading to the `_exit` each such change waits on the same fence a hold
+/// waits on ([`SessionFabric::wait_unfenced`]). A retirement that waits there
+/// is never answered, so the bridge keeps the sequence it pinned and the
+/// successor's bridge publishes the carried copy at that sequence: the
+/// broker's dedup answers the record it already holds.
+///
+/// BOUNDED: the rows ride the manifest, whose cap every successor enforces
+/// whole, so a handoff carries at most [`CARRY_MAIL_BYTES`] of them — posts
+/// AND receipts, each charged what TOML WRITES for it ([`toml_cost`]: an ESC
+/// in a coloured body costs six bytes, not one) — across every session; a
+/// post past that is named in `uncarried` and the successor retires it DEAD,
+/// `reason=not-carried`, on its timeline — said, never silent — and a receipt
+/// past it is counted in `receipts_uncarried`, which the successor logs. A row
+/// that cannot be written as TOML (a number past `i64::MAX`) goes the same
+/// way. And when the manifest is still over its cap once the held panes are
+/// gone, the writer sheds the carry the same way ([`Self::shed`]) before it
+/// would refuse the update: the mailbox never costs a desk its update.
+///
+/// `not-carried` is exact about what the SUCCESSOR holds, not about the bus:
+/// a post shed here that the old process's bridge published in the last
+/// instant before the `_exit` (its retirement then waits on the fence and is
+/// never answered) is on the bus all the same. A sender that must never send
+/// a message twice posts with `key=`, which the broker deduplicates. Additive and lenient on the way in: an older reader
+/// skips the key, and a row that does not validate is dropped (and, for a
+/// post, retired dead) — never the manifest.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FabricCarry {
+    /// The last inbox row id this session handed out ([`Inbox::last_msg_id`]).
+    #[serde(default)]
+    pub last_msg_id: u64,
+    /// The last post id ([`Inbox::next_post_id`]).
+    #[serde(default)]
+    pub last_post_id: u64,
+    /// The last receipt id ([`Inbox::next_receipt_id`]).
+    #[serde(default)]
+    pub last_receipt_id: u64,
+    /// The posts still waiting for a bridge, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub posts: Vec<PostCarry>,
+    /// The receipts still owed, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<ReceiptCarry>,
+    /// Waiting posts this handoff could not carry, by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncarried: Vec<u64>,
+    /// How many owed receipts this handoff could not carry (their asks'
+    /// senders wait out their own deadlines, as for any receipt that never
+    /// comes); the successor logs the count.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub receipts_uncarried: u64,
+}
+
+/// `skip_serializing_if` for a zero count.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// One waiting post on the handoff record — [`PostRow`]'s queued fields.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PostCarry {
+    pub id: u64,
+    pub to: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dl: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub body: String,
+}
+
+/// One owed receipt on the handoff record — an [`OwedReceipt`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReceiptCarry {
+    pub rid: u64,
+    pub off: u64,
+    pub verdict: String,
+    pub kind: String,
+    pub from: String,
+}
+
+/// The most mailbox bytes — carried posts and owed receipts, each at what the
+/// manifest's TOML spends on it ([`PostCarry::cost`], [`ReceiptCarry::cost`])
+/// — one handoff manifest carries across every session ([`FabricCarry`]). The
+/// manifest's whole cap is 4 MiB and the screens' metas may take three of it;
+/// this keeps the mailbox to a small part of the rest. A post past it is
+/// retired dead in the successor, `reason=not-carried`; a receipt past it is
+/// counted in [`FabricCarry::receipts_uncarried`].
+pub(crate) const CARRY_MAIL_BYTES: usize = 256 * 1024;
+
+/// What one carried row costs the manifest beyond its escaped strings: its
+/// table header, its keys, its integers and their punctuation — an upper
+/// bound for [`PostCarry`] (eight keys) and [`ReceiptCarry`] (five).
+const CARRY_ROW_OVERHEAD: usize = 256;
+
+/// What `s` costs the manifest as TOML writes it: one byte per byte, plus one
+/// per `"` or `\`, plus five per control byte (`\uXXXX`) — an upper bound
+/// whichever string form the writer picks, the same rule the screens' metas
+/// are charged by (`seamless::meta_json_manifest_cost`).
+pub(crate) fn toml_cost(s: &str) -> usize {
+    s.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' => 2,
+            0..=0x1f | 0x7f => 6,
+            _ => 1,
+        })
+        .fold(0, usize::saturating_add)
+}
+
+/// The reason a post the handoff could not carry is retired with in the
+/// successor ([`FabricCarry::uncarried`]).
+pub(crate) const NOT_CARRIED: &str = "not-carried";
+
+/// The largest number a TOML integer holds (an `i64`): a carried value past it
+/// would fail the whole manifest's serialization, so its row is not carried.
+const CARRY_INT_MAX: u64 = i64::MAX as u64;
+
+/// How many inbox row ids a seamless update leaves this process between the
+/// park's draw and its `_exit` ([`SessionFabric::handoff_carry`]). The bridge
+/// keeps delivering in that overlap — a peer's post, a topic broadcast, a
+/// refill — and each row takes an id; the successor counts on from above the
+/// reserve, so no id is ever handed to two rows (round seven's review of group
+/// J, item 2). Rows delivered in the overlap reach the successor again (its
+/// bridge refills from the session's `seen` offset) under ids of its own, and
+/// an `inbox seen <old id>` there names no row rather than a wrong one.
+///
+/// Inbound mail is NOT activity that vetoes an update: only a process that
+/// numbers more than this many rows in one overlap stands its Commit down (a
+/// lossless retry), and one that would do so under the Commit's fence waits
+/// for the attempt to land or stand down ([`deliver_row`]) — never answered an
+/// `ERR` its bridge would book as a verdict.
+pub(crate) const INBOX_ID_RESERVE: u64 = 1 << 12;
+
+/// How often a delivery waiting past [`INBOX_ID_RESERVE`] under a committing
+/// update logs that it is still waiting ([`SessionFabric::wait_msg_id_room`]).
+/// Short under test, so a test drives several rounds of the wait's timeout
+/// arm and sees that none of them answers.
+#[cfg(not(test))]
+const MSG_ROOM_NOTICE_EVERY: std::time::Duration = HOLD_FENCE_WAIT;
+#[cfg(test)]
+const MSG_ROOM_NOTICE_EVERY: std::time::Duration = std::time::Duration::from_millis(40);
+
+impl FabricCarry {
+    /// Nothing to write: every counter at zero and no row.
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// What this carry's rows cost the manifest ([`CARRY_MAIL_BYTES`]'s
+    /// measure): the largest carry is the one [`Self::shed`] gives up first.
+    pub(crate) fn rows_cost(&self) -> usize {
+        self.posts
+            .iter()
+            .map(PostCarry::cost)
+            .chain(self.receipts.iter().map(ReceiptCarry::cost))
+            .fold(0, usize::saturating_add)
+    }
+
+    /// GIVE UP THE ROWS, KEEP THE COUNTERS — what the manifest writer does
+    /// when the manifest is over its cap with nothing else optional left
+    /// (round seven's review, item 1): every carried post is named in
+    /// `uncarried` instead (the successor retires it dead, `not-carried`),
+    /// every receipt is counted in `receipts_uncarried`. The id counters stay:
+    /// they are a few bytes, and they are what keeps the successor's ids above
+    /// the old process's. `false` when there was nothing to shed.
+    pub(crate) fn shed(&mut self) -> bool {
+        if self.posts.is_empty() && self.receipts.is_empty() {
+            return false;
+        }
+        self.uncarried.extend(self.posts.drain(..).map(|p| p.id));
+        self.uncarried.sort_unstable();
+        self.uncarried.dedup();
+        let dropped = u64::try_from(self.receipts.len()).unwrap_or(u64::MAX);
+        self.receipts.clear();
+        self.receipts_uncarried = self
+            .receipts_uncarried
+            .saturating_add(dropped)
+            .min(CARRY_INT_MAX);
+        true
+    }
+}
+
+impl PostCarry {
+    /// The bytes this post costs the carry's budget: what the manifest's TOML
+    /// spends on it ([`toml_cost`]), never its raw length — a body of ANSI
+    /// colour codes costs up to six times its length once escaped.
+    fn cost(&self) -> usize {
+        [
+            Some(self.body.as_str()),
+            Some(self.to.as_str()),
+            Some(self.kind.as_str()),
+            self.via.as_deref(),
+            self.key.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(toml_cost)
+        .fold(CARRY_ROW_OVERHEAD, usize::saturating_add)
+    }
+
+    /// Whether the successor accepts this row: the grammar `post` held it to,
+    /// re-checked, because the manifest is another build's word.
+    fn valid(&self, last_post_id: u64) -> bool {
+        (1..=last_post_id).contains(&self.id)
+            && !self.to.is_empty()
+            && !self
+                .to
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+            && POSTABLE.contains(&self.kind.as_str())
+            && self.via.as_deref().is_none_or(valid_via)
+            && self.key.as_deref().is_none_or(valid_key)
+            && self.body.len() <= BODY_MAX.saturating_mul(3)
+    }
+}
+
+impl ReceiptCarry {
+    /// The bytes this receipt costs the carry's budget (see
+    /// [`PostCarry::cost`]).
+    fn cost(&self) -> usize {
+        [&self.verdict, &self.kind, &self.from]
+            .into_iter()
+            .map(|s| toml_cost(s))
+            .fold(CARRY_ROW_OVERHEAD, usize::saturating_add)
+    }
+
+    /// Whether the successor accepts this row (see [`PostCarry::valid`]).
+    fn valid(&self, last_receipt_id: u64) -> bool {
+        (1..=last_receipt_id).contains(&self.rid)
+            && VERDICTS.contains(&self.verdict.as_str())
+            && matches!(self.kind.as_str(), "ask" | "task")
+            && !self.from.is_empty()
+            && !self
+                .from
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
     }
 }
 
@@ -1036,7 +1329,7 @@ impl SessionFabric {
     }
 
     /// How many times this session's hold has moved (see the field).
-    #[cfg(any(unix, test))]
+    #[cfg(test)]
     pub(crate) fn hold_serial(&self) -> u64 {
         self.hold_serial.load(Ordering::Acquire)
     }
@@ -1053,19 +1346,316 @@ impl SessionFabric {
     /// activation, the harness suspend and the identity markers before its
     /// `_exit`, and a `hold on` answered `OK hold=1` inside that stretch
     /// reached neither the manifest nor the successor (the round-four review).
-    #[cfg(unix)]
-    pub(crate) fn fence_hold(&self) -> u64 {
+    ///
+    /// `successor_reads_carry` says whether the fence holds back the bridge's
+    /// retirements as well ([`Inbox::retirements_fenced`]): only when the
+    /// successor carries the outbox on, which an older one does not.
+    #[cfg(any(unix, test))]
+    pub(crate) fn fence_hold(&self, successor_reads_carry: bool) -> u64 {
         let mut inbox = self.lock();
         inbox.hold_fenced = true;
-        self.hold_serial.load(Ordering::Acquire)
+        inbox.retirements_fenced = successor_reads_carry;
+        Self::serial_of(&self.hold_serial, &inbox)
+    }
+
+    /// Everything a handoff carries of this session's fabric that can move
+    /// after the park drew the manifest: the hold serial and the outbox's
+    /// moves ([`FabricCarry`]) — a post queued after the draw refuses the
+    /// Commit (a lossless retry). Inbound rows are not in it: their ids are
+    /// kept apart by [`INBOX_ID_RESERVE`] ([`Self::past_handoff_ceiling`]).
+    /// What `App::hold_serials` sums at
+    /// the park and the Commit compares again under [`Self::fence_hold`],
+    /// which returns the same sum.
+    #[cfg(any(unix, test))]
+    pub(crate) fn carry_serial(&self) -> u64 {
+        let inbox = self.lock();
+        Self::serial_of(&self.hold_serial, &inbox)
+    }
+
+    /// The one sum [`Self::carry_serial`] and [`Self::fence_hold`] return.
+    ///
+    /// The inbox row id is NOT in it (round seven's review of group J, item
+    /// 2): mail from outside this desk arriving in the overlap would revoke
+    /// every attempt. Ids are kept apart by [`INBOX_ID_RESERVE`] instead, and
+    /// only a process that outruns it stands down
+    /// ([`Self::past_handoff_ceiling`]).
+    #[cfg(any(unix, test))]
+    fn serial_of(hold_serial: &AtomicU64, inbox: &Inbox) -> u64 {
+        hold_serial
+            .load(Ordering::Acquire)
+            .wrapping_add(inbox.outbox_moves)
+    }
+
+    /// Whether this session has numbered an inbox row past the id the last
+    /// handoff manifest carried ([`Inbox::msg_id_ceiling`]): the successor
+    /// would number a row with the same id, so the Commit stands down. Read
+    /// by the Commit after [`Self::fence_hold`], under which no delivery
+    /// crosses the ceiling ([`deliver_row`] waits instead).
+    #[cfg(any(unix, test))]
+    pub(crate) fn past_handoff_ceiling(&self) -> bool {
+        let inbox = self.lock();
+        inbox
+            .msg_id_ceiling
+            .is_some_and(|ceiling| inbox.last_msg_id > ceiling)
+    }
+
+    /// Wait, for as long as the Commit's fence stands, while the next inbox
+    /// row would be numbered past the manifest's carried id
+    /// ([`Inbox::msg_id_ceiling`]). NO DEADLINE OF ITS OWN, on purpose: the
+    /// only caller is the bridge's `deliver`, and any answer but `OK` is a
+    /// verdict it books (`Delivery::Accounted` in aterm-link — the record
+    /// refused to its sender, a broadcast dropped, the group cursor committed
+    /// past it), so a timeout would lose the message. The fence's own end is
+    /// the deadline — the update lands (`_exit`, and the successor's bridge
+    /// delivers the record again) or stands down (the fence lifts) — and every
+    /// [`MSG_ROOM_NOTICE_EVERY`] spent waiting is logged. Below the ceiling nothing
+    /// waits: the reserve is what keeps inbound mail from stalling or vetoing
+    /// an update.
+    fn wait_msg_id_room<'a>(
+        &'a self,
+        mut inbox: std::sync::MutexGuard<'a, Inbox>,
+    ) -> std::sync::MutexGuard<'a, Inbox> {
+        let mut waited = std::time::Duration::ZERO;
+        while inbox.hold_fenced
+            && inbox
+                .msg_id_ceiling
+                .is_some_and(|ceiling| inbox.last_msg_id >= ceiling)
+        {
+            let (guard, timeout) = self
+                .changed
+                .wait_timeout(inbox, MSG_ROOM_NOTICE_EVERY)
+                .unwrap_or_else(|p| p.into_inner());
+            inbox = guard;
+            if timeout.timed_out() && inbox.hold_fenced {
+                waited = waited.saturating_add(MSG_ROOM_NOTICE_EVERY);
+                eprintln!(
+                    "aterm: an inbox delivery has waited {:.1} s on a committing update \
+                     (past the {INBOX_ID_RESERVE}-id overlap reserve); it lands when \
+                     the update lands or stands down",
+                    waited.as_secs_f64()
+                );
+            }
+        }
+        inbox
+    }
+
+    /// Wait out a committing update's fence ([`Self::fence_hold`]) before a
+    /// change the handoff carries — a post, a receipt owed, a retirement —
+    /// lands: `None` past `wait`, with the guard released and nothing moved,
+    /// which the caller answers [`HOLD_BUSY`]. An update that lands `_exit`s
+    /// with the waiter still waiting, so nothing is ever acknowledged that the
+    /// successor did not adopt; one that stands down lifts the fence and the
+    /// change lands here.
+    fn wait_unfenced<'a>(
+        &'a self,
+        mut inbox: std::sync::MutexGuard<'a, Inbox>,
+        wait: std::time::Duration,
+    ) -> Option<std::sync::MutexGuard<'a, Inbox>> {
+        let deadline = std::time::Instant::now() + wait;
+        while inbox.hold_fenced {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            inbox = self
+                .changed
+                .wait_timeout(inbox, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        Some(inbox)
+    }
+
+    /// [`Self::wait_unfenced`] for a RETIREMENT (`outbox sent`, `deliver …
+    /// receipt=`): it waits only when the fence holds retirements back
+    /// ([`Inbox::retirements_fenced`]); for a successor that does not read the
+    /// carry it is answered at once, as every earlier build answered it.
+    fn wait_unfenced_retirement<'a>(
+        &'a self,
+        inbox: std::sync::MutexGuard<'a, Inbox>,
+        wait: std::time::Duration,
+    ) -> Option<std::sync::MutexGuard<'a, Inbox>> {
+        if inbox.retirements_fenced {
+            self.wait_unfenced(inbox, wait)
+        } else {
+            Some(inbox)
+        }
+    }
+
+    /// THE OUTBOUND HALF THE HANDOFF CARRIES ([`FabricCarry`]): the id
+    /// counters, the posts still waiting and the receipts still owed, read
+    /// under one guard. `budget` is what is left of [`CARRY_MAIL_BYTES`] for
+    /// the whole manifest; a post past it (or one holding a number TOML cannot
+    /// write) is named in `uncarried` instead, and a receipt past it is
+    /// counted in `receipts_uncarried`.
+    ///
+    /// The inbox row id it carries is [`Inbox::last_msg_id`] PLUS
+    /// [`INBOX_ID_RESERVE`], remembered as this process's ceiling
+    /// ([`Inbox::msg_id_ceiling`]): the bridge goes on delivering until the
+    /// `_exit`, and the rows it numbers in that overlap stay below every id
+    /// the successor hands out.
+    #[cfg(any(unix, test))]
+    pub(crate) fn handoff_carry(&self, budget: &mut usize) -> FabricCarry {
+        let mut inbox = self.lock();
+        let carried_msg_id = inbox
+            .last_msg_id
+            .saturating_add(INBOX_ID_RESERVE)
+            .min(CARRY_INT_MAX);
+        inbox.msg_id_ceiling = Some(carried_msg_id);
+        let mut carry = FabricCarry {
+            last_msg_id: carried_msg_id,
+            last_post_id: inbox.next_post_id.min(CARRY_INT_MAX),
+            last_receipt_id: inbox.next_receipt_id.min(CARRY_INT_MAX),
+            ..FabricCarry::default()
+        };
+        for post in inbox.posts.iter().filter(|p| p.off.is_none() && !p.dead) {
+            let row = PostCarry {
+                id: post.id,
+                to: post.to.clone(),
+                kind: post.kind.clone(),
+                re: post.re,
+                dl: post.dl,
+                via: post.via.clone(),
+                key: post.key.clone(),
+                body: post.body.clone(),
+            };
+            let writable = row.id <= CARRY_INT_MAX
+                && row.re.is_none_or(|n| n <= CARRY_INT_MAX)
+                && row.dl.is_none_or(|n| n <= CARRY_INT_MAX);
+            if writable && row.cost() <= *budget {
+                *budget -= row.cost();
+                carry.posts.push(row);
+            } else if post.id <= CARRY_INT_MAX {
+                carry.uncarried.push(post.id);
+            }
+        }
+        for r in &inbox.receipts {
+            let row = ReceiptCarry {
+                rid: r.rid,
+                off: r.off,
+                verdict: r.verdict.clone(),
+                kind: r.kind.clone(),
+                from: r.from.clone(),
+            };
+            let writable = row.rid <= CARRY_INT_MAX && row.off <= CARRY_INT_MAX;
+            if writable && row.cost() <= *budget {
+                *budget -= row.cost();
+                carry.receipts.push(row);
+            } else {
+                carry.receipts_uncarried = carry.receipts_uncarried.saturating_add(1);
+            }
+        }
+        carry
+    }
+
+    /// Put back what a SEAMLESS UPDATE carried of this session's mailbox — the
+    /// handoff's carry, and nothing else ([`FabricCarry`]). Called by
+    /// `spawn_session` with the hold and the topics, before the adopted session
+    /// is registered, so the bridge's first `outbox` drain here already lists
+    /// the carried posts and receipts, and every id this session hands out from
+    /// now on is above the ones the old process handed out.
+    ///
+    /// A post the handoff could not carry, or whose row does not validate, is
+    /// retired DEAD here with `reason=not-carried` and a `post-landed <id>
+    /// off=- reason=not-carried` timeline row: the sender learns the post is
+    /// gone, which is what it was owed. A receipt that does not validate is
+    /// dropped (its ask's sender waits out its own deadline, as for any
+    /// receipt that never comes).
+    pub(crate) fn seed_carry(
+        &self,
+        carry: &FabricCarry,
+        timeline: &Mutex<crate::session_timeline::SessionTimeline>,
+    ) {
+        if carry.is_empty() {
+            return;
+        }
+        let mut inbox = self.lock();
+        inbox.last_msg_id = inbox.last_msg_id.max(carry.last_msg_id);
+        inbox.next_post_id = inbox.next_post_id.max(carry.last_post_id);
+        inbox.next_receipt_id = inbox.next_receipt_id.max(carry.last_receipt_id);
+        let mut dead: Vec<u64> = carry.uncarried.clone();
+        let mut seen_ids = HashSet::new();
+        for post in &carry.posts {
+            if !post.valid(carry.last_post_id)
+                || !seen_ids.insert(post.id)
+                || inbox.posts.len() >= OUTBOX_CAP
+            {
+                dead.push(post.id);
+                continue;
+            }
+            inbox.posts.push_back(PostRow {
+                id: post.id,
+                to: post.to.clone(),
+                kind: post.kind.clone(),
+                off: None,
+                re: post.re,
+                dl: post.dl,
+                via: post.via.clone(),
+                key: post.key.clone(),
+                dup: false,
+                dead: false,
+                dead_reason: String::new(),
+                body: post.body.clone(),
+            });
+        }
+        let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        dead.sort_unstable();
+        dead.dedup();
+        for id in dead
+            .into_iter()
+            .filter(|id| (1..=carry.last_post_id).contains(id) && !seen_ids.contains(id))
+        {
+            inbox.posts.push_back(PostRow {
+                id,
+                to: "-".to_string(),
+                kind: "note".to_string(),
+                off: None,
+                re: None,
+                dl: None,
+                via: None,
+                key: None,
+                dup: false,
+                dead: true,
+                dead_reason: NOT_CARRIED.to_string(),
+                body: String::new(),
+            });
+            tl.record("post-landed", format!("{id} off=- reason={NOT_CARRIED}"));
+        }
+        let mut rids = HashSet::new();
+        for r in &carry.receipts {
+            if r.valid(carry.last_receipt_id) && rids.insert(r.rid) {
+                inbox.receipts.push_back(OwedReceipt {
+                    rid: r.rid,
+                    off: r.off,
+                    verdict: r.verdict.clone(),
+                    kind: r.kind.clone(),
+                    from: r.from.clone(),
+                });
+            }
+        }
+        while inbox.receipts.len() > RECEIPTS_OWED_MAX {
+            inbox.receipts.pop_front();
+        }
+        if carry.receipts_uncarried > 0 {
+            aterm_log::warn!(
+                "seamless update: {} receipt(s) this session owed were not carried (the \
+                 handoff's mailbox budget); their senders wait out their own deadlines",
+                carry.receipts_uncarried
+            );
+        }
+        drop(tl);
+        inbox.trim_retired_posts();
+        drop(inbox);
+        self.changed.notify_all();
     }
 
     /// The attempt that fenced this session stood down: let the holds that
     /// waited for it land ([`Self::fence_hold`]).
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(crate) fn lift_hold_fence(&self) {
         let mut inbox = self.lock();
         inbox.hold_fenced = false;
+        inbox.retirements_fenced = false;
         drop(inbox);
         self.changed.notify_all();
     }
@@ -2991,7 +3581,19 @@ fn deliver_receipt(ctx: &SessionCtx, toks: &[&str]) -> String {
     let (Some(rid), true) = (rid, landed) else {
         return DELIVER_USAGE.to_string();
     };
-    ctx.fabric.lock().receipts.retain(|r| r.rid != rid);
+    // Held back by a committing update like a post's retirement (see
+    // [`retire_post`]): the successor carries the receipt as owed.
+    let Some(mut inbox) = ctx
+        .fabric
+        .wait_unfenced_retirement(ctx.fabric.lock(), HOLD_FENCE_WAIT)
+    else {
+        return HOLD_BUSY.to_string();
+    };
+    let before = inbox.receipts.len();
+    inbox.receipts.retain(|r| r.rid != rid);
+    if inbox.receipts.len() != before {
+        inbox.outbox_moves += 1;
+    }
     "OK\n".to_string()
 }
 
@@ -3336,7 +3938,20 @@ fn retire_post(
     reason: &str,
     dup: bool,
 ) -> Result<(), String> {
-    let mut inbox = ctx.fabric.lock();
+    // A RETIREMENT A COMMITTING UPDATE WOULD NOT CARRY WAITS: answered here
+    // it would let the bridge forget the sequence it pinned while the
+    // successor carries the post as still queued — and publishes it again at
+    // a FRESH sequence. Unanswered, the pin stays, and the successor's bridge
+    // publishes the carried copy at it (the broker's dedup) — see
+    // [`FabricCarry`]. Only for a successor that reads the carry
+    // ([`Inbox::retirements_fenced`]): an older one restarts the post ids
+    // under the same sid, and a pin left standing would swallow its post.
+    let Some(mut inbox) = ctx
+        .fabric
+        .wait_unfenced_retirement(ctx.fabric.lock(), HOLD_FENCE_WAIT)
+    else {
+        return Err(HOLD_BUSY.to_string());
+    };
     let Some(row) = inbox.posts.iter_mut().find(|p| p.id == post_id) else {
         return Err("ERR no such post\n".to_string());
     };
@@ -3371,6 +3986,7 @@ fn retire_post(
     row.via = None;
     row.key = None;
     if !already {
+        inbox.outbox_moves += 1;
         let payload = match off {
             Some(n) => format!("{post_id} off={n}"),
             None => format!("{post_id} off=-"),
@@ -3615,7 +4231,17 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         return DELIVER_USAGE.to_string();
     };
 
-    let mut inbox = ctx.fabric.lock();
+    // A ROW IN THE UPDATE'S OVERLAP IS NUMBERED BELOW THE SUCCESSOR'S IDS
+    // (round seven's review of group J, item 2): the manifest carried the last
+    // id plus [`INBOX_ID_RESERVE`], so a delivery between the park's draw and
+    // the `_exit` lands here as ever, and the successor — whose bridge refills
+    // it from the session's `seen` offset — lists it under an id of its own.
+    // Only a row that would pass that ceiling while the Commit's fence stands
+    // waits for the attempt to land or stand down ([`SessionFabric::
+    // wait_msg_id_room`]); it is never answered an `ERR` the bridge would book
+    // as a verdict (the review's item 1). Before the fence, passing it stands
+    // the Commit down ([`SessionFabric::past_handoff_ceiling`]).
+    let mut inbox = ctx.fabric.wait_msg_id_room(ctx.fabric.lock());
     // IDEMPOTENCY, before anything else: the offset decides, and a duplicate
     // answers the id it first got without touching the ring, the quota or the
     // events digest.
@@ -4341,6 +4967,15 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
         return INBOX_USAGE.to_string();
     }
     let mut inbox = ctx.fabric.lock();
+    // A VERDICT MAY OWE A RECEIPT, which a committing update carries as the
+    // park drew it: held back until the attempt lands or stands down, like a
+    // post ([`SessionFabric::wait_unfenced`]).
+    if verdict.is_some() {
+        match ctx.fabric.wait_unfenced(inbox, HOLD_FENCE_WAIT) {
+            Some(guard) => inbox = guard,
+            None => return HOLD_BUSY.to_string(),
+        }
+    }
     let Some(at) = inbox.rows.iter().position(|r| r.id == id) else {
         return "ERR no such message\n".to_string();
     };
@@ -4621,7 +5256,13 @@ pub(crate) fn cmd_post_waking(
         (matches!(kind.as_str(), "ask" | "task") || wait_ack.is_some()).then_some(None)
     });
 
-    let mut inbox = ctx.fabric.lock();
+    // A COMMITTING UPDATE HOLDS THE POST BACK ([`SessionFabric::wait_unfenced`]):
+    // the successor carries the outbox the park drew, so a post queued here
+    // after the Commit's reading would be answered `OK` and lost with this
+    // process.
+    let Some(mut inbox) = ctx.fabric.wait_unfenced(ctx.fabric.lock(), HOLD_FENCE_WAIT) else {
+        return HOLD_BUSY.to_string();
+    };
     // REFUSED AT THE DOOR. A full outbox is answered, not absorbed: see
     // [`OUTBOX_CAP`]. Counted over the posts still WAITING for the bridge —
     // retired ones hold no body and cost nothing.
@@ -4636,6 +5277,7 @@ pub(crate) fn cmd_post_waking(
         return format!("ERR outbox full queued={queued} bytes={queued_bytes}\n");
     }
     inbox.next_post_id += 1;
+    inbox.outbox_moves += 1;
     let id = inbox.next_post_id;
     let to_tok = pct_encode(&to);
     inbox.posts.push_back(PostRow {
@@ -4990,6 +5632,17 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut guard = ctx.fabric.lock();
+    // AN ANCHOR ABOVE EVERY ID THIS SESSION HAS HANDED OUT names no row of
+    // this process's (round seven of the update audit, finding 8): nothing
+    // here can have told a caller an id it has not minted, so it was taken
+    // from another process — a producer before the id carry, whose successor
+    // counts from 1 again. Parked, it waited for a count the ring may never
+    // reach and answered `OK timeout` over unread mail; refused, the caller
+    // re-reads `inbox` and takes the new high, as `timeline` and `offscreen`
+    // refuse an index past their newest.
+    if since > guard.last_msg_id {
+        return format!("ERR bad since high={}\n", guard.last_msg_id);
+    }
     let hold_at_arm = guard.hold.is_some();
     loop {
         if let Some(id) = guard
@@ -5334,7 +5987,7 @@ mod inbox_hold {
     fn a_committing_update_holds_every_hold_back_and_drops_none() {
         let store = new_store();
         let (sid, ctx) = registered(&store);
-        let serial = ctx.fabric.fence_hold();
+        let serial = ctx.fabric.fence_hold(true);
         assert_eq!(
             cmd_hold_within(
                 &store,
@@ -9613,5 +10266,531 @@ mod inbox_hold {
             app_halt_refusal(&store, "hover").is_none(),
             "`hover` toggles a highlight; a halt must not turn into an App freeze"
         );
+    }
+}
+
+/// ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 6, 8 AND 28: what a seamless
+/// update carries of a session's mailbox beside its topics and hold
+/// ([`FabricCarry`]), driven through the real manifest — `from_store`, TOML
+/// out and back, and the spawn's own seed.
+#[cfg(test)]
+mod handoff_carry {
+    use super::*;
+    use crate::session_store::{SessionHandoff, Store, new_store, test_handle};
+
+    use super::with_link_reset as with_link;
+
+    fn registered(store: &Store, local_id: u64) -> (String, std::sync::Arc<SessionCtx>) {
+        let h = test_handle(local_id);
+        let sid = h.sid.as_str().to_string();
+        let ctx = h.ctx.clone();
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+        (sid, ctx)
+    }
+
+    fn deliver(store: &Store, sid: &str, off: u64, from: &str, kind: &str, text: &str) -> String {
+        cmd_deliver(
+            store,
+            &format!("{sid} off={off} from={from} kind={kind} trust=agent text={text}"),
+        )
+    }
+
+    /// The outgoing store drawn into a manifest and read back as the
+    /// successor reads it, each record seeded onto a FRESH session through
+    /// the spawn's seam and registered in a fresh store.
+    fn hand_over(store: &Store) -> (Store, Vec<(String, std::sync::Arc<SessionCtx>)>) {
+        let manifest = SessionHandoff::from_store(&store.read().unwrap());
+        let wire = manifest.to_toml().expect("serializes");
+        assert!(manifest.roundtrips(), "{wire}");
+        let read = SessionHandoff::from_toml(&wire).expect("the successor reads it");
+        let successor = new_store();
+        let mut adopted = Vec::new();
+        for rec in &read.sessions {
+            let h = test_handle(rec.local_id);
+            crate::spawn::seed_adopted_fabric(
+                &h.ctx.fabric,
+                &h.ctx.timeline,
+                &rec.topics,
+                rec.hold.as_deref(),
+                &rec.fabric,
+            );
+            adopted.push((h.sid.as_str().to_string(), h.ctx.clone()));
+            successor.write().unwrap().register(h);
+        }
+        (successor, adopted)
+    }
+
+    /// FINDING 6: a post still queued and a receipt still owed at the park are
+    /// on the SUCCESSOR's `outbox` peek — its bridge drains them — under the
+    /// ids the old process gave them. FINDINGS 8 AND 28: every id the
+    /// successor hands out after that is above the old process's, so a
+    /// pre-update anchor or sequence pin never names a new row, post or
+    /// receipt. NEGATIVE CONTROL: a post the bridge already retired is not
+    /// carried (it would go on the bus twice).
+    ///
+    /// FAILS WITHOUT THE FIX: the successor's outbox is empty and its ids
+    /// start over at 1 (measured: `seed_carry` a no-op leaves `outbox` at
+    /// `OK 0`).
+    #[test]
+    fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            assert_eq!(
+                deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 11, "h-andrew", "task", "two"),
+                "OK 2\n"
+            );
+            // No bridge: both posts queue. The first is published and retired
+            // before the park; the second waits.
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note gone", None), "OK 1\n");
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=note waiting", None),
+                "OK 2\n"
+            );
+            assert_eq!(
+                cmd_outbox_verb(&store, &format!("sent {sid} 1 off=70")),
+                "OK\n"
+            );
+            // A verdict on the ask owes its sender a receipt.
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+
+            let (successor, adopted) = hand_over(&store);
+            let (new_sid, new_ctx) = &adopted[0];
+            let drain = cmd_outbox(&successor, "");
+            assert!(
+                drain.contains(&format!(
+                    "post sid={new_sid} id=2 to=@s-peer kind=note len=7\nwaiting"
+                )),
+                "the queued post is on the successor's drain: {drain}"
+            );
+            assert!(
+                !drain.contains(" id=1 "),
+                "the retired post is not: {drain}"
+            );
+            assert!(
+                drain.contains(&format!(
+                    "receipt sid={new_sid} rid=1 off=10 verdict=handled kind=ask from=s-peer@n-lab"
+                )),
+                "the owed receipt is on the successor's drain: {drain}"
+            );
+            // The ids go on above the old process's — the inbox's above its
+            // overlap reserve too ([`INBOX_ID_RESERVE`]).
+            let next_row = 2 + INBOX_ID_RESERVE + 1;
+            assert_eq!(
+                deliver(&successor, new_sid, 12, "h-andrew", "task", "three"),
+                format!("OK {next_row}\n")
+            );
+            assert_eq!(
+                cmd_post(new_ctx, "to=@s-peer kind=note next", None),
+                "OK 3\n"
+            );
+            assert_eq!(
+                cmd_inbox_seen(new_ctx, &format!("{next_row} handled")),
+                format!("OK seen={next_row}\n")
+            );
+            assert!(
+                cmd_outbox(&successor, "").contains("rid=2 off=12"),
+                "the next receipt is rid 2, never a second rid 1"
+            );
+            // An old id the successor never minted names nothing.
+            assert_eq!(
+                cmd_inbox_seen(new_ctx, "1 handled"),
+                "ERR no such message\n"
+            );
+        });
+    }
+
+    /// A POST PAST THE CARRY'S BUDGET IS RETIRED DEAD, SAID — never dropped
+    /// silently: its id is named on the record and the successor records
+    /// `post-landed <id> off=- reason=not-carried`.
+    #[test]
+    fn a_post_past_the_budget_is_retired_dead_and_said() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store, 1);
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note small", None), "OK 1\n");
+            let mut left = 0;
+            let carry = ctx.fabric.handoff_carry(&mut left);
+            assert_eq!(carry.uncarried, [1], "no budget left: named, not carried");
+            let fresh = test_handle(1);
+            fresh.ctx.fabric.seed_carry(&carry, &fresh.ctx.timeline);
+            let rows: Vec<(String, String)> = fresh
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .map(|e| (e.kind.to_string(), e.payload.clone()))
+                .collect();
+            assert_eq!(
+                rows,
+                [(
+                    "post-landed".to_string(),
+                    format!("1 off=- reason={NOT_CARRIED}")
+                )]
+            );
+            assert_eq!(
+                fresh.ctx.fabric.lock().queued_load().0,
+                0,
+                "nothing is queued"
+            );
+        });
+    }
+
+    /// THE COMMIT SEES THE OUTBOX MOVE, and a move past its reading WAITS: a
+    /// post queued, a receipt owed or a post retired after the park changes
+    /// [`SessionFabric::carry_serial`] (the Commit then stands down, a lossless
+    /// retry), and under the fence ([`SessionFabric::fence_hold`]) a post is
+    /// not answered until the attempt stands down — never `OK` for a row the
+    /// successor would not carry. NEGATIVE CONTROL: a read moves nothing.
+    #[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+    #[test]
+    fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one");
+            let parked = ctx.fabric.carry_serial();
+            let _ = cmd_inbox(&ctx, "");
+            assert_eq!(ctx.fabric.carry_serial(), parked, "a read moves nothing");
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note one", None), "OK 1\n");
+            let after_post = ctx.fabric.carry_serial();
+            assert_ne!(after_post, parked, "a queued post moves it");
+            assert_eq!(cmd_inbox_seen(&ctx, "1 deferred"), "OK seen=1\n");
+            let after_receipt = ctx.fabric.carry_serial();
+            assert_ne!(after_receipt, after_post, "an owed receipt moves it");
+            assert_eq!(
+                cmd_outbox_verb(&store, &format!("sent {sid} 1 off=70")),
+                "OK\n"
+            );
+            assert_ne!(
+                ctx.fabric.carry_serial(),
+                after_receipt,
+                "a retirement moves it"
+            );
+
+            // The Commit's reading raises the fence: a post waits for it.
+            let fenced = ctx.fabric.fence_hold(true);
+            assert_eq!(fenced, ctx.fabric.carry_serial());
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_post(&ctx, "to=@s-peer kind=note two", None))
+            };
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !poster.is_finished(),
+                "a post under the fence is not answered"
+            );
+            assert_eq!(ctx.fabric.carry_serial(), fenced, "and it moved nothing");
+            ctx.fabric.lift_hold_fence();
+            assert_eq!(
+                poster.join().unwrap(),
+                "OK 2\n",
+                "it lands once the attempt stands down"
+            );
+        });
+    }
+
+    /// FINDING 8's GUARD, for a successor whose producer predates the id carry:
+    /// an `await inbox since=` above every id this session has handed out
+    /// names no row of this process's, and is refused at once — never parked
+    /// over unread mail until `OK timeout`.
+    ///
+    /// FAILS WITHOUT THE FIX: the wait parks its whole timeout and answers `OK
+    /// timeout` with rows 1 and 2 unread.
+    #[test]
+    fn an_inbox_anchor_this_process_never_minted_is_refused() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            deliver(&store, &sid, 10, "h-andrew", "task", "one");
+            deliver(&store, &sid, 11, "h-andrew", "task", "two");
+            let started = std::time::Instant::now();
+            assert_eq!(
+                cmd_await_inbox(&ctx, &["since=37"], 5_000),
+                "ERR bad since high=2\n"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            // NEGATIVE CONTROL: an anchor it minted still waits and latches.
+            assert_eq!(cmd_await_inbox(&ctx, &["since=1"], 50), "OK inbox 2\n");
+            assert_eq!(cmd_await_inbox(&ctx, &["since=2"], 50), "OK timeout\n");
+        });
+    }
+
+    /// ROUND SEVEN'S REVIEW, ITEM 1: THE MAIL BUDGET CHARGES WHAT TOML WRITES,
+    /// AND IT HOLDS THE RECEIPTS TOO. A post of ANSI colour codes escapes to up
+    /// to six bytes per byte in the manifest, so it is charged that — a budget
+    /// its RAW length fits leaves it uncarried, said — and owed receipts are
+    /// charged against the same budget, counted when they do not fit.
+    ///
+    /// FAILS WITHOUT THE FIX: the post was charged its raw length and carried,
+    /// and every receipt rode with no budget at all.
+    #[test]
+    fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            let coloured = "\u{1b}[31mred\u{1b}[0m \"q\" \\ ".repeat(20);
+            assert_eq!(
+                cmd_post(
+                    &ctx,
+                    "to=@s-peer kind=note",
+                    Some(coloured.clone().into_bytes())
+                ),
+                "OK 1\n"
+            );
+            let raw = {
+                let inbox = ctx.fabric.lock();
+                let p = &inbox.posts[0];
+                p.body.len() + p.to.len() + p.kind.len()
+            };
+            let mut left = raw + CARRY_ROW_OVERHEAD;
+            let carry = ctx.fabric.handoff_carry(&mut left);
+            assert_eq!(carry.uncarried, [1], "the escaped cost does not fit");
+            assert!(carry.posts.is_empty());
+            // The charge is an upper bound on what the TOML writer spends.
+            let mut roomy = CARRY_MAIL_BYTES;
+            let carried = ctx.fabric.handoff_carry(&mut roomy);
+            assert_eq!(carried.posts[0].body, coloured);
+            let written = aterm_toml::to_string(&carried).unwrap();
+            assert!(
+                written.len() <= carried.rows_cost(),
+                "{} written, {} charged",
+                written.len(),
+                carried.rows_cost()
+            );
+            assert!(toml_cost(&coloured) > coloured.len() * 3 / 2);
+
+            // Receipts share the budget.
+            deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one");
+            deliver(&store, &sid, 11, "s-peer@n-lab", "ask", "two");
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
+            let mut none = 0;
+            let carry = ctx.fabric.handoff_carry(&mut none);
+            assert!(carry.receipts.is_empty());
+            assert_eq!(carry.receipts_uncarried, 2, "counted, never silent");
+            let mut one = ReceiptCarry {
+                rid: 1,
+                off: 10,
+                verdict: "handled".to_string(),
+                kind: "ask".to_string(),
+                from: "s-peer@n-lab".to_string(),
+            }
+            .cost();
+            let carry = ctx.fabric.handoff_carry(&mut one);
+            assert_eq!(carry.receipts.len(), 1);
+            assert_eq!(carry.receipts_uncarried, 1);
+            assert_eq!(one, 0, "the budget is spent");
+            // NEGATIVE CONTROL: a roomy budget carries everything.
+            let mut roomy = CARRY_MAIL_BYTES;
+            let carry = ctx.fabric.handoff_carry(&mut roomy);
+            assert_eq!((carry.posts.len(), carry.receipts.len()), (1, 2));
+            assert_eq!(carry.receipts_uncarried, 0);
+            assert!(carry.uncarried.is_empty());
+        });
+    }
+
+    /// ROUND SEVEN'S REVIEW, ITEM 1: SHEDDING THE CARRY keeps the counters and
+    /// retires every post dead in the successor, `not-carried`, said; the
+    /// receipts are counted. What the manifest writer does before it would
+    /// refuse an update over its cap.
+    #[test]
+    fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note one", None), "OK 1\n");
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note two", None), "OK 2\n");
+            deliver(&store, &sid, 10, "s-peer@n-lab", "task", "t");
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+            let mut roomy = CARRY_MAIL_BYTES;
+            let mut carry = ctx.fabric.handoff_carry(&mut roomy);
+            assert!(carry.rows_cost() > 0);
+            assert!(carry.shed());
+            assert!(!carry.shed(), "nothing left to shed");
+            assert_eq!(carry.rows_cost(), 0);
+            assert_eq!(carry.uncarried, [1, 2]);
+            assert_eq!(carry.receipts_uncarried, 1);
+            assert_eq!(
+                (carry.last_msg_id, carry.last_post_id, carry.last_receipt_id),
+                (1 + INBOX_ID_RESERVE, 2, 1),
+                "the counters stay"
+            );
+            let fresh = test_handle(1);
+            fresh.ctx.fabric.seed_carry(&carry, &fresh.ctx.timeline);
+            let rows: Vec<String> = fresh
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .map(|e| e.payload.clone())
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    format!("1 off=- reason={NOT_CARRIED}"),
+                    format!("2 off=- reason={NOT_CARRIED}")
+                ]
+            );
+            assert_eq!(
+                cmd_post(&fresh.ctx, "to=@s-peer kind=note three", None),
+                "OK 3\n"
+            );
+        });
+    }
+
+    /// ROUND SEVEN'S REVIEW OF GROUP J, ITEM 2: INBOUND MAIL IN THE OVERLAP
+    /// NEVER VETOES THE UPDATE. A row delivered after the park's draw moves no
+    /// serial the Commit compares, and one delivered under the Commit's fence
+    /// is answered at once: the manifest carried the last id plus
+    /// [`INBOX_ID_RESERVE`], so both are numbered below every id the successor
+    /// hands out. Only a process that outruns the reserve stands its Commit
+    /// down ([`SessionFabric::past_handoff_ceiling`]). NEGATIVE CONTROL: the
+    /// last row inside the reserve does not.
+    ///
+    /// FAILS WITHOUT THE FIX: the row's id was in the carry serial, so the
+    /// first delivery after the draw revoked the attempt, and one under the
+    /// fence waited.
+    #[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+    #[test]
+    fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            assert_eq!(
+                deliver(&store, &sid, 10, "h-andrew", "task", "one"),
+                "OK 1\n"
+            );
+            let parked = ctx.fabric.carry_serial();
+            let carried = ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone());
+            assert_eq!(carried.last_msg_id, 1 + INBOX_ID_RESERVE);
+            assert_eq!(
+                deliver(&store, &sid, 11, "h-andrew", "task", "two"),
+                "OK 2\n"
+            );
+            assert_eq!(ctx.fabric.carry_serial(), parked, "a new row moves nothing");
+            let fenced = ctx.fabric.fence_hold(true);
+            assert_eq!(fenced, parked);
+            assert_eq!(
+                deliver(&store, &sid, 12, "s-peer@n-lab", "note", "three"),
+                "OK 3\n",
+                "under the fence, inside the reserve: answered at once"
+            );
+            assert!(!ctx.fabric.past_handoff_ceiling());
+            ctx.fabric.lift_hold_fence();
+
+            // The last id inside the reserve is still no veto; one past it is.
+            ctx.fabric.lock().last_msg_id = carried.last_msg_id - 1;
+            assert_eq!(
+                deliver(&store, &sid, 13, "h-andrew", "task", "four"),
+                format!("OK {}\n", carried.last_msg_id)
+            );
+            assert!(!ctx.fabric.past_handoff_ceiling(), "at the ceiling: fine");
+            assert_eq!(
+                deliver(&store, &sid, 14, "s-peer@n-lab", "note", "five"),
+                format!("OK {}\n", carried.last_msg_id + 1)
+            );
+            assert!(
+                ctx.fabric.past_handoff_ceiling(),
+                "past it, the Commit stands down"
+            );
+        });
+    }
+
+    /// ROUND SEVEN'S REVIEW OF GROUP J, ITEM 1: A DELIVERY THAT WOULD PASS THE
+    /// CARRIED ID UNDER THE COMMIT'S FENCE WAITS FOR THE ATTEMPT — through
+    /// several rounds of its wait's timeout arm — and is never answered an
+    /// `ERR`: the bridge books any non-`OK` reply as a verdict (the record
+    /// refused to its sender, a broadcast dropped) and commits its cursor past
+    /// it. Once the attempt stands down it lands under the next id.
+    /// NEGATIVE CONTROL: a duplicate offset still answers at once… after the
+    /// fence lifts, with the id it first got.
+    ///
+    /// FAILS WITHOUT THE FIX: after `HOLD_FENCE_WAIT` it answered `ERR busy
+    /// update-committing`, which the bridge refused to the sender for good.
+    #[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+    #[test]
+    fn a_delivery_past_the_reserve_under_the_fence_waits_and_is_never_refused() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            assert_eq!(
+                deliver(&store, &sid, 10, "h-andrew", "task", "one"),
+                "OK 1\n"
+            );
+            let carried = ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone());
+            ctx.fabric.lock().last_msg_id = carried.last_msg_id;
+            let _ = ctx.fabric.fence_hold(true);
+            let bridge = {
+                let store = store.clone();
+                let sid = sid.clone();
+                std::thread::spawn(move || deliver(&store, &sid, 11, "s-peer@n-lab", "note", "two"))
+            };
+            std::thread::sleep(MSG_ROOM_NOTICE_EVERY * 8);
+            assert!(
+                !bridge.is_finished(),
+                "several timeout rounds later it still waits: no ERR, no row"
+            );
+            assert!(!ctx.fabric.past_handoff_ceiling(), "and it minted nothing");
+            ctx.fabric.lift_hold_fence();
+            let reply = bridge.join().unwrap();
+            assert_eq!(reply, format!("OK {}\n", carried.last_msg_id + 1));
+            assert_eq!(
+                deliver(&store, &sid, 11, "s-peer@n-lab", "note", "two"),
+                reply,
+                "a redelivery of the same offset answers the same id"
+            );
+        });
+    }
+
+    /// ROUND SEVEN'S REVIEW, ITEM 5: THE FENCE HOLDS A RETIREMENT BACK ONLY FOR
+    /// A SUCCESSOR THAT READS THE CARRY. An older one restarts the post ids
+    /// under the same sid, so a retirement left unanswered keeps a sequence
+    /// pin its own post would be deduplicated into; for it the retirement is
+    /// answered, as every earlier build answered it. NEGATIVE CONTROL: for a
+    /// successor that reads the carry, it waits.
+    #[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+    #[test]
+    fn the_fence_holds_a_retirement_back_only_for_a_successor_that_reads_the_carry() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store, 1);
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note one", None), "OK 1\n");
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note two", None), "OK 2\n");
+            deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "q");
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+
+            let _ = ctx.fabric.fence_hold(false);
+            assert_eq!(
+                cmd_outbox_verb(&store, &format!("sent {sid} 1 off=70")),
+                "OK\n",
+                "answered at once for an older successor"
+            );
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} receipt=1 off=71")),
+                "OK\n"
+            );
+            ctx.fabric.lift_hold_fence();
+
+            let _ = ctx.fabric.fence_hold(true);
+            let bridge = {
+                let store = store.clone();
+                let sid = sid.clone();
+                std::thread::spawn(move || cmd_outbox_verb(&store, &format!("sent {sid} 2 off=72")))
+            };
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !bridge.is_finished(),
+                "held back for a successor that carries it"
+            );
+            ctx.fabric.lift_hold_fence();
+            assert_eq!(bridge.join().unwrap(), "OK\n");
+        });
     }
 }

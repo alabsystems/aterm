@@ -1794,10 +1794,12 @@ impl RestoreManifest {
     }
 }
 
-/// The manifest path: `<data_dir>/aterm/session.toml`. `None` when no data dir resolves
-/// (e.g. wasm / a stripped environment).
+/// The manifest path: `<aterm data dir>/session.toml` — [`aterm_types::dirs::aterm_data_dir`],
+/// `<data_dir>/aterm` unless a development build's `ATERM_STATE_HOME` gives the instance
+/// its own root (ruling 406), which the crash journals beside it then follow too. `None`
+/// when nothing resolves (e.g. wasm / a stripped environment, or a relative seam).
 pub(crate) fn manifest_path() -> Option<PathBuf> {
-    aterm_types::dirs::data_dir().map(|d| d.join("aterm").join("session.toml"))
+    aterm_types::dirs::aterm_data_dir().map(|dir| dir.join("session.toml"))
 }
 
 /// Durably write `manifest` under the process-shared restore lock. Publication
@@ -2090,9 +2092,20 @@ fn sync_restore_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write the manifest to the standard [`manifest_path`] (graceful-quit hook).
+/// Write the manifest to the standard [`manifest_path`] (graceful-quit hook). With
+/// no path, the refusal names its cause: a development build's relative (or empty)
+/// `ATERM_STATE_HOME` resolves none on purpose (ruling 406), else no data dir
+/// resolves (ruling 408).
 pub(crate) fn write(manifest: &RestoreManifest) -> Result<(), String> {
-    let path = manifest_path().ok_or("no data dir for session restore")?;
+    let path = manifest_path().ok_or_else(|| {
+        if aterm_types::dev_seam!("ATERM_STATE_HOME")
+            .is_some_and(|root| !Path::new(&root).is_absolute())
+        {
+            "ATERM_STATE_HOME is not an absolute path; session restore is off".to_string()
+        } else {
+            "no data dir for session restore".to_string()
+        }
+    })?;
     write_to(&path, manifest)
 }
 
@@ -2171,9 +2184,10 @@ pub(crate) struct CellMetricsCache {
     pub entries: Vec<CellMetricsEntry>,
 }
 
-/// The cache path: `<data_dir>/aterm/cell-metrics.toml`, beside `session.toml`.
+/// The cache path: `<aterm data dir>/cell-metrics.toml`, beside `session.toml` under the
+/// same rule ([`aterm_types::dirs::aterm_data_dir`], ruling 406).
 fn cell_metrics_path() -> Option<PathBuf> {
-    aterm_types::dirs::data_dir().map(|d| d.join("aterm").join("cell-metrics.toml"))
+    aterm_types::dirs::aterm_data_dir().map(|dir| dir.join("cell-metrics.toml"))
 }
 
 /// `scale` → the integer entry key. Clamped positive so a hostile/broken scale
@@ -3682,6 +3696,58 @@ metadata = "opaque=copy-me"
         assert_eq!(b_returned["returned"], 2);
         assert!(!model.check_invariant("AtMostOneConsumer", &b_returned));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PRIVATE INSTANCE'S LAYOUT STAYS ITS OWN (ruling 406; day ten's D1): under a
+    /// development build's `ATERM_STATE_HOME` the manifest, the crash journals beside
+    /// it and the cell-metrics cache live in that root, beside the logs folder whose
+    /// crash markers the journal claim reads — before, an instance on the owner's
+    /// `$HOME` with its own state root took the owner's `session.toml` and claimed,
+    /// then deleted, the owner's dead journals. A relative seam resolves nothing
+    /// (never the owner's folder), and unset they are `<data_dir>/aterm` exactly as
+    /// before. NEGATIVE CONTROL: the unset arm names the OS data dir, not the scratch
+    /// root, so the scoped arm's pass is the seam's doing.
+    #[test]
+    fn the_manifest_journals_and_cell_metrics_follow_the_state_home_seam() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-restore-state-home")
+            .tempdir()
+            .expect("scratch dir");
+        let root = scratch.path().to_path_buf();
+        crate::test_env::scoped("ATERM_STATE_HOME", &root, || {
+            assert_eq!(manifest_path(), Some(root.join("session.toml")));
+            assert_eq!(crate::crash_journal::journal_dir(), Some(root.clone()));
+            assert_eq!(cell_metrics_path(), Some(root.join("cell-metrics.toml")));
+            assert_eq!(
+                aterm_types::dirs::logs_dir(),
+                Some(root.join("logs")),
+                "the crash evidence the claim reads sits under the same root"
+            );
+        });
+        crate::test_env::scoped("ATERM_STATE_HOME", "relative/state", || {
+            assert_eq!(manifest_path(), None, "a relative seam is refused");
+            assert_eq!(crate::crash_journal::journal_dir(), None);
+            assert_eq!(cell_metrics_path(), None);
+            // The quit's refusal names that cause, not a missing data dir
+            // (ruling 408). Nothing is written: no path resolves.
+            assert_eq!(
+                write(&RestoreManifest::new(Vec::new())),
+                Err("ATERM_STATE_HOME is not an absolute path; session restore is off".to_string())
+            );
+        });
+        crate::test_env::scoped_unset("ATERM_STATE_HOME", || {
+            let data = aterm_types::dirs::data_dir().map(|dir| dir.join("aterm"));
+            assert_eq!(
+                manifest_path(),
+                data.as_ref().map(|dir| dir.join("session.toml"))
+            );
+            assert_eq!(crate::crash_journal::journal_dir(), data.clone());
+            assert_eq!(
+                cell_metrics_path(),
+                data.as_ref().map(|dir| dir.join("cell-metrics.toml"))
+            );
+            assert_ne!(manifest_path(), Some(root.join("session.toml")));
+        });
     }
 
     /// The recorded scale is the cache's SOLE entry: none when the file is

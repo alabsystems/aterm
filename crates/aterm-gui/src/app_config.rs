@@ -150,10 +150,9 @@ pub(crate) struct Config {
     /// master) turns it off with everything else — which the frame step has
     /// honoured since 2026-09-27 (before, a master-off window typed into fast
     /// still lit it). So its effective default follows the master's:
-    /// [`DEFAULT_DECORATIVE_EFFECTS`], OFF on Windows. Decided 2026-09-27 under
-    /// the owner's standing direction: the glow is a cursor decoration like the
-    /// rest of the family, and Windows' minimal-fast default keeps it off until
-    /// `cursor_trail = true` turns the family on.
+    /// [`DEFAULT_DECORATIVE_EFFECTS`], OFF on Windows — no ruling of its own,
+    /// only this key's contract meeting the owner's Windows minimal-fast
+    /// default for the master; `cursor_trail = true` turns the family on.
     pub(crate) cursor_momentum_glow: Option<bool>,
     /// Trail STYLE: `rainbow kitty pet` (DEFAULT — the smooth momentum-driven
     /// rainbow ribbon with the full-body cat that walks, runs and pounces along
@@ -830,11 +829,13 @@ pub(crate) struct Config {
     /// the consent attention path and the update-health banner. Default OFF
     /// (owner, 2026-09-28: "I don't know what these OSX alerts are from aterm
     /// but they are annoying, disable them" — without `terminal-notifier`
-    /// macOS shows them as Script Editor's). Off, the notices still reach the
-    /// message band, the menu bar, the tab marks and `messages.log`; only the
-    /// desktop banner is withheld. Program notifications (OSC 9/99/777) are
-    /// `allow_notifications`'s, not this key's. Applied live
-    /// (`notify::spawn_delivery`'s `own_alerts`).
+    /// macOS shows them as Script Editor's). Off, only the desktop banner is
+    /// withheld: the herald's and the consent path's facts stay in the menu bar
+    /// and the tab marks, update health's in the message band and
+    /// `messages.log`. The operator's notices are shown nowhere else, so its
+    /// queue (`aterm fleet status` and `next`) is their one record. Program
+    /// notifications (OSC 9/99/777) are `allow_notifications`'s, not this key's.
+    /// Applied live (`notify::spawn_delivery`'s `own_alerts`).
     pub(crate) desktop_alerts: Option<bool>,
     /// Whether every FRESH session spawn also installs/updates the coding-agent
     /// primer (and the bundled skills) for every DETECTED agent — the same upsert
@@ -2587,8 +2588,10 @@ pub(crate) struct PresenceConfig {
 /// table's ONE reader — the same one `aterm drive watch|supervise` and the
 /// live-upgrade sweep read it with — so no two of them disagree on a key, a
 /// default or a refusal. Its rule is the owner's (2026-09-24): every power is
-/// on by default and the file can only take power away; a malformed value is
-/// its key's limit, and a `false` filed under another table still limits.
+/// on by default and the file can only take power away — and only by an
+/// explicit setting (2026-09-25): an off spelling is its key's limit, a value
+/// that is neither the key's own nor an off keeps the key's default, and a
+/// `false` filed under another table still limits.
 /// Part of [`Config`]'s `PartialEq`, so a reload that only edits `[harness]`
 /// is not deduped away.
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -4888,8 +4891,10 @@ impl Config {
     /// window supervises the agent sessions it hosts — the Settings ▸ Harness
     /// row. It is the SUPERVISOR'S bit ([`Self::harness`], read by the
     /// table's one reader), so the row and the supervisor cannot disagree:
-    /// absent is ON, and a value the reader cannot take (`enabled = "no"`,
-    /// `enabled = 0`) or a `false` filed under another table is OFF.
+    /// absent is ON; an explicit off (`false`, `"no"`, `"off"`, `0`) — or one
+    /// filed under another table — is OFF; and a value that says neither
+    /// (`enabled = "maybe"`) is no setting and leaves it ON (owner ruling of
+    /// 2026-09-25: only an explicit setting takes power away).
     pub(crate) fn harness_enabled(&self) -> bool {
         self.harness.policy.enabled
     }
@@ -4898,7 +4903,8 @@ impl Config {
     /// 2026-09-24): what the supervisor answers a permission box with —
     /// `all`, `safe` or `none`. Read from the same one reader as
     /// [`Self::harness_enabled`], so the Settings row and the supervisor cannot
-    /// disagree: a value the reader cannot take is its limit here too.
+    /// disagree: an off spelling is `none`, and a value that is no level
+    /// (`approve = "maybe"`) keeps `all` here too.
     pub(crate) fn harness_approve(&self) -> &'static str {
         use aterm_agent::supervise::config::Approve;
         match self.harness.policy.approve {
@@ -8300,27 +8306,40 @@ pub(crate) struct LaunchFont {
 /// missing or outside the zoom's own bounds is ignored whole, and the launch
 /// keeps the config's font — today's behaviour, never a clamp to a size
 /// nobody chose.
+pub(crate) fn successor_font_px(
+    resolved: f32,
+    explicit: bool,
+    carry: Option<&crate::session_store::WindowCarry>,
+) -> LaunchFont {
+    let (px_milli, reset_milli) = carry.map_or((None, None), |carry| {
+        (carry.font_px_milli, carry.font_reset_px_milli)
+    });
+    launch_font_for_zoom(resolved, explicit, px_milli, reset_milli)
+}
+
+/// [`successor_font_px`] over the zoom pair alone, in the carry's shape —
+/// what the warm prologue derives its BUILD size from when it runs before the
+/// dial (`main_entry`'s `WarmOrder::BeforeDial`), where the pair is the
+/// advisory launch hint's (`handoff_warm_hint`), not yet the carry's. Same
+/// admission, same answer for the same pair: a hint that matches the carry
+/// builds at exactly the size the carry then selects.
 #[allow(
     clippy::cast_precision_loss,
     reason = "a carried size is a u32 of thousandths; any value past f32's exact range is far \
               outside the admitted bounds and is refused by them"
 )]
-pub(crate) fn successor_font_px(
+pub(crate) fn launch_font_for_zoom(
     resolved: f32,
     explicit: bool,
-    carry: Option<&crate::session_store::WindowCarry>,
+    px_milli: Option<u32>,
+    reset_milli: Option<u32>,
 ) -> LaunchFont {
     let admitted = |milli: Option<u32>| {
         milli
             .map(|milli| milli as f32 / 1000.0)
             .filter(font_px_in_range)
     };
-    let zoom = carry.and_then(|carry| {
-        Some((
-            admitted(carry.font_px_milli)?,
-            admitted(carry.font_reset_px_milli)?,
-        ))
-    });
+    let zoom = admitted(px_milli).zip(admitted(reset_milli));
     match zoom {
         Some((px, reset_px)) => LaunchFont {
             px,
@@ -10923,7 +10942,7 @@ impl App {
         // the value it refused keeps its fuller sentence and this adds nothing
         // for that key.
         // The supervisor's `[harness]` values it refused (a known key with a
-        // value it cannot take: `continue = "yes"`).
+        // value it cannot take: `continue = "maybe"`, which keeps its default).
         collect_harness_notices(&mut warns, &config);
         // A `font_px` the resolver ignores says so here, like it does at launch,
         // and so does a theme the window draws Default in place of.
@@ -14916,10 +14935,11 @@ mod output_streak_cfg_tests {
     /// THE SUPERVISOR'S POLICY is `[harness]` as its one reader
     /// (`SupervisorConfig::from_aterm_toml`) takes the file's text: a key a
     /// reload changes makes a changed `Config` (so it is not deduped away), a
-    /// value the reader cannot take is its key's LIMIT and a config notice
-    /// naming the key, a `false` filed under another table still limits and
-    /// is named, and an unknown key is left to the ignored-key notice — never
-    /// a failed load, never silence.
+    /// value the reader cannot take keeps its key's default and is a config
+    /// notice naming the key (an off spelling is the key's limit — owner
+    /// ruling of 2026-09-25), a `false` filed under another table still
+    /// limits and is named, and an unknown key is left to the ignored-key
+    /// notice — never a failed load, never silence.
     #[test]
     fn the_harness_table_is_the_supervisors_policy() {
         use aterm_agent::supervise::{SuperviseOpts, SupervisorConfig};
@@ -14947,37 +14967,44 @@ mod output_streak_cfg_tests {
         // A reload that changes only a policy key is a changed Config.
         assert!(set != cfg(&text.replace("continue = false", "continue = true")));
 
-        // A refused VALUE is its key's limit and a notice naming the key; the
-        // load still stands and the rest of the table still applies.
-        let bad = cfg("[harness]\ncontinue = \"yes\"\nheadless = false\ncontine = true\n");
+        // A VALUE it cannot read keeps its key's default and is a notice
+        // naming the key; the load still stands and the rest of the table
+        // still applies (owner ruling of 2026-09-25: only an explicit setting
+        // takes power away — this was the key's limit until then).
+        let bad = cfg("[harness]\ncontinue = \"maybe\"\nheadless = false\ncontine = true\n");
         assert!(!bad.harness.policy.headless, "the other keys still apply");
         assert!(
-            !bad.harness.policy.continue_policy,
-            "the refused switch is off"
+            bad.harness.policy.continue_policy,
+            "the unreadable switch keeps its default"
         );
         assert_eq!(bad.harness.notes.len(), 2, "{:?}", bad.harness.notes);
         let notices = bad.harness_notices();
         assert_eq!(notices.len(), 1, "the unknown key is the config language's");
         assert!(
             notices[0].starts_with("config harness.continue:")
-                && notices[0].contains("yes")
-                && notices[0].contains("read as its limit"),
+                && notices[0].contains("maybe")
+                && notices[0].contains("keeps its default"),
             "{notices:?}"
         );
         let ignored = crate::native_config_language::key_warnings(
-            "[harness]\ncontinue = \"yes\"\nheadless = false\ncontine = true\n",
+            "[harness]\ncontinue = \"maybe\"\nheadless = false\ncontine = true\n",
         )
         .ignored;
         assert!(ignored.iter().any(|l| l.contains("contine")), "{ignored:?}");
-        let wrong = cfg("[harness]\nenabled = \"no\"\n");
-        assert!(!wrong.harness_enabled());
+        // An explicit off spelled `"no"` is OFF; `"yes"` is ON.
+        assert!(!cfg("[harness]\nenabled = \"no\"\n").harness_enabled());
+        assert!(cfg("[harness]\nenabled = \"yes\"\n").harness_enabled());
+        assert_eq!(
+            cfg("[harness]\napprove = \"everything\"\n").harness_approve(),
+            "all"
+        );
         // The config language's own domain check stands down for a value the
-        // reader already named: its "the default is used at load" would be
-        // false, the value being the key's limit. NEGATIVE CONTROL: without
-        // the reader's note, the domain check says it.
+        // reader already named: its words would be a second, different
+        // sentence about the same line. NEGATIVE CONTROL: without the
+        // reader's note, the domain check says it.
         let text = "[harness]\napprove = \"everything\"\n";
         let told = cfg(text).harness_notices();
-        assert!(told[0].contains("read as its limit"), "{told:?}");
+        assert!(told[0].contains("keeps its default"), "{told:?}");
         assert_eq!(
             super::unaccepted_value_notices(text, &told),
             Vec::<String>::new()
@@ -15002,7 +15029,11 @@ mod output_streak_cfg_tests {
         assert!(!presses(&cfg("[harness]\napprove = \"none\"\n")));
         assert!(
             !presses(&cfg("[harness]\napprove = 0\n")),
-            "malformed: none"
+            "`0` is an off: none"
+        );
+        assert!(
+            presses(&cfg("[harness]\napprove = \"most\"\n")),
+            "a value that is no level is no setting: all"
         );
         assert!(presses(&Config::default()));
         assert!(presses(&cfg("[harness]\napprove = \"safe\"\n")));

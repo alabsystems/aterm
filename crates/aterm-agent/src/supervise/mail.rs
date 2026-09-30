@@ -476,6 +476,14 @@ impl<L: Ctl> Lane<'_, L> {
                     kinds = false;
                     continue;
                 }
+                // An anchor the instance never minted (`ERR bad since`): the
+                // one answering is a successor that counts its ids anew (a
+                // producer before the id carry). Take up from the offset, as
+                // after an outage.
+                if r.err_text().starts_with("ERR bad since") {
+                    resync = true;
+                    continue;
+                }
                 return Err(format!("await inbox: {}", r.err_text()));
             }
             let latched = field(r.stdout.trim(), "hold").is_none();

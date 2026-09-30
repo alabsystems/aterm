@@ -271,11 +271,21 @@ pub(crate) fn is_hangup(e: &io::Error) -> bool {
 /// Whether a request is retried ONCE on a successor after a hang-up before its
 /// reply: a blocking read with no instance-local anchor. `await seq <n>` (a
 /// per-grid counter a successor restarts), `await inbox since=<id>` and
-/// `inbox get <id>` (inbox row ids: each process's fabric numbers its own rows
-/// from its own counter, and a handoff carries none of them — the same id on
-/// the successor can name a different message or none) are not — their anchor
-/// means nothing on another process, so they end with [`EXIT_REPLACED`] and a
-/// note to re-issue them. Nor is any request whose SESSION is named by its local
+/// `inbox get <id>` (inbox row ids: the successor's bridge delivers its unread
+/// rows again under ids of its own, so the same id on the successor can name a
+/// different message or none) are not — their anchor means nothing on another
+/// process, so they end with [`EXIT_REPLACED`] and a note to re-issue them.
+///
+/// NOR IS A WAIT WHOSE ANCHOR IS THE MOMENT IT WAS ARMED (round seven of the
+/// update audit, finding 16): `await block` (a command that completes AFTER
+/// the arm), a bare `await seq` (the next change after the arm) and `await
+/// consent` (a change from the posture at the arm). What they wait for is
+/// exactly what a parked producer defers to its successor — the output a
+/// finished command queued during the park is parsed there, before any retry
+/// can arm — so one asked again waited for a SECOND event and answered `OK
+/// timeout` (exit 124) for a command that had finished. They end with
+/// [`EXIT_REPLACED`] and a note to read the session before waiting again
+/// ([`not_asked_again_note`]). Nor is any request whose SESSION is named by its local
 /// number (`@<n>`, [`is_local_selector`]): a successor numbers the sessions it
 /// adopts afresh, in layout order, so `@2` there can be another tab — a person's
 /// — and an `await match` asked again could succeed on the wrong one (review of
@@ -292,13 +302,76 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
         Some("text" | "wait" | "ready") => true,
         Some("inbox") => args.is_empty(),
         Some("await") => match args.first() {
-            Some(&"seq") => args.len() < 2 || args[1].contains('='),
+            Some(&("seq" | "block" | "consent")) => false,
             Some(&"inbox") => !args.iter().any(|a| a.starts_with("since=")),
             Some(_) => true,
             None => false,
         },
         _ => false,
     }
+}
+
+/// The verb and its arguments, past a leading `@<selector>`.
+fn verb_and_args(request_parts: &[String]) -> (Option<&str>, Vec<&str>) {
+    let rest = match request_parts.first() {
+        Some(sel) if sel.starts_with('@') => &request_parts[1..],
+        _ => request_parts,
+    };
+    (
+        rest.first().map(String::as_str),
+        rest.iter().skip(1).map(String::as_str).collect(),
+    )
+}
+
+/// What a request cut by a replacement and NOT asked again tells its caller
+/// ([`retries_across_replacement`]): why it was not, and what to do instead —
+/// which differs by what the request was.
+pub(crate) fn not_asked_again_note(request_parts: &[String]) -> &'static str {
+    match verb_and_args(request_parts) {
+        (Some("turn"), _) => {
+            "a `turn` TYPES: its text may already have been typed, and submitted, in the \
+             session — read the screen (`text`) before sending it again; never retry it blind"
+        }
+        (Some("post"), _) => {
+            "the `post` may already be queued — an update carries a queued post under its id \
+             and the successor sends it — so never post it again blind: re-post it with the \
+             same `key=` (the broker keeps one), or look for it first (`outbox`, and the \
+             `post`/`post-landed` rows of `timeline`)"
+        }
+        (Some("await"), args) if matches!(args.first(), Some(&("block" | "consent"))) => {
+            "`await block` and `await consent` wait for a change after they were armed, and it \
+             may have happened during the update — read the session (`status`, `text`) before \
+             waiting again"
+        }
+        (Some("await"), args) if args.first() == Some(&"seq") && args.len() < 2 => {
+            "a bare `await seq` waits for the next change after it was armed, and the update \
+             may have made it — read the session (`status`, `text`) before waiting again"
+        }
+        _ => {
+            "this request's anchor (`seq <n>`, `since=`, an inbox id, a local `@<n>`) names a \
+             position in the old process — re-issue it"
+        }
+    }
+}
+
+/// Whether a hang-up before the reply is reported as a REPLACEMENT — followed
+/// to a successor or ended with [`EXIT_REPLACED`] and a note — rather than as a
+/// bare connection error: every blocking read ([`is_blocking_read`]), and `turn`
+/// (round seven of the update audit, finding 17). A `turn` is a write that blocks
+/// for minutes, so it is the verb most likely to be in flight when an update
+/// lands; cut there it exited 1 — "server closed the connection without
+/// responding", the refusal code — and a caller that retried it typed its
+/// prompt twice. It is never asked again ([`retries_across_replacement`]).
+///
+/// AND `post` (round seven's review, item 4): a `post --wait=` (or
+/// `--wait-ack`) parks until the bus answers, and a post queued before the
+/// park is now CARRIED to the successor and sent from there — but its caller,
+/// cut at the Commit, never learned its id and exited 1, the code callers
+/// retry, so the re-post went out beside the carried copy. It exits
+/// [`EXIT_REPLACED`] with a note not to post it again blind.
+pub(crate) fn reports_replacement(request_parts: &[String]) -> bool {
+    is_blocking_read(request_parts)
+        || matches!(verb_and_args(request_parts).0, Some("turn" | "post"))
 }
 
 /// Whether the request is a blocking read at all (so a hang-up before its reply
@@ -322,13 +395,31 @@ pub(crate) fn is_local_selector(sel: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The request a redialled `subscribe` sends: the original with its resume
-/// anchors (`since=`, `since-turn=`, `since-block=`) removed. They name
-/// positions in the OLD process — its per-grid content counter, which a
-/// successor restarts (the checkpoint a successor adopts does not carry it),
-/// and ring ids — so the successor instead sends each target's current state
-/// fresh, which is what a consumer treating the new `sub` lines as a new
-/// stream expects.
+/// The request a redialled `subscribe` sends: the original with its `since=`
+/// removed — the OLD process's per-grid content counter, which a successor
+/// restarts (the checkpoint a successor adopts does not carry it) — so the
+/// successor sends each target's current screen fresh, which is what a consumer
+/// treating the new `sub` lines as a new stream expects.
+///
+/// THE EVENT ANCHORS ARE KEPT, AND MOVED UP (round seven of the update audit,
+/// finding 51): `since-block=` and `since-turn=` name ids the handoff CARRIES —
+/// the adopted engine keeps its shell blocks and their count, the turn ids go
+/// on above the old process's — so they mean the same thing on the successor.
+/// Dropping them seeded the resumed watch at the successor's live high, and a
+/// block that completed there before the resubscribe (the finished command's
+/// output a parked producer deferred to it) was never pushed: `block-complete`
+/// lost with no `GAP`, the stream's one loss marker. The resumed request asks
+/// for everything after the newest `block-complete` and `turn` this relay has
+/// seen ([`EventAnchors`], or the original anchor when the stream showed none).
+/// A successor whose count is below such an anchor (a session it could not
+/// carry exactly) seeds at its live high, as before. A multi-target stream
+/// carries none: the server takes resume anchors for a single target only.
+///
+/// A target named as SELF (`@.`, `@`, or no selector) is pinned to the sid
+/// the stream's `sub` line named before the anchors ride with it — self is
+/// resolved again on the successor, and for a client outside every session
+/// it is whichever tab is active then; with no sid to pin it to, the anchors
+/// are left off.
 ///
 /// A target named by its LOCAL number (`@<n>`, [`is_local_selector`]) is
 /// another such anchor, and a worse one: the successor numbers its sessions
@@ -337,13 +428,73 @@ pub(crate) fn is_local_selector(sel: &str) -> bool {
 /// session id the stream's own `sub <n> <sid>` line tied it to (`sids`,
 /// [`FrameTracker::sids`]); `None` when one was never tied — it cannot be
 /// followed, and the relay ends with [`EXIT_REPLACED`].
-pub(crate) fn resume_request(request: &str, sids: &[(String, String)]) -> Option<String> {
+pub(crate) fn resume_request(
+    request: &str,
+    sids: &[(String, String)],
+    seen: &EventAnchors,
+) -> Option<String> {
+    resume_request_with(request, sids, seen, true)
+}
+
+/// THE SAME REQUEST WITH ITS SELF TARGET LEFT AS THE CLIENT WROTE IT, and no
+/// anchors — the fallback for a pinned resume the successor refused
+/// ([`resume_request`]'s pin names the session id of the stream's `sub` line;
+/// a REPLACEMENT that is not an update numbers and names its sessions afresh,
+/// so it has no such session and answers `ERR no such session`, where the
+/// stream used to go on with the successor's own session, `@.` resolved
+/// there). `None` when it would be the pinned request itself (no self target,
+/// or none to pin): there is nothing else to ask.
+pub(crate) fn unpinned_resume_request(
+    request: &str,
+    sids: &[(String, String)],
+    seen: &EventAnchors,
+) -> Option<String> {
+    let pinned = resume_request_with(request, sids, seen, true)?;
+    let unpinned = resume_request_with(request, sids, seen, false)?;
+    (unpinned != pinned).then_some(unpinned)
+}
+
+/// What one resume leg asks, in order ([`relay_subscription`]): the last
+/// leg's `request` resumed ([`resume_request`]), then the ORIGINAL request's
+/// self target as written, with no anchors ([`unpinned_resume_request`]), when
+/// that is something else to ask. `None` as [`resume_request`].
+///
+/// THE FALLBACK IS THE ORIGINAL'S, NOT THE LAST LEG'S: once an update's
+/// successor took the pinned request, the next leg's request names the sid
+/// (`@s-…`), no longer self, and a fallback derived from it was `None`. A
+/// stream that rode one update and was replaced later by a fresh instance
+/// (a quit or a crash, and a new one on the socket) exited 75 again.
+pub(crate) fn resume_lines(
+    original: &str,
+    request: &str,
+    sids: &[(String, String)],
+    seen: &EventAnchors,
+) -> Option<Vec<String>> {
+    let resumed = resume_request(request, sids, seen)?;
+    let fallback = unpinned_resume_request(original, sids, seen).filter(|own| *own != resumed);
+    Some(std::iter::once(resumed).chain(fallback).collect())
+}
+
+fn resume_request_with(
+    request: &str,
+    sids: &[(String, String)],
+    seen: &EventAnchors,
+    pin: bool,
+) -> Option<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut block = seen.block;
+    let mut turn = seen.turn;
+    let anchor = |v: &str| v.parse::<u64>().ok();
     for token in request.split_whitespace() {
-        if token.starts_with("since=")
-            || token.starts_with("since-turn=")
-            || token.starts_with("since-block=")
-        {
+        if token.starts_with("since=") {
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("since-block=") {
+            block = block.max(anchor(v));
+            continue;
+        }
+        if let Some(v) = token.strip_prefix("since-turn=") {
+            turn = turn.max(anchor(v));
             continue;
         }
         if !token.starts_with('@') {
@@ -361,9 +512,79 @@ pub(crate) fn resume_request(request: &str, sids: &[(String, String)]) -> Option
         }
         out.push(pieces.join(","));
     }
+    let selectors: Vec<&String> = out.iter().filter(|t| t.starts_with('@')).collect();
+    let single = match selectors.as_slice() {
+        [] => true,
+        [one] => !one.contains(',') && one.as_str() != "@*",
+        _ => false,
+    };
+    let self_target = selectors.first().is_none_or(|s| is_self_selector(s));
+    // SELF IS RESOLVED AGAIN, SO IT IS PINNED (round seven's review, item 3):
+    // `@.`, a bare `@` and no selector at all mean "this connection's own
+    // session", which for a client outside every session is the ACTIVE tab
+    // when the request is served. The anchors are one session's ids; applied
+    // to another (the person switched tabs, or the successor's active tab
+    // differs) they pushed that tab's long-finished blocks and turns as fresh
+    // events. So self is rewritten to the sid the stream's own `sub <n> <sid>`
+    // line named, and with none to pin it to the anchors are not sent (the
+    // successor seeds at its live high, as before).
+    let pinned = single && (!self_target || (pin && pin_self(&mut out, sids)));
+    if pinned {
+        if let Some(id) = block {
+            out.push(format!("since-block={id}"));
+        }
+        if let Some(id) = turn {
+            out.push(format!("since-turn={id}"));
+        }
+    }
     let mut line = out.join(" ");
     line.push('\n');
     Some(line)
+}
+
+/// Rewrite a self target in `out` to `@<sid>` of the one session the stream
+/// was tied to ([`self_sid`]) — in place of `@.`/`@`, or after `subscribe`
+/// when the request named no selector. `false` when there is no such sid.
+fn pin_self(out: &mut Vec<String>, sids: &[(String, String)]) -> bool {
+    let Some(sid) = self_sid(sids) else {
+        return false;
+    };
+    let at = format!("@{sid}");
+    if let Some(slot) = out.iter_mut().find(|t| is_self_selector(t)) {
+        *slot = at;
+        return true;
+    }
+    match out.iter().position(|t| t == "subscribe") {
+        Some(verb) => {
+            out.insert(verb + 1, at);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether a selector token names the connection's own session (`@.`, or a
+/// bare `@`), which the server resolves afresh on every request.
+fn is_self_selector(token: &str) -> bool {
+    token == "@." || token == "@"
+}
+
+/// The one session a single-target stream's `sub` lines tied it to, or `None`
+/// when they named none or more than one.
+fn self_sid(sids: &[(String, String)]) -> Option<&str> {
+    let (_, first) = sids.first()?;
+    sids.iter()
+        .all(|(_, sid)| sid == first)
+        .then_some(first.as_str())
+}
+
+/// The newest `block-complete` and `turn` ids a relayed `events` stream has
+/// shown its consumer, across every leg — what a resumed request asks the
+/// successor to go on after ([`resume_request`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EventAnchors {
+    pub(crate) block: Option<u64>,
+    pub(crate) turn: Option<u64>,
 }
 
 /// Whether the subscription's target set is the live `@*` roster, which never
@@ -388,6 +609,8 @@ pub(crate) struct FrameTracker {
     targets: Vec<(String, String, bool)>,
     everything: bool,
     lost: bool,
+    /// The newest block and turn ids relayed, kept across legs.
+    anchors: EventAnchors,
 }
 
 /// The longest header line the tracker keeps; a longer one is not a frame
@@ -406,10 +629,24 @@ impl FrameTracker {
     /// A redialled leg starts a new stream: new `sub` lines, new locals.
     pub(crate) fn new_leg(&mut self) {
         let everything = self.everything;
+        let anchors = self.anchors;
         *self = Self {
             everything,
+            anchors,
             ..Self::default()
         };
+    }
+
+    /// The newest `block-complete` and `turn` ids relayed so far, every leg.
+    pub(crate) fn anchors(&self) -> EventAnchors {
+        self.anchors
+    }
+
+    /// Drop the anchors: the leg now starting streams a session the old ids
+    /// say nothing about (a fallback to the successor's own self,
+    /// [`resume_lines`]).
+    pub(crate) fn forget_anchors(&mut self) {
+        self.anchors = EventAnchors::default();
     }
 
     /// Whether the stream said every one of its sessions exited.
@@ -471,6 +708,16 @@ impl FrameTracker {
                     if known == local {
                         *exited = true;
                     }
+                }
+            }
+            ["EVENT", _, "block-complete", id, ..] => {
+                if let Ok(id) = id.parse::<u64>() {
+                    self.anchors.block = self.anchors.block.max(Some(id));
+                }
+            }
+            ["EVENT", _, "turn", id, ..] => {
+                if let Ok(id) = id.parse::<u64>() {
+                    self.anchors.turn = self.anchors.turn.max(Some(id));
                 }
             }
             ["DELTA", _, _, "screen", rows, ..] => match rows.parse::<u64>() {
@@ -568,6 +815,8 @@ pub(crate) fn relay_subscription(
     }
     // What the next leg asks for: the original, then each resumed form — whose
     // local targets are already sids, so a later leg's new numbers never matter.
+    // The ORIGINAL is kept for the fallback to self ([`resume_lines`]).
+    let original = request.to_string();
     let mut request = request.to_string();
     let mut dialed = first.dialed.to_string();
     let mut server = first.server;
@@ -601,7 +850,8 @@ pub(crate) fn relay_subscription(
         });
         let _ = stream.set_write_timeout(Some(handshake));
         let _ = stream.set_read_timeout(Some(handshake));
-        let Some(resumed) = resume_request(&request, &tracker.sids()) else {
+        let Some(lines) = resume_lines(&original, &request, &tracker.sids(), &tracker.anchors())
+        else {
             super::stderr_line(&format!(
                 "aterm was replaced (pid {} -> {pid}), and this subscription names a session by \
                  its local number (`@<n>`), which the successor numbers afresh and the stream \
@@ -610,19 +860,88 @@ pub(crate) fn relay_subscription(
             ))?;
             return Ok(ExitCode::from(EXIT_REPLACED));
         };
-        if super::send_request(&stream, super::read_token_for(&path).as_deref(), &resumed).is_err()
-        {
+        // The pinned request first. A successor that does not know the pinned
+        // session — a REPLACEMENT with sessions of its own, not an update,
+        // which carries them — refuses it, and the stream falls back ONCE to
+        // its self target as written, resolved there, with no anchors (they
+        // are one session's ids): it goes on with the successor's own
+        // session, as it did before self was pinned.
+        let mut first = Some(stream);
+        let (mut served, mut resend, mut refused) = (false, false, String::new());
+        for (asked, line) in lines.iter().enumerate() {
+            let stream = match first.take() {
+                Some(stream) => stream,
+                None => match CtlStream::connect(aterm_uds::latest::resolve(&path)) {
+                    Ok(stream) => stream,
+                    Err(_) => {
+                        resend = true;
+                        break;
+                    }
+                },
+            };
+            let _ = stream.set_write_timeout(Some(handshake));
+            let _ = stream.set_read_timeout(Some(handshake));
+            if super::send_request(&stream, super::read_token_for(&path).as_deref(), line).is_err()
+            {
+                resend = true;
+                break;
+            }
+            let mut reader = BufReader::new(&stream);
+            let mut status = String::new();
+            let got = super::read_bounded_line(&mut reader, &mut status);
+            let status = status.trim_end_matches(['\r', '\n']);
+            if !matches!(got, Ok(n) if n > 0) || !status.starts_with("OK") {
+                refused = status.to_string();
+                // ONLY A SUCCESSOR WITHOUT THE SESSION is asked for its own
+                // self. Any other refusal of the pin (a busy socket, a halt, a
+                // denial) comes from one that may well hold it — an update's —
+                // and falling back there moved the stream to whichever tab was
+                // active, its anchors dropped.
+                if refused != NO_SUCH_SESSION {
+                    break;
+                }
+                continue;
+            }
+            super::stderr_line(status)?;
+            if asked == 0 {
+                super::stderr_line(&format!(
+                    "aterm was replaced (pid {} -> {pid}, an update); the stream resumed on \
+                     {path} — screen frames between the two were not delivered, and each \
+                     target starts over with its current state; its block and turn events go \
+                     on after the last ones relayed",
+                    server.unwrap_or(0)
+                ))?;
+            } else {
+                super::stderr_line(&format!(
+                    "aterm was replaced (pid {} -> {pid}) by an instance that holds none of this \
+                     stream's sessions — not an update's successor; the stream resumed on \
+                     {path} at that instance's own session, which starts over with its current \
+                     state and its own block and turn events",
+                    server.unwrap_or(0)
+                ))?;
+            }
+            request.clone_from(line);
+            tracker.new_leg();
+            if asked > 0 {
+                // The old anchors are another instance's ids: kept, the next
+                // update's resume would ask this session for blocks after
+                // them and skip its own below them.
+                tracker.forget_anchors();
+            }
+            if let Leg::Timeout = pump(&stream, &mut reader, out, &mut tracker, watch)? {
+                return Ok(ExitCode::from(super::EXIT_TIMEOUT));
+            }
+            served = true;
+            break;
+        }
+        if resend {
             dialed = path;
             server = Some(pid);
             continue;
         }
-        let mut reader = BufReader::new(&stream);
-        let mut status = String::new();
-        let got = super::read_bounded_line(&mut reader, &mut status);
-        let status = status.trim_end_matches(['\r', '\n']);
-        if !matches!(got, Ok(n) if n > 0) || !status.starts_with("OK") {
-            if !status.is_empty() {
-                super::stderr_line(status)?;
+        if !served {
+            if !refused.is_empty() {
+                super::stderr_line(&refused)?;
             }
             super::stderr_line(&format!(
                 "aterm was replaced (pid {} -> {pid}), and its successor did not resume this \
@@ -631,22 +950,13 @@ pub(crate) fn relay_subscription(
             ))?;
             return Ok(ExitCode::from(EXIT_REPLACED));
         }
-        super::stderr_line(status)?;
-        super::stderr_line(&format!(
-            "aterm was replaced (pid {} -> {pid}, an update); the stream resumed on {path} — \
-             frames between the two were not delivered, and each target starts over with its \
-             current state",
-            server.unwrap_or(0)
-        ))?;
-        request = resumed;
-        tracker.new_leg();
-        if let Leg::Timeout = pump(&stream, &mut reader, out, &mut tracker, watch)? {
-            return Ok(ExitCode::from(super::EXIT_TIMEOUT));
-        }
         dialed = path;
         server = Some(pid);
     }
 }
+
+/// The server's refusal of a target it holds no session for.
+const NO_SUCH_SESSION: &str = "ERR no such session";
 
 /// The note for a hang-up nothing replaced ([`Hangup::Gone`]'s fields).
 pub(crate) fn gone_note(server: Option<u32>, waited: Duration, by_deadline: bool) -> String {

@@ -588,18 +588,87 @@ pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::Machin
 /// How often a launch runs `aterm pkg machine apply` on its own: once a day.
 pub const LAUNCH_APPLY_EVERY_SECS: u64 = 24 * 60 * 60;
 
+/// The one line a launch logs when it skips the day's apply under a private state root
+/// ([`LaunchApply::PrivateStateRoot`]).
+pub const PRIVATE_STATE_ROOT_SKIP: &str = "atpkg machine apply: skipped at launch \u{2014} \
+     this process runs under a private state root (ATERM_STATE_HOME), and the [machine] \
+     settings are this Mac's; the day's slot is left unclaimed, and `aterm pkg machine apply` \
+     typed in a terminal still applies them";
+
+/// What a launch does about the day's `aterm pkg machine apply` ([`launch_apply_due`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchApply {
+    /// This launch claimed the day's slot: it runs the apply.
+    Due,
+    /// Another launch holds the day's slot: nothing runs.
+    NotDue,
+    /// This process runs under a private state root
+    /// (`aterm_types::dirs::runs_under_private_state_root`): nothing runs, and the slot
+    /// was never claimed, so the day's apply stays the owner's ([`PRIVATE_STATE_ROOT_SKIP`]).
+    PrivateStateRoot,
+}
+
+impl LaunchApply {
+    /// Whether the launch runs the apply. A skip under a private state root hands its one
+    /// line to `say` first, which the callers log at info in their own log (the window's
+    /// `aterm.log`, the session's): the decision is the launch's, not a pass's, so
+    /// `packages.log`, which records passes, has no place for it, and atpkg's notice route
+    /// (`crate::notice::say`) would log it at warn, which a skip on purpose is not.
+    pub fn runs(self, say: impl FnOnce(&'static str)) -> bool {
+        match self {
+            Self::Due => true,
+            Self::NotDue => false,
+            Self::PrivateStateRoot => {
+                say(PRIVATE_STATE_ROOT_SKIP);
+                false
+            }
+        }
+    }
+}
+
 /// Whether this launch runs the day's `aterm pkg machine apply`: it claims the one daily
 /// slot in `machine-apply.stamp` ([`aterm_update_core::pkg_check::claim`]). A terminal
 /// session and a window opening both claim it here, so their walk of `$HOME` runs once a
 /// day between them, not at every tab and every window; an edit to `[machine]` rides the
 /// next pass ([`changed_since_applied`]) and Settings' Apply now runs at once, unclaimed.
+///
+/// NOT UNDER A PRIVATE STATE ROOT (ruling 409, 2026-09-29): a development build given its
+/// own `ATERM_STATE_HOME` (AGENTS.md's recipe for a real Claude Code session keeps the
+/// owner's `$HOME`) shares this prefix, so it would take the owner's slot for the day and
+/// apply its own `[machine]` table to the owner's Mac. It stands aside BEFORE the claim
+/// (`launch_apply_decision`, below). The seam is read here, not by the callers, and the
+/// half that takes the answer injected is private to this module, so no launch lane can
+/// claim without asking (ruling 410); a shipped binary reads no seam and is unchanged.
 #[must_use]
-pub fn launch_apply_due(layout: &crate::store::Layout, now_unix: i64) -> bool {
-    aterm_update_core::pkg_check::claim(
+pub fn launch_apply_due(layout: &crate::store::Layout, now_unix: i64) -> LaunchApply {
+    launch_apply_decision(
+        layout,
+        now_unix,
+        aterm_types::dirs::runs_under_private_state_root(),
+    )
+}
+
+/// [`launch_apply_due`] with the private-state-root answer injected: under one, the launch
+/// stands aside before anything is claimed; otherwise it claims the day's slot. Private,
+/// so only this module's tests pass the answer in.
+#[must_use]
+fn launch_apply_decision(
+    layout: &crate::store::Layout,
+    now_unix: i64,
+    private_state_root: bool,
+) -> LaunchApply {
+    if private_state_root {
+        return LaunchApply::PrivateStateRoot;
+    }
+    if aterm_update_core::pkg_check::claim(
         &layout.machine_apply_stamp(),
         now_unix,
         LAUNCH_APPLY_EVERY_SECS,
-    )
+    ) {
+        LaunchApply::Due
+    } else {
+        LaunchApply::NotDue
+    }
 }
 
 #[cfg(test)]
@@ -623,12 +692,94 @@ mod tests {
         };
         let now = 1_790_000_000_i64;
         let day = i64::try_from(LAUNCH_APPLY_EVERY_SECS).unwrap();
-        assert!(launch_apply_due(&layout, now));
-        assert!(!launch_apply_due(&layout, now + 60));
-        assert!(!launch_apply_due(&layout, now + day - 1));
-        assert!(launch_apply_due(&layout, now + day));
+        // The owner's process: no private state root (injected — the live answer is the
+        // environment's, which this test must not depend on).
+        let due = |at| launch_apply_decision(&layout, at, false);
+        assert_eq!(due(now), LaunchApply::Due);
+        assert_eq!(due(now + 60), LaunchApply::NotDue);
+        assert_eq!(due(now + day - 1), LaunchApply::NotDue);
+        assert_eq!(due(now + day), LaunchApply::Due);
         assert!(layout.machine_apply_stamp().is_file());
         let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// A PRIVATE STATE ROOT LEAVES THE DAY'S SLOT TO THE OWNER (ruling 409). Under it a
+    /// launch runs nothing and claims nothing: no stamp is written, however often it asks,
+    /// so the owner's first launch of the day still claims the slot and applies. Unset, the
+    /// decision is today's (the test above). `runs` says the skip's one line and nothing
+    /// else does.
+    #[test]
+    fn a_private_state_root_skips_the_launch_apply_before_the_claim() {
+        let prefix = std::env::temp_dir().join(format!(
+            "atpkg-machine-private-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = crate::store::Layout {
+            prefix: prefix.clone(),
+        };
+        let now = 1_790_000_000_i64;
+        for at in [now, now + 60, now + 2 * 86_400] {
+            assert_eq!(
+                launch_apply_decision(&layout, at, true),
+                LaunchApply::PrivateStateRoot
+            );
+        }
+        assert!(
+            !layout.machine_apply_stamp().exists(),
+            "the skip precedes the claim: no stamp"
+        );
+        // The owner's launch, the same second: the slot is still there to take.
+        assert_eq!(launch_apply_decision(&layout, now, false), LaunchApply::Due);
+        assert!(layout.machine_apply_stamp().is_file());
+        // And a private launch after the owner's claim still skips, not "not due".
+        assert_eq!(
+            launch_apply_decision(&layout, now + 1, true),
+            LaunchApply::PrivateStateRoot
+        );
+
+        let mut said = Vec::new();
+        assert!(!LaunchApply::PrivateStateRoot.runs(|line| said.push(line)));
+        assert_eq!(said, [PRIVATE_STATE_ROOT_SKIP]);
+        assert!(LaunchApply::Due.runs(|line| said.push(line)));
+        assert!(!LaunchApply::NotDue.runs(|line| said.push(line)));
+        assert_eq!(said.len(), 1, "only the skip says anything");
+        assert!(
+            PRIVATE_STATE_ROOT_SKIP.contains("private state root (ATERM_STATE_HOME)")
+                && PRIVATE_STATE_ROOT_SKIP.contains("`aterm pkg machine apply`"),
+            "the line names why and what still applies: {PRIVATE_STATE_ROOT_SKIP}"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// THE LIVE CLAIM ASKS THE SEAM ITSELF, and the skip precedes the claim in source
+    /// order too: the callers (the window's one-shot, a terminal session's) hold no
+    /// flag they could get wrong. A scrape, since the live answer is the environment's.
+    #[test]
+    fn the_live_launch_claim_reads_the_private_root_before_the_slot() {
+        let src = include_str!("machine.rs");
+        let body = |name: &str| {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name}"));
+            let rest = &src[start..];
+            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+        };
+        let live = body("pub fn launch_apply_due(");
+        assert!(
+            live.contains("aterm_types::dirs::runs_under_private_state_root()")
+                && live.contains("launch_apply_decision("),
+            "{live}"
+        );
+        assert!(!live.contains("pkg_check::claim("), "{live}");
+        // The injected half is PRIVATE (ruling 410): a caller outside this module cannot
+        // hand in `false`.
+        assert!(!src.contains(concat!("pub fn ", "launch_apply_decision(")));
+        assert!(!src.contains(concat!("pub(crate) fn ", "launch_apply_decision(")));
+        let decision = body("\nfn launch_apply_decision(");
+        let skip = decision.find("if private_state_root {").expect("the skip");
+        let claim = decision.find("pkg_check::claim(").expect("the claim");
+        assert!(skip < claim, "{skip} {claim}");
     }
 
     /// THE PASSES CARRY ONLY AN EDIT (Phase 3): a machine that never applied the `[machine]`

@@ -1113,10 +1113,10 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 #   * it refuses BEFORE any compile. trust-gate's refusal is a mid-build
 #     abort, and FAILSAFE POLICY (the header) makes a condition a pre-flight
 #     can detect a skip, never that;
-#   * the PUBLIC snapshot ships this script with a stock pin
-#     (publish/public-rust-toolchain.toml). There trust-gate stands down
-#     (gate::tree_pins_trust) and a Homebrew cargo DOES build silently, with
-#     whatever rustc PATH holds.
+#   * a tree whose committed pin names a stock channel (the PUBLIC snapshot
+#     did until 2026-09-29; it now pins `trust` too) stands trust-gate down
+#     (gate::tree_pins_trust), and there a Homebrew cargo DOES build silently,
+#     with whatever rustc PATH holds.
 # On a Mac the proxy is the one that loses:
 # path_helper puts the system dirs FIRST in every login shell's INHERITED PATH,
 # so a terminal spawned from a terminal finds /usr/local/bin/cargo before
@@ -1633,9 +1633,11 @@ cargo_build_pinned() { # <root>
 	fi
 }
 # <<< cargo-pin gate
-# PUBLIC BOUNDARY: the rustup lane in the block above is the PUBLIC snapshot's source
-# build (its export pins stock Rust; publish/transforms.sh). The dev tree builds with
-# the aterm-managed Trust targo only — tools/dev-app.sh refuses the rustup lane.
+# The rustup lane in the block above serves a tree whose pin names a stock channel,
+# or a `trust` link rustup resolves with no aterm-managed store in reach. The public
+# snapshot pins `trust` like the dev tree (2026-09-29), so on a machine with aterm
+# both take the store lane. The dev tree builds with the aterm-managed Trust targo
+# only — tools/dev-app.sh refuses the rustup lane.
 
 # Does <name> parse as a rustup DIST toolchain, one `rustup toolchain install`
 # can fetch? rustup's grammar (`rustup help toolchain`, 1.29.1):
@@ -3102,9 +3104,9 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 			#     rustup at all) and the ~/.rustup/toolchains/trust seam
 			#     rustup resolves the pin through (crates/atpkg/src/seam.rs)
 			#     — and the Trust tarballs, hand-linked, second;
-			#   * a rustup DIST channel. The PUBLIC snapshot ships this script
-			#     with publish/public-rust-toolchain.toml's stock
-			#     `channel = "1.97.1"`, which one `rustup toolchain install`
+			#   * a rustup DIST channel (the PUBLIC snapshot pinned stock
+			#     `channel = "1.97.1"` until 2026-09-29; it now pins `trust`,
+			#     like the dev tree), which one `rustup toolchain install`
 			#     fetches. The no-download listing above no longer installs it,
 			#     so the skip names that command. The Trust recipe would have
 			#     the user link Trust under the stock name.

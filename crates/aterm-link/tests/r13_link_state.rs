@@ -42,6 +42,19 @@ const BACKOFF_TICK: Duration = Duration::from_secs(5);
 /// `ACK_DEADLINE` in `bridge.rs`.
 const ACK_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long the killed broker stays down before the restart: long enough that
+/// the reconnect bound below says something about [`BACKOFF_TICK`].
+///
+/// The bridge redials from `RECONNECT_MIN` (100 ms), doubling. CAPPED at
+/// `RECONNECT_MAX` its dials land about 0.1, 0.3, 0.7, 1.5, 3.1, 6.3, 11.3, 16.3,
+/// 21.3, 26.3, 31.3 s after the kill; UNCAPPED they land at 12.7, 25.5, 51.1 s.
+/// Restarted a fraction of a second after the kill (as this test did until
+/// 2026-09-29), both redial at once, and a bridge whose back-off never capped
+/// passed the "within a back-off tick" bound in 133 ms (measured with the cap
+/// deleted). Restarted at 30 s, the capped bridge redials within one tick and the
+/// uncapped one waits until 51.1 s — over 20 s, twice the bound.
+const OUTAGE: Duration = Duration::from_secs(30);
+
 /// The `key=` value of a whitespace-token header.
 fn kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.split_whitespace()
@@ -134,10 +147,24 @@ fn a_killed_broker_stalls_the_fabric_within_a_backoff_tick_and_a_restart_reconne
     assert!(s.contains(&format!(" fabric_rtt_ms={rtt} ")), "{s}");
 
     // A WAIT ON A STALLED FABRIC IS REFUSED AT ONCE, and the post stays queued.
+    // "At once" is against the product's clocks, not this post's `--wait`:
+    // nothing on the refusal path waits (the endpoint reads the link state the
+    // bridge already reported), so a late refusal is one that picked up a
+    // bridge clock — its next report, one back-off tick away, and an ack
+    // deadline after it — or sat out the `--wait` itself. The bound is the sum
+    // of the two clocks, which leaves a loaded gate's verb round trip 10 s
+    // where 5 s left it none. The accepted loss: a refusal delayed by ONE of
+    // them (5 s) passes here when the round trip is short; aterm-gui's
+    // in-process `the_link_is_the_bridges_to_report_and_stalled_refuses_a_wait_at_once`
+    // still bounds the refusal under 5 s with no socket in between.
+    const WAIT: Duration = Duration::from_secs(30);
+    const AT_ONCE: Duration = BACKOFF_TICK.saturating_add(ACK_DEADLINE);
+    const _: () = assert!(AT_ONCE.as_secs() < WAIT.as_secs());
     let asked = Instant::now();
     let reply = w
         .verb(&format!(
-            "@{sid} post to=@{sid} kind=note --wait=30000 still there?"
+            "@{sid} post to=@{sid} kind=note --wait={} still there?",
+            WAIT.as_millis()
         ))
         .header()
         .to_string();
@@ -147,8 +174,8 @@ fn a_killed_broker_stalls_the_fabric_within_a_backoff_tick_and_a_restart_reconne
         "{reply}"
     );
     assert!(
-        answered_in < Duration::from_secs(5),
-        "refused at once, not after the 30 s wait: {answered_in:?}"
+        answered_in < AT_ONCE,
+        "refused at once, not after a bridge clock or the {WAIT:?} wait: {answered_in:?}"
     );
     let post_id: u64 = reply
         .split_whitespace()
@@ -163,6 +190,12 @@ fn a_killed_broker_stalls_the_fabric_within_a_backoff_tick_and_a_restart_reconne
         "the refused post is still queued"
     );
 
+    // THE SCENARIO: the outage is held open until the back-off has had room
+    // to grow past its cap (see `OUTAGE`).
+    if let Some(left) = OUTAGE.checked_sub(killed_at.elapsed()) {
+        std::thread::sleep(left);
+    }
+
     // RESTART IT on the same socket, and the bridge comes back on its own —
     // within one back-off tick plus its attach.
     let restarted_at = Instant::now();
@@ -172,15 +205,13 @@ fn a_killed_broker_stalls_the_fabric_within_a_backoff_tick_and_a_restart_reconne
         .expect("serve the same socket again");
     w.broker = Some(broker);
     w.handle = Some(handle);
-    let connected_in = until_within(
-        BACKOFF_TICK + Duration::from_secs(10),
-        "fabric=connected after the restart",
-        || {
-            status(&w)
-                .contains(" fabric=connected ")
-                .then(|| restarted_at.elapsed())
-        },
-    );
+    // A hang detector; the bound is the assertion below, which reads the
+    // measured number (an uncapped back-off reconnects, late, inside it).
+    let connected_in = until("fabric=connected after the restart", || {
+        status(&w)
+            .contains(" fabric=connected ")
+            .then(|| restarted_at.elapsed())
+    });
     eprintln!(
         "MEASURED restarted broker -> fabric=connected: {} ms",
         connected_in.as_millis()
@@ -190,8 +221,9 @@ fn a_killed_broker_stalls_the_fabric_within_a_backoff_tick_and_a_restart_reconne
         "reconnect within a back-off tick and an attach: {connected_in:?}"
     );
     // ...and the post it refused to wait on is delivered by the reconnected
-    // bridge: to itself, through the broker, into its own inbox.
-    let landed_by = Instant::now() + Duration::from_secs(20);
+    // bridge: to itself, through the broker, into its own inbox. (A hang
+    // detector: the loop leaves the moment the row lands.)
+    let landed_by = Instant::now() + harness::DEADLINE;
     loop {
         // The endpoint pct-encodes the space and leaves `?` as it is.
         if w.inbox(&sid)
@@ -314,8 +346,9 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_after_the_ack_deadline() {
     });
     // The accept precedes the attach the poll saw, so it is already in the
     // channel; measure from it, and record how far behind it the poll was.
+    // A hang detector for the stub thread's send, which it made at the accept.
     let attached_at = accepted_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(harness::DEADLINE)
         .expect("the stub accepted the bridge's dial before the attach was seen");
     eprintln!(
         "MEASURED the first poll saw the attach {} ms after the stub accepted",
@@ -384,15 +417,13 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
     });
     let sid = boot_sid(&w);
     let booted = Instant::now();
-    let stalled_in = until_within(
-        BACKOFF_TICK + Duration::from_secs(2),
-        "fabric=stalled reason=read",
-        || {
-            let fs = fabric_status(&w);
-            (kv(&fs, "state") == Some("stalled") && kv(&fs, "reason") == Some("read"))
-                .then(|| booted.elapsed())
-        },
-    );
+    // A hang detector (nothing bounds `stalled_in`; it is printed as the
+    // measurement), so the harness's minute rather than one back-off tick.
+    let stalled_in = until("fabric=stalled reason=read", || {
+        let fs = fabric_status(&w);
+        (kv(&fs, "state") == Some("stalled") && kv(&fs, "reason") == Some("read"))
+            .then(|| booted.elapsed())
+    });
     eprintln!(
         "MEASURED refused halt read -> stalled reason=read: {} ms after boot",
         stalled_in.as_millis()

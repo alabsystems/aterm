@@ -1150,6 +1150,14 @@ pub(crate) struct Adopted {
     /// `keeper_link::register`; dropped with no session registered, it
     /// releases the keeper's copy. `None` for an update's handoff.
     pub keeper: Option<crate::keeper_link::Claim>,
+    /// THE MAILBOX THE HANDOFF CARRIED (round seven of the update audit,
+    /// findings 6, 8 and 28): the record's posts still waiting, receipts still
+    /// owed and id counters, put back by [`seed_adopted_fabric`]. Empty for
+    /// every fresh construction and from a producer that predates the carry.
+    pub fabric: crate::fabric::FabricCarry,
+    /// The record's newest timeline id (round seven, finding 50): the adopted
+    /// timeline counts on above it ([`mark_handoff_gap`]). `0`: none carried.
+    pub timeline_id: u64,
 }
 
 /// THE HANDOFF GAP (round five, item 17): an adopted session's timeline, cast
@@ -1159,17 +1167,24 @@ pub(crate) struct Adopted {
 /// carried=0 from_build=<n>` row, the cast header's `aterm_handoff`, `temporal
 /// status`'s tail. [`spawn_session`] calls it for an adopted session before any
 /// other row reaches its timeline, so the gap is the first thing a reader sees.
+///
+/// The timeline's ids go on above `timeline_id`, the last one the outgoing
+/// process handed out (round seven of the update audit, finding 50), so the gap
+/// row — and every row after it — is above any `timeline since=` anchor a
+/// driver took before the update.
 pub(crate) fn mark_handoff_gap(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     cast: &std::sync::Mutex<crate::cast::CastRecorder>,
     temporal: &std::sync::Mutex<crate::temporal::TemporalRecorder>,
     from_build: Option<u64>,
+    timeline_id: u64,
 ) {
     let gap = crate::session_timeline::HandoffGap { from_build };
-    timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record("handoff", gap.payload());
+    {
+        let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        tl.continue_ids(timeline_id);
+        tl.record("handoff", gap.payload());
+    }
     cast.lock()
         .unwrap_or_else(|p| p.into_inner())
         .mark_handoff(gap);
@@ -1196,6 +1211,7 @@ pub(crate) fn seed_adopted_fabric(
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
     topics: &[String],
     hold: Option<&str>,
+    carry: &crate::fabric::FabricCarry,
 ) {
     // THE BROADCAST OPT-INS THE HANDOFF CARRIED. Receiver-side consent is the
     // whole safety story of `post to=say:<topic>`, and consent that evaporates
@@ -1207,6 +1223,11 @@ pub(crate) fn seed_adopted_fabric(
     if let Some(row) = hold {
         fabric.seed_hold(crate::fabric::parse_hold(row), timeline);
     }
+    // THE MAILBOX (round seven, findings 6/8/28): the posts a sender was told
+    // are queued, the receipts still owed, and the id counters the sid's
+    // bridge pins are keyed by — each id this session hands out from here is
+    // above the old process's.
+    fabric.seed_carry(carry, timeline);
 }
 
 /// THE ADOPTED SHELL'S NONCE, authorized on the successor engine right after
@@ -1567,6 +1588,12 @@ pub(crate) fn spawn_session(
         .map(|adopted| adopted.topics.clone())
         .unwrap_or_default();
     let adopt_hold: Option<String> = adopt.as_ref().and_then(|adopted| adopted.hold.clone());
+    // …and the carried mailbox and the timeline's last id (round seven).
+    let adopt_fabric: crate::fabric::FabricCarry = adopt
+        .as_ref()
+        .map(|adopted| adopted.fabric.clone())
+        .unwrap_or_default();
+    let adopt_timeline_id: u64 = adopt.as_ref().map_or(0, |adopted| adopted.timeline_id);
     // …and the build that handed it across, for the handoff gap.
     let adopt_from_build: Option<u64> = adopt.as_ref().and_then(|adopted| adopted.outgoing_build);
     // …and the title the handoff record names, for a checkpoint without one.
@@ -1910,6 +1937,7 @@ pub(crate) fn spawn_session(
         human_input: Default::default(),
         generation_look: Default::default(),
         reset_lane: Default::default(),
+        update_parked: Default::default(),
     });
     // ROOT session only: record the edges the OUTER aterm preminted for us (from
     // our injected env), so it holds the read/write/signal authority it granted.
@@ -1920,7 +1948,13 @@ pub(crate) fn spawn_session(
     // start here, empty, and say so — first, before the fabric and claim
     // seeds below write their rows.
     if adopted {
-        mark_handoff_gap(&ctx.timeline, &ctx.cast, &ctx.temporal, adopt_from_build);
+        mark_handoff_gap(
+            &ctx.timeline,
+            &ctx.cast,
+            &ctx.temporal,
+            adopt_from_build,
+            adopt_timeline_id,
+        );
     }
     // THE FABRIC THE HANDOFF CARRIED — broadcast opt-ins and the standing
     // halt — before this session can be registered, let alone driven. Nothing
@@ -1930,6 +1964,7 @@ pub(crate) fn spawn_session(
         &ctx.timeline,
         &adopt_topics,
         adopt_hold.as_deref(),
+        &adopt_fabric,
     );
     // THE CLAIM AND THE ESCALATIONS THE HANDOFF CARRIED (round four, item 9):
     // another supervisor's lease, so its next renewal renews it here and this
@@ -2356,7 +2391,7 @@ mod adoption_wiring_tests {
             let timeline = StdMutex::new(crate::session_timeline::SessionTimeline::default());
             let cast = StdMutex::new(crate::cast::CastRecorder::new(80, 24));
             let temporal = StdMutex::new(crate::temporal::TemporalRecorder::new());
-            super::mark_handoff_gap(&timeline, &cast, &temporal, from_build);
+            super::mark_handoff_gap(&timeline, &cast, &temporal, from_build, 0);
             // …and a row recorded after it (the fabric seed, the registration).
             timeline
                 .lock()
@@ -2408,6 +2443,7 @@ mod adoption_wiring_tests {
             "ctx.cast",
             "ctx.temporal",
             "adopt_from_build",
+            "adopt_timeline_id",
         ] {
             assert!(args.contains(arg), "the call hands over `{arg}`: {args}");
         }
@@ -2443,7 +2479,13 @@ mod adoption_wiring_tests {
             .collect();
         assert_eq!(calls.len(), 1, "one seed, for every adopted session");
         let args = &calls[0][..calls[0].find(");").expect("the call ends")];
-        for arg in ["ctx.fabric", "ctx.timeline", "adopt_topics", "adopt_hold"] {
+        for arg in [
+            "ctx.fabric",
+            "ctx.timeline",
+            "adopt_topics",
+            "adopt_hold",
+            "adopt_fabric",
+        ] {
             assert!(args.contains(arg), "the call hands over `{arg}`: {args}");
         }
         for inline in [
@@ -3356,6 +3398,9 @@ pub(crate) fn prepare_deferred_reader(
 /// the reader that posted it.
 fn reset_reader_latches(session: &Session) {
     session.reader_stop.store(false, Ordering::Release);
+    // Output is consumed again from here: the control waits measure idle and
+    // submit windows on their own clocks once more (`SessionCtx::update_parked`).
+    session.ctx.update_parked.store(false, Ordering::Release);
     // Relaxed matches the latch protocol everywhere else: grid content is
     // synchronized by the term mutex, the latch only governs wake delivery.
     session.output_wake_pending.store(0, Ordering::Relaxed);
@@ -3565,6 +3610,12 @@ pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
     let Some(join) = session.reader_join.take() else {
         return true; // never attached, already parked, or deferred
     };
+    // From the stop on, nothing here consumes this session's output: say so to
+    // the control waits before the reader is told (`SessionCtx::update_parked`).
+    session
+        .ctx
+        .update_parked
+        .store(true, std::sync::atomic::Ordering::Release);
     if session.wake_wr >= 0 {
         aterm_pty::wake(session.wake_wr);
     }
@@ -3648,6 +3699,14 @@ mod park_reader_tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
         ));
         assert!(session.reader_join.is_none());
+        // Parked, whatever the verdict: the control waits hold their clocks
+        // (round seven, findings 62 and 63).
+        assert!(
+            session
+                .ctx
+                .update_parked
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
     }
 
     /// A park leaves the wake latch armed with an event no handler will consume
@@ -3666,8 +3725,20 @@ mod park_reader_tests {
         session
             .reader_stop
             .store(true, std::sync::atomic::Ordering::Release);
+        session
+            .ctx
+            .update_parked
+            .store(true, std::sync::atomic::Ordering::Release);
 
         super::reset_reader_latches(&session);
+
+        assert!(
+            !session
+                .ctx
+                .update_parked
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a re-attached reader consumes output again: the waits run on their clocks"
+        );
 
         assert!(
             !session

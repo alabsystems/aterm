@@ -105,16 +105,6 @@
 //                         too (see the table). TS-3's cost is buried inside
 //                         the `bed_off` number; only an A/B of the fix prices
 //                         it.
-//   bed_variant/<cand>    The ambient-bed TOURNAMENT candidates behind
-//                         `set_bed_variant` — audition-only (no host path
-//                         reaches them), pricing their per-sample
-//                         `melody_hz`/LFO work against `bed/water_on`, which
-//                         IS `BedVariant::Current`. `bed_variant/silence` is
-//                         also the CONTROL the bed pair above cannot be: the
-//                         identical warm state with the bed body silenced and
-//                         everything else — voices, RNG history, grain
-//                         history — held fixed, so `water_on - silence` is the
-//                         bed body's true cost.
 //   buffer/<frames>       128/256/512/1024-frame buffers from one warm state:
 //                         separates per-BLOCK overhead (`tick_bed`, the rate
 //                         decay's `exp`) from per-SAMPLE cost. 512 is the
@@ -140,7 +130,7 @@
 // COST — and because every fix in this module is judged against BYTE identity
 // (`palettes_render_byte_identical_to_v056_reference`,
 // `brrrring_of_rapid_line_feeds_is_pinned`, `deterministic`'s mech row,
-// `bed_variants_render_deterministically_and_decay_to_exact_silence`), a
+// `the_bed_renders_deterministically_and_decays_to_exact_silence`), a
 // "faster" variant that quietly changed the AUDIO shows up here as a changed
 // checksum instead of hiding behind a green benchmark.
 //
@@ -178,9 +168,9 @@
 //     more like the working set than the flag scan.)
 //   * TS-3's bed layer is cheaper than a per-sample `sinf` count suggests, and
 //     the off/on pair CANNOT price it: `bed/lumen_on` measured 2.0 us FASTER
-//     than `bed/lumen_off` — noise, not a discount. The clean control is
-//     `bed_variant/silence` against `bed/water_on`, identical state with only
-//     the bed body silenced: 21.0 vs 23.3 us, so Water's entire live bed is
+//     than `bed/lumen_off` — noise, not a discount. The clean control was the
+//     since-retired `bed_variant/silence` against `bed/water_on`, identical
+//     state with only the bed body silenced: 21.0 vs 23.3 us, so Water's entire live bed is
 //     2.3 us/buffer (10 %) and the structurally-silent default's per-sample
 //     call+compare is necessarily well under that.
 
@@ -191,8 +181,7 @@ use aterm_effects::tone::{
     self, BUCKETS, MIN_NGRAMS, Tone, ToneModel, ToneScratch, for_each_ngram_bucket,
 };
 use aterm_effects::trail_sound::{
-    BedVariant, CHANNELS, CelebrationGesture, SoundEvent, SoundGesture, SoundKind, SoundVoice,
-    TrailSynth,
+    CHANNELS, CelebrationGesture, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth,
 };
 use criterion::measurement::WallTime;
 use criterion::{
@@ -714,26 +703,6 @@ fn workloads() -> Vec<Workload> {
         }
     }
 
-    // The tournament candidates, against `bed/water_on` (= `Current`).
-    for (name, variant) in [
-        ("chord_drift", BedVariant::ChordDrift),
-        ("breathing", BedVariant::Breathing),
-        ("shimmer", BedVariant::Shimmer),
-        ("silence", BedVariant::Silence),
-    ] {
-        let (mut end, _) = typing_states(GlowStyle::Water, SoundVoice::Style, true);
-        end.set_bed_variant(variant);
-        out.push(Workload {
-            kind: "bed_variant",
-            param: name.into(),
-            frames: FRAMES,
-            warm: end,
-            live: (1, 24),
-            voices: Voices::Audible,
-            bed: Bed::Live,
-        });
-    }
-
     // Block size: one state, four buffer lengths.
     let (_, busiest) = typing_states(GlowStyle::Lumen, SoundVoice::Style, false);
     for frames in [128usize, 256, 512, 1024] {
@@ -771,27 +740,6 @@ fn workloads() -> Vec<Workload> {
     out
 }
 
-/// Cross-workload proof for the tournament sweep: every candidate must render
-/// DIFFERENT bytes from `Current`, which is the only externally visible
-/// evidence that `set_bed_variant` really re-routed `bed_sample` — the
-/// `Silence` candidate emits no bed at all, so nothing else could witness it.
-fn verify_variants_diverge(rows: &[(&Workload, Emission)]) {
-    let current = rows
-        .iter()
-        .find(|(w, _)| w.kind == "bed" && w.param == "water_on")
-        .map(|(_, e)| e.checksum)
-        .expect("bed/water_on is the Current baseline");
-    for (w, e) in rows.iter().filter(|(w, _)| w.kind == "bed_variant") {
-        assert_ne!(
-            e.checksum, current,
-            "bed_variant/{}: renders byte-identically to BedVariant::Current — \
-             `set_bed_variant` did not reach the bed mixer, so this workload \
-             times the shipping path under a candidate's name",
-            w.param
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The benchmarks
 // ---------------------------------------------------------------------------
@@ -802,7 +750,6 @@ fn trail_synth_render(c: &mut Criterion) {
         .iter()
         .map(|w| (w, verify_reaches_target(w)))
         .collect();
-    verify_variants_diverge(&rows);
 
     println!(
         "\nTRAIL SYNTH — emitted volume per rendered buffer (48 kHz stereo; a \

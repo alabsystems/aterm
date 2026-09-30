@@ -3,7 +3,7 @@
 //
 // ARENA-SCROLL (FASTER_THAN_GHOSTTY_PLAN §2 harness table + §4 SCROLL-1): the
 // engine-level, headless-capable half of the scrollback-scrub dimension — the
-// piece that becomes a `gate perf` floor. It guards our own moat: our tiered
+// piece that becomes an `xtask perf` floor. It guards our own moat: our tiered
 // compressed scrollback pays LZ4/zstd tier decode on the interactive scrub path
 // where ghostty's all-RAM PageList pays only pointer math, so scrub is the
 // dimension we are structurally most at risk of LOSING. This harness fences the

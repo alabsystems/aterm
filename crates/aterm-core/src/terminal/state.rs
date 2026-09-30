@@ -824,6 +824,30 @@ impl Terminal {
         self.modes.synchronized_output && self.transient.sync_open_dirty
     }
 
+    /// Whether the screen holds a frame the PROGRAM has not finished: its
+    /// own DEC-2026 bracket is still open and it has written into it since
+    /// the opening `?2026h`.
+    ///
+    /// This is the program's account, not the mode level. It stays `true`
+    /// across the terminal's `sync_timeout_ms` force-clear (which ends the
+    /// MODE so a crashed app cannot freeze the screen, and says nothing about
+    /// whether the app finished its frame), and it ends only on the
+    /// program's `?2026l`, DECSTR or RIS. A bracket closed and reopened with
+    /// nothing written since reads `false`: the grid is the completed frame.
+    ///
+    /// A host reads it to know that the cursor on screen may be the
+    /// program's WRITE position rather than its caret — a TUI that hides the
+    /// cursor for a repaint walks it across the screen until the close.
+    /// Measured 2026-09-28 on the owner's installed v0.98.0: a Claude Code
+    /// transcript redraw held one bracket open ~280 ms, the GUI presented it
+    /// torn at its 150 ms hold cap, and the cursor trail took that write
+    /// position for the caret. Reading the mode level instead would make the
+    /// same mistake for any bracket that outlives the 1 s terminal timeout.
+    #[must_use]
+    pub fn sync_frame_unfinished(&self) -> bool {
+        self.transient.app_sync_open && self.transient.app_sync_dirty
+    }
+
     // format_paste in buffer_api.rs.
 
     /// Check if the VT parser is in Ground state.

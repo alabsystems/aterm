@@ -444,6 +444,74 @@ fn an_adopted_ledger_says_which_turn_ids_it_cannot_vouch_for() {
     assert_eq!(ledger.low_id(), Some(40), "a held record is the low-water");
 }
 
+/// Round seven, finding 23: a `turn` still waiting when the park exported
+/// the ledger records into the exiting process afterwards (the frozen screen
+/// latches its idle settle). The carried ledger never gets that record, so it
+/// must not vouch for its id: a subscriber resuming from before it is told,
+/// and one resuming from it is not.
+#[test]
+fn a_turn_open_at_the_export_is_not_vouched_for_by_the_carry() {
+    let ledger = Arc::new(Mutex::new(TurnLedger::default()));
+    for id in 1..=3 {
+        ledger
+            .lock()
+            .unwrap()
+            .push(record(id, true, ArchMark::default()));
+    }
+    ledger.lock().unwrap().begin(4);
+    let (term, _) = session(20);
+    let bytes = export(&[capture(&term, &ledger, true)]).remove(0).1;
+    // The late settle, into the ledger the successor will never read.
+    let late = record(4, true, ArchMark::default());
+    ledger.lock().unwrap().record(late, || unreachable!());
+    let mut carry = decode(&bytes).unwrap();
+    let mut adopted = adopted_ledger(Some(&mut carry));
+    adopted.push(record(5, true, ArchMark::default()));
+    let low = adopted.low_id().unwrap();
+    assert!(3 + 1 < low, "anchor 3 is told of the gap (low {low})");
+    assert!(4 + 1 >= low, "anchor 4 saw it, and is not told (low {low})");
+}
+
+/// Round seven, finding 37: the aggregate is spent on every session's
+/// ledger and counters first, and on archive rows only with what is left.
+/// Spent first come, first served, a crowded desk's first sessions carried
+/// their optional rows and the last ones lost their whole ledger, on every
+/// update.
+#[test]
+fn a_crowded_desk_keeps_every_sessions_ledger() {
+    let (term, turns) = session_every(8000, 2000);
+    // A long-driven worker's ledger: a couple of hundred turns of long text.
+    {
+        let mut ledger = turns.lock().unwrap();
+        *ledger = TurnLedger::default();
+        for id in 1..=200 {
+            let mut r = record(id, true, ArchMark::default());
+            r.text = "x".repeat(480);
+            ledger.push(r);
+        }
+    }
+    let sources: Vec<CarrySource> = (0..64).map(|_| capture(&term, &turns, true)).collect();
+    let want = turns.lock().unwrap().len();
+    let alone = export(std::slice::from_ref(&sources[0])).remove(0).1.len() as u64;
+    assert!(
+        alone * 64 > MAX_AGGREGATE_BYTES,
+        "the fixture overflows the aggregate ({alone} a session)"
+    );
+    let out = export(&sources);
+    assert_eq!(out.len(), 64, "every session carries a sidecar");
+    let total: u64 = out.iter().map(|(_, b)| b.len() as u64).sum();
+    assert!(total <= MAX_AGGREGATE_BYTES, "{total}");
+    for (i, (_, bytes)) in out.iter().enumerate() {
+        let carry = decode(bytes).unwrap();
+        assert_eq!(carry.turns.len(), want, "session {i} keeps its ledger");
+        assert_eq!(carry.unheld_below, 0, "session {i} vouches for it whole");
+    }
+    assert!(
+        !decode(&out[0].1).unwrap().archive.unwrap().rows.is_empty(),
+        "what is left still carries rows"
+    );
+}
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {

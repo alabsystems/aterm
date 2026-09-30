@@ -5152,30 +5152,42 @@ mod tests {
             .chain(ZSH_ARITHMETIC_VARS)
             .copied()
             .collect();
-        let probe = format!(
-            "[[ a =~ a ]]; \
-             for n in ${{(ou)${{(k)parameters}}}} {}; do \
-               [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] || continue; \
-               v=\"'path[\\$(print -u2 RAN_\\$((6*7)))]'\"; \
-               out=$( ( eval \"$n=$v\" ) 2>&1; ( eval \"$n=$v :\" ) 2>&1; \
-                      ( eval \"for $n in $v; do :; done\" ) 2>&1; \
-                      ( eval \"$n=$v; cd .; /usr/bin/true; :\" ) 2>&1; \
-                      ( eval \"echo \\${{$n:=$v}} >/dev/null; cd .; /usr/bin/true; :\" ) 2>&1 ); \
-               [[ $out == *RAN_42* ]] && print -r -- $n; \
+        let list = format!(
+            "for n in ${{(ou)${{(k)parameters}}}} {}; do \
+               [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] && print -r -- $n; \
              done",
             extra.join(" ")
         );
-        let out = std::process::Command::new(perl)
-            .args(["-e", "alarm 60; exec @ARGV", "/bin/zsh", "-f", "-c", &probe])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("zsh runs");
-        let mut measured: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect();
+        let dir = crate::supervise::test_scratch_path("classify", "zsh-arith");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the test's dir");
+        // Short probes, each under its own hang-detector alarm: one probe
+        // over every name, killed by its alarm, was read as a list missing
+        // its tail.
+        let out = zsh_walk(
+            &dir,
+            "[[ a =~ a ]]; ",
+            &list,
+            |names| {
+                format!(
+                    "for n in {names}; do \
+                       v=\"'path[\\$(print -u2 RAN_\\$((6*7)))]'\"; \
+                       out=$( ( eval \"$n=$v\" ) 2>&1; ( eval \"$n=$v :\" ) 2>&1; \
+                              ( eval \"for $n in $v; do :; done\" ) 2>&1; \
+                              ( eval \"$n=$v; cd .; /usr/bin/true; :\" ) 2>&1; \
+                              ( eval \"echo \\${{$n:=$v}} >/dev/null; cd .; /usr/bin/true; :\" ) 2>&1 ); \
+                       [[ $out == *RAN_42* ]] && print -r -- $n; \
+                     done"
+                )
+            },
+            60,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(out) = out else {
+            return;
+        };
+        let out = out.unwrap_or_else(|why| panic!("{why}"));
+        let mut measured: Vec<String> = out.lines().map(str::to_string).collect();
         measured.sort();
         measured.dedup();
         let mut want: Vec<String> = ZSH_ARITHMETIC_VARS.iter().map(|n| n.to_string()).collect();
@@ -5272,25 +5284,152 @@ mod tests {
         }
     }
 
-    /// `zsh -f -c script` run from `dir` (the test's own), stdin closed,
-    /// under a `secs`-second alarm: its stdout, or `None` where zsh or perl
-    /// is not installed.
+    /// The line [`zsh_probe`] appends to every script: a probe whose output
+    /// lacks it did not run to its end, whatever it printed first.
     #[cfg(unix)]
-    fn zsh_in(dir: &std::path::Path, script: &str, secs: u32) -> Option<String> {
+    const ZSH_PROBE_DONE: &str = "__ZSH_PROBE_DONE__";
+
+    /// The perl that runs a probe under its alarm. The probe gets a process
+    /// group of its own, and the alarm kills the WHOLE group before perl
+    /// dies by SIGALRM itself, so a grandchild (a `sleep`, a `$( … )`) that
+    /// holds the stdout pipe cannot keep `.output()` waiting past the alarm;
+    /// the group is killed after a normal exit too. Otherwise perl exits as
+    /// the probe did: by its signal, or with its code.
+    #[cfg(unix)]
+    const ZSH_PROBE_RUNNER: &str = "my $secs = shift; my $late = 0; \
+        defined(my $p = fork) or die \"fork: $!\"; \
+        if (!$p) { setpgrp(0, 0); exec @ARGV or die \"exec: $!\"; } \
+        setpgrp($p, $p); \
+        $SIG{ALRM} = sub { $late = 1; kill 'KILL', -$p; }; \
+        alarm $secs; waitpid($p, 0); my $st = $?; alarm 0; kill 'KILL', -$p; \
+        if ($late) { $SIG{ALRM} = 'DEFAULT'; kill 'ALRM', $$; } \
+        if ($st & 127) { kill $st & 127, $$; } \
+        exit($st >> 8);";
+
+    /// `zsh -f -c script` run from `dir` (the test's own), stdin closed,
+    /// under a `secs`-second alarm, which is a HANG detector, not a latency
+    /// budget: `None` where zsh or perl is not installed, `Some(Err)` when
+    /// the probe did not run to its end — the alarm killed it (`probe timed
+    /// out after Ns`), another signal did, or its closing line is missing —
+    /// and otherwise `Some(Ok(stdout))` without that closing line. A probe
+    /// the alarm cut short once returned what it had printed so far, which a
+    /// test read as a measurement missing its tail.
+    #[cfg(unix)]
+    fn zsh_probe(dir: &std::path::Path, script: &str, secs: u32) -> Option<Result<String, String>> {
+        use std::os::unix::process::ExitStatusExt;
+        /// SIGALRM, 14 on every unix this test runs on (macOS, Linux).
+        const SIGALRM: i32 = 14;
         let (zsh, perl) = ("/bin/zsh", "/usr/bin/perl");
         if !std::path::Path::new(zsh).exists() || !std::path::Path::new(perl).exists() {
             return None;
         }
-        let alarm = format!("alarm {secs}; exec @ARGV");
+        let secs_arg = secs.to_string();
+        let script = format!("{script}\nprint -r -- {ZSH_PROBE_DONE}");
         let out = std::process::Command::new(perl)
-            .args(["-e", &alarm, zsh, "-f", "-c", script])
+            .args(["-e", ZSH_PROBE_RUNNER, &secs_arg, zsh, "-f", "-c", &script])
             .current_dir(dir)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(std::process::Stdio::null())
             .output()
             .expect("zsh runs");
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let printed = stdout.lines().count();
+        match out.status.signal() {
+            Some(SIGALRM) => {
+                return Some(Err(format!(
+                    "zsh probe timed out after {secs}s (killed by its alarm, SIGALRM) \
+                     having printed {printed} lines; its output is incomplete"
+                )));
+            }
+            Some(sig) => {
+                return Some(Err(format!(
+                    "zsh probe killed by signal {sig} having printed {printed} lines; \
+                     stderr: {stderr}"
+                )));
+            }
+            None => {}
+        }
+        let done = format!("{ZSH_PROBE_DONE}\n");
+        match stdout.strip_suffix(&done) {
+            Some(body) => Some(Ok(body.to_string())),
+            None => Some(Err(format!(
+                "zsh probe did not run to its end ({}, no closing line) having \
+                 printed {printed} lines; stderr: {stderr}",
+                out.status
+            ))),
+        }
+    }
+
+    /// [`zsh_probe`] for a test: its stdout, `None` without zsh or perl, and
+    /// a PANIC naming why when the probe did not run to its end.
+    #[cfg(unix)]
+    fn zsh_in(dir: &std::path::Path, script: &str, secs: u32) -> Option<String> {
+        zsh_probe(dir, script, secs).map(|r| r.unwrap_or_else(|why| panic!("{why}")))
+    }
+
+    /// A walk over zsh's parameter names as SHORT probes, each under its own
+    /// `secs`-second hang-detector alarm (so the whole walk may take up to
+    /// one alarm per 16 names, plus one): `prelude` runs first in every
+    /// probe, `list` (after it) prints the names one per line, and
+    /// `per_names` builds the probe over a space-separated group of them.
+    /// `None` without zsh or perl; `Some(Err)` names the first probe that
+    /// did not run to its end, so the caller can clean up before failing.
+    #[cfg(unix)]
+    fn zsh_walk(
+        dir: &std::path::Path,
+        prelude: &str,
+        list: &str,
+        per_names: impl Fn(&str) -> String,
+        secs: u32,
+    ) -> Option<Result<String, String>> {
+        let names = match zsh_probe(dir, &format!("{prelude}{list}"), secs)? {
+            Ok(names) => names,
+            Err(why) => return Some(Err(why)),
+        };
+        let names: Vec<&str> = names.lines().collect();
+        if names.len() <= 100 {
+            return Some(Err(format!("zsh declares its parameters: {names:?}")));
+        }
+        let mut out = String::new();
+        for group in names.chunks(16) {
+            let probe = format!("{prelude}{}", per_names(&group.join(" ")));
+            match zsh_probe(dir, &probe, secs)? {
+                Ok(o) => out.push_str(&o),
+                Err(why) => return Some(Err(why)),
+            }
+        }
+        Some(Ok(out))
+    }
+
+    /// A probe the alarm kills is reported as a timeout, never as the
+    /// partial output it printed; one that exits early without its closing
+    /// line is reported too. Negative control: the same probe with time to
+    /// finish returns exactly what it printed.
+    #[cfg(unix)]
+    #[test]
+    fn a_zsh_probe_killed_by_its_alarm_is_a_timeout() {
+        let dir = std::path::Path::new("/");
+        // `sleep` is a child of zsh holding the stdout pipe: the alarm must
+        // kill it too, or the wait lasts its 30 s, not the alarm's 1 s.
+        let started = std::time::Instant::now();
+        let Some(cut) = zsh_probe(dir, "print partial; sleep 30", 1) else {
+            return;
+        };
+        let waited = started.elapsed();
+        let why = cut.expect_err("an alarm-killed probe is no measurement");
+        assert!(why.contains("probe timed out after 1s"), "{why}");
+        assert!(why.contains("printed 1 lines"), "{why}");
+        assert!(
+            waited < std::time::Duration::from_secs(20),
+            "the alarm bounds the wait, grandchildren included: {waited:?}"
+        );
+        let early = zsh_probe(dir, "print partial; exit 0", 30).expect("zsh");
+        let why = early.expect_err("a probe that exits early is no measurement");
+        assert!(why.contains("did not run to its end"), "{why}");
+        let whole = zsh_probe(dir, "print partial; sleep 0.1", 30).expect("zsh");
+        assert_eq!(whole.as_deref(), Ok("partial\n"));
     }
 
     /// THE FIFTH CHECK (2026-09-28): zsh TIES an array to a scalar, so
@@ -5461,30 +5600,49 @@ mod tests {
             .chain(&hooks)
             .copied()
             .collect();
-        let probe = format!(
+        // Every probe defines the same names first, so the parameter list
+        // the first one prints is the one a single probe walked.
+        let prelude = format!(
             "d='{d}'; f() {{ print -u2 RAN_$((6*7)); }}; \
              reads='ls >/dev/null; < f; > /dev/null; print ok >/dev/null; \
                echo $terminfo[colors] >/dev/null; true | cat >/dev/null; \
                cat <<< x >/dev/null; cd . >/dev/null'; \
-             vals=(\"$d/x\" f 'print -u2 RAN_$((6*7))' \"$d\"); \
-             for n in ${{(ou)${{(k)parameters}}}} {}; do \
-               [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] || continue; \
-               for v in $vals; do \
-                 out=$( ( eval \"$n=\\$v; $reads\" ) 2>&1; \
-                        ( eval \"for $n in \\\"\\$v\\\"; do $reads; done\" ) 2>&1; \
-                        ( eval \"echo \\${{$n:=\\$v}} >/dev/null; $reads\" ) 2>&1 ); \
-                 if [[ $out == *RAN_42* || $out == *$d/zsh/* ]]; then \
-                   print -r -- $n; break; \
-                 fi; \
-               done; \
+             vals=(\"$d/x\" f 'print -u2 RAN_$((6*7))' \"$d\"); "
+        );
+        let list = format!(
+            "for n in ${{(ou)${{(k)parameters}}}} {}; do \
+               [[ $n == [A-Za-z_]* && $n != *[^A-Za-z0-9_]* ]] && print -r -- $n; \
              done",
             extra.join(" ")
         );
-        let out = zsh_in(&dir, &probe, 120);
+        // The walk runs as short probes, each under its own hang-detector
+        // alarm: one probe over every name took ~16 s alone, outran its
+        // 120 s alarm under load, and was read as a list missing its tail.
+        let out = zsh_walk(
+            &dir,
+            &prelude,
+            &list,
+            |names| {
+                format!(
+                    "for n in {names}; do \
+                       for v in $vals; do \
+                         out=$( ( eval \"$n=\\$v; $reads\" ) 2>&1; \
+                                ( eval \"for $n in \\\"\\$v\\\"; do $reads; done\" ) 2>&1; \
+                                ( eval \"echo \\${{$n:=\\$v}} >/dev/null; $reads\" ) 2>&1 ); \
+                         if [[ $out == *RAN_42* || $out == *$d/zsh/* ]]; then \
+                           print -r -- $n; break; \
+                         fi; \
+                       done; \
+                     done"
+                )
+            },
+            120,
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let Some(out) = out else {
             return;
         };
+        let out = out.unwrap_or_else(|why| panic!("{why}"));
         let mut measured: Vec<&str> = out.lines().collect();
         measured.sort_unstable();
         measured.dedup();

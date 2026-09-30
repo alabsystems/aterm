@@ -4698,7 +4698,7 @@ mod tests {
     /// instead of hanging the suite.
     #[cfg(unix)]
     fn read_until_hangup(master: i32) -> String {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut out = Vec::new();
         let mut buf = [0u8; 512];
         loop {
@@ -4724,7 +4724,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the probe shell did not hang up in time; got {:?}",
+                "the probe shell did not hang up within 60 s; got {:?}",
                 String::from_utf8_lossy(&out)
             );
         }

@@ -27,14 +27,12 @@ pub fn is_trust_compiler(verbose_version: &str) -> bool {
 }
 
 /// Does this TREE pin the Trust toolchain? The gate enforces the pin the tree
-/// actually carries, because there are two sanctioned trees: the dev workspace
-/// (rust-toolchain.toml pins `channel = "trust"` — the 2026-08-30 standing
-/// directive, enforce) and the PUBLIC SNAPSHOT, whose export deliberately
-/// swaps that file for the stock pin (publish/transforms.sh copies
-/// public-rust-toolchain.toml over it; publish/DECISIONS.md's public
-/// stock-Rust gate then builds it with upstream 1.97.1 under anonymous git).
-/// Enforcing the trust marker in a tree whose own committed pin says stock
-/// made the public snapshot unbuildable by its own gate. Fail-closed: a
+/// actually carries. Both sanctioned trees — the dev workspace and, since
+/// 2026-09-29, the PUBLIC SNAPSHOT — pin `channel = "trust"` (the 2026-08-30
+/// standing directive, enforce). The stand-down for an explicit non-trust pin
+/// was made for the public snapshot while its export swapped in a stock pin
+/// (until 2026-09-29), when enforcing the trust marker there made it
+/// unbuildable by its own stock gate. Fail-closed: a
 /// missing or unreadable pin file, or one with no channel line, ENFORCES —
 /// only an explicit non-trust channel stands the gate down, and changing that
 /// is a committed-file edit, never an environment variable.

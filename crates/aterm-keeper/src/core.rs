@@ -431,6 +431,10 @@ pub struct Peer {
     /// The window's crash marker, once HELLO named one the keeper found held
     /// by a live owner ([`KeeperCore::name_marker`]).
     pub marker: Option<MarkerRef>,
+    /// Offers made to this connection went back to Orphaned when its EOF was
+    /// read ([`KeeperCore::eof`]): its death, when judged, owes those orphans
+    /// a window unless the process quit.
+    pub returned_offers: bool,
 }
 
 impl Peer {
@@ -698,6 +702,7 @@ impl KeeperCore {
                 hello_at: None,
                 relaunched: false,
                 marker: None,
+                returned_offers: false,
             },
         );
         true
@@ -1123,9 +1128,21 @@ impl KeeperCore {
     }
 
     /// BYE: quit intent. The peer's end is judged when its EOF and exit arrive.
+    ///
+    /// The intent is the PROCESS's, whichever of its links carried it: a
+    /// window whose link dropped and reconnected (the same pid and birth) quit
+    /// on every one of them, so the dead link's end, judged at the same exit,
+    /// never reads as a crash that brings the window back (round-seven update
+    /// audit, finding 65; `PtyKeeperCustody`'s `RelaunchedWindowQuits`, whose
+    /// mutant marks only the link that carried it).
     pub fn bye(&mut self, conn: ConnId) {
-        if let Some(p) = self.peers.get_mut(&conn) {
-            p.bye = true;
+        let Some(who) = self.peers.get(&conn).map(|p| (p.pid, p.birth)) else {
+            return;
+        };
+        for p in self.peers.values_mut() {
+            if (p.pid, p.birth) == who {
+                p.bye = true;
+            }
         }
     }
 
@@ -1152,9 +1169,22 @@ impl KeeperCore {
         vec![Out::WatchPid(pid)]
     }
 
-    /// The connection read EOF. Alone it decides nothing: the peer's death is
-    /// judged when the kernel's exit status arrives too (a link that dropped
-    /// while its window lives is `LinkDrops`, whose mutant orphans here).
+    /// The connection read EOF. Alone it decides nothing about a CLAIM: the
+    /// peer's death is judged when the kernel's exit status arrives too (a
+    /// registered window's link that dropped while it lives is `LinkDrops`,
+    /// whose mutant orphans here).
+    ///
+    /// An OFFER, though, was made to the CONNECTION, and nothing registers on
+    /// a connection that is gone: every record offered to `conn` is an orphan
+    /// again now, its leader watched again (round-seven update audit, finding
+    /// 65; `RelaunchedLinkDrops`, whose mutant leaves the offer with the dead
+    /// link). Left Offered to a dead connection while its window lives, no
+    /// ADOPT and no later launch could be offered it, and the window's
+    /// eventual end read it back as a fresh orphan. A window that took the
+    /// descriptor before its link dropped still holds it, so the holder scan
+    /// keeps a second offer away ([`Self::offers_for`]), and its reconnected
+    /// link may REGISTER it ([`Self::register`] proves possession, not the
+    /// offer).
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -1163,13 +1193,30 @@ impl KeeperCore {
             project = "aterm_keeper::KeeperCore::custody_view"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "PtyKeeperCustody",
+            action = "RelaunchedLinkDrops",
+            project = "aterm_keeper::KeeperCore::custody_view"
+        )
+    )]
     pub fn eof(&mut self, conn: ConnId, now: u64, env: &mut dyn KeeperEnv) -> Vec<Out> {
+        let mut out = Vec::new();
         if let Some(p) = self.peers.get_mut(&conn)
             && p.eof_at.is_none()
         {
             p.eof_at = Some(now);
+            for rec in self.records.values_mut() {
+                if rec.state == (RecordState::Offered { to: conn }) {
+                    rec.state = RecordState::Orphaned;
+                    p.returned_offers = true;
+                    out.push(Out::WatchPid(rec.header.shell_pid));
+                }
+            }
         }
-        self.settle(now, env)
+        out.extend(self.settle(now, env));
+        out
     }
 
     /// The kernel delivered `pid`'s `wait(2)` status (the exit watch). The
@@ -1381,6 +1428,14 @@ impl KeeperCore {
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
             machine = "PtyKeeperCustody",
+            action = "RelaunchedWindowQuits",
+            project = "aterm_keeper::KeeperCore::custody_view"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "PtyKeeperCustody",
             action = "SuccessorCrashes",
             project = "aterm_keeper::KeeperCore::custody_view"
         )
@@ -1407,11 +1462,15 @@ impl KeeperCore {
         };
         let mut out = Vec::new();
         let mut orphaned_any = false;
+        // Offers returned to Orphaned, here or at this connection's EOF: the
+        // window died before it registered them. They owe a window only when
+        // it did not quit (a BYE, [`Self::bye`]).
+        let mut returned_offers = peer.returned_offers;
         let mut last: Vec<Rdev> = Vec::new();
         for (rdev, rec) in &mut self.records {
             if rec.state == (RecordState::Offered { to: conn }) {
                 rec.state = RecordState::Orphaned;
-                orphaned_any = true;
+                returned_offers = true;
                 out.push(Out::WatchPid(rec.header.shell_pid));
                 continue;
             }
@@ -1424,6 +1483,9 @@ impl KeeperCore {
         }
         if !peer.is_app() {
             return out;
+        }
+        if returned_offers && !peer.bye {
+            orphaned_any = true;
         }
         let pending_live = self.pending.is_some_and(|p| {
             !p.dead && now < p.expires && p.pid != peer.pid && env.pid_alive(p.pid, p.birth)
@@ -2205,6 +2267,72 @@ mod tests {
         k.eof(2, 2, &mut w);
         k.peer_exit(600, 9, 2, &mut w);
         assert_eq!(k.records()[&10].state, RecordState::Orphaned);
+        assert!(
+            matches!(k.relaunch_state(), RelaunchState::Due { .. }),
+            "a recipient that crashed before it registered still owes the orphan a window"
+        );
+    }
+
+    /// An offer is made to a CONNECTION (round-seven update audit, finding
+    /// 65): when that connection drops while its window lives — the window's
+    /// boot HELLO timed out, or the keeper's own send of the OFFER failed —
+    /// the offer returns to Orphaned at the EOF, so an ADOPT from the same
+    /// window's next link (or the next launch) is offered it again; it never
+    /// stays Offered to a dead connection for the window's lifetime. And the
+    /// window's later QUIT, whose BYE arrives on its new link, relaunches
+    /// nothing: a BYE is the process's, whichever of its links carried it.
+    #[test]
+    fn an_offer_whose_link_drops_while_its_window_lives_is_offered_again() {
+        let mut k = KeeperCore::new(true);
+        let mut w = World::default();
+        window(&mut k, &mut w, 1, 10, 0);
+        k.register(1, hdr(10, 900), vec![], 10);
+        w.live_pids.clear();
+        k.eof(1, 0, &mut w);
+        k.peer_exit(10, 9, 0, &mut w);
+        assert_eq!(k.records()[&10].state, RecordState::Orphaned);
+        // The keeper relaunches; the new window's HELLO is offered the orphan.
+        assert_eq!(k.tick(0, &mut w), vec![Out::Relaunch]);
+        let outs = window(&mut k, &mut w, 2, 20, 1);
+        assert!(outs.contains(&Out::Offer { conn: 2, rdev: 10 }), "{outs:?}");
+        assert_eq!(k.records()[&10].state, RecordState::Offered { to: 2 });
+        // Its link drops before it registers; the window lives on.
+        let outs = k.eof(2, 2, &mut w);
+        assert!(
+            outs.contains(&Out::WatchPid(900)),
+            "the orphan's leader is watched again: {outs:?}"
+        );
+        assert!(k.tick(2 + DEATH_GRACE_MS + 1, &mut w).is_empty());
+        assert_eq!(
+            k.records()[&10].state,
+            RecordState::Orphaned,
+            "no offer stands to a connection that is gone"
+        );
+        // The same window's link reconnects, and asks for the offers.
+        assert!(k.accept(3, 20, None));
+        assert_eq!(
+            k.hello(3, PeerClass::App, CAP_SENDS_BYE | CAP_LINK, 3, &mut w),
+            vec![Out::Welcome { conn: 3, offers: 0 }]
+        );
+        let outs = k.adopt(3, &mut w);
+        assert!(outs.contains(&Out::Offer { conn: 3, rdev: 10 }), "{outs:?}");
+        // The person quits that window: BYE on the new link, then its end.
+        k.bye(3);
+        let now = 100_000;
+        k.eof(3, now, &mut w);
+        w.live_pids.clear();
+        k.peer_exit(20, 0, now, &mut w);
+        for t in [now, now + 1_000_000, now + 10_000_000] {
+            assert!(
+                !k.tick(t, &mut w).contains(&Out::Relaunch),
+                "a window the person quit is never brought back"
+            );
+        }
+        assert!(
+            !matches!(k.relaunch_state(), RelaunchState::Due { .. }),
+            "{:?}",
+            k.relaunch_state()
+        );
     }
 }
 

@@ -46,7 +46,7 @@
 //!   with long waits; while it is, `aterm ctl` reports the refusal as busy — an
 //!   ordinary failure naming the server's words, never "Broken pipe"; then
 //!   every waiting client hangs up and a fresh client, and a fresh wait, must be
-//!   admitted within a second and a half — long before the waits' own minute.
+//!   admitted within a second and a half — long before the waits' own end.
 //!   The listener's health fields are on `metrics`.
 //!
 //! Every instance runs under a descriptor limit its test names (the cap is a
@@ -82,9 +82,24 @@ const WAIT_LANES: usize = 64;
 const BUSY: &str = "ERR control server busy; retry";
 
 /// How long a refusal must last to be read as the socket's verdict rather than
-/// a moment: a lane places a connection in milliseconds, and a cap or a
-/// saturation lasts until a connection closes or a wait ends.
-const REFUSAL_STAYS: Duration = Duration::from_millis(500);
+/// a moment: a lane places a connection in milliseconds on an idle machine
+/// and can take a scheduler's seconds on a loaded one, while a cap or a
+/// saturation lasts until a connection closes or a wait ends. Paid only once a
+/// refusal is seen (a probe every 50 ms until it clears): it was 500 ms, and
+/// a lane that took longer than that ended the filling below the cap.
+const REFUSAL_STAYS: Duration = Duration::from_secs(5);
+
+/// How long a wait for something that MUST happen may take before it is read
+/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
+const HANG: Duration = Duration::from_secs(60);
+
+/// A fresh client refused at a cap or a saturation is told so without a wait:
+/// the listener writes the busy line as it refuses, never parking the peer.
+/// Judged on the FASTEST busy reply of a refusal that stays (every probe
+/// [`refusal_stays`] makes is one): a loaded gate's slow dial is one probe
+/// among many, while a busy line the listener writes late is late on every
+/// probe (it was 1 s on one probe, then 10 s).
+const BUSY_PROMPTLY: Duration = Duration::from_secs(2);
 
 /// Where the cap test makes a refusal momentary on purpose: well below the cap
 /// (a quarter of launchd's 256 is 64).
@@ -277,11 +292,11 @@ impl Driver {
     /// driver, established. A refusal while the request lanes are briefly full
     /// of WORK (a burst of connections being authenticated on a loaded machine)
     /// is the busy line clients retry on — the supervisor rides it as an outage
-    /// — so it is retried here; a refusal that LASTS five seconds is the defect
-    /// (every lane held by a connection with nothing to ask), reported with the
-    /// server's last words.
+    /// — so it is retried here; a refusal that LASTS (every lane held by a
+    /// connection with nothing to ask — the defect — lasts for ever) fails at
+    /// the hang detector, reported with the server's last words.
     fn established(sock: &Path, token: &str) -> Result<Self, String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG;
         loop {
             let last = match Self::try_open(sock, token) {
                 Ok(mut driver) => {
@@ -377,14 +392,15 @@ fn probe(sock: &Path, token: &str) -> (String, Duration) {
 }
 
 /// A fresh idle driver: dialled, authenticated and served one `version` (reads
-/// bounded at 5 s), or the reply that refused it and how long that took.
+/// bounded at 20 s, as a [`probe`]'s are: a refused one reads its busy line at
+/// once), or the reply that refused it and how long that took.
 fn idle_driver(sock: &Path, token: &str) -> Result<Driver, (String, Duration)> {
     let start = Instant::now();
     let mut driver = match Driver::try_open(sock, token) {
         Ok(driver) => driver,
         Err(e) => return Err((format!("<dial error: {e}>"), start.elapsed())),
     };
-    bound_reads(driver.stream(), Duration::from_secs(5));
+    bound_reads(driver.stream(), Duration::from_secs(20));
     let reply = driver.request("version");
     if reply.starts_with("OK") {
         Ok(driver)
@@ -420,10 +436,12 @@ fn occupy_request_lanes(sock: &Path, token: &str) -> Vec<Driver> {
     panic!("the request lanes never all took a silent peer");
 }
 
-/// A wait the server can only end at its timeout: `await seq` for a content
-/// count this idle instance never reaches.
+/// A wait the server can only end at its timeout: `await match` for text no
+/// row of this idle instance holds. (Not `await seq <huge>`: an anchor above
+/// the current count is now read as one from another grid or process and
+/// latched at once — round seven of the update audit, finding 29.)
 fn long_wait(timeout_ms: u64) -> String {
-    format!("await seq 999999999999 timeout {timeout_ms}")
+    format!("await match zq-no-row-holds-this-qz timeout {timeout_ms}")
 }
 
 /// One wait the socket ADMITTED, on a fresh connection, and the fresh probe
@@ -464,10 +482,47 @@ fn admitted_wait(
     }
 }
 
+/// Whether `reply` — a probe's answer, which took `took` — is a refusal that
+/// STAYS: [`BUSY`], and still busy on every probe for [`REFUSAL_STAYS`]. A lane
+/// still handing over the previous wait answers a later probe; a saturated
+/// socket refuses until a wait ends, one at its cap until a connection closes.
+///
+/// `Ok` is the fastest of the busy replies, `took` included (for
+/// [`BUSY_PROMPTLY`]). `Err` is the socket's answer when the refusal did not
+/// stay: the probe that ended it (a momentary refusal), or `reply` itself
+/// when it was no refusal at all. The caller judges that answer.
+fn refusal_stays(
+    sock: &Path,
+    token: &str,
+    reply: &str,
+    took: Duration,
+) -> Result<Duration, String> {
+    if reply != BUSY {
+        return Err(reply.to_string());
+    }
+    let mut fastest = took;
+    let stays = Instant::now() + REFUSAL_STAYS;
+    while Instant::now() < stays {
+        std::thread::sleep(Duration::from_millis(50));
+        let (again, took) = probe(sock, token);
+        if again != BUSY {
+            return Err(again);
+        }
+        fastest = fastest.min(took);
+    }
+    Ok(fastest)
+}
+
 #[test]
 fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     const IDLE: usize = 12;
     const WAITING: usize = 12;
+    /// The waits' own timeout: a fresh client queued behind them would be
+    /// answered only when they end.
+    const WAIT_MS: u64 = 30_000;
+    /// "At once": half the waits' timeout, so a client served only when a
+    /// wait ends still fails, with room for a loaded gate's dial (it was 5 s).
+    const AT_ONCE: Duration = Duration::from_millis(WAIT_MS / 2);
 
     roomy_test_process();
     let Some(world) = world("s") else {
@@ -486,7 +541,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     for index in 0..IDLE {
         let driver = Driver::established(&sock, &token).unwrap_or_else(|reply| {
             panic!(
-                "idle driver {} of {IDLE} was not served within 5 s: {reply:?}",
+                "idle driver {} of {IDLE} was not served within {HANG:?}: {reply:?}",
                 index + 1
             )
         });
@@ -496,7 +551,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     let mut reopened = 0;
     let mut waiting = Vec::new();
     for index in 0..WAITING {
-        let (wait, reply, _) = admitted_wait(&sock, &token, 30_000, &mut reopened);
+        let (wait, reply, _) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
         assert!(
             reply.starts_with("OK"),
             "a fresh client was refused with {IDLE} idle and {} waiting drivers open: \
@@ -515,10 +570,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
             "fresh client {attempt} was refused with {IDLE} idle and {WAITING} waiting \
              drivers open: {reply:?}"
         );
-        assert!(
-            took < Duration::from_secs(5),
-            "fresh client {attempt} waited {took:?}"
-        );
+        assert!(took < AT_ONCE, "fresh client {attempt} waited {took:?}");
         std::thread::sleep(Duration::from_millis(50));
     }
     // The CLI path a person types.
@@ -566,7 +618,10 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
 fn a_pool_saturated_with_waits_still_answers_busy() {
     // Held idle alongside the waits: they must not count toward saturation.
     const IDLE: usize = 16;
-    const WAIT_MS: u64 = 15_000;
+    /// The waits' own timeout. Saturating opens 72 of them one at a time, and
+    /// the verdict needs the first still open when the last is: a minute
+    /// leaves a loaded gate most of it (it was 15 s, 12 of them usable).
+    const WAIT_MS: u64 = 60_000;
 
     roomy_test_process();
     let Some(world) = world("b") else {
@@ -601,26 +656,20 @@ fn a_pool_saturated_with_waits_still_answers_busy() {
     let mut reopened = 0;
     let mut refused = None;
     while waits.len() < RPC_LANES + WAIT_LANES + 8 {
-        let (wait, mut reply, took) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
+        let (wait, reply, took) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
         waits.push(wait);
-        if reply == BUSY {
-            // Held for a quarter of a second, or a lane that was finishing.
-            for _ in 0..5 {
-                std::thread::sleep(Duration::from_millis(50));
-                reply = probe(&sock, &token).0;
-                if reply != BUSY {
-                    break;
-                }
+        // Held for [`REFUSAL_STAYS`], or a lane that was finishing: then the
+        // probe that ended the refusal is the answer, and the filling goes on.
+        match refusal_stays(&sock, &token, &reply, took) {
+            Ok(fastest) => {
+                refused = Some((waits.len(), fastest));
+                break;
             }
+            Err(reply) => assert!(
+                reply.starts_with("OK"),
+                "a fresh client below saturation got {reply:?}"
+            ),
         }
-        if reply == BUSY {
-            refused = Some((waits.len(), took));
-            break;
-        }
-        assert!(
-            reply.starts_with("OK"),
-            "a fresh client below saturation got {reply:?}"
-        );
     }
     let saturated = started.elapsed();
     eprintln!(
@@ -638,8 +687,8 @@ fn a_pool_saturated_with_waits_still_answers_busy() {
         "saturating took {saturated:?}, too close to the waits' own end to judge"
     );
     assert!(
-        took < Duration::from_secs(1),
-        "the busy reply took {took:?}"
+        took < BUSY_PROMPTLY,
+        "the fastest busy reply of the saturation took {took:?}"
     );
     assert_eq!(
         at,
@@ -649,11 +698,14 @@ fn a_pool_saturated_with_waits_still_answers_busy() {
     );
 
     // The waits end at their timeout; each answers, and the socket recovers.
+    // A read here waits out what is left of its wait's minute, past the 20 s
+    // every driver's reads are bounded by.
     for (index, driver) in waits.iter_mut().enumerate() {
+        bound_reads(driver.stream(), Duration::from_millis(WAIT_MS) + HANG);
         let reply = driver.line();
         assert_eq!(reply, "OK timeout", "wait {index} ended at its timeout");
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG;
     loop {
         let (reply, _) = probe(&sock, &token);
         if reply.starts_with("OK") {
@@ -693,8 +745,9 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
     // (measured 2026-09-26: one early refusal at 25 open, its retry served
     // 0.4 ms later). A refused connection never counted, so such a moment is
     // dialled again and the filling goes on; the cap is a refusal that holds
-    // for half a second — the cap ends only when a connection closes, a lane's
-    // moment in milliseconds. So that the retry is never dead code, one such
+    // for [`REFUSAL_STAYS`] — the cap ends only when a connection closes, a
+    // lane's moment in milliseconds (seconds on a loaded gate). So that the
+    // retry is never dead code, one such
     // moment is made on purpose at `MOMENT_AT` open (`occupy_request_lanes`)
     // and ends as its silent peers hang up; taking its refusal for the cap
     // would stop the filling there.
@@ -722,6 +775,8 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
         }
         // The moment made on purpose ends here: its silent peers hang up.
         let made = moment.take().is_some();
+        // The cap's promptness is its fastest busy reply ([`BUSY_PROMPTLY`]).
+        let mut fastest = took;
         let stays = Instant::now() + REFUSAL_STAYS;
         while Instant::now() < stays {
             std::thread::sleep(Duration::from_millis(50));
@@ -740,11 +795,11 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
                     }
                     continue 'fill;
                 }
-                Err((again, _)) if again == BUSY => {}
+                Err((again, took)) if again == BUSY => fastest = fastest.min(took),
                 Err(other) => break 'fill other,
             }
         }
-        break (reply, took);
+        break (reply, fastest);
     };
     eprintln!(
         "cap: {} open at soft limit {soft_limit}; the moment made at {MOMENT_AT} retried: \
@@ -769,8 +824,8 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
         "the refusal made momentary on purpose at {MOMENT_AT} open was never retried"
     );
     assert!(
-        took < Duration::from_secs(1),
-        "the busy reply took {took:?}"
+        took < BUSY_PROMPTLY,
+        "the fastest busy reply at the cap took {took:?}"
     );
     for driver in &held {
         bound_reads(driver.stream(), Duration::from_secs(20));
@@ -786,10 +841,11 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
     }
     // And the cap still holds, in the documented words, promptly.
     let (reply, took) = probe(&sock, &token);
-    assert_eq!(reply, BUSY, "a fresh client at the cap");
+    let took = refusal_stays(&sock, &token, &reply, took)
+        .unwrap_or_else(|reply| panic!("a fresh client at the cap got {reply:?}"));
     assert!(
-        took < Duration::from_secs(1),
-        "the busy reply took {took:?}"
+        took < BUSY_PROMPTLY,
+        "the fastest busy reply at the cap took {took:?}"
     );
     // Every held connection is still served (persistent drivers keep theirs).
     for (index, driver) in held.iter_mut().enumerate() {
@@ -798,7 +854,7 @@ fn the_connection_past_the_cap_is_told_busy_and_tabs_still_open() {
     }
     // One ends: its place is a fresh client's.
     drop(held.pop());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG;
     loop {
         let (reply, _) = probe(&sock, &token);
         if reply.starts_with("OK") {
@@ -827,8 +883,15 @@ fn aterm_ctl(root: &Path, sock: &Path, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn hung_up_waits_give_their_lanes_back_and_ctl_names_busy() {
-    /// Far longer than the test: only a hangup can end these waits in time.
-    const WAIT_MS: u64 = 60_000;
+    /// Far longer than the test: only a hangup can end these waits in time. A
+    /// wait that ended on its own would give its lane back with no hangup and
+    /// pass the check below vacuously, so this outlives a loaded gate's
+    /// saturation and its [`REFUSAL_STAYS`] by far (it was 60 s), and the
+    /// test checks that it did, below.
+    const WAIT_MS: u64 = 120_000;
+    /// How long the lanes may take to drain once every caller hangs up
+    /// before the drain is read as a hang (the verdict itself is 1.5 s).
+    const DRAIN_HANG: Duration = Duration::from_secs(10);
 
     roomy_test_process();
     let Some(world) = world("h") else {
@@ -847,6 +910,7 @@ fn hung_up_waits_give_their_lanes_back_and_ctl_names_busy() {
 
     // Saturate the socket with waits (each one admitted), judged by a refusal
     // that STAYS, exactly as the negative control above does.
+    let first_opened = Instant::now();
     let mut waits: Vec<Driver> = Vec::new();
     let mut reopened = 0;
     let saturated = loop {
@@ -855,24 +919,15 @@ fn hung_up_waits_give_their_lanes_back_and_ctl_names_busy() {
             "{} waits open and no fresh client was refused",
             waits.len()
         );
-        let (wait, mut reply, _) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
+        let (wait, reply, took) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
         waits.push(wait);
-        if reply == BUSY {
-            for _ in 0..5 {
-                std::thread::sleep(Duration::from_millis(50));
-                reply = probe(&sock, &token).0;
-                if reply != BUSY {
-                    break;
-                }
-            }
+        match refusal_stays(&sock, &token, &reply, took) {
+            Ok(_) => break waits.len(),
+            Err(reply) => assert!(
+                reply.starts_with("OK"),
+                "a fresh client below saturation got {reply:?}"
+            ),
         }
-        if reply == BUSY {
-            break waits.len();
-        }
-        assert!(
-            reply.starts_with("OK"),
-            "a fresh client below saturation got {reply:?}"
-        );
     };
     eprintln!("saturated at {saturated} waits ({reopened} refused on arrival and reopened)");
 
@@ -899,10 +954,19 @@ fn hung_up_waits_give_their_lanes_back_and_ctl_names_busy() {
     );
 
     // Every waiting client hangs up (a SIGKILLed `aterm ctl` closes exactly
-    // so). Their lanes must come back within a hangup poll, not at the minute
-    // their waits were given: a fresh client is served, and a fresh wait is
-    // admitted and runs to its own (short) timeout.
+    // so). Their lanes must come back within a hangup poll, not at the end of
+    // the two minutes their waits were given: a fresh client is served, and a
+    // fresh wait is admitted and runs to its own (short) timeout. Every wait
+    // must still be open through the whole drain: one that could end on its
+    // own inside it would free its lane with no hangup (the oldest was
+    // opened after `first_opened`, so this is conservative).
     let hung_up = Instant::now();
+    let open_for = hung_up.duration_since(first_opened);
+    assert!(
+        open_for + DRAIN_HANG < Duration::from_millis(WAIT_MS),
+        "the first wait was {open_for:?} old at the hangup: it could end on its own \
+         before the drain is judged, so the check would be vacuous"
+    );
     drop(waits);
     let released = loop {
         let (reply, _) = probe(&sock, &token);
@@ -911,7 +975,7 @@ fn hung_up_waits_give_their_lanes_back_and_ctl_names_busy() {
         }
         assert_eq!(reply, BUSY, "an unexpected answer while the lanes drain");
         assert!(
-            hung_up.elapsed() < Duration::from_secs(10),
+            hung_up.elapsed() < DRAIN_HANG,
             "hung-up clients still hold their lanes after {:?}",
             hung_up.elapsed()
         );

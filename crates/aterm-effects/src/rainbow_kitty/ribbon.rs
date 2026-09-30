@@ -682,6 +682,7 @@ use aterm_render::{
     ribbon_beam,
 };
 
+use crate::color_math::relative_luminance;
 use crate::cursor_glow::{InkRole, band_pos, band_row};
 use crate::effect_util::lerp_rgb;
 use crate::spectrum::{spectrum, spectrum_with_min_saturation};
@@ -932,7 +933,7 @@ pub const SLABS_PER_CELL: usize = 3;
 /// can never reproduce the measured "only the bottom 2–3 px bright" defect:
 /// the body now rides its own ceiling, so the strip has ~19 levels of headroom
 /// to be crisp in and no more.
-pub const STRIP_LIFT_GAIN: f32 = 0.35;
+const STRIP_LIFT_GAIN: f32 = 0.35;
 
 // ===========================================================================
 // The comet body, the vivid rail and the from-the-hand attack (2026-09-13,
@@ -1124,11 +1125,11 @@ pub fn reads_as_ink(rgb: u32) -> bool {
 /// (see [`bed_luma_budget`]): at full opacity the composite IS the ink, whose
 /// relative luminance is the bar's own budget, so a brighter ALPHA cannot
 /// break a bar that a brighter COLOUR would have.
-pub const BODY_FRAME_TOP: f32 = 251.0;
+const BODY_FRAME_TOP: f32 = 251.0;
 
 /// The contrast bar every legibility ceiling in the rainbow family is solved
 /// against: unlit ink over lit ground, 5.25:1 (L3).
-pub const BODY_CONTRAST_BAR: f32 = 5.25;
+const BODY_CONTRAST_BAR: f32 = 5.25;
 
 /// The margin under [`BODY_CONTRAST_BAR`] the emitter's own rounding may not
 /// be able to cross — and NO MORE than that, because light left under the
@@ -1147,12 +1148,12 @@ pub const BODY_CONTRAST_BAR: f32 = 5.25;
 /// `letters_stay_legible_under_the_ribbon_on_every_dark_theme_above_the_floor`,
 /// which is the first step of a `0 / 0.005 / 0.01 / 0.015 / 0.02 / 0.03 /
 /// 0.05` sweep that holds the bar on all 67 of its themes.
-pub const BODY_CONTRAST_GUARD: f32 = 0.05;
+const BODY_CONTRAST_GUARD: f32 = 0.05;
 
 /// Floor on the bed's composited luminance budget. A theme whose foreground is
 /// almost black would solve to a bed nobody can see; below this the ribbon
 /// stops obeying the bar and simply takes the dimmest light that still reads.
-pub const BED_LUMA_MIN: f32 = 0.020;
+const BED_LUMA_MIN: f32 = 0.020;
 
 /// …and the ceiling: the bar's own answer at a WHITE foreground
 /// (`(1.0 + 0.05) / 5.25 − 0.05`), which no foreground can exceed — so under
@@ -1176,7 +1177,7 @@ pub const BED_LUMA_MIN: f32 = 0.020;
 /// two numbers are one ceiling in two coordinates; this module states it in
 /// the one the 5.25:1 bar is written in. Pinned by
 /// `a_bright_foreground_s_bed_takes_the_bar_s_whole_budget_not_a_tenth`.
-pub const BED_LUMA_MAX: f32 = 0.150;
+const BED_LUMA_MAX: f32 = 0.150;
 
 /// **THE BED'S CHROMA FLOOR** — the least HSV saturation a stop of the arc
 /// may carry into [`bed_ink`] and [`hot_edge_ink`], applied before the
@@ -2773,15 +2774,6 @@ fn srgb_to_linear(c: f32) -> f32 {
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
     }
-}
-
-/// The WCAG relative luminance of an `0x00RRGGBB` colour — the coordinate the
-/// 5.25:1 bar is stated in, and therefore the only honest coordinate for a
-/// ceiling that claims to keep it.
-#[must_use]
-pub fn relative_luminance(rgb: u32) -> f32 {
-    let chan = |sh: u32| srgb_to_linear(((rgb >> sh) & 0xff) as f32 / 255.0);
-    0.2126 * chan(16) + 0.7152 * chan(8) + 0.0722 * chan(0)
 }
 
 /// **THE BED'S ONE CEILING**, in relative luminance: the brightest a
@@ -8636,15 +8628,17 @@ impl Ribbon {
         }
         let cohorts = &self.cohorts;
         self.cells.retain(|cell| {
+            // A cell leaves with its cohort.
+            let Some(coh) = cohorts.iter().find(|c| c.id == cell.cohort) else {
+                return false;
+            };
             // A FLOWING band's expiry is frozen at the fold
             // ([`Ribbon::env_of`]): its cells leave with the flow's phase,
-            // below, never on their own life (2026-09-23).
-            let flowing = cohorts
-                .iter()
-                .any(|c| c.id == cell.cohort && c.flow.is_some());
-            if !flowing
+            // below, never on their own life (2026-09-23). Otherwise expiry
+            // runs from the cohort's clock ([`live_since`]).
+            if coh.flow.is_none()
                 && now
-                    .saturating_duration_since(live_since(cohorts, cell))
+                    .saturating_duration_since(cell.born.max(coh.alive_at))
                     .as_secs_f32()
                     >= cell.life_s
             {
@@ -8660,9 +8654,7 @@ impl Ribbon {
             {
                 return false;
             }
-            cohorts
-                .iter()
-                .any(|c| c.id == cell.cohort && c.phase_at(c.idle_s(now)).is_some())
+            coh.phase_at(coh.idle_s(now)).is_some()
         });
         let cells = &self.cells;
         // The walk a cohort leaves when it goes, so a same-row rebirth can
@@ -8861,8 +8853,15 @@ impl Ribbon {
     /// The per-cell sample every boundary is the midpoint of: `(spine, up,
     /// dn, cov)`. The plateau is NOT sampled here — it is a constant of
     /// [`BodyProfile`], and computing it per cell would be exactly the dead
-    /// per-station work §18 deletes.
-    fn sample(&self, ctx: &Ctx<'_>, cell: &Cell, sp: f32) -> (f32, f32, f32, f32) {
+    /// per-station work §18 deletes. `coh` is `cell`'s cohort, looked up once
+    /// per run by [`Ribbon::plan_run`].
+    fn sample(
+        &self,
+        ctx: &Ctx<'_>,
+        cell: &Cell,
+        coh: Option<&Cohort>,
+        sp: f32,
+    ) -> (f32, f32, f32, f32) {
         let chf = ctx.geom.ch as f32;
         let prof = Self::body_profile(ctx.cfg);
         let reduced = ctx.cfg.reduced_motion;
@@ -8880,9 +8879,7 @@ impl Ribbon {
         let (settle, breath) = if reduced {
             (0.0, 0.0)
         } else {
-            self.cohorts
-                .iter()
-                .find(|c| c.id == cell.cohort && c.flow.is_some() && c.phase.is_retracting())
+            coh.filter(|c| c.flow.is_some() && c.phase.is_retracting())
                 .map_or((0.0, 0.0), |c| {
                     let idle = c.idle_s(ctx.now);
                     (
@@ -8905,7 +8902,11 @@ impl Ribbon {
         // it. Shape, not light. Under the comet (2026-09-13) the wedge opens
         // to `COMET_DN_HAND_CH` — `prof.dn_ch` — at the hand: the comet's
         // lower lobe, which the rail fills with vivid ink.
-        let behind = sp * self.mark_span(cell);
+        // `sp` was normalized by the mark's own length in cells, so `sp ·
+        // span` is "how many cells behind the head this one is", which is the
+        // coordinate the wedge is stated in.
+        let span = coh.map_or(1.0, |c| f32::from(c.col1.saturating_sub(c.col0)).max(1.0));
+        let behind = sp * span;
         let bloom = clamp01(ctx.disp) * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS));
         // The lobe needs the LEADING below the row. The grid's last row has
         // none — its spine is clamped up by `dn` so the body ends at the
@@ -8946,17 +8947,7 @@ impl Ribbon {
         let spine = (f32::from(ctx.geom.origin_y) + (f32::from(cell.row) + 1.0) * chf + wave)
             .min(self.pane_bot(ctx, chf) - dn)
             .max(ctx.geom.fx_top() as f32);
-        (spine, up, dn, self.cov_of(ctx, cell))
-    }
-
-    /// The mark's own length in cells — the denominator `sp` was normalized
-    /// by, so `sp · span` is "how many cells behind the head this one is",
-    /// which is the coordinate the wedge is stated in.
-    fn mark_span(&self, cell: &Cell) -> f32 {
-        self.cohorts
-            .iter()
-            .find(|c| c.id == cell.cohort)
-            .map_or(1.0, |c| f32::from(c.col1.saturating_sub(c.col0)).max(1.0))
+        (spine, up, dn, self.cov_of(ctx, cell, coh))
     }
 
     /// **THE CELL'S ENVELOPE**, `0..1` — everything that opens and closes a
@@ -8977,6 +8968,12 @@ impl Ribbon {
     /// `now`, which is what lets "never brightens after the last keystroke"
     /// hold for the hairline by construction.
     fn env_of(&self, ctx: &Ctx<'_>, cell: &Cell) -> f32 {
+        self.env_with(ctx, cell, self.cohorts.iter().find(|c| c.id == cell.cohort))
+    }
+
+    /// [`Ribbon::env_of`] with `cell`'s cohort already looked up — the form
+    /// the plan reads, which has it once per run.
+    fn env_with(&self, ctx: &Ctx<'_>, cell: &Cell, coh: Option<&Cohort>) -> f32 {
         let now = ctx.now;
         // A wake cell laid AHEAD of its birth (`WAKE_BORN_LAG_S`) is dark
         // until it is born: the attack starts at `born`, never before it.
@@ -8984,7 +8981,6 @@ impl Ribbon {
             return 0.0;
         }
         let reduced = ctx.cfg.reduced_motion;
-        let coh = self.cohorts.iter().find(|c| c.id == cell.cohort);
         // The attack runs from its visual origin, which a live re-wet may
         // retain across a fresh identity; expiry runs from the COHORT's
         // clock (`live_since`): a key refreshes the whole run. A
@@ -9146,10 +9142,11 @@ impl Ribbon {
     /// [`Ribbon::env_of`], and scaled by the host's intensity BEFORE the cap
     /// (§3.4: requests are clipped by the ledger, never by ad-hoc caps — this
     /// is the bed's own published ceiling, and the only one this producer
-    /// applies).
-    fn cov_of(&self, ctx: &Ctx<'_>, cell: &Cell) -> f32 {
+    /// applies). `coh` is `cell`'s cohort.
+    fn cov_of(&self, ctx: &Ctx<'_>, cell: &Cell, coh: Option<&Cohort>) -> f32 {
         let cap = cov_cap(ctx.cfg);
-        (cap * cell.cov0 * self.env_of(ctx, cell) * clamp01(ctx.cfg.intensity)).clamp(0.0, cap)
+        (cap * cell.cov0 * self.env_with(ctx, cell, coh) * clamp01(ctx.cfg.intensity))
+            .clamp(0.0, cap)
     }
 
     /// **THE EMBER'S FLOOR FOR THIS CELL**, as a share of the ember's own
@@ -9241,8 +9238,8 @@ impl Ribbon {
     /// not lurch the leaving mark across the row. Per COHORT, never per row:
     /// a cohort still being typed beside one that is swooshing keeps every
     /// boundary where its letters are. Under reduced motion nothing moves
-    /// (§6.11).
-    fn retract_x(&self, ctx: &Ctx<'_>, cohort: u32, x: f32) -> f32 {
+    /// (§6.11). `coh` is the run's cohort.
+    fn retract_x(&self, ctx: &Ctx<'_>, coh: Option<&Cohort>, x: f32) -> f32 {
         if ctx.cfg.reduced_motion {
             return x;
         }
@@ -9259,22 +9256,13 @@ impl Ribbon {
         // has already taken it to column 0 of the next line.
         if let Some(at) = self.curtain {
             let u = clamp01(ctx.now.saturating_duration_since(at).as_secs_f32() / CURTAIN_S);
-            let target = self
-                .cohorts
-                .iter()
-                .find(|c| c.id == cohort)
-                .and_then(|c| c.retract_col);
-            let Some(col) = target else {
+            let Some(col) = coh.and_then(|c| c.retract_col) else {
                 return x;
             };
             let caret_x = f32::from(ctx.geom.origin_x) + f32::from(col) * ctx.geom.cw as f32;
             return caret_x + (x - caret_x) * (1.0 - suck_in(u));
         }
-        let Some(coh) = self
-            .cohorts
-            .iter()
-            .find(|c| c.id == cohort && c.phase.is_retracting())
-        else {
+        let Some(coh) = coh.filter(|c| c.phase.is_retracting()) else {
             return x;
         };
         let idle = coh.idle_s(ctx.now);
@@ -9367,8 +9355,13 @@ impl Ribbon {
     /// `at caret` is the emit-order key (the run the hand is on goes first)
     /// and is true whenever the caret is in or beside the run, wet or not.
     /// The fourth value is the run's `stream_dir`: `+1` from the wake clause,
-    /// `−1` from every other branch.
-    fn head_col(&self, ctx: &Ctx<'_>, run: &[(u16, u16, u32)]) -> (u16, bool, bool, i8) {
+    /// `−1` from every other branch. `coh` is the run's cohort.
+    fn head_col(
+        &self,
+        ctx: &Ctx<'_>,
+        run: &[(u16, u16, u32)],
+        coh: Option<&Cohort>,
+    ) -> (u16, bool, bool, i8) {
         let row = run[0].0;
         let (col0, col1) = (run[0].1, run[run.len() - 1].1);
         let (crow, ccol) = ctx.caret;
@@ -9385,15 +9378,7 @@ impl Ribbon {
         {
             return (own, true, true, -1);
         }
-        if at_caret
-            && ccol == col0
-            && live(col0)
-            && self
-                .cells
-                .get(run[0].2 as usize)
-                .and_then(|c| self.cohorts.iter().find(|k| k.id == c.cohort))
-                .is_some_and(|k| k.wake)
-        {
+        if at_caret && ccol == col0 && live(col0) && coh.is_some_and(|k| k.wake) {
             return (col0, true, true, 1);
         }
         let newest = run
@@ -9462,8 +9447,11 @@ impl Ribbon {
         let Some(cohort) = self.cells.get(run[0].2 as usize).map(|c| c.cohort) else {
             return;
         };
+        // A run is contiguous in COHORT ([`Ribbon::build_runs`]): its cohort
+        // is looked up here, once, for every per-cell read below.
+        let coh = self.cohorts.iter().find(|c| c.id == cohort);
         let slabs = self.slabs_per_cell();
-        let (head_col, at_caret, wet, stream_dir) = self.head_col(ctx, run);
+        let (head_col, at_caret, wet, stream_dir) = self.head_col(ctx, run, coh);
         let born = run
             .iter()
             .filter_map(|e| self.cells.get(e.2 as usize))
@@ -9552,11 +9540,11 @@ impl Ribbon {
             };
             let sp = |c: &Cell| f32::from(head_col.abs_diff(c.col)) / span;
             debug_assert_eq!(left_sample.is_some(), left.is_some());
-            let sa = left_sample.unwrap_or_else(|| self.sample(ctx, a, sp(a)));
+            let sa = left_sample.unwrap_or_else(|| self.sample(ctx, a, coh, sp(a)));
             let sb = if a.col == b.col {
                 sa
             } else {
-                self.sample(ctx, b, sp(b))
+                self.sample(ctx, b, coh, sp(b))
             };
             left_sample = right.map(|_| sb);
             // THE WIPE'S COORDINATE (2026-09-13): `dist` runs from the cell's
@@ -9629,7 +9617,8 @@ impl Ribbon {
                 // `caret_side_right` below still picks the wipe's edge for
                 // this run's OWN cells, so the boundary's light is not yet
                 // free of the caret — only its choice of soft end is.
-                lb = self.cov_of(ctx, nb) * self.wipe_of(ctx, nb, 1.0);
+                let nb_coh = self.cohorts.iter().find(|c| c.id == nb.cohort);
+                lb = self.cov_of(ctx, nb, nb_coh) * self.wipe_of(ctx, nb, 1.0);
             }
             // …AND IT IS THE SAME EXPRESSION ON EVERY RUN (2026-09-14, at
             // the merge with the scrub round). The left side owns the
@@ -9705,7 +9694,7 @@ impl Ribbon {
                         // half-open at `ceil`, and a fractional interior vertex
                         // made the two segments either side of it co-own a
                         // column — which a source-over bed composites twice.
-                        x: self.retract_x(ctx, cohort, l(px, x)).round(),
+                        x: self.retract_x(ctx, coh, l(px, x)).round(),
                         spine: l(p.0, here.0),
                         up: l(p.1, here.1),
                         dn: l(p.2, here.2),
@@ -9715,7 +9704,7 @@ impl Ribbon {
                 }
             }
             self.plan.push(Segment {
-                x: self.retract_x(ctx, cohort, x).round(),
+                x: self.retract_x(ctx, coh, x).round(),
                 spine: here.0,
                 up: here.1,
                 dn: here.2,
@@ -9728,7 +9717,7 @@ impl Ribbon {
                 doubled = Some((boundary - u32::from(col0)) as usize);
                 let seam = (shape.0, shape.1, shape.2, shape.3, natural);
                 self.plan.push(Segment {
-                    x: self.retract_x(ctx, cohort, x).round(),
+                    x: self.retract_x(ctx, coh, x).round(),
                     spine: seam.0,
                     up: seam.1,
                     dn: seam.2,
@@ -9755,7 +9744,7 @@ impl Ribbon {
                 let f = j as f32 / slabs as f32;
                 let cov = af.level(self, ctx, f);
                 self.plan.push(Segment {
-                    x: self.retract_x(ctx, cohort, px + (x - px) * f).round(),
+                    x: self.retract_x(ctx, coh, px + (x - px) * f).round(),
                     spine: p.0,
                     up: p.1,
                     dn: p.2,
@@ -10468,11 +10457,11 @@ impl Ribbon {
         let dur = std::time::Duration::from_secs_f32;
         let reduced_fade_s = REDUCED_MOTION_FADE_MS / 1000.0;
         for cell in &self.cells {
+            let coh = self.cohorts.iter().find(|c| c.id == cell.cohort);
             // The expiry clock is the cohort's (`live_since`), as `env_of`
             // and `retire` read it.
-            let age = since(live_since(&self.cohorts, cell));
+            let age = since(coh.map_or(cell.born, |c| cell.born.max(c.alive_at)));
             let life = cell.life_s.max(1e-3);
-            let coh = self.cohorts.iter().find(|c| c.id == cell.cohort);
             // A FLOWING band's expiry is frozen at the fold: its life offers
             // nothing, and the flow keeps the cadence brisk until it ends
             // (2026-09-23).
@@ -16866,7 +16855,10 @@ mod tests {
         let light = !cx.cfg.dark_theme;
         let mut out: Vec<u16> = Vec::new();
         for cell in rib.cells().iter().filter(|c| c.row == row) {
-            let a = (rib.cov_of(cx, cell) * scale).round().clamp(0.0, 255.0) as u8;
+            let coh = rib.cohorts.iter().find(|c| c.id == cell.cohort);
+            let a = (rib.cov_of(cx, cell, coh) * scale)
+                .round()
+                .clamp(0.0, 255.0) as u8;
             if a > 0 && census_paint(over_premul(bg, premul_rgb(rib.ink.at(cell.t), a), a), light) {
                 out.push(cell.col);
             }

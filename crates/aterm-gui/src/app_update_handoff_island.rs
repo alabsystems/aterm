@@ -47,8 +47,12 @@ clean {
       | rolledBack : Phase
       | lost : Phase
 
+    -- warm is the successor's warm prologue (warm successor P2): config,
+    -- fonts and the backend worker, run BEFORE its dial while the outgoing
+    -- process still owns and reads every session.
     inductive Event where
       | launch : Event
+      | warm : Event
       | park : Event
       | transfer : Event
       | prove : Event
@@ -76,6 +80,7 @@ clean {
     -- what HandoffWorkerCleanup exists to guarantee.
     def step : Phase -> Event -> Phase
       | Phase.idle, Event.launch => Phase.launched
+      | Phase.launched, Event.warm => Phase.launched
       | Phase.launched, Event.park => Phase.parked
       | Phase.launched, Event.fail => Phase.rolledBack
       | Phase.idle, Event.park => Phase.parked
@@ -114,6 +119,14 @@ clean {
     theorem the_candidate_never_gives_it_back (p : Phase) (e : Event) :
         owner p = Owner.candidate -> owner (step p e) = Owner.candidate := by
       cases p <;> cases e <;> intro h <;> first | rfl | exact Owner.noConfusion h
+
+    -- THE WARM TAKES NOTHING (warm successor P2). Whatever phase the protocol
+    -- is in, a successor warming before its dial moves no ownership: it
+    -- neither parks, nor transfers, nor proves. The dial -- the park trigger --
+    -- is what the warm comes before, never something it stands in for.
+    theorem the_warm_takes_nothing (p : Phase) :
+        step p Event.warm = p := by
+      cases p <;> rfl
 
     -- THE ORPHAN STATE IS UNREACHABLE. lost is in Phase so that the property
     -- can be stated at all; no protocol step ever enters it.

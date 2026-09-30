@@ -191,6 +191,30 @@ pub fn button_label(label: &str) -> String {
     }
 }
 
+/// WHICH OFFERED INTENT IS THE PAGE'S PRIMARY — the button drawn in the accent, the
+/// one a bare Return presses — as a position in `actions` (the offered capsules in
+/// order, [`MessageView::actions`]), not an `ActionIndex`. ONE rule, the engine's, so
+/// no page re-derives it (ruling 407; the lines carry it as `primary=`):
+///
+/// - the FIRST offered intent while a press can still perform it (ruling 265) — a
+///   decline included: a first `Not now` that is pressable keeps it;
+/// - past a first a press cannot perform (a dead Primary drawn in the accent read
+///   as the thing to do: day ten, D2; ruling 401), the first LATER intent a press
+///   can perform that is not a decline (ruling 403: `Skip version` past a dead
+///   `Upgrade now` would be a decision drawn as the thing to do, and pressed by a
+///   bare Return);
+/// - none such — only declines left pressable, or nothing pressable — and none
+///   leads (`None`, as for no intents at all).
+#[must_use]
+pub fn primary_index(actions: &[MessageActionView]) -> Option<usize> {
+    match actions.first() {
+        Some(first) if first.still_actionable => Some(0),
+        _ => actions
+            .iter()
+            .position(|action| action.still_actionable && !action.declines),
+    }
+}
+
 /// WHAT COPY ALL PUTS ON THE CLIPBOARD (design ruling 65): the host's build
 /// information, then each entry `shown` — the ones the filters admit, newest
 /// first — as its own Copy puts it ([`MessageView::copy_text`]), each after
@@ -429,6 +453,12 @@ pub struct MessageActionView {
     /// still takes it ([`Host::upgrade_takes`]); every navigation wherever
     /// the host performs one ([`Host::performs_navigation`]).
     pub still_actionable: bool,
+    /// A decline — `Not now`, `Not today`, `Skip version`
+    /// ([`Intent::is_decline`]): no page promotes one to its Primary past a
+    /// first intent a press cannot perform (design ruling 403; the rule is
+    /// [`primary_index`]). The page lines do not carry it; `label=` names it,
+    /// and `primary=` carries the decision it takes part in.
+    pub declines: bool,
 }
 
 impl MessageView {
@@ -505,6 +535,7 @@ impl MessageView {
                         index: u8::try_from(k).ok()?,
                         label: intent.label(),
                         still_actionable: still_actionable(intent, live.is_some(), host),
+                        declines: intent.is_decline(),
                     })
                 })
                 .collect(),
@@ -1152,12 +1183,17 @@ impl MessagesState {
 ///   clipboard ([`MessageView::copy_text`]) — ONE text, not a list: its line
 ///   breaks are the escaping's `\n`, so it reads back byte for byte (a US
 ///   join would drop a US inside a line).
-/// - `action id= index= label= actionable= button=`, after its entry, one per
-///   offered capsule in order (the first is the Primary, ruling 265): its
-///   entry, the `ActionIndex` a press names, the full capsule label, whether
-///   a press can still be performed
-///   ([`MessageActionView::still_actionable`]), and the words its footer
-///   button paints ([`button_label`]: `Open Manual` for `Manual`).
+/// - `action id= index= label= actionable= button= primary=`, after its
+///   entry, one per offered capsule in order: its entry, the `ActionIndex` a
+///   press names, the full capsule label, whether a press can still be
+///   performed ([`MessageActionView::still_actionable`]), the words its
+///   footer button paints ([`button_label`]: `Open Manual` for `Manual`),
+///   and `primary=1` on the entry's Primary alone ([`primary_index`], ruling
+///   407: the first while it has `actionable=1`, else the first later one
+///   with `actionable=1` whose `label=` is no decline — `Not now`, `Not
+///   today`, `Skip version` — else none: rulings 265, 401 and 403). Every
+///   key is appended after the older ones, so a reader of the older keys
+///   reads on.
 ///
 /// Not a field — what a page that renders the lines words or decides
 /// itself:
@@ -1209,7 +1245,8 @@ pub fn wire_lines(state: &MessagesState, filter: &MessagesFilter) -> Vec<String>
             );
         }
         lines.push(entry_line(state, clock, entry));
-        for action in &entry.actions {
+        let primary = primary_index(&entry.actions);
+        for (k, action) in entry.actions.iter().enumerate() {
             lines.push(
                 Line::new("action")
                     .num("id", entry.id)
@@ -1217,6 +1254,7 @@ pub fn wire_lines(state: &MessagesState, filter: &MessagesFilter) -> Vec<String>
                     .field("label", action.label)
                     .flag("actionable", action.still_actionable)
                     .field("button", &button_label(action.label))
+                    .flag("primary", primary == Some(k))
                     .0,
             );
         }

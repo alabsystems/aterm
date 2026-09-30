@@ -162,6 +162,12 @@ struct HandoffPrelaunchLane {
     /// anything is killed. See [`retire_ungranted_successor`].
     stand_down_ack: std::sync::mpsc::Receiver<()>,
     hold_bound: std::time::Duration,
+    /// The advisory warm hint the successor is launched with
+    /// (`handoff_warm_hint`, P2): this process's window facts and font zoom
+    /// at LAUNCH time, read on the main thread when the attempt started. A
+    /// guess the successor warms at, never trusted; the capture at the park
+    /// is what it adopts.
+    warm_hint: String,
 }
 
 #[cfg(unix)]
@@ -540,6 +546,15 @@ struct HandoffWorkerCleanup {
         crate::app_native::NativeUpdateReconcileSender,
         crate::app_native::NativeUpdateReconcileTicket,
     )>,
+}
+
+/// Whether a successor of `target_build` reads the mailbox a handoff carries
+/// (`SessionRecord::fabric`): one at least as new as this build does. Build
+/// numbers only grow along the channel, so an older number is a downgrade or a
+/// channel switch — a build that may predate the carry.
+#[cfg(unix)]
+fn successor_reads_fabric_carry(target_build: u64, running_build: u64) -> bool {
+    target_build >= running_build
 }
 
 /// THE HOLD FENCE THE COMMIT RAISES ([`App::fence_hold_serials`]): every
@@ -2895,10 +2910,15 @@ fn prepare_outgoing_artifacts(
     // the frozen terminal nothing. What the freeze took is the fence; a
     // session whose archive moved since, or whose lock another thread keeps,
     // carries its counters alone. The turn-id count rides the manifest itself,
-    // so a ledger that could not be carried cannot lower it.
+    // so a ledger that could not be carried cannot lower it — with a reserve
+    // for the turns this process still serves until its `_exit`, so the
+    // successor never mints an id this one already replied with (round
+    // seven, finding 22; the Commit checks the reserve held).
     let controls = crate::handoff_carry::export(&capture.carries);
-    capture.manifest.next_turn_id =
-        crate::handoff_carry::manifest_turn_id(crate::control::turn_ids_minted());
+    let turn_id_ceiling = crate::control::turn_ids_for_handoff();
+    capture.manifest.next_turn_id = crate::handoff_carry::manifest_turn_id(turn_id_ceiling);
+    // The ceiling rides THIS attempt, which the Commit reads it from.
+    job.arbiter.set_turn_id_ceiling(turn_id_ceiling);
     // THE HISTORY CARRY'S JOIN (`crate::handoff_history`), here where the
     // capture meets the export that ran with every reader live: each session
     // whose export still describes its history, and meets the lines its
@@ -3546,6 +3566,8 @@ fn fork_after_park(
         // down: the fork below is the attempt's only candidate.
         stand_down_ack: _,
         hold_bound,
+        // The fork lane inherits its environment and warms after its intake.
+        warm_hint: _,
     } = lane;
     aterm_log::warn!("update apply: {why}; forking instead — asking the outgoing process to park");
     if proxy
@@ -3758,6 +3780,13 @@ fn run_prelaunched_handoff(
             crate::handoff_rendezvous::GRANT_CAPS_CHUNKS.into(),
         ));
     }
+    // THE WARM HINT (P2): named beside the grant capabilities, read by the
+    // successor's warm prologue before it dials. Advisory: an older successor
+    // captures and ignores it, and none ever authenticates by it.
+    environment.push((
+        crate::handoff_warm_hint::ENV_WARM_HINT.into(),
+        lane.warm_hint.clone().into(),
+    ));
     for (key, value) in crate::seamless::outgoing_parent_env() {
         environment.push((key.into(), value.into()));
     }
@@ -6187,6 +6216,32 @@ impl App {
         })
     }
 
+    /// THE ADVISORY WARM HINT a launched successor is started with
+    /// (`handoff_warm_hint`, warm successor P2): the facts
+    /// [`Self::handoff_window_carry`] will write at the park, read now, at
+    /// launch — the font zoom the successor's warm prologue builds its backend
+    /// at before it dials, and window 0's grid and the window and session
+    /// counts, which it only compares and logs. Stale by design (the automatic
+    /// lane can hold a dialled successor until its park cap): a person who
+    /// zooms during the hold costs the successor one warm miss, which it
+    /// corrects at its backend join and says in its log.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn handoff_warm_hint(&self) -> crate::handoff_warm_hint::WarmHint {
+        let (px, reset) = self.handoff_font_zoom();
+        let (cols, rows) = self
+            .windows
+            .values()
+            .next()
+            .map_or((0, 0), |state| (state.cols, state.rows));
+        crate::handoff_warm_hint::WarmHint {
+            windows: u32::try_from(self.windows.len()).unwrap_or(u32::MAX),
+            sessions: u32::try_from(self.pool.iter().count()).unwrap_or(u32::MAX),
+            cols,
+            rows,
+            zoom: px.zip(reset),
+        }
+    }
+
     /// THE LIVE FONT ZOOM, as the window carry writes it (the round-four plan,
     /// item 15): `(px, reset px)` in thousandths of a physical px while a
     /// person has the font zoomed — pinned (`font_px_explicit`, which every
@@ -6736,19 +6791,21 @@ impl App {
             // takes it then, while the fence's fingerprint of it holds (nothing
             // committed since), so the adopting engine still goes on exactly:
             // the carry is never worth the deadline. A session whose screen was
-            // clamped or carried blank goes without: its differ state describes
-            // a screen that was not carried (plan P0-1e). One that lost only
-            // the links of its over-cap lines keeps it — the differ's state is
-            // the rows' text, which is exact (`CarryRung::keeps_control_carry`).
+            // clamped or carried blank goes without the DIFFER'S STATE only: it
+            // describes a screen that was not carried (plan P0-1e); its ledger
+            // and archive rows are not about the screen and still travel
+            // (round seven, finding 24). One that lost only the links of its
+            // over-cap lines keeps the differ's state too — it is the rows'
+            // text, which is exact (`CarryRung::keeps_differ_state`).
             let differ = deadline.saturating_duration_since(std::time::Instant::now())
                 >= handoff_history_comfort;
             // THE FOREGROUND HOLDER, for EVERY session and apart from the
             // control carry below (the 2026-09-25 review). The readers are
-            // parked, so it is the last group the reader saw. A session at the
-            // Sanitized or Repaint rung, or one whose sidecar the aggregate
-            // budget drops, goes without the control carry but still restores
-            // its modes: its holder is what lets the adopting reader hand back
-            // a job that died during the handoff. Reserved above: no allocation.
+            // parked, so it is the last group the reader saw. A session whose
+            // sidecar the aggregate budget drops, or one no storage was left
+            // for, goes without the control carry but still restores its
+            // modes: its holder is what lets the adopting reader hand back a
+            // job that died during the handoff. Reserved above: no allocation.
             if holder_room {
                 fg_holders.push((
                     session.id,
@@ -6760,14 +6817,18 @@ impl App {
             // Reserved for every live session above, so this never allocates.
             history_heads.push(crate::handoff_history::capture_head(session.id, &terminal));
             // Reserved for every live session above, so this never allocates.
-            if carry_room && rung.keeps_control_carry() {
-                carries.push(crate::handoff_carry::capture_head(
+            if carry_room {
+                let mut source = crate::handoff_carry::capture_head(
                     session.id,
                     &terminal,
                     &session.term,
                     &session.ctx.turns,
-                    differ,
-                ));
+                    differ && rung.keeps_differ_state(),
+                );
+                if !rung.keeps_differ_state() {
+                    source.without_differ();
+                }
+                carries.push(source);
             }
             wire.push(WireCarry {
                 local_id: session.id,
@@ -6797,11 +6858,19 @@ impl App {
                 }
             })?;
         // A session the self-check lowered to a clamped or blank screen loses
-        // its control carry too (`CarryRung::keeps_control_carry`).
-        carries.retain(|source: &crate::handoff_carry::CarrySource| {
-            wire.iter().any(|carry| {
-                carry.local_id == source.local_id() && carry.rung.keeps_control_carry()
-            })
+        // its differ's state too (`CarryRung::keeps_differ_state`); its ledger
+        // and archive rows still travel.
+        carries.retain_mut(|source: &mut crate::handoff_carry::CarrySource| {
+            let Some(carry) = wire
+                .iter()
+                .find(|carry| carry.local_id == source.local_id())
+            else {
+                return false;
+            };
+            if !carry.rung.keeps_differ_state() {
+                source.without_differ();
+            }
+            true
         });
         let mut screens = Vec::new();
         let mut repaint = Vec::new();
@@ -7145,6 +7214,9 @@ impl App {
         // manifest and layout by path, and the writer derives the same names
         // from this nonce after the park.
         let nonce = crate::seamless::mint_outgoing_nonce();
+        // Read here, on the main thread, where the windows are: the worker
+        // that launches the successor never touches `App`.
+        let warm_hint = self.handoff_warm_hint();
         let (stand_down_tx, stand_down_rx) = std::sync::mpsc::sync_channel(1);
         let (stand_down_ack_tx, stand_down_ack_rx) = std::sync::mpsc::sync_channel(1);
         let (transfer_tx, transfer_rx) = std::sync::mpsc::sync_channel(1);
@@ -7212,6 +7284,7 @@ impl App {
                 stand_down: stand_down_rx,
                 stand_down_ack: stand_down_ack_rx,
                 hold_bound: PRELAUNCH_HOLD_BOUND,
+                warm_hint: warm_hint.encode(),
             }),
             lane: HandoffLane::OutOfBand,
             // Set by the WORKER immediately before the candidate is launched; the
@@ -8116,8 +8189,31 @@ impl App {
     pub(crate) fn hold_serials(&self) -> u64 {
         self.pool
             .iter()
-            .map(|session| session.ctx.fabric.hold_serial())
+            .map(|session| session.ctx.fabric.carry_serial())
             .fold(0, u64::wrapping_add)
+    }
+
+    /// Whether any pooled session's timeline or inbox has handed out an id
+    /// past the one the park's manifest carried — each carries its last id
+    /// plus an overlap reserve
+    /// ([`crate::session_timeline::SessionTimeline::past_handoff_ceiling`],
+    /// [`crate::fabric::SessionFabric::past_handoff_ceiling`]): the successor
+    /// would hand it out again, so the Commit stands down. Only a process
+    /// that outruns the reserve does; ordinary traffic in the overlap never
+    /// vetoes an update. Read after the fence, under which no delivery
+    /// crosses the inbox's ceiling. Leaf reads, one short lock each, taken
+    /// one after the other.
+    #[cfg(unix)]
+    fn ids_past_handoff_ceiling(&self) -> bool {
+        self.pool.iter().any(|session| {
+            let timeline = session
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .past_handoff_ceiling();
+            timeline || session.ctx.fabric.past_handoff_ceiling()
+        })
     }
 
     /// [`Self::hold_serials`] as the COMMIT reads it: every pooled session's
@@ -8128,8 +8224,15 @@ impl App {
     /// the attempt. The fence lifts when the returned guard drops, which every
     /// path that stands the attempt down does; a Commit that lands `_exit`s
     /// with it still raised.
+    ///
+    /// `successor_reads_carry`: the successor is this build or a newer one, so
+    /// it carries the outbox on and the fence holds the bridge's retirements
+    /// back too; an older one (a downgrade, a channel switch) ignores the
+    /// carry, and a retirement it leaves unanswered would keep a sequence pin
+    /// that swallows its own post of the same id (round seven's review, item
+    /// 5) — for it they are answered, as every earlier build answered them.
     #[cfg(unix)]
-    fn fence_hold_serials(&self) -> (u64, HoldFence) {
+    fn fence_hold_serials(&self, successor_reads_carry: bool) -> (u64, HoldFence) {
         let fabrics: Vec<std::sync::Arc<crate::fabric::SessionFabric>> = self
             .pool
             .iter()
@@ -8137,7 +8240,7 @@ impl App {
             .collect();
         let serials = fabrics
             .iter()
-            .map(|fabric| fabric.fence_hold())
+            .map(|fabric| fabric.fence_hold(successor_reads_carry))
             .fold(0, u64::wrapping_add);
         (serials, HoldFence(fabrics))
     }
@@ -8184,9 +8287,25 @@ impl App {
         // Read under the FENCE, which holds every later `hold` back until
         // this attempt either exits or stands down (`fence_hold_serials`):
         // this is the last time anything compares the serials.
-        let (commit_hold_serials, hold_fence) = self.fence_hold_serials();
+        let (commit_hold_serials, hold_fence) = self.fence_hold_serials(
+            successor_reads_fabric_carry(pending_target_build, crate::running_build_number()),
+        );
+        // A process that minted more turn ids in the overlap than the
+        // manifest's reserve left it would share one with the successor
+        // (`control::TURN_ID_RESERVE`): only that stands the Commit down, a
+        // lossless retry; turns in the overlap are otherwise tolerated.
+        let turn_ids_held =
+            !crate::control::turn_ids_past_handoff_ceiling(arbiter.turn_id_ceiling());
+        if !turn_ids_held {
+            aterm_log::warn!(
+                "update apply: this process minted more turn ids since the handoff manifest \
+                 than its reserve holds; standing the Commit down so no id is minted twice"
+            );
+        }
         let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch
-            && commit_hold_serials == pending_hold_serials;
+            && commit_hold_serials == pending_hold_serials
+            && !self.ids_past_handoff_ceiling()
+            && turn_ids_held;
         // The live set as the park drew it: an exited pane the park left out
         // stays out, but a HANDED session that exited during the overlap stays
         // IN, so its death reaches `sessions_alive` — which names the reason
@@ -8485,6 +8604,12 @@ impl App {
                     if let Some(pid) = child_pid {
                         crate::identity_claim::mark_successor(&carried, pid);
                     }
+                    // THE PARENT'S RECORD LANDS BEFORE ITS `_exit` (round-seven
+                    // update audit, finding 53): the writer thread's queue dies
+                    // with the process, and the successor reads the file again
+                    // after Commit for what this process recorded since its
+                    // boot. Last, so a line any step above queued is on disk.
+                    self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);
                     let commit_result = match operator_quiesce.as_ref() {
                         Some(quiesce) => quiesce.with_commit_permit(|| {
                             crate::seamless::commit_and_exit(commit_fd, proof)
@@ -10213,6 +10338,15 @@ pub(crate) fn park_miss_disposition(misses: u8, reason: String) -> ParkMissDispo
 #[cfg(unix)]
 pub(crate) const VIDEO_EXPORT_COMMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long the seamless parent waits at Commit for its message-log writer to
+/// land what it holds before `_exit` (round-seven update audit, finding 53;
+/// [`crate::App::flush_messages_log_within`]). A line is one small append, so
+/// this is spent only on a writer throttled behind a disk the update itself is
+/// keeping busy; what does not land in time is said in `aterm.log`.
+#[cfg(unix)]
+pub(crate) const MESSAGES_FLUSH_COMMIT_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
 /// How long a dialled successor is held for a quiet moment before the attempt
 /// stands down (activity-revoked: no physical budget spent, retried later).
 /// Longer than the whole ladder ([`crate::native_update_auto_intent::LANDS_WITHIN`])
@@ -11484,6 +11618,57 @@ mod late_park_record_tests {
         arm(&mut app);
         assert!(!apply_hold_for_test(&ctx, Some(halt())));
         assert!(exact_activity(&mut app));
+    }
+
+    /// THE TURN-ID CEILING BELONGS TO THE ATTEMPT (round seven, finding 22,
+    /// review). The Commit stands down only when this process minted past
+    /// the count ITS attempt's manifest carried. The ceiling once lived in a
+    /// process-global static that the last `turn_ids_for_handoff` call set,
+    /// so an attempt whose manifest was never written (or a later test in
+    /// this binary, after a hand-over played in-process raised the count past
+    /// an earlier ceiling) read another attempt's ceiling and refused.
+    ///
+    /// Robust to other tests minting concurrently: the count only rises, so
+    /// a ceiling of 1 under a count of 2 or more is always passed, and one at
+    /// `MAX_TURN_ID` never is.
+    #[test]
+    fn the_commit_reads_the_turn_id_ceiling_of_its_own_attempt() {
+        let mut app = App::headless_for_test();
+        crate::control::raise_turn_ids(2);
+        let arm = |app: &mut App, ceiling: u64| {
+            let mut pending = parked_record(9, ApplyMode::Immediate);
+            pending.live = app
+                .pool
+                .iter()
+                .map(|session| (session.id, session.master, session.pid))
+                .collect();
+            pending.layout = app.capture_handoff_layout();
+            pending.activity_epoch = app.update_handoff_activity_epoch;
+            pending.hold_serials = app.hold_serials();
+            pending.arbiter.set_turn_id_ceiling(ceiling);
+            app.pending_update_handoff = Some(pending);
+        };
+        let exact_activity = |app: &mut App| {
+            app.collect_handoff_commit_facts(None, true, true, true)
+                .expect("an attempt is pending")
+                .0
+                .exact_activity
+        };
+
+        // Another attempt's manifest set a low ceiling: this one never wrote
+        // a manifest, so it has none, and nothing stands it down.
+        let _other = crate::control::turn_ids_for_handoff();
+        arm(&mut app, 0);
+        assert!(exact_activity(&mut app), "no manifest, no ceiling");
+
+        arm(&mut app, crate::handoff_carry::MAX_TURN_ID);
+        assert!(exact_activity(&mut app), "the reserve held");
+
+        arm(&mut app, 1);
+        assert!(
+            !exact_activity(&mut app),
+            "negative control: minted past this attempt's ceiling, no Commit"
+        );
     }
 
     /// A HALT ISSUED WHILE THE COMMIT RUNS IS NEVER ANSWERED AND THEN LOST
@@ -12912,7 +13097,8 @@ mod handed_set_and_mid_sequence_tests {
 
     /// THE FOREGROUND HOLDER CROSSES AT THE REPAINT RUNG (the 2026-09-25
     /// foreground handback review). A session whose screen the park carries
-    /// blank goes without the control carry, yet the successor restores its
+    /// blank went without the control carry then (it now keeps its ledger
+    /// and rows, without the differ's state), yet the successor restores its
     /// modes. The first cut carried the holder only in that control carry, so
     /// such a session reached the adopting reader with holder `0`, the reader
     /// probed the reclaimed shell, and a job that died during the handoff kept
@@ -12950,9 +13136,10 @@ mod handed_set_and_mid_sequence_tests {
             )
             .unwrap_or_else(|failure| panic!("the desk parks: {failure}"));
         assert_eq!(parked.repaint, vec![0], "carried blank");
+        assert_eq!(parked.carries.len(), 1, "its ledger and rows still travel");
         assert!(
-            parked.carries.is_empty(),
-            "a blank carry goes without the control carry"
+            !parked.carries[0].carries_differ(),
+            "a blank carry goes without the differ's state"
         );
         assert_eq!(
             parked.fg_holders,
@@ -18863,6 +19050,8 @@ mod font_zoom_carry_tests {
             next_turn_id: None,
             outgoing_build: None,
             held: Vec::new(),
+            roster_seq: None,
+            fabric_attached: Vec::new(),
         }
         .to_toml()
         .expect("serializes");
@@ -18884,6 +19073,8 @@ mod font_zoom_carry_tests {
             next_turn_id: None,
             outgoing_build: None,
             held: Vec::new(),
+            roster_seq: None,
+            fabric_attached: Vec::new(),
         }
         .to_toml()
         .expect("serializes");
@@ -20140,5 +20331,21 @@ mod manifest_over_cap_tests {
             ),
             crate::app_native::HandoffFailureLane::Refused
         );
+    }
+}
+
+/// ROUND SEVEN'S REVIEW, ITEM 5: the Commit fence holds the bridge's
+/// retirements back only for a successor that reads the mailbox carry — this
+/// build or a newer one. A downgrade (an older build number) gets them
+/// answered, as every earlier build answered them.
+#[cfg(all(test, unix))]
+mod fabric_carry_successor_tests {
+    use super::successor_reads_fabric_carry;
+
+    #[test]
+    fn only_a_successor_at_least_as_new_holds_retirements_back() {
+        assert!(successor_reads_fabric_carry(1_790_700_000, 1_790_607_299));
+        assert!(successor_reads_fabric_carry(1_790_607_299, 1_790_607_299));
+        assert!(!successor_reads_fabric_carry(1_790_585_188, 1_790_607_299));
     }
 }

@@ -231,21 +231,32 @@ fn ctl(root: &Path, sock: &Path, args: &[&str]) -> Reaped {
 /// An explicit `--timeout` bounds the wait for a successor too. MEASURED by the
 /// review of 2026-09-24 on an isolated headless instance SIGKILLed 1 s into the
 /// call: `--timeout 3 subscribe` and `--timeout 3 await match` each exited 75
-/// after 31 s — the 30 s successor bound on top of the caller's deadline. Here
-/// the instance is killed and nothing replaces it: both calls exit 75 (not 0,
-/// not 124), well inside the 30 s the regression adds to their 10 s deadline,
-/// and say the deadline is what ended the wait. The unbounded wait is the unit
-/// tests' negative control (`redial::tests::an_explicit_timeout_bounds_…`).
+/// after 31 s — the whole 30 s successor bound (`redial::SUCCESSOR_BOUND`)
+/// counted from the HANG-UP, the caller's deadline ignored. Here the instance
+/// is killed and nothing replaces it: both calls exit 75 (not 0, not 124)
+/// sooner after the kill than that 30 s, and say the deadline is what ended
+/// the wait. The unbounded wait is the unit tests' negative control
+/// (`redial::tests::an_explicit_timeout_bounds_…`).
 ///
-/// The clock starts BEFORE two spawns of a freshly built `aterm`, whose first
-/// exec macOS assesses (seconds under a loaded gate, 26 s once), while each
-/// CLI's own `--timeout` starts only after its exec. So the deadline is 10 s
-/// and the bound deadline + 15 s: the slack is exec latency, and the 30 s
-/// regression still overshoots it by 15 s. They were 5 s and deadline + 3 s,
-/// with a 4 s precondition charged two spawns (the load-sensitive test audit
-/// of 2026-09-27).
+/// The exits are timed FROM THE KILL. Each CLI's `--timeout` clock started
+/// before it (the subscription's first frame is read before the kill, and the
+/// blocking read is spawned first), so a correct call exits at most
+/// [`DEADLINE`] after the kill, while the regression exits no sooner than the
+/// 30 s it waits from the hang-up: [`EXIT_BOUND`] sits between them. Timed
+/// from BEFORE the two spawns instead (until 2026-09-29), a loaded gate's
+/// exec latency (26 s once for a freshly built `aterm`) was charged against a
+/// 9 s precondition and, with a longer deadline, would have let the
+/// regression through; from the kill, the precondition is only that the kill
+/// lands inside the deadline.
 #[test]
 fn a_timeout_bounds_the_wait_when_nothing_replaces_the_instance() {
+    /// Each call's `--timeout`, in seconds.
+    const DEADLINE: u64 = 20;
+    /// A call must exit within this of the kill: [`DEADLINE`] plus room for
+    /// the exit to be seen on a loaded gate, and under the 30 s the
+    /// regression waits from the hang-up, so that regression still fails.
+    const EXIT_BOUND: Duration = Duration::from_secs(27);
+    let deadline = DEADLINE.to_string();
     let Some(world) = world("t") else {
         eprintln!("SKIP: no scratch base with a short enough socket path");
         return;
@@ -264,7 +275,7 @@ fn a_timeout_bounds_the_wait_when_nothing_replaces_the_instance() {
         &sock,
         &[
             "--timeout",
-            "10",
+            &deadline,
             "await",
             "match",
             "NEVER-7f3c",
@@ -274,7 +285,7 @@ fn a_timeout_bounds_the_wait_when_nothing_replaces_the_instance() {
     let mut subscriber = ctl(
         &root,
         &sock,
-        &["--timeout", "10", "subscribe", "@.", "events"],
+        &["--timeout", &deadline, "subscribe", "@.", "events"],
     );
     let out = collect(subscriber.0.stdout.take().unwrap());
     let sub_err = collect(subscriber.0.stderr.take().unwrap());
@@ -284,21 +295,22 @@ fn a_timeout_bounds_the_wait_when_nothing_replaces_the_instance() {
     });
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        started.elapsed() < Duration::from_secs(9),
-        "the kill must land inside the 10 s deadline for this to measure anything"
+        started.elapsed() < Duration::from_secs(DEADLINE - 1),
+        "the kill must land inside the {DEADLINE} s deadline for this to measure anything"
     );
+    let killed = Instant::now();
     a.0.kill().unwrap();
     a.0.wait().unwrap();
 
-    let bound = Duration::from_secs(10 + 15);
     for (what, call, err) in [
         ("subscribe", &mut subscriber, &sub_err),
         ("await", &mut awaiter, &await_err),
     ] {
         let (code, at) = exit_of(call);
         eprintln!(
-            "{what}: exit {code:?} {:?} after the call started",
-            at.duration_since(started)
+            "{what}: exit {code:?} {:?} after the call started, {:?} after the kill",
+            at.duration_since(started),
+            at.duration_since(killed)
         );
         assert_eq!(
             code,
@@ -307,10 +319,10 @@ fn a_timeout_bounds_the_wait_when_nothing_replaces_the_instance() {
             err.lock().unwrap()
         );
         assert!(
-            at.duration_since(started) < bound,
-            "{what}: exited {:?} after the call started — the successor wait outlived \
-             --timeout 10",
-            at.duration_since(started)
+            at.duration_since(killed) < EXIT_BOUND,
+            "{what}: exited {:?} after the kill — the successor wait outlived \
+             --timeout {DEADLINE}",
+            at.duration_since(killed)
         );
         wait_for(&format!("{what}'s note"), err, |l| {
             l.iter().any(|x| x.contains("its --timeout left"))

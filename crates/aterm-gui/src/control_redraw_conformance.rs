@@ -174,6 +174,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         human_input: Default::default(),
         generation_look: Default::default(),
         reset_lane: Default::default(),
+        update_parked: Default::default(),
     });
     SessionHandle {
         sid,

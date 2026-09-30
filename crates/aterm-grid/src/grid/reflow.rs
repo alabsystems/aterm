@@ -275,7 +275,7 @@ impl Grid {
     /// Resize the grid with explicit reflow mode.
     // COST: UNBOUNDED(scrollback-width-reflow) — the width branch calls
     // `take_scrollback_lines` + `reflow_scrollback_lines` SYNCHRONOUSLY. See
-    // `xtask gate mainloop` (MAIN-LOOP COMPLETENESS CENSUS): a main-thread reach
+    // `aterm-census --mainloop` (MAIN-LOOP COMPLETENESS CENSUS): a main-thread reach
     // to this under the `term` lock is the L0 whole-Mac freeze. `Grid::resize` /
     // `Terminal::resize` forward here; the offloaded path detaches history first.
     pub fn resize_with_reflow_mode(

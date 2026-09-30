@@ -26,7 +26,7 @@ use std::time::Duration;
 use aterm_uds::CtlStream;
 
 use crate::frameio::{Incoming, read_frame, write_frame};
-use crate::identity::Identity;
+use crate::identity::{CheckError, Identity};
 use crate::wire::{CAP_LINK, CAP_SENDS_BYE, Frame, MarkerRef, MasterHeader, PROTO, PeerClass};
 
 /// One OFFER as the window receives it: the master, its fixed header, and the
@@ -39,6 +39,40 @@ pub struct Offered {
     pub meta: Vec<u8>,
 }
 
+/// A keeper that answered but failed this build's identity check (§5.7): the
+/// payload of the `PermissionDenied` error [`KeeperClient::connect`] returns,
+/// so a caller can tell it from a socket it may not open
+/// ([`refused_identity`]).
+#[derive(Debug)]
+pub struct NotThisBuild(pub String);
+
+impl std::fmt::Display for NotThisBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotThisBuild {}
+
+/// Whether `e` is [`KeeperClient::connect`] refusing a keeper that answered
+/// but is not this build's.
+#[must_use]
+pub fn refused_identity(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<NotThisBuild>())
+}
+
+/// The error [`KeeperClient::connect`] returns for a failed identity check:
+/// a refusal is a [`NotThisBuild`] inside `PermissionDenied`; a check that
+/// could not run keeps its own words.
+fn check_failed(e: CheckError) -> io::Error {
+    match e {
+        CheckError::Refused(why) => {
+            io::Error::new(io::ErrorKind::PermissionDenied, NotThisBuild(why))
+        }
+        CheckError::Unchecked(why) => io::Error::other(why),
+    }
+}
+
 /// One connection to a keeper.
 #[derive(Debug)]
 pub struct KeeperClient {
@@ -49,12 +83,11 @@ impl KeeperClient {
     /// Dial `path`, check the keeper's identity, and set a read timeout.
     ///
     /// # Errors
-    /// The dial failing, or the keeper failing the identity check.
+    /// The dial failing, the keeper failing the identity check (a
+    /// [`NotThisBuild`] inside `PermissionDenied`), or the check not running.
     pub fn connect(path: &Path, identity: &Identity, timeout: Duration) -> io::Result<Self> {
         let stream = CtlStream::connect(path)?;
-        identity
-            .check(&stream)
-            .map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why))?;
+        identity.check(&stream).map_err(check_failed)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         Ok(Self { stream })
@@ -507,6 +540,83 @@ mod tests {
             assert!(Instant::now() < deadline, "never: {what}");
             server.step(20).expect("step");
         }
+    }
+
+    /// A listener that is not this build's code — Apple's `nc` — answers on
+    /// the socket: the designated check refuses it, and the error says so
+    /// ([`refused_identity`]). NEGATIVE CONTROLS: no socket at all, and a
+    /// socket of ours this process may not open (also `PermissionDenied`),
+    /// are not read as that refusal.
+    #[test]
+    fn a_listener_of_other_code_is_refused_as_not_this_build() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("akl-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let own = Identity::for_self(crate::identity::IdentityPolicy::Designated).expect("own");
+
+        let sock = dir.join("nc.sock");
+        let mut nc = std::process::Command::new("/usr/bin/nc")
+            .arg("-dlU")
+            .arg(&sock)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nc");
+        // A hang detector: `nc` binds, then listens; a dial between the two is
+        // refused, so the dial is retried until it reaches the listener.
+        let started = Instant::now();
+        let refused = loop {
+            match KeeperClient::connect(&sock, &own, Duration::from_secs(2)) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    assert!(started.elapsed().as_secs() < 60, "nc never listened: {e}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => break other,
+            }
+        };
+        let _ = nc.kill();
+        let _ = nc.wait();
+        let e = refused.expect_err("nc is not this build's code");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(refused_identity(&e), "{e}");
+
+        let absent = KeeperClient::connect(&dir.join("none.sock"), &own, Duration::from_secs(2))
+            .expect_err("nothing there");
+        assert!(!refused_identity(&absent), "{absent}");
+
+        let closed = dir.join("closed.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&closed).expect("bind");
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let denied = KeeperClient::connect(&closed, &own, Duration::from_secs(2))
+            .expect_err("a socket this process may not open");
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied, "{denied}");
+        assert!(!refused_identity(&denied), "{denied}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a peer the check refused is [`NotThisBuild`]; a check that could
+    /// not run (no audit token, the peer's code not found) keeps its words
+    /// and is not read as that refusal.
+    #[test]
+    fn only_a_refused_check_is_not_this_build() {
+        let refused = check_failed(CheckError::Refused("OSStatus -67050".into()));
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(refused_identity(&refused), "{refused}");
+        let unchecked = check_failed(CheckError::Unchecked(
+            "the kernel did not give the peer's audit token".into(),
+        ));
+        assert!(!refused_identity(&unchecked), "{unchecked}");
+        assert_eq!(
+            unchecked.to_string(),
+            "the kernel did not give the peer's audit token"
+        );
     }
 
     /// §5.3 step 9: a keeper that restarts is told again what the window

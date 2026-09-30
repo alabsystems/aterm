@@ -80,8 +80,10 @@ pub(crate) const CARRY_ARCHIVE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
 /// The most sidecar bytes one handoff writes, and one receiver reads, across
 /// every session — the receiver decodes them in early `main`, inside the
-/// freeze the user sees. A session past it carries less (counters, then
-/// nothing).
+/// freeze the user sees. Every session's ledger and counters are set aside
+/// first; past it, sessions carry fewer rows (then no differ state) — and
+/// only a desk whose ledgers alone overflow it sheds ledger records
+/// ([`export`]).
 pub(crate) const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 /// How many of the newest SUBMITTED turns' marks the carried tail reaches back
 /// to: `aterm drive report` reads `history 8` and starts from the newest
@@ -116,17 +118,34 @@ pub(crate) struct CarrySource {
     /// The counters-only carry (plus the differ's state when there was time):
     /// what is carried when the rows cannot be.
     head: AltArchiveCarry,
+    /// Whether the differ's state may travel ([`Self::without_differ`]).
+    keep_differ: bool,
 }
 
 #[cfg(any(unix, test))]
 impl CarrySource {
     /// The session this capture belongs to — what the park's capture matches
     /// against its carried screens, so a session whose screen it lowered below
-    /// VisibleOnly after the fact goes without its control carry too (the
-    /// 2026-09-22/23 update audit, plan P0-1e).
+    /// the exact rungs after the fact goes without its differ's state too (the
+    /// 2026-09-22/23 update audit, plan P0-1e; [`Self::without_differ`]).
     #[cfg(unix)]
     pub(crate) fn local_id(&self) -> u64 {
         self.local_id
+    }
+
+    /// Whether the differ's state may travel with this session.
+    #[cfg(test)]
+    pub(crate) fn carries_differ(&self) -> bool {
+        self.keep_differ
+    }
+
+    /// Carry this session without the differ's state: its screen was not
+    /// carried as the program drew it (`CarryRung::keeps_differ_state`), so
+    /// that state describes nothing the successor shows. The ledger and the
+    /// archive's rows still travel.
+    pub(crate) fn without_differ(&mut self) {
+        self.head.differ = None;
+        self.keep_differ = false;
     }
 }
 
@@ -149,17 +168,25 @@ pub(crate) fn capture_head(
         turns: Arc::clone(turns),
         fence,
         head,
+        keep_differ: true,
     }
 }
 
 /// THE WORKER'S SHARE, just before the manifest is written: one sidecar per
 /// session, `(local_id, JSON)`. Never fails the handoff — a session whose
 /// sidecar would not fit carries less, and in the end nothing.
+///
+/// THE AGGREGATE IS SPENT BY PRIORITY, not first come, first served (round
+/// seven, finding 37): every session's CORE — its ledger and the archive's
+/// counters, what `aterm drive report`, `history` and a resumed `since-turn=`
+/// stand on — is set aside first, and the differ's state and the archive's
+/// rows share what is left, in pool order. Spent greedily, a crowded desk's
+/// first sessions carried their optional rows and its last ones lost their
+/// whole ledger, the same sessions on every update.
 #[cfg(any(unix, test))]
 pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
-    let mut out = Vec::with_capacity(sources.len());
-    let mut total = 0_u64;
     let patience = Instant::now() + LOCK_PATIENCE;
+    let mut taken = Vec::with_capacity(sources.len());
     for source in sources {
         // A ledger another thread keeps is carried as NOTHING it vouches for:
         // every turn id this process minted may have named a record of it.
@@ -170,7 +197,9 @@ pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
                     crate::control::turn_ids_minted().saturating_add(1),
                 )
             },
-            |ledger| (ledger.records().cloned().collect(), ledger.unheld_below()),
+            // A turn still open here records into THIS process after the
+            // export: the carry does not vouch for its id either.
+            |ledger| (ledger.records().cloned().collect(), ledger.carry_floor()),
         );
         let mut archive = source.head.clone();
         if let Some(terminal) = patiently(patience, || source.term.try_lock()) {
@@ -178,7 +207,9 @@ pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
             // while nothing committed since (then it is the state the freeze
             // would have taken). Without it the adopting engine starts a new
             // baseline after a `restore` gap, and a report says `archive-gap`.
-            let _ = terminal.alt_archive_carry_differ(&mut archive, source.fence);
+            if source.keep_differ {
+                let _ = terminal.alt_archive_carry_differ(&mut archive, source.fence);
+            }
             let from = tail_from(&turns, source.fence, archive.differ.as_ref());
             // `false` (the archive moved since the freeze) leaves the head:
             // counters only, the rows counted lost.
@@ -189,13 +220,48 @@ pub(crate) fn export(sources: &[CarrySource]) -> Vec<(u64, Vec<u8>)> {
                 CARRY_ARCHIVE_BYTES,
             );
         }
-        let room = MAX_SIDECAR_BYTES.min(MAX_AGGREGATE_BYTES.saturating_sub(total));
+        let core = core_len(&turns, unheld_below, &archive);
+        taken.push((source.local_id, turns, unheld_below, archive, core));
+    }
+    let cores = taken
+        .iter()
+        .fold(0_u64, |sum, (.., core)| sum.saturating_add(*core));
+    // What the differs and the rows may spend, over every session's core.
+    let mut spare = MAX_AGGREGATE_BYTES.saturating_sub(cores);
+    let mut total = 0_u64;
+    let mut out = Vec::with_capacity(taken.len());
+    for (local_id, turns, unheld_below, archive, core) in taken {
+        let room = MAX_SIDECAR_BYTES
+            .min(core.saturating_add(spare))
+            .min(MAX_AGGREGATE_BYTES.saturating_sub(total));
         if let Some(bytes) = encode_within(turns, unheld_below, archive, room) {
-            total += bytes.len() as u64;
-            out.push((source.local_id, bytes));
+            let len = bytes.len() as u64;
+            total = total.saturating_add(len);
+            spare = spare.saturating_sub(len.saturating_sub(core));
+            out.push((local_id, bytes));
+        } else {
+            // SAID, not silent (round seven, finding 44): the session adopts
+            // with an empty ledger and a fresh archive.
+            aterm_log::warn!(
+                "update apply: session {local_id}'s control carry does not fit what is left \
+                 of the handoff's budget ({room} bytes); it hands off without its turn ledger \
+                 and archive tail"
+            );
         }
     }
     out
+}
+
+/// The size of a session's CORE sidecar — its whole ledger and the archive's
+/// counters, without rows or the differ's state — as [`export`] sets it aside
+/// (never more than one sidecar may hold: a ledger past that is shed anyway).
+#[cfg(any(unix, test))]
+fn core_len(turns: &[TurnRecord], unheld_below: u64, archive: &AltArchiveCarry) -> u64 {
+    let mut core = counters_only(archive.clone());
+    core.differ = None;
+    encode(turns, unheld_below, &core).map_or(MAX_SIDECAR_BYTES, |bytes| {
+        (bytes.len() as u64).min(MAX_SIDECAR_BYTES)
+    })
 }
 
 /// The turn-id counter as the manifest can carry it (a TOML integer is an
@@ -478,19 +544,36 @@ impl ControlCarry {
             .map(|archive| terminal.alt_archive_import(archive))
     }
 
+    /// Adopt this carry without the differ's state: the successor repaints
+    /// the session, so the screen that state describes is not the one it
+    /// shows. The ledger and the archive's rows are kept.
+    pub(crate) fn without_differ(&mut self) {
+        if let Some(archive) = self.archive.as_mut() {
+            archive.differ = None;
+        }
+    }
+
     /// The highest carried turn id.
     pub(crate) fn high_turn_id(&self) -> Option<u64> {
         self.turns.iter().map(|t| t.id).max()
     }
 }
 
-/// Decode a sidecar; `None` for anything that is not one this build reads.
-/// A record with a status word this build does not print, or an id past
-/// [`MAX_TURN_ID`], is left out; a gap of a kind it does not know is left out.
+/// Decode a sidecar; `None` for anything that is not one this build reads
+/// ([`decode_why`] says which).
+#[cfg(test)]
 pub(crate) fn decode(bytes: &[u8]) -> Option<ControlCarry> {
-    let wire: Wire = aterm_json::from_slice(bytes).ok()?;
+    decode_why(bytes).ok()
+}
+
+/// Decode a sidecar, or say why it is not one this build reads. A record
+/// with a status word this build does not print, or an id past
+/// [`MAX_TURN_ID`], is left out; a gap of a kind it does not know is left out.
+pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
+    let wire: Wire =
+        aterm_json::from_slice(bytes).map_err(|_| "its sidecar is not the carry's JSON")?;
     if wire.version != WIRE_VERSION {
-        return None;
+        return Err("its sidecar is a layout version this build does not read");
     }
     let turns = wire
         .turns
@@ -550,7 +633,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<ControlCarry> {
             }
         }),
     });
-    Some(ControlCarry {
+    Ok(ControlCarry {
         turns,
         unheld_below: wire.unheld_below.min(MAX_TURN_ID.saturating_add(1)),
         archive,

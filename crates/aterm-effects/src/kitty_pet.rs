@@ -268,7 +268,7 @@ use crate::rainbow_kitty::companion::{PetOffer, StarCatch};
 
 mod console_life;
 use console_life::ConsoleLife;
-pub use console_life::{PetAttention, PetEditPhase, PetInputKind};
+pub use console_life::{PetAttention, PetInputKind};
 
 // ── the chase ───────────────────────────────────────────────────────────────
 
@@ -2809,27 +2809,67 @@ impl PetSpecies {
     /// falls back to the cat frame rather than drawing nothing.
     #[must_use]
     pub fn skin(self, pose: PetGlyphId) -> PetGlyphId {
-        let Self::Dog = self else { return pose };
-        let cat_id = PET_GLYPHS[pose as usize].id;
-        // Already a dog frame (a re-skin of an already-skinned pose is a no-op).
-        if cat_id.starts_with("pet_dog_") {
-            return pose;
+        match self {
+            Self::Cat => pose,
+            Self::Dog => DOG_SKIN[pose as usize],
         }
-        let Some(tail) = cat_id.strip_prefix("pet_") else {
-            return pose;
-        };
-        PET_GLYPH_IDS
-            .iter()
-            .copied()
-            .find(|id| {
-                PET_GLYPHS[*id as usize]
-                    .id
-                    .strip_prefix("pet_dog_")
-                    .is_some_and(|t| t == tail)
-            })
-            .unwrap_or(pose)
     }
 }
+
+/// [`PetSpecies::skin`]'s dog column, indexed by pose and resolved by ident
+/// once, at compile time: `pet_<tail>` maps to `pet_dog_<tail>` when the
+/// roster has one. A dog frame (a re-skin of an already-skinned pose is a
+/// no-op) and a pose with no counterpart map to themselves.
+const DOG_SKIN: [PetGlyphId; PET_GLYPHS.len()] = {
+    const fn starts_with(s: &[u8], prefix: &[u8]) -> bool {
+        if s.len() < prefix.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < prefix.len() {
+            if s[i] != prefix[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    // `dog` is `pet_dog_` followed by `cat`'s tail after `pet_`.
+    const fn dog_of(dog: &[u8], cat: &[u8]) -> bool {
+        const DOG: &[u8] = b"pet_dog_";
+        if !starts_with(dog, DOG) || dog.len() - DOG.len() != cat.len() - 4 {
+            return false;
+        }
+        let mut i = 0;
+        while i < cat.len() - 4 {
+            if dog[DOG.len() + i] != cat[4 + i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut table = [PetGlyphId::PetApex; PET_GLYPHS.len()];
+    let mut i = 0;
+    while i < PET_GLYPH_IDS.len() {
+        let pose = PET_GLYPH_IDS[i];
+        let cat = PET_GLYPHS[pose as usize].id.as_bytes();
+        table[pose as usize] = pose;
+        if starts_with(cat, b"pet_") && !starts_with(cat, b"pet_dog_") {
+            let mut j = 0;
+            while j < PET_GLYPH_IDS.len() {
+                let dog = PET_GLYPH_IDS[j];
+                if dog_of(PET_GLYPHS[dog as usize].id.as_bytes(), cat) {
+                    table[pose as usize] = dog;
+                    break;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    table
+};
 
 /// The pet's decision layer: a caret follower with a behaviour state machine on
 /// top. `tick` is the whole API; everything else is derived from it.
@@ -3848,6 +3888,9 @@ impl PetBrain {
         }
         let mut ink_spans = std::mem::take(&mut self.ink_spans);
         ink_spans.clear();
+        // The console's observation buffer is carried the same way: cleared,
+        // not reallocated.
+        let console = self.console.retired();
 
         // One expression, not a seventeen-step ritual: `..Self::default()`
         // STATES the contract — every field not named here is reset — where a
@@ -3871,6 +3914,7 @@ impl PetBrain {
             trick_content_at,
             stroke,
             ink_spans,
+            console,
             ..Self::default()
         };
     }
@@ -4822,25 +4866,7 @@ impl PetBrain {
         // for byte what it was; after a 4 s pause a backspace no longer
         // completes a stale held-delete run, and the key's own velocity
         // impulse is no longer decayed by the whole pause.
-        let excess = (elapsed - dt).max(0.0);
-        self.reversal_t += excess;
-        if self.reversal_t > FROLIC_WINDOW {
-            self.reversals = 0;
-            self.reversal_t = 0.0;
-        }
-        // The held-delete window (capped so an idle hour cannot overflow it).
-        self.retreat_gap = (self.retreat_gap + excess).min(60.0);
-        // v̂ decays every tick; observed moves add their impulse in `on_move`.
-        // A pause therefore eases the lead back over VEL_TAU, and the station
-        // drifts home to caret+1 instead of staying parked out ahead. A pause
-        // is wall time (the law above): the lead eases home over the seconds
-        // the user actually paused, whatever the lane was doing.
-        self.vhat *= (-excess / VEL_TAU).exp();
-        // The rhythm run's clock (capped like `retreat_gap`).
-        self.run_t = (self.run_t + excess).min(60.0);
-        if self.run_t > RHYTHM_WINDOW {
-            self.run_count = 0;
-        }
+        self.age_gesture_windows((elapsed - dt).max(0.0));
         // The coarse offer's inputs, and the glide sensor's baseline — see
         // the fields. Written before any arm can return. THE MARK IS ONLY
         // MOVED BY A TICK THAT CAN MOVE THE BODY (2026-09-06): the ease home
@@ -5086,62 +5112,25 @@ impl PetBrain {
                 self.worn = Some(pair);
             }
             self.quiet += elapsed;
-            self.speed = 0.0;
             self.last_caret = None;
-            self.hop_crouch = false;
-            self.flinch_t = 0.0;
-            // A caret that went away took its velocity with it: the next
-            // sighting is a NEW sighting, and a stale v̂ would scoot the pet
-            // ahead of a caret that has not moved yet.
-            self.vhat = 0.0;
             self.run_count = 0;
-            self.pending_wall_transit = false;
-            // No caret, no audience: the wave-1 stimuli are dropped, not
-            // parked — a cheer/fright/pet with nothing on glass to act it
-            // out would otherwise pin `needs_frames` on a hidden cat.
-            self.pending_bell = None;
-            self.pending_cheer = None;
-            self.pending_sulk = false;
-            self.pending_flow = None;
-            // …and THE VERDICT with them: a strike aimed at a prompt row
-            // nobody can see, and the cheer that strike was carrying.
-            self.drop_verdict_latches();
-            // …and v2's offers with them: an arrival nobody can watch and a
-            // star over an invisible cat are offers to nobody, and the hue is
-            // a level about a body that is not on glass.
-            self.pending_perk = None;
-            self.pending_catch = None;
-            self.caught = None;
-            self.catch_cool = 0.0;
-            self.mote_rgb = None;
-            self.pending_pet = 0;
-            self.pet_at = None;
-            self.pet_hold_t = 0.0;
-            // …and a song sung to nobody, with it: the ♪ a hidden cat deals
-            // land on no glass, and an owed one would pin `needs_frames`.
-            self.song_left = 0;
+            // No caret, no audience: the stimuli, offers, holds and play are
+            // dropped, not parked — a cheer/fright/pet with nothing on glass
+            // to act it out would otherwise pin `needs_frames` on a hidden
+            // cat. A caret that went away took its velocity with it (the next
+            // sighting is a NEW sighting), a strike aimed at a prompt row
+            // nobody can see and a song sung to nobody go with it, and a hide
+            // mid-flight drops the WHOLE trip, second bound and landing
+            // recovery included: a stranded `bound2` latch used to dress the
+            // next ordinary landing in the touch-land coil and then relaunch a
+            // screen-crossing bound at a target from before the hide (review,
+            // 2026-08-10).
+            self.drop_theater();
             // …and the typed kitty command, whole: a word typed at a cat
             // nobody can see is a request to nobody (and a typed word never
             // summons), and a commanded seat is a pose about a body that is
             // not on glass.
             self.drop_tricks();
-            // The wave-2 heat too: a hidden caret means no stream on this
-            // surface worth watching, and a stale watch must not resume
-            // against a fresh sighting.
-            self.watch_heat = 0.0;
-            self.watch_t = 0.0;
-            self.watch_spent = false;
-            // And the play state: no audience, no toys (dropped, not
-            // parked, the wave-1 rule).
-            self.clear_play();
-            // A hide mid-flight drops the WHOLE trip, second bound and
-            // landing recovery included: a stranded `bound2` latch used to
-            // dress the next ordinary landing in the touch-land coil and
-            // then relaunch a screen-crossing bound at a target from before
-            // the hide (review, 2026-08-10).
-            self.bound2 = None;
-            self.land_t = 0.0;
-            self.land_span = 0.0;
             self.skid_dir = 0.0;
             // THE DOC's `:2402` find — the live arc a hidden pet was still
             // flying — is NOT fixed here. It was fixed upstream, and better:
@@ -5151,8 +5140,7 @@ impl PetBrain {
             // follower if the caret returns first. Snapping the paws to the
             // destination here would teleport the still-visible body and
             // steal the arc that custody needs.
-            // …and the pose a re-anchor hop owed back: no audience, no debt.
-            self.resume = None;
+            //
             // A hidden caret retires the handoff's PARK outright: it landed
             // (or will land) at zero alpha above, no audience, no theater
             // (the wave-1 rule). A crossfade ALREADY ON GLASS is another
@@ -5173,35 +5161,15 @@ impl PetBrain {
                 self.departures = [None; PET_DEPARTURES_MAX];
                 self.arrive_t = 0.0;
             }
-            self.handoff_parked_clock = None;
-            // Micro-life sleeps with the audience gone.
-            self.twitch_t = 0.0;
-            self.last_burst = false;
-            self.droop_seated = false;
             // No caret, no gaze: a hidden cursor is not a thing to look at,
             // and a dwell it was earning dies with it.
             self.sit_front = false;
             self.peek = false;
-            self.look_row = 0;
             self.gaze_dwell = 0.0;
             // The wave-4 comedy dies with the audience too.
             self.tennis = false;
             self.stumble_t = 0.0;
-            self.braking = false;
-            self.brake_over = None;
-            self.skid_puff = false;
-            self.lateral = false;
             self.leg_dist = 0.0;
-            // A fall nobody is watching is not a fall, and neither the
-            // drop's stare nor the commit stare has an audience.
-            self.pending_drop = false;
-            self.drop_sit_t = 0.0;
-            self.drop_stare = false;
-            self.commit_t = 0.0;
-            self.scrabble = false;
-            self.wriggle_t = 0.0;
-            self.hide_to = None;
-            self.hiding = false;
             // A cat in the AIR is never settled here, and needs no guard
             // saying so: this arm's very first act was `flight.take()` —
             // the retirement above, which hands the authored parabola to
@@ -5401,66 +5369,31 @@ impl PetBrain {
             // sensor too, or needs_frames mistakes the snap for unfinished travel.
             self.home = col;
             self.col_at_tick = col;
-            self.speed = 0.0;
             self.flight = None;
-            self.land_t = 0.0;
-            self.hop_crouch = false;
-            // A re-anchor hop cancelled mid-air owes nothing: reduced motion
-            // has no poses to hand back to, only the station.
-            self.resume = None;
-            self.flinch_t = 0.0;
-            self.vhat = 0.0;
-            self.pending_wall_transit = false;
             // Reduced motion plays NO choreography and spawns NO particles.
             self.pending_big_jump = false;
             self.quiet_leap = false;
             self.stream = false;
             self.stream_run = 0;
             self.big_gather = false;
-            // No gait at all here, so no gait FLAG either: the amble and the
-            // drift-brake's slide are motion, and the pet simply IS at its
-            // station.
-            self.lateral = false;
-            self.braking = false;
-            self.brake_over = None;
-            self.skid_puff = false;
-            // No fall, no stare: reduced motion has no floor to lose and no
-            // beat to spend on an empty cell.
-            self.pending_drop = false;
-            self.drop_sit_t = 0.0;
-            self.drop_stare = false;
-            self.commit_t = 0.0;
-            self.scrabble = false;
-            self.bound2 = None;
-            self.land_span = 0.0;
             self.motes = [None; PET_MOTES_MAX];
             // The wave-1 stimuli are BOOKKEEPING ONLY here: the contentment
             // a pet would have bought still lands (the exit-status ledger
             // already moved at note time), but no wake, no droop, no purr
-            // hold, and no motes — the tests' motion contract.
+            // hold, and no motes — the tests' motion contract. The same law
+            // drops everything else that is theater: no gait (the amble and
+            // the drift-brake's slide are motion — the pet simply IS at its
+            // station), no fall and no stare, no strike (a flight at the
+            // prompt row is the one thing this arm exists to refuse; what
+            // the verdict BOUGHT lands, the theater does not), none of v2's
+            // offers (the impulse is a `Land` here by law), no re-anchor
+            // pose owed back (only the station), no orphaned roll, hide or
+            // SONG hold (this arm pins the pose to Sit or Sleep, and every
+            // one of them holds `needs_frames` open), no wave-2 perk, play
+            // or heat, and no micro-life (the bob is motion, and so is every
+            // dealt idle beat).
             self.content = (self.content + f32::from(self.pending_pet) * PET_CONTENT).min(1.0);
-            self.pending_pet = 0;
-            self.pet_at = None;
-            self.pending_bell = None;
-            self.pending_cheer = None;
-            self.pending_sulk = false;
-            self.pending_flow = None;
-            // …and THE VERDICT with them: reduced motion has no strike to
-            // throw — a flight at the prompt row is the one thing this arm
-            // exists to refuse — and so nothing to carry the cheer on. The
-            // ledger already moved at note time (the petting precedent): what
-            // the verdict BOUGHT lands, the theater does not.
-            self.drop_verdict_latches();
-            // v2's offers are theater too: reduced motion has no notice to
-            // play and no paw to put out (the impulse is a `Land` there by
-            // law, and a landing is a pose, not an edge to wait for). The hue
-            // is dropped with them — a still frame deals no motes.
-            self.pending_perk = None;
-            self.pending_catch = None;
-            self.caught = None;
-            self.catch_cool = 0.0;
-            self.mote_rgb = None;
-            self.pet_hold_t = 0.0;
+            self.drop_theater();
             // THE TYPED KITTY COMMAND is bookkeeping here too: no notice, no
             // verb, no held seat — the opening beat, the playing flag and
             // the commanded level are all zeroed, and praise still warms the
@@ -5491,32 +5424,6 @@ impl PetBrain {
                     self.praise(p.trick);
                 }
             }
-            // …and THE ORPHANED HOLDS the commands made reachable: a roll,
-            // a hide or a SONG that was live when reduced motion (or a load
-            // shed) engaged has no arm left to spend it — this one pins the
-            // pose to Sit or Sleep — and every one of them holds
-            // `needs_frames` open.
-            self.wriggle_t = 0.0;
-            self.hide_to = None;
-            self.hiding = false;
-            self.song_left = 0;
-            // Wave 2 is theater and theater only: no perk at a stream under
-            // reduced motion, no pointer play, and no heat left behind to
-            // fire either later.
-            self.watch_heat = 0.0;
-            self.watch_t = 0.0;
-            self.watch_spent = false;
-            self.clear_play();
-            // No micro-life either: the bob is motion, and so is every
-            // dealt idle beat — the seat's tail, its blink, its yawn, its
-            // glance, the loaf's peek and the wash's second half all read
-            // the pose off `quiet` and the hand, and none of them is
-            // reachable from here. The two emit-only bits they share are
-            // cleared with the rest of the latches.
-            self.twitch_t = 0.0;
-            self.last_burst = false;
-            self.droop_seated = false;
-            self.look_row = 0;
             // BREED HANDOFF under reduced motion: the parked look applies
             // IMMEDIATELY (the departure is theater; the costume is state),
             // and no departing body ever spawns — or survives a mid-flight
@@ -5524,7 +5431,6 @@ impl PetBrain {
             if let Some(pair) = self.pending_worn.take() {
                 self.worn = Some(pair);
             }
-            self.handoff_parked_clock = None;
             self.departures = [None; PET_DEPARTURES_MAX];
             self.arrive_t = 0.0;
             self.action = if self.quiet >= SLEEP_AFTER {
@@ -5536,17 +5442,7 @@ impl PetBrain {
         }
 
         // ── the frame's own aging (see the pause's excess, above) ──────────
-        self.reversal_t += dt;
-        if self.reversal_t > FROLIC_WINDOW {
-            self.reversals = 0;
-            self.reversal_t = 0.0;
-        }
-        self.retreat_gap = (self.retreat_gap + dt).min(60.0);
-        self.vhat *= (-dt / VEL_TAU).exp();
-        self.run_t = (self.run_t + dt).min(60.0);
-        if self.run_t > RHYTHM_WINDOW {
-            self.run_count = 0;
-        }
+        self.age_gesture_windows(dt);
 
         self.action_t += dt;
         self.land_t = (self.land_t - dt).max(0.0);
@@ -9408,25 +9304,8 @@ impl PetBrain {
                 let beat = ((self.quiet - SIT_AFTER).max(0.0) / PURR_MOTE_EVERY).floor() as i64;
                 if beat >= 1 && beat != self.mote_mark {
                     self.mote_mark = beat;
-                    let seed = self.mote_serial;
-                    self.mote_serial = self.mote_serial.wrapping_add(1);
                     // Alternate ♪ and ♥ deterministically by serial parity.
-                    let kind = if seed.is_multiple_of(2) {
-                        PetMoteKind::Note
-                    } else {
-                        PetMoteKind::Heart
-                    };
-                    let chest_x = if self.facing_left { 0.38 } else { 0.62 };
-                    self.spawn_mote(Mote {
-                        kind,
-                        born: self.clock,
-                        life: PURR_MOTE_LIFE,
-                        col: self.col + width * chest_x + 0.23,
-                        row: self.row - 0.27,
-                        dir: if self.facing_left { -1.0 } else { 1.0 },
-                        seed,
-                        rgb: None,
-                    });
+                    self.spawn_chest_mote(None, width, (0.0, 0.0));
                 }
             }
             _ => {}
@@ -10092,6 +9971,93 @@ impl PetBrain {
         self.groom_owed = false;
     }
 
+    /// Age the gesture windows by `secs` of wall time: the frolic detector's
+    /// reversal run, the held-delete window (capped so an idle hour cannot
+    /// overflow it), the lead's decay and the rhythm run's clock (capped
+    /// like the held-delete window). v̂ decays every tick; observed moves add
+    /// their impulse in `on_move`. A pause therefore eases the lead back over
+    /// `VEL_TAU`, and the station drifts home to caret+1 instead of staying
+    /// parked out ahead: the lead eases home over the seconds the user
+    /// actually paused, whatever the lane was doing.
+    fn age_gesture_windows(&mut self, secs: f32) {
+        self.reversal_t += secs;
+        if self.reversal_t > FROLIC_WINDOW {
+            self.reversals = 0;
+            self.reversal_t = 0.0;
+        }
+        self.retreat_gap = (self.retreat_gap + secs).min(60.0);
+        self.vhat *= (-secs / VEL_TAU).exp();
+        self.run_t = (self.run_t + secs).min(60.0);
+        if self.run_t > RHYTHM_WINDOW {
+            self.run_count = 0;
+        }
+    }
+
+    /// THE THEATER, DROPPED — not parked: every stimulus, offer, hold, gait
+    /// flag and micro-life beat that only exists to be acted out on glass.
+    /// Shared by the two arms that have nothing to act it on, the no-caret
+    /// arm (no audience) and the reduced-motion arm (no motion); each says
+    /// why at its call. A latch left here would pin `needs_frames` on a cat
+    /// that cannot spend it. The contentment the wave-1 stimuli and the
+    /// verdict bought moved at note time, so dropping them loses no ledger.
+    fn drop_theater(&mut self) {
+        self.speed = 0.0;
+        self.hop_crouch = false;
+        self.flinch_t = 0.0;
+        self.vhat = 0.0;
+        self.pending_wall_transit = false;
+        // The wave-1 stimuli, and THE VERDICT with them.
+        self.pending_bell = None;
+        self.pending_cheer = None;
+        self.pending_sulk = false;
+        self.pending_flow = None;
+        self.drop_verdict_latches();
+        // v2's offers: an arrival nobody can watch and a star over an absent
+        // cat are offers to nobody, and the hue is a level about a body that
+        // is not being drawn.
+        self.pending_perk = None;
+        self.pending_catch = None;
+        self.caught = None;
+        self.catch_cool = 0.0;
+        self.mote_rgb = None;
+        self.pending_pet = 0;
+        self.pet_at = None;
+        self.pet_hold_t = 0.0;
+        // The holds the commands made reachable: a song, a roll, a hide.
+        self.song_left = 0;
+        self.wriggle_t = 0.0;
+        self.hide_to = None;
+        self.hiding = false;
+        // Wave 2's heat (a stale watch must not resume against a fresh
+        // sighting) and its play.
+        self.watch_heat = 0.0;
+        self.watch_t = 0.0;
+        self.watch_spent = false;
+        self.clear_play();
+        // The trip: a second bound, the landing's recovery, and the pose a
+        // re-anchor hop owed back.
+        self.bound2 = None;
+        self.land_t = 0.0;
+        self.land_span = 0.0;
+        self.resume = None;
+        self.handoff_parked_clock = None;
+        // Micro-life and the idle look.
+        self.twitch_t = 0.0;
+        self.last_burst = false;
+        self.droop_seated = false;
+        self.look_row = 0;
+        // The gait flags, the fall and the stares.
+        self.braking = false;
+        self.brake_over = None;
+        self.skid_puff = false;
+        self.lateral = false;
+        self.pending_drop = false;
+        self.drop_sit_t = 0.0;
+        self.drop_stare = false;
+        self.commit_t = 0.0;
+        self.scrabble = false;
+    }
+
     /// **RAINBOW KITTY v2's OFFER, CONSUMED** (panel #10) — the perk edge
     /// first, then the star. Called from the arrived branch only, so every
     /// caret-travel intent and every one-shot hold has already had its turn
@@ -10218,19 +10184,7 @@ impl PetBrain {
         self.perk_in_place();
         self.twitch_t = TWITCH_DUR;
         self.twitch_up = self.mote_serial.is_multiple_of(2);
-        let seed = self.mote_serial;
-        self.mote_serial = self.mote_serial.wrapping_add(1);
-        let chest_x = if self.facing_left { 0.38 } else { 0.62 };
-        self.spawn_mote(Mote {
-            kind: PetMoteKind::Note,
-            born: self.clock,
-            life: PURR_MOTE_LIFE,
-            col: self.col + width * chest_x + 0.23,
-            row: self.row - 0.27,
-            dir: if self.facing_left { -1.0 } else { 1.0 },
-            seed,
-            rgb: self.mote_rgb,
-        });
+        self.spawn_chest_mote(Some(PetMoteKind::Note), width, (0.0, 0.0));
     }
 
     /// The perk taken IN PLACE — the v2 perk edge's idiom: not a quiet
@@ -10398,48 +10352,45 @@ impl PetBrain {
     /// dresses these gold and pink and a size up — the warmth is its half.
     fn spawn_cheer_motes(&mut self, big: bool, width: f32) {
         let n: u8 = if big { 3 } else { 2 };
-        let chest_x = if self.facing_left { 0.38 } else { 0.62 };
         for k in 0..n {
-            let seed = self.mote_serial;
-            self.mote_serial = self.mote_serial.wrapping_add(1);
             // Note and heart ALTERNATE at every tier — a lone teal speck
             // was the old small-cheer, and it read as a z.
-            let kind = if seed.is_multiple_of(2) {
-                PetMoteKind::Note
-            } else {
-                PetMoteKind::Heart
-            };
-            self.spawn_mote(Mote {
-                kind,
-                born: self.clock,
-                life: PURR_MOTE_LIFE,
-                col: self.col + width * chest_x + 0.23 + 0.31 * f32::from(k),
-                row: self.row - 0.27 - 0.13 * f32::from(k),
-                dir: if self.facing_left { -1.0 } else { 1.0 },
-                seed,
-                rgb: None,
-            });
+            let k = f32::from(k);
+            self.spawn_chest_mote(None, width, (0.31 * k, 0.13 * k));
         }
     }
 
     /// One heart per consumed pet, off the chest anchor — the 4-slot mote
     /// cap drops extras silently, by the lane's own law.
     fn spawn_pet_hearts(&mut self, n: u8, width: f32) {
-        let chest_x = if self.facing_left { 0.38 } else { 0.62 };
         for k in 0..n {
-            let seed = self.mote_serial;
-            self.mote_serial = self.mote_serial.wrapping_add(1);
-            self.spawn_mote(Mote {
-                kind: PetMoteKind::Heart,
-                born: self.clock,
-                life: PURR_MOTE_LIFE,
-                col: self.col + width * chest_x + 0.23 + 0.17 * f32::from(k),
-                row: self.row - 0.27 - 0.11 * f32::from(k),
-                dir: if self.facing_left { -1.0 } else { 1.0 },
-                seed,
-                rgb: None,
-            });
+            let k = f32::from(k);
+            self.spawn_chest_mote(Some(PetMoteKind::Heart), width, (0.17 * k, 0.11 * k));
         }
+    }
+
+    /// One ♪/♥ off the chest anchor (which follows the facing), `(dx, dy)`
+    /// cells right of and above it, dealt the next mote serial. `None` is the
+    /// purr tell's alternation: ♪ on an even serial, ♥ on an odd one.
+    fn spawn_chest_mote(&mut self, kind: Option<PetMoteKind>, width: f32, (dx, dy): (f32, f32)) {
+        let seed = self.mote_serial;
+        self.mote_serial = self.mote_serial.wrapping_add(1);
+        let kind = kind.unwrap_or(if seed.is_multiple_of(2) {
+            PetMoteKind::Note
+        } else {
+            PetMoteKind::Heart
+        });
+        let chest_x = if self.facing_left { 0.38 } else { 0.62 };
+        self.spawn_mote(Mote {
+            kind,
+            born: self.clock,
+            life: PURR_MOTE_LIFE,
+            col: self.col + width * chest_x + 0.23 + dx,
+            row: self.row - 0.27 - dy,
+            dir: if self.facing_left { -1.0 } else { 1.0 },
+            seed,
+            rgb: None,
+        });
     }
 
     /// Cull dead motes and resolve the live ones into frame sprites — pure
@@ -12562,7 +12513,7 @@ mod tests {
     /// counterpart, and the mapping is a permutation — distinct poses stay
     /// distinct. Without both halves a dog could silently fall back to a cat
     /// frame mid-gait (one wrong sprite in a four-beat walk is a visible
-    /// stutter), which the `unwrap_or(pose)` fallback would otherwise hide.
+    /// stutter), which the skin's fall-back-to-itself would otherwise hide.
     #[test]
     fn every_cat_pose_has_a_distinct_dog_counterpart() {
         let cats: Vec<PetGlyphId> = PET_GLYPH_IDS

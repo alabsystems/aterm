@@ -696,7 +696,9 @@ impl AtermGpuTerminal {
     }
 
     /// The accessibility motion preference for EVERY effect at once (the
-    /// page's `prefers-reduced-motion: reduce`): the pet is drawn but pinned
+    /// page's `prefers-reduced-motion: reduce`): the cursor's light is off
+    /// (the aurora, the block bodies, the momentum glow and the comet, as a
+    /// window's Reduce Motion turns them off), the pet is drawn but pinned
     /// at its station (no arc, no gait), sparkle words take the static path
     /// and PHOSPHOR freezes. The per-engine spellings
     /// `set_sparkle_reduced_motion` and `set_matrix_rain_reduced_motion` are

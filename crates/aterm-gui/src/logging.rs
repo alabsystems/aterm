@@ -67,7 +67,7 @@ pub(crate) fn init(arming: crate::crash_signal::Arming) {
         // Name the one cause that applies, so a refused folder is not a
         // silently lost log.
         crate::logging::stderr_line!(
-            "aterm-gui: {}; crash reports and aterm.log are off",
+            "aterm-gui: {}",
             no_log_dir_reason(
                 aterm_types::dev_seam!("ATERM_STATE_HOME").as_deref(),
                 aterm_types::dirs::logs_dir(),
@@ -570,24 +570,30 @@ fn prune_seen_crash_reports(dir: &Path, named: Option<&Path>) {
     }
 }
 
-/// Why [`log_dir`] found no folder: a development `ATERM_STATE_HOME` that is
-/// not absolute (empty included), no home folder at all, or the folder named
-/// with the error that refused it (on Unix, one that cannot be made
-/// owner-only).
+/// Why [`log_dir`] found no folder, and what that turns off: a development
+/// `ATERM_STATE_HOME` that is not absolute (empty included) resolves no root at
+/// all, so session restore, the crash journal and the cell-metrics cache are off
+/// with the logs (`aterm_types::dirs::aterm_data_dir`, rulings 406 and 408); no
+/// home folder at all, or the folder named with the error that refused it (on
+/// Unix, one that cannot be made owner-only), turn off crash reports and
+/// `aterm.log`.
 fn no_log_dir_reason(state_home: Option<&std::ffi::OsStr>, dir: Option<PathBuf>) -> String {
+    const LOGS_OFF: &str = "crash reports and aterm.log are off";
     if state_home.is_some_and(|root| !std::path::Path::new(root).is_absolute()) {
-        return "ATERM_STATE_HOME is not an absolute path".to_string();
+        return "ATERM_STATE_HOME is not an absolute path; crash reports, aterm.log, session \
+                restore, the crash journal and the cell-metrics cache are off"
+            .to_string();
     }
     let Some(dir) = dir else {
-        return "no home folder found".to_string();
+        return format!("no home folder found; {LOGS_OFF}");
     };
     #[cfg(unix)]
     let made = crate::control_auth::ensure_private_dir(&dir);
     #[cfg(not(unix))]
     let made = std::fs::create_dir_all(&dir);
     match made {
-        Err(e) => format!("cannot use {} ({e})", dir.display()),
-        Ok(()) => format!("cannot use {}", dir.display()),
+        Err(e) => format!("cannot use {} ({e}); {LOGS_OFF}", dir.display()),
+        Ok(()) => format!("cannot use {}; {LOGS_OFF}", dir.display()),
     }
 }
 
@@ -999,18 +1005,27 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// The startup line names the one cause that applies, not a list of
-    /// three the code can tell apart.
+    /// three the code can tell apart, and what that cause turns off: a
+    /// relative (or empty) seam resolves no root at all (ruling 406), so
+    /// session restore, the crash journal and the cell-metrics cache go with
+    /// the logs (ruling 408; before, the line named crash reports and
+    /// `aterm.log` alone).
     #[test]
     fn a_missing_log_dir_names_its_one_cause() {
+        const SEAM: &str = "ATERM_STATE_HOME is not an absolute path; crash reports, aterm.log, \
+                            session restore, the crash journal and the cell-metrics cache are off";
         assert_eq!(
             no_log_dir_reason(Some(std::ffi::OsStr::new("relative-state")), None),
-            "ATERM_STATE_HOME is not an absolute path"
+            SEAM
         );
         assert_eq!(
             no_log_dir_reason(Some(std::ffi::OsStr::new("")), None),
-            "ATERM_STATE_HOME is not an absolute path"
+            SEAM
         );
-        assert_eq!(no_log_dir_reason(None, None), "no home folder found");
+        assert_eq!(
+            no_log_dir_reason(None, None),
+            "no home folder found; crash reports and aterm.log are off"
+        );
     }
 
     /// A private scratch dir per test, removed on drop.

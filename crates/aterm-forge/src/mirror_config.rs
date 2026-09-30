@@ -12,11 +12,10 @@
 //! `[target.'cfg(trust_verify)'] rustflags = ["-Ztrust-verify=off", "--cfg",
 //! "clean_islands"]`, the same pair as `rustdocflags`, and
 //! `[build] rustdoc = "trustdoc"` — three Trust-toolchain-only settings, and
-//! `publish/manifest.txt` does not list the file, while
-//! `publish/transforms.sh` replaces `rust-toolchain.toml` with
-//! `publish/public-rust-toolchain.toml` (stock `1.97.1`). So the public
-//! snapshot is a stock-Rust clone that never sees `.cargo/config.toml`, by
-//! construction and on purpose.
+//! `publish/manifest.txt` does not list the file (the public snapshot keeps the
+//! Trust `rust-toolchain.toml` pin since 2026-09-29, but not this private
+//! configuration). So the public snapshot is a clone that never sees
+//! `.cargo/config.toml`, by construction and on purpose.
 //!
 //! The consequence is the whole reason this module exists: **the mirror's
 //! `[source]` block cannot ride in the file that carries those flags**, so it

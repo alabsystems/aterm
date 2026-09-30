@@ -108,10 +108,13 @@
 //! gate every producer on the queue passes, however it was written. The App's
 //! producers also check the key themselves (the herald so its `aterm.log` line can
 //! say the setting held the notice back; the update-health banner, which does not
-//! ride the queue). Nothing else changes: the band, the menu bar, the tab marks
-//! and `messages.log` carry every one of these notices as before. Program
-//! notifications (OSC 9/99/777) are [`NotifyMsg::program`] and answer to
-//! `allow_notifications` alone.
+//! ride the queue). Nothing else changes: the menu bar, the tab marks, the band
+//! and `messages.log` still carry the herald's, the consent path's and update
+//! health's facts. The operator's notices are shown nowhere else, so off they
+//! are dropped and its queue (`aterm fleet status` and `next`) is their one
+//! record.
+//! Program notifications (OSC 9/99/777) are [`NotifyMsg::program`] and answer
+//! to `allow_notifications` alone.
 
 // Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
 // channel-draining stub (`spawn_delivery`), and the real-notification helpers
@@ -746,6 +749,32 @@ mod tests {
         assert!(
             !delivers(&own, &looking, true),
             "for aterm's own notices too"
+        );
+    }
+
+    /// The consent path's instance-level notice (the warm-up's denial, which
+    /// belongs to no tab) is not suppressed by the first tab's focus. Session
+    /// `0` is that tab, and the suppression set starts as `{0}`; the notice
+    /// used to carry `0`, so it was dropped whenever the first tab was focused,
+    /// and its one-shot gate was already spent. NEGATIVE CONTROL: a notice that
+    /// does name session `0` is suppressed by the same set.
+    #[test]
+    fn an_instance_level_consent_notice_is_not_suppressed_by_the_first_tab() {
+        use crate::consent_observer::{AttentionEvent, AttentionGate};
+        let notice = AttentionGate::new()
+            .note(AttentionEvent::ProtectedEperm { session: None })
+            .notice
+            .expect("a first denial notifies");
+        let first_tab_focused = HashSet::from([0u64]);
+        let own = NotifyMsg::own(notice.session, Some(notice.title.into()), notice.body);
+        assert!(
+            delivers(&own, &first_tab_focused, true),
+            "the first tab's focus does not hide an instance-level notice"
+        );
+        let first_tab = NotifyMsg::own(0, None, "tab 0".into());
+        assert!(
+            !delivers(&first_tab, &first_tab_focused, true),
+            "session 0's own notice is suppressed (control)"
         );
     }
 

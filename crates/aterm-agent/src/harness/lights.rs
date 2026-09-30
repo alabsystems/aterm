@@ -255,10 +255,6 @@ impl Mode {
 /// parse the footer and the lights share per frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
-    /// The composer's top rule.
-    pub top: usize,
-    /// The composer's bottom rule.
-    pub bottom: usize,
     /// The permission mode its pill names — every mode draws one on 2.1.283,
     /// default included (`⏸ manual mode on`, measured 2026-09-25). `None`
     /// when no pill this build knows is under the composer, and then the mode
@@ -266,28 +262,30 @@ pub struct Screen {
     pub mode: Option<Mode>,
     /// Claude is mid-turn (`aterm_phase::phase::busy_signal`, hard).
     pub busy: bool,
-    /// The words Claude Code wrote into the top rule (its effort tag, `↯`, …).
-    pub tags: Vec<String>,
+    /// The composer's top rule says fast mode is on: among the words Claude
+    /// Code wrote into it ([`rule_tags`]), `↯` or `fast mode` (the vendor's
+    /// narrow-terminal spelling, `fast mode (cooling down)` included).
+    pub fast: bool,
 }
 
 /// Read `rows` (one pane, top to bottom). `None` without a composer frame.
 #[must_use]
 pub fn read_screen(rows: &[String]) -> Option<Screen> {
     let (top, bottom) = aterm_phase::phase::composer_rules(rows)?;
-    let mode = footer::mode_row(rows)
+    let mode = footer::mode_row_under(rows, bottom)
         .and_then(|r| footer::pill_indicator(&rows[r]))
         .and_then(Mode::of_indicator);
     // A turn in flight, by the phase reader's own rule (the spinner, `Still
     // working`, `esc to interrupt` under the composer, …) — a background
     // monitor alone (`soft`) is not a turn.
     let busy = aterm_phase::phase::busy_signal(rows).is_some_and(|b| !b.soft);
-    Some(Screen {
-        top,
-        bottom,
-        mode,
-        busy,
-        tags: rule_tags(&rows[top]),
-    })
+    let mut before = "";
+    let fast = rule_tags(&rows[top]).any(|tag| {
+        let fast = tag == FAST_ICON || (before == "fast" && tag == "mode");
+        before = tag;
+        fast
+    });
+    Some(Screen { mode, busy, fast })
 }
 
 /// Whether Claude's composer holds EXACTLY `cmd` with the cursor right behind
@@ -313,12 +311,9 @@ pub fn composer_holds(rows: &[String], cursor: (usize, usize), cmd: &str) -> boo
 
 /// The words inside a composer rule: `──── <tag> ↯ ─` → `<tag>`, `↯`.
 /// A `·` between tags is a separator, not a word.
-#[must_use]
-pub fn rule_tags(rule: &str) -> Vec<String> {
+pub fn rule_tags(rule: &str) -> impl Iterator<Item = &str> {
     rule.split(['\u{2500}', '\u{00B7}'])
         .flat_map(str::split_whitespace)
-        .map(str::to_owned)
-        .collect()
 }
 
 /// What the lights show: the permission mode its pill names, and fast mode
@@ -424,13 +419,13 @@ pub fn read(screen: Option<&Screen>) -> Reading {
     let Some(s) = screen else {
         return Reading::UNKNOWN;
     };
-    let on = |b: bool| if b { LightState::On } else { LightState::Off };
-    let has = |word: &str| s.tags.iter().any(|t| t == word);
     Reading {
         mode: s.mode,
-        // `↯`, or the words `fast mode` (the vendor's narrow-terminal
-        // spelling, `fast mode (cooling down)` included).
-        fast: on(has(FAST_ICON) || s.tags.windows(2).any(|w| w[0] == "fast" && w[1] == "mode")),
+        fast: if s.fast {
+            LightState::On
+        } else {
+            LightState::Off
+        },
     }
 }
 
@@ -494,12 +489,6 @@ pub fn drive(light: Light, reading: &Reading) -> Option<Drive> {
             LightState::Unknown => None,
         },
     }
-}
-
-/// Whether a mode cycle has arrived: the pill shows a mode the owner expects.
-#[must_use]
-pub fn cycle_done(now: Mode) -> bool {
-    now.is_expected()
 }
 
 /// Claude's answer to `/fast`, in its own words.
@@ -736,7 +725,8 @@ impl FastAnswers {
 /// applying fast mode) the whole screen is transcript.
 #[must_use]
 pub fn fast_answers(rows: &[String], cmd: &str) -> FastAnswers {
-    let (transcript, below) = match aterm_phase::phase::composer_rules(rows) {
+    let rules = aterm_phase::phase::composer_rules(rows);
+    let (transcript, below) = match rules {
         Some((top, bottom)) => (&rows[..top], &rows[(bottom + 1).min(rows.len())..]),
         None => (rows, &rows[rows.len()..]),
     };
@@ -777,7 +767,7 @@ pub fn fast_answers(rows: &[String], cmd: &str) -> FastAnswers {
     // 144 columns, from column 2 and cut to fit at 80), for about 8 s; under
     // the composer only where the layout differs. Only that one row above
     // the rule, and only its vendor words, count.
-    let above = match aterm_phase::phase::composer_rules(rows) {
+    let above = match rules {
         Some((top, _)) if top > 0 => &rows[top - 1..top],
         _ => &rows[..0],
     };
@@ -983,8 +973,6 @@ mod tests {
             FAST_SETTLE_MS,
             "past the vendor's 8 s org check"
         );
-        assert!(cycle_done(Mode::Auto) && cycle_done(Mode::Bypass));
-        assert!(!cycle_done(Mode::Plan) && !cycle_done(Mode::Manual));
     }
 
     /// The vendor's ring, bypass and auto both available: every non-expected
@@ -1238,8 +1226,10 @@ mod tests {
             let s = read_screen(&rows).unwrap_or_else(|| panic!("{name}: a composer"));
             assert_eq!(s.mode, Some(mode), "{name}");
             assert_eq!(s.busy, busy, "{name}");
+            let (top, _) = aterm_phase::phase::composer_rules(&rows)
+                .unwrap_or_else(|| panic!("{name}: the composer's rules"));
             assert!(
-                s.tags.iter().any(|t| t == "workspace"),
+                rule_tags(&rows[top]).any(|t| t == "workspace"),
                 "{name}: the effort tag is read off the rule"
             );
             assert_eq!(
@@ -1463,7 +1453,8 @@ mod tests {
         let rows = screen(FOOTER_PLAN_API_KEY_MEASURED);
         let s = read_screen(&rows).expect("a composer");
         assert_eq!((s.mode, s.busy), (Some(Mode::Plan), false));
-        assert!(s.tags.is_empty(), "{:?}", s.tags);
+        let (top, _) = aterm_phase::phase::composer_rules(&rows).expect("the composer's rules");
+        assert!(rule_tags(&rows[top]).next().is_none(), "{:?}", rows[top]);
         assert_eq!(read(Some(&s)).fast, LightState::Off);
     }
 
@@ -1618,9 +1609,10 @@ mod tests {
     #[test]
     fn a_rule_holds_words_not_dashes() {
         assert_eq!(
-            rule_tags("\u{2500}\u{2500}\u{2500} workspace \u{00B7} \u{21AF} \u{2500}"),
+            rule_tags("\u{2500}\u{2500}\u{2500} workspace \u{00B7} \u{21AF} \u{2500}")
+                .collect::<Vec<_>>(),
             ["workspace", "\u{21AF}"]
         );
-        assert!(rule_tags(&"\u{2500}".repeat(20)).is_empty());
+        assert!(rule_tags(&"\u{2500}".repeat(20)).next().is_none());
     }
 }

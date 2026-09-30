@@ -4,9 +4,8 @@
 //! R3-c: the cost curve of EVENING the arc by H-K — how much light the cool
 //! half must give up per point of apparent-brightness spread closed. The bar
 //! is untouched: no stop ever exceeds `bed_luma_budget`.
-use aterm_effects::rainbow_kitty::ribbon::{
-    UNDER_COV_CAP, bed_ink, bed_luma_budget, relative_luminance,
-};
+use aterm_effects::color_math::relative_luminance;
+use aterm_effects::rainbow_kitty::ribbon::{UNDER_COV_CAP, bed_ink, bed_luma_budget};
 use aterm_effects::spectrum::spectrum;
 use aterm_render::{over_premul, premul_rgb};
 

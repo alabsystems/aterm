@@ -175,8 +175,9 @@ pub(crate) const KEY_GPU_LOST: &str = "render.gpu-lost";
 
 /// The supersede key of the dead accessibility publisher (R8). Its producer
 /// is the panic hook of a build WITH an accessibility tree; the builder is
-/// platform-neutral (D10) and this build's tests still exercise it.
-#[cfg(any(a11y_tree, test))]
+/// platform-neutral (D10) and this build's tests still exercise it. Never
+/// gated: a seamless successor withdraws a carried row under it whatever it
+/// was built with (`messages_host::describes_the_old_process`).
 pub(crate) const KEY_A11Y_PUBLISHER: &str = "a11y.publisher";
 
 /// The supersede key of the Windows backdrop family (R6): every backdrop
@@ -740,12 +741,24 @@ pub(crate) fn killed_message(evidence: &crate::logging::KillEvidence) -> Message
         .key(KEY_CRASH)
 }
 
+/// What the keeper's recovery row says of the reattached screens.
+pub(crate) const KEEPER_SCREENS: &str = "each screen started blank and its program was asked to \
+                                         redraw; the scrollback before the stop is not here";
+
 /// THE PTY KEEPER'S RECOVERY ROW (P3, design §5.3 step 7): the last window
 /// crashed or was killed, and the keeper kept `n` of its sessions running;
-/// this launch reattached them. It takes the crash row's slot. `End
-/// sessions` hangs every reattached shell up (Force Quit and jetsam look the
-/// same, decision 4); `refused` offers the admission turned down are counted.
-pub(crate) fn keeper_recovered_message(n: usize, refused: usize) -> Message {
+/// this launch reattached them. It takes the crash row's slot, and so carries
+/// where that row's evidence is: the crash log, or the killed run's log.
+/// `End sessions` hangs every reattached shell up (Force Quit and jetsam look
+/// the same, decision 4); `refused` offers the admission turned down are
+/// counted. Each screen lands blank and its program is sent a size pulse: a
+/// program that ignores it stays blank until it next writes.
+pub(crate) fn keeper_recovered_message(
+    n: usize,
+    refused: usize,
+    crash: Option<&crate::logging::CrashEvidence>,
+    killed: Option<&crate::logging::KillEvidence>,
+) -> Message {
     let mut message = Message::new(tags::CRASH, Severity::Warn, "aterm stopped unexpectedly")
         .glyph(Glyph::or_fallback('\u{21bb}'))
         .line(format!(
@@ -753,12 +766,20 @@ pub(crate) fn keeper_recovered_message(n: usize, refused: usize) -> Message {
             counted(n, "session"),
             if n == 1 { "was" } else { "were" }
         ))
-        .line("each screen was redrawn by its program; the scrollback before the stop is not here");
+        .line(KEEPER_SCREENS);
     if refused > 0 {
         message = message.line(format!(
             "{} could not be reattached and {} ended",
             counted(refused, "session"),
             if refused == 1 { "was" } else { "were" }
+        ));
+    }
+    if let Some(evidence) = crash {
+        message = message.line(format!("crash log at {}", evidence.path.display()));
+    } else if let Some(evidence) = killed {
+        message = message.line(format!(
+            "aterm's last lines are in {}",
+            evidence.log.display()
         ));
     }
     message
@@ -4374,7 +4395,9 @@ mod tests {
     /// 2.1.283`, never `it moves to 2.1.283 now`); a round that stopped says
     /// when it retries, at its widest clock words; a lock held elsewhere
     /// paints the pressed capsule, the press being the remedy. NEGATIVE
-    /// CONTROL: the old 43-cell title paints no excerpt at that width.
+    /// CONTROL: the old 43-cell title paints no whole remedy at that width —
+    /// since ruling 402 only its lead clause, `a newer build`, never the
+    /// build it names.
     #[test]
     fn a_refused_press_paints_its_remedy_at_80_columns() {
         use aterm_agent::harness::upgrade::Agent;
@@ -4424,7 +4447,7 @@ mod tests {
         // NEGATIVE CONTROL: the title ruling 307 first chose.
         let mut old = refused(UpgradeWord::NotToday, "stale:2.1.283");
         "Couldn't postpone Claude's upgrade in tab 2".clone_into(&mut old.title);
-        assert_eq!(painted(&old).0, None);
+        assert_eq!(painted(&old).0.as_deref(), Some("a newer build"));
     }
 
     /// AN UPGRADE STILL ASKING ON ITS OWN IS A RECORD (round 18, day four,
@@ -5817,6 +5840,58 @@ mod tests {
             }]
         );
         assert_eq!(msg.key.as_deref(), Some(KEY_CRASH));
+    }
+
+    /// A crash's and a kill's evidence, as the keeper's row receives them.
+    fn keeper_evidence_fixtures() -> (crate::logging::CrashEvidence, crate::logging::KillEvidence) {
+        (
+            crate::logging::CrashEvidence {
+                path: std::path::PathBuf::from(
+                    "/Users/_an/Library/Logs/aterm/crash-signal-1-1.log.seen",
+                ),
+                head: vec!["aterm-gui 0.1.0 crashed".into()],
+            },
+            crate::logging::KillEvidence {
+                marker: std::path::PathBuf::from(
+                    "/Users/_an/Library/Logs/aterm/crash-marker-9-9-app.log.seen",
+                ),
+                log: std::path::PathBuf::from("/Users/_an/Library/Logs/aterm/aterm.log"),
+            },
+        )
+    }
+
+    /// The keeper's recovery row takes the crash row's slot, so it says
+    /// where that row's evidence is — the crash log, else the killed run's
+    /// log — while `End sessions` stays its one action; and it never claims
+    /// a screen was redrawn, only that its program was asked to.
+    #[test]
+    fn the_keeper_row_keeps_the_evidence_of_the_row_it_replaces() {
+        let (crash, killed) = keeper_evidence_fixtures();
+        let bare = keeper_recovered_message(2, 1, None, None);
+        assert_eq!(bare.key.as_deref(), Some(KEY_CRASH));
+        assert_eq!(bare.actions, [Intent::EndRecovered]);
+        assert_eq!(
+            bare.detail,
+            [
+                "2 sessions kept running and were reattached",
+                KEEPER_SCREENS,
+                "1 session could not be reattached and was ended",
+            ]
+        );
+        assert!(!KEEPER_SCREENS.contains("was redrawn"));
+        let crashed = keeper_recovered_message(1, 0, Some(&crash), Some(&killed));
+        assert_eq!(
+            crashed.detail.last().map(String::as_str),
+            Some("crash log at /Users/_an/Library/Logs/aterm/crash-signal-1-1.log.seen"),
+            "a crash names its log, and wins over a kill"
+        );
+        assert_eq!(crashed.actions, [Intent::EndRecovered]);
+        let stopped = keeper_recovered_message(1, 0, None, Some(&killed));
+        assert_eq!(
+            stopped.detail.last().map(String::as_str),
+            Some("aterm's last lines are in /Users/_an/Library/Logs/aterm/aterm.log"),
+            "named: after the screens line, `its` would read as a session's"
+        );
     }
 
     /// A reopened crash journal of `class`: two tabs in one window.
@@ -7294,6 +7369,103 @@ mod tests {
             Some("windw_padding \u{2192} window_padding"),
         ),
     ];
+
+    /// THE OVERDUE ROW SAYS HOW LONG AT THE DEFAULT WIDTH (round 38, day ten,
+    /// D3; ruling 402): the day's step 8, one Claude tab seven hours behind on
+    /// a turn still running, through the agent's own row
+    /// ([`agent_upgrade_stalled_group`], as `upgrade_host` posts it). Ruling
+    /// 380 (c)'s title left the excerpt 20 cells at 100 columns, under the
+    /// floor, and the row painted no word of the wait: `behind for 7 h`, the
+    /// clause before the why's `: `, stands whole there. The title, both
+    /// capsules and the link keep their words.
+    #[test]
+    fn the_overdue_upgrade_row_says_how_long_at_100_columns() {
+        use aterm_agent::harness::upgrade::Phase;
+        use aterm_agent::harness::upgrade_drive::Row;
+        const NOW: u64 = 1_790_311_076;
+        let row = Row {
+            tab: "s-b5cf2faabac5ce5127bd".into(),
+            from: "2.1.280".into(),
+            to: "2.1.283".into(),
+            phase: Phase::Pending,
+            wait: "not-idle:busy".into(),
+            behind_since: NOW - 7 * 3_600,
+            noticed_at: NOW - 3_600,
+            ..Row::default()
+        };
+        let msg = super::agent_upgrade_stalled_group(&[(&row, "in tab 1".to_string())], NOW)
+            .expect("one tab's row");
+        assert_eq!(msg.title, "Couldn't upgrade Claude in tab 1 yet");
+        assert!(
+            msg.detail[0].starts_with("behind for 7 h: "),
+            "{:?}",
+            msg.detail
+        );
+        let mut app = crate::App::headless_for_test();
+        app.post_message(msg);
+        let p = app.band_presentation(100);
+        let r = &p.rows[0];
+        assert_eq!(r.title.1, "Couldn't upgrade Claude in tab 1 yet");
+        assert_eq!(
+            r.capsules
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Not today", "Skip version", "Details \u{203a}"]
+        );
+        assert_eq!(
+            r.detail.as_ref().map(|(_, d)| d.as_str()),
+            Some("behind for 7 h"),
+            "{r:?}"
+        );
+    }
+
+    /// THE AGENT'S ROW FOR SEVERAL TABS SAYS HOW LONG TOO (round 38's
+    /// review, finding 1; ruling 404): two Claude tabs, seven and two hours
+    /// behind on turns still running, are the agent's ONE overdue row. Its
+    /// excerpt, `tab 1 for 7 h · tab 3 for 2 h`, has no `: `, so ruling 402's
+    /// clause did not reach it and at 100 columns the row painted no word of
+    /// the wait. Its first ` · ` piece now stands whole there.
+    #[test]
+    fn the_agents_overdue_row_for_two_tabs_says_how_long_at_100_columns() {
+        use aterm_agent::harness::upgrade::Phase;
+        use aterm_agent::harness::upgrade_drive::Row;
+        const NOW: u64 = 1_790_311_076;
+        let row = |tab: &str, hours: u64| Row {
+            tab: tab.into(),
+            from: "2.1.280".into(),
+            to: "2.1.283".into(),
+            phase: Phase::Pending,
+            wait: "not-idle:busy".into(),
+            behind_since: NOW - hours * 3_600,
+            noticed_at: NOW - 3_600,
+            ..Row::default()
+        };
+        let (one, three) = (
+            row("s-b5cf2faabac5ce5127bd", 7),
+            row("s-c6d0a3bbcbd6df6238ce", 2),
+        );
+        let msg = super::agent_upgrade_stalled_group(
+            &[
+                (&one, "in tab 1".to_string()),
+                (&three, "in tab 3".to_string()),
+            ],
+            NOW,
+        )
+        .expect("the agent's row");
+        assert_eq!(msg.title, "Couldn't upgrade Claude in 2 tabs yet");
+        assert_eq!(msg.detail[0], "tab 1 for 7 h \u{b7} tab 3 for 2 h");
+        let mut app = crate::App::headless_for_test();
+        app.post_message(msg);
+        let p = app.band_presentation(100);
+        let r = &p.rows[0];
+        assert_eq!(r.title.1, "Couldn't upgrade Claude in 2 tabs yet");
+        assert_eq!(
+            r.detail.as_ref().map(|(_, d)| d.as_str()),
+            Some("tab 1 for 7 h"),
+            "{r:?}"
+        );
+    }
 
     /// THE BAND'S CONFIG ROW (ruling 261): a misspelled key reads
     /// `Misspelled setting`, its excerpt the correction — `windw_padding →

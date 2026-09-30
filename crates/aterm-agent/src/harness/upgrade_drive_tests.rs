@@ -6842,7 +6842,7 @@ fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_re
     );
     assert_eq!(memory.cause, "memory");
     assert_eq!(memory.model, None);
-    assert_eq!(memory.fallback_from, launched);
+    assert_eq!(memory.fallback_from.as_deref(), Some(launched));
     let back = model_restart(
         &Restart::ModelBack { to: None },
         Some(&saved_restart(&memory)),
@@ -6862,7 +6862,7 @@ fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_re
         argv(&["--model", launched, "--resume", SESSION])
     );
     // Spent: no fallback stands after the way back.
-    assert_eq!(fallback_origin(Some(&saved_restart(&back))), None);
+    assert_eq!(fallback_origin(&saved_restart(&back)), None);
     let again = model_restart(
         &Restart::ModelBack { to: None },
         Some(&saved_restart(&back)),
@@ -6881,7 +6881,7 @@ fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_re
         None,
         None,
     );
-    assert_eq!(second.fallback_from, launched);
+    assert_eq!(second.fallback_from.as_deref(), Some(launched));
     // An older build's fallback record: its kept launch model.
     let legacy = St {
         phase: Phase::Done,
@@ -6889,7 +6889,7 @@ fn the_way_back_from_a_fallback_returns_to_the_launched_model_across_a_memory_re
         launch_model: launched.to_string(),
         ..St::default()
     };
-    assert_eq!(fallback_origin(Some(&legacy)).as_deref(), Some(launched));
+    assert_eq!(fallback_origin(&legacy).as_deref(), Some(launched));
 }
 
 /// THE WAY BACK RETURNS TO WHAT THE PERSON HAD, NOT TO THE NOTICE'S ALIAS
@@ -6990,7 +6990,7 @@ fn a_second_fallback_from_a_launch_with_no_model_goes_back_to_no_model() {
         None,
     );
     assert_eq!(
-        fallback_origin(Some(&saved_restart(&first))).as_deref(),
+        fallback_origin(&saved_restart(&first)).as_deref(),
         Some(""),
         "a fallback stands, from no model"
     );
@@ -7060,7 +7060,7 @@ fn a_model_chosen_by_hand_after_a_fallback_is_not_undone_by_the_way_back() {
         None,
     );
     save(&opts, SESSION, &saved_restart(&fell));
-    let exit_record = |fallback_from: String, launch: &str| St {
+    let exit_record = |fallback_from: Option<String>, launch: &str| St {
         phase: Phase::Done,
         cause: CAUSE_EXIT.to_string(),
         launch_model: launch.to_string(),
@@ -7109,7 +7109,7 @@ fn a_model_chosen_by_hand_after_a_fallback_is_not_undone_by_the_way_back() {
             ..St::default()
         },
     );
-    assert_eq!(exit_fallback(&opts, SESSION, None, Some(hand)), "");
+    assert_eq!(exit_fallback(&opts, SESSION, None, Some(hand)), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -7143,7 +7143,7 @@ fn an_upgrade_record_keeps_the_fallbacks_origin() {
     for (name, prior) in [("done", fell.clone()), ("retargeted", pending)] {
         let next = St::for_target(Some(prior), &from, &to, None, 900);
         assert_eq!(
-            fallback_origin(Some(&next)).as_deref(),
+            fallback_origin(&next).as_deref(),
             Some("claude-fable-5-1"),
             "{name}"
         );
@@ -7157,7 +7157,7 @@ fn an_upgrade_record_keeps_the_fallbacks_origin() {
     };
     legacy.rearm(900);
     assert_eq!(
-        fallback_origin(Some(&legacy)).as_deref(),
+        fallback_origin(&legacy).as_deref(),
         Some("claude-fable-5-1")
     );
     let none = St::for_target(
@@ -7170,7 +7170,7 @@ fn an_upgrade_record_keeps_the_fallbacks_origin() {
         None,
         900,
     );
-    assert_eq!(fallback_origin(Some(&none)), None);
+    assert_eq!(fallback_origin(&none), None);
 }
 
 /// A `/MODEL` BEFORE A FALLBACK IS WHAT THE WAY BACK RETURNS TO: launched
@@ -7205,7 +7205,7 @@ fn a_fallback_after_a_model_chosen_by_hand_goes_back_to_that_model() {
         Some(hand.to_string()),
     );
     assert_eq!(fell.model.as_deref(), Some("claude-opus-5"));
-    assert_eq!(fell.fallback_from, hand);
+    assert_eq!(fell.fallback_from.as_deref(), Some(hand));
     assert_eq!(way_back(&fell).as_deref(), Some(hand));
     // NEGATIVE CONTROL: nobody's `/model`.
     let plain = model_restart(&fallback, None, launched.to_string(), None, None);
@@ -7218,7 +7218,7 @@ fn a_fallback_after_a_model_chosen_by_hand_goes_back_to_that_model() {
         None,
         Some(hand.to_string()),
     );
-    assert_eq!(second.fallback_from, launched);
+    assert_eq!(second.fallback_from.as_deref(), Some(launched));
 }
 
 /// A restart in place of a stand-in agent launched `--model <launch>`,
@@ -7354,7 +7354,7 @@ fn a_restart_in_place_saves_the_fallback_origin_it_decides() {
             !matches!(saved.phase, Phase::Pending | Phase::Done),
             "{name}: signalled: {r:?} {saved:?}"
         );
-        assert_eq!(saved.fallback_from, want, "{name}: {r:?}");
+        assert_eq!(saved.fallback_from.as_deref(), Some(want), "{name}: {r:?}");
         assert!(
             saved.line.contains(&format!("'--model' '{asks}'")),
             "{name}: {}",
@@ -7415,7 +7415,7 @@ fn an_exit_relaunch_saves_the_fallback_origin_it_decides() {
         let r = after_exit(&a.opts, &a.snap, &left, true, false);
         let saved = load(&a.opts, SESSION).expect("state");
         assert_eq!(saved.cause, CAUSE_EXIT, "{name}: {r:?}");
-        assert_eq!(saved.fallback_from, want, "{name}: {r:?}");
+        assert_eq!(saved.fallback_from.as_deref(), Some(want), "{name}: {r:?}");
         assert!(
             saved
                 .line
@@ -12934,7 +12934,7 @@ fn an_upgrade_restart_makes_the_hand_choice_it_carries_the_fallbacks_origin() {
     let seed = |chose: bool| {
         move |opts: &Opts| {
             let mut st = load(opts, SESSION).expect("state");
-            st.fallback_from = origin.to_string();
+            st.fallback_from = Some(origin.to_string());
             save(opts, SESSION, &st);
             if chose {
                 chose_by_hand(opts, hand);
@@ -13007,7 +13007,7 @@ fn an_upgrade_restart_makes_the_hand_choice_it_carries_the_fallbacks_origin() {
                         None => assert!(signalled, "{name}: {r:?}"),
                     }
                     let saved = saved.expect("state");
-                    assert_eq!(saved.fallback_from, want, "{name}: {r:?}");
+                    assert_eq!(saved.fallback_from.as_deref(), Some(want), "{name}: {r:?}");
                     assert!(
                         saved.line.contains(&format!("'--model' '{model}'")),
                         "{name}: {}",

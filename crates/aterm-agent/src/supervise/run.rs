@@ -519,6 +519,17 @@ impl Guard {
 /// review of 2026-09-25: the loop used to END at such a point and a new one
 /// start after the step, forgetting all of it; and a park flag re-read
 /// every 2 s kept every idle session polling the server).
+/// The loop's next try ([`IdleHost::waiting`]): when the wait it stands in
+/// ends, as a unix second, and the policy's reason for it (`overloaded retry
+/// 1`, `a person is typing`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitPlan {
+    /// Unix seconds at which the loop decides the point again.
+    pub at_unix: i64,
+    /// The policy's words for the wait.
+    pub why: String,
+}
+
 pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// The host asks for the next idle point: read at each point the loop
     /// reaches and at each wake of its wait ([`WAIT_STEP`], the settle the
@@ -652,6 +663,18 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// own rule. The default ignores it.
     fn limited(&self, open: bool) {
         let _ = open;
+    }
+
+    /// THE LOOP'S NEXT TRY, told to the host (`Some`) or gone (`None`): the
+    /// deadline of the wait the turn-end policy stands in
+    /// ([`Self::wait_for_next`]'s `turn_end_due`), as a unix second, and why.
+    /// Told when the deadline changes, never on every step of a wait, so a
+    /// host may show it — a tab at an API wall says `→ 14:05 · 3m` — without
+    /// being woken for a tick. `None` when no wait stands (the try was made,
+    /// the wall left, the point is an escalation). The plan is a fact of the
+    /// LOOP's; nothing acts on it. The default ignores it.
+    fn waiting(&self, plan: Option<WaitPlan>) {
+        let _ = plan;
     }
 
     /// The line a PERSON runs to resume the agent's own conversation after
@@ -1986,6 +2009,10 @@ pub struct Session<'a, C: Ctl> {
     /// the host again at the top of each step, and a new measure decides the
     /// point again at once ([`Self::reach_edge`]).
     reach_seen: Option<Reach>,
+    /// The deadline of the wait last told to the host
+    /// ([`IdleHost::waiting`]): `Some(None)` is a told `None`, `None` is
+    /// nothing told yet. The wait is told again only when its deadline moves.
+    wait_told: Option<Option<Instant>>,
     /// A Codex session's model and effort as its footer last showed them —
     /// kept, since a box covers the footer ([`Self::note_codex_screen`]).
     codex_setting: Option<super::policy::turn_end::CodexSetting>,
@@ -2176,6 +2203,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             turn_end_badge: false,
             task_done_said: false,
             reach_seen: None,
+            wait_told: None,
             codex_setting: None,
             codex_goal: None,
             codex_seen: None,
@@ -4413,6 +4441,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.look_at = None;
                 return Ok(None);
             }
+            self.tell_wait(opts);
             let due = self
                 .turn_end_due
                 .as_ref()
@@ -4469,6 +4498,36 @@ impl<C: Ctl> Session<'_, C> {
             self.turn_end_now(&seen, opts, allow, review)?;
             return Ok(None);
         }
+    }
+
+    /// TELL THE HOST THE LOOP'S NEXT TRY ([`IdleHost::waiting`]): the
+    /// deadline of the wait the policy stands in, when it moved since it was
+    /// last told (a wait's own steps tell nothing), as unix seconds on the
+    /// loop's clock. Nothing standing is told once as `None`, so a tab does
+    /// not keep the last try's time.
+    fn tell_wait(&mut self, opts: &SuperviseOpts) {
+        // Only the wait of a wall's RETRY is a next try
+        // ([`super::policy::turn_end::is_retry_wait`]): the check that the
+        // worker took the try just typed is told as no plan.
+        let due = self
+            .turn_end_due
+            .as_ref()
+            .filter(|(_, why)| super::policy::turn_end::is_retry_wait(why))
+            .map(|(at, why)| (*at, why));
+        if self.wait_told == Some(due.map(|(at, _)| at)) {
+            return;
+        }
+        let Some(host) = opts.idle_host.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let plan = due.map(|(at, why)| WaitPlan {
+            at_unix: self.now_unix()
+                + i64::try_from(at.saturating_duration_since(now).as_secs()).unwrap_or(0),
+            why: why.clone(),
+        });
+        self.wait_told = Some(due.map(|(at, _)| at));
+        host.waiting(plan);
     }
 
     /// A NEW MEASURE from the host at a network wall: the loop's cue to

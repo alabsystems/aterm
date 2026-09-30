@@ -906,6 +906,8 @@ impl ControlHandle {
     /// Queue one "aterm operator" notice for the desktop. aterm's OWN words
     /// ([`crate::notify::NotifyMsg::own`]): the delivery thread drops it while
     /// `desktop_alerts` is off, as it does every notice aterm writes itself.
+    /// Nothing else shows it — no band row, no `messages.log` line — so off,
+    /// the queue (`aterm fleet status` and `next`) is its one record.
     fn surface_notice(&self, local_id: u64, body: &str) {
         let message = crate::notify::NotifyMsg::own(
             local_id,
@@ -2879,6 +2881,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         });
         SessionHandle {
             sid,

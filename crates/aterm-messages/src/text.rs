@@ -225,6 +225,32 @@ pub fn shape_detail(detail: &str, cap: usize) -> String {
 const MIN_HEAD_WORDS: usize = 2;
 const MIN_HEAD_CELLS: usize = 12;
 
+/// An excerpt's LEAD CLAUSE — its words before its first joint, a `: ` or
+/// the ` · ` that ends its first piece, whichever comes first — where they
+/// are a whole statement on their own (design rulings 402 and 404; round
+/// 38, day ten, D3, and its review): at least [`MIN_HEAD_WORDS`] words and
+/// [`MIN_HEAD_CELLS`] cells, with no command quoting, and words after it.
+/// `behind for 7 h: its turn is still running` → `behind for 7 h`; `tab 1
+/// for 7 h · tab 3 for 2 h` → `tab 1 for 7 h`; `was: …`, `line 3: …` and
+/// `tab 1 · …` say nothing alone, and half a quoted command is never kept.
+/// The width law paints it whole, with no ellipsis, where the floor would
+/// drop the excerpt, and in place of a cut that says no word past it
+/// ([`crate::glass`]).
+#[must_use]
+pub(crate) fn lead_clause(detail: &str) -> Option<String> {
+    let clean = sanitize(detail, usize::MAX);
+    let (at, joint) = [": ", PIECE_SEP]
+        .into_iter()
+        .filter_map(|joint| clean.find(joint).map(|at| (at, joint.len())))
+        .min()?;
+    let (lead, rest) = (clean[..at].trim(), &clean[at + joint..]);
+    (!rest.trim().is_empty()
+        && !lead.contains('`')
+        && lead.split_whitespace().count() >= MIN_HEAD_WORDS
+        && char_width(lead) >= MIN_HEAD_CELLS)
+        .then(|| lead.to_string())
+}
+
 /// The prose before a command gives way to the command: back up to the
 /// start of the sentence (or ` · ` clause) the backtick sits in, so the kept
 /// tail reads as a sentence and not as half of one. When even that sentence

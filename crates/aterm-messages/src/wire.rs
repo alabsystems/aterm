@@ -1399,6 +1399,24 @@ pub(crate) fn press_words(press: &Press) -> String {
     }
 }
 
+/// How long a script is told to wait while aterm hands itself to a new version
+/// ([`switching_reply`]): the park lasts until the new version commits —
+/// seconds — and the retry then reaches that version.
+pub const SWITCHING_RETRY: Duration = Duration::from_secs(1);
+
+/// `ERR busy notice: aterm is switching to its new version retry_ms=<ms>` —
+/// the host's answer to every `notice` while a seamless update has parked this
+/// process (round-seven update audit, finding 32): the rows crossed to the new
+/// version at the park, so a row posted, dismissed, re-worded or pressed now
+/// would be lost at Commit. The transient class drivers already back off on.
+#[must_use]
+pub fn switching_reply() -> String {
+    format!(
+        "ERR busy notice: aterm is switching to its new version retry_ms={}",
+        SWITCHING_RETRY.as_millis()
+    )
+}
+
 /// `ERR notice: no live message <id>` — `dismiss`, `act` and the host's
 /// press that found the row gone all answer with this one line.
 #[must_use]

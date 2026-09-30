@@ -12,7 +12,7 @@
 //! cells are inline, so a full screen of SGR text retains ZERO additional heap.
 //!
 //! An integration test is its own crate, so the counting global allocator here does
-//! NOT affect any other test or bench. The local gate runs this via `gate perf`.
+//! NOT affect any other test or bench. The merge contract's workspace test stage runs it.
 //! Run directly: `cargo test -p aterm-core --test mem_budget -- --nocapture`.
 
 use std::alloc::{GlobalAlloc, Layout, System};

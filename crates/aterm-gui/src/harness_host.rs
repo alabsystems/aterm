@@ -846,6 +846,9 @@ type HoldsFn = dyn Fn(&str, i32) -> Option<bool> + Send + Sync;
 type DueFn = dyn Fn(&str) -> Due + Send + Sync;
 type BodyFn = dyn Fn(&WorkerJob) -> BodyEnd + Send + Sync;
 type BadgeFn = dyn Fn(&str, Option<&str>) + Send + Sync;
+/// The loop's next try, told to the window ([`IdleHost::waiting`]): `(sid,
+/// unix second)`, or `None` once no wait stands.
+type WaitingFn = dyn Fn(&str, Option<i64>) + Send + Sync;
 type EpochFn = dyn Fn() -> u64 + Send + Sync;
 type StepFn = dyn Fn(&str, u32) -> String + Send + Sync;
 /// The session noted behind since a unix second
@@ -944,6 +947,10 @@ pub(crate) struct Hooks {
     pub(crate) still_wanted: Arc<StillFn>,
     pub(crate) body: Arc<BodyFn>,
     pub(crate) badge: Arc<BadgeFn>,
+    /// Where the loop's NEXT TRY goes ([`IdleHost::waiting`], the tab's
+    /// retry plan): the window, which shows it on the tab beside an API wall
+    /// (`Wake::HarnessWait`). A fact only — nothing acts on it.
+    pub(crate) waiting: Arc<WaitingFn>,
     pub(crate) claim_epoch: Arc<EpochFn>,
     pub(crate) acts: Acts,
     pub(crate) backoff: Arc<BackoffFn>,
@@ -2187,6 +2194,20 @@ impl IdleHost for WorkerIdle {
             .unwrap_or_else(PoisonError::into_inner) = Some(now);
         self.hold_clock();
     }
+
+    /// THE LOOP'S NEXT TRY ([`IdleHost::waiting`]): told to the window, which
+    /// shows it on this tab beside an API wall; `None` when no wait stands.
+    fn waiting(&self, plan: Option<aterm_agent::supervise::WaitPlan>) {
+        (self.hooks.waiting)(&self.sid, plan.map(|p| p.at_unix));
+    }
+}
+
+/// A worker that ends takes its session's next try with it: the tab does not
+/// keep a time nobody will act on.
+impl Drop for WorkerIdle {
+    fn drop(&mut self) {
+        (self.hooks.waiting)(&self.sid, None);
+    }
 }
 
 impl WorkerIdle {
@@ -2915,9 +2936,6 @@ struct Shared {
     wake: std::sync::OnceLock<WakeTrigger>,
     /// Set (then the bell rung) when the host thread's loop has returned.
     host_done: AtomicBool,
-    /// Host threads started again after one ended in a panic
-    /// ([`HOST_RESTARTS`] at most).
-    host_restarts: AtomicU64,
     /// The instance's one API reach probe, shared by every worker's
     /// [`WorkerIdle::reach`]; stopped at the host's shutdown.
     net: Arc<NetProbe>,
@@ -2928,10 +2946,14 @@ struct Shared {
     restored_wake: Condvar,
 }
 
-/// How many times a host thread that ended in a panic is started again (by
-/// the next policy change or resume, [`HostHandle::ensure_thread`]) before
-/// supervision stays off for the process.
-const HOST_RESTARTS: u64 = 3;
+// THE HOST THREAD IS NEVER GIVEN UP ON (owner ruling of 2026-09-25: only
+// an explicit setting takes the harness's power away). A host loop that
+// ends in a panic starts again IN PLACE, after [`Hooks::backoff`] — the
+// workers' growing ladder, a second up to an hour — for as long as the
+// policy is active; a stop, a suspend or the policy switched off ends the
+// wait at once (the bell). Until the ruling a process-lifetime budget of
+// three restarts, spent by a policy change or a resume, ended supervision
+// for good after one repeating panic, with nothing but a log line.
 
 /// The disk watch's period: a free-space figure has no event to hang on
 /// (design §5.5, §4.2 row 18), so this is the one timer the host keeps.
@@ -2985,7 +3007,6 @@ impl HostHandle {
                 activations: Arc::default(),
                 wake: std::sync::OnceLock::new(),
                 host_done: AtomicBool::new(false),
-                host_restarts: AtomicU64::new(0),
                 net: NetProbe::new(),
                 restored: Mutex::default(),
                 restored_wake: Condvar::new(),
@@ -3081,11 +3102,9 @@ impl HostHandle {
             // thread that has FINISHED ended in a panic: every worker it ran
             // was stopped with it and nothing was supervised any more — the
             // slot still held its handle and nothing started another (the
-            // reliability review of 2026-09-24). Start it again, within a
-            // budget.
-            if !running.is_finished()
-                || self.shared.host_restarts.fetch_add(1, Ordering::SeqCst) >= HOST_RESTARTS
-            {
+            // reliability review of 2026-09-24) — or it stopped with the
+            // policy. Start it again: no budget (see the host loop's own).
+            if !running.is_finished() {
                 return;
             }
             if let Some(ended) = slot.take() {
@@ -3100,14 +3119,28 @@ impl HostHandle {
         match std::thread::Builder::new()
             .name(format!("{THREAD_PREFIX}host"))
             .spawn(move || {
-                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    host_loop(&shared, &hooks);
-                }));
-                if let Err(payload) = run {
+                // A panic restarts the host IN PLACE after the back-off, for as
+                // long as the policy is active — never given up on (above).
+                let mut attempt = 0usize;
+                loop {
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        host_loop(&shared, &hooks);
+                    }));
+                    // The host loop returns only at shutdown.
+                    let Err(payload) = run else { break };
+                    attempt += 1;
                     aterm_log::warn!(
-                        "harness host stopped after an internal panic: {}",
+                        "harness host stopped after an internal panic ({attempt} in a row): {}",
                         panic_text(payload.as_ref())
                     );
+                    let stop = || {
+                        let state = shared.lock();
+                        state.shutting_down || !Shared::active(&state, shared.headless)
+                    };
+                    if stop() || wait_for(Instant::now() + (hooks.backoff)(attempt), stop) {
+                        break;
+                    }
+                    aterm_log::warn!("harness host started again after a panic");
                 }
                 shared_done.host_done.store(true, Ordering::SeqCst);
                 ring();
@@ -5773,6 +5806,15 @@ pub(crate) fn start_default(
             still_wanted: Arc::new(move |sid, group| still_wanted(&s2, sid, group)),
             body: Arc::new(move |job| hosted_body(&k1, job)),
             badge: Arc::new(move |sid, text| set_badge(&k2, sid, text)),
+            waiting: {
+                let proxy = proxy.clone();
+                Arc::new(move |sid, at_unix| {
+                    let _ = proxy.send_event(crate::Wake::HarnessWait {
+                        sid: sid.to_string(),
+                        at_unix,
+                    });
+                })
+            },
             claim_epoch: Arc::new(|| CLAIM_EPOCH.load(Ordering::SeqCst)),
             acts: live_acts(s3, k3),
             backoff: Arc::new(restart_backoff),
@@ -5865,6 +5907,7 @@ impl HostHandle {
             still_wanted: Arc::new(|_, _| false),
             body: Arc::new(|_| BodyEnd::Stopped),
             badge: Arc::new(|_, _| {}),
+            waiting: Arc::new(|_, _| {}),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(|_| Duration::from_millis(10)),
@@ -6169,6 +6212,7 @@ mod tests {
                     .unwrap()
                     .push((sid.to_string(), text.map(str::to_string)));
             }),
+            waiting: Arc::new(|_, _| {}),
             claim_epoch: Arc::new(move || w4.released.load(Ordering::SeqCst)),
             acts: Acts::inert(),
             backoff: Arc::new(quick_backoff),
@@ -6190,6 +6234,22 @@ mod tests {
     /// thousandth of each (the 10 s relaunch back-off, 10 ms).
     fn quick_pause(pause: Duration) -> Duration {
         pause / 1000
+    }
+
+    /// The pause seam for a test whose successor must CARRY a restart through
+    /// more than one step ([`carry_in_flight_after_handoff`]). The carry's
+    /// bound ([`carry_bound`]: the record's stale horizon and two of the
+    /// longest pauses) goes through the same seam, so [`quick_pause`] makes it
+    /// 0.36 s — and on a loaded disk one record read outlasts that, the carry
+    /// ends before its second step, and the test waits out its minute:
+    /// measured 2 failures in 6 runs of
+    /// `resume_after_handoff_carries_an_exiting_record_in_a_shell_tab` under
+    /// parallel `dd`/`cat` load, 0 in 6 under CPU load alone, 0 in 6 with
+    /// this seam under the same disk load. A hundredth keeps every retry
+    /// pause under a third of a second and the bound at 3.6 s. A test OF the
+    /// bound keeps [`quick_pause`].
+    fn carry_pause(pause: Duration) -> Duration {
+        pause / 100
     }
 
     /// Waits for something that must happen. The minute is a hang detector,
@@ -6754,6 +6814,7 @@ mod tests {
         let world = Arc::new(World::default());
         let mut h = hooks(&world, parking_body(&world));
         h.acts.carry_in_flight = Arc::clone(&carry);
+        h.pause = Arc::new(carry_pause);
         let old = HostHandle::start(on(), false, true, h);
         old.resume();
         std::thread::sleep(Duration::from_millis(300));
@@ -6765,6 +6826,7 @@ mod tests {
         let world = Arc::new(World::default());
         let mut h = hooks(&world, parking_body(&world));
         h.acts.carry_in_flight = carry;
+        h.pause = Arc::new(carry_pause);
         let host = HostHandle::start(on(), false, true, h);
         host.resume_after_handoff(sessions());
         until("the record carried on and the gone tab tried", || {
@@ -6860,6 +6922,7 @@ mod tests {
         let world = Arc::new(World::default());
         let mut h = hooks(&world, parking_body(&world));
         h.acts.carry_in_flight = carry;
+        h.pause = Arc::new(carry_pause);
         let host = HostHandle::start(on(), false, true, h);
         host.defer_adopted_claims(vec!["s-exiting".into()], Duration::from_millis(200));
         host.resume_after_handoff(vec![("s-exiting".into(), "in tab 1".into())]);
@@ -7804,13 +7867,14 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// The reliability review of 2026-09-24 (minor): a panic in the host
-    /// thread ended supervision for the process — its workers stopped, the
-    /// slot kept the finished handle, and neither a policy change nor a
-    /// resume started another. Now the next policy change starts it again.
-    /// NEGATIVE CONTROL: before that change nothing is supervised.
+    /// THE OWNER RULING OF 2026-09-25: one panic in the host thread must not
+    /// silently stop every box being answered until the owner happens to touch
+    /// `[harness]` — the thread starts itself again, in place, after the
+    /// back-off, and is never given up on. NEGATIVE CONTROLS: a host that
+    /// panics every time keeps being started again (it was given up on after
+    /// three), and a shutdown during an hour's back-off ends it at once.
     #[test]
-    fn a_host_thread_that_panicked_is_started_again_by_the_next_policy_change() {
+    fn a_host_thread_that_panicked_is_started_again_in_place() {
         let world = Arc::new(World::default());
         world.set(&[("s-h", Program::Claude)]);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7829,21 +7893,59 @@ mod tests {
                 .collect()
         });
         let host = HostHandle::start(on(), false, false, h);
-        until("the host thread ended", || {
+        until("supervised again, with no policy change", || {
+            world.runs.load(Ordering::SeqCst) == 1
+        });
+        host.shutdown_and_join();
+
+        // Every host run panics: it is started again, and again.
+        let world = Arc::new(World::default());
+        world.set(&[("s-a", Program::Claude)]);
+        let mut h = hooks(&world, parking_body(&world));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&reads);
+        h.roster = Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            panic!("the host run panics");
+        });
+        let host = HostHandle::start(on(), false, false, h);
+        until("started again more than three times", || {
+            reads.load(Ordering::SeqCst) > 6
+        });
+        assert!(
+            !host
+                .thread
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished),
+            "never given up on"
+        );
+        host.shutdown_and_join();
+
+        // A shutdown during the back-off ends it at once, however long.
+        let world = Arc::new(World::default());
+        world.set(&[("s-b", Program::Claude)]);
+        let mut h = hooks(&world, parking_body(&world));
+        h.roster = Arc::new(|| panic!("the host run panics"));
+        h.backoff = Arc::new(|_| Duration::from_secs(3600));
+        let host = HostHandle::start(on(), false, false, h);
+        std::thread::sleep(Duration::from_millis(200));
+        let asked = Instant::now();
+        host.shutdown_and_join();
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "the back-off held the shutdown for {:?}",
+            asked.elapsed()
+        );
+        assert!(
             host.thread
                 .lock()
                 .unwrap()
                 .as_ref()
-                .is_some_and(JoinHandle::is_finished)
-        });
-        assert_eq!(world.runs.load(Ordering::SeqCst), 0, "nothing supervised");
-        let mut changed = on();
-        changed.set("continue_per_hour", "3").unwrap();
-        host.set_config(changed);
-        until("supervised again", || {
-            world.runs.load(Ordering::SeqCst) == 1
-        });
-        host.shutdown_and_join();
+                .is_none_or(JoinHandle::is_finished),
+            "the host thread ended"
+        );
     }
 
     #[test]
@@ -8553,6 +8655,7 @@ mod tests {
                 badge: Arc::new(move |_, text| {
                     w4.badges.lock().unwrap().push(text.map(str::to_string));
                 }),
+                waiting: Arc::new(|_, _| {}),
                 claim_epoch: Arc::new(|| 0),
                 acts: Acts {
                     open: Arc::new(move |sid| a1.open.lock().unwrap().contains(sid)),
@@ -12597,6 +12700,7 @@ mod tests {
                 badge: Arc::new(move |_sid, text| {
                     p3.badge_on.store(text.is_some(), Ordering::SeqCst)
                 }),
+                waiting: Arc::new(|_, _| {}),
                 claim_epoch: Arc::new(move || p4.released.load(Ordering::SeqCst)),
                 acts: Acts::inert(),
                 backoff: Arc::new(quick_backoff),
@@ -13155,6 +13259,7 @@ mod tests {
                 still_wanted: Arc::new(|_, _| true),
                 body: Arc::new(|_| BodyEnd::Stopped),
                 badge: Arc::new(|_, _| {}),
+                waiting: Arc::new(|_, _| {}),
                 claim_epoch: Arc::new(|| 0),
                 acts,
                 backoff: Arc::new(quick_backoff),

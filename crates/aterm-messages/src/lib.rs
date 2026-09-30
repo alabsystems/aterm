@@ -174,7 +174,8 @@ pub(crate) const BEFORE_CAPSULES: usize = 2;
 /// Cells between capsules.
 pub(crate) const CAPSULE_GAP: usize = 1;
 /// Below this many cells the excerpt is DROPPED, never stubbed
-/// (`status_bars.rs:143-147`).
+/// (`status_bars.rs:143-147`) — save its whole lead clause, which is not a
+/// stub (`behind for 7 h`; design ruling 402, `text::lead_clause`).
 pub(crate) const DETAIL_FLOOR: usize = 20;
 /// The title elides no further; capsules never drop.
 pub(crate) const TITLE_MIN: usize = 12;

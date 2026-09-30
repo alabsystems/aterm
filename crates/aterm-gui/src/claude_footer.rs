@@ -609,7 +609,8 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
     loop {
         let now = std::time::Instant::now();
         schedule.prune(now, |session, job| {
-            walled.contains(&session) && u32::try_from(job.pgid).is_ok_and(pid_alive)
+            walled.contains(&session)
+                && u32::try_from(job.pgid).is_ok_and(crate::control_auth::pid_alive)
         });
         known.retain(|session, _| schedule.watched.contains_key(session));
         folds.retain(|session, _| schedule.watched.contains_key(session));
@@ -665,11 +666,6 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
             schedule.read(job.session, std::time::Instant::now());
         }
     }
-}
-
-/// Whether process `pid` is still there (`ESRCH` alone means gone).
-fn pid_alive(pid: u32) -> bool {
-    crate::control_auth::pid_alive(pid)
 }
 
 /// The resolver's state one read touches: per session, the process known
@@ -796,11 +792,12 @@ fn resolve_and_post(
     let started = birth_seconds(pgid);
     let cached = known
         .get(&session)
-        .filter(|id| id.pid == pgid && id.started.is_some() && id.started == started)
-        .cloned();
+        .is_some_and(|id| id.pid == pgid && id.started.is_some() && id.started == started)
+        .then(|| known.remove(&session))
+        .flatten();
     let mut identity = cached.unwrap_or_else(|| {
         let args = process_args(pgid);
-        let fresh = Identity {
+        Identity {
             pid: pgid,
             started,
             dir: claude_dir_of_args(args.as_ref()),
@@ -809,17 +806,8 @@ fn resolve_and_post(
                 .map(|a| footer::launch_facts_of(&a.argv, &a.env))
                 .unwrap_or_default(),
             launch_for: None,
-            argv: args.as_ref().map(|a| a.argv.clone()).unwrap_or_default(),
-        };
-        // No directory is not remembered: a launch through the atpkg twin is
-        // `/bin/sh` for its first milliseconds, whose environment macOS hides,
-        // and the `exec` into Claude Code keeps both the pid and the start
-        // time — a cached `None` would outlive the shell and leave that
-        // process with no footer for its whole life.
-        if fresh.dir.is_some() {
-            known.insert(session, fresh.clone());
+            argv: args.map(|a| a.argv).unwrap_or_default(),
         }
-        fresh
     });
     let tail = tails.cache(
         session,
@@ -828,11 +816,13 @@ fn resolve_and_post(
         std::time::Instant::now(),
     );
     let (moved, shows_wall) = resolve_into(timeline, &mut identity, tail, fold);
-    if let Some(kept) = known.get_mut(&session)
-        && kept.pid == identity.pid
-        && kept.started == identity.started
-    {
-        kept.clone_from(&identity);
+    // No directory is not remembered: a launch through the atpkg twin is
+    // `/bin/sh` for its first milliseconds, whose environment macOS hides,
+    // and the `exec` into Claude Code keeps both the pid and the start time
+    // — a cached `None` would outlive the shell and leave that process with
+    // no footer for its whole life.
+    if identity.dir.is_some() {
+        known.insert(session, identity);
     }
     if let Some(denied) = moved {
         post_changed(session);
@@ -912,13 +902,11 @@ fn resolve_into(
     tail: &mut footer::TailCache,
     fold: &mut footer::FooterCache,
 ) -> (Option<Option<PathBuf>>, bool) {
-    // ONE footer read, composed in `footer::read_pid` (the review of
-    // 2026-09-28: composed here by hand, main's torn-read tests guarded a
-    // function the window no longer called): one read of
-    // `sessions/<pid>.json` feeds the model, the Σ, the wall and the
-    // frozen-program remedy's resume line alike (main's 5bebdcf36), so after
-    // `/clear` or `/resume` the footer never pairs one conversation's model
-    // with another's Σ or wall, nor names another's conversation to resume.
+    // ONE footer read (`footer::read_pid`): one read of `sessions/<pid>.json`
+    // feeds the model, the Σ, the wall and the frozen-program remedy's resume
+    // line alike, so after `/clear` or `/resume` the footer never pairs one
+    // conversation's model with another's Σ or wall, nor names another's
+    // conversation to resume.
     // `read_at` is no later than that registry read: when this read saw the
     // process in the session the registry names.
     let clock = footer::ReadClock {
@@ -1067,9 +1055,9 @@ fn compose_rule(
             if i > 0 {
                 facts.extend(std::iter::repeat_n(blank, footer::GAP));
             }
-            push_text(&mut facts, blank, &seg.mark.to_string(), mark_fg);
+            push_text(&mut facts, blank, [seg.mark], mark_fg);
             facts.push(blank);
-            push_text(&mut facts, blank, &seg.text, blank.fg);
+            push_text(&mut facts, blank, seg.text.chars(), blank.fg);
         }
         facts.push(blank);
     }
@@ -1085,8 +1073,13 @@ fn compose_rule(
 /// char takes its lead cell and a continuation, and a char that occupies no
 /// column of its own (a combining mark, a control) is left out — a cell
 /// cannot carry one without the side channels this splice never writes.
-fn push_text(out: &mut Vec<RenderCell>, blank: RenderCell, text: &str, fg: [u8; 3]) {
-    for ch in text.chars() {
+fn push_text(
+    out: &mut Vec<RenderCell>,
+    blank: RenderCell,
+    text: impl IntoIterator<Item = char>,
+    fg: [u8; 3],
+) {
+    for ch in text {
         let cols = aterm_grapheme::char_width(ch);
         if cols == 0 || ch.is_control() {
             continue;
@@ -1438,14 +1431,20 @@ impl App {
                 if source.display_offset != 0 {
                     continue;
                 }
-                let facts = entry
-                    .ctx
-                    .timeline
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .claude_footer()
-                    .cloned();
-                let Some(facts) = facts else {
+                // What the footer shows (`claude_footer_shown`), and — while
+                // nothing since the process started named its model or
+                // effort — the owner a launch card may be kept for.
+                let shown = {
+                    let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    timeline.claude_footer().map(|facts| {
+                        let open = facts.model_open || facts.effort_open;
+                        (
+                            facts.filled_from(timeline.claude_card()),
+                            open.then(|| facts.owner.clone()).flatten(),
+                        )
+                    })
+                };
+                let Some((mut shown, card_owner)) = shown else {
                     continue;
                 };
                 let blank = source.implicit_blank;
@@ -1471,7 +1470,7 @@ impl App {
                 // it paints nothing — unless the chrome claimed that row.
                 let read = read_footer(session, &texts, read_rule_row);
                 if read.is_some_and(|r| !r.mode_row) {
-                    note_vendor_drift(session, facts.version.as_deref(), &texts);
+                    note_vendor_drift(session, shown.version.as_deref(), &texts);
                 }
                 // Nothing since this process started named its model or
                 // effort: its launch card may, read off a live REPL of its
@@ -1483,10 +1482,8 @@ impl App {
                 // replaced as soon as the new process draws its own. A frame
                 // with no card to read (it scrolled away, a message sits
                 // under it) keeps the last reading: the card still names
-                // what the process started on.
-                let timeline = &entry.ctx.timeline;
-                if (facts.model_open || facts.effort_open)
-                    && let Some(owner) = facts.owner.as_ref()
+                // what the process started on. A card kept anew shows now.
+                if let Some(owner) = card_owner
                     && let Some(card) = crate::reader_guard::read_or_none(
                         &format!("{session}"),
                         "Claude Code launch card",
@@ -1495,17 +1492,14 @@ impl App {
                     )
                     .flatten()
                 {
-                    let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
-                    let pgid = timeline.claude_footer_identity().map(|(pgid, _)| pgid);
-                    if let Some(pgid) = pgid {
-                        timeline.note_claude_card(pgid, owner, card);
+                    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some((pgid, _)) = timeline.claude_footer_identity()
+                        && timeline.note_claude_card(pgid, &owner, card)
+                        && let Some(now) = timeline.claude_footer_shown()
+                    {
+                        shown = now;
                     }
                 }
-                let shown = timeline
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .claude_footer_shown()
-                    .unwrap_or(facts);
                 let on_glass = read
                     .map(|r| r.rule)
                     .filter(|&r| !self.chrome_owns_terminal_row(wid, row_off + r));
@@ -1665,7 +1659,7 @@ type FooterRead = Option<RuleRead>;
 fn read_rule_row(rows: &[String]) -> FooterRead {
     aterm_phase::phase::composer_bottom(rows).map(|rule| RuleRead {
         rule,
-        mode_row: footer::mode_row(rows).is_some(),
+        mode_row: footer::mode_row_under(rows, rule).is_some(),
     })
 }
 

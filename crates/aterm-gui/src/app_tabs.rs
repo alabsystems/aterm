@@ -10395,6 +10395,19 @@ mod shell_start_exit_tests {
         Some((name, at))
     }
 
+    /// The reader's EOF stamp of a shell that ended "at start": moments after
+    /// the spawn recorded at `at`, well inside [`SHELL_START_WINDOW`]. A
+    /// scenario, not a reading: stamped from the clock after the stub ran, it
+    /// measured how long a loaded machine took to spawn and exit `/bin/sh`,
+    /// and under the merge gate's load (and at background QoS beside 72
+    /// spinners, 3 to 5 of 12 per run) that passed the 2 s window, so the
+    /// shells these tests say failed at start were judged late and their
+    /// windows closed ("nothing closes: [WindowId(1)]"). The one test about
+    /// a late exit stamps its own ([`a_shell_that_fails_after_two_seconds_closes_as_today`]).
+    fn eof_at_start(at: Instant) -> Option<Instant> {
+        Some(at + Duration::from_millis(100))
+    }
+
     /// A fresh headless app plus a window whose only pane is `pid`'s session:
     /// `start` is what the spawn recorded, `closed` when the reader saw its PTY
     /// close.
@@ -10486,7 +10499,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "zsh", "exit 3");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
 
         let to_close = reader_eof(&mut app, id);
 
@@ -10525,7 +10538,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "fish", "kill -KILL $$");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("fish", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("fish", at), eof_at_start(at));
 
         let to_close = reader_eof(&mut app, id);
 
@@ -10540,7 +10553,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "fish", "kill -KILL $$");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("fish", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("fish", at), eof_at_start(at));
         app.config.tab_status = Some(false);
 
         let to_close = reader_eof(&mut app, id);
@@ -10557,7 +10570,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "zsh", "exit 4");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         app.config.tab_status = Some(false);
 
         let to_close = reader_eof(&mut app, id);
@@ -10581,7 +10594,7 @@ mod shell_start_exit_tests {
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
         let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
         let (mut app, wid, id) =
-            app_with_sink(pid, started("zsh", at), Some(Instant::now()), sink.clone());
+            app_with_sink(pid, started("zsh", at), eof_at_start(at), sink.clone());
         sink.write_frame(b"\x04")
             .expect("the Ctrl-D reaches the PTY");
 
@@ -10607,7 +10620,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "zsh", "kill -KILL $$");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         // The shell-integration prompt marks around a prompt, as zsh draws it.
         term_lock(&app.pool.get(id).expect("the pane's session").term)
             .process(b"\x1b]133;A\x07% \x1b]133;B\x07");
@@ -10643,7 +10656,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "zsh", "exit 0");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
 
         assert_eq!(reader_eof(&mut app, id), vec![wid], "the window closes");
         assert!(!pane_text(&app, id).contains("ended at start"));
@@ -10687,7 +10700,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "zsh", "exit 3");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         app.hold = true;
 
         assert!(reader_eof(&mut app, id).is_empty());
@@ -10703,7 +10716,7 @@ mod shell_start_exit_tests {
         let shell = stub_shell(dir.path(), "zsh", "exit 1");
         let at = Instant::now();
         let pid = run_to_zombie(&shell);
-        let (mut app, wid, id) = app_with(pid, started("zsh", at), Some(Instant::now()));
+        let (mut app, wid, id) = app_with(pid, started("zsh", at), eof_at_start(at));
         app.frontmost_window = Some(wid);
         let second = app
             .open_active_session_in_new_window_logical()

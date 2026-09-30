@@ -1117,8 +1117,10 @@ mod tests {
             matches!(nil, AcquireRefusal::AcquireNil),
             "the deviceless refusal is the nil arm, not drift/latch: {nil:?}"
         );
+        // A hang detector: the deviceless nil is immediate and a parked thread
+        // never returns, so a minute loses nothing 8 s caught.
         assert!(
-            waited < std::time::Duration::from_secs(8),
+            waited < std::time::Duration::from_secs(60),
             "the live nil is BOUNDED — {waited:?} is not a parked thread"
         );
         assert_eq!(

@@ -208,7 +208,7 @@ mod tests {
     /// So pin every combination against the pure renderer — no arm can go dead —
     /// and separately assert the exported method reports THIS build faithfully. The
     /// shipped module's lz4/no-spill shape is enforced structurally instead: the
-    /// wasm builds are `-p`-scoped (`xtask gate web`, `tools/wasm-bench/run.sh`) and
+    /// wasm builds are `-p`-scoped (the wasm cells, `tools/wasm-bench/run.sh`) and
     /// `disk-tier` drags in libc mmap + zstd-sys C, which cannot target
     /// wasm32-unknown-unknown — so it fails to BUILD long before any assertion.
     #[test]

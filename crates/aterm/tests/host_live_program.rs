@@ -49,7 +49,17 @@ fn boot(tag: &str) -> Option<Instance> {
     )
 }
 
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(60);
+/// A client that has not exited by now is hung: past every [`HANG`] wait a
+/// call makes, so a wait that times out answers before it is killed.
+const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a wait for something that MUST happen may take before it is read
+/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
+/// Every one is BELOW the shim's life ([`write_shim`]'s `sleep`): a shim that
+/// ended first would leave `program=sh` behind, which the negative controls
+/// would read as their pass.
+const HANG: Duration = Duration::from_secs(60);
+const HANG_MS: &str = "timeout=60000";
 
 fn client_command(inst: &Instance, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
@@ -169,11 +179,12 @@ fn screen_529() -> String {
 }
 
 /// A shim-shaped script: `#!/bin/sh`, draw the 529 screen on the alternate
-/// screen, then wait without ever `exec`-ing.
+/// screen, then wait without ever `exec`-ing — for ten minutes, far past every
+/// [`HANG`] wait on it (the instance's hangup ends it with the test).
 fn write_shim(path: &Path, screen: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let body = format!(
-        "#!/bin/sh\nprintf '\\033[?1049h\\033[2J\\033[H'\ncat '{}'\nsleep 60\nexit 0\n",
+        "#!/bin/sh\nprintf '\\033[?1049h\\033[2J\\033[H'\ncat '{}'\nsleep 600\nexit 0\n",
         screen.display()
     );
     std::fs::write(path, body).expect("write the shim");
@@ -212,7 +223,7 @@ fn run_shim(name: &str, managed: bool, tag: &str) -> Option<(Instance, String)> 
             "await",
             "match",
             "API.Error:.529",
-            "timeout=10000",
+            HANG_MS,
         ],
     );
     assert!(
@@ -230,17 +241,20 @@ fn a_shim_before_its_exec_is_the_agent_and_its_529_is_a_wall() {
     let rec = status_until(
         &inst,
         &sid,
-        Duration::from_secs(10),
+        HANG,
         "program=claude agent=wall:overloaded",
         |s| field(s, "program") == Some("claude") && field(s, "agent") == Some("wall:overloaded"),
     );
     assert_eq!(field(&rec, "agent_detail"), Some("-"), "{rec}");
     assert_eq!(field(&rec, "level"), Some("limited"), "{rec}");
-    // Latched: the verdict is already true, so both answer at once.
+    // Latched: the verdict is already true, so both answer at once. A wait
+    // that did not latch parks for a change this still screen never makes and
+    // answers `OK timeout`, exit 124, which fails `ctl_ok` — so the timeout is
+    // a hang detector, not the "at once" (it was 3 s).
     for word in ["wall:overloaded", "wall", "busy,wall:overloaded"] {
         let reply = ctl_ok(
             &inst,
-            &[&format!("@{sid}"), "await", "agent", word, "timeout=3000"],
+            &[&format!("@{sid}"), "await", "agent", word, HANG_MS],
         );
         assert!(
             reply.starts_with("OK agent wall:overloaded rev="),
@@ -274,7 +288,7 @@ fn the_same_script_under_another_name_is_a_shell() {
     let Some((inst, sid)) = run_shim("build.sh", true, "n") else {
         return;
     };
-    let rec = status_until(&inst, &sid, Duration::from_secs(10), "program=sh", |s| {
+    let rec = status_until(&inst, &sid, HANG, "program=sh", |s| {
         field(s, "program") == Some("sh")
     });
     // Sample for a second: never an agent.
@@ -295,7 +309,7 @@ fn a_wrapper_named_claude_outside_the_prefix_is_a_shell() {
     let Some((inst, sid)) = run_shim("claude", false, "u") else {
         return;
     };
-    let rec = status_until(&inst, &sid, Duration::from_secs(10), "program=sh", |s| {
+    let rec = status_until(&inst, &sid, HANG, "program=sh", |s| {
         field(s, "program") == Some("sh")
     });
     assert_eq!(field(&rec, "agent"), Some("-"), "{rec}");

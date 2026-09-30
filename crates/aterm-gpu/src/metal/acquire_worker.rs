@@ -290,7 +290,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    const LIMIT: Duration = Duration::from_secs(5);
+    /// A HANG DETECTOR, never a latency budget: every wait under it is for a
+    /// thread handoff that must happen (a worker entering, a release, a wake,
+    /// a retirement), and each returns the instant it does. A minute, as the
+    /// house rule for correctness waits says, so a descheduled worker on a
+    /// loaded gate is not read as a lost wake.
+    const LIMIT: Duration = Duration::from_secs(60);
 
     struct Retirement {
         acquiring: Arc<AtomicBool>,

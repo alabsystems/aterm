@@ -2356,11 +2356,21 @@ pub fn check_now_with_settings(
     {
         match provider() {
             Some(settings) => check_now(current_build, &settings.source),
-            None => UpdateStatus::empty(
-                enabled(),
-                current_build,
-                "current update settings could not be read".into(),
-            ),
+            // NO CHECK RAN, BUT THE STAGE ON DISK IS STILL THERE (round seven
+            // of the update audit, finding 40): the durable status says so,
+            // with this request's outcome. An empty status here reported
+            // `staged_build=-` over a verified stage, and a driver reading
+            // `relaunch_ready=` concluded nothing was staged.
+            None => {
+                let outcome = "current update settings could not be read".to_string();
+                status(current_build).map_or_else(
+                    || UpdateStatus::empty(enabled(), current_build, outcome.clone()),
+                    |mut durable| {
+                        durable.outcome = outcome.clone();
+                        durable
+                    },
+                )
+            }
         }
     }
 }

@@ -266,6 +266,7 @@ fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
             index: 0,
             label: "Packages",
             still_actionable: true,
+            declines: false,
         }],
         "a navigation is always live"
     );
@@ -571,7 +572,7 @@ fn a_navigation_is_pressable_only_where_the_host_performs_one() {
     let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
     assert!(
         lines.contains(&format!(
-            "action\tid={}\tindex=1\tlabel=Manual\tactionable=0\tbutton=Open Manual",
+            "action\tid={}\tindex=1\tlabel=Manual\tactionable=0\tbutton=Open Manual\tprimary=0",
             crash.raw()
         )),
         "{lines:#?}"
@@ -1175,13 +1176,16 @@ fn the_page_as_lines_says_every_word_in_one_grammar() {
             "entry\tid=4\tat={}\twhen=1 min ago\tlocal=Today 3:52:20 PM\ttag=harness\ttag_words=Agents\tsev=warn\tsev_words=Warning\tmark=\u{26a0}\ttitle=Claude upgrade waits in C:\\\\work\tstate=live\tstate_words=showing now\trep=1\tdescription=Warning, Agents, 1 minute ago\tsentence=it asks again on its own at 4:00 PM\\uUpgrade now asks it at its next turn end\ttechnical=in tab 1 \u{00b7} 2.1.281 \u{2192} 2.1.282\tmeta=Today 3:52:20 PM \u{00b7} showing now\tcopy=Claude upgrade waits in C:\\\\work\\n2025-09-21 15:52:20 UTC \u{00b7} harness \u{00b7} warn\\nit asks again on its own at 4:00 PM\\nUpgrade now asks it at its next turn end\\nin tab 1 \u{00b7} 2.1.281 \u{2192} 2.1.282",
             NOW - 60_000
         ),
-        "action\tid=4\tindex=0\tlabel=Upgrade now\tactionable=1\tbutton=Upgrade now".to_string(),
-        "action\tid=4\tindex=1\tlabel=Not today\tactionable=0\tbutton=Not today".to_string(),
+        "action\tid=4\tindex=0\tlabel=Upgrade now\tactionable=1\tbutton=Upgrade now\tprimary=1"
+            .to_string(),
+        "action\tid=4\tindex=1\tlabel=Not today\tactionable=0\tbutton=Not today\tprimary=0"
+            .to_string(),
         format!(
             "entry\tid=3\tat={}\twhen=10 min ago\tlocal=Today 3:43:20 PM\ttag=crash\ttag_words=Crashes\tsev=error\tsev_words=Error\tmark=\u{2715}\ttitle=aterm closed unexpectedly\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Error, Crashes, 10 minutes ago\tsentence=\ttechnical=panicked at src/grid.rs:3:9\\u    ^ index out of bounds\tmeta=Today 3:43:20 PM \u{00b7} recorded\tcopy=aterm closed unexpectedly\\n2025-09-21 15:43:20 UTC \u{00b7} crash \u{00b7} error\\npanicked at src/grid.rs:3:9\\n    ^ index out of bounds",
             NOW - 10 * 60_000
         ),
-        "action\tid=3\tindex=0\tlabel=Open log\tactionable=1\tbutton=Open log".to_string(),
+        "action\tid=3\tindex=0\tlabel=Open log\tactionable=1\tbutton=Open log\tprimary=1"
+            .to_string(),
         format!(
             "entry\tid=2\tat={}\twhen=2 h ago\tlocal=Today 1:53:20 PM\ttag=packages\ttag_words=ALab tools\tsev=info\tsev_words=Info\tmark=\u{2139}\ttitle=trust updated\tstate=recorded\tstate_words=recorded\trep=1\tdescription=Info, ALab tools, 2 hours ago\tsentence=0.9.1 is live\ttechnical=\tmeta=Today 1:53:20 PM \u{00b7} recorded\tcopy=trust updated\\n2025-09-21 13:53:20 UTC \u{00b7} packages \u{00b7} info\\n0.9.1 is live",
             NOW - 2 * 3_600_000
@@ -1371,9 +1375,12 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
     );
     // No host has the log: `Open log` offered, not pressable (the negative
     // control of the desk's file).
-    assert!(lines.contains(
-        &"action\tid=3\tindex=0\tlabel=Open log\tactionable=0\tbutton=Open log".to_string()
-    ));
+    assert!(
+        lines.contains(
+            &"action\tid=3\tindex=0\tlabel=Open log\tactionable=0\tbutton=Open log\tprimary=0"
+                .to_string()
+        )
+    );
 
     // An empty log: the head alone, and no count line.
     let fresh = center(Instant::now());
@@ -1413,6 +1420,7 @@ fn any_word_survives_the_page_lines() {
             index: 3,
             label: "Open\tlog\n",
             still_actionable: true,
+            declines: false,
         }],
         ..entry_at(9, NOW - 60_000)
     };
@@ -1482,7 +1490,10 @@ fn any_word_survives_the_page_lines() {
             "copy"
         ]
     );
-    assert_eq!(keys(3), ["id", "index", "label", "actionable", "button"]);
+    assert_eq!(
+        keys(3),
+        ["id", "index", "label", "actionable", "button", "primary"]
+    );
     let (_, head) = &read[0];
     assert_eq!(page_field(head, "folder"), Some(hostile));
     let (_, chip) = &read[1];
@@ -1693,5 +1704,245 @@ fn the_pages_chrome_words_are_the_engines() {
             newer.copy_text(),
             older.copy_text()
         )
+    );
+}
+
+/// THE PAGE'S PRIMARY IS THE ENGINE'S (ruling 407; the rule of rulings 265, 401
+/// and 403, which the macOS page applied itself until then): the first offered
+/// intent while a press can perform it — a pressable first decline keeps it —
+/// else, past a dead first, the first LATER pressable intent that is no decline,
+/// else none. Every case of ruling 403 is pinned, with the controls that tell the
+/// rule from its near misses: plain "first pressable" would promote `Skip
+/// version` past a dead `Upgrade now` (case b), and "first non-decline" would
+/// take the Primary from a pressable first `Not now` (case d).
+#[test]
+fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
+    use crate::page::primary_index;
+    let act = |index: u8, label: &'static str, still_actionable: bool, declines: bool| {
+        MessageActionView {
+            index,
+            label,
+            still_actionable,
+            declines,
+        }
+    };
+    // (a) The first offered intent, pressable, leads — whatever follows.
+    assert_eq!(
+        primary_index(&[
+            act(0, "Upgrade now", true, false),
+            act(1, "Skip version", true, true),
+            act(2, "Software Update", true, false),
+        ]),
+        Some(0)
+    );
+    // (b) A dead first hands the Primary to the first LATER pressable intent
+    // that is no decline: `Skip version` is passed over, `Software Update`
+    // leads.
+    assert_eq!(
+        primary_index(&[
+            act(0, "Upgrade now", false, false),
+            act(1, "Skip version", true, true),
+            act(2, "Software Update", true, false),
+        ]),
+        Some(2)
+    );
+    // …and a dead later non-decline is passed over too.
+    assert_eq!(
+        primary_index(&[
+            act(0, "Install now", false, false),
+            act(1, "Open log", false, false),
+            act(2, "Manual", true, false),
+        ]),
+        Some(2)
+    );
+    // A dead first DECLINE hands it on the same way.
+    assert_eq!(
+        primary_index(&[
+            act(0, "Not now", false, true),
+            act(1, "Open Settings", true, false),
+        ]),
+        Some(1)
+    );
+    // (c) Past a dead first, only declines left pressable: none leads.
+    assert_eq!(
+        primary_index(&[
+            act(0, "Upgrade now", false, false),
+            act(1, "Skip version", true, true),
+        ]),
+        None
+    );
+    assert_eq!(
+        primary_index(&[
+            act(0, "Upgrade now", false, false),
+            act(1, "Not today", true, true),
+            act(2, "Skip version", true, true),
+        ]),
+        None
+    );
+    // (d) A first decline that is pressable keeps it (the reporter's order
+    // leads, ruling 265).
+    assert_eq!(
+        primary_index(&[
+            act(0, "Not now", true, true),
+            act(1, "Open Settings", true, false),
+        ]),
+        Some(0)
+    );
+    // Nothing pressable, and nothing offered: none.
+    assert_eq!(
+        primary_index(&[
+            act(0, "Open log", false, false),
+            act(1, "Manual", false, false),
+        ]),
+        None
+    );
+    assert_eq!(primary_index(&[]), None);
+}
+
+/// THE LINES CARRY THE PRIMARY (ruling 407): each `action` line ends
+/// `primary=`, `1` on the entry's Primary alone ([`crate::page::primary_index`]),
+/// `0` on every other — so a page drawing the lines could lead with the one the
+/// native footer does without re-deriving the rule (none does yet: no site
+/// renders the page, and the web hosts press nothing on a record, ruling 389)
+/// — and the key is appended after
+/// every older one (`button=` stays where it was). Across entries: a dead
+/// first hands it to a later navigation; only declines left, none leads; a
+/// pressable first decline keeps it.
+#[test]
+fn the_action_lines_carry_the_primary_after_every_older_key() {
+    let act = |index: u8, label: &'static str, still_actionable: bool, declines: bool| {
+        MessageActionView {
+            index,
+            label,
+            still_actionable,
+            declines,
+        }
+    };
+    let entries = vec![
+        MessageView {
+            actions: vec![
+                act(0, "Upgrade now", false, false),
+                act(1, "Skip version", true, true),
+                act(2, "Software Update", true, false),
+            ],
+            ..entry_at(3, NOW - 60_000)
+        },
+        MessageView {
+            actions: vec![
+                act(0, "Upgrade now", false, false),
+                act(1, "Skip version", true, true),
+            ],
+            ..entry_at(2, NOW - 120_000)
+        },
+        MessageView {
+            actions: vec![
+                act(0, "Not now", true, true),
+                act(1, "Open Settings", true, false),
+            ],
+            ..entry_at(1, NOW - 180_000)
+        },
+    ];
+    let page = MessagesState {
+        revision: 1,
+        now_unix_ms: NOW,
+        entries,
+        tags: vec![("config".to_string(), 3)],
+        log_folder: None,
+        saved: true,
+        utc_offset_s: 0,
+    };
+    let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
+    let actions: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.starts_with("action\t"))
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "action\tid=3\tindex=0\tlabel=Upgrade now\tactionable=0\tbutton=Upgrade now\tprimary=0",
+            "action\tid=3\tindex=1\tlabel=Skip version\tactionable=1\tbutton=Skip version\tprimary=0",
+            "action\tid=3\tindex=2\tlabel=Software Update\tactionable=1\tbutton=Open Software Update\tprimary=1",
+            "action\tid=2\tindex=0\tlabel=Upgrade now\tactionable=0\tbutton=Upgrade now\tprimary=0",
+            "action\tid=2\tindex=1\tlabel=Skip version\tactionable=1\tbutton=Skip version\tprimary=0",
+            "action\tid=1\tindex=0\tlabel=Not now\tactionable=1\tbutton=Not now\tprimary=1",
+            "action\tid=1\tindex=1\tlabel=Open Settings\tactionable=1\tbutton=Open Settings\tprimary=0",
+        ]
+    );
+    // Read back as a page reads it: the lines' `primary=1` is the rule's pick,
+    // entry by entry.
+    for entry in &page.entries {
+        let picked: Vec<usize> = actions
+            .iter()
+            .map(|line| read_page_line(line).1)
+            .filter(|fields| page_field(fields, "id") == Some(&*entry.id.to_string()))
+            .enumerate()
+            .filter(|(_, fields)| page_field(fields, "primary") == Some("1"))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            picked,
+            crate::page::primary_index(&entry.actions)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "entry {}",
+            entry.id
+        );
+    }
+}
+
+/// `primary=` MARKS A POSITION IN THE OFFERED INTENTS, NOT AN `ActionIndex`
+/// (the round-39 review; ruling 408). [`crate::page::primary_index`] answers a
+/// position in `entry.actions`, while each line's `index=` keeps the intent's
+/// own `ActionIndex`: an intent whose moment passed is not offered (ruling
+/// 265: `Not now` on an answered ask), so the offered indices can start past
+/// 0 and skip. Every other pin offers `index=` equal to the position, where a
+/// mark by `index=` reads the same. Here they differ: (A) the first offered
+/// intent, `index=1`, leads, where a mark by `index=` would mark none; (B) past a
+/// dead `index=1`, the pressable `index=2` leads, where a mark by `index=`
+/// would put the Primary on the dead button (day ten's D2 again).
+#[test]
+fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index() {
+    let act = |index: u8, label: &'static str, still_actionable: bool| MessageActionView {
+        index,
+        label,
+        still_actionable,
+        declines: false,
+    };
+    let page = MessagesState {
+        revision: 1,
+        now_unix_ms: NOW,
+        entries: vec![
+            MessageView {
+                actions: vec![act(1, "Show tab 2", true), act(2, "Settings", true)],
+                ..entry_at(2, NOW - 60_000)
+            },
+            MessageView {
+                actions: vec![
+                    act(1, "Install now", false),
+                    act(2, "Software Update", true),
+                ],
+                ..entry_at(1, NOW - 120_000)
+            },
+        ],
+        tags: vec![("config".to_string(), 2)],
+        log_folder: None,
+        saved: true,
+        utc_offset_s: 0,
+    };
+    let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
+    let actions: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.starts_with("action\t"))
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "action\tid=2\tindex=1\tlabel=Show tab 2\tactionable=1\tbutton=Show tab 2\tprimary=1",
+            "action\tid=2\tindex=2\tlabel=Settings\tactionable=1\tbutton=Open Settings\tprimary=0",
+            "action\tid=1\tindex=1\tlabel=Install now\tactionable=0\tbutton=Install now\tprimary=0",
+            "action\tid=1\tindex=2\tlabel=Software Update\tactionable=1\tbutton=Open Software Update\tprimary=1",
+        ]
     );
 }

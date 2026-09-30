@@ -106,19 +106,62 @@ pub(crate) struct TurnLedger {
     /// Turn ids below this may have named records of this session that the
     /// ledger never got: a self-update handoff could not carry the ledger
     /// whole (no sidecar, a bad one, a lock another thread kept, records shed
-    /// to fit). [`TurnLedger::low_id`] reports it while no record is held,
-    /// so a resumed `since-turn=` below it is told, as for evicted records.
+    /// to fit, a turn still open at the export). [`TurnLedger::low_id`]
+    /// reports it while it is above every held record's id, so a resumed
+    /// `since-turn=` below it is told, as for evicted records.
     /// 0: none.
     unheld_below: u64,
+    /// Turn ids minted for this session whose record has not landed yet
+    /// ([`TurnLedger::begin`] … [`TurnLedger::record`] or
+    /// [`TurnLedger::abandon`]): a handoff's export carries them as ids the
+    /// carried ledger does not vouch for ([`TurnLedger::carry_floor`]), since
+    /// their records land in the process that exits (the 2026-09-29 review,
+    /// round seven, finding 23). One lease holds a session's turn at a time,
+    /// so this holds one id, or a few when `lease release force` preempted a
+    /// wedged turn.
+    open: Vec<u64>,
 }
 
 impl TurnLedger {
-    /// Append one record, evicting the oldest past the cap.
+    /// Append one record, evicting the oldest past the cap. The caller keeps
+    /// the ids rising ([`TurnLedger::record`] does, for a live turn).
     pub(crate) fn push(&mut self, rec: TurnRecord) {
         if self.records.len() == LEDGER_CAP {
             self.records.pop_front();
         }
         self.records.push_back(rec);
+    }
+
+    /// A turn with id `id` began on this session: its record is owed
+    /// ([`TurnLedger::record`]), or it ends without one
+    /// ([`TurnLedger::abandon`]).
+    pub(crate) fn begin(&mut self, id: u64) {
+        self.open.push(id);
+    }
+
+    /// The turn `id` ended without a record (refused, failed, the session
+    /// exited): no record is owed for it any more. Idempotent.
+    pub(crate) fn abandon(&mut self, id: u64) {
+        self.open.retain(|&open| open != id);
+    }
+
+    /// Record a finished turn that began as `rec.id`, and return the id it is
+    /// recorded under — the one its reply prints. That is `rec.id`, unless a
+    /// LATER turn already recorded (a `lease release force` preempted this
+    /// one, and the turn that took the slot settled first): then it is
+    /// re-numbered with `mint`, the process's turn-id mint, so the ids stay
+    /// strictly rising in the order records land. [`TurnLedger::since`] seeks
+    /// by id, the `events` digest streams by id watermark, and a handoff
+    /// carries only a rising run — a record landing under its old, lower id
+    /// was one no subscriber was ever sent (round seven, finding 43).
+    pub(crate) fn record(&mut self, mut rec: TurnRecord, mint: impl FnOnce() -> u64) -> u64 {
+        self.abandon(rec.id);
+        if self.high_id().is_some_and(|high| high >= rec.id) {
+            rec.id = mint();
+        }
+        let id = rec.id;
+        self.push(rec);
+        id
     }
 
     /// How many turns this session has retained (for the `who` verb's `turns=`).
@@ -127,20 +170,22 @@ impl TurnLedger {
     }
 
     /// The ledger a self-update handoff carried from the previous process:
-    /// its records, each marked [`TurnRecord::carried`], newest-last. Only a
-    /// strictly rising run of ids is kept (a record whose id does not rise past
-    /// the one before it is dropped), because [`TurnLedger::since`] seeks by id,
-    /// and only the newest [`LEDGER_CAP`] of them. `unheld_below`: turn ids
-    /// below it may have named records the carry could not bring (0: none).
-    pub(crate) fn carried(records: Vec<TurnRecord>, unheld_below: u64) -> Self {
+    /// its records, each marked [`TurnRecord::carried`], in id order (as
+    /// [`TurnLedger::since`] seeks), and only the newest [`LEDGER_CAP`] of
+    /// them. A sender whose ledger was out of order (an older build recorded a
+    /// preempted turn after the one that replaced it) is put back in order
+    /// rather than losing the record; of two records under one id, the first
+    /// is kept. `unheld_below`: turn ids below it may have named records the
+    /// carry could not bring (0: none).
+    pub(crate) fn carried(mut records: Vec<TurnRecord>, unheld_below: u64) -> Self {
+        records.sort_by_key(|rec| rec.id);
+        records.dedup_by_key(|rec| rec.id);
         let mut ledger = Self {
             records: VecDeque::new(),
             unheld_below,
+            open: Vec::new(),
         };
         for mut rec in records {
-            if ledger.records.back().is_some_and(|last| last.id >= rec.id) {
-                continue;
-            }
             rec.carried = true;
             ledger.push(rec);
         }
@@ -154,10 +199,39 @@ impl TurnLedger {
     }
 
     /// Turn ids below this may have named records the ledger never got (see
-    /// the field); 0: none. The handoff's export carries it on.
-    #[cfg(any(unix, test))]
+    /// the field); 0: none. Replies read [`TurnLedger::live_floor`].
+    #[cfg(test)]
     pub(crate) const fn unheld_below(&self) -> u64 {
         self.unheld_below
+    }
+
+    /// The floor ([`TurnLedger::unheld_below`]) while it still tells a reader
+    /// something: the ledger is empty, or the floor lies above its OLDEST
+    /// held record, so a turn id inside the window the ledger answers for may
+    /// be missing. Once every record under the floor has been evicted (the
+    /// oldest held id is at or past it), the floor sits below that window —
+    /// the same low-water eviction leaves, and [`TurnLedger::low_id`] already
+    /// answers the oldest record there — so it is stale and `None`: a floor
+    /// set by one update must not ride every `history` reply and every later
+    /// export for the rest of the session (round seven, finding 58's review).
+    pub(crate) fn live_floor(&self) -> Option<u64> {
+        let floor = self.unheld_below;
+        (floor > 0 && self.records.front().is_none_or(|front| floor > front.id)).then_some(floor)
+    }
+
+    /// What a handoff's export carries as the ledger's `unheld_below`: the
+    /// ledger's own, raised past every turn still OPEN on this session. Such a
+    /// turn records into this process's ledger after the export took it (a
+    /// parked reader leaves its screen frozen, so an idle settle latches), and
+    /// the successor never sees that record — so the carried ledger must not
+    /// vouch for its id (round seven, finding 23).
+    #[cfg(any(unix, test))]
+    /// A floor gone stale ([`TurnLedger::live_floor`]) is not carried on.
+    pub(crate) fn carry_floor(&self) -> u64 {
+        self.open
+            .iter()
+            .map(|id| id.saturating_add(1))
+            .fold(self.live_floor().unwrap_or(0), u64::max)
     }
 
     /// The highest recorded turn id, or `None` when empty — the events digest
@@ -175,12 +249,16 @@ impl TurnLedger {
     /// a per-session id gap the way it can for contiguous block ids). An EMPTY
     /// ledger a self-update handoff could not carry whole reports the first id it
     /// can vouch for ([`TurnLedger::carried`]'s `unheld_below`): the turns below it
-    /// are just as gone.
+    /// are just as gone — and so does one whose floor sits ABOVE a held record
+    /// (a turn still open when the handoff exported it: the records past the
+    /// floor are whole, the ones below it are not), so the low-water is the
+    /// higher of the two.
     pub(crate) fn low_id(&self) -> Option<u64> {
-        self.records
-            .front()
-            .map(|r| r.id)
-            .or((self.unheld_below > 0).then_some(self.unheld_below))
+        let floor = (self.unheld_below > 0).then_some(self.unheld_below);
+        match (self.records.front().map(|r| r.id), floor) {
+            (Some(front), Some(floor)) => Some(front.max(floor)),
+            (front, floor) => front.or(floor),
+        }
     }
 
     /// Records with `id > after`, oldest-first (the events digest's scan, and the
@@ -386,6 +464,85 @@ mod tests {
             observed(Some(high)).is_empty(),
             "at the high-water = nothing new"
         );
+    }
+
+    /// Round seven, finding 43: a turn a `lease release force` preempted
+    /// finishes after the turn that took its slot. Recorded under its own,
+    /// lower id it sat behind the newer record — the `events` digest, whose
+    /// watermark had passed it, never sent it, and a handoff's carry dropped
+    /// it. It is re-numbered instead, so the ids rise in the order records
+    /// land, and a watcher past the newer turn is sent it.
+    #[test]
+    fn a_preempted_turn_that_records_late_is_renumbered_and_streamed() {
+        let mut l = TurnLedger::default();
+        l.push(rec(5));
+        l.begin(10);
+        l.begin(11);
+        assert_eq!(l.record(rec(11), || unreachable!("in order")), 11);
+        let watermark = l.high_id();
+        let mut minted = 11;
+        let late = l.record(rec(10), || {
+            minted += 1;
+            minted
+        });
+        assert_eq!(late, 12, "re-numbered past the newer record");
+        let ids: Vec<u64> = l.since(None).map(|r| r.id).collect();
+        assert_eq!(ids, vec![5, 11, 12], "rising in landing order");
+        let streamed: Vec<u64> = l.since(watermark).map(|r| r.id).collect();
+        assert_eq!(streamed, vec![12], "the watcher past 11 is sent it");
+        assert_eq!(l.carry_floor(), 0, "nothing is open any more");
+
+        // A sender that predates this (its ledger out of order) is put back
+        // in order by the receiver, not left a record short.
+        let carried = TurnLedger::carried(vec![rec(5), rec(11), rec(10), rec(11)], 0);
+        let ids: Vec<u64> = carried.since(None).map(|r| r.id).collect();
+        assert_eq!(ids, vec![5, 10, 11]);
+        assert_eq!(carried.since(Some(9)).count(), 2, "turn 10 is found");
+    }
+
+    /// Round seven, finding 23: a turn still OPEN when the handoff exports
+    /// the ledger records into the exiting process. The export carries a
+    /// floor past it, and the adopted ledger's low-water is that floor even
+    /// though older records are held, so a subscriber resuming from before
+    /// it is told (`GAP … events-resync=`).
+    #[test]
+    fn an_open_turn_is_carried_as_an_id_the_ledger_does_not_vouch_for() {
+        let mut l = TurnLedger::default();
+        for id in 1..=3 {
+            l.push(rec(id));
+        }
+        l.begin(4);
+        assert_eq!(l.carry_floor(), 5);
+        let adopted = TurnLedger::carried(l.since(None).cloned().collect(), l.carry_floor());
+        assert_eq!(adopted.low_id(), Some(5), "the floor, over the held 1");
+        // An abandoned turn owes no record.
+        l.abandon(4);
+        assert_eq!(l.carry_floor(), 0);
+    }
+
+    /// A floor stays live while it lies inside the ledger's window, and goes
+    /// stale — neither reported nor carried on — once every record under it
+    /// is evicted (round seven, finding 58's review: it rode every `history`
+    /// reply and every later export for the life of the session).
+    #[test]
+    fn a_floor_goes_stale_once_the_records_under_it_are_evicted() {
+        let empty = TurnLedger::carried(Vec::new(), 10);
+        assert_eq!(empty.live_floor(), Some(10), "an empty ledger's floor");
+        assert_eq!(empty.carry_floor(), 10);
+        let mut l = TurnLedger::carried((1..=3).map(rec).collect(), 10);
+        assert_eq!(l.live_floor(), Some(10), "above the oldest held record");
+        let at = TurnLedger::carried((10..=12).map(rec).collect(), 10);
+        assert_eq!(at.live_floor(), None, "at the oldest held record");
+        assert_eq!(at.low_id(), Some(10), "the low-water still says it");
+        for id in 10..10 + LEDGER_CAP as u64 {
+            l.push(rec(id));
+        }
+        assert_eq!(l.low_id(), Some(10));
+        assert_eq!(l.live_floor(), None, "every record under 10 is evicted");
+        assert_eq!(l.carry_floor(), 0, "a stale floor is not carried on");
+        // An open turn still raises the carry over a stale floor.
+        l.begin(10 + LEDGER_CAP as u64);
+        assert_eq!(l.carry_floor(), 11 + LEDGER_CAP as u64);
     }
 
     #[test]

@@ -47,7 +47,7 @@ use super::Model;
 /// the relaunch count (a SPACE guard: the brake's policy is
 /// [`keeper_relaunch_brake_model`]'s).
 ///
-/// `Buggy = 1` is six defects: an EOF on a live window's link read as its
+/// `Buggy = 1` is six design defects: an EOF on a live window's link read as its
 /// death (`LinkDrops`, `BuggyOfferOnEof`); the holder scan skipped at the offer
 /// (so an update's committed successor's masters are offered —
 /// `BuggyIgnorePending`); the keeper closing its copy when it offers
@@ -58,6 +58,11 @@ use super::Model;
 /// custody copy the other still depends on (`OutgoingReleasesA`,
 /// `BuggyReleaseEndsEveryClaim`: P2's open finding, reproduced here and fixed
 /// in `KeeperCore::release`). Each invariant is falsified by its own schedule.
+/// Two more replay round seven's finding 65, whose Tier-1 bind is the
+/// conformance's negative control (no invariant here states liveness): an
+/// offer left with the relaunched window's dropped link instead of returned
+/// to Orphaned (`RelaunchedLinkDrops`), and a BYE on the reconnected link that
+/// leaves the dropped one's end reading as a crash (`RelaunchedWindowQuits`).
 ///
 /// The outgoing window after Commit: `o_draining` — its stream is not read to
 /// its end yet, so it still claims every master it registered (`o_claims_a`).
@@ -112,6 +117,12 @@ pub fn pty_keeper_custody_model() -> Model {
             // every master the keeper held at Commit (`o_claims_*`).
             var o_draining = 0;
             var o_claims_a = 0;
+            // A dropped link of the relaunched window had offers it never
+            // registered returned to Orphaned (`RelaunchedLinkDrops`), and the
+            // window reconnected: its later BYE arrives on a link other than
+            // the one those offers were made to. The mutant returns nothing,
+            // so it never sets this.
+            var r_relinked = 0;
 
             // A claim: the window's first REGISTER, a committed successor's, the
             // relaunched window's after adopting, or anyone's after a keeper
@@ -326,14 +337,64 @@ pub fn pty_keeper_custody_model() -> Model {
                 orphan_b = 0;
                 k_holds_b = if Buggy == 1 { 0 } else { 1 };
             }
+            // The relaunched window reads what it was offered and REGISTERs it,
+            // which claims the record whether it is still Offered or went back
+            // to Orphaned when the link it was offered on dropped
+            // (`RelaunchedLinkDrops`): REGISTER proves possession.
             action AdoptA when (r_live == 1 && r_holds_a == 1 && r_reads_a == 0) {
                 r_reads_a = 1;
+                orphan_a = 0;
             }
             action AdoptB when (r_live == 1 && r_holds_b == 1 && r_reads_b == 0) {
                 r_reads_b = 1;
+                orphan_b = 0;
+            }
+            // The relaunched window's link drops before it REGISTERed what it
+            // was offered (its boot HELLO timed out, or the keeper's send of the
+            // OFFER failed), and reconnects while the window lives. An OFFER is
+            // made to a CONNECTION: every master offered on the dropped link is
+            // an orphan again, the window still holding the descriptor it
+            // received — so the holder scan keeps a second offer away, and its
+            // reconnected link may still REGISTER it (`AdoptA`). The mutant is
+            // the keeper before round seven's finding 65: the offer stays with
+            // the dead link. (After its HELLO's answer: the real keeper makes
+            // every offer in that one answer, so no orphan is still unoffered.)
+            action RelaunchedLinkDrops when (
+                k_live == 1 && r_live == 1 &&
+                (orphan_a == 0 || r_holds_a == 1) && (orphan_b == 0 || r_holds_b == 1) &&
+                ((r_holds_a == 1 && r_reads_a == 0 && k_holds_a == 1 && orphan_a == 0) ||
+                 (r_holds_b == 1 && r_reads_b == 0 && k_holds_b == 1 && orphan_b == 0))
+            ) {
+                orphan_a = if Buggy == 0 && r_holds_a == 1 && r_reads_a == 0 { k_holds_a } else { orphan_a };
+                orphan_b = if Buggy == 0 && r_holds_b == 1 && r_reads_b == 0 { k_holds_b } else { orphan_b };
+                r_relinked = if Buggy == 0 { 1 } else { r_relinked };
+            }
+            // The person quits the relaunched window: BYE on its (current)
+            // link, then its end. The keeper closes the copies it read and
+            // returns an offer it never registered to Orphaned, and relaunches
+            // nothing — a BYE is the PROCESS's, so a link that dropped earlier
+            // (`r_relinked`), judged at the same exit, quit too. The mutant
+            // reads the BYE on its own link only: the dead link's returned
+            // offers read as a crash. Stated only once a link dropped (the
+            // finding needs it there; a relaunched window quitting on its one
+            // link is `KeeperHonoursBye`'s judgement, and the extra schedules
+            // would take the `Buggy = 1` space past the interpreter's bound).
+            action RelaunchedWindowQuits when (r_live == 1 && r_relinked == 1) {
+                r_live = 0;
+                r_holds_a = 0;
+                r_reads_a = 0;
+                r_holds_b = 0;
+                r_reads_b = 0;
+                k_holds_a = if r_reads_a == 1 { 0 } else { k_holds_a };
+                k_holds_b = if r_reads_b == 1 { 0 } else { k_holds_b };
+                orphan_a = if r_holds_a == 1 && r_reads_a == 0 { k_holds_a } else { orphan_a };
+                orphan_b = if r_holds_b == 1 && r_reads_b == 0 { k_holds_b } else { orphan_b };
+                bye = if Buggy == 1 && r_relinked == 1 { 0 } else { 1 };
+                r_relinked = 0;
             }
             action RelaunchedWindowCrashes when (r_live == 1) {
                 r_live = 0;
+                r_relinked = 0;
                 r_holds_a = 0;
                 r_reads_a = 0;
                 r_holds_b = 0;
@@ -354,6 +415,7 @@ pub fn pty_keeper_custody_model() -> Model {
                 orphan_b = 0;
                 o_draining = 0;
                 o_claims_a = 0;
+                r_relinked = 0;
                 lost_a = if k_holds_a == 1 && w_holds_a + s_holds_a + r_holds_a == 0 && closed_a == 0 { 1 } else { lost_a };
                 lost_b = if k_holds_b == 1 && w_holds_b + s_holds_b + r_holds_b == 0 && closed_b == 0 { 1 } else { lost_b };
             }

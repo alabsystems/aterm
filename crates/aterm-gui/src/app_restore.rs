@@ -6614,6 +6614,8 @@ mod tests {
             claim_grace: false,
             outgoing_build: None,
             keeper: None,
+            fabric: Default::default(),
+            timeline_id: 0,
         }
     }
 

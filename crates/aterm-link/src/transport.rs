@@ -438,9 +438,12 @@ mod tests {
             ),
             "{err:?}"
         );
+        // Not an instant refusal (the lower bound), and not a hang: a hang never
+        // returns at all, so the upper bound is a minute's hang detector rather
+        // than 5 s a descheduled test thread could outlast.
         assert!(
             waited >= std::time::Duration::from_millis(250)
-                && waited < std::time::Duration::from_secs(5),
+                && waited < std::time::Duration::from_secs(60),
             "the deadline, not a hang and not an instant refusal: {waited:?}"
         );
         drop(peer);

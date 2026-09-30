@@ -1859,21 +1859,27 @@ mod tests {
     /// parser/terminal path.
     #[test]
     fn sync_open_dirty_tracks_the_current_episode_only() {
+        // ONE clock reading for every batch: an episode opened here must stay
+        // open across the steps however long the scheduler parks this thread
+        // between them — the 1 s mode-2026 timeout is not this test's subject,
+        // and on the live clock a stall of over a second between two `process`
+        // calls expires the episode, which reads as a dirty bit that never set.
+        let clock = super::ClockReading::now();
         let mut term = Terminal::new(24, 80);
         assert!(!term.sync_open_dirty());
 
-        term.process(b"\x1b[?2026h");
+        term.process_at(b"\x1b[?2026h", clock);
         assert!(term.modes().synchronized_output());
         assert!(
             !term.sync_open_dirty(),
             "the opening delimiter itself starts a clean episode"
         );
 
-        term.process(b"old-frame");
+        term.process_at(b"old-frame", clock);
         assert!(term.sync_open_dirty(), "output dirties the open episode");
         let before_close = term.sync_end_seq();
 
-        term.process(b"\x1b[?2026l\x1b[?2026h");
+        term.process_at(b"\x1b[?2026l\x1b[?2026h", clock);
         assert!(term.modes().synchronized_output());
         assert_eq!(term.sync_end_seq(), before_close + 1);
         assert!(
@@ -1881,18 +1887,18 @@ mod tests {
             "close+reopen with no following action leaves the new episode clean"
         );
 
-        term.process(b"next-frame-prefix");
+        term.process_at(b"next-frame-prefix", clock);
         assert!(
             term.sync_open_dirty(),
             "a prefix after the reopen forbids presenting the prior close from the current grid"
         );
-        term.process(b"\x1b[?2026h");
+        term.process_at(b"\x1b[?2026h", clock);
         assert!(
             term.sync_open_dirty(),
             "a redundant DECSET must not launder a dirty episode"
         );
 
-        term.process(b"\x1b[?2026l");
+        term.process_at(b"\x1b[?2026l", clock);
         assert!(!term.modes().synchronized_output());
         assert!(!term.sync_open_dirty(), "an ordinary close clears dirty");
     }
@@ -1902,6 +1908,9 @@ mod tests {
     /// commit edge rather than branching for every byte.
     #[test]
     fn sync_open_dirty_covers_parser_action_families() {
+        // One clock reading for every batch, as above: each episode opened in
+        // one batch must still be open when the next batch's action lands.
+        let clock = super::ClockReading::now();
         let mut term = Terminal::new(24, 80);
         let actions: &[(&str, &[u8])] = &[
             ("bulk print", b"text"),
@@ -1916,11 +1925,71 @@ mod tests {
         ];
 
         for &(name, action) in actions {
-            term.process(b"\x1b[?2026l\x1b[?2026h");
+            term.process_at(b"\x1b[?2026l\x1b[?2026h", clock);
             assert!(term.modes().synchronized_output(), "{name}: episode open");
             assert!(!term.sync_open_dirty(), "{name}: episode starts clean");
-            term.process(action);
+            term.process_at(action, clock);
             assert!(term.sync_open_dirty(), "{name}: action must mark dirty");
+        }
+    }
+
+    /// THE PROGRAM'S UNFINISHED FRAME OUTLIVES THE TERMINAL'S TIMEOUT
+    /// (2026-09-28, the owner's tab-2 trail gap, review round 1). The
+    /// timeout force-clear ends the MODE so a crashed app cannot freeze the
+    /// screen; it does not finish the program's frame, whose partial writes
+    /// and hidden write cursor are still on the grid. `sync_frame_unfinished`
+    /// keeps the program's account: open and written-into, until the
+    /// program's own `?2026l`, DECSTR or RIS. NEGATIVE CONTROL: the mode-level
+    /// signals the first fix read (`synchronized_output`, `sync_open_dirty`)
+    /// both read `false` at the same instant, which is the regression.
+    #[test]
+    fn sync_frame_unfinished_is_the_programs_account_and_survives_the_timeout() {
+        let mut term = Terminal::new(24, 80);
+        assert!(!term.sync_frame_unfinished());
+
+        term.process(b"\x1b[?2026h");
+        assert!(
+            !term.sync_frame_unfinished(),
+            "the opening delimiter alone writes nothing"
+        );
+        term.process(b"\x1b[?25l\x1b[3;1Hpartial");
+        assert!(term.sync_frame_unfinished(), "written into: unfinished");
+
+        term.backdate_sync_start(Duration::from_secs(120));
+        term.process(b"more");
+        assert!(
+            !term.modes().synchronized_output() && !term.sync_open_dirty(),
+            "control: the timeout force-cleared the mode-level signals"
+        );
+        assert!(
+            term.sync_frame_unfinished(),
+            "the program has not finished its frame"
+        );
+        term.process(b"\x1b[?2026h");
+        assert!(
+            term.sync_frame_unfinished(),
+            "a redundant open after the timeout does not launder the frame"
+        );
+
+        term.process(b"\x1b[?25h\x1b[?2026l");
+        assert!(!term.sync_frame_unfinished(), "the program's close ends it");
+
+        // Close+reopen with nothing written: the grid is the finished frame.
+        term.process(b"\x1b[?2026hframe\x1b[?2026l\x1b[?2026h");
+        assert!(!term.sync_frame_unfinished());
+        term.process(b"x");
+        assert!(term.sync_frame_unfinished());
+
+        for (name, reset) in [("DECSTR", &b"\x1b[!p"[..]), ("RIS", b"\x1bc")] {
+            term.process(b"\x1b[?2026hdirty");
+            term.backdate_sync_start(Duration::from_secs(120));
+            term.process(b"y");
+            assert!(
+                term.sync_frame_unfinished(),
+                "{name}: timed out, unfinished"
+            );
+            term.process(reset);
+            assert!(!term.sync_frame_unfinished(), "{name} ends the frame");
         }
     }
 

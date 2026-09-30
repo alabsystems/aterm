@@ -71,6 +71,10 @@ pub(crate) const HANDOFF_ENV_KEYS: &[&str] = &[
     "ATERM_HANDOFF_GRANT_CAPS",
     #[cfg(target_os = "macos")]
     "ATERM_HANDOFF_PROOF_TERM",
+    // The advisory warm hint (P2): captured like the rest so no helper or
+    // shell ever sees it, and read only as a guess (`handoff_warm_hint`).
+    #[cfg(target_os = "macos")]
+    "ATERM_HANDOFF_WARM_HINT",
     #[cfg(target_os = "macos")]
     "ATERM_HANDOFF_LAUNCHER_NOFILE",
 ];
@@ -230,20 +234,48 @@ pub(crate) fn through_process_env<T>(
     out
 }
 
-/// The machine's actions with no P1 code, each waived by name. Bound here are
-/// `Capture` (`HandoffEnv::capture`), `Dial`/`ClaimFail`
+/// The machine's actions with no unit-drivable code, each waived by name. Bound
+/// elsewhere are `Capture` (`HandoffEnv::capture`), `Dial`/`ClaimFail`
 /// (`handoff_rendezvous::claim_incoming`), `ClaimOk` (`ClaimedIntake::install`),
-/// `TakeOwned` (`seamless::take_incoming_from`) and `Adopt`
-/// (`seamless::take_commit_fd_from`), driven by
+/// `TakeOwned` (`seamless::take_incoming_from`), `Adopt`
+/// (`seamless::take_commit_fd_from`) and, from P2, `SpawnWarm`
+/// (`crate::warm_order`) and `Reshape` (`crate::warm_miss_px`), all driven by
 /// `seamless::handoff_env_conformance`.
 #[cfg(test)]
 mod waivers {
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
-        action = "SpawnWarm",
-        reason = "P2 moves the warm prologue ahead of the dial; in P1 the conformance realizes it \
-                  as a real thread spawned after the capture, and no shipping thread precedes the \
-                  claim yet."
+        action = "RelativeSocket",
+        reason = "The environment: the launch's own `--control-sock` flag. `warm_order`'s Tier-1 \
+                  drives the real decision over every shape, relative included."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "WarmDone",
+        reason = "The return of `warm_prologue`'s main-thread section (lib.rs): it builds a GPU \
+                  device and cannot run in a unit test (AGENTS.md rule 5); the conformance \
+                  realizes it as a stand-in that returns without joining its thread, and asserts \
+                  that thread is still running at the real dial."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "StaleHint",
+        reason = "The environment: the outgoing process's window changed between its launch-time \
+                  hint and its capture. `warm_miss_px`'s Tier-1 drives the real hint parser over \
+                  stale and hostile hints."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "PrepareSocketDir",
+        reason = "ControlSocketIdentity::prepare_incoming_directory's chdir, driven by \
+                  control_socket_identity's own suites; P2's part is keeping threads away from it, \
+                  bound through `warm_order`."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "SpawnLate",
+        reason = "`warm_prologue` on the late order, after the intake (lib.rs `main_entry`): a GPU \
+                  device, as WarmDone; the order decision itself is bound through `warm_order`."
     )]
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
@@ -298,7 +330,27 @@ mod waivers {
     #[aterm_spec::spec_unmodeled(
         machine = "native_update_successor_warm_before_claim",
         action = "FoldHint",
-        reason = "The Buggy=1 mutant: the launch hint folded into the digests; P1 has no hint."
+        reason = "The Buggy=1 mutant: the launch hint folded into the digests; no shipping code, \
+                  and the conformance replays it and sees it prove something else."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "WarmBeforeDialOnRelativeSocket",
+        reason = "The Buggy=1 mutant: the prologue before the dial on the relative-socket shape; \
+                  no shipping code (`warm_order` refuses it), replayed and caught by the \
+                  conformance."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "PresentAtHintedSize",
+        reason = "The Buggy=1 mutant: a carried present at a stale hint's size; no shipping code \
+                  (`finalize_backend` re-selects first)."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "native_update_successor_warm_before_claim",
+        action = "JoinWorkerBeforeDial",
+        reason = "The Buggy=1 liveness mutant: a prologue that joins its backend worker before \
+                  the dial; no shipping code (the worker is joined only at the first attach)."
     )]
     #[expect(
         dead_code,
@@ -373,6 +425,7 @@ mod tests {
         readers.extend([
             crate::handoff_rendezvous::ENV_GRANT_CAPS,
             crate::handoff_rendezvous::ENV_PROOF_TERM,
+            crate::handoff_warm_hint::ENV_WARM_HINT,
             crate::handoff_rendezvous::ENV_LAUNCHER_NOFILE,
         ]);
         let mut captured = HANDOFF_ENV_KEYS.to_vec();

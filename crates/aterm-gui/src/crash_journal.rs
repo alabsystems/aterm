@@ -636,8 +636,11 @@ pub(crate) struct BootClaim {
     pub(crate) set_aside: Vec<(JournalId, &'static str)>,
 }
 
-/// The journal directory: beside `session.toml`. `None` when no data dir
-/// resolves.
+/// The journal directory: beside `session.toml`, so it follows a development
+/// build's `ATERM_STATE_HOME` as the manifest does (ruling 406: an instance with its
+/// own state root never claims another's journals). `None` when no data dir
+/// resolves, or when that seam is relative or empty (then nothing is claimed
+/// and the journal is off: ruling 408).
 pub(crate) fn journal_dir() -> Option<PathBuf> {
     crate::restore::manifest_path().and_then(|path| path.parent().map(Path::to_path_buf))
 }

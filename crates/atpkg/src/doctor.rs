@@ -2145,12 +2145,13 @@ pub fn run_with(
                 // in one parenthetical, why it matters and what a rename leaves behind
                 // (audit, 2026-09-25: the row used to open with the incident and the
                 // git-exclude mechanism ahead of the action).
-                "{p}: warn — {} of {} cargo target dir(s) under {} are indexed by Spotlight \
-                 ({}); {reach}{now}; `aterm pkg noindex` lists them, `aterm pkg noindex verify \
-                 <dir>` measures one (`mds` grinding build output was one of the two \
-                 amplifiers behind the 2026-09-01 WindowServer watchdog kill; a git checkout \
-                 keeps a `target` symlink and its .cargo/config.toml untouched, the new name \
-                 excluded via .git/info/exclude — [machine] spotlight_noindex, default on)",
+                "{p}: warn — {at_least}{} of {} cargo target dir(s) under {} are indexed by \
+                 Spotlight ({}); {reach}{now}; `aterm pkg noindex` lists them, `aterm pkg \
+                 noindex verify <dir>` measures one (`mds` grinding build output was one of \
+                 the two amplifiers behind the 2026-09-01 WindowServer watchdog kill; a git \
+                 checkout keeps a `target` symlink and its .cargo/config.toml untouched, the \
+                 new name excluded via .git/info/exclude — [machine] spotlight_noindex, \
+                 default on)",
                 exposed.len(),
                 found.targets.len(),
                 home.display(),
@@ -2160,6 +2161,10 @@ pub fn run_with(
                 // finished explaining that it skips every one of these — and offering it
                 // anyway is a guaranteed no-op that leaves the warning standing, which
                 // reads as a tool that does not work.
+                // A scan its budget stopped counted only what it reached, and the default
+                // report keeps this row's first clause, never the note below that says so:
+                // two runs read "1 of 20" and "2 of 23" on 2026-09-29.
+                at_least = if found.complete { "" } else { "at least " },
                 now = if in_repo.is_empty() {
                     String::new()
                 } else {

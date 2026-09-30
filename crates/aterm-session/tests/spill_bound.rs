@@ -128,7 +128,7 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
     // A generous absolute timeout distinguishes "never wedged" (a broken test setup)
     // from either real outcome.
     const STABLE_TARGET: u32 = 8; // ~160ms of no growth above the running peak
-    let reproduce_deadline = Instant::now() + Duration::from_secs(10);
+    let reproduce_deadline = Instant::now() + Duration::from_secs(60);
     let mut peak: i64 = 0;
     let mut stable: u32 = 0;
     loop {
@@ -155,7 +155,7 @@ fn nonparking_spill_is_bounded_against_a_wedged_pty() {
         peak = peak.max(delta);
         assert!(
             Instant::now() < reproduce_deadline,
-            "spill only reached {peak}B in 10s — the foreground never wedged, so the non-parking \
+            "spill only reached {peak}B in 60s — the foreground never wedged, so the non-parking \
              spill path was not exercised and the ceiling check above passed vacuously; fix the \
              test setup"
         );

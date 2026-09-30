@@ -273,8 +273,8 @@ impl Outcome {
     }
 }
 
-/// Ordinal, NOT a probability. This is the contract a later interpretation tier
-/// escalates against (RFC §3).
+/// Ordinal, NOT a probability. A reader of `status` treats `heuristic`/`unknown`
+/// (or `conflict`) as unsettled before acting on the phase (RFC §3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Confidence {
     #[default]

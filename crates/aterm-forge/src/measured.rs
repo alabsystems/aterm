@@ -67,8 +67,8 @@
 //! It is two rows now, one per artifact aterm actually ships to a browser:
 //! [`WASM_CPU`] (`crates/aterm-wasm`) at 27 / 255,826 and [`WASM_GPU`]
 //! (`crates/aterm-gpu-web`) at 64 / 984,913. Those are the two crates the only
-//! two lanes that build wasm at all — `xtask gate web` and
-//! `tools/wasm-bench/run.sh` — name explicitly.
+//! two lanes that compile wasm at all — `xtask gate cells-foreign`'s two wasm
+//! cells and `tools/wasm-bench/run.sh` — name explicitly.
 //!
 //! THIS IS A RESTATED DENOMINATOR, NOT A RETIREMENT. Nothing left the graph on
 //! 2026-08-30; the old number measured a target that does not exist. No wasm

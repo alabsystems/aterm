@@ -16,7 +16,7 @@
 //! 7/7 rounds) would be handed back in silence.
 //!
 //! Only the frame's own bench could see it, and the bench is not in the merge
-//! contract — `xtask gate perf` is a TIMING gate that needs release builds of
+//! contract — `xtask perf` is a TIMING gate that needs release builds of
 //! several harnesses and has not run green in a month. A COUNT has none of those
 //! problems: it is exact, machine-independent, cannot flake under load, and
 //! rides `cargo test` — hence `tools/verify.sh`, the merge contract — at

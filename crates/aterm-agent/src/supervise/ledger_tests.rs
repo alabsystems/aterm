@@ -792,6 +792,38 @@ fn a_reply_the_archive_lost_says_so() {
     );
 }
 
+/// Round seven, finding 58: a worker whose ledger an aterm update could not
+/// carry answers `history` with ` unheld_below=` on its header (on stderr,
+/// as `aterm ctl` prints it). The ledger then says the turns were lost to
+/// the update, not that nobody drove the session.
+#[test]
+fn a_ledger_an_update_could_not_carry_is_not_blamed_on_the_person() {
+    let lost = CtlReply {
+        code: 0,
+        stdout: String::new(),
+        stderr: "aterm-ctl: OK 0 unheld_below=48 (history: no results)\n".to_string(),
+    };
+    assert_eq!(history_floor(&lost), Some(48));
+    let mut host = Host::default()
+        .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
+        .on("history", lost);
+    let l = read(&mut host, &opts(None), &mut anchors);
+    let src = l.sources.iter().find(|s| s.name == "history").expect("row");
+    assert!(!src.ok);
+    assert!(
+        src.detail.contains("could not carry") && src.detail.contains("48"),
+        "{}",
+        src.detail
+    );
+    assert!(!src.detail.contains("typed by hand"), "{}", src.detail);
+    // A raw reply (the header on its first line) says the same.
+    assert_eq!(
+        history_floor(&ok("OK 2 unheld_below=7\nturn 9 x\n")),
+        Some(7)
+    );
+    assert_eq!(history_floor(&history()), None);
+}
+
 /// `--since` drops what came before it, from every source.
 #[test]
 fn since_drops_what_came_before_it() {

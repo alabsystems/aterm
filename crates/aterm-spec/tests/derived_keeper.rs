@@ -58,6 +58,8 @@ fn pty_keeper_custody_proves_and_catches() {
         "OfferA",
         "OfferB",
         "AdoptA",
+        "RelaunchedLinkDrops",
+        "RelaunchedWindowQuits",
         "RelaunchedWindowCrashes",
         "KeeperCrashes",
         "KeeperRestarts",
@@ -171,6 +173,61 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     assert!(m.fire("SuccessorFailStops", &mut mid2));
     assert_eq!((mid2["orphan_a"], mid2["lost_a"]), (1, 0), "{mid2:?}");
     assert!(m.action_enabled("Relaunch", &mid2));
+}
+
+/// Round seven's finding 65: an OFFER is made to a connection. The relaunched
+/// window's link drops before it registered its offers: they are orphans
+/// again while it still holds them (no second offer), its reconnected link
+/// registers them, and its later quit — BYE on the new link — relaunches
+/// nothing. At `Buggy = 1` the offer stays with the dead link, and the quit
+/// reads as a crash.
+#[test]
+fn pty_keeper_custody_an_offer_returns_when_its_link_drops() {
+    let m = pty_keeper_custody_model();
+    let offered = [
+        "RegisterA",
+        "WindowCrashes",
+        "Relaunch",
+        "OfferA",
+        "RelaunchedLinkDrops",
+    ];
+    let s = walk(&m, &offered);
+    assert_eq!(
+        (
+            s["orphan_a"],
+            s["k_holds_a"],
+            s["r_holds_a"],
+            s["r_relinked"]
+        ),
+        (1, 1, 1, 1),
+        "{s:?}"
+    );
+    assert!(
+        !m.action_enabled("OfferA", &s),
+        "the window still holds it: no second offer"
+    );
+    let mut adopted = s.clone();
+    assert!(m.fire("AdoptA", &mut adopted));
+    assert_eq!((adopted["orphan_a"], adopted["r_reads_a"]), (0, 1));
+    for from in [s, adopted] {
+        let mut quit = from.clone();
+        assert!(m.fire("RelaunchedWindowQuits", &mut quit));
+        assert_eq!(quit["bye"], 1, "{quit:?}");
+        assert!(!m.action_enabled("Relaunch", &quit), "{quit:?}");
+    }
+    // Each mutant's step, from the committed machine's own state.
+    let buggy = interp::with_buggy(&m, 1);
+    let mut stuck = walk(&m, &offered[..4]);
+    assert!(buggy.fire("RelaunchedLinkDrops", &mut stuck));
+    assert_eq!(
+        (stuck["orphan_a"], stuck["r_relinked"]),
+        (0, 0),
+        "the mutant leaves the offer with the dead link: {stuck:?}"
+    );
+    let mut quit = walk(&m, &offered);
+    assert!(buggy.fire("RelaunchedWindowQuits", &mut quit));
+    assert_eq!(quit["bye"], 0, "the mutant reads the quit as a crash");
+    assert!(buggy.action_enabled("Relaunch", &quit), "{quit:?}");
 }
 
 /// P2's open finding, the P3 fix: a RELEASE from ONE of two claimants — the

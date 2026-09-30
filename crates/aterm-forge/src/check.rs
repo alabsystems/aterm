@@ -3,10 +3,11 @@
 
 //! `targo --unverified forge check` — THE GATE VERB, wired as `xtask gate forge`.
 //!
-//! [`check_report`] is the symbol the roster calls. It answers one question —
-//! *is aterm's third-party surface still the surface this repository says it
-//! is?* — with NO COMPILATION and NO NETWORK: one `cargo tree` resolution per
-//! cell plus a few hundred file reads, because it sits inside `gate all`.
+//! [`check_report`] is the symbol `xtask gate forge` calls. It answers one
+//! question — *is aterm's third-party surface still the surface this repository
+//! says it is?* — with NO COMPILATION and NO NETWORK: one `cargo tree` resolution
+//! per cell plus a few hundred file reads, because the merge contract's
+//! `third-party surface` row runs it on every run.
 //!
 //! # Why patch liveness is the obligation that justifies this gate
 //!

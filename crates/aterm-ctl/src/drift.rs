@@ -901,7 +901,7 @@ mod tests {
                 selector: Some("@s-x"),
             },
             &strings(&["rows=3"]),
-            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(60)),
             &local,
             &|_| {},
         )
@@ -915,7 +915,7 @@ mod tests {
                 selector: Some("@s-x"),
             },
             &[],
-            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(60)),
             &LocalVerbs::NONE,
             &|_| {},
         )
@@ -1020,7 +1020,7 @@ mod tests {
             TargetOrigin::Pinned,
             route,
             &strings(&["rows=3"]),
-            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(60)),
             &local,
             &|_| {},
         )
@@ -1069,7 +1069,7 @@ mod tests {
             TargetOrigin::Pinned,
             route,
             &[],
-            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(60)),
             &local,
             &|_| {},
         )
@@ -1117,7 +1117,7 @@ mod tests {
             TargetOrigin::Pinned,
             route,
             &[],
-            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(60)),
             &local,
             &|_| {},
         )

@@ -5520,7 +5520,7 @@ const SALT_EXHAUST: u32 = 0x0000_0E7A;
 /// per-cell deals, so a v2 star and a v1 spark hashed from the same cell do
 /// not correlate.
 #[inline]
-fn mix32(mut h: u32) -> u32 {
+pub(super) fn mix32(mut h: u32) -> u32 {
     h ^= h >> 16;
     h = h.wrapping_mul(0x7FEB_352D);
     h ^= h >> 15;
@@ -5542,7 +5542,7 @@ fn cell_hash(row: u16, col: u16, salt: u32) -> u32 {
 
 /// A seed's uniform draw on `[0, 1)`.
 #[inline]
-fn hash01(h: u32) -> f32 {
+pub(super) fn hash01(h: u32) -> f32 {
     (h >> 8) as f32 / 16_777_216.0
 }
 

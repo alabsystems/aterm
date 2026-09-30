@@ -120,6 +120,8 @@ fn record() -> SessionRecord {
         claim_known: false,
         attention_owners: Vec::new(),
         viewport_from_bottom: None,
+        fabric: Default::default(),
+        timeline_id: 0,
     }
 }
 
@@ -222,6 +224,8 @@ impl Real {
                     next_turn_id: None,
                     outgoing_build: None,
                     held: Vec::new(),
+                    roster_seq: None,
+                    fabric_attached: Vec::new(),
                 };
                 stamp_manifest(
                     &mut manifest,

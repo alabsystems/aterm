@@ -125,6 +125,8 @@ impl TerminalHandler<'_> {
         self.modes.synchronized_output = false;
         self.transient.sync_start = None;
         self.transient.sync_open_dirty = false;
+        self.transient.app_sync_open = false;
+        self.transient.app_sync_dirty = false;
 
         // Reset grapheme cluster mode (mode 2027)
         self.modes.grapheme_cluster_mode = false;

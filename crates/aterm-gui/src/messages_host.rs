@@ -32,10 +32,16 @@
 //! The LOG is not frozen with the holds. The parent's record is its own to
 //! the end: it keeps appending through the park and
 //! [`App::flush_messages_log`]es right before it execs the successor (`exec`
-//! runs no destructor, so nothing the writer still held would land). Only
+//! runs no destructor, so nothing the writer still held would land) — or,
+//! on the lanes that never exec, right before Commit `_exit`s it
+//! ([`App::flush_messages_log_within`], bounded). Only
 //! the SUCCESSOR's drain waits ([`App::message_persist_frozen`]), until
 //! Commit — a refused successor then wrote nothing about rows that were the
-//! parent's to record. The first cut froze the parent's drain too and
+//! parent's to record. A successor that booted BEFORE its parent's last write
+//! (the late park) reads the file again after Commit and merges what the
+//! parent wrote since ([`App::reload_messages_log_at_commit`]); rows cross only
+//! in the carry, and a `notice` while parked is told to retry
+//! ([`App::take_notice`]). The first cut froze the parent's drain too and
 //! shipped the pending lines in the carry; the carry was captured BEFORE
 //! the freeze (the manifest needs it), so it shipped nothing, and every
 //! line posted under the freeze died with the parent (review, 2026-09-22).
@@ -759,6 +765,30 @@ impl App {
         }
     }
 
+    /// THE SEAMLESS PARENT'S LAST WRITE before Commit `_exit`s it (round-seven
+    /// update audit, finding 53): [`Self::flush_messages_log`], bounded by
+    /// `within` — the person sits through it frozen (L5). `_exit` runs no
+    /// destructor, so a line the writer thread still held — a record a script
+    /// was answered `OK recorded` for during the park — died with the process,
+    /// and the successor, which reads the file again after Commit
+    /// ([`Self::reload_messages_log_at_commit`]), never saw it. `false`, said in
+    /// `aterm.log`, when the writer was still behind at the deadline.
+    pub(crate) fn flush_messages_log_within(&mut self, within: std::time::Duration) -> bool {
+        self.persist_messages();
+        let Some(writer) = &self.messages_log else {
+            return true;
+        };
+        let landed = writer.flush_within(within);
+        if !landed {
+            aterm_log::warn!(
+                "messages log: the writer was still behind {} ms into Commit; its last lines \
+                 may not reach messages.log",
+                within.as_millis()
+            );
+        }
+        landed
+    }
+
     /// THE GRACEFUL EXIT'S LAST WORD (design ruling 267): every row still
     /// open — live work, a held warning, one still queued — is recorded as
     /// cut off by aterm quitting (`Retired::Quit`, with the percent a
@@ -1256,7 +1286,19 @@ impl App {
     /// then the page's own press ([`Self::perform_message_act`]) runs in the
     /// front window (window 0 on a headless instance), exactly what a click on
     /// the capsule does. Returns the whole reply line without its `\n`.
+    ///
+    /// NOT WHILE PARKED (round-seven update audit, finding 32): the band
+    /// crossed to the successor in the carry the park captured, and this
+    /// process `_exit`s at Commit — a row posted now would never be shown (and
+    /// a script is told its id for the row it asked for), and a dismiss, a
+    /// re-word or a press would be undone there. The script is told to retry
+    /// ([`wire::switching_reply`]), and its retry reaches the new version (or
+    /// this one, if the switch stood down).
     pub(crate) fn take_notice(&mut self, req: wire::NoticeRequest) -> String {
+        if self.update_handoff_parked() {
+            aterm_log::info!("notice: refused while parked for an update");
+            return wire::switching_reply();
+        }
         if let wire::NoticeRequest::Act { id, press } = &req {
             let enc = &crate::control::pct_encode;
             let target = wire::press_target(
@@ -2012,7 +2054,8 @@ impl App {
     /// had [`Self::note_update_health`] or [`Self::note_update_health_as`]
     /// return `true`): off the UI thread — `notify::deliver` blocks on a
     /// notifier subprocess — and in the banner's words
-    /// ([`update_words::health_notification_body`]). No focus suppression:
+    /// ([`update_words::health_notification_title`],
+    /// [`update_words::health_notification_body`]). No focus suppression:
     /// updater health belongs to no tab. Every producer of the announcement
     /// (`Wake::UpdateHealth`, the checker watchdog, the automatic lane's
     /// convergence) comes through here, so ONE check holds `desktop_alerts`:
@@ -2028,14 +2071,14 @@ impl App {
         #[cfg(test)]
         {
             let banner = update_words::health_notification_body(body);
-            UPDATE_HEALTH_BANNERS
-                .with(|posted| posted.borrow_mut().push((title.to_string(), banner)));
+            let title = update_words::health_notification_title(title);
+            UPDATE_HEALTH_BANNERS.with(|posted| posted.borrow_mut().push((title, banner)));
             true
         }
         #[cfg(all(target_os = "macos", not(test)))]
         {
             let banner = update_words::health_notification_body(body);
-            let title = title.to_string();
+            let title = update_words::health_notification_title(title);
             std::thread::spawn(move || {
                 crate::notify::deliver(Some(&title), &banner, false);
             });
@@ -2133,7 +2176,7 @@ impl App {
     /// screen): the landing record names them and says why they came over
     /// blank. A record only, like the landing itself — one fact, one entry.
     pub(crate) fn post_update_landed(&mut self, version: &str, build: u64, repainted: usize) {
-        self.heal_update_health(HealthProof::Installed);
+        self.heal_update_health(HealthProof::Landed);
         let took = self
             .update_verified
             .take()
@@ -2150,6 +2193,20 @@ impl App {
         self.update_flow = None;
         if let Some(id) = live {
             self.resolve_message(id, Outcome::Ok);
+        }
+        // THE APPLY LANE'S LAST OUTCOME is answered by the landing (round-seven
+        // update audit, finding 30): "Update waits for you" or "Couldn't
+        // install aterm vX · Install now" — raised before the attempt that
+        // landed, carried across it on glass — would otherwise take a fresh
+        // hold beside "Updated to aterm vX", its press opening Settings for a
+        // build already running. Withdrawn, not resolved: no ✓ stands on a
+        // failure's words, and the record keeps what it said.
+        if let Some(id) = self
+            .messages
+            .live_by_key(update_words::KEY_OUTCOME)
+            .map(|l| l.id)
+        {
+            self.messages.withdraw(id, Instant::now());
         }
         self.record_message(update_words::landed(version, build, repainted, took));
         if repainted > 0 {
@@ -2233,8 +2290,9 @@ impl App {
 
     /// THE SWITCH TO A NEW VERSION BEGINS, on record ([`update_words::switch_started`])
     /// — and flushed to `messages.log` NOW: a line queued for after the process
-    /// execs, or inside the park's few milliseconds, is a line never written, and
-    /// the seamless parent `_exit`s at Commit without a flush. `build` is the
+    /// execs, or inside the park's few milliseconds, is a line never written (the
+    /// seamless parent flushes again, bounded, right before Commit `_exit`s it:
+    /// [`Self::flush_messages_log_within`]). `build` is the
     /// RUNNING build; a same-image switch (`same_image`: a reload of this very
     /// build) installs nothing, whatever is staged. A switch that then stops says
     /// so ([`Self::record_update_switch_stopped`]).
@@ -2480,6 +2538,42 @@ impl App {
         carry
     }
 
+    /// THE FILE READ AGAIN AT COMMIT (round-seven update audit, findings 41
+    /// and 18): a late-park successor loaded `messages.log` at its boot, and
+    /// its parent kept recording — posting, retiring, pressing, taking
+    /// `appnotice` records — until Commit, flushing its last line first
+    /// ([`Self::flush_messages_log_within`]). Merged here
+    /// ([`aterm_messages::MessageCenter::merge_reloaded_log`]), so the history
+    /// holds the parent's records since this process booted and each row it
+    /// closed with its real ending, and every id minted from now on is above
+    /// the file's.
+    ///
+    /// SYNCHRONOUS, AND FIRST: the Commit wake calls this before anything else
+    /// it does can mint ("Updated to aterm vX" among them) and before a
+    /// `messages since=` reader can reach this process's ring, so no record of
+    /// the parent's appears later BELOW an id a reader has already been handed
+    /// (the review of the first cut, which read it on a worker). The read is
+    /// the launch load's own, bounded by size ([`crate::messages_store::load_tail`]:
+    /// at most [`crate::messages_store::TAIL_BYTES`] of the log and
+    /// [`crate::messages_store::WIRE_TAIL_BYTES`] of the wire's, regular files,
+    /// no-follow) — a message log is tens of kilobytes. Nothing with no writer:
+    /// no file was opened, so there is none to read.
+    #[cfg(unix)]
+    pub(crate) fn reload_messages_log_at_commit(&mut self) {
+        let Some(path) = self
+            .messages_log
+            .as_ref()
+            .and_then(crate::messages_store::Writer::folder)
+            .map(|dir| dir.join(crate::messages_store::FILE_NAME))
+        else {
+            return;
+        };
+        let disk = crate::messages_store::load_tail(&path, crate::messages_store::TAIL_BYTES).log;
+        // The Commit wake republishes (its own `sync_messages`) once the
+        // carried windows are shown; nothing is painted from here.
+        self.messages.merge_reloaded_log(&disk);
+    }
+
     /// THE SUCCESSOR'S FIRST FRAMES, before Commit: re-seed the rows the
     /// outgoing process carried into the center (each keeps its id, words and
     /// hold under the handoff's staleness cap until Commit), queue the lines
@@ -2487,8 +2581,10 @@ impl App {
     /// successor with a carried progress row — say its own phase in that row
     /// ("almost done — what you type is kept", [`update_words::finishing`])
     /// rather than the parent's "installing…", and adopt it as this process's
-    /// flow row. A carried health warning leaves with
-    /// it: the build that landed is the proof. No sync here: the row count
+    /// flow row. A carried warning that installing fails leaves with it: the
+    /// build that landed is the proof ([`HealthProof::Landed`]). A carried
+    /// check, download or stall warning stays up, and this process does not
+    /// say it again: a landing proves nothing about those halves. No sync here: the row count
     /// is the carried one until Commit, and nothing paints yet. `finishing`
     /// is the running build's version.
     pub(crate) fn seed_carried_messages(
@@ -2509,25 +2605,45 @@ impl App {
             }
         }
         let carried: Carry = carry.message_carry();
-        if carried.is_empty() {
+        // THE PARENT'S NEXT ID crosses even when no row does (round-seven
+        // update audit, finding 18): the automatic lane parks with nothing on
+        // the band, and the parent recorded past what this process loaded at
+        // its boot — `seed_carried` raises the ids first, rows or none.
+        if carried.is_empty() && carried.next_id == 0 {
             return;
         }
         self.messages.seed_carried(&carried, wall_stamp_now(), now);
-        // A session's wait (a paste on its way, a rewrap) is the process's
-        // that watches it (rulings 231–234): this one watches nothing it did
-        // not start, so a carried one leaves now rather than going stale.
-        let waits: Vec<MessageId> = self
+        // THE PARENT RECORDS ON UNTIL COMMIT (round-seven update audit,
+        // finding 18, as reviewed): the carry's next id was taken at the park,
+        // and the parent keeps minting from it — a harness note, a toolchain
+        // or `appnotice` record, an update record — while this process mints
+        // too (before Commit, and "Updated to aterm vX" at it). The parent
+        // keeps the band below `next_id + PARKED_PARENT_ID_RESERVE`; this
+        // process mints above it, so no id is handed out twice and none of
+        // this process's records sits below one a `messages since=` reader
+        // took from the parent. The records themselves cross in the file
+        // ([`Self::reload_messages_log_at_commit`]).
+        if self.incoming_handoff_pending {
+            self.messages.raise_next_id(
+                carried
+                    .next_id
+                    .max(1)
+                    .saturating_add(PARKED_PARENT_ID_RESERVE),
+            );
+        }
+        // A row about the OLD PROCESS leaves with it: a session's wait (a
+        // paste on its way, a rewrap) is the process's that watches it
+        // (rulings 231–234), and this one watches nothing it did not start;
+        // the dead accessibility publisher's "restart aterm to retry" is
+        // answered by this very process, whose publisher is its own (finding
+        // 42) — carried, either would stand for good.
+        let old_process: Vec<MessageId> = self
             .messages
             .live_rows()
-            .filter(|l| {
-                l.msg
-                    .key
-                    .as_deref()
-                    .is_some_and(aterm_messages::waits::is_wait_key)
-            })
+            .filter(|l| l.msg.key.as_deref().is_some_and(describes_the_old_process))
             .map(|l| l.id)
             .collect();
-        for id in waits {
+        for id in old_process {
             self.messages.withdraw(id, now);
         }
         let Some(version) = finishing else {
@@ -2548,7 +2664,15 @@ impl App {
             // The landing at Commit is the proof, and it is this process's to
             // record against what the parent's warning said
             // (`post_update_landed` → `heal_update_health`): the parent `_exit`s
-            // at Commit and never learns its warning healed.
+            // at Commit and never learns its warning healed. It answers ONLY an
+            // install warning (round-seven update audit, finding 54): a build
+            // staged before the check or download streak began lands without
+            // proving that checking or downloading works, and the updater's
+            // ledger keeps those streaks (`record_apply_success` clears the
+            // apply streak only). Such a warning stays up, LATCHED here as it
+            // was in the parent, so this process's first failing check does not
+            // raise it a second time; its own proof (a real check or download,
+            // or the ledger's healing) takes it down and records the healing.
             let carried: Vec<_> = self
                 .messages
                 .live_rows()
@@ -2565,13 +2689,38 @@ impl App {
                 })
                 .collect();
             for (health, said) in carried {
-                self.messages.resolve(health, Outcome::Warn, now);
+                if HealthProof::Landed.answers(said.0) {
+                    self.messages.resolve(health, Outcome::Warn, now);
+                } else if !self.update_health_latched.contains(&said.0) {
+                    self.update_health_latched.push(said.0);
+                }
                 // One entry per carried row: two kinds the parent raised are
-                // two records at the landing (ruling 318), never only the first.
+                // two records at their healings (ruling 318), never only the
+                // first.
                 self.remember_update_health_said(said);
             }
         }
     }
+}
+
+/// The ids a seamless successor leaves its parent, which records on from the
+/// carry's next id until Commit (round-seven update audit, finding 18;
+/// [`App::seed_carried_messages`]). The park lasts seconds (the automatic
+/// lane's hold is capped at two minutes), `notice` is refused while parked
+/// ([`App::take_notice`]), and what the parent still records then is the odd
+/// harness note or toolchain and update record — a thousand is far past it.
+/// Beyond it the two processes' ids could meet again; the merge at Commit
+/// still keeps both records, the parent's under a fresh id
+/// ([`aterm_messages::MessageCenter::merge_reloaded_log`]).
+pub(crate) const PARKED_PARENT_ID_RESERVE: u64 = 1000;
+
+/// Whether a carried row keyed `key` states a fact about the PROCESS that
+/// posted it — one a successor, a new process, has made untrue by existing
+/// ([`App::seed_carried_messages`]): a session wait's row (the waits belong to
+/// the process that watches them), or the dead accessibility publisher's (a
+/// process gets one publisher; the successor starts its own).
+fn describes_the_old_process(key: &str) -> bool {
+    aterm_messages::waits::is_wait_key(key) || key == crate::message_reporters::KEY_A11Y_PUBLISHER
 }
 
 /// The band's motion on the host side — the idle law, hidden windows, the
@@ -2586,6 +2735,8 @@ mod band_motion_tests;
 /// warnings it answers — the warning's kind names the broken half
 /// ([`update_words::HealthKind`]), and the updater's own ledger reads the
 /// same way: a whole-pipeline success clears every streak but an install streak.
+/// [`Self::Landed`] stands apart from that ladder (its order is never read):
+/// it answers the install warning only ([`Self::answers`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum HealthProof {
     /// The check reached a release and its bytes are arriving (`Downloading`,
@@ -2595,8 +2746,15 @@ pub(crate) enum HealthProof {
     /// downloading works too.
     Downloaded,
     /// The ledger healed (`HEALTH_RECOVERED_TITLE`, sent only once no class is
-    /// failing), or a build landed: installing works too.
+    /// failing): installing works too.
     Installed,
+    /// A build LANDED (`post_update_landed`): installing works — and nothing
+    /// more is proved (round-seven update audit, finding 54). Off the ladder:
+    /// the build may have been staged before a check or download streak
+    /// began, and the updater's ledger keeps those streaks through the
+    /// install (`record_apply_success` clears the apply streak only), so a
+    /// landing answers an install warning alone.
+    Landed,
 }
 
 impl HealthProof {
@@ -2634,6 +2792,9 @@ impl HealthProof {
 
     /// Whether this proof answers a warning of `kind` ([`Self::needed_for`]).
     fn answers(self, kind: update_words::HealthKind) -> bool {
+        if self == Self::Landed {
+            return kind == update_words::HealthKind::Install;
+        }
         Self::needed_for(kind).is_some_and(|needed| self >= needed)
     }
 }
@@ -5594,7 +5755,8 @@ mod tests {
     /// in glass order and re-seed under the handoff's staleness cap with
     /// their ids, words and holds; the update row moves on to "finishing"
     /// only when this process is the handed-off successor AND the carry had
-    /// one, and a carried standing health warning leaves with it; no log
+    /// one, and a carried check warning stands, latched (a landing answers
+    /// only an install warning, finding 54); no log
     /// line crosses (the parent's record is its own to the end); an older
     /// parent's `bars` map to rows and junk is dropped.
     #[test]
@@ -5682,22 +5844,24 @@ mod tests {
             "the successor adopts the flow row as its own"
         );
         assert!(
-            successor.messages.live(health).is_none(),
-            "the build that landed is the proof: the standing warning leaves"
+            successor.messages.live(health).is_some(),
+            "a landing proves nothing about checking: the check warning stands (finding 54)"
         );
-        assert_eq!(
-            successor.messages.log().get(health).unwrap().state,
-            aterm_messages::LogState::Retired(aterm_messages::Retired::Resolved(Outcome::Warn))
+        assert!(
+            successor
+                .update_health_latched
+                .contains(&update_words::HealthKind::Check),
+            "…latched, so this process's first failing check does not say it again"
         );
         assert_eq!(
             successor.messages.log().next_id().raw(),
-            carried.next_message_id,
-            "ids continue past the carry"
+            carried.next_message_id + PARKED_PARENT_ID_RESERVE,
+            "ids continue past the carry, above the band the parked parent records in"
         );
         assert_eq!(
             successor.messages.log().pending_len(),
-            1,
-            "the line the warning's resolution wrote here waits for Commit; nothing crossed"
+            0,
+            "nothing crossed as a log line"
         );
         assert!(
             !successor.sync_message_band_rows(Instant::now()),
@@ -5776,6 +5940,508 @@ mod tests {
         empty.seed_carried_messages(&window_carry(0, Default::default()), Some("0.76.0"));
         assert_eq!(empty.messages.live_rows().count(), 0);
         assert_eq!(empty.messages.log().next_id(), MessageId::FIRST);
+    }
+
+    #[cfg(unix)]
+    /// THE LANDING ANSWERS THE APPLY LANE'S LAST OUTCOME (round-seven update
+    /// audit, finding 30): "Update waits for you" (the automatic lane blocked,
+    /// then retried) and "Couldn't install aterm vX · Install now" (pressed,
+    /// and it landed) are carried on glass across the handoff that installed
+    /// the build; the successor's landing takes them down rather than
+    /// re-arming a fresh 45 s hold beside "Updated to aterm vX".
+    #[test]
+    fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
+        for outcome in [
+            update_words::failed(
+                crate::app_update_screen::UPDATE_WAITS_FOR_YOU,
+                App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+                true,
+            ),
+            update_words::needs_install(
+                "Couldn't install aterm v9.9.9",
+                update_words::INSTALL_FROM_MENU,
+                Severity::Warn,
+                7,
+            ),
+        ] {
+            let title = outcome.title.clone();
+            let mut parent = App::headless_for_test();
+            parent.note_update_outcome(outcome);
+            parent.sync_messages();
+            assert!(
+                parent
+                    .messages
+                    .live_by_key(update_words::KEY_OUTCOME)
+                    .is_some(),
+                "{title}: the outcome is up"
+            );
+            parent.begin_update_installing(7, false);
+            let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+            let mut successor = App::headless_for_test();
+            successor.seed_carried_messages(&carry, Some("9.9.9"));
+            successor.messages.after_handoff_commit(Instant::now());
+            successor.post_update_landed("9.9.9", 7, 0);
+            assert!(
+                successor
+                    .messages
+                    .live_by_key(update_words::KEY_OUTCOME)
+                    .is_none(),
+                "{title}: a landed update leaves no row saying it did not land"
+            );
+            assert!(
+                successor.messages.log().records().any(|r| r.title == title),
+                "{title}: the record keeps what it said"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    /// A LANDING ANSWERS AN INSTALL WARNING ONLY (round-seven update audit,
+    /// finding 54): build X was staged while checks worked, then checks failed
+    /// and "Couldn't check for updates" went up; the person pressed Install
+    /// now and X landed. The updater's ledger still holds the check streak
+    /// (`record_apply_success` clears the apply streak only), so the successor
+    /// must not record "aterm updates work again" against the check warning,
+    /// nor take it down — and it does not raise it a second time. A real
+    /// check (`HealthProof::Checked`) then heals it and records the healing.
+    /// The negative control: an install warning carried the same way IS
+    /// answered by the landing.
+    #[test]
+    fn a_landing_heals_only_an_install_warning() {
+        let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
+        let mut parent = App::headless_for_test();
+        assert!(parent.note_update_health_as(
+            update_words::HealthKind::Check,
+            "Couldn't check for updates",
+            body,
+        ));
+        parent.post_message(update_words::installing("9.9.9"));
+        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, Some("9.9.9"));
+        successor.messages.after_handoff_commit(Instant::now());
+        successor.post_update_landed("9.9.9", 7, 0);
+        let healed = |app: &App| {
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.title == "aterm updates work again")
+                .count()
+        };
+        assert_eq!(
+            healed(&successor),
+            0,
+            "a landing proves nothing about checking: no healing on record"
+        );
+        assert_eq!(
+            successor
+                .live_update_health(|k| k == update_words::HealthKind::Check)
+                .len(),
+            1,
+            "the check warning stands"
+        );
+        assert!(
+            !successor.note_update_health_as(
+                update_words::HealthKind::Check,
+                "Couldn't check for updates",
+                body,
+            ),
+            "the successor's first failing check does not raise it again"
+        );
+        successor.heal_update_health(HealthProof::Checked);
+        assert_eq!(healed(&successor), 1, "a real check heals it, on record");
+        assert!(
+            successor
+                .live_update_health(|k| k == update_words::HealthKind::Check)
+                .is_empty()
+        );
+
+        // The negative control: an install warning is the landing's to answer.
+        let mut parent = App::headless_for_test();
+        assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
+        parent.post_message(update_words::installing("9.9.9"));
+        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, Some("9.9.9"));
+        successor.messages.after_handoff_commit(Instant::now());
+        successor.post_update_landed("9.9.9", 7, 0);
+        assert_eq!(
+            healed(&successor),
+            1,
+            "the landing heals an install warning"
+        );
+        assert!(successor.live_update_health(|_| true).is_empty());
+    }
+
+    #[cfg(unix)]
+    /// WHAT A HEALTH WARNING SAID crosses on the automatic lane too (round-seven
+    /// update audit, finding 31 — fixed by round six's finding 54, pinned
+    /// here): no progress row is carried, the warning is either still on glass
+    /// or already folded in the parent, and the landing still puts "aterm
+    /// updates work again" on the successor's record.
+    #[test]
+    fn an_automatic_landing_records_the_healing_of_a_carried_warning() {
+        let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
+        for folded in [false, true] {
+            let mut parent = App::headless_for_test();
+            assert!(parent.note_update_health(aterm_update::health_failing_title("apply"), body));
+            if folded {
+                let past =
+                    Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(60);
+                parent.settle_messages(past);
+                assert!(
+                    parent.live_update_health(|_| true).is_empty(),
+                    "the warning folded in the parent"
+                );
+            }
+            // No installing row: the automatic lane.
+            let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+            let mut successor = App::headless_for_test();
+            successor.seed_carried_messages(&carry, Some("0.76.0"));
+            successor.post_update_landed("0.76.0", 7, 0);
+            assert!(
+                successor
+                    .messages
+                    .log()
+                    .records()
+                    .any(|r| r.title == "aterm updates work again"),
+                "folded={folded}: the healing is on the successor's record"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    /// THE LATE-PARK SUCCESSOR SEES WHAT ITS PARENT WROTE AFTER ITS BOOT
+    /// (round-seven update audit, finding 41): the successor loads the file at
+    /// its boot and its parent keeps recording until Commit. After Commit the
+    /// successor reads the file again — the parent flushed its last line
+    /// first — so a row the parent resolved after the boot is Resolved in its
+    /// history, never Stale, and a record written after the boot is there.
+    #[test]
+    fn a_late_park_successor_sees_the_parents_records_written_after_its_boot() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-messages-late-park-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join(crate::messages_store::FILE_NAME);
+        let mut parent = App::headless_for_test();
+        parent.messages_log = crate::messages_store::Writer::spawn(&path);
+        let x = parent.post_message(warn("open at the boot"));
+        parent.flush_messages_log();
+        // The successor boots: its ring is the file as it is now.
+        let mut successor = App::headless_for_test();
+        successor.messages = aterm_messages::MessageCenter::new(
+            crate::messages_store::load_tail(&path, u64::MAX).log,
+            Instant::now(),
+        );
+        assert_eq!(
+            successor.messages.log().get(x).and_then(LogRecord::retired),
+            Some(&Retired::Stale),
+            "the boot reads the parent's open row as nobody's"
+        );
+        successor.incoming_handoff_pending = true;
+        // The parent carries on: it resolves X and records R, then parks.
+        parent.resolve_message(x, Outcome::Ok);
+        let r = parent.record_message(warn("written after the boot"));
+        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        parent.pending_update_handoff = Some(parked());
+        // Commit: the parent's last write, bounded, then its `_exit`.
+        assert!(
+            parent.flush_messages_log_within(crate::app_update_handoff::MESSAGES_FLUSH_COMMIT_WAIT),
+            "the writer landed everything"
+        );
+        drop(parent);
+        successor.seed_carried_messages(&carry, Some("9.9.9"));
+        successor.incoming_handoff_pending = false;
+        successor.messages.after_handoff_commit(Instant::now());
+        successor.messages_log = crate::messages_store::Writer::spawn(&path);
+        successor.reload_messages_log_at_commit();
+        let log = successor.messages.log();
+        assert!(
+            matches!(
+                log.get(x).and_then(LogRecord::retired),
+                Some(Retired::Resolved(_))
+            ),
+            "the parent's ending, not Stale: {:?}",
+            log.get(x).map(|rec| &rec.state)
+        );
+        assert!(
+            log.records()
+                .any(|rec| rec.title == "written after the boot"),
+            "the record the parent wrote after the boot is in the history"
+        );
+        let next = successor.post_message(warn("the successor's own"));
+        assert!(next > r, "ids continue past the parent's: {next} after {r}");
+        drop(successor.messages_log.take());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    /// NO ID IS HANDED OUT TWICE ACROSS THE PARK (round-seven update audit,
+    /// finding 18, as reviewed): the carry's next id is taken at the park, and
+    /// the parked parent still records — an `appnotice`, a harness note — while
+    /// the successor records before Commit and at it ("Updated to aterm vX").
+    /// A reader that followed the parent to its last id K reads `since=K` from
+    /// the successor after Commit and sees every record the successor made;
+    /// the parent's parked records are in the successor's history, merged at
+    /// Commit before the landing; and messages.log names each id once.
+    #[test]
+    fn a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-messages-park-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join(crate::messages_store::FILE_NAME);
+        let mut parent = App::headless_for_test();
+        parent.messages_log = crate::messages_store::Writer::spawn(&path);
+        parent.record_message(warn("before the boot").hold(Hold::LogOnly));
+        parent.flush_messages_log();
+        // The successor boots on the file as it is.
+        let mut successor = App::headless_for_test();
+        successor.messages = aterm_messages::MessageCenter::new(
+            crate::messages_store::load_tail(&path, u64::MAX).log,
+            Instant::now(),
+        );
+        successor.incoming_handoff_pending = true;
+        // The park: the carry's next id is taken now…
+        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        parent.pending_update_handoff = Some(parked());
+        // …and the parked parent records on, as `appnotice` and a harness do.
+        assert_eq!(
+            parent.take_app_notice("toolchain", "aterm pkg: a note while parked"),
+            Ok(crate::AppNoticeTaken::Recorded)
+        );
+        assert!(parent.record_harness_note("a harness note while parked"));
+        let parents_last = parent.messages.log().next_id().raw() - 1;
+        assert!(
+            parents_last >= carry.next_message_id,
+            "the parent minted past the carry's next id"
+        );
+        // The successor, before Commit, records one of its own.
+        successor.seed_carried_messages(&carry, Some("9.9.9"));
+        let own = successor.record_message(warn("the successor's own").hold(Hold::LogOnly));
+        // Commit: the parent's last write, then its `_exit`.
+        assert!(
+            parent.flush_messages_log_within(crate::app_update_handoff::MESSAGES_FLUSH_COMMIT_WAIT)
+        );
+        drop(parent);
+        successor.incoming_handoff_pending = false;
+        successor.messages_log = crate::messages_store::Writer::spawn(&path);
+        successor.reload_messages_log_at_commit();
+        successor.post_update_landed("9.9.9", 7, 0);
+        let landed = successor
+            .messages
+            .log()
+            .records()
+            .find(|r| r.title.contains("9.9.9") && r.id > own)
+            .map(|r| r.id)
+            .expect("the landing's record");
+        assert!(
+            own.raw() > parents_last,
+            "{own} after the parent's {parents_last}"
+        );
+        let rows = successor.read_messages(&wire::ReadQuery {
+            since: MessageId::from_raw(parents_last),
+            ..wire::ReadQuery::default()
+        });
+        for id in [own, landed] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.starts_with(&format!("message {id} "))),
+                "a reader past the parent's last id sees {id}: {rows:?}"
+            );
+        }
+        for title in ["a note while parked", "a harness note while parked"] {
+            assert!(
+                successor
+                    .messages
+                    .log()
+                    .records()
+                    .any(|r| r.title.contains(title) && r.id.raw() <= parents_last),
+                "{title}: the parent's record is in the history under its own id"
+            );
+        }
+        successor.flush_messages_log();
+        let file = std::fs::read_to_string(&path).expect("messages.log");
+        let mut posted: Vec<u64> = file
+            .lines()
+            .filter_map(|line| match aterm_messages::LogLine::decode(line) {
+                Ok(aterm_messages::LogLine::Posted(rec)) => Some(rec.id.raw()),
+                _ => None,
+            })
+            .collect();
+        let n = posted.len();
+        posted.sort_unstable();
+        posted.dedup();
+        assert_eq!(posted.len(), n, "messages.log names each id once: {file}");
+        drop(successor.messages_log.take());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    /// THE FILE IS MERGED FIRST AT COMMIT (round-seven update audit, finding
+    /// 18, as reviewed): synchronously, before the Commit wake's first step
+    /// that can mint an id — the landing's record among them — so no record
+    /// of the parent's appears in this process's ring after, and below, an id
+    /// a `messages since=` reader was handed. The merge itself is the test
+    /// above; this pins where it runs.
+    #[test]
+    fn the_commit_wake_merges_the_parents_record_before_it_mints() {
+        let src = include_str!("lib.rs");
+        let wake = src
+            .find("Wake::ActivateCommittedHandoff { mut expected } => {")
+            .expect("the Commit wake");
+        let body = &src[wake..];
+        let reload = body
+            .find("self.reload_messages_log_at_commit();")
+            .expect("the Commit wake merges the file");
+        for mints in [
+            "self.hand_carried_restored_agents();",
+            "self.window_event(el, winit_id, deferred);",
+            "self.post_update_landed(",
+        ] {
+            let at = body.find(mints).expect(mints);
+            assert!(reload < at, "the merge runs before `{mints}`");
+        }
+        assert!(
+            !src.contains("MessagesLogReloaded"),
+            "no later, asynchronous merge"
+        );
+    }
+
+    #[cfg(unix)]
+    /// THE PARENT'S RECORD LANDS BEFORE COMMIT `_exit`S IT (round-seven update
+    /// audit, finding 53): the lanes that never exec flush, bounded, as the
+    /// ProofReady arm's last step before `commit_and_exit` — after every step
+    /// that may still record, so nothing the writer thread holds dies with
+    /// the process. The flush's own behaviour is the test above; this pins
+    /// where it runs.
+    #[test]
+    fn the_seamless_parent_flushes_its_record_right_before_commit() {
+        let src = include_str!("app_update_handoff.rs");
+        let video = src
+            .find("let video = self.video_answer_before_commit(VIDEO_EXPORT_COMMIT_WAIT);")
+            .expect("the ProofReady arm answers video first");
+        let flush = src[video..]
+            .find("self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);")
+            .map(|at| video + at)
+            .expect("the ProofReady arm flushes the message log");
+        let commit = src[video..]
+            .find("crate::seamless::commit_and_exit(commit_fd, proof)")
+            .map(|at| video + at)
+            .expect("and commits");
+        assert!(flush < commit, "the flush runs before the Commit write");
+        assert!(
+            !src[flush..commit].contains("record_message(")
+                && !src[flush..commit].contains("post_message("),
+            "nothing records between the flush and the Commit write"
+        );
+    }
+
+    #[cfg(unix)]
+    /// A NOTICE WHILE PARKED IS TOLD TO RETRY (round-seven update audit,
+    /// finding 32): the carry was captured at the park, so a post the parked
+    /// parent accepted was never shown by the successor and its id was handed
+    /// out again. Now the parent answers the transient `ERR busy` class and
+    /// mints nothing; unparked, the same post is taken.
+    #[test]
+    fn a_notice_while_parked_is_refused_for_a_retry_and_mints_nothing() {
+        let mut parent = App::headless_for_test();
+        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        parent.pending_update_handoff = Some(parked());
+        let before = parent.messages.log().next_id();
+        let req =
+            || wire::NoticeRequest::parse("post system sev=warn Deploy failed").expect("a post");
+        let reply = parent.take_notice(req());
+        assert_eq!(reply, wire::switching_reply());
+        assert!(reply.starts_with("ERR busy notice: "), "{reply}");
+        assert!(reply.ends_with("retry_ms=1000"), "{reply}");
+        assert_eq!(parent.messages.log().next_id(), before, "no id handed out");
+        assert!(
+            !parent
+                .messages
+                .live_rows()
+                .any(|l| l.msg.title == "Deploy failed")
+        );
+        // The successor's ids start where the carry said, and no script holds one.
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, Some("9.9.9"));
+        let next = successor.post_message(warn("after commit"));
+        assert!(next >= before);
+        // A stand-down unparks, and the retry is taken.
+        parent.pending_update_handoff = None;
+        let reply = parent.take_notice(req());
+        assert!(reply.starts_with("OK message="), "{reply}");
+    }
+
+    #[cfg(unix)]
+    /// A ROW ABOUT THE OLD PROCESS LEAVES WITH IT (round-seven update audit,
+    /// finding 42): "Screen reader access lost · restart aterm to retry" is
+    /// answered by the successor, a new process with its own publisher, so a
+    /// carried one never stands (Standing) over access that works.
+    #[test]
+    fn a_carried_dead_publisher_row_leaves_with_the_process_it_described() {
+        let mut parent = App::headless_for_test();
+        parent.post_message(crate::message_reporters::a11y_publisher_dead(
+            "bus gone", true,
+        ));
+        parent.post_message(warn("a config warning"));
+        let carried = parent.carried_messages();
+        assert_eq!(carried.messages.len(), 2, "both rows are carried");
+        let carry = window_carry(parent.message_band_rows, carried);
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, Some("9.9.9"));
+        successor.messages.after_handoff_commit(Instant::now());
+        assert!(
+            successor
+                .messages
+                .live_by_key(crate::message_reporters::KEY_A11Y_PUBLISHER)
+                .is_none(),
+            "the old process's publisher is not this one's"
+        );
+        assert!(
+            successor
+                .messages
+                .live_rows()
+                .any(|l| l.msg.title == "a config warning"),
+            "a row about something else still crosses"
+        );
+    }
+
+    #[cfg(unix)]
+    /// A CARRY WITH NO ROWS STILL CARRIES THE PARENT'S NEXT ID (round-seven
+    /// update audit, finding 18): the automatic lane parks with nothing on the
+    /// band, while the parent recorded past what the successor loaded at its
+    /// boot — so the successor's first record after Commit must still be
+    /// numbered above every id the parent handed out, or a `messages since=`
+    /// reader skips it.
+    #[test]
+    fn a_carry_with_no_rows_still_raises_the_successors_ids() {
+        let mut parent = App::headless_for_test();
+        for n in 0..10 {
+            parent.record_message(warn(&format!("record {n}")).hold(Hold::LogOnly));
+        }
+        let carried = parent.carried_messages();
+        assert!(carried.messages.is_empty(), "nothing is on the band");
+        assert_eq!(carried.next_message_id, 11);
+        let carry = window_carry(0, carried);
+        let mut successor = App::headless_for_test();
+        successor.incoming_handoff_pending = true;
+        successor.seed_carried_messages(&carry, Some("0.99.0"));
+        successor.incoming_handoff_pending = false;
+        let id = successor.record_message(warn("after commit").hold(Hold::LogOnly));
+        assert!(
+            id.raw() >= 11,
+            "the successor's first id is above the parent's: {id}"
+        );
+        let rows = successor.read_messages(&wire::ReadQuery {
+            since: MessageId::from_raw(10),
+            ..wire::ReadQuery::default()
+        });
+        assert!(
+            rows.iter().any(|row| row.contains("after%20commit")),
+            "a reader past the parent's last id sees it: {rows:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -7767,12 +8433,22 @@ mod tests {
         app.post_update_landed("9.9.9", 7, 0);
         assert_eq!(healed(&app).len(), 2, "NEGATIVE: each healing once");
 
-        // Install, then Download: one landing answers both, and both are on
-        // record, oldest first — not only the later, lesser warning.
+        // Install, then Download: the landing answers the install only
+        // (round-seven update audit, finding 54 — the build may have been
+        // staged before the download streak began, and the ledger keeps it);
+        // a staged build then answers the download. Both are on record, each
+        // against its own words — not only the later, lesser warning.
         let mut app = App::headless_for_test();
         assert!(app.note_update_health(install, body));
         assert!(app.note_update_health(download, body));
         app.post_update_landed("9.9.9", 7, 0);
+        assert_eq!(
+            live_kinds(&app),
+            vec![update_words::HealthKind::Download],
+            "NEGATIVE: a landing is no proof that downloading works"
+        );
+        assert_eq!(healed(&app), vec![after(install)]);
+        app.note_update_progress(&staged);
         assert!(live_kinds(&app).is_empty());
         assert_eq!(healed(&app), vec![after(install), after(download)]);
 
@@ -7800,7 +8476,9 @@ mod tests {
         assert_eq!(healed(&app)[1], after(install));
 
         // Carried across the handoff: the successor seeds one entry per carried
-        // row, so its landing records both of the parent's warnings.
+        // row, so its landing records the install warning's healing and its
+        // staged build the download's — both of the parent's warnings, each
+        // once, each by the proof that answers it (finding 54).
         let mut parent = App::headless_for_test();
         parent.post_message(update_words::installing("9.9.9"));
         assert!(parent.note_update_health(download, body));
@@ -7809,6 +8487,12 @@ mod tests {
         let mut successor = App::headless_for_test();
         successor.seed_carried_messages(&carry, Some("9.9.9"));
         successor.post_update_landed("9.9.9", 7, 0);
+        assert_eq!(
+            healed(&successor),
+            vec![after(install)],
+            "NEGATIVE: the landing is no proof that downloading works"
+        );
+        successor.note_update_progress(&staged);
         let mut said = healed(&successor);
         said.sort();
         let mut want = vec![after(download), after(install)];
@@ -7996,6 +8680,8 @@ mod tests {
             claim_grace: false,
             outgoing_build: None,
             keeper: None,
+            fabric: Default::default(),
+            timeline_id: 0,
         }];
         assert!(
             app.post_managed_current(

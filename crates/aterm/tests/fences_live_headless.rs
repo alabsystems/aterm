@@ -46,7 +46,22 @@ fn boot(tag: &str) -> Option<Instance> {
     )
 }
 
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(60);
+/// A client that has not exited by now is hung: past every [`HANG`] wait a
+/// call makes, so a wait that times out answers before it is killed.
+const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a wait for something that MUST happen may take before it is read
+/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
+const HANG: Duration = Duration::from_secs(60);
+const HANG_MS: &str = "timeout=60000";
+
+/// A connection-bound supervisor claim goes WITH its connection: the fastest
+/// of [`CLAIMS_RELEASED`] closes is read off the roster within this, a roster
+/// poll's `aterm ctl` spawn included. A loaded gate's one slow poll is one
+/// close among several; a claim that outlives its connection by a lease is
+/// late on every one (each was held to 5 s, then only to the minute's hang).
+const RELEASED_PROMPTLY: Duration = Duration::from_secs(5);
+const CLAIMS_RELEASED: usize = 4;
 
 fn client_command(inst: &Instance, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
@@ -133,7 +148,7 @@ fn status(inst: &Instance, sid: &str) -> String {
 /// Wait for the process-name resolver before asserting supervisor behavior.
 /// The fake worker's screen can be ready before its asynchronous name lookup.
 fn await_program(inst: &Instance, sid: &str, wanted: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG;
     let mut last = status(inst, sid);
     while field(&last, "program") != Some(wanted) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -200,10 +215,7 @@ while :; do sleep 1; done
 /// `await match <re>` on the session: the server's latched watcher, not a
 /// client poll. `<re>` is one wire token (`.` for a space).
 fn await_match(inst: &Instance, sid: &str, re: &str) {
-    let reply = ctl_ok(
-        inst,
-        &[&format!("@{sid}"), "await", "match", re, "timeout=10000"],
-    );
+    let reply = ctl_ok(inst, &[&format!("@{sid}"), "await", "match", re, HANG_MS]);
     assert!(
         reply.starts_with("OK") && !reply.starts_with("OK timeout"),
         "`{re}` never reached the screen: {reply}"
@@ -372,10 +384,12 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     );
     assert!(said.contains("ERR usage: if-seq= is not a fence"), "{said}");
     // The presses above were refused in the server, so nothing is in flight:
-    // one `await idle` bounds the wait for a byte that must not come.
+    // one `await idle` bounds the wait for a byte that must not come. The
+    // window is its 200 ms of quiet; the timeout is only how long the quiet
+    // may take to come (exit 124 fails `ctl_ok`), so it is a hang detector.
     ctl_ok(
         &inst,
-        &[&format!("@{sid}"), "await", "idle", "200", "timeout=2000"],
+        &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],
     );
     assert_eq!(
         std::fs::read(&keylog).expect("the key log"),
@@ -389,7 +403,7 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         &[&format!("@{sid}"), "key", &format!("if-gen={gen_b}"), "1"],
     );
     assert!(reply.starts_with("OK seq="), "{reply}");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG;
     while Instant::now() < deadline && std::fs::read(&keylog).unwrap_or_default().is_empty() {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -407,7 +421,7 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     );
     ctl_ok(
         &inst,
-        &[&format!("@{sid}"), "await", "idle", "200", "timeout=2000"],
+        &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],
     );
     assert_eq!(std::fs::read(&keylog).unwrap(), b"1");
 }
@@ -426,7 +440,7 @@ fn request(reader: &mut BufReader<std::os::unix::net::UnixStream>, line: &str) -
 
 /// Poll the session's roster row until `supervisor=` reads `want`.
 fn supervisor_until(inst: &Instance, sid: &str, want: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG;
     let mut row = String::new();
     while Instant::now() < deadline {
         let roster = ctl_ok(inst, &["sessions"]);
@@ -456,9 +470,7 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
         .trim()
         .to_string();
     let stream = std::os::unix::net::UnixStream::connect(&inst.sock).expect("connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("read timeout");
+    stream.set_read_timeout(Some(HANG)).expect("read timeout");
     let mut conn = BufReader::new(stream);
     assert_eq!(
         request(
@@ -509,13 +521,19 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     // the server sees the close by reading EOF, which a close alone delivers only
     // once every copy of this descriptor is gone — and std makes a connected
     // socket close-on-exec non-atomically on macOS, so a sibling test's spawn can
-    // carry a copy into an `aterm` that outlives the 5 s wait below (the fd-copy
+    // carry a copy into an `aterm` that outlives the wait below (the fd-copy
     // sweep of 2026-09-27). `shutdown` acts on the socket, copies and all.
+    let closed = Instant::now();
     let _ = conn.get_ref().shutdown(std::net::Shutdown::Both);
     drop(conn);
     supervisor_until(&inst, &sid, "-");
+    // How long each connection-bound claim outlived its connection, for
+    // [`RELEASED_PROMPTLY`].
+    let mut outlived = vec![closed.elapsed()];
 
-    // A `ttl=` claim from a one-shot client outlives the client.
+    // A `ttl=` claim from a one-shot client outlives the client. Its ttl
+    // outlives the wait for the roster to show it (it was 30 s, under that
+    // wait), and it is unset below, not left to lapse.
     ctl_ok(
         &inst,
         &[
@@ -524,7 +542,7 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
             "set",
             "supervisor",
             "sup-ttl",
-            "ttl=30000",
+            "ttl=120000",
         ],
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -533,11 +551,24 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     supervisor_until(&inst, &sid, "-");
     // …and a one-shot claim WITHOUT ttl= is bound to a connection that has
     // already closed by the time anyone can read it.
-    ctl_ok(
-        &inst,
-        &[&format!("@{sid}"), "meta", "set", "supervisor", "sup-once"],
+    for _ in 1..CLAIMS_RELEASED {
+        ctl_ok(
+            &inst,
+            &[&format!("@{sid}"), "meta", "set", "supervisor", "sup-once"],
+        );
+        let exited = Instant::now();
+        supervisor_until(&inst, &sid, "-");
+        outlived.push(exited.elapsed());
+    }
+    // Released WITH the connection, not by a lease of its own: each roster
+    // wait above is only a hang detector, and a claim that held on for a
+    // lease of seconds past its connection is late every time.
+    let fastest = outlived.iter().min().copied().unwrap_or_default();
+    assert!(
+        fastest < RELEASED_PROMPTLY,
+        "the fastest of {CLAIMS_RELEASED} connection-bound claims outlived its connection by \
+         {fastest:?}: {outlived:?}"
     );
-    supervisor_until(&inst, &sid, "-");
 
     // A `ttl=` claim nobody renews LAPSES, and the lapse is recorded — the
     // `meta-change field=supervisor value=-` a dead supervisor never writes
@@ -568,7 +599,7 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
             "ttl=400",
         ],
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG;
     let mut since = changes().split_off(before);
     while !since.iter().any(|v| v == "value=-") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
@@ -735,7 +766,7 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         ctl.requests
     );
     // The server took the fenced press: the `1` reached the worker.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG;
     let mut got = Vec::new();
     while Instant::now() < deadline {
         got = std::fs::read(&keylog).unwrap_or_default();

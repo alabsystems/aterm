@@ -12,9 +12,9 @@
 //! bounded-wait harness and the same session path.
 //!
 //! The unix tests drive a POSIX `/bin/sh` through the binary; the `#[cfg(windows)]`
-//! twin drives the platform's default shell through the ConPTY seam. No box in
-//! this fleet runs Windows natively, so `gate cells-foreign` type-checks the twin
-//! on every `gate all` and it RUNS only on a Windows host.
+//! twin drives the platform's default shell through the ConPTY seam. No gate host
+//! runs Windows (`FLEET_HOST_TRIPLES`), so the merge contract's `gate
+//! cells-foreign` row type-checks the twin and it RUNS only on a Windows host.
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};

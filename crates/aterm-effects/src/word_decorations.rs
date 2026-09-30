@@ -44,14 +44,14 @@ use aterm_scene::{mix_rgb, smoothstep};
 
 use crate::animal_baker::{AnimalBakeKey, AnimalBaker};
 use crate::animal_glyphs_gen::{ANIMAL_GLYPHS, AnimalGlyphId, animal_glyph_from_key};
-use crate::cat_baker::{BakeKeyV4, CatBaker, CatColorKey, EyesFrame, PATCH_STRIP};
+use crate::cat_baker::{BakeKeyV4, CatBaker, CatColorKey, CatTile, EyesFrame, PATCH_STRIP};
 use crate::kitty_registry::{
     KittyLook, KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BOW, TRAIT_CROWN,
 };
 // The shared color math lives in the leaf `color_math` module (so `nova.rs`
 // and the §13 demo compile without this host state machine); imported — not
 // re-exported — here for the ink/guard call sites below.
-use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS};
+use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphDef};
 use crate::color_math::{hsv2rgb, hue_nudge, relative_luminance};
 use crate::genome::{
     self, CatAge, Genome, NovaFeatures, NovaMagic, VoteScratch, accessory_variant_v4, cat_age_v4,
@@ -1787,6 +1787,28 @@ struct NotePaintCache {
     rgba: Vec<u8>,
 }
 
+impl NotePaintCache {
+    /// Land `host`'s `w × h` tile in the shared atlas from the resident paint
+    /// in `slot`, repainting it (`paint`) only when the host id changed.
+    /// `None` means the shared bake budget is spent: it lands next frame.
+    fn tile(
+        slot: &mut Option<Self>,
+        baker: &mut CatBaker,
+        host: u64,
+        (w, h): (u16, u16),
+        paint: impl FnOnce() -> aterm_scene::Tile,
+    ) -> Option<CatTile> {
+        let cache = match slot {
+            Some(cache) if cache.host == host => cache,
+            _ => slot.insert(Self {
+                host,
+                rgba: paint().pixels().to_vec(),
+            }),
+        };
+        baker.host_tile(host, w, h, &cache.rgba)
+    }
+}
+
 /// Immutable host-authored source for the kitty cursor companion.
 ///
 /// `Disabled` is distinct from `BuiltIn` so an invalid configured custom asset
@@ -3240,6 +3262,26 @@ impl WordDecorations {
         self.robi_last_body = None;
     }
 
+    /// The per-FRAME baker prologue every atlas-baking entry runs first: LRU
+    /// clock + bake budget, and a cell-metric change wholesale-clears +
+    /// version-bumps (§5.5). Guarded by `cat_baker_ready`, so a window
+    /// compositing N panes runs it once and every entry shares one two-bake
+    /// budget (one window, one atlas, one cell size); unbracketed hosts clear
+    /// the flag at tick start, which is the historical one-prologue-per-tick
+    /// behaviour verbatim. `animals` also begins the animal roster's cache —
+    /// the dog and robi entries, which never bake one, leave it alone.
+    fn begin_baker_frame(&mut self, geom: EffectGeom, animals: bool) {
+        if self.cat_baker_ready {
+            return;
+        }
+        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
+        self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+        if animals {
+            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
+        }
+        self.cat_baker_ready = true;
+    }
+
     /// Word-owned half of [`Self::reset_transient_state`]. Keep cursor
     /// companion placement and the shared atlas/bakers out of this function:
     /// Sparkle Words is a content effect, not their lifecycle owner.
@@ -3803,13 +3845,7 @@ impl WordDecorations {
             }),
             "cursor-kitty placement must match the frame it is emitted with"
         );
-        self.cat_baker.set_free_tiles(true);
-        if !self.cat_baker_ready {
-            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
-            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.cat_baker_ready = true;
-        }
+        self.begin_baker_frame(geom, true);
 
         let (w, h) = (footprint.w, footprint.h);
         // Resolve the atlas tile: a USER sprite (resampled to fit, host-baked)
@@ -4052,19 +4088,13 @@ impl WordDecorations {
                 };
                 let (nw, nh) = crate::kitty_sing::note_nat_size(note.kind, geom.cell_h);
                 let host = crate::kitty_sing::note_host_id(note.kind, nw, nh);
-                if self.note_cache[kind_idx].as_ref().map(|c| c.host) != Some(host) {
-                    self.note_cache[kind_idx] = Some(NotePaintCache {
-                        host,
-                        rgba: crate::kitty_sing::bake_note(nw, nh, note.kind)
-                            .pixels()
-                            .to_vec(),
-                    });
-                }
-                let paint = &self.note_cache[kind_idx]
-                    .as_ref()
-                    .expect("filled above")
-                    .rgba;
-                let Some(tile) = self.cat_baker.host_tile(host, nw, nh, paint) else {
+                let Some(tile) = NotePaintCache::tile(
+                    &mut self.note_cache[kind_idx],
+                    &mut self.cat_baker,
+                    host,
+                    (nw, nh),
+                    || crate::kitty_sing::bake_note(nw, nh, note.kind),
+                ) else {
                     continue; // budget spent; this note lands next frame
                 };
                 // The wind-down crossfade rides the alpha: note envelope ×
@@ -4192,13 +4222,7 @@ impl WordDecorations {
         if !self.claim_companion_body() {
             return None;
         }
-        self.cat_baker.set_free_tiles(true);
-        if !self.cat_baker_ready {
-            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
-            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.cat_baker_ready = true;
-        }
+        self.begin_baker_frame(geom, true);
         self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.pet_baker.begin_frame(geom.cell_w, geom.cell_h);
 
@@ -4758,12 +4782,7 @@ impl WordDecorations {
         if alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
-        self.cat_baker.set_free_tiles(true);
-        if !self.cat_baker_ready {
-            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
-            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.cat_baker_ready = true;
-        }
+        self.begin_baker_frame(geom, false);
         self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.dog_baker.begin_frame(geom.cell_w, geom.cell_h);
 
@@ -4881,12 +4900,7 @@ impl WordDecorations {
         if frame.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
-        self.cat_baker.set_free_tiles(true);
-        if !self.cat_baker_ready {
-            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
-            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.cat_baker_ready = true;
-        }
+        self.begin_baker_frame(geom, false);
         // Like the pet's and the dog's: the guard is idempotent, so asking
         // here as well costs a compare and keeps this entry from depending on
         // some OTHER companion having run the prologue first.
@@ -7009,22 +7023,7 @@ impl WordDecorations {
             return 0;
         }
         self.frame = self.frame.wrapping_add(1);
-        // Free-overlay Phase 4: cats always ride the free channel, so the
-        // baker always bakes exact-size tiles (steady-state a no-op compare;
-        // set BEFORE the frame prologue).
-        self.cat_baker.set_free_tiles(true);
-        // Per-FRAME baker prologue: LRU clock + bake budget; a cell-metric
-        // change wholesale-clears + version-bumps here (§5.5). Guarded like
-        // `kitty_cursor`'s, so a window compositing N panes runs it once and the
-        // panes share one two-bake budget (one window, one atlas, one cell
-        // size). Unbracketed hosts clear the flag at tick start, which is the
-        // historical one-prologue-per-tick behaviour verbatim.
-        if !self.cat_baker_ready {
-            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
-            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.cat_baker_ready = true;
-        }
+        self.begin_baker_frame(geom, true);
         // v3 §1.1/§1.2 episode prepass: arm freezing (Cat vs Paw stored at
         // the first emission decision) and the per-axis one-shot flags
         // (peek/burst/sweep started/done) — the done-mark write condition.
@@ -7125,6 +7124,15 @@ impl WordDecorations {
         let mut animals = 0usize;
 
         for (oi, occ) in self.occ.iter().enumerate() {
+            // The occurrence's episode, looked up ONCE (`persist` is only read
+            // in this loop). Its readers are the graphic and burst axes (and
+            // the nova's ink fx), so an ink-only word never pays for it.
+            // Direct-built occurrences (tests/demos) have none.
+            let ep = if occ.spec.graphic.is_some() || occ.spec.burst.is_some() {
+                self.persist.get(&occ.ident)
+            } else {
+                None
+            };
             // §6 ink modifiers: the word's own nova (palette anchors, Dip,
             // sweep freeze, ember tint) + the §6.5 blast-coupling pulse.
             let fx = ink_fx(
@@ -7136,7 +7144,7 @@ impl WordDecorations {
                 &self.novas,
                 &self.supers,
                 &self.coupling,
-                &self.persist,
+                ep,
             );
             // Ink is emitted independently of the deco cap: its own budget was
             // enforced at rescan (≤ MAX_INK_CELLS captured lead cells).
@@ -7184,7 +7192,6 @@ impl WordDecorations {
                     // morph a dwelling cat into a paw or vice versa).
                     // Direct-built occurrences (tests/demos, no episode)
                     // resolve the arm per frame, keyed off `appeared`.
-                    let ep = self.persist.get(&occ.ident);
                     let peek = PeekView {
                         start: ep.map_or(Some(occ.appeared), |e| e.phase_start),
                         peek_done: ep.is_some_and(|e| e.peek_done),
@@ -7243,7 +7250,7 @@ impl WordDecorations {
                         let Some(species) = occ.species else {
                             break 'graphic; // tag without shipped art: ink only
                         };
-                        let eligible = animal_eligible(occ, cfg, geom);
+                        let eligible = peek_eligible(occ, geom);
                         // Both operands are already computed (`eligible` above,
                         // `animals` is a running count), so there is nothing to
                         // defer and the eager form says so.
@@ -7326,7 +7333,7 @@ impl WordDecorations {
                         frame,
                         sel,
                         &self.novas,
-                        &self.persist,
+                        ep,
                         out,
                         nova,
                         &mut fp,
@@ -7344,7 +7351,7 @@ impl WordDecorations {
                         frame,
                         sel,
                         &self.supers,
-                        &self.persist,
+                        ep,
                         out,
                         nova,
                         &mut fp,
@@ -7360,7 +7367,7 @@ impl WordDecorations {
                         continue;
                     }
                     // v3 §6 `chance_pct`: a rolled-off glow never fires.
-                    if self.persist.get(&occ.ident).is_some_and(|e| !e.burst_roll) {
+                    if ep.is_some_and(|e| !e.burst_roll) {
                         continue;
                     }
                     let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
@@ -7395,7 +7402,7 @@ impl WordDecorations {
                     // v3 §6 `chance_pct`: a rolled-off burst never fires
                     // (episode-backed; direct-built test/demo occurrences
                     // have no episode and always fire).
-                    if self.persist.get(&occ.ident).is_some_and(|e| !e.burst_roll) {
+                    if ep.is_some_and(|e| !e.burst_roll) {
                         continue;
                     }
                     let age_s = now.saturating_duration_since(occ.appeared).as_secs_f32();
@@ -7452,8 +7459,7 @@ impl WordDecorations {
                             // reduced-from-birth episode never advances the
                             // flag, so its static spark persists —
                             // accessibility semantics preserved.
-                            (!self.persist.get(&occ.ident).is_some_and(|e| e.burst_done))
-                                .then_some(1.0f32)
+                            (!ep.is_some_and(|e| e.burst_done)).then_some(1.0f32)
                         } else if t < cfg.anim_ms + RESIDUAL_FADE_MS {
                             let until = occ.appeared
                                 + Duration::from_millis(cfg.anim_ms + RESIDUAL_FADE_MS);
@@ -7507,14 +7513,13 @@ impl WordDecorations {
                 };
                 let (nw, nh) = crate::nuke::nuke_nat_size(part, geom.cell_w, geom.cell_h);
                 let host = crate::nuke::nuke_host_id(part, nw, nh);
-                if self.nuke_cache[slot].as_ref().map(|c| c.host) != Some(host) {
-                    self.nuke_cache[slot] = Some(NotePaintCache {
-                        host,
-                        rgba: crate::nuke::bake_nuke(nw, nh, part).pixels().to_vec(),
-                    });
-                }
-                let paint = &self.nuke_cache[slot].as_ref().expect("filled above").rgba;
-                let Some(tile) = self.cat_baker.host_tile(host, nw, nh, paint) else {
+                let Some(tile) = NotePaintCache::tile(
+                    &mut self.nuke_cache[slot],
+                    &mut self.cat_baker,
+                    host,
+                    (nw, nh),
+                    || crate::nuke::bake_nuke(nw, nh, part),
+                ) else {
                     continue; // bake budget spent; this part lands next frame
                 };
                 let dest_w = ((f32::from(nw) * d.sx).round() as i32).max(1);
@@ -7689,7 +7694,7 @@ impl WordDecorations {
                     // draw at decision time".
                     let is_animal = g.collection == Collection::Animals;
                     let drawable = if is_animal {
-                        animal_eligible(occ, cfg, geom)
+                        peek_eligible(occ, geom)
                     } else {
                         cat_eligible(occ, cfg, geom)
                     };
@@ -8142,41 +8147,19 @@ impl WordDecorations {
                     continue;
                 }
                 // The flash limiter charges a supernova as a FULL ignition.
-                let Some(start) = grant_pane_ignition(
+                if !grant_burst(
                     &mut self.ignitions,
                     scope,
                     self.pane_px,
-                    occ.ident,
+                    occ,
+                    ep,
                     now,
                     (cx, cy),
-                    2.0 * r_max,
-                ) else {
+                    r_max,
+                    &mut self.burst_hint,
+                    &mut self.curse_cues,
+                ) {
                     continue;
-                };
-                ep.nova_start = Some(start);
-                // Fold the granted window into the monotone burst-mutex hint
-                // (see [`Self::burst_hint`]) through the SAME predicate the
-                // busy scan reads, so the bound and the scan cannot drift.
-                if let Some(end) = burst_mutex_end(ep) {
-                    self.burst_hint = Some(self.burst_hint.map_or(end, |h: Instant| h.max(end)));
-                }
-                // §1.1: burst_done at IGNITION GRANT — a supernova scrolled
-                // off mid-blast never replays when the word comes back.
-                ep.burst_started = true;
-                ep.burst_done = true;
-                // Curse-BONK detonation cue, AT the grant edge: it inherits
-                // the flash limiter's rolling rate cap and `burst_done`'s
-                // once-per-episode guarantee verbatim. Profanity only — a
-                // custom Toy-Pack supernova on another class is a light show,
-                // not a curse. The host drops this kind unless the separate
-                // `bonk_detonation` knob opted in (screen content detonates
-                // regardless of who typed it).
-                if occ.class == Class::Profanity && self.curse_cues.len() < MAX_CURSE_CUES {
-                    self.curse_cues.push(CurseCue {
-                        kind: CurseCueKind::Detonated,
-                        row: occ.row,
-                        col: occ.start_col,
-                    });
                 }
             }
             let Some(start) = ep.nova_start else { continue };
@@ -8287,43 +8270,19 @@ impl WordDecorations {
                     }
                     continue;
                 }
-                let Some(start) = grant_pane_ignition(
+                if !grant_burst(
                     &mut self.ignitions,
                     scope,
                     self.pane_px,
-                    occ.ident,
+                    occ,
+                    ep,
                     now,
                     (cx, cy),
-                    2.0 * r_max,
-                ) else {
+                    r_max,
+                    &mut self.burst_hint,
+                    &mut self.curse_cues,
+                ) {
                     continue;
-                };
-                ep.nova_start = Some(start);
-                // The classic half of the burst-mutex hint fold (see
-                // [`Self::burst_hint`]): the mutex is TWO-WAY, so a live
-                // CLASSIC window must raise the bound exactly like a supernova.
-                if let Some(end) = burst_mutex_end(ep) {
-                    self.burst_hint = Some(self.burst_hint.map_or(end, |h: Instant| h.max(end)));
-                }
-                // v3 §1.1: `burst_done` is set at IGNITION GRANT — detonation
-                // start is the point of no return; a nova scrolled off
-                // mid-blast never replays when the word comes back (done-mark
-                // write path).
-                ep.burst_started = true;
-                ep.burst_done = true;
-                // Curse-BONK detonation cue, AT the grant edge — the classic
-                // `style = "nova"` twin of the supernova cue in `super_prepass`.
-                // Inherits the flash limiter's rolling rate cap and `burst_done`'s
-                // once-per-episode guarantee verbatim (it hangs off the same
-                // grant edge). Profanity only — a custom Toy-Pack nova on another
-                // class is a light show, not a curse; the host drops this kind
-                // unless the separate `bonk_detonation` knob opted in.
-                if occ.class == Class::Profanity && self.curse_cues.len() < MAX_CURSE_CUES {
-                    self.curse_cues.push(CurseCue {
-                        kind: CurseCueKind::Detonated,
-                        row: occ.row,
-                        col: occ.start_col,
-                    });
                 }
             }
             let Some(start) = ep.nova_start else { continue };
@@ -8409,6 +8368,63 @@ fn burst_center(occ: &Occurrence, geom: EffectGeom) -> (i32, i32) {
     let cx = (i32::from(occ.start_col) + i32::from(occ.end_col) + 1) * advance / 2;
     let cy = i32::from(occ.row) * ch + ch / 2;
     (cx, cy)
+}
+
+/// The IGNITION GRANT both burst prepasses share — the point of no return.
+/// Requests the §6.4 flash slot (overlap distance `2·r_max`) and, when one is
+/// granted:
+///
+/// - latches `nova_start` and folds the granted window into the monotone
+///   burst-mutex hint (see [`WordDecorations::burst_hint`]) through the SAME
+///   predicate the busy scan reads, so the bound and the scan cannot drift —
+///   the mutex is TWO-WAY, so a classic window raises it exactly like a
+///   supernova;
+/// - sets `burst_done` (v3 §1.1): a burst scrolled off mid-blast never
+///   replays when the word comes back (the done-mark write path);
+/// - queues the Curse-BONK detonation cue AT the grant edge, inheriting the
+///   flash limiter's rolling rate cap and `burst_done`'s once-per-episode
+///   guarantee verbatim. Profanity only — a custom Toy-Pack burst on another
+///   class is a light show, not a curse; the host drops this kind unless the
+///   separate `bonk_detonation` knob opted in (screen content detonates
+///   regardless of who typed it).
+///
+/// Returns `false` when the limiter refused a slot (nothing is written). A
+/// free function so the caller keeps its disjoint `&mut persist` borrow.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the prepass's disjoint field borrows, split around its live `&mut persist` entry"
+)]
+fn grant_burst(
+    igns: &mut Vec<IgnitionReservation>,
+    scope: Option<u64>,
+    pane_px: (i32, i32),
+    occ: &Occurrence,
+    ep: &mut Episode,
+    now: Instant,
+    center: (i32, i32),
+    r_max: f32,
+    burst_hint: &mut Option<Instant>,
+    curse_cues: &mut Vec<CurseCue>,
+) -> bool {
+    let Some(start) =
+        grant_pane_ignition(igns, scope, pane_px, occ.ident, now, center, 2.0 * r_max)
+    else {
+        return false;
+    };
+    ep.nova_start = Some(start);
+    if let Some(end) = burst_mutex_end(ep) {
+        *burst_hint = Some(burst_hint.map_or(end, |h: Instant| h.max(end)));
+    }
+    ep.burst_started = true;
+    ep.burst_done = true;
+    if occ.class == Class::Profanity && curse_cues.len() < MAX_CURSE_CUES {
+        curse_cues.push(CurseCue {
+            kind: CurseCueKind::Detonated,
+            row: occ.row,
+            col: occ.start_col,
+        });
+    }
+    true
 }
 
 /// Request a §6.4 flash slot for `pane`, whose grid origin sits at `pane_px`
@@ -8520,7 +8536,7 @@ fn emit_nova_axis(
     frame: u64,
     sel: Option<SelView<'_>>,
     novas: &[NovaLive],
-    persist: &FxHashMap<u64, Episode>,
+    ep: Option<&Episode>,
     out: &mut Vec<WordDecoration>,
     nova: &mut Vec<GlowQuad>,
     fp: &mut u64,
@@ -8587,7 +8603,6 @@ fn emit_nova_axis(
         // occurrences are already past the fade); the
         // reduced-motion static glint keeps its v2 frame-
         // invariant bytes (no animation to one-shot).
-        let ep = persist.get(&occ.ident);
         let done = ep.is_none_or(|e| e.nova_done);
         let fade = if cfg.reduced_motion && !occ.inert {
             // v3 one-shot × reduced motion: the static glint
@@ -8670,7 +8685,7 @@ fn emit_super_axis(
     frame: u64,
     sel: Option<SelView<'_>>,
     supers: &[SuperLive],
-    persist: &FxHashMap<u64, Episode>,
+    ep: Option<&Episode>,
     out: &mut Vec<WordDecoration>,
     nova: &mut Vec<GlowQuad>,
     fp: &mut u64,
@@ -8685,9 +8700,7 @@ fn emit_super_axis(
         // PER-TIER window: a Flash is over in ~1.1 s, a Nova
         // runs 2.4 s, a Nuke runs 3.6 s while the cloud rises,
         // blooms and rolls out.
-        let tier = persist
-            .get(&occ.ident)
-            .map_or(supernova::SuperTier::Nova, |e| e.burst_tier);
+        let tier = ep.map_or(supernova::SuperTier::Nova, |e| e.burst_tier);
         let until = sv.start + Duration::from_millis(supernova::total_ms(tier));
         arm_until(active_until, until);
         *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
@@ -8770,7 +8783,7 @@ fn emit_super_axis(
             *fp = fold_deco(*fp, d);
         }
     } else if !cfg.reduced_motion
-        && let Some(ep) = persist.get(&occ.ident)
+        && let Some(ep) = ep
         && ep.burst_roll
         && let Some(s) = ep.nova_start
     {
@@ -8967,7 +8980,7 @@ fn ink_fx(
     novas: &[NovaLive],
     supers: &[SuperLive],
     coupling: &[(u16, u8)],
-    persist: &FxHashMap<u64, Episode>,
+    ep: Option<&Episode>,
 ) -> InkFx {
     let mut fx = INK_FX_NONE;
     // v3 §3.2: a live supernova drives its own word's ink (charge → hold →
@@ -9006,7 +9019,6 @@ fn ink_fx(
         let (core, fringe) = nova::palette(nova_palette(occ.genome.gkey));
         let (n0, n1) = genome::ink_pair_nudges(Class::Profanity, occ.genome.gkey);
         let pair = (hue_nudge(core, n0), hue_nudge(fringe, n1));
-        let ep = persist.get(&occ.ident);
         let done = ep.is_none_or(|e| e.nova_done);
         if cfg.reduced_motion || done {
             // §6.1 Ember: the settled gradient shifted to the palette's ember
@@ -9115,8 +9127,16 @@ pub fn cat_chin(hart: u16) -> u16 {
 /// reaches the slot ceiling, both dimensions shrink together rather than
 /// distorting the silhouette.
 fn authored_cat_size(variant: CatGlyphId, desired_h: f32, cell_h: u16) -> (u16, u16) {
-    let aspect = (f32::from(GLYPHS[variant as usize].aspect_x1000) / 1000.0).max(0.001);
-    let max_w = f32::from(cell_h.saturating_mul(4).saturating_sub(PATCH_STRIP).max(1));
+    let max_w = cell_h.saturating_mul(4).saturating_sub(PATCH_STRIP);
+    fit_glyph(&GLYPHS[variant as usize], desired_h, max_w, cell_h)
+}
+
+/// Fit an authored glyph (cat or species head) at a requested height into a
+/// `max_w × 2·cell_h` box, preserving its viewbox aspect: when the width cap
+/// binds, both dimensions shrink together.
+fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) -> (u16, u16) {
+    let aspect = (f32::from(glyph.aspect_x1000) / 1000.0).max(0.001);
+    let max_w = f32::from(max_w.max(1));
     let max_h = f32::from(cell_h.saturating_mul(2).max(1));
     let fitted_h = desired_h.max(1.0).min(max_h).min(max_w / aspect);
     let h = fitted_h.round().clamp(1.0, max_h) as u16;
@@ -9130,18 +9150,24 @@ pub fn cat_rest_reveal(hart: u16) -> u16 {
     hart
 }
 
-/// cat-art v4 eligibility gate: a matched feline word shows the authored peeking
-/// cat whenever it is wide enough (`word_px ≥ 0.8·ch`, so a 1-cell word takes
-/// no cat), [`cat_peek_plan`] resolved a habitable side, and the cell metrics
-/// clear the §5.7 floors. TOP ROWS ARE ELIGIBLE: a row-0 word has no rows above,
-/// so the plan picks [`PeekDir::Down`] and the head slides out from UNDER the
-/// word rather than covering it. BUSY SURFACES ARE ELIGIBLE TOO: cats draw
-/// [`FreeZ::UnderText`], so a TUI prompt frame in the band costs legibility
-/// nothing — only a genuine text wall on BOTH sides is rejected. Every
-/// ineligible case draws NO graphic — the word's ink is the graceful fallback.
+/// cat-art v4 eligibility gate: the cat `feline_style` plus [`peek_eligible`].
 fn cat_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
-    if cfg.feline_style != FelineStyle::Cat
-        || geom.cell_h < CAT_MIN_CELL_H
+    cfg.feline_style == FelineStyle::Cat && peek_eligible(occ, geom)
+}
+
+/// The peek eligibility both rosters share: a matched word shows its authored
+/// peeking head whenever it is wide enough (`word_px ≥ 0.8·ch`, so a 1-cell
+/// word takes none), [`cat_peek_plan`] resolved a habitable side, and the cell
+/// metrics clear the §5.7 floors. TOP ROWS ARE ELIGIBLE: a row-0 word has no
+/// rows above, so the plan picks [`PeekDir::Down`] and the head slides out from
+/// UNDER the word rather than covering it. BUSY SURFACES ARE ELIGIBLE TOO: heads
+/// draw [`FreeZ::UnderText`], so a TUI prompt frame in the band costs
+/// legibility nothing — only a genuine text wall on BOTH sides is rejected.
+/// Every ineligible case draws NO graphic — the word's ink is the graceful
+/// fallback. The animal roster takes it bare: the paw style is a statement
+/// about cats, and there is no animal paw.
+fn peek_eligible(occ: &Occurrence, geom: EffectGeom) -> bool {
+    if geom.cell_h < CAT_MIN_CELL_H
         || geom.cell_w < CAT_MIN_CELL_W
         || occ.dec_line
         || !occ.cat_text_clear
@@ -9165,42 +9191,32 @@ fn cat_geometry_for(
     geom: EffectGeom,
     variant: CatGlyphId,
 ) -> CatGeom {
+    let desired_h = f32::from(cat_hart(geom.cell_h)) * cat_age_v4(gkey).scale();
+    let size = authored_cat_size(variant, desired_h, geom.cell_h);
+    anchored_geom(start_col, end_col, geom, size, &GLYPHS[variant as usize])
+}
+
+/// Land a fitted `(w, hart)` glyph's authored visual center on the word
+/// midpoint, then clamp inward at viewport edges.
+fn anchored_geom(
+    start_col: u16,
+    end_col: u16,
+    geom: EffectGeom,
+    (w, hart): (u16, u16),
+    glyph: &GlyphDef,
+) -> CatGeom {
     let cw = i32::from(geom.cell_w);
-    let age = cat_age_v4(gkey);
-    let desired_h = f32::from(cat_hart(geom.cell_h)) * age.scale();
-    let (w, hart) = authored_cat_size(variant, desired_h, geom.cell_h);
-    let chin = cat_chin(hart);
     let w_i = i32::from(w);
-    // Land the asset's authored visual center on the matched word midpoint,
-    // then clamp inward at viewport edges.
     let grid_w = i32::from(geom.cols) * cw;
     let mid = (i32::from(start_col) * cw + (i32::from(end_col) + 1) * cw) / 2;
-    let center = f32::from(GLYPHS[variant as usize].center_x) / f32::from(FIXED_ONE);
+    let center = f32::from(glyph.center_x) / f32::from(FIXED_ONE);
     let x = (mid - (center * f32::from(w)).round() as i32).clamp(0, (grid_w - w_i).max(0));
     CatGeom {
         w,
         hart,
-        chin,
+        chin: cat_chin(hart),
         x: x as u16,
     }
-}
-
-/// The animal roster's eligibility gate: [`cat_eligible`] minus the
-/// `feline_style` arm — the paw style is a statement about cats, and there is
-/// no animal paw. Same cell floors, same DEC-line suppression, same
-/// both-sides-walled rejection, same 1-cell-word floor; every ineligible case
-/// draws NO graphic and the word's ink is the graceful fallback.
-fn animal_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
-    let _ = cfg; // parity with cat_eligible's signature; no style gate to read
-    if geom.cell_h < CAT_MIN_CELL_H
-        || geom.cell_w < CAT_MIN_CELL_W
-        || occ.dec_line
-        || !occ.cat_text_clear
-    {
-        return false;
-    }
-    let word_px = (i32::from(occ.end_col) - i32::from(occ.start_col) + 1) * i32::from(geom.cell_w);
-    (word_px as f32) >= 0.8 * f32::from(geom.cell_h)
 }
 
 /// §5.2 geometry for a species head: the cat law with two deletions — no age
@@ -9208,27 +9224,11 @@ fn animal_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool
 /// the width cap (animal tiles are exact-size). Authored aspect from the
 /// species' own viewbox, word-midpoint anchor, viewport clamp.
 fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -> CatGeom {
-    let cw = i32::from(geom.cell_w);
-    let aspect = AnimalBaker::aspect(species);
-    let desired_h = f32::from(cat_hart(geom.cell_h));
+    let glyph = &ANIMAL_GLYPHS[species as usize];
     // `host_tile` admits `w ≤ slot_w (= 4·cell_h)` and `h ≤ 2·cell_h`.
-    let max_w = f32::from(geom.cell_h.saturating_mul(4).max(1));
-    let max_h = f32::from(geom.cell_h.saturating_mul(2).max(1));
-    let fitted_h = desired_h.max(1.0).min(max_h).min(max_w / aspect);
-    let hart = fitted_h.round().clamp(1.0, max_h) as u16;
-    let w = (f32::from(hart) * aspect).round().clamp(1.0, max_w) as u16;
-    let chin = cat_chin(hart);
-    let w_i = i32::from(w);
-    let grid_w = i32::from(geom.cols) * cw;
-    let mid = (i32::from(occ.start_col) * cw + (i32::from(occ.end_col) + 1) * cw) / 2;
-    let center = f32::from(ANIMAL_GLYPHS[species as usize].center_x) / f32::from(FIXED_ONE);
-    let x = (mid - (center * f32::from(w)).round() as i32).clamp(0, (grid_w - w_i).max(0));
-    CatGeom {
-        w,
-        hart,
-        chin,
-        x: x as u16,
-    }
+    let max_w = geom.cell_h.saturating_mul(4);
+    let size = fit_glyph(glyph, f32::from(cat_hart(geom.cell_h)), max_w, geom.cell_h);
+    anchored_geom(occ.start_col, occ.end_col, geom, size, glyph)
 }
 
 /// §5.6 ease-out-back with an EXACT overshoot amplitude: `f(p) = 1 +
@@ -9255,8 +9255,8 @@ fn ease_out_back(p: f32, amp: f32) -> f32 {
 /// this repo verifies against real frames.
 ///
 /// WHY A MEMO IS ENOUGH: `amp` is frame-invariant and drawn from a tiny fixed
-/// set — `(0.06 + a 2-bit genome field × 0.04) × {1.0, 1.3}` in [`emit_cat`],
-/// the same without the kitten factor in [`emit_animal`] — so EIGHT values
+/// set — `(0.06 + a 2-bit genome field × 0.04) × {1.0, 1.3}` in
+/// [`emit_peek`], the ×1.3 for kittens only — so EIGHT values
 /// cover every cat and every animal that will ever exist. The solve was being
 /// re-run from scratch on every frame of every rising sprite (24 serial
 /// divides each, up to `MAX_CATS + MAX_ANIMALS` = 16 sprites at once) to
@@ -9395,15 +9395,6 @@ fn touch_done(marks: &mut DoneMarkLru, key: u64) -> bool {
     marks.touch(key)
 }
 
-/// Push one 1:1 cat dest/source window `[top, bottom)` as ONE row-free
-/// [`FreeSprite`] (UnderText, NEAREST). No band split, no y = 0 clip, no
-/// viewport drop here: the renderer's `stamp_free_sprite`/scissor clip against
-/// the UNCLAMPED origin, so the §5.7 row-0 clip falls out of the signed `y`.
-/// Clipping early would sample different texels than the renderer does.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a pure push over explicit dest/source scalars; a carrier struct would rename the list"
-)]
 /// THE AMBIENT CAT'S IDLE LIFE — a peeking word-cat's own animation vocabulary
 /// (owner, 2026-08-04: "I want the kitty animations to be in the keyword kitties
 /// versus on the cursor").
@@ -9417,7 +9408,7 @@ fn touch_done(marks: &mut DoneMarkLru, key: u64) -> bool {
 ///
 /// * no new field on `Episode`, so nothing to advance in `episode_prepass` and
 ///   nothing that can desync from the one-shot clock that owns the peek;
-/// * `emit_cat` stays the documented pure function of `(now, genome, ident,
+/// * `emit_peek` stays the documented pure function of `(now, genome, ident,
 ///   PeekView)`, which is what lets the emission loop hold `persist` immutably;
 /// * no new bake keys — the pose rides the DEST rect, so the eye frame stays
 ///   `Open` and the two-bakes-a-frame atlas budget is untouched.
@@ -9472,6 +9463,11 @@ impl CatIdlePose {
     }
 }
 
+/// Push one 1:1 cat dest/source window `[top, bottom)` as ONE row-free
+/// [`FreeSprite`] (UnderText, NEAREST). No band split, no y = 0 clip, no
+/// viewport drop here: the renderer's `stamp_free_sprite`/scissor clip against
+/// the UNCLAMPED origin, so the §5.7 row-0 clip falls out of the signed `y`.
+/// Clipping early would sample different texels than the renderer does.
 #[allow(
     clippy::too_many_arguments,
     reason = "one cat sprite: its dest box, its source window, and the living-cartoon pose"
@@ -9567,7 +9563,7 @@ struct CatTick<'a> {
 /// Is the cat rect `(x, w, top..bottom)` STACKED on the companion box `a` —
 /// covered enough to read as a second kitty in the same place, rather than one
 /// merely passing nearby? `bottom`/`y1` are exclusive, matching the
-/// `top..bottom` spans `emit_cat` computes.
+/// `top..bottom` spans `emit_peek` computes.
 ///
 /// Judged by intersected AREA as a fraction of the cat's own area, because
 /// mere touching is normal and common: an ambient cat peeking UP from a word
@@ -9604,23 +9600,9 @@ struct PeekView {
     arm: Option<KittyShownAs>,
 }
 
-/// Emit one peeking cat — the v3 §1.2 ONE-SHOT peek cycle:
-///
-/// ```text
-/// Rise (450 ms, ease_out_back, genome overshoot,
-///       eyes closed → open at p ≥ 0.85)
-/// → Dwell (genome 2200..3598 ms − mix(ident) % 300; +500 ms magic/accessory,
-///          cap 3750; authored pose/accessory variation)
-/// → Descend (320 ms easeInOutCubic; optional 60 ms anticipation lift on
-///            ~50% of genomes; eyes Closed-happy at the near-stationary top)
-/// → Done (zero quads, forever for this episode)
-/// ```
-///
-/// Emission is a pure function of `(now, genome, ident, PeekView)`. The whole
-/// cycle rides `active_until` (frame-paced while live); dwell frames between
-/// the pure-time events are byte-stable, so the fp early-out dedupes them.
-/// `reduced_motion` shows the static settled pose while the word is visible
-/// (no motion to one-shot — the accessibility override keeps v2 semantics).
+/// Emit one peeking cat: the genome wardrobe (magic, specials, accessories,
+/// age) resolved into the shared [`emit_peek`] one-shot, then — once a body
+/// has landed — the §F4.2 Kitty Log sighting and the pet's peek cue.
 #[allow(
     clippy::too_many_arguments,
     reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_ink; a carrier struct would rename the list, not shrink it"
@@ -9655,23 +9637,193 @@ fn emit_cat(
     } else {
         None
     };
+    let age = cat_age_v4(occ.genome.gkey);
+    // cat-art v4: the authored glyph path. A special (from the magic word)
+    // REPLACES the head; otherwise the genome variant picks a HEAD, and an
+    // overlay accessory (bow/crown/bell) rides a plain head. Fills come from
+    // the v4 genome fields plus the bounded local text/background palette.
     let g = cat_geometry(occ, geom, variant);
+    let (coat, iris) = cat_fills_v4(occ.genome.gkey);
+    let key = BakeKeyV4 {
+        variant,
+        accessory,
+        coat,
+        iris,
+        colors: occ.cat_colors,
+        w: g.w,
+        h: g.hart,
+        // Peeking word-cats keep their authored eyes (the blink/squint frames
+        // belong to the animated cursor companion, not the roster cameo).
+        eyes: EyesFrame::Open,
+    };
+    let Some((top, bottom)) = emit_peek(
+        ctx,
+        occ,
+        cfg,
+        geom,
+        now,
+        frame,
+        peek,
+        g,
+        magic.is_some() || has_accessory(occ.genome.magic),
+        age == CatAge::Kitten,
+        |ctx| ctx.baker.get_v4(&key),
+        free,
+        fp,
+        active_until,
+    ) else {
+        return;
+    };
+    // §F4.2 Kitty Log: body sprites actually landed for this cat — queue its
+    // once-per-episode sighting (the post-loop pass flips Episode::logged). v4
+    // cats are all peeking heads; the only per-identity trait the authored roster
+    // still carries into the log is the overlay accessory (bow / crown).
+    if ctx.unlogged.contains(&occ.ident) && ctx.sightings.len() < MAX_OCCURRENCES {
+        // Wave 2, the pet's word-cat bat: the POSITIONED twin of the
+        // sighting below, on the same once-per-episode edge (a body sprite
+        // actually landed) — with the dest rect that is final right here
+        // and nowhere else. Cap-truncation drops the gag, never the log.
+        if ctx.peek_cues.len() < MAX_PEEK_CUES {
+            ctx.peek_cues.push(PeekCue {
+                row: occ.row,
+                col: occ.start_col,
+                head_px: (i32::from(g.x), i32::from(g.x) + i32::from(g.w), top, bottom),
+            });
+        }
+        let traits = match accessory {
+            Some(CatGlyphId::AccBow) => TRAIT_BOW,
+            Some(CatGlyphId::AccCrown) => TRAIT_CROWN,
+            _ => 0,
+        };
+        ctx.sightings.push(KittySighting {
+            kitty_type: KittyType::HeadPeek,
+            magic: KittyMagic::from_cat(magic),
+            shown_as: KittyShownAs::Cat,
+            langs: occ.langs,
+            traits,
+            look: KittyLook {
+                variant,
+                accessory,
+                coat,
+                iris,
+                age,
+            },
+            ident: occ.ident,
+        });
+    }
+}
+
+/// The species-head twin of [`emit_cat`]: the SAME one-shot peek with
+/// everything the genome wardrobe owns deleted. No magic, no specials, no
+/// accessories, no age scale, no kitten bounce, no paw fallback, and NO Kitty
+/// Log sighting and NO peek cue: the log is the feline collectible surface
+/// (§F4.2) — a camel is not a collectible cat — and the pet's word-cat bat
+/// answers cats, not camels. The tile rides the exact-size [`AnimalBaker`]
+/// cache into the shared atlas through the `host_tile` door (the pet's path),
+/// so a deferred bake defers the sprite one beat exactly like a deferred cat
+/// bake.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_cat"
+)]
+fn emit_animal(
+    ctx: &mut CatTick,
+    occ: &Occurrence,
+    species: AnimalGlyphId,
+    cfg: &DecoConfig,
+    geom: EffectGeom,
+    now: Instant,
+    frame: u64,
+    peek: PeekView,
+    free: &mut Vec<FreeSprite>,
+    fp: &mut u64,
+    active_until: &mut Option<Instant>,
+) {
+    let g = animal_geometry(occ, geom, species);
+    let key = AnimalBakeKey {
+        species,
+        colors: occ.cat_colors,
+        w: g.w,
+        h: g.hart,
+    };
+    // magical = false: the prepass's dwell derivation mirrors this (see
+    // episode_prepass). Two doors, one budget (the pet's idiom): bake the
+    // species head into its exact-size cache, then land the texels in the
+    // shared atlas; a miss on either door defers the sprite one short beat.
+    emit_peek(
+        ctx,
+        occ,
+        cfg,
+        geom,
+        now,
+        frame,
+        peek,
+        g,
+        false,
+        false,
+        |ctx| {
+            let rgba = ctx.animal_baker.tile(&key)?;
+            ctx.baker.host_tile(key.host_id(), key.w, key.h, rgba)
+        },
+        free,
+        fp,
+        active_until,
+    );
+}
+
+/// The v3 §1.2 ONE-SHOT peek cycle both rosters share:
+///
+/// ```text
+/// Rise (450 ms, ease_out_back, genome overshoot,
+///       eyes closed → open at p ≥ 0.85)
+/// → Dwell (genome 2200..3598 ms − mix(ident) % 300; +500 ms magic/accessory,
+///          cap 3750; authored pose/accessory variation)
+/// → Descend (320 ms easeInOutCubic; optional 60 ms anticipation lift on
+///            ~50% of genomes; eyes Closed-happy at the near-stationary top)
+/// → Done (zero quads, forever for this episode)
+/// ```
+///
+/// Emission is a pure function of `(now, genome, ident, PeekView)` plus the
+/// roster's resolved geometry `g` and `bake` door. The whole cycle rides
+/// `active_until` (frame-paced while live); dwell frames between the pure-time
+/// events are byte-stable, so the fp early-out dedupes them. `reduced_motion`
+/// shows the static settled pose while the word is visible (no motion to
+/// one-shot — the accessibility override keeps v2 semantics). Returns the
+/// landed dest span `(top, bottom)` when a body sprite was pushed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_ink; a carrier struct would rename the list, not shrink it"
+)]
+fn emit_peek<'a>(
+    ctx: &mut CatTick<'a>,
+    occ: &Occurrence,
+    cfg: &DecoConfig,
+    geom: EffectGeom,
+    now: Instant,
+    frame: u64,
+    peek: PeekView,
+    g: CatGeom,
+    magical: bool,
+    kitten: bool,
+    bake: impl FnOnce(&mut CatTick<'a>) -> Option<CatTile>,
+    free: &mut Vec<FreeSprite>,
+    fp: &mut u64,
+    active_until: &mut Option<Instant>,
+) -> Option<(i32, i32)> {
     let ch = i32::from(geom.cell_h);
     // §5.6 v2.6: the REST reveal — full Hart for every identity.
     let rest = i32::from(cat_rest_reveal(g.hart));
-    let age = cat_age_v4(occ.genome.gkey);
-    let kitten = age == CatAge::Kitten;
     // Entrance overshoot amplitude from a free v4 bit window (bits 15–16 sit
     // above the v4 art layout 0..=14, so they never fragment the bake key).
     let overshoot = 0.06 + genome::field(occ.genome.gkey, 15, 2) as f32 * 0.04;
     let amp = overshoot * if kitten { 1.3 } else { 1.0 };
-    let magical = magic.is_some() || has_accessory(occ.genome.magic);
     // v3 §6: the dwell range rides the graphic spec (class default
     // 2200..=3598; direct-built test occurrences fall back to it too).
     let dwell_range = occ.spec.graphic.map_or((2200, 3598), |g| g.dwell_ms);
     let dwell = peek_dwell_ms(occ.ident, occ.genome.gkey, magical, dwell_range);
     let antic = anticipation_ms(occ.genome.gkey);
-    let total = peek_total_ms(occ.ident, occ.genome.gkey, magical, dwell_range);
+    // `peek_total_ms`'s sum, from the parts already in hand.
+    let total = CAT_RISE_MS + dwell + antic + CAT_DESCEND_MS;
     let dwell_end = CAT_RISE_MS + dwell;
 
     // Phase resolution. reduced_motion pins the static settled pose (t is
@@ -9687,23 +9839,21 @@ fn emit_cat(
         // pose persists. An unlatched clock (defensive; `fresh` always
         // latches) shows nothing.
         if peek.peek_done || peek.start.is_none() {
-            return;
+            return None;
         }
         (CAT_RISE_MS, false, true)
     } else {
-        let Some(ps) = peek.start else {
-            return; // defensive belt: an unlatched clock emits nothing
-        };
+        let ps = peek.start?; // defensive belt: an unlatched clock emits nothing
         if now < ps {
             // Defensive: a future clock origin emits nothing yet but keeps
             // frames coming until the rise begins.
             arm_until(active_until, ps + Duration::from_millis(total));
             *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
-            return;
+            return None;
         }
         let t = now.saturating_duration_since(ps).as_millis() as u64;
         if peek.peek_done || t >= total {
-            return; // Done: zero quads, forever for this episode
+            return None; // Done: zero quads, forever for this episode
         }
         arm_until(active_until, ps + Duration::from_millis(total));
         (t, t < CAT_RISE_MS, t >= CAT_RISE_MS && t < dwell_end)
@@ -9752,31 +9902,14 @@ fn emit_cat(
         }
     };
     if reveal <= 0 {
-        return; // pre-rise / post-descend edge frame: nothing visible
+        return None; // pre-rise / post-descend edge frame: nothing visible
     }
-    // cat-art v4: the authored glyph path. A special (from the magic word)
-    // REPLACES the head; otherwise the genome variant picks a HEAD, and an
-    // overlay accessory (bow/crown/bell) rides a plain head. Fills come from
-    // the v4 genome fields plus the bounded local text/background palette.
-    let (coat, iris) = cat_fills_v4(occ.genome.gkey);
-    let key_v4 = BakeKeyV4 {
-        variant,
-        accessory,
-        coat,
-        iris,
-        colors: occ.cat_colors,
-        w: g.w,
-        h: g.hart,
-        // Peeking word-cats keep their authored eyes (the blink/squint frames
-        // belong to the animated cursor companion, not the roster cameo).
-        eyes: EyesFrame::Open,
-    };
-    let Some(tile) = ctx.baker.get_v4(&key_v4) else {
+    let Some(tile) = bake(ctx) else {
         // Bake deferred (≤ 2/frame, §5.5): emit nothing this frame; keep the
         // scheduler armed one short beat so the retry frame happens.
         arm_until(active_until, now + Duration::from_millis(50));
         *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
-        return;
+        return None;
     };
     // §5.6 entrance kinematics, all bake-free: the dest bottom is pinned at
     // `word_row_top + chin`; the visible height grows to the rest reveal with
@@ -9798,7 +9931,7 @@ fn emit_cat(
         0
     };
     let row_top = i32::from(occ.row) * ch;
-    // v4 cats are the two-band peeking HEAD. UP (the authored pose) anchors the
+    // v4 heads are the two-band peeking HEAD. UP (the authored pose) anchors the
     // chin slice at the word row's TOP edge and rises into the two rows above.
     // DOWN mirrors it about the word row: the chin tucks behind the row's
     // BOTTOM edge and the head slides out from UNDER the word into the two rows
@@ -9861,17 +9994,16 @@ fn emit_cat(
     // in `tick` cannot see this: it only knows where the OCCURRENCE is, and by
     // then the drawn position has moved rows. Decide it here, where the dest
     // rect is final. Returning here is exactly equivalent to not pushing: the
-    // only work below is the Kitty Log sighting, and that is already gated on a
-    // body having landed (`free.len() > n_free`), so a yielded cat logs no
-    // sighting — which is the honest reading of a log whose entry means "this
-    // cat was SEEN". The episode and its one-shot live in the caller and are
-    // untouched. A cat that merely stands NEXT to the companion still draws;
-    // only a genuine overlap yields.
+    // caller's Kitty Log sighting is gated on a body having landed (the
+    // `Some` below), so a yielded cat logs no sighting — which is the honest
+    // reading of a log whose entry means "this cat was SEEN". The episode and
+    // its one-shot live in the caller and are untouched. A cat that merely
+    // stands NEXT to the companion still draws; only a genuine overlap yields.
     if ctx
         .companion_px
         .stacked_on(i32::from(g.x), i32::from(g.w), top, bottom)
     {
-        return;
+        return None;
     }
     let n_free = free.len();
     // Free overlay: ONE FreeSprite per cat — the whole dest rect `[top, bottom)`
@@ -9901,223 +10033,7 @@ fn emit_cat(
         pose,
         fp,
     );
-    // §F4.2 Kitty Log: body sprites actually landed for this cat — queue its
-    // once-per-episode sighting (the post-loop pass flips Episode::logged). v4
-    // cats are all peeking heads; the only per-identity trait the authored roster
-    // still carries into the log is the overlay accessory (bow / crown).
-    if free.len() > n_free
-        && ctx.unlogged.contains(&occ.ident)
-        && ctx.sightings.len() < MAX_OCCURRENCES
-    {
-        // Wave 2, the pet's word-cat bat: the POSITIONED twin of the
-        // sighting below, on the same once-per-episode edge (a body sprite
-        // actually landed) — with the dest rect that is final right here
-        // and nowhere else. Cap-truncation drops the gag, never the log.
-        if ctx.peek_cues.len() < MAX_PEEK_CUES {
-            ctx.peek_cues.push(PeekCue {
-                row: occ.row,
-                col: occ.start_col,
-                head_px: (i32::from(g.x), i32::from(g.x) + i32::from(g.w), top, bottom),
-            });
-        }
-        let traits = match accessory {
-            Some(CatGlyphId::AccBow) => TRAIT_BOW,
-            Some(CatGlyphId::AccCrown) => TRAIT_CROWN,
-            _ => 0,
-        };
-        ctx.sightings.push(KittySighting {
-            kitty_type: KittyType::HeadPeek,
-            magic: KittyMagic::from_cat(magic),
-            shown_as: KittyShownAs::Cat,
-            langs: occ.langs,
-            traits,
-            look: KittyLook {
-                variant,
-                accessory,
-                coat,
-                iris,
-                age,
-            },
-            ident: occ.ident,
-        });
-    }
-}
-
-/// The species-head twin of [`emit_cat`]: the SAME one-shot peek — birth-latched
-/// clock, ease-out-back rise, breathing dwell, anticipation + descend, the
-/// text-line-only cut, the companion pixel-yield — with everything the genome
-/// wardrobe owns deleted. No magic, no specials, no accessories, no age scale,
-/// no kitten bounce, no paw fallback, and NO Kitty Log sighting: the log is the
-/// feline collectible surface, and a camel is not a collectible cat. The tile
-/// rides the exact-size [`AnimalBaker`] cache into the shared atlas through the
-/// `host_tile` door (the pet's path), so a deferred bake defers the sprite one
-/// beat exactly like a deferred cat bake.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_cat"
-)]
-fn emit_animal(
-    ctx: &mut CatTick,
-    occ: &Occurrence,
-    species: AnimalGlyphId,
-    cfg: &DecoConfig,
-    geom: EffectGeom,
-    now: Instant,
-    frame: u64,
-    peek: PeekView,
-    free: &mut Vec<FreeSprite>,
-    fp: &mut u64,
-    active_until: &mut Option<Instant>,
-) {
-    let g = animal_geometry(occ, geom, species);
-    let ch = i32::from(geom.cell_h);
-    let rest = i32::from(cat_rest_reveal(g.hart));
-    // Entrance overshoot from the same free genome bit window as the cat's —
-    // per-word personality without a bake-key axis. No kitten ×1.3: species
-    // heads have no age.
-    let amp = 0.06 + genome::field(occ.genome.gkey, 15, 2) as f32 * 0.04;
-    // magical = false everywhere below: the prepass's dwell derivation mirrors
-    // this (see episode_prepass).
-    let dwell_range = occ.spec.graphic.map_or((2200, 3598), |g| g.dwell_ms);
-    let dwell = peek_dwell_ms(occ.ident, occ.genome.gkey, false, dwell_range);
-    let antic = anticipation_ms(occ.genome.gkey);
-    let total = peek_total_ms(occ.ident, occ.genome.gkey, false, dwell_range);
-    let dwell_end = CAT_RISE_MS + dwell;
-
-    // Phase resolution — the cat law verbatim (reduced_motion pins the settled
-    // pose; the clock latched at birth; Done emits zero quads forever).
-    let (t, in_rise, in_dwell) = if cfg.reduced_motion {
-        if peek.peek_done || peek.start.is_none() {
-            return;
-        }
-        (CAT_RISE_MS, false, true)
-    } else {
-        let Some(ps) = peek.start else {
-            return;
-        };
-        if now < ps {
-            arm_until(active_until, ps + Duration::from_millis(total));
-            *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
-            return;
-        }
-        let t = now.saturating_duration_since(ps).as_millis() as u64;
-        if peek.peek_done || t >= total {
-            return;
-        }
-        arm_until(active_until, ps + Duration::from_millis(total));
-        (t, t < CAT_RISE_MS, t >= CAT_RISE_MS && t < dwell_end)
-    };
-    let td = t.saturating_sub(CAT_RISE_MS);
-    // The anti-skip frame fold — the dwell breathes, so it folds through the
-    // whole peek exactly like the cat's.
-    if !cfg.reduced_motion {
-        *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
-    }
-    let p = if in_rise {
-        t as f32 / CAT_RISE_MS as f32
-    } else {
-        1.0
-    };
-    let mut antic_lift = 0i32;
-    let reveal = if cfg.reduced_motion || in_dwell {
-        rest
-    } else if in_rise {
-        (ease_out_back(p, amp) * rest as f32).round() as i32
-    } else {
-        let ta = t - dwell_end;
-        if ta < antic {
-            antic_lift = 2;
-            rest
-        } else {
-            let pd = (ta - antic) as f32 / CAT_DESCEND_MS as f32;
-            ((1.0 - ease_in_out_cubic(pd)) * rest as f32).round() as i32
-        }
-    };
-    if reveal <= 0 {
-        return;
-    }
-    // Two doors, one budget (the pet's idiom): bake the species head into its
-    // exact-size cache, then land the texels in the shared atlas. A miss on
-    // either door defers the sprite one short beat — same retry the cat bake
-    // gets. Field-split the ctx so the tile borrow and the atlas door don't
-    // fight over it.
-    let key = AnimalBakeKey {
-        species,
-        colors: occ.cat_colors,
-        w: g.w,
-        h: g.hart,
-    };
-    let host = key.host_id();
-    let CatTick {
-        baker,
-        animal_baker,
-        companion_px,
-        ..
-    } = &mut *ctx;
-    let tile = match animal_baker.tile(&key) {
-        Some(rgba) => baker.host_tile(host, key.w, key.h, rgba),
-        None => None,
-    };
-    let Some(tile) = tile else {
-        arm_until(active_until, now + Duration::from_millis(50));
-        *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
-        return;
-    };
-    // Entrance kinematics + the text-line-only cut: the cat law verbatim
-    // (see emit_cat's §5.6/§5.2 commentary), minus the kitten bounce.
-    let vh = reveal.min(rest);
-    let lift = (reveal - rest)
-        .max(0)
-        .max(antic_lift)
-        .min(2 * ch - (i32::from(g.hart) - i32::from(g.chin)));
-    let row_top = i32::from(occ.row) * ch;
-    let (mut top, mut bottom) = if occ.cat_peek_down {
-        let rest_top = row_top + ch - i32::from(g.chin);
-        let top = rest_top + lift;
-        (top, top + vh)
-    } else {
-        let rest_bottom = row_top + i32::from(g.chin);
-        let bottom = rest_bottom - lift;
-        (bottom - vh, bottom)
-    };
-    let grid_h = i32::from(geom.rows) * ch;
-    if top < 0 {
-        bottom -= top;
-        top = 0;
-    } else if bottom > grid_h {
-        let over = bottom - grid_h;
-        top -= over;
-        bottom -= over;
-    }
-    let src_y0 = if occ.cat_peek_down {
-        i32::from(tile.ay) + (rest - vh).max(0)
-    } else {
-        i32::from(tile.ay)
-    };
-    // Yield to the companion in pixels, exactly like a cat: overlapping the
-    // flying head or the resident pet draws nothing this frame.
-    if companion_px.stacked_on(i32::from(g.x), i32::from(g.w), top, bottom) {
-        return;
-    }
-    let pose = if in_dwell && !cfg.reduced_motion {
-        CatIdlePose::breathing(td, occ.genome.gkey, geom.cell_h)
-    } else {
-        CatIdlePose::STILL
-    };
-    push_cat_free(
-        free,
-        i32::from(g.x),
-        i32::from(g.w),
-        top,
-        bottom,
-        i32::from(tile.ax),
-        src_y0,
-        pose,
-        fp,
-    );
-    // Deliberately NO Kitty Log sighting and NO peek cue: the log is the
-    // feline collectible surface (§F4.2), and the pet's word-cat bat answers
-    // cats, not camels.
+    (free.len() > n_free).then_some((top, bottom))
 }
 
 /// The class base ink pair `(c0, c1)` (§4.2/§4.6), `0x00RRGGBB`. `None` = the
@@ -10307,23 +10223,19 @@ fn emit_ink(
         // exactly mix_rgb(base_fg, base(u), strength) — constant forever.
         (0.0, 0.0)
     };
-    // §4.3 legibility guard, per WORD per FRAME: pull the mix toward the
-    // captured base fg (the theme's own legible color) in eighth-steps until the
-    // word's mid-gradient ink clears 2.5:1 against the first lead cell's bg.
-    let bg = rgb3_to_u32(occ.ink_bg);
-    let fg_first = rgb3_to_u32(base_fg[occ.ink_base]);
+    // §4.3 legibility guard on the word's mid-gradient ink, against the first
+    // lead cell's bg.
     let mid_raw = mix_rgb(
         mix_rgb(c0, c1, 0.5),
         0x00FF_FFFF,
         glare * spec_lobe(0.5, center),
     );
-    let step = cfg.ink_strength.clamp(0.0, 1.0) / 8.0;
-    let mut strength = cfg.ink_strength.clamp(0.0, 1.0);
-    while strength > 0.0
-        && contrast_ratio(mix_rgb(fg_first, mid_raw, strength), bg) < MIN_INK_CONTRAST
-    {
-        strength = (strength - step).max(0.0);
-    }
+    let strength = legible_strength(
+        cfg.ink_strength,
+        rgb3_to_u32(base_fg[occ.ink_base]),
+        &[mid_raw],
+        relative_luminance(rgb3_to_u32(occ.ink_bg)),
+    );
     // Gradient parameter: u over the VISUAL span (wide trailing halves count —
     // the §4.2 single normative, column-based definition).
     let span = f32::from(occ.end_col.saturating_sub(occ.start_col)).max(1.0);
@@ -10366,6 +10278,28 @@ fn emit_ink(
         };
         arm_until(active_until, until);
     }
+}
+
+/// The §4.3/§3.1 legibility guard, per WORD per FRAME: pull the ink mix
+/// `strength` toward the captured base fg `fg_first` (the theme's own legible
+/// colour) in eighth-steps until every guard `sample`, mixed at that strength,
+/// clears [`MIN_INK_CONTRAST`] against a background of luminance `lum_bg`.
+/// Samples are tried in order and a pass stops at the first that fails.
+fn legible_strength(ink_strength: f32, fg_first: u32, samples: &[u32], lum_bg: f32) -> f32 {
+    let contrast = |c: u32| {
+        let la = relative_luminance(c);
+        (la.max(lum_bg) + 0.05) / (la.min(lum_bg) + 0.05)
+    };
+    let step = ink_strength.clamp(0.0, 1.0) / 8.0;
+    let mut strength = ink_strength.clamp(0.0, 1.0);
+    while strength > 0.0
+        && samples
+            .iter()
+            .any(|&c| contrast(mix_rgb(fg_first, c, strength)) < MIN_INK_CONTRAST)
+    {
+        strength = (strength - step).max(0.0);
+    }
+    strength
 }
 
 /// v3 §3.1 Rainbow colorway emission: per-lead-cell hue
@@ -10424,15 +10358,8 @@ fn emit_rainbow_ink(
     };
     // §3.1 legibility guard: min contrast over u ∈ {0, ⅓, ⅔, 1} (4
     // relative_luminance calls per pass — the single mid-gradient sample is
-    // blind to yellow/cyan washout); strength pulls toward the captured base
-    // fg in eighth-steps until every sample clears MIN_INK_CONTRAST.
-    let fg_first = rgb3_to_u32(base_fg[occ.ink_base]);
-    let contrast = |c: u32| {
-        let la = relative_luminance(c);
-        (la.max(lum_bg) + 0.05) / (la.min(lum_bg) + 0.05)
-    };
-    let step = cfg.ink_strength.clamp(0.0, 1.0) / 8.0;
-    let mut strength = cfg.ink_strength.clamp(0.0, 1.0);
+    // blind to yellow/cyan washout).
+    //
     // The four guard samples are LOOP-INVARIANT: `hue_at` reads `base_hue`,
     // `span_used`, `phase`, `sat` and `val` — every one of them fixed before
     // the loop starts — and NOT `strength`. A failing sample restarted the
@@ -10456,15 +10383,12 @@ fn emit_rainbow_ink(
         hue_at(2.0 / 3.0),
         hue_at(1.0),
     ];
-    'guard: while strength > 0.0 {
-        for hue in guard_hues {
-            if contrast(mix_rgb(fg_first, hue, strength)) < MIN_INK_CONTRAST {
-                strength = (strength - step).max(0.0);
-                continue 'guard;
-            }
-        }
-        break;
-    }
+    let strength = legible_strength(
+        cfg.ink_strength,
+        rgb3_to_u32(base_fg[occ.ink_base]),
+        &guard_hues,
+        lum_bg,
+    );
     // Per-LEAD-CELL hue (§3.1): u indexes lead cells, not columns.
     let denom = f32::from(occ.ink_cells.saturating_sub(1)).max(1.0);
     for i in 0..occ.ink_cells as usize {
@@ -10914,7 +10838,9 @@ pub(crate) fn u32_to_rgb3(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
-/// WCAG contrast ratio (≥ 1) between two `0x00RRGGBB` colours.
+/// WCAG contrast ratio (≥ 1) between two `0x00RRGGBB` colours — the tests'
+/// oracle for [`legible_strength`].
+#[cfg(test)]
 fn contrast_ratio(a: u32, b: u32) -> f32 {
     let (la, lb) = (relative_luminance(a), relative_luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)

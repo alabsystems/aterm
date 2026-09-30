@@ -612,11 +612,16 @@ aterm ctl exits 20 since=<id>        # the newest 20 with id > <id> — page wit
 socket dir). `2` = discovery only: found-but-unreachable, or a missing/unreadable/unresolvable
 dir (see above). **`124` = timeout** (client deadline, or server `OK timeout`, or a `turn`
 verdict with `status=timeout`; for discovery, every socket timed out). **`75`** = a
-`subscribe` or a blocking read (`text`, `wait`, `ready`, `await`, `inbox`) lost its instance
-and nothing replaced it within 30 s (less if `--timeout` ran out first): find the session
-with `ls` before you retry. Those follow a self-update, except `await seq <n>`, `await inbox
-since=`, `inbox` with arguments and a read naming its session `@<n>`, which exit 75 too; any
-other verb cut by an update exits 1.
+`subscribe`, a blocking read (`text`, `wait`, `ready`, `await`, `inbox`), a `turn` or a `post` lost its
+instance and nothing replaced it within 30 s (less if `--timeout` ran out first): find the
+session with `ls` before you retry. Those follow a self-update, except `await seq`, `await
+block`, `await consent` (each waits for a change after its arm, which the update may have
+made — read the session before waiting again), `await inbox since=`, `inbox` with arguments
+and a read naming its session `@<n>`, which exit 75 too — and a `turn`, which exits 75 and is
+never asked again: its text may already have been typed, so read the screen before you send
+it again — and a `post`, which exits 75 too: it may already be queued and carried to the
+successor under its id, so re-post it only with the same `key=`, or after `outbox` shows it
+gone. Any other verb cut by an update exits 1.
 
 Unit mismatch: the client's `--timeout` is in **SECONDS** (default 900, `0` disables);
 every server-side verb timeout is in **milliseconds**.

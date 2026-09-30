@@ -274,8 +274,9 @@ pub(crate) trait AppRt {
     }
 
     /// Spawn the process-wide notification delivery thread and return the bounded
-    /// `SyncSender` each tab clones into its engine callbacks. Off macOS this is the
-    /// channel-draining stub (senders never block; nothing is delivered).
+    /// `SyncSender` each tab clones into its engine callbacks. macOS and Windows
+    /// deliver; elsewhere this is the channel-draining stub (senders never block;
+    /// nothing is delivered).
     /// `own_alerts` is the live `desktop_alerts` switch: while it reads `false` the
     /// thread drops every notice aterm wrote itself ([`NotifyMsg::own`]).
     fn send_notification_init(

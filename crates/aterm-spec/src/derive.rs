@@ -1164,7 +1164,10 @@ pub use models_update_retired_intent::{
     native_update_failure_target_model, native_update_retired_intent_model,
 };
 pub use models_update_settings_draft_carry::native_update_settings_draft_carry_model;
-pub use models_update_successor_warm::native_update_successor_warm_before_claim_model;
+pub use models_update_successor_warm::{
+    native_update_successor_warm_before_claim_liveness,
+    native_update_successor_warm_before_claim_model,
+};
 pub use models_update_web_cache::native_update_web_cache_model;
 pub use models_update_window_show::native_update_window_show_model;
 

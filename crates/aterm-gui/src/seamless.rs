@@ -1187,27 +1187,36 @@ fn take_grid_capped(
 }
 
 /// Read, delete and decode one CONTROL CARRY sidecar at its exact `path`:
-/// `None` — the session adopts without it — when the stamp is malformed or
-/// names more than a sidecar may hold or the handoff has left, or the file is
-/// missing, bigger than stamped, truncated, of another sha, or not a sidecar
-/// this build reads. The file is deleted on every outcome that reaches it.
+/// `Err(cause)` — the session adopts without it, and the caller logs the
+/// cause — when the stamp is malformed or names more than a sidecar may hold
+/// or the handoff has left, or the file is missing, bigger than stamped,
+/// truncated, of another sha, or not a sidecar this build reads. The file is
+/// deleted on every outcome that reaches it.
 fn take_control_sidecar(
     path: &std::path::Path,
     dir: &std::path::Path,
     stamp: &str,
     remaining: &mut u64,
-) -> Option<crate::handoff_carry::ControlCarry> {
-    let Some(len) = crate::handoff_carry::stamp_len(stamp)
-        .filter(|&len| len <= crate::handoff_carry::MAX_SIDECAR_BYTES && len <= *remaining)
-    else {
+) -> Result<crate::handoff_carry::ControlCarry, &'static str> {
+    let Some(len) = crate::handoff_carry::stamp_len(stamp) else {
         let _ = std::fs::remove_file(path);
-        return None;
+        return Err("its manifest stamp is malformed");
     };
-    let bytes = take_regular_capped(path, dir, len)?;
+    if len > crate::handoff_carry::MAX_SIDECAR_BYTES {
+        let _ = std::fs::remove_file(path);
+        return Err("its stamp names more than one sidecar may hold");
+    }
+    if len > *remaining {
+        let _ = std::fs::remove_file(path);
+        return Err("the handoff's control-carry budget was spent");
+    }
+    let bytes = take_regular_capped(path, dir, len)
+        .ok_or("its sidecar is missing, not a regular file, or bigger than stamped")?;
     *remaining = remaining.saturating_sub(bytes.len() as u64);
-    crate::handoff_carry::stamp_matches(stamp, &bytes)
-        .then(|| crate::handoff_carry::decode(&bytes))
-        .flatten()
+    if !crate::handoff_carry::stamp_matches(stamp, &bytes) {
+        return Err("its sidecar is not the bytes the manifest stamped (length or sha)");
+    }
+    crate::handoff_carry::decode_why(&bytes)
 }
 
 /// The relation a meta value had to satisfy against its bound.
@@ -2304,18 +2313,22 @@ impl CarryRung {
         matches!(self, Self::Sanitized | Self::Repaint)
     }
 
-    /// The session's control carry (`handoff_carry::capture_head`) travels
-    /// with it only while the screen it describes is the one carried: its
-    /// differ state diffs the program's next frame against that screen.
+    /// The control carry's DIFFER STATE (`handoff_carry::capture_head`)
+    /// travels with the session only while the screen it describes is the
+    /// one carried: it diffs the program's next frame against that screen.
+    /// The rest of the control carry — the turn ledger and the archive's
+    /// scrolled-off rows — is not about the screen, and travels at every
+    /// rung (round seven, finding 24); without the differ's state the
+    /// adopting archive starts a new baseline behind a `restore` gap.
     ///
     /// [`Self::StrippedLinks`] keeps it: the differ's state is the rows'
-    /// TEXT (`AltArchiveDiffer::prev`/`below`), and the turn ledger is not
-    /// about the grid at all, so a screen that lost only its link
-    /// destinations is still the screen that state describes. Dropping it
-    /// would start the archive a new baseline behind a gap for no reason.
+    /// TEXT (`AltArchiveDiffer::prev`/`below`), so a screen that lost only
+    /// its link destinations is still the screen that state describes.
+    /// Dropping it would start the archive a new baseline behind a gap for
+    /// no reason.
     #[must_use]
     #[cfg(any(unix, test))]
-    pub(crate) const fn keeps_control_carry(self) -> bool {
+    pub(crate) const fn keeps_differ_state(self) -> bool {
         matches!(self, Self::Full | Self::VisibleOnly | Self::StrippedLinks)
     }
 }
@@ -4004,12 +4017,18 @@ pub(crate) fn write_outgoing_with_held(
     // THE CONTROL CARRY, after the commitment above on purpose: nothing here
     // is in it. Each sidecar joins `written_blobs`, so every failure below
     // retires it with the grids.
+    // A sidecar that does not go is SAID (round seven, finding 44): the
+    // session adopts with an empty ledger and a fresh archive.
     let mut aggregate_control = 0_u64;
     for (local_id, bytes) in controls {
         let len = bytes.len() as u64;
         if len > crate::handoff_carry::MAX_SIDECAR_BYTES
             || aggregate_control + len > crate::handoff_carry::MAX_AGGREGATE_BYTES
         {
+            aterm_log::warn!(
+                "update apply: session {local_id}'s control carry ({len} bytes) is past the \
+                 sidecar or aggregate cap; it hands off without its turn ledger and archive tail"
+            );
             continue;
         }
         let Some(rec) = manifest
@@ -4027,6 +4046,11 @@ pub(crate) fn write_outgoing_with_held(
             aggregate_control += len;
             written_blobs.push(path);
             rec.control = Some(crate::handoff_carry::stamp(bytes));
+        } else {
+            aterm_log::warn!(
+                "update apply: session {local_id}'s control carry could not be written; it hands \
+                 off without its turn ledger and archive tail"
+            );
         }
     }
     // THE HELD PANES, after the commitment above on purpose: nothing here is
@@ -4062,6 +4086,30 @@ pub(crate) fn write_outgoing_with_held(
         // cap is refused whole by every successor on every retry — say so
         // here, typed, instead of writing it.
         let Some(dropped) = manifest.held.pop() else {
+            // THE MAILBOX GIVES WAY BEFORE THE UPDATE DOES (round seven's
+            // review, item 1): the carried posts and owed receipts are the
+            // other optional part, so the largest session's carry sheds its
+            // rows — each post retired dead `not-carried` in the successor,
+            // each receipt counted — keeping its id counters, until the
+            // manifest fits. Only then is it refused.
+            if let Some(rec) = manifest
+                .sessions
+                .iter_mut()
+                .filter(|r| r.fabric.rows_cost() > 0)
+                .max_by_key(|r| r.fabric.rows_cost())
+            {
+                let posts = rec.fabric.posts.len();
+                let receipts = rec.fabric.receipts.len();
+                rec.fabric.shed();
+                aterm_log::warn!(
+                    "overlap handoff: session {} carries {posts} waiting post(s) and {receipts} \
+                     owed receipt(s) no further, to keep the manifest under the \
+                     {MAX_HANDOFF_MANIFEST_BYTES}-byte cap; the successor retires the posts \
+                     dead (`not-carried`)",
+                    rec.local_id
+                );
+                continue;
+            }
             for path in written_blobs {
                 let _ = std::fs::remove_file(path);
             }
@@ -4146,6 +4194,17 @@ pub(crate) struct IncomingHandoff {
     /// that was offered none. Decides the refusing successor's exit status
     /// ([`refused_intake_exit`]).
     pub refusal: Option<WholeRefusal>,
+    /// The outgoing store's exit-ledger sequence
+    /// ([`crate::session_store::SessionHandoff::roster_seq`]), which this
+    /// process's store counts on above before it registers a session (round
+    /// seven of the update audit, finding 49). `None` from a producer that
+    /// predates it, and for a boot that was offered no handoff.
+    pub roster_seq: Option<u64>,
+    /// The argv the outgoing process's bridge was attached to at runtime
+    /// ([`crate::session_store::SessionHandoff::fabric_attached`]), empty when
+    /// none — armed by this process's supervisor when it has no command
+    /// configured (round seven of the update audit, finding 7).
+    pub fabric_attached: Vec<String>,
 }
 
 /// WHOSE CONTENT A WHOLE-HANDOFF REFUSAL WAS ABOUT (round six of the update
@@ -6244,20 +6303,36 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
             let screen = admit_incoming_screen(meta, wire, &mut used_grid_cells);
             let repaint = sc.repaint || matches!(screen, IncomingScreen::Degraded { .. });
             // The CONTROL CARRY, best-effort: whatever happens to it, this
-            // session adopts. A REPAINTED session goes without it — the
-            // archive diffs the app's next frame against a screen that was not
-            // carried — and its sidecar is removed unread.
+            // session adopts. A REPAINTED session goes without its differ's
+            // state — the archive would diff the app's next frame against a
+            // screen that was not carried — but keeps its ledger and archive
+            // rows, which are not about the screen (round seven, finding 24).
             let control_path =
                 manifest_path.with_file_name(format!("{manifest_stem}.s{}.ctl", rec.local_id));
             let control = match shape {
-                ReceiverShape::Current if repaint => {
-                    if rec.control.is_some() {
-                        let _ = std::fs::remove_file(&control_path);
-                    }
-                    None
-                }
                 ReceiverShape::Current => rec.control.as_deref().and_then(|stamp| {
-                    take_control_sidecar(&control_path, &dir, stamp, &mut remaining_control_bytes)
+                    let mut control = take_control_sidecar(
+                        &control_path,
+                        &dir,
+                        stamp,
+                        &mut remaining_control_bytes,
+                    )
+                    // A LOST CARRY IS SAID (round seven, finding 44), as every
+                    // other degrade here is: the session's `history` starts
+                    // empty and its archive afresh, which reads like a session
+                    // nobody drove unless the log names the loss.
+                    .inspect_err(|cause| {
+                        aterm_log::warn!(
+                            "overlap handoff: session {} adopts without its control carry \
+                             (turn ledger, archive tail): {cause}",
+                            rec.local_id
+                        );
+                    })
+                    .ok()?;
+                    if repaint {
+                        control.without_differ();
+                    }
+                    Some(control)
                 }),
                 #[cfg(all(test, unix))]
                 ReceiverShape::PreCarry => None,
@@ -6377,6 +6452,11 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     outgoing_build: manifest.outgoing_build,
                     // An update's handoff: the keeper offered nothing here.
                     keeper: None,
+                    // THE MAILBOX AND THE TIMELINE'S COUNT (round seven,
+                    // findings 6/8/28/50), as the record carried them — the
+                    // mailbox re-validated row by row at the seed.
+                    fabric: rec.fabric.clone(),
+                    timeline_id: rec.timeline_id,
                 },
             })
         })
@@ -6503,6 +6583,8 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         unplaced_settings_drafts: unplaced_drafts,
         held,
         refusal: None,
+        roster_seq: manifest.roster_seq,
+        fabric_attached: manifest.fabric_attached,
     }
 }
 
@@ -7836,11 +7918,15 @@ pub(crate) mod tests {
                     attention_owners: Vec::new(),
                     viewport_from_bottom: None,
                     questions: None,
+                    fabric: Default::default(),
+                    timeline_id: 0,
                 })
                 .collect(),
             next_turn_id: None,
             outgoing_build: None,
             held: Vec::new(),
+            roster_seq: None,
+            fabric_attached: Vec::new(),
         };
         let fds = HandoffFds {
             entries: (0..TABS)
@@ -7913,6 +7999,56 @@ pub(crate) mod tests {
             .is_some(),
             "the successor's capped read takes it"
         );
+
+        // THE MAILBOX GIVES WAY BEFORE THE UPDATE DOES (round seven's review,
+        // item 1): the same settled desk, its broker down, every session
+        // holding a waiting post of ANSI colour codes — each escapes to six
+        // bytes per ESC, and together they are past what the cap leaves after
+        // the metas. The largest carries shed their rows (their ids named
+        // `uncarried`, their counters kept) and the manifest is written.
+        // RED before the fix: `ManifestOverCap`, on every retry.
+        let mut mailed = manifest.clone();
+        for rec in &mut mailed.sessions {
+            rec.fabric = crate::fabric::FabricCarry {
+                last_post_id: 7,
+                posts: vec![crate::fabric::PostCarry {
+                    id: 7,
+                    to: "@s-peer".to_string(),
+                    kind: "note".to_string(),
+                    re: None,
+                    dl: None,
+                    via: None,
+                    key: None,
+                    body: "\u{1b}[31m".repeat(10_000),
+                }],
+                ..Default::default()
+            };
+        }
+        let mail = mailed.to_toml().expect("serializes").len() as u64;
+        assert!(
+            cost(&pool) + mail > MAX_HANDOFF_MANIFEST_BYTES,
+            "PRECONDITION — the carried mail puts the manifest past its cap ({} + {mail})",
+            cost(&pool)
+        );
+        let nonce = mint_outgoing_nonce();
+        let outgoing = write_outgoing(&mailed, &fds, &screens, &[], None, &[], &nonce)
+            .expect("the mailbox sheds, the update is not refused");
+        let body = std::fs::read_to_string(&outgoing.manifest_path).expect("written");
+        assert!(body.len() as u64 <= MAX_HANDOFF_MANIFEST_BYTES);
+        let read = SessionHandoff::from_toml(body.split_once('\n').expect("nonce line").1)
+            .expect("the successor reads it");
+        let shed = read
+            .sessions
+            .iter()
+            .filter(|r| r.fabric.posts.is_empty())
+            .count();
+        assert!(shed > 0, "some carries shed");
+        for rec in &read.sessions {
+            assert_eq!(rec.fabric.last_post_id, 7, "the counters stay");
+            if rec.fabric.posts.is_empty() {
+                assert_eq!(rec.fabric.uncarried, [7], "a shed post is named");
+            }
+        }
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -7980,10 +8116,14 @@ pub(crate) mod tests {
                 attention_owners: Vec::new(),
                 viewport_from_bottom: None,
                 questions: None,
+                fabric: Default::default(),
+                timeline_id: 0,
             }],
             next_turn_id: None,
             outgoing_build: None,
             held: Vec::new(),
+            roster_seq: None,
+            fabric_attached: Vec::new(),
         };
         let fds = HandoffFds {
             entries: vec![(0, 100, 4000)],
@@ -9093,34 +9233,19 @@ pub(crate) mod tests {
         let mut live = Vec::new();
         let mut screens = Vec::new();
         for index in 0..sessions {
-            let (mut master, mut slave) = (0i32, 0i32);
-            // SAFETY: valid out-params; openpty fills them on success.
-            let rc = unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(rc, 0, "openpty {index}");
-            // Both ends CLOEXEC at once. The test binary runs hundreds of tests
-            // on parallel threads, and any of them that spawns a process while
-            // this fixture's PTYs are inheritable hands the child a copy: the
-            // master then never closes, and
-            // `a_refused_handoff_closes_every_master_it_was_handed` read its
-            // slave as `leaked` (the full-suite gate, 2026-09-26; 3/3 green
-            // alone). The handoff claims a descriptor by liveness (`F_GETFD`),
-            // never by its CLOEXEC bit, so nothing here needs them
-            // inheritable. The few instructions between `openpty` and these
-            // `F_SETFD`s remain a window.
-            for fd in [master, slave] {
-                // SAFETY: F_SETFD on a descriptor openpty just returned to this
-                // fixture; it sets only the close-on-exec flag.
-                let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-                assert_eq!(rc, 0, "cloexec {index}");
-            }
+            // Both ends CLOSE-ON-EXEC FROM BIRTH (`aterm_pty::open_pty_pair`).
+            // The test binary runs hundreds of tests on parallel threads, and
+            // any of them that spawns a process while this fixture's PTYs are
+            // inheritable hands the child a copy: the master then never
+            // closes, and `a_refused_handoff_closes_every_master_it_was_handed`
+            // read its slave as `leaked` (the full-suite gate, 2026-09-26; 3/3
+            // green alone). `openpty` + `F_SETFD` narrowed that to the few
+            // instructions between the two, which a loaded machine still
+            // stretched; the pair's own `O_CLOEXEC` opens leave none. The
+            // handoff claims a descriptor by liveness (`F_GETFD`), never by
+            // its CLOEXEC bit, so nothing here needs them inheritable.
+            let (master, slave) = aterm_pty::open_pty_pair()
+                .unwrap_or_else(|e| panic!("open a close-on-exec pty pair {index}: {e}"));
             slaves.push(slave);
             let local_id = index as u64;
             records.push(SessionRecord {
@@ -9158,6 +9283,8 @@ pub(crate) mod tests {
                 claim_known: false,
                 attention_owners: Vec::new(),
                 viewport_from_bottom: None,
+                fabric: Default::default(),
+                timeline_id: 0,
             });
             live.push((local_id, master, 4000 + index as i32));
             if let Some(carry) = carry {
@@ -9207,6 +9334,8 @@ pub(crate) mod tests {
             next_turn_id: carry.and_then(|c| c.next_turn_id),
             outgoing_build: Some(crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0)),
             held: Vec::new(),
+            roster_seq: None,
+            fabric_attached: Vec::new(),
         };
         let fds = HandoffFds {
             entries: live.clone(),
@@ -9911,7 +10040,13 @@ pub(crate) mod tests {
             let fabric = crate::fabric::SessionFabric::default();
             let timeline =
                 std::sync::Mutex::new(crate::session_timeline::SessionTimeline::default());
-            crate::spawn::seed_adopted_fabric(&fabric, &timeline, &a.topics, a.hold.as_deref());
+            crate::spawn::seed_adopted_fabric(
+                &fabric,
+                &timeline,
+                &a.topics,
+                a.hold.as_deref(),
+                &a.fabric,
+            );
             assert_eq!(fabric.hold(), want_hold, "session {}", a.local_id);
             let mut engine = term.lock().unwrap();
             match a.local_id {
@@ -10435,6 +10570,8 @@ pub(crate) mod tests {
             next_turn_id: None,
             outgoing_build: None,
             held: Vec::new(),
+            roster_seq: None,
+            fabric_attached: Vec::new(),
         };
         let nonce = "0123456789abcdef0123456789abcdef";
         let mut written = Vec::new();
@@ -10530,7 +10667,8 @@ pub(crate) mod tests {
     ///
     /// NEGATIVE CONTROL: make `HandedMaster`'s `Drop` a no-op and session 0's
     /// claimed master stays open; make `IncomingPtyGuard`'s `Drop` a no-op and
-    /// session 1's does. Either is the `BuggyDrop` step, and this test fails.
+    /// session 1's does. Either is the `BuggyDrop` step, and this test fails
+    /// once its 30 s wait for that slave's EOF runs out.
     #[test]
     #[cfg(unix)]
     fn a_refused_handoff_closes_every_master_it_was_handed() {
@@ -10598,6 +10736,36 @@ pub(crate) mod tests {
             witnesses.iter().all(|&slave| !master_closed(slave)),
             "PRECONDITION: every handed master is open before the handoff is taken"
         );
+        // After the refusal, WAIT FOR THE FACT — the slave's EOF — rather than
+        // read the slave once. A child another test's thread has forked and not
+        // yet exec'd holds a copy of every descriptor of this process, masters
+        // included, until its exec closes them (they are close-on-exec), and
+        // a loaded machine stretches that window to tens of milliseconds: a
+        // master this process has closed then still reads open for a moment.
+        // A master the refusal LEAKED never reads closed, however long the
+        // wait; the bound is that verdict's hang detector, not a measurement.
+        let master_closed_within = |slave: i32, hang: std::time::Duration| {
+            let started = std::time::Instant::now();
+            loop {
+                if master_closed(slave) {
+                    return true;
+                }
+                let left = hang.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return false;
+                }
+                let mut ready = libc::pollfd {
+                    fd: slave,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Wakes on the hangup; sliced to 10 ms so a platform whose
+                // slave never polls ready on it still reads the EOF promptly.
+                let slice = i32::try_from(left.as_millis().min(10)).unwrap_or(10);
+                // SAFETY: one live, owned pollfd and its exact count.
+                unsafe { libc::poll(&mut ready, 1, slice) };
+            }
+        };
 
         let (ready_read, ready_write) = pipe_pair("ready");
         let (commit_read, commit_write) = pipe_pair("commit");
@@ -10629,7 +10797,7 @@ pub(crate) mod tests {
         let mut closed = 0;
         for (local_id, &slave) in witnesses.iter().enumerate() {
             let what = format!("session {local_id}'s master");
-            if master_closed(slave) {
+            if master_closed_within(slave, std::time::Duration::from_secs(30)) {
                 closed += 1;
                 advance(&what, "CloseFallback", "closed", closed);
             } else {

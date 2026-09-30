@@ -1,11 +1,13 @@
-# PUBLIC BOUNDARY: the public snapshot's pin, copied over rust-toolchain.toml at
-# export (publish/transforms.sh). The public cannot resolve the locally linked
-# `trust` channel, so the exported source builds on stock Rust; the dev tree pins
-# the `trust` channel (owner directive 2026-09-28).
+# The Trust toolchain, always (owner directive 2026-09-28: every ALab system
+# builds with Trust). targo chooses the lane (`targo --unverified <verb>` or
+# `targo trust <verb>`), not this file; `aterm pkg which targo` shows which
+# store build answers, and crates/trust-gate refuses any other host compiler.
+#
+# Stock remains only where Trust lacks a capability (the cross lanes, the wasm32
+# lane among them: E0463, no std in the Trust sysroot; fuzz/miri/Kani), each
+# labelled at its point of use: `git grep -nE 'STOCK EXCEPTION|PUBLIC
+# BOUNDARY'` lists them all. The public snapshot keeps this pin (2026-09-29: a
+# public user installs aterm, and atpkg installs Trust).
+# The long pre-2026-09-28 rationale lives in this file at commit 3f91fbb1c.
 [toolchain]
-channel = "1.97.1"
-profile = "minimal"
-components = ["rustfmt", "clippy"]
-# crates/aterm-wasm (the in-browser engine) is built for this target, and the
-# release gate type-checks it for this target on this channel.
-targets = ["wasm32-unknown-unknown"]
+channel = "trust"

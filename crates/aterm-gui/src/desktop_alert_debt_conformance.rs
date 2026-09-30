@@ -23,6 +23,7 @@ fn escalation(session: u64, key: u64) -> Escalation {
         key,
         label: key.to_string(),
         body: "attention".to_string(),
+        headline: EscalationKind::Attention.headline(),
         shared: false,
     }
 }

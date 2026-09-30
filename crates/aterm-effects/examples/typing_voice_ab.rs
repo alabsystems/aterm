@@ -2,10 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! TYPING-VOICE A/B — the bench for the KEYSTROKE voice, the way
-//! `bed_audition` is the bench for the bed and `mix_meter` is the bench for
-//! the ladder. Neither of those can answer "does the typing still read as a
-//! phrase": `mix_meter` reports one isolated event's peak and `bed_audition`
-//! scores the BED by subtraction, treating the melody as a fixed reference.
+//! `mix_meter` is the bench for the ladder. That one cannot answer "does the
+//! typing still read as a phrase": `mix_meter` reports one isolated event's
+//! peak.
 //!
 //! Renders ONE typing script through the real synth in several states of the
 //! borrowed song key ([`TrailSynth`]'s `song_key`, latched by a riff bar) and
@@ -67,8 +66,7 @@ const SEED: u32 = 0xBEDA_0D10;
 type Cue = (f32, SoundGesture, f32, f32);
 
 /// The TYPING script every scenario shares, offset by `t0`: three paragraphs
-/// of 5-8 cps with pauses, an Enter, and a backspace correction — the same
-/// shape `bed_audition` uses, so the two harnesses read against each other.
+/// of 5-8 cps with pauses, an Enter, and a backspace correction.
 ///
 /// EVERY SIXTH CHARACTER IS A SPACE (2026-08-28). Until then this script cued
 /// Typed / Jump / Backspace and nothing else, so the SPACE — a per-character
@@ -78,7 +76,7 @@ type Cue = (f32, SoundGesture, f32, f32);
 /// every sixth is the real word cadence rather than a decoration. (The
 /// dedicated bench for that request is `keyboard_song_ab`, which types actual
 /// prose; this one keeps its own shape so its scenarios stay comparable
-/// against `bed_audition`.)
+/// with its earlier runs.)
 fn typing_script(t0: f32) -> Vec<Cue> {
     let mut cues: Vec<Cue> = Vec::new();
     let typing = |from: f32, to: f32, cps: f32, heat: f32, cues: &mut Vec<Cue>| {
@@ -381,7 +379,7 @@ fn render_one(sc: &Scenario) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// FFT (radix-2 DIT, hand-rolled — no dependency), lifted from bed_audition
+// FFT (radix-2 DIT, hand-rolled — no dependency)
 // ---------------------------------------------------------------------------
 
 fn fft(re: &mut [f32], im: &mut [f32]) {
@@ -527,7 +525,7 @@ fn rms_db(x: &[f32]) -> f64 {
 }
 
 /// Fraction of envelope-modulation energy in the 15-30 Hz sensory-roughness
-/// band (bed_audition's `mix_roughness_15_30hz`, same construction).
+/// band.
 fn roughness(x: &[f32]) -> f64 {
     const EW: usize = 64;
     let env: Vec<f32> = x

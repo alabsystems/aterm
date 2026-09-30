@@ -1379,11 +1379,10 @@ pub fn remove_all(layout: &Layout) {
 ///
 /// NO ROW REFUSES AN AGENT (decided with evidence, 2026-09-23). The stub answers a
 /// NAME looked up on PATH, and it cannot tell an agent's own `cargo` from a by-name
-/// spawn inside a tool that agent ran: aterm's own `xtask gate web` / `gate linux`
-/// and the cross cells spawn the rustup proxy `cargo` BY NAME with
-/// `RUSTUP_TOOLCHAIN=<stable>` — stock by design, the Trust sysroot carrying only
-/// its host std — so a refusal here would turn those gates red for every agent that
-/// runs them. What can refuse an agent's OWN command is its text: `aterm pkg lane`
+/// spawn inside a tool that agent ran (a build script, a Makefile, a project's own
+/// stock-toolchain lane — stock by design where the Trust sysroot carries only its
+/// host std), so a refusal here would turn those tools red for every agent that runs
+/// them. What can refuse an agent's OWN command is its text: `aterm pkg lane`
 /// ([`crate::lane`]) reads one command line, and a guard the owner wires calls it
 /// (an agent's `PreToolUse` hook, say). aterm installs nothing into an agent
 /// (decision "B", 2026-09-23), so it wires no such guard itself.

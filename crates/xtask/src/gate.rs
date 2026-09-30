@@ -57,27 +57,29 @@ pub(crate) fn verb_names() -> Vec<&'static str> {
     VERBS.iter().map(|(name, _)| *name).collect()
 }
 
-/// The census verbs retired on 2026-09-27, each with the `aterm-census` flag
-/// that runs it now, so a caller still typing the old name is told where it went.
-const RETIRED_CENSUS_VERBS: &[(&str, &str)] = &[
-    ("mainloop", "--mainloop"),
-    ("lockorder", "--locks"),
-    ("wasmloop", "--wasm"),
-    ("scope", "--scope"),
-    ("lazyinit", "--lazy-init"),
+/// The verbs retired on 2026-09-27 that still have a home, each with the package
+/// and argument that run it now, so a caller still typing the old name (the dated
+/// records under `docs/` keep it) is told where it went.
+const RETIRED_VERBS: &[(&str, &str, &str)] = &[
+    ("mainloop", "aterm-census", "--mainloop"),
+    ("lockorder", "aterm-census", "--locks"),
+    ("wasmloop", "aterm-census", "--wasm"),
+    ("scope", "aterm-census", "--scope"),
+    ("lazyinit", "aterm-census", "--lazy-init"),
+    ("perf", "xtask", "perf"),
 ];
 
 /// What `xtask gate` says when `check` names no verb it dispatches: the usage
 /// line for a bare `gate`, the verb list for an unknown one, and the new home
-/// of a retired census verb.
+/// of a retired verb.
 fn unknown_verb_message(check: Option<&str>) -> String {
     let Some(verb) = check else {
         return format!("usage: xtask gate <{}>", verb_names().join("|"));
     };
-    let moved = RETIRED_CENSUS_VERBS
+    let moved = RETIRED_VERBS
         .iter()
-        .find(|(old, _)| *old == verb)
-        .map(|(_, flag)| format!(" (now: targo --unverified run -p aterm-census -- {flag})"))
+        .find(|(old, ..)| *old == verb)
+        .map(|(_, package, arg)| format!(" (now: targo --unverified run -p {package} -- {arg})"))
         .unwrap_or_default();
     format!(
         "xtask gate: no verb `{verb}`{moved} — verbs: {}",
@@ -3478,8 +3480,8 @@ mod tests {
     }
 
     /// A bare `xtask gate` prints the usage line and an unknown verb the verb
-    /// list — never a Rust `Option` — and a census verb retired on 2026-09-27
-    /// says where it went.
+    /// list — never a Rust `Option` — and a verb retired on 2026-09-27 says
+    /// where it went.
     #[test]
     fn an_unknown_gate_verb_names_the_verbs_and_the_new_home_of_a_retired_one() {
         assert_eq!(
@@ -3495,9 +3497,14 @@ mod tests {
             "xtask gate: no verb `mainloop` (now: targo --unverified run -p aterm-census -- \
              --mainloop) — verbs: lint, forge, cells, cells-foreign"
         );
-        for (old, flag) in RETIRED_CENSUS_VERBS {
+        assert_eq!(
+            unknown_verb_message(Some("perf")),
+            "xtask gate: no verb `perf` (now: targo --unverified run -p xtask -- perf) — \
+             verbs: lint, forge, cells, cells-foreign"
+        );
+        for (old, package, arg) in RETIRED_VERBS {
             assert!(
-                unknown_verb_message(Some(old)).contains(&format!("aterm-census -- {flag})")),
+                unknown_verb_message(Some(old)).contains(&format!("-p {package} -- {arg})")),
                 "{old}"
             );
         }

@@ -631,6 +631,23 @@ impl WatcherSet {
         latched_any
     }
 
+    /// **Unseen time is not quiet time** — restart every un-latched `IdleFor`'s
+    /// deadline at `now + dur`. The host calls it instead of [`Self::expire`]
+    /// while this terminal's output is not being CONSUMED (its reader parked for
+    /// an update): the program may be printing into the kernel queue all the
+    /// while, so the silence the watcher would otherwise count is the host's,
+    /// not the program's. Idle is then measured afresh once output flows again.
+    pub fn restart_idle(&mut self, now: Instant) {
+        for w in &mut self.watchers {
+            if w.latched.is_some() {
+                continue;
+            }
+            if let WatcherSpec::IdleFor { dur } = w.spec {
+                w.deadline = Some(now + dur);
+            }
+        }
+    }
+
     /// **The idle-fire call** — run by the host when its armed `WaitUntil` wake
     /// reaches `now` (and once at a replay target). Latches every un-latched
     /// `IdleFor` / `MomentumBelow` whose deadline has passed, recording `at = deadline` (NOT `now`)
@@ -799,6 +816,13 @@ impl super::Terminal {
     /// Host-driven idle firing: latch any `IdleFor` whose deadline `<= now`.
     pub fn watch_expire(&mut self, now: Instant) -> bool {
         self.watchers.expire(now)
+    }
+
+    /// Host-driven idle HOLD: while the host consumes none of this terminal's
+    /// output, restart every pending `IdleFor` at `now` instead of firing it
+    /// ([`WatcherSet::restart_idle`]).
+    pub fn watch_restart_idle(&mut self, now: Instant) {
+        self.watchers.restart_idle(now);
     }
 
     /// `true` iff any watcher is armed (the producer's wake fan-out gate).
@@ -1017,6 +1041,31 @@ mod tests {
                 at: act + d
             })
         );
+    }
+
+    /// A restarted idle watcher waits its whole window again from the restart,
+    /// and a latched one keeps its latch (the host's park cannot un-say what
+    /// already held). NEGATIVE CONTROL: without the restart it fires at once.
+    #[test]
+    fn a_restarted_idle_waits_its_whole_window_again() {
+        let base = t0();
+        let d = Duration::from_millis(250);
+        let mut w = WatcherSet::default();
+        let id = w.arm(WatcherSpec::IdleFor { dur: d }, base).unwrap();
+        let later = base + Duration::from_millis(1000);
+        let mut control = w.clone();
+        control.expire(later);
+        assert!(control.poll(id).is_some(), "the window passed unseen");
+        w.restart_idle(later);
+        w.expire(later + d - Duration::from_millis(1));
+        assert!(
+            w.poll(id).is_none(),
+            "not before a whole window from the restart"
+        );
+        w.expire(later + d);
+        assert_eq!(w.poll(id).map(|s| s.at), Some(later + d));
+        w.restart_idle(later + Duration::from_secs(10));
+        assert_eq!(w.poll(id).map(|s| s.at), Some(later + d), "a latch stays");
     }
 
     #[test]

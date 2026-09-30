@@ -1144,6 +1144,13 @@ mod tests {
         ceiled(dir, Some(DEFAULT_CHILD_CEILING))
     }
 
+    /// The ceiling for a hung child whose OWN output a test then asserts: it has
+    /// to outlast `/bin/sh` starting and printing, which a loaded gate can
+    /// stretch past the 300 ms these tests used, killing the child before it
+    /// wrote a byte (sweep 4, 2026-09-29). The child sleeps 600 s after, so the
+    /// ceiling still always fires.
+    const PRINTS_FIRST: Duration = Duration::from_secs(5);
+
     fn ceiled(dir: &Path, child_ceiling: Option<Duration>) -> ExecEnv<'_> {
         ExecEnv {
             cwd: dir,
@@ -1444,7 +1451,7 @@ mod tests {
             vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
         )
         .preamble("     Running unittests src/lib.rs (target/debug/deps/x-abc)\n");
-        let r = run(&cmd, ceiled(&tmp, Some(Duration::from_millis(300))));
+        let r = run(&cmd, ceiled(&tmp, Some(PRINTS_FIRST)));
         assert!(!r.ok);
         let out = r.trimmed_output();
         assert!(
@@ -1550,14 +1557,14 @@ mod tests {
         let hang = Cmd::new("/bin/sh").args(["-c", "echo got-this-far; exec sleep 600"]);
 
         let t = Instant::now();
-        let r = run(&hang, ceiled(&tmp, Some(Duration::from_millis(300))));
+        let r = run(&hang, ceiled(&tmp, Some(PRINTS_FIRST)));
         let waited = t.elapsed();
 
         assert!(
             waited < Duration::from_secs(30),
             "the ceiling has to END the wait, not merely describe it (waited {waited:?})"
         );
-        assert!(waited >= Duration::from_millis(300), "and not end it early");
+        assert!(waited >= PRINTS_FIRST, "and not end it early");
         assert!(!r.ok, "a child that never finished is a FAILURE");
         assert!(
             r.spawn_error.is_none(),
@@ -1578,20 +1585,32 @@ mod tests {
             "{out}"
         );
         // The elapsed figure is a measurement, so only the LIMIT is asserted
-        // exactly; a loaded machine may overshoot 300 ms by a whole tick.
+        // exactly; a loaded machine may overshoot the ceiling by a whole tick.
         assert!(out.contains("child killed after "), "{out}");
-        assert!(out.contains("over the 0.3s wall-clock ceiling"), "{out}");
+        assert!(out.contains("over the 5.0s wall-clock ceiling"), "{out}");
         assert!(out.contains("--stage-timeout <seconds>"), "{out}");
         assert!(out.contains("--stage-timeout off"), "{out}");
         assert!(out.contains("whole process group"), "{out}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Is `pid` still a live (not zombie) process? Polls up to five seconds for
-    /// it to go, because a killed grandchild is reaped by launchd, not by us.
+    /// How long a grandchild that MUST be gone gets to go: a hang detector (a
+    /// killed grandchild is reaped by launchd, not by us, and a loaded box
+    /// takes its time). Every such grandchild is a `sleep 600`, so this stays
+    /// far below its own life.
     #[cfg(unix)]
-    fn gone_within_5s(pid: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    const GONE: Duration = Duration::from_secs(60);
+
+    /// How long a negative control's orphan must SURVIVE to count as left
+    /// behind. A window that can only go vacuous: kept short.
+    #[cfg(unix)]
+    const STILL_THERE: Duration = Duration::from_secs(5);
+
+    /// Is `pid` gone (or a zombie) within `window`? Polls, because a killed
+    /// grandchild is reaped by launchd, not by us.
+    #[cfg(unix)]
+    fn gone_within(pid: &str, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
         loop {
             let stat = std::process::Command::new("ps")
                 .args(["-o", "stat=", "-p", pid])
@@ -1652,7 +1671,7 @@ mod tests {
         assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
         let grandchild = read_pid(&pidfile);
         assert!(
-            gone_within_5s(&grandchild),
+            gone_within(&grandchild, GONE),
             "the grandchild {grandchild} outlived the ceiling kill"
         );
 
@@ -1668,7 +1687,7 @@ mod tests {
         let orphan = read_pid(&pidfile);
         child.kill().expect("kill");
         let _ = child.wait();
-        let survived = !gone_within_5s(&orphan);
+        let survived = !gone_within(&orphan, STILL_THERE);
         let _ = std::process::Command::new("/bin/kill")
             .args(["-KILL", &orphan])
             .status();
@@ -1772,12 +1791,12 @@ mod tests {
             "it still dies of SIGINT: {status:?}"
         );
         assert!(
-            gone_within_5s(&grandchild),
+            gone_within(&grandchild, GONE),
             "the grandchild {grandchild} outlived the interrupted gate"
         );
 
         let (_, orphan) = stand_in(&tmp.join("unhandled.pid"), false);
-        let survived = !gone_within_5s(&orphan);
+        let survived = !gone_within(&orphan, STILL_THERE);
         let _ = std::process::Command::new("/bin/kill")
             .args(["-KILL", &orphan])
             .status();
@@ -1850,7 +1869,7 @@ mod tests {
         );
         let grandchild = read_pid(&pidfile);
         assert!(
-            gone_within_5s(&grandchild),
+            gone_within(&grandchild, GONE),
             "{grandchild} outlived the kill"
         );
 
@@ -1863,7 +1882,7 @@ mod tests {
         assert!(!r.ok && r.output.contains("TIMEOUT"), "{}", r.output);
         let grandchild = read_pid(&pidfile);
         assert!(
-            gone_within_5s(&grandchild),
+            gone_within(&grandchild, GONE),
             "{grandchild} outlived the kill"
         );
         assert!(
@@ -1900,7 +1919,7 @@ mod tests {
         assert!(waited < Duration::from_secs(30), "{waited:?}");
         let grandchild = read_pid(&pidfile);
         assert!(
-            gone_within_5s(&grandchild),
+            gone_within(&grandchild, GONE),
             "{grandchild} outlived the kill"
         );
         std::fs::remove_dir_all(&tmp).ok();
@@ -1969,7 +1988,7 @@ mod tests {
         );
         assert!(trapped, "the graceful child's EXIT trap ran");
         assert!(
-            gone_within_5s(&grandchild),
+            gone_within(&grandchild, GONE),
             "{grandchild} outlived the gate"
         );
         assert!(
@@ -1980,7 +1999,7 @@ mod tests {
         let (status, grandchild, _, trapped) = stand_in(&tmp.join("plain"), false);
         assert_eq!(status.signal(), Some(2), "{status:?}");
         assert!(
-            gone_within_5s(&grandchild),
+            gone_within(&grandchild, GONE),
             "{grandchild} outlived the gate"
         );
         assert!(
@@ -2004,19 +2023,19 @@ mod tests {
         let hang = Cmd::new("/bin/sh").args(["-c", script]);
 
         let t = Instant::now();
-        let r = run(&hang, ceiled(&tmp, Some(Duration::from_millis(300))));
+        let r = run(&hang, ceiled(&tmp, Some(PRINTS_FIRST)));
         let waited = t.elapsed();
 
         // Everything the plain ceiling test holds, holds here too.
         assert!(waited < Duration::from_secs(30), "waited {waited:?}");
-        assert!(waited >= Duration::from_millis(300), "and not end it early");
+        assert!(waited >= PRINTS_FIRST, "and not end it early");
         assert!(!r.ok, "a child that never finished is a FAILURE");
         assert!(r.spawn_error.is_none());
         assert_eq!(r.code, None, "killed by a signal, so there is no exit code");
         let out = r.trimmed_output();
         assert!(out.contains("  child: /bin/sh -c printf "), "{out}");
         assert!(out.contains("child killed after "), "{out}");
-        assert!(out.contains("over the 0.3s wall-clock ceiling"), "{out}");
+        assert!(out.contains("over the 5.0s wall-clock ceiling"), "{out}");
         assert!(out.contains("--stage-timeout <seconds>"), "{out}");
         assert!(out.contains("--stage-timeout off"), "{out}");
         assert!(out.contains("whole process group"), "{out}");

@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use harness::{until, World, FLEET};
+use harness::{until, World, DEADLINE, FLEET};
 
 /// The words that must never leave the screen.
 const SENTINEL: &str = "SECRET-TRANSCRIPT-TEXT";
@@ -146,8 +146,11 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
 }
 
 /// Wait for the row to carry `key=value`, asserting on every read that no
-/// row ever carried the sentinel; answers how long it took.
-fn until_field(w: &World, sid: &str, key: &str, want: &str, budget: Duration) -> Duration {
+/// row ever carried the sentinel; answers how long it took. The wait is the
+/// harness's [`DEADLINE`], a hang detector: nothing bounds the answer (it is
+/// printed as the measurement), and the loop leaves the moment the row lands.
+fn until_field(w: &World, sid: &str, key: &str, want: &str) -> Duration {
+    let budget = DEADLINE;
     let started = Instant::now();
     let mut last = None;
     loop {
@@ -235,13 +238,7 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     assert!(set.ok(), "meta set role: {}", set.header());
     let set = w.verb(&format!("@{sid} meta set title satcomp run"));
     assert!(set.ok(), "meta set title: {}", set.header());
-    let took = until_field(
-        &w,
-        &sid,
-        "role",
-        "worker%20satcomp",
-        Duration::from_secs(15),
-    );
+    let took = until_field(&w, &sid, "role", "worker%20satcomp");
     eprintln!(
         "MEASURED meta set role -> role= on the bus: {} ms",
         took.as_millis()
@@ -268,7 +265,7 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     assert!(sent.ok(), "send: {}", sent.header());
     let started = Instant::now();
     assert!(w.verb(&format!("@{sid} key enter")).ok());
-    until_field(&w, &sid, "phase", "busy", Duration::from_secs(20));
+    until_field(&w, &sid, "phase", "busy");
     eprintln!(
         "MEASURED spinner painted -> phase=busy on the bus: {} ms",
         started.elapsed().as_millis()
@@ -286,7 +283,7 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     // figure, so no row carries `context=`.
     let flipped_at = Instant::now();
     assert!(w.verb(&format!("@{sid} key enter")).ok());
-    until_field(&w, &sid, "phase", "idle", Duration::from_secs(20));
+    until_field(&w, &sid, "phase", "idle");
     eprintln!(
         "MEASURED turn ended on screen -> phase=idle on the bus: {} ms",
         flipped_at.elapsed().as_millis()
@@ -297,7 +294,7 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
     // ENTER: a question.
     let asked_at = Instant::now();
     assert!(w.verb(&format!("@{sid} key enter")).ok());
-    until_field(&w, &sid, "phase", "question", Duration::from_secs(20));
+    until_field(&w, &sid, "phase", "question");
     eprintln!(
         "MEASURED question painted -> phase=question on the bus: {} ms",
         asked_at.elapsed().as_millis()
@@ -363,13 +360,7 @@ fn a_minimal_bridge_writes_attention_alone() {
     assert!(w
         .verb(&format!("@{sid} meta set attention needs-a-key"))
         .ok());
-    let took = until_field(
-        &w,
-        &sid,
-        "attention",
-        "needs-a-key",
-        Duration::from_secs(15),
-    );
+    let took = until_field(&w, &sid, "attention", "needs-a-key");
     eprintln!(
         "MEASURED meta set attention -> attention= on the bus (minimal): {} ms",
         took.as_millis()
@@ -421,12 +412,12 @@ fn a_meta_change_after_the_first_read_rides_the_push_alone() {
 
     // THE FIRST READ: the row is on the bus and its slot is sampled.
     assert!(w.verb(&format!("@{sid} meta set role first-read")).ok());
-    until_field(&w, &sid, "role", "first-read", Duration::from_secs(15));
+    until_field(&w, &sid, "role", "first-read");
 
     // THE PUSH CARRIES A LATER CHANGE.
     let set_at = Instant::now();
     assert!(w.verb(&format!("@{sid} meta set attention pushed-a")).ok());
-    until_field(&w, &sid, "attention", "pushed-a", Duration::from_secs(15));
+    until_field(&w, &sid, "attention", "pushed-a");
     eprintln!(
         "MEASURED meta set attention (sampled slot) -> attention= on the bus: {} ms",
         set_at.elapsed().as_millis()
@@ -442,7 +433,7 @@ fn a_meta_change_after_the_first_read_rides_the_push_alone() {
         .verb(&format!("@{sid} send /bin/sh {}", witness.display()))
         .ok());
     assert!(w.verb(&format!("@{sid} key enter")).ok());
-    until_field(&w, &sid, "detail", "r13witness", Duration::from_secs(20));
+    until_field(&w, &sid, "detail", "r13witness");
     let body = presence(&w, &sid).expect("the row");
     assert_eq!(
         kv(&body, "attention"),
@@ -454,5 +445,5 @@ fn a_meta_change_after_the_first_read_rides_the_push_alone() {
     // THE PUSH RESTORED CARRIES THE NEXT CHANGE.
     std::fs::remove_file(&marker).expect("disarm the dropped push");
     assert!(w.verb(&format!("@{sid} meta set attention pushed-c")).ok());
-    until_field(&w, &sid, "attention", "pushed-c", Duration::from_secs(15));
+    until_field(&w, &sid, "attention", "pushed-c");
 }

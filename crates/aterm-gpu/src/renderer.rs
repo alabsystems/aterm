@@ -23531,7 +23531,9 @@ impl GpuRenderer {
         // substitute (risk 6): poll both handles to terminal instead of
         // parking on `waitUntilCompleted`.
         let ticket = frame.present(&session)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // A hang detector for the GPU's completion, which the poll returns on
+        // the moment both handles turn terminal.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             match (submitted.try_outcome(), ticket.try_outcome()) {
                 (Some(s), Some(t)) => {

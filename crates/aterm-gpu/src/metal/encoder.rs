@@ -2014,8 +2014,10 @@ mod tests {
             if let Some(o) = b.try_outcome() {
                 break o;
             }
+            // A hang detector: B's completion is the GPU's, and the loop
+            // breaks the moment the status poll sees it.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(8),
+                started.elapsed() < std::time::Duration::from_secs(60),
                 "B never turned terminal — status polling is broken"
             );
             std::hint::spin_loop();

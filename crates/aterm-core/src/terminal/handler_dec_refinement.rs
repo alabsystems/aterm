@@ -263,6 +263,14 @@ impl TerminalHandler<'_> {
         if opening {
             self.transient.sync_open_dirty = false;
         }
+        // The program's own episode opens only when the PROGRAM has none
+        // open: a `?2026h` after the terminal's timeout force-clear reopens
+        // the mode, but the frame the program began is still unfinished, and
+        // its writes are still on the grid.
+        if !self.transient.app_sync_open {
+            self.transient.app_sync_open = true;
+            self.transient.app_sync_dirty = false;
+        }
     }
 
     #[cfg_attr(
@@ -277,6 +285,8 @@ impl TerminalHandler<'_> {
         self.modes.synchronized_output = false;
         self.transient.sync_start = None;
         self.transient.sync_open_dirty = false;
+        self.transient.app_sync_open = false;
+        self.transient.app_sync_dirty = false;
         // ESU: one sync window closed — a complete frame is ready. The host's
         // present-hold releases on this edge (see `Terminal::sync_end_seq`).
         self.transient.sync_end_seq += 1;

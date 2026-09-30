@@ -895,10 +895,30 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
 /// subscriber, and parks on its wake — driven by output / exit notifications and
 /// the idle deadline. The registry lifecycle is re-checked on each wake, and a
 /// session exit `notify`s us (`Wake::Exit`), so an exit is reported promptly.
+/// How often a wait re-reads the park while its session's reader is parked
+/// for an update (round seven of the update audit, findings 62 and 63): the
+/// kernel's idle deadline says nothing then, so the wait polls the park
+/// instead, to take up its own clock the moment output flows again.
+const PARKED_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Fire the idle watchers that are due — unless this session's output is not
+/// being consumed (`SessionCtx::update_parked`), when their clocks are held
+/// instead: the silence of a parked reader is the host's, not the program's,
+/// and `ready`/`await idle`/a `turn`'s idle settle answered "idle" over a
+/// program still printing into the kernel queue (finding 62).
+fn fire_idle_unless_parked(t: &mut Terminal, now: std::time::Instant, parked: bool) {
+    if parked {
+        t.watch_restart_idle(now);
+    } else {
+        t.watch_expire(now);
+    }
+}
+
 pub(crate) fn cmd_ready(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
     session: u64,
+    ctx: &SessionCtx,
     rest: &str,
     subscribers: &crate::subscribe::Subscribers,
 ) -> String {
@@ -967,6 +987,7 @@ pub(crate) fn cmd_ready(
             return crate::control::HUNG_UP_REPLY.to_string();
         }
         let now = Instant::now();
+        let parked = ctx.update_parked.load(std::sync::atomic::Ordering::Acquire);
         let (prompt, settled, next_dl) = {
             let mut t = term_lock(term);
             // Shell-integration fast path: newest block prompt/complete => ready
@@ -975,7 +996,7 @@ pub(crate) fn cmd_ready(
                 t.all_blocks().last().map(|b| b.state),
                 Some(BlockState::PromptOnly | BlockState::Complete)
             );
-            t.watch_expire(now); // host-injected idle fire
+            fire_idle_unless_parked(&mut t, now, parked); // host-injected idle fire
             let settled = idle_id.and_then(|id| t.watch_poll(id)).is_some();
             (prompt, settled, t.watch_next_deadline())
         };
@@ -999,6 +1020,9 @@ pub(crate) fn cmd_ready(
         let mut wake = deadline;
         if let Some(dl) = next_dl {
             wake = wake.min(dl);
+        }
+        if parked {
+            wake = wake.min(now + PARKED_POLL);
         }
         let dur = wake
             .saturating_duration_since(now)
@@ -1166,10 +1190,24 @@ pub(crate) fn cmd_await(
             }
             "seq" => {
                 // Default `after` = the current content_seq (wait for the NEXT change).
+                let current = t.content_seq();
                 let after = args
                     .get(1)
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| t.content_seq());
+                    .unwrap_or(current);
+                // AN ANCHOR FROM THE FUTURE IS AN ANCHOR FROM ELSEWHERE (round
+                // seven of the update audit, finding 29): the counter only
+                // rises within one grid, so a `<n>` above it was read off
+                // another grid (the screen switched since — a change) or
+                // another process (an update's successor starts its count
+                // over — output since the handoff is a change too). Parked,
+                // it waited for the new count to pass the old one and
+                // answered `OK timeout` — "nothing changed", even to the
+                // `timeout=0` dirty check — over a moving screen. Latched at
+                // once instead, with the seq to anchor on next.
+                if after > current {
+                    return format!("OK seq {current}\n");
+                }
                 t.watch(WatcherSpec::SeqAdvanced { after }, now0)
             }
             "block" => t.watch(WatcherSpec::BlockComplete, now0),
@@ -1221,9 +1259,12 @@ pub(crate) fn cmd_await(
             return crate::control::HUNG_UP_REPLY.to_string();
         }
         let now = Instant::now();
+        let parked = ctx.update_parked.load(std::sync::atomic::Ordering::Acquire);
         let (sat, next_dl) = {
             let mut t = term_lock(term);
-            t.watch_expire(now); // fire any elapsed idle deadline (host-injected `now`)
+            // Fire any elapsed idle deadline (host-injected `now`) — held
+            // while the session's reader is parked for an update.
+            fire_idle_unless_parked(&mut t, now, parked);
             (t.watch_poll(id), t.watch_next_deadline())
         };
         if let Some(s) = sat {
@@ -1241,6 +1282,9 @@ pub(crate) fn cmd_await(
         let mut wake = overall;
         if let Some(dl) = next_dl {
             wake = wake.min(dl);
+        }
+        if parked {
+            wake = wake.min(now + PARKED_POLL);
         }
         let dur = wake
             .saturating_duration_since(now)
@@ -1380,6 +1424,11 @@ fn await_agent(
 /// before it still means "after turn n".
 static NEXT_TURN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Mint the next turn id (see [`NEXT_TURN_ID`]).
+fn mint_turn_id() -> u64 {
+    NEXT_TURN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// The last turn id minted — by this process, or by the one it continued the
 /// count from ([`raise_turn_ids`]); 0 before either — for the handoff manifest.
 pub(crate) fn turn_ids_minted() -> u64 {
@@ -1398,6 +1447,44 @@ pub(crate) fn raise_turn_ids(minted: u64) {
         minted.min(crate::handoff_carry::MAX_TURN_ID),
         std::sync::atomic::Ordering::Relaxed,
     );
+}
+
+/// How many turn ids a self-update leaves this process between the park's
+/// manifest and its `_exit` ([`turn_ids_for_handoff`]). The parent serves the
+/// control socket until Commit, and a `turn` in that overlap mints an id; the
+/// successor counts on from above the reserve, so no id is ever handed to two
+/// turns (round seven, finding 22) — a `report`, `history since=` or
+/// `since-turn=` naming an overlap id never reads another exchange. A turn in
+/// the overlap is not activity that vetoes an update: only a process that
+/// mints more than this many in one overlap stands its Commit down
+/// ([`turn_ids_past_handoff_ceiling`]), a lossless retry.
+pub(crate) const TURN_ID_RESERVE: u64 = 1 << 12;
+
+/// The turn-id count a handoff manifest carries: the ids minted so far plus
+/// [`TURN_ID_RESERVE`] (never past what a manifest can hold). The caller
+/// keeps it on its ATTEMPT (`HandoffAttemptArbiter::set_turn_id_ceiling`), so
+/// the Commit checks the ceiling of the manifest its successor consumed
+/// ([`turn_ids_past_handoff_ceiling`]).
+#[cfg(any(unix, test))]
+pub(crate) fn turn_ids_for_handoff() -> u64 {
+    turn_ids_minted()
+        .saturating_add(TURN_ID_RESERVE)
+        .min(crate::handoff_carry::MAX_TURN_ID)
+}
+
+/// Whether this process has minted a turn id past `ceiling`, the count the
+/// attempt's handoff manifest carried: the successor would mint it again, so
+/// the Commit stands down (and the next attempt carries a fresh count). A
+/// `ceiling` of 0 — an attempt whose manifest was never written — is none.
+#[cfg(any(unix, test))]
+pub(crate) fn turn_ids_past_handoff_ceiling(ceiling: u64) -> bool {
+    past_ceiling(turn_ids_minted(), ceiling)
+}
+
+/// [`turn_ids_past_handoff_ceiling`]'s rule: `ceiling` 0 is none.
+#[cfg(any(unix, test))]
+const fn past_ceiling(minted: u64, ceiling: u64) -> bool {
+    ceiling > 0 && minted > ceiling
 }
 
 /// Input delivery for [`cmd_turn`], resolved by the dispatch site so the ONE
@@ -1640,6 +1727,18 @@ enum OnHangup {
 /// is a real event or a deadline the kernel named. On a lane serving a
 /// socket connection the park also wakes every [`crate::control::HANGUP_POLL`]
 /// (200 ms) to ask whether the caller hung up ([`crate::control::hangup_park`]).
+///
+/// `parked` is the session's update park (`SessionCtx::update_parked`) and the
+/// latest `until` may be stretched to (round seven of the update audit,
+/// findings 62 and 63): while the reader is parked, idle clocks are held
+/// ([`fire_idle_unless_parked`]) and the window does not close — the time
+/// spent parked is added to `until`, never past that bound — because an
+/// absent echo then says nothing about the press or the program. `None` for a
+/// wait the park does not touch (the momentum ribbon is the window's).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the one park every turn phase shares; its collaborators are independent"
+)]
 fn park_watch(
     term: &Arc<Mutex<Terminal>>,
     exited: &dyn Fn() -> bool,
@@ -1647,8 +1746,11 @@ fn park_watch(
     id: aterm_core::terminal::WatchId,
     until: std::time::Instant,
     on_hangup: OnHangup,
+    parked: Option<(&std::sync::atomic::AtomicBool, std::time::Instant)>,
 ) -> Phase {
     use std::time::{Duration, Instant};
+    let mut until = until;
+    let mut parked_since: Option<Instant> = None;
     loop {
         if exited() {
             term_lock(term).watch_disarm(id);
@@ -1662,22 +1764,42 @@ fn park_watch(
             return Phase::HungUp;
         }
         let now = Instant::now();
+        let is_parked =
+            parked.is_some_and(|(flag, _)| flag.load(std::sync::atomic::Ordering::Acquire));
+        match (is_parked, parked_since) {
+            (true, None) => parked_since = Some(now),
+            (false, Some(since)) => {
+                // The window resumes with what it had left when the park began.
+                let bound = parked.map_or(until, |(_, bound)| bound);
+                until = (until + now.saturating_duration_since(since)).min(bound.max(until));
+                parked_since = None;
+            }
+            _ => {}
+        }
         let (sat, next_dl) = {
             let mut t = term_lock(term);
-            t.watch_expire(now);
+            fire_idle_unless_parked(&mut t, now, is_parked);
             (t.watch_poll(id), t.watch_next_deadline())
         };
         if sat.is_some() {
             term_lock(term).watch_disarm(id);
             return Phase::Latched;
         }
-        if now >= until {
+        // Parked, only the stretch bound ends the window.
+        let closes = match parked {
+            Some((_, bound)) if is_parked => bound.max(until),
+            _ => until,
+        };
+        if now >= closes {
             term_lock(term).watch_disarm(id);
             return Phase::Deadline;
         }
-        let mut wake = until;
+        let mut wake = closes;
         if let Some(dl) = next_dl {
             wake = wake.min(dl);
+        }
+        if is_parked {
+            wake = wake.min(now + PARKED_POLL);
         }
         let dur = wake
             .saturating_duration_since(now)
@@ -1761,7 +1883,7 @@ pub(crate) fn park_until_momentum_below(
         let Some(id) = armed else {
             return MomentumWait::Unreadable(WAITS_FULL.to_string());
         };
-        match park_watch(term, exited, sub, id, until, OnHangup::Abort) {
+        match park_watch(term, exited, sub, id, until, OnHangup::Abort, None) {
             // The crossing passed: confirm on a fresh reading (the loop head),
             // which is also where a re-lit ribbon gets its next crossing.
             Phase::Latched => {}
@@ -2257,7 +2379,21 @@ pub(crate) fn cmd_turn_guarded(
                 crate::Lease::Drive { holder, .. } => format!("ERR busy lease={holder}\n"),
             };
         }
-        let id = NEXT_TURN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // The ledger owes this id a record from here (or its abandonment, by
+        // the guard below): a handoff that exports the ledger meanwhile does
+        // not vouch for it (`TurnLedger::carry_floor`). MINTED under the
+        // ledger's own lock, the one `handoff_carry::export` takes (it never
+        // takes the lease lock): an export either sees the id open, or ran
+        // before it was minted. The latter is a turn begun after the export,
+        // a stated residual: it records only in this process, and the
+        // successor's ledger does not know it was lost (round seven, finding
+        // 23; the parked readers make a turn in that window rare).
+        let id = {
+            let mut turns = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
+            let id = mint_turn_id();
+            turns.begin(id);
+            id
+        };
         // The lease names its issuer — the dispatch site's resolution of the
         // connection's scope ([`TurnIo::driver`]) — so the presence band and
         // `status hand=` credit the hand that is actually on the keyboard.
@@ -2276,6 +2412,9 @@ pub(crate) fn cmd_turn_guarded(
         /// lock-order census (OB-7) resolves this Drop-path acquisition to the
         /// same `turn_lease` identity as the acquire above.
         turn_lease: &'a std::sync::Mutex<Option<crate::Lease>>,
+        /// `ctx.turns`, NAMED for the census like `turn_lease`: the ledger
+        /// this turn's id was opened in.
+        turns: &'a std::sync::Mutex<crate::turn_ledger::TurnLedger>,
         /// This turn's own id. The guard clears the slot ONLY if it still holds THIS
         /// turn's lease — so a `lease release force` preemption of a WEDGED turn
         /// (whose driver crashed) followed by a fresh turn acquiring the slot is not
@@ -2292,6 +2431,14 @@ pub(crate) fn cmd_turn_guarded(
     }
     impl Drop for LeaseGuard<'_> {
         fn drop(&mut self) {
+            // A turn that ends without its record owes none any more (a
+            // no-op once `TurnLedger::record` took it). Before the lease, so
+            // the order is the acquire's: never the ledger under the lease
+            // here — a leaf lock, released at once.
+            self.turns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .abandon(self.id);
             let mut lease = self.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
             if matches!(lease.as_ref(), Some(crate::Lease::Turn { id: held, .. }) if *held == self.id)
             {
@@ -2307,6 +2454,7 @@ pub(crate) fn cmd_turn_guarded(
     }
     let lease_guard = LeaseGuard {
         turn_lease: &ctx.turn_lease,
+        turns: &ctx.turns,
         id: turn_id,
         sid: &ctx.self_id,
         driver: io.driver.as_ref(),
@@ -2358,11 +2506,14 @@ pub(crate) fn cmd_turn_guarded(
     // for the phases between the first typed byte and a verified submit,
     // which a hangup must not cut short (see [`OnHangup::Finish`]).
     let exited_now = || exited(store);
+    // Both hold their clocks while the session's reader is parked for an
+    // update, stretched never past the turn's own deadline (findings 62/63).
+    let parked = Some((&ctx.update_parked, deadline));
     let wait = |id: aterm_core::terminal::WatchId, until: Instant| -> Phase {
-        park_watch(term, &exited_now, &sub, id, until, OnHangup::Abort)
+        park_watch(term, &exited_now, &sub, id, until, OnHangup::Abort, parked)
     };
     let wait_committed = |id: aterm_core::terminal::WatchId, until: Instant| -> Phase {
-        park_watch(term, &exited_now, &sub, id, until, OnHangup::Finish)
+        park_watch(term, &exited_now, &sub, id, until, OnHangup::Finish, parked)
     };
     // Arm a watcher; None (budget full) fails the whole verb honestly.
     let arm = |spec: WatcherSpec| -> Option<aterm_core::terminal::WatchId> {
@@ -2503,6 +2654,15 @@ pub(crate) fn cmd_turn_guarded(
             // still unread in its queue would only stack another behind it
             // (2026-09-24, `input_stall::repress_would_queue`).
             if press_no > 0 && crate::input_stall::repress_would_queue(&ctx.sink) {
+                break;
+            }
+            // NEVER A RE-PRESS INTO A PARKED SESSION (round seven of the update
+            // audit, finding 63): its echo cannot be seen until the reader
+            // runs again, so a window without one says nothing about the press
+            // — and a second Enter can confirm whatever the program shows next
+            // (a permission box's default). The window only closes parked at
+            // the turn's own deadline; the press is judged as unverified.
+            if press_no > 0 && ctx.update_parked.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
             let base_block = commands_started(&term_lock(term));
@@ -2724,9 +2884,12 @@ pub(crate) fn cmd_turn_guarded(
     // promise them) are the SAME values `history` later reports for this id.
     let dur_ms = now0.elapsed().as_millis() as u64;
     let screen_hash = crate::turn_ledger::fnv1a_64(screen.as_bytes());
-    {
+    // `record` keeps the ids rising in landing order: a turn a `lease release
+    // force` preempted, finishing after the one that took its slot, is
+    // re-numbered, and its verdict prints the id it was recorded under.
+    let turn_id = {
         let mut ledger = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
-        ledger.push(crate::turn_ledger::TurnRecord {
+        let record = crate::turn_ledger::TurnRecord {
             id: turn_id,
             started_ms,
             dur_ms,
@@ -2740,8 +2903,9 @@ pub(crate) fn cmd_turn_guarded(
             seq,
             arch,
             carried: false,
-        });
-    }
+        };
+        ledger.record(record, mint_turn_id)
+    };
     // Wake any `events` subscriber NOW so it scans the fresh record immediately
     // rather than on its next timeout tick — the same content-less notify the
     // output/exit producers use (the ledger write above is the scannable state).
@@ -2799,7 +2963,11 @@ pub(crate) fn cmd_turn_guarded(
 /// `" text="`), so a field after it would be read as part of the message — as
 /// does ` carried=1`, printed on a record a self-update handoff carried from the
 /// previous process ([`crate::turn_ledger::TurnRecord::carried`]: its
-/// `started_ms` and `seq` are that process's).
+/// `started_ms` and `seq` are that process's). A ledger an update could not
+/// carry whole adds ` unheld_below=<id>` to the header (after the count)
+/// when that floor is above the `since=` anchor and above the oldest record
+/// the ledger holds: records of turn ids below it may be gone rather than
+/// absent.
 pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     let mut n = 0usize;
     let mut since: Option<u64> = None;
@@ -2825,7 +2993,22 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
         recs.len().saturating_sub(n)
     };
     let recs = recs.skip(skip);
-    let mut out = format!("OK {}\n", recs.len());
+    let mut out = format!("OK {}", recs.len());
+    // A LEDGER A HANDOFF COULD NOT CARRY WHOLE says so (round seven, finding
+    // 58): records under ids below its floor may be gone, not absent, so an
+    // empty or short reply is not "no turn landed". Only when the floor is
+    // above the anchor — a `since=` past it lost nothing — and after the
+    // count, where every reader of the header already allows fields. Only
+    // while the floor lies inside the window this ledger answers for
+    // (`TurnLedger::live_floor`): once the records under it are evicted, it
+    // is stale noise a supervisor's every `drive ledger` would repeat.
+    if let Some(floor) = ledger
+        .live_floor()
+        .filter(|&floor| since.is_none_or(|anchor| anchor.saturating_add(1) < floor))
+    {
+        out.push_str(&format!(" unheld_below={floor}"));
+    }
+    out.push('\n');
     for r in recs {
         out.push_str(&format!(
             "turn {} submitted={} status={} started_ms={} dur_ms={} seq={} hash={:016x} arch={}{} text={}\n",
@@ -4163,6 +4346,23 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Round seven, finding 22: the count a handoff manifest carries leaves
+    /// room for the turns the parent still serves before its `_exit`, so the
+    /// successor never mints an id the parent already replied with; only a
+    /// parent that outruns the reserve stands its Commit down.
+    #[test]
+    fn the_handoff_turn_count_leaves_room_for_turns_in_the_overlap() {
+        let carried = super::turn_ids_for_handoff();
+        let overlap = super::mint_turn_id();
+        assert!(
+            overlap <= carried,
+            "an id minted after the manifest ({overlap}) is one the successor, counting \
+             on from {carried}, never mints"
+        );
+        assert!(!super::past_ceiling(carried, carried));
+        assert!(super::past_ceiling(carried + 1, carried));
+        assert!(!super::past_ceiling(u64::MAX, 0), "no manifest, no ceiling");
+    }
     use super::*;
     use aterm_session::{EdgeTable, LaunchNonce};
 
@@ -4460,6 +4660,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         });
         SessionHandle {
             sid,
@@ -5190,6 +5391,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         }
     }
 
@@ -5722,5 +5924,280 @@ mod exits_tests {
             row.ends_with(&format!(" reason=ctl-close exit_code=- by={caller_sid}")),
             "{row}"
         );
+    }
+}
+
+/// ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 29, 49 AND 50: the per-instance
+/// counters a driver pages or waits by keep their meaning across a seamless
+/// update — the exit ledger's and the timeline's ids go on above the old
+/// process's (carried on the manifest), and a content sequence from before it
+/// is recognised as one rather than parked on.
+#[cfg(test)]
+mod update_anchor_tests {
+    use super::{cmd_await, cmd_exits, cmd_timeline};
+    use crate::session_store::{
+        ExitActor, ExitReason, SessionHandoff, SessionStore, new_store, test_handle,
+    };
+
+    /// FINDING 49: `exits since=<id>` from before an update still means "after
+    /// that row" on the successor. FAILS WITHOUT THE FIX: the successor's
+    /// journal counts 1..3 again and the page answers `OK 0` (measured with
+    /// `continue_roster_seq` a no-op).
+    #[test]
+    fn exits_ids_keep_rising_across_a_handoff() {
+        let mut producer = SessionStore::default();
+        for local in 1..=3 {
+            producer.register(test_handle(local));
+        }
+        producer.deregister_local_as(3, ExitReason::ShellExit, ExitActor::Human);
+        assert_eq!(producer.roster_seq(), 4);
+        let manifest = SessionHandoff::from_store(&producer);
+        let read = SessionHandoff::from_toml(&manifest.to_toml().unwrap()).unwrap();
+        assert_eq!(read.roster_seq, Some(4));
+
+        // The successor's store, as `main_entry` makes it: the carried count
+        // first, then the adopted sessions.
+        let successor = new_store();
+        successor
+            .write()
+            .unwrap()
+            .continue_roster_seq(read.roster_seq.unwrap());
+        for rec in &read.sessions {
+            successor
+                .write()
+                .unwrap()
+                .register(test_handle(rec.local_id));
+        }
+        successor
+            .write()
+            .unwrap()
+            .deregister_local_as(1, ExitReason::ShellExit, ExitActor::Human);
+        let page = cmd_exits(&successor, "since=4");
+        assert!(page.starts_with("OK 1\n"), "{page}");
+        assert!(page.contains("reason=shell-exit"), "{page}");
+        // An older producer's manifest carries none: nothing is raised.
+        let old = SessionHandoff::from_toml(
+            "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-old\"\nstate = \"alive\"\ntitle = \"zsh\"\n",
+        )
+        .expect("an old manifest reads");
+        assert_eq!(old.roster_seq, None);
+    }
+
+    /// FINDING 50: an adopted session's timeline goes on above the id the
+    /// record carried, so a pre-update `timeline since=<id>` sees the
+    /// `handoff` row and what follows. FAILS WITHOUT THE FIX: the handoff row
+    /// is id 1 and the page answers `OK 0`.
+    #[test]
+    fn an_adopted_timeline_is_visible_to_a_pre_update_since_anchor() {
+        let producer = test_handle(1);
+        for i in 0..57 {
+            producer
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .record("meta-change", format!("n={i}"));
+        }
+        let producer_timeline = std::sync::Arc::clone(&producer.ctx.timeline);
+        let mut store = SessionStore::default();
+        store.register(producer);
+        let manifest = SessionHandoff::from_store(&store);
+        let read = SessionHandoff::from_toml(&manifest.to_toml().unwrap()).unwrap();
+        // `register` recorded `spawned` as well: 58 rows, and the overlap's
+        // reserve above them.
+        let reserve = crate::session_timeline::HANDOFF_ID_RESERVE;
+        assert_eq!(read.sessions[0].timeline_id, 58 + reserve);
+
+        // THE OVERLAP (round seven's review, item 2): the old process goes on
+        // recording after the draw, and a driver pages past those events —
+        // `since=60` here. FAILS WITHOUT THE FIX: the successor's `handoff`
+        // row was id 59, below the anchor, and the page hid it.
+        for i in 0..2 {
+            producer_timeline
+                .lock()
+                .unwrap()
+                .record("meta-change", format!("overlap={i}"));
+        }
+        assert!(!producer_timeline.lock().unwrap().past_handoff_ceiling());
+
+        let adopted = test_handle(1);
+        crate::spawn::mark_handoff_gap(
+            &adopted.ctx.timeline,
+            &adopted.ctx.cast,
+            &adopted.ctx.temporal,
+            Some(7),
+            read.sessions[0].timeline_id,
+        );
+        adopted
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .record("meta-change", "after".to_string());
+        let page = cmd_timeline(&adopted.ctx, "since=60");
+        assert!(page.starts_with("OK 2\n"), "{page}");
+        assert!(
+            page.contains(&format!("event {} ", 59 + reserve)) && page.contains("kind=handoff"),
+            "{page}"
+        );
+        // A process that outruns the reserve says so: the Commit stands down.
+        {
+            let mut tl = producer_timeline.lock().unwrap();
+            for _ in 0..reserve {
+                tl.record("meta-change", String::new());
+            }
+            assert!(tl.past_handoff_ceiling());
+        }
+    }
+
+    /// FINDING 29: a `seq` anchor above the current count (one read off the
+    /// instance an update replaced) answers at once with the current seq —
+    /// never `OK timeout`, "unchanged", over a moving screen. NEGATIVE
+    /// CONTROL: an anchor at the current count still waits for a change.
+    /// FAILS WITHOUT THE FIX: `OK timeout`.
+    #[test]
+    fn a_seq_anchor_from_another_process_answers_at_once() {
+        let handle = test_handle(0);
+        let store = new_store();
+        let registry = crate::subscribe::new_registry();
+        handle.term.lock().unwrap().process(b"x");
+        let current = handle.term.lock().unwrap().content_seq();
+        assert_eq!(
+            cmd_await(
+                &handle.term,
+                &store,
+                0,
+                &handle.ctx,
+                "seq 100000 timeout=0",
+                &registry
+            ),
+            format!("OK seq {current}\n")
+        );
+        assert_eq!(
+            cmd_await(
+                &handle.term,
+                &store,
+                0,
+                &handle.ctx,
+                &format!("seq {current} timeout=0"),
+                &registry
+            ),
+            "OK timeout\n"
+        );
+    }
+}
+
+/// ROUND SEVEN OF THE UPDATE AUDIT, FINDINGS 62 AND 63: while a session's PTY
+/// reader is parked for an update (`SessionCtx::update_parked`), nothing on
+/// this side consumes its output, so the silence is not the program's: an idle
+/// wait does not latch on it, and a `turn`'s submit window neither closes nor
+/// presses Enter again.
+#[cfg(test)]
+mod update_park_wait_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{TurnIo, cmd_await, cmd_ready, cmd_turn};
+    use crate::session_store::{new_store, test_handle};
+
+    /// FINDING 62. FAILS WITHOUT THE FIX: both latch within their windows
+    /// (`OK idle …`, `OK ready idle`) with the reader parked.
+    #[test]
+    fn idle_waits_do_not_latch_on_a_parked_readers_silence() {
+        let handle = test_handle(0);
+        let store = new_store();
+        let registry = crate::subscribe::new_registry();
+        handle.term.lock().unwrap().process(b"tick\r\n");
+        handle.ctx.update_parked.store(true, Ordering::Release);
+        assert_eq!(
+            cmd_await(
+                &handle.term,
+                &store,
+                0,
+                &handle.ctx,
+                "idle 60 timeout=400",
+                &registry
+            ),
+            "OK timeout\n"
+        );
+        assert_eq!(
+            cmd_ready(&handle.term, &store, 0, &handle.ctx, "400", &registry),
+            "OK timeout\n"
+        );
+        // Unparked mid-wait: the idle window is measured from the resume, in
+        // full — never from before the park.
+        let resumer = {
+            let ctx = handle.ctx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                ctx.update_parked.store(false, Ordering::Release);
+                Instant::now()
+            })
+        };
+        let reply = cmd_await(
+            &handle.term,
+            &store,
+            0,
+            &handle.ctx,
+            "idle 200 timeout=60000",
+            &registry,
+        );
+        let latched = Instant::now();
+        let resumed = resumer.join().unwrap();
+        assert!(reply.starts_with("OK idle "), "{reply}");
+        assert!(
+            latched >= resumed + Duration::from_millis(150),
+            "a whole window after the resume, not {:?}",
+            latched.saturating_duration_since(resumed)
+        );
+        // NEGATIVE CONTROL: unparked, the same wait latches on true quiet.
+        assert!(
+            cmd_await(
+                &handle.term,
+                &store,
+                0,
+                &handle.ctx,
+                "idle 60 timeout=2000",
+                &registry
+            )
+            .starts_with("OK idle ")
+        );
+    }
+
+    /// FINDING 63: a `turn` whose Enter lands while the reader is parked
+    /// presses it ONCE — the absent echo says nothing then — however many
+    /// presses it was allowed. FAILS WITHOUT THE FIX: three presses, one per
+    /// submit window. NEGATIVE CONTROL: unparked, a swallowed press is pressed
+    /// again, as before.
+    #[test]
+    fn a_turn_across_an_update_park_presses_submit_once() {
+        let run = |parked: bool| -> usize {
+            let handle = test_handle(0);
+            let store = new_store();
+            let registry = crate::subscribe::new_registry();
+            handle.ctx.update_parked.store(parked, Ordering::Release);
+            let presses = AtomicUsize::new(0);
+            let paste = |_: &str| true;
+            let press = |_: &str| {
+                presses.fetch_add(1, Ordering::SeqCst);
+                true
+            };
+            let _ = cmd_turn(
+                &handle.term,
+                &store,
+                0,
+                "idle=50 timeout=1200 submit_window=150 presses=3 hello",
+                &registry,
+                &handle.ctx,
+                &TurnIo {
+                    paste: &paste,
+                    press: &press,
+                    ..TurnIo::paste_only()
+                },
+            );
+            presses.load(Ordering::SeqCst)
+        };
+        assert_eq!(run(true), 1, "one Enter into a parked session");
+        assert_eq!(run(false), 3, "a swallowed press is re-pressed unparked");
     }
 }

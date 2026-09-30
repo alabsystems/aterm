@@ -3119,7 +3119,9 @@ mod tests {
     fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
         use std::os::unix::process::ExitStatusExt as _;
         let bin = std::path::Path::new("/stage/ship/aterm");
-        let wait = std::time::Duration::from_secs(5);
+        // A hang detector for `sh` + `touch` (a loaded box can take seconds to
+        // start a shell); it returns as soon as the socket file appears.
+        let wait = std::time::Duration::from_secs(60);
         let turn_out = |code: i32, verdict: &str, rows: &str| std::process::Output {
             status: std::process::ExitStatus::from_raw(code << 8),
             stdout: rows.as_bytes().to_vec(),
@@ -3135,6 +3137,7 @@ mod tests {
         };
         // The fake instance: the real command's --control-sock operand becomes a file,
         // then it sleeps until reaped — standing in for the translated headless aterm.
+        // Its sleep outlives `wait`, so it can only end by the reap.
         let fake_instance = |command: &mut std::process::Command| {
             let args: Vec<String> = command
                 .get_args()
@@ -3149,7 +3152,7 @@ mod tests {
             let sock = &args[args.iter().position(|a| a == "--control-sock").unwrap() + 1];
             std::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(format!("touch '{sock}'; exec sleep 30"))
+                .arg(format!("touch '{sock}'; exec sleep 120"))
                 .spawn()
         };
 

@@ -225,8 +225,7 @@ pub use extract::{
 };
 pub use flow::{
     AppliedMember, ChannelApplyReport, DepOutcome, DepResult, Fetcher, FlowError, InstallReport,
-    InstallRequest, VendorFetchError, VendorGet, apply_channel, apply_channel_with, install,
-    resolve_verified_index,
+    InstallRequest, VendorFetchError, VendorGet, apply_channel, install, resolve_verified_index,
 };
 pub use gate::ApplyDecision;
 pub use install::{StageError, verify_and_stage};

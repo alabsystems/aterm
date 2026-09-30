@@ -164,27 +164,119 @@ pub fn resolve_aterm_config_path(
 /// Return the user's data directory.
 ///
 /// - **macOS**: `$HOME/Library/Application Support`
-/// - **Linux**: `$XDG_DATA_HOME` or `$HOME/.local/share`
+/// - **Linux**: `$XDG_DATA_HOME` (absolute) or `$HOME/.local/share`
 /// - **Windows**: `%LOCALAPPDATA%`
+///
+/// [`resolve_data_dir`] is the rule; this reads the variables it consults.
 #[must_use]
 pub fn data_dir() -> Option<PathBuf> {
+    resolve_data_dir(data_platform())
+}
+
+/// The platform inputs [`resolve_data_dir`] and [`resolve_aterm_data_dir`] read,
+/// captured so the rule is testable without mutating the process environment.
+#[derive(Debug, Default, Clone)]
+pub struct DataPlatform {
+    /// `$HOME` (`%USERPROFILE%`), as [`home_dir`] gives it; read on macOS and Linux.
+    pub home: Option<PathBuf>,
+    /// `$XDG_DATA_HOME`, consulted only on Linux (and only when absolute).
+    pub xdg_data_home: Option<PathBuf>,
+    /// `%LOCALAPPDATA%`, consulted only on Windows.
+    pub local_app_data: Option<PathBuf>,
+}
+
+/// The live environment as [`DataPlatform`].
+fn data_platform() -> DataPlatform {
+    DataPlatform {
+        home: home_dir(),
+        xdg_data_home: std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+    }
+}
+
+/// The pure half of [`data_dir`]: the OS data directory per platform.
+#[must_use]
+pub fn resolve_data_dir(platform: DataPlatform) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        home_dir().map(|h| h.join("Library/Application Support"))
+        let _ = (&platform.xdg_data_home, &platform.local_app_data);
+        platform.home.map(|h| h.join("Library/Application Support"))
     }
     #[cfg(target_os = "linux")]
     {
-        xdg_dir("XDG_DATA_HOME").or_else(|| home_dir().map(|h| h.join(".local/share")))
+        let _ = &platform.local_app_data;
+        platform
+            .xdg_data_home
+            .filter(|p| p.is_absolute())
+            .or_else(|| platform.home.map(|h| h.join(".local/share")))
     }
     #[cfg(windows)]
     {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        let _ = (&platform.home, &platform.xdg_data_home);
+        platform.local_app_data
     }
     // wasm and other targets have no OS data dir.
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
+        let _ = platform;
         None
     }
+}
+
+/// aterm's DATA root — the folder of what a window keeps between its own launches:
+/// the restore manifest (`session.toml`), the crash journals beside it, and the
+/// cell-metrics cache. ONE rule for all three:
+///
+/// - in a development build only, the `ATERM_STATE_HOME` seam ([`crate::dev_seam!`],
+///   read as [`state_dir`] reads it; the override root itself, and a relative value is
+///   refused as `None`, as [`state_dir`] refuses it) — so an instance given its own
+///   state root also keeps its layout and its journals there (ruling 406,
+///   2026-09-29). Before, these followed only the OS data dir: an instance on the
+///   owner's `$HOME` with its own state root took the owner's `session.toml` and
+///   claimed — and deleted — the owner's dead journals, whose crash evidence sits in
+///   a logs folder it could not see;
+/// - otherwise [`data_dir`]`/aterm`, exactly as before on every platform (on Linux
+///   that is `$XDG_DATA_HOME`/`.local/share`, NOT [`state_dir`]'s `.local/state`: a
+///   shipped path does not move).
+///
+/// `None` only when nothing resolves (a relative override, or no data dir).
+#[must_use]
+pub fn aterm_data_dir() -> Option<PathBuf> {
+    resolve_aterm_data_dir(
+        crate::dev_seam!("ATERM_STATE_HOME").map(PathBuf::from),
+        data_platform(),
+    )
+}
+
+/// The pure half of [`aterm_data_dir`]: `override_root` is `$ATERM_STATE_HOME`.
+#[must_use]
+pub fn resolve_aterm_data_dir(
+    override_root: Option<PathBuf>,
+    platform: DataPlatform,
+) -> Option<PathBuf> {
+    if let Some(root) = override_root {
+        // Relative is refused, not resolved, as `resolve_state_dir` refuses it.
+        return root.is_absolute().then_some(root);
+    }
+    resolve_data_dir(platform).map(|data| data.join("aterm"))
+}
+
+/// Whether this process runs under a PRIVATE state root: a development build's
+/// `ATERM_STATE_HOME` seam is set ([`crate::dev_seam!`], so a shipped binary answers
+/// `false` whatever its environment holds). A relative or empty value counts: it
+/// resolves no root ([`aterm_data_dir`], [`state_dir`]), but the process asked for one
+/// of its own, so it never stands in for the person whose `$HOME` it shares.
+///
+/// What it gates is what such a process writes to the MACHINE (ruling 409,
+/// 2026-09-29): the `[machine]` settings (Universal Control, Spotlight) are the Mac's,
+/// not the instance's, so a launch's daily apply (`atpkg::machine::launch_apply_due`),
+/// a package pass's carried `[machine]` edit and Settings' Apply now stand aside under
+/// it, and a window says so to the passes it spawns (`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`,
+/// ruling 410), since the `atpkg` beside a development build may compile no seam. `aterm
+/// pkg machine apply` typed by a person still applies.
+#[must_use]
+pub fn runs_under_private_state_root() -> bool {
+    crate::dev_seam!("ATERM_STATE_HOME").is_some()
 }
 
 /// aterm's own STATE root — where it keeps what it owns across launches (the
@@ -343,14 +435,6 @@ pub fn resolve_logs_dir(
 #[must_use]
 pub fn identities_dir() -> Option<PathBuf> {
     state_dir().map(|state| state.join("identities"))
-}
-
-/// Read an XDG env var, returning `None` if unset or not an absolute path.
-#[cfg(target_os = "linux")]
-fn xdg_dir(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var)
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
 }
 
 #[cfg(test)]
@@ -538,6 +622,110 @@ mod tests {
         }
         let _ = &platform;
         assert_eq!(resolve_logs_dir(None, StatePlatform::default()), None);
+    }
+
+    /// THE DATA ROOT RULE (ruling 406, 2026-09-29), pure: the state-home seam is the
+    /// data root itself when absolute — the restore manifest and the crash journals
+    /// follow an instance given its own state root — and is refused when relative,
+    /// never falling through to the owner's folder; unset, it is the OS data dir's
+    /// `aterm`, the path they always had, on each platform arm.
+    #[test]
+    fn aterm_data_dir_follows_the_state_home_seam_and_else_the_os_data_dir() {
+        let platform = DataPlatform {
+            home: Some(PathBuf::from("/Users//who")),
+            xdg_data_home: Some(PathBuf::from("/xdg/data")),
+            local_app_data: Some(PathBuf::from(r"C:\Users\who\AppData\Local")),
+        };
+        // Per host, for the reason `state_dir_honours_an_absolute_override_…` gives.
+        #[cfg(not(windows))]
+        let absolute_override = PathBuf::from("/tmp/aterm-state");
+        #[cfg(windows)]
+        let absolute_override = PathBuf::from(r"C:\tmp\aterm-state");
+        assert_eq!(
+            resolve_aterm_data_dir(Some(absolute_override.clone()), platform.clone()),
+            Some(absolute_override.clone()),
+            "the override is the root itself, no `aterm` appended"
+        );
+        assert_eq!(
+            resolve_aterm_data_dir(Some(absolute_override.clone()), platform.clone()),
+            resolve_state_dir(Some(absolute_override.clone()), StatePlatform::default()),
+            "under the seam the data root IS the state root"
+        );
+        for relative in ["relative/state", "./state", ""] {
+            assert_eq!(
+                resolve_aterm_data_dir(Some(PathBuf::from(relative)), platform.clone()),
+                None,
+                "a relative override ({relative:?}) is refused, never the owner's folder"
+            );
+        }
+        let unset = resolve_aterm_data_dir(None, platform.clone());
+        assert_eq!(
+            unset,
+            resolve_data_dir(platform.clone()).map(|data| data.join("aterm")),
+            "unset, it is the OS data dir's `aterm`"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            unset,
+            Some(PathBuf::from(
+                "/Users//who/Library/Application Support/aterm"
+            ))
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(unset, Some(PathBuf::from("/xdg/data/aterm")));
+            assert_eq!(
+                resolve_aterm_data_dir(
+                    None,
+                    DataPlatform {
+                        xdg_data_home: Some(PathBuf::from("relative")),
+                        ..platform.clone()
+                    }
+                ),
+                Some(PathBuf::from("/Users//who/.local/share/aterm")),
+                "a relative XDG_DATA_HOME falls through to the home default — the data \
+                 dir, never the state dir's `.local/state`"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            unset,
+            Some(PathBuf::from(r"C:\Users\who\AppData\Local\aterm"))
+        );
+        assert_eq!(
+            resolve_aterm_data_dir(None, DataPlatform::default()),
+            None,
+            "nothing to resolve from is None, not a panic"
+        );
+        // The live resolvers ARE the rules over the live environment.
+        assert_eq!(data_dir(), resolve_data_dir(data_platform()));
+        if crate::dev_seam!("ATERM_STATE_HOME").is_none() {
+            assert_eq!(aterm_data_dir(), data_dir().map(|data| data.join("aterm")));
+        }
+    }
+
+    /// A PRIVATE STATE ROOT IS THE SEAM BEING SET, and nothing else (ruling 409): the
+    /// helper reads the same seam `aterm_data_dir` and `state_dir` read, so a process
+    /// they place in its own root is one that leaves the machine's `[machine]` settings
+    /// alone. The environment is not mutated here (no lock in this crate), so this only
+    /// checks agreement with whatever the runner inherited, and with the seam unset a
+    /// helper that always answered `false` would pass it (ruling 410). The helper's pin is
+    /// at the process edge: atpkg's `tests/machine_edge.rs` sets the seam unset, absolute,
+    /// empty and relative on a real `atpkg` pass. The decisions that take the answer are
+    /// pinned with it injected (`atpkg::machine`'s `launch_apply_decision`, the window's
+    /// `packages_request_refusal` and `pass_lead`).
+    #[test]
+    fn a_private_state_root_is_the_state_home_seam_set() {
+        let seam = crate::dev_seam!("ATERM_STATE_HOME");
+        assert_eq!(runs_under_private_state_root(), seam.is_some());
+        // A relative or empty value resolves no root, and still counts as a private one.
+        if seam
+            .as_deref()
+            .is_some_and(|v| !std::path::Path::new(v).is_absolute())
+        {
+            assert_eq!(aterm_data_dir(), None);
+            assert!(runs_under_private_state_root());
+        }
     }
 
     #[test]

@@ -2075,6 +2075,13 @@ fn cli_parses_the_whole_spec_5_surface() {
     assert_eq!(parse(&[]).unwrap(), cli::Cmd::Help);
     assert_eq!(parse(&["--help"]).unwrap(), cli::Cmd::Help);
     assert_eq!(parse(&["status"]).unwrap(), cli::Cmd::Status);
+    assert_eq!(parse(&["check"]).unwrap(), cli::Cmd::Check { commit: None });
+    assert_eq!(
+        parse(&["check", "--commit", "f37ddc740"]).unwrap(),
+        cli::Cmd::Check {
+            commit: Some("f37ddc740".to_string())
+        }
+    );
     assert_eq!(
         parse(&["provision", "--id", "m2"]).unwrap(),
         cli::Cmd::Provision {
@@ -2334,6 +2341,16 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
             "--release-credentials given twice",
         ),
         (vec!["status", "extra"], "no arguments"),
+        (vec!["check", "extra"], "check takes only --commit"),
+        (vec!["check", "--commit"], "--commit needs a commit"),
+        (
+            vec!["check", "--commit", "--dry-run"],
+            "--commit needs a commit",
+        ),
+        (
+            vec!["check", "--commit", "a", "--commit", "b"],
+            "--commit given twice",
+        ),
         (vec!["recover", "v0.55.0"], "full claim SHA"),
         (
             vec!["recover", "v0.55.0", "abc", "extra"],

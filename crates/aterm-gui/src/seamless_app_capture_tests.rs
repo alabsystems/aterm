@@ -229,7 +229,7 @@ fn hand_over_as(
         pool_ids,
         "{at}: every handed session carries a screen"
     );
-    let (repainted, controlled) = match carried_as {
+    let (repainted, with_differ) = match carried_as {
         Carried::Exact => (Vec::new(), pool_ids.clone()),
         Carried::Blank => (pool_ids.clone(), Vec::new()),
     };
@@ -246,8 +246,19 @@ fn hand_over_as(
                 .iter()
                 .map(crate::handoff_carry::CarrySource::local_id)
         ),
-        controlled,
-        "{at}: every session carried at an exact rung keeps its control carry, and a blank \
+        pool_ids,
+        "{at}: every session keeps its control carry (ledger and archive rows)"
+    );
+    assert_eq!(
+        ids_of(
+            &mut parked
+                .carries
+                .iter()
+                .filter(|source| source.carries_differ())
+                .map(crate::handoff_carry::CarrySource::local_id)
+        ),
+        with_differ,
+        "{at}: every session carried at an exact rung keeps its differ's state, and a blank \
          one has none"
     );
     assert_eq!(
@@ -329,7 +340,7 @@ fn hand_over_as(
     let controls = crate::handoff_carry::export(&parked.carries);
     let mut manifest = parked.manifest.clone();
     manifest.next_turn_id =
-        crate::handoff_carry::manifest_turn_id(crate::control::turn_ids_minted());
+        crate::handoff_carry::manifest_turn_id(crate::control::turn_ids_for_handoff());
     // The lanes hand the successor close-on-exec DUPLICATES of the masters;
     // the successor, played in this process, owns them from here (it closes
     // them itself if it refuses). A stub session has no child, so its pid on

@@ -84,6 +84,13 @@ fn id_at_off(w: &World, sid: &str, off: u64) -> Option<u64> {
     })
 }
 
+/// The fair wait every [`poll`] here takes: the harness's minute. Each one is
+/// for a record that must land (an ack, an `expired`), returns the moment it
+/// does, and is read by an assertion that fails if it never did — so it is a
+/// hang detector, and the ten seconds it was (which included up to a 5 s
+/// `RECONNECT_MAX` back-off) read a loaded gate as a lost record.
+const FAIR_WAIT_MS: u64 = 60_000;
+
 /// Poll `f` for up to `ms`; `None` when it never answered (NOT a panic) —
 /// for the counts that must be read after a fair wait whatever they are.
 fn poll<T>(ms: u64, mut f: impl FnMut() -> Option<T>) -> Option<T> {
@@ -169,7 +176,7 @@ fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
     ));
     let notes = lane_len(&w, &note_lane);
 
-    let _ = poll(10_000, || (lane_len(&w, &ack_lane) > 0).then_some(()));
+    let _ = poll(FAIR_WAIT_MS, || (lane_len(&w, &ack_lane) > 0).then_some(()));
     // Saying the same word again must not ack twice.
     let again = w.verb(&format!("@{b} inbox seen {id} handled"));
     assert!(again.ok());
@@ -218,7 +225,7 @@ fn x1c_receipt_given_during_a_seconds_long_outage_is_not_lost() {
     // THE OUTAGE: a few seconds, i.e. several back-off rounds.
     std::thread::sleep(Duration::from_millis(3_000));
     start_broker(&mut w);
-    let _ = poll(10_000, || (lane_len(&w, &ack_lane) > 0).then_some(()));
+    let _ = poll(FAIR_WAIT_MS, || (lane_len(&w, &ack_lane) > 0).then_some(()));
     let acks = lane_len(&w, &ack_lane);
     let again = w.verb(&format!("@{b} inbox seen {id} handled"));
     assert!(again.ok());
@@ -272,7 +279,7 @@ fn x1b_receipt_given_while_the_bridge_restarts_is_not_lost() {
             .contains("fabric=connected")
             .then_some(())
     });
-    let _ = poll(10_000, || (lane_len(&w, &ack_lane) > 0).then_some(()));
+    let _ = poll(FAIR_WAIT_MS, || (lane_len(&w, &ack_lane) > 0).then_some(()));
     let acks = lane_len(&w, &ack_lane);
     let again = w.verb(&format!("@{b} inbox seen {id} handled"));
     assert!(again.ok());
@@ -402,7 +409,7 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
 }
 
 /// X3. A REPLY ADDRESSED TO SOMEBODY ELSE DOES NOT CANCEL MY `expired`. A asks
-/// B twice with `dl=10000`; B answers X — to C. Y (no reply anywhere) is the
+/// B twice with `dl=30000`; B answers X — to C. Y (no reply anywhere) is the
 /// control that proves the sweep ran.
 #[test]
 fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
@@ -422,21 +429,24 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
     let expired_lane = format!("/f/{FLEET}/in/{}/{a}/{}/expired", w.node, w.node);
     let a_lane = format!("/f/{FLEET}/in/{}/{a}/>", w.node);
 
-    // The deadline is 10 s, and the scenario must land inside it: two asks, a
+    // The deadline is 30 s, and the scenario must land inside it: two asks, a
     // misrouted answer and its delivery through the bridge and broker, each
     // post waiting on the bus ack. At 4 s against a 3.5 s precondition that
     // was a race the bridge and broker could lose under a loaded gate, failing
-    // the test on a correct tree (the load-sensitive test audit of 2026-09-27).
+    // the test on a correct tree (the load-sensitive test audit of 2026-09-27);
+    // 10 s against 9.5 s was still a precondition a stalled gate could redden,
+    // so the deadline is 30 s and the precondition half a second inside it.
+    const DL_MS: u64 = 30_000;
     let t0 = Instant::now();
     let x = off_of(
         w.verb(&format!(
-            "@{a} post to=@{b} kind=ask dl=10000 --wait=30000 q-x"
+            "@{a} post to=@{b} kind=ask dl={DL_MS} --wait=30000 q-x"
         ))
         .header(),
     );
     let y = off_of(
         w.verb(&format!(
-            "@{a} post to=@{b} kind=ask dl=10000 --wait=30000 q-y"
+            "@{a} post to=@{b} kind=ask dl={DL_MS} --wait=30000 q-y"
         ))
         .header(),
     );
@@ -453,13 +463,15 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
     });
     let delivered_at = t0.elapsed();
     assert!(
-        delivered_at < Duration::from_millis(9_500),
+        delivered_at < Duration::from_millis(DL_MS - 500),
         "must land before X's deadline: {delivered_at:?}"
     );
     until_within(PERIODIC_DEADLINE, "expired re=Y on A's lane", || {
         (lane_re(&w, &expired_lane, y) == 1).then_some(())
     });
-    let _ = poll(5_000, || (lane_re(&w, &expired_lane, x) > 0).then_some(()));
+    let _ = poll(FAIR_WAIT_MS, || {
+        (lane_re(&w, &expired_lane, x) > 0).then_some(())
+    });
     let expired_x = lane_re(&w, &expired_lane, x);
     let replies_x_on_a = lane_rows(&w, &a_lane)
         .iter()
@@ -618,7 +630,9 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
             body.from.as_deref().expect("from"),
             w.node
         );
-        let got = poll(10_000, || (lane_len(&w, &ghost_lane) > 0).then_some(()));
+        let got = poll(FAIR_WAIT_MS, || {
+            (lane_len(&w, &ghost_lane) > 0).then_some(())
+        });
         assert!(got.is_some(), "the ack to a gone node is queued on the bus");
     }
     assert!(

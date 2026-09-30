@@ -78,9 +78,9 @@ use std::process::Command;
 /// # Why TWO wasm cells and not one
 ///
 /// aterm ships two separate `.wasm` artifacts into the Electron renderer, and
-/// both are built by name in the two lanes that build wasm at all —
-/// `xtask gate web` and `tools/wasm-bench/run.sh`, each `-p aterm-wasm -p
-/// aterm-gpu-web`:
+/// both are compiled by name in the two lanes that compile wasm at all —
+/// `xtask gate cells-foreign` (these two cells) and `tools/wasm-bench/run.sh`
+/// (`-p aterm-wasm -p aterm-gpu-web`):
 ///
 /// * `aterm-wasm` — the CPU/`putImageData` path (`aterm-render` rasterizer);
 /// * `aterm-gpu-web` — the GPU path (`aterm-gpu` over `wgpu` -> WebGL2/WebGPU).
@@ -138,7 +138,7 @@ pub fn default_cells() -> Vec<Cell> {
         // the six triples the index can name are the six a compiler reads.
         // Each is rooted at `aterm` like its sibling, and each is FOREIGN to
         // every box in this fleet — no `FLEET_HOST_TRIPLES` entry — so all
-        // three join `xtask gate cells-foreign`, which `gate all` runs, and
+        // three join `xtask gate cells-foreign`, which the merge contract runs, and
         // their verdicts do not depend on who is asking.
         //
         // The Intel-Mac slice of the universal release binary

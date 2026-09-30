@@ -361,7 +361,14 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// out. Served in-process by the ONE `aterm` binary (`aterm pkg …` / the
 /// `atpkg` argv0 alias) and by the thin standalone bin. Everything below is
 /// unchanged from the binary era.
-pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
+pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
+    // THE PRIVATE WINDOW'S LEAD ([`PRIVATE_STATE_ROOT_FLAG`], ruling 410), taken off
+    // before anything reads the first word as the verb: this pass carries no `[machine]`
+    // edit, whatever this build's seams say.
+    if argv.first().and_then(|v| v.to_str()) == Some(PRIVATE_STATE_ROOT_FLAG) {
+        argv.remove(0);
+        PRIVATE_STATE_ROOT_LEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // THE HIDDEN WARM VERB, ON THE RAW ARGV ([`crate::warm`]): what a pass that landed an
     // agent build starts, detached, to run that build once headless. Its operands carry the
     // store prefix, which must reach it byte for byte (the lossy conversion below would
@@ -555,13 +562,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     // a pass's edge, only when the `[machine]` table CHANGED since it was last applied, so
     // an edit takes effect at the next pass on every lane. Before the lock: this work
     // takes none, and a contended or refused pass must not hold it hostage.
+    // NOT UNDER A PRIVATE STATE ROOT (ruling 409): a pass from a development build given
+    // its own `ATERM_STATE_HOME` — a window's launch seed, its loop, a session's detached
+    // pass — shares the owner's prefix, and `machine.applied` there records the OWNER's
+    // table, so its own `[machine]` table would read as an edit and be applied to the
+    // owner's Mac. It carries none; `aterm pkg machine apply`, typed, still applies. Nor a
+    // pass the private window LED with its flag (ruling 410): this build may compile no
+    // seam, and the window that spawned it knows ([`under_private_state_root`]).
     let machine_settings = verb.is_some_and(|v| {
         verb_applies_machine_settings(v)
             && !(v == "update"
                 && args
                     .get(1)
                     .is_some_and(|p| crate::vendor_direct::is_vendor(p)))
-    }) && machine_table_changed();
+    }) && !under_private_state_root()
+        && machine_table_changed();
     if machine_settings {
         // Behind any apply already running (the window's or a session's launch apply), and
         // then only if that one did not just apply this very table.
@@ -1326,6 +1341,33 @@ fn head_watch_pass() -> bool {
 /// or from Settings — the flip lands at once. Machinery for the lanes' spawns, never user
 /// vocabulary; ON for every pass those lanes run.
 pub const DEFER_BUSY_FLIP_FLAG: &str = "--defer-busy-flip";
+
+/// The word a window under a private state root puts AHEAD OF THE VERB of every pass it
+/// spawns (ruling 410): the pass carries no `[machine]` edit, whatever its own build is.
+///
+/// A pass decides the edge in its own process (`under_private_state_root`), and a
+/// window's passes run the `atpkg` beside its executable (`aterm-gui`'s
+/// `co_located_atpkg`), which in a development tree is a separate build: one that compiles no
+/// seam reads the inherited `ATERM_STATE_HOME` as unset and would carry the instance's
+/// `[machine]` table to the owner's Mac. So the window, which knows it is private, says
+/// so. First, not after the verb, on purpose: every `atpkg` reads its first word as the
+/// verb and asks the `[machine]` edge only for a pass verb, so one built before this flag
+/// answers the lead as an unknown verb — exit 2, nothing done — instead of applying.
+/// Machinery for the window's spawns, never user vocabulary; a shipped window, which reads
+/// no seam, never passes it.
+pub const PRIVATE_STATE_ROOT_FLAG: &str = "--private-state-root";
+
+/// Whether the dispatch edge saw [`PRIVATE_STATE_ROOT_FLAG`] ahead of the verb.
+static PRIVATE_STATE_ROOT_LEAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this pass runs for a private state root: its own process's seam
+/// ([`aterm_types::dirs::runs_under_private_state_root`]), or the lead of a window that
+/// knows it runs under one ([`PRIVATE_STATE_ROOT_FLAG`]).
+fn under_private_state_root() -> bool {
+    PRIVATE_STATE_ROOT_LEAD.load(std::sync::atomic::Ordering::Relaxed)
+        || aterm_types::dirs::runs_under_private_state_root()
+}
 
 /// Whether the dispatch edge saw [`DEFER_BUSY_FLIP_FLAG`].
 static DEFER_BUSY_FLIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -6640,7 +6682,7 @@ fn rfc3339_at(secs: i64) -> String {
 /// candidate, and re-observes the roster generation — two to four times per six-hourly
 /// tick, for an answer that cannot differ inside one pass. Threading the pass's first
 /// index through the rest is the shape [`crate::flow::bootstrap_group`] and
-/// [`crate::flow::apply_channel_with`] already have.
+/// [`crate::flow::apply_channel_gated`] already have.
 ///
 /// What it must never become is a way around a gate. Everything a resolve proves — the
 /// anti-rollback floor, the roster admission, the machine signature over the index — is a
@@ -22524,6 +22566,45 @@ mod tests {
         ] {
             assert!(!verb_applies_machine_settings(verb), "{verb}");
         }
+        // NOT UNDER A PRIVATE STATE ROOT (ruling 409): the edge asks it before it reads the
+        // owner's `machine.applied` — so a private pass carries no edit, whatever its table
+        // says (`tests/machine_edge.rs` drives it at the process edge). The question is the
+        // seam OR the private window's lead (ruling 410), and the lead is taken off the argv
+        // before anything reads the verb.
+        let src = include_str!("cli.rs");
+        let edge = src
+            .find("let machine_settings = verb.is_some_and(|v| {")
+            .expect("the dispatch edge");
+        let edge = &src[edge..edge + src[edge..].find(';').expect("the edge's end")];
+        let private = edge
+            .find("!under_private_state_root()")
+            .expect("the edge asks for a private state root");
+        let changed = edge
+            .find("machine_table_changed()")
+            .expect("the changed-table read");
+        assert!(private < changed, "{edge}");
+        let asks = src
+            .find("\nfn under_private_state_root() -> bool {")
+            .expect("the question");
+        let asks = &src[asks..asks + src[asks..].find("\n}\n").expect("its end")];
+        assert!(
+            asks.contains("PRIVATE_STATE_ROOT_LEAD.load(")
+                && asks.contains("aterm_types::dirs::runs_under_private_state_root()"),
+            "the lead or the seam: {asks}"
+        );
+        let entry = src.find("\npub fn main_entry(").expect("main_entry");
+        let entry = &src[entry..];
+        let lead = entry
+            .find("== Some(PRIVATE_STATE_ROOT_FLAG)")
+            .expect("the lead is read");
+        for first_read in [
+            "crate::warm::HIDDEN_VERB",
+            "let verb = args.first()",
+            "let machine_settings = ",
+        ] {
+            let at = entry.find(first_read).expect(first_read);
+            assert!(lead < at, "the lead comes off before {first_read}");
+        }
     }
 
     /// WHAT AN APPLY MUST RETRY: a live build it skipped and a migration that failed. A
@@ -24964,7 +25045,7 @@ mod tests {
             .map(|i| start + i)
             .expect("a function after the verb");
         let body = &production[start..end];
-        // `apply_channel_gated` is `apply_channel_with` under the pass's flip gate
+        // `apply_channel_gated` takes the pass's resolved index under its flip gate
         // ([`crate::quiet`]): the same resolved index, handed in.
         assert!(
             body.contains("crate::flow::apply_channel_gated("),

@@ -106,12 +106,16 @@ impl Fixture {
     }
 
     /// A command confined to this fixture's HOME, config and registry, both pipes
-    /// captured — for the dev `atpkg` itself or for a shell that runs it.
+    /// captured — for the dev `atpkg` itself or for a shell that runs it. Never under an
+    /// inherited private state root (`ATERM_STATE_HOME`, rulings 409 and 410): a suite run
+    /// in a tab of a private instance would otherwise skip the `[machine]` edge these
+    /// tests read and write its logs into that instance's root.
     fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
         cmd.env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("ATPKG_REGISTRY", format!("dir:{}", self.registry.display()))
+            .env_remove("ATERM_STATE_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

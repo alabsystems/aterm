@@ -1106,7 +1106,11 @@ impl AtermTerminal {
     /// `empty=` and the rest), a `chip` its painted `label=` (`ALab tools ·
     /// 2`), an `entry` its `meta=` line and its `copy=` — what Copy puts on
     /// the clipboard — and an `action` both the intent's own `label=`
-    /// (`Manual`) and the `button=` the native footer paints (`Open Manual`).
+    /// (`Manual`) and the `button=` the native footer paints (`Open Manual`),
+    /// then `primary=1` on the one the native footer draws in the accent and
+    /// a bare Return presses (the engine's rule,
+    /// `aterm_messages::page::primary_index`, ruling 407), `primary=0` on the
+    /// rest.
     /// Copy All's text is the page's build information, then for each entry
     /// in order two line feeds and its `copy=`; Copy All is pressable while
     /// `total=` is above 0. `tag` selects a chip (`""`: every tag; a chip's
@@ -1123,7 +1127,8 @@ impl AtermTerminal {
     /// (`aterm_messages::page::wire_lines`), whose doc names every field. A
     /// wire row carries no authored capsule (ruling 172), so the web's
     /// entries have no `action` lines unless a restored log brought some,
-    /// and none of those is pressable here (`actionable=0`, ruling 389).
+    /// and none of those is pressable here (`actionable=0`, ruling 389), so
+    /// none leads (`primary=0`).
     pub fn messages_page(&self, tag: &str, problems: bool, timezone_offset_min: f64) -> String {
         self.messages_page_at(
             tag,
@@ -2976,8 +2981,9 @@ mod tests {
     /// pressable — a page has no filesystem — and its `Manual` (a footer
     /// button worded `Open Manual`, ruling 396) NOT pressable either: the
     /// web performs no navigation, and no press route reaches a record
-    /// (`notice act` on it answers `no live message`, pinned here).
-    /// An agent's upgrade record offers no word at all: no harness runs
+    /// (`notice act` on it answers `no live message`, pinned here). So
+    /// neither leads: both lines end `primary=0` (ruling 407). An agent's
+    /// upgrade record offers no word at all: no harness runs
     /// under a page, so no tab's upgrade stands (ruling 315). The log itself
     /// still names the word (the negative control: the page dropped it, the
     /// record did not).
@@ -3027,11 +3033,14 @@ mod tests {
         assert_eq!(
             actions,
             [
-                "action\tid=1\tindex=0\tlabel=Open log\tactionable=0\tbutton=Open log",
-                "action\tid=1\tindex=1\tlabel=Manual\tactionable=0\tbutton=Open Manual",
+                "action\tid=1\tindex=0\tlabel=Open log\tactionable=0\tbutton=Open log\tprimary=0",
+                "action\tid=1\tindex=1\tlabel=Manual\tactionable=0\tbutton=Open Manual\tprimary=0",
             ],
             "{page}"
         );
+        // Nothing pressable, nothing leads (ruling 407): the engine's rule
+        // gives no Primary, and the key is the last of its line (appended).
+        assert!(!page.contains("\tprimary=1"), "{page}");
         assert_eq!(
             t.notice_at("act 1 1", t0, stamp()),
             wire::no_live_reply(MessageId::from_raw(1).expect("id 1")),

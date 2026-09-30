@@ -126,6 +126,19 @@ pub struct HistTurn {
     pub text: String,
 }
 
+/// The floor a `history` header names (` unheld_below=<id>`: an aterm update
+/// could not carry the ledger whole, so records of turn ids below it may be
+/// gone). `aterm ctl` prints that header on stderr; a raw reply carries it on
+/// its first line.
+pub(crate) fn history_floor(reply: &CtlReply) -> Option<u64> {
+    let header = reply.stdout.lines().next().filter(|l| l.starts_with("OK "));
+    header
+        .into_iter()
+        .chain(reply.stderr.lines())
+        .flat_map(str::split_whitespace)
+        .find_map(|word| word.strip_prefix("unheld_below=")?.parse().ok())
+}
+
 /// The records of a `history` reply (`turn <id> submitted=… status=…
 /// started_ms=… dur_ms=… … arch=<o>:<l> [carried=1] text=<pct>`); any other
 /// line is skipped. `text=` is the free-text tail, so the line is cut there
@@ -359,21 +372,33 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         Ok(r) => {
             hist = parse_history_records(&r.stdout);
             let carried = hist.iter().filter(|t| t.carried).count();
+            // An update that could not carry the ledger whole says so on the
+            // header (`unheld_below=`): then an empty ledger is not a session
+            // nobody drove.
+            let lost = history_floor(&r).map(|floor| {
+                format!(
+                    "an aterm update could not carry its ledger whole: turns before id {floor} \
+                     may be lost"
+                )
+            });
             sources.push(Source {
                 name: "history",
                 ok: !hist.is_empty(),
-                detail: if hist.is_empty() {
-                    format!("{at} has no turns in its ledger (typed by hand or by `drive prompt`?)")
-                } else {
-                    format!(
-                        "{} turn(s) from {at}{}",
+                detail: match (hist.is_empty(), lost) {
+                    (true, Some(lost)) => format!("{at} has no turns in its ledger ({lost})"),
+                    (true, None) => format!(
+                        "{at} has no turns in its ledger (typed by hand or by `drive prompt`?)"
+                    ),
+                    (false, lost) => format!(
+                        "{} turn(s) from {at}{}{}",
                         hist.len(),
                         if carried > 0 {
                             format!(", {carried} carried from an earlier aterm (no time)")
                         } else {
                             String::new()
-                        }
-                    )
+                        },
+                        lost.map(|lost| format!("; {lost}")).unwrap_or_default()
+                    ),
                 },
             });
         }

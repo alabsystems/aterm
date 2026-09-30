@@ -466,6 +466,32 @@ pub(crate) fn remove_graph_entry(sock_dir: &Path, sid: &SessionId) {
     let _ = std::fs::remove_file(graph_path(sock_dir, sid));
 }
 
+/// Retire `sid`'s discovery entry only while it names THIS instance's socket
+/// (`our_sock`, in any spelling the entry could carry): an entry another live
+/// process wrote — the parent of a rolled-back update candidate, which still
+/// serves the carried ids — is left for its owner (round seven of the update
+/// audit, finding 13). An entry that does not read is left too: hygiene only,
+/// and the stale sweep retires a dead one.
+pub(crate) fn remove_own_graph_entry(sock_dir: &Path, sid: &SessionId, our_sock: &str) {
+    let path = graph_path(sock_dir, sid);
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Some(named) = aterm_types::control_socket::graph_entry_sock(&body) else {
+        return;
+    };
+    let canonical = |p: &str| {
+        std::fs::canonicalize(p)
+            .map_or_else(|_| p.to_string(), |c| c.to_string_lossy().into_owned())
+    };
+    let ours = named == our_sock
+        || canonical(&named) == canonical(our_sock)
+        || self_sock_path().is_some_and(|me| named == me || named == published_sock_spelling(&me));
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Sweep dead discovery entries: remove any `graph/<sid>` whose recorded socket no
 /// longer has a live listener — a crashed session that never ran its graceful
 /// `remove_graph_entry`. Mirrors `control_auth::sweep_stale_instances` for the
@@ -1747,5 +1773,41 @@ mod tests {
         assert_eq!(drain_buffered(&mut r), b"LEFTOVER");
         // Second drain is empty (consumed).
         assert!(drain_buffered(&mut r).is_empty());
+    }
+
+    /// ROUND SEVEN, FINDING 13: an instance's quit retires only the discovery
+    /// entries that name ITS socket — a rolled-back update candidate carries
+    /// its live parent's session ids, and unlinking the parent's entries left
+    /// every carried session unresolvable. NEGATIVE CONTROL: its own entry
+    /// goes.
+    #[test]
+    fn a_quit_retires_only_its_own_graph_entries() {
+        let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let ours = dir.path().join("aterm-cand.sock");
+        let theirs = dir.path().join("aterm-parent.sock");
+        let (mine, parents) = (SessionId::generate(), SessionId::generate());
+        write_graph_entry(
+            dir.path(),
+            &mine,
+            ours.to_str().unwrap(),
+            &LaunchNonce::generate(),
+        );
+        write_graph_entry(
+            dir.path(),
+            &parents,
+            theirs.to_str().unwrap(),
+            &LaunchNonce::generate(),
+        );
+        for sid in [&mine, &parents] {
+            remove_own_graph_entry(dir.path(), sid, ours.to_str().unwrap());
+        }
+        assert!(
+            !graph_path(dir.path(), &mine).exists(),
+            "its own entry goes"
+        );
+        assert!(
+            graph_path(dir.path(), &parents).exists(),
+            "the parent's entry stays with the parent"
+        );
     }
 }

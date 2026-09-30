@@ -6911,14 +6911,15 @@ mod tests {
             }
         }
         mailbox.push_aterm_closed();
+        // The retry delay a defect would sleep through is a minute; "promptly"
+        // is under half of it. The close is already queued, so the correct wait
+        // returns at once, and a descheduled test thread is not read as a wait
+        // that slept through the backoff.
+        const RETRY: Duration = Duration::from_secs(60);
         let start = Instant::now();
-        assert!(wait_for_retry_or_aterm_close(
-            &mailbox,
-            Duration::from_secs(5),
-            |_| {}
-        ));
+        assert!(wait_for_retry_or_aterm_close(&mailbox, RETRY, |_| {}));
         assert!(
-            start.elapsed() < Duration::from_secs(3),
+            start.elapsed() < RETRY / 2,
             "a closed aterm lane must interrupt the backoff promptly"
         );
         assert!(model.fire("Closed", &mut closed));
@@ -7024,8 +7025,9 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let responder = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            // A hang detector for the bridge's startup request.
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
@@ -8335,8 +8337,10 @@ mod tests {
         assert_eq!(lane.delivery_offsets(), [old, new]);
 
         let (consumer, closer) = bridge.connect().unwrap();
+        // The consumer socket's read timeout is also `sub.recv()`'s: a hang
+        // detector for a group record that must arrive, not the 3 s it was.
         closer
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let mut sub = consumer
             .subscribe_group(&group, &subject::inbox_filter("f", &bridge.node))
@@ -8384,8 +8388,10 @@ mod tests {
         bridge.conn = Some(first);
         assert!(model.fire("Attach", &mut state));
         let (consumer, closer) = bridge.connect().unwrap();
+        // The consumer socket's read timeout is also `sub.recv()`'s: a hang
+        // detector for a group record that must arrive, not the 3 s it was.
         closer
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let mut sub = consumer
             .subscribe_group(&group, &subject::inbox_filter("f", &bridge.node))
@@ -8508,7 +8514,8 @@ mod tests {
             let mut all = lines.to_vec();
             all.push(&barrier);
             self.write(&all);
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // A hang detector: the loop leaves the moment the barrier is taken.
+            let deadline = Instant::now() + Duration::from_secs(60);
             while !bridge.watched.contains_key(&sid) {
                 assert!(
                     !bridge.park_detached(Duration::from_millis(20)),
@@ -8534,7 +8541,8 @@ mod tests {
                     .write_all(format!("{line}\n").as_bytes())
                     .expect("the push lane");
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // A hang detector: the loop leaves the moment the barrier comes back.
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 match bridge.mailbox.take(Duration::from_millis(50)) {
                     Some(Item::Event(line)) if line == barrier => return,

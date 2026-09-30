@@ -7,7 +7,7 @@
 //! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]
 //! [--release-credentials <profile.toml>]`,
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
-//! `verify [vX.Y.Z]`,
+//! `check [--commit REV]`, `verify [vX.Y.Z]`,
 //! `yank <build> [--release-credentials <profile.toml>]`.
 
 use std::process::Command;
@@ -135,6 +135,23 @@ USAGE
 
   targo --unverified ship status        version · ledger tail · dangling claims · newest
                            published build
+  targo --unverified ship check [--commit REV]
+                           would a real cut of REV (default HEAD) pass the
+                           pre-claim gates that read only the commit and this
+                           repository's receipt store — the release notes, the
+                           predecessor's handoff fixtures, the handoff policy,
+                           the MEASURE receipt, the whole-tree TRUST receipt —
+                           with the compiler this machine's cut builds with?
+                           The cut's own gate code, run for REV: no build of
+                           aterm, seconds. Answers only as REV's own cutter
+                           (built from REV, or with its cutter sources
+                           unchanged since) and refuses to answer otherwise.
+                           Exits 1 naming each gate that would refuse and its
+                           remedy. publish/pre-promote builds REV's own cutter
+                           in a throwaway worktree and runs it before `pub
+                           promote` publishes the source, so a source those
+                           gates would stop a cut of is never published
+                           (v0.96.0, v0.99.0)
   targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
         [--release-credentials <profile.toml>] [--no-draft-was-posted]
                            explicit killed-machine recovery: exact-CAS rotate
@@ -178,6 +195,12 @@ pub enum Cmd {
         cert_dir: Option<std::path::PathBuf>,
     },
     Status,
+    /// `check [--commit REV]` — the cut's pre-claim gates that read only a
+    /// commit and the receipt store, for one commit
+    /// ([`crate::gates::precheck`]); `None` is HEAD.
+    Check {
+        commit: Option<String>,
+    },
     Recover {
         version: String,
         owner: String,
@@ -349,6 +372,29 @@ fn parse_as(args: &[String], handed_off: bool) -> std::result::Result<Cmd, Strin
                 return Err(format!("status takes no arguments (got {extra:?})"));
             }
             Ok(Cmd::Status)
+        }
+        "check" => {
+            let mut commit: Option<String> = None;
+            while let Some(flag) = it.next() {
+                match flag {
+                    "--commit" => {
+                        if commit.is_some() {
+                            return Err("--commit given twice".to_string());
+                        }
+                        let rev = it
+                            .next()
+                            .ok_or("--commit needs a commit (a sha or a ref)")?;
+                        if rev.is_empty() || rev.starts_with('-') {
+                            return Err(format!("--commit needs a commit, got {rev:?}"));
+                        }
+                        commit = Some(rev.to_string());
+                    }
+                    other => {
+                        return Err(format!("check takes only --commit <REV> (got {other:?})"));
+                    }
+                }
+            }
+            Ok(Cmd::Check { commit })
         }
         "recover" => {
             let version = normalize_version(
@@ -625,6 +671,9 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             cert_dir,
         } => crate::provision::run_provision(&repo_root()?, &id, check, cert_dir.as_deref()),
         Cmd::Status => verify::run_status(&repo_root()?),
+        Cmd::Check { commit } => {
+            crate::gates::run_check(&repo_root()?, commit.as_deref().unwrap_or("HEAD"))
+        }
         Cmd::Recover {
             version,
             owner,

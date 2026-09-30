@@ -21,7 +21,10 @@ path = "src/main.rs"
 # ATPKG_STAGE_DISK_REVERIFY; `config::DEV_SEAMS`: `[packages]`
 # prefix/account and the owner/repo form of `[packages.links]`). Debug builds compile
 # them anyway; the release cutter never enables this — aterm-release's buildplan pins it.
-dev-seams = ["aterm-update-core/dev-seams"]
+# `aterm-types/dev-seams` too: atpkg asks aterm-types' own seam readers — the log folder
+# (`dirs::logs_dir`) and, at a pass's `[machine]` edge, whether it runs under a private
+# state root (`dirs::runs_under_private_state_root`, ruling 409) — which expand there.
+dev-seams = ["aterm-update-core/dev-seams", "aterm-types/dev-seams"]
 
 [dependencies]
 # THE load-bearing crypto root, for both signatures atpkg checks: Ed25519 over every

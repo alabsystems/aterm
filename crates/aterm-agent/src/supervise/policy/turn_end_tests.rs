@@ -5591,3 +5591,109 @@ fn a_done_task_never_strands_an_open_switch() {
     let a = at(&mut st, &reading(astra()), t);
     assert_eq!(a, TurnEndAction::Nothing);
 }
+
+/// THE WAITS THAT ARE A WALL'S NEXT TRY (the tab retry plan, verified live on
+/// 2026-09-29: after every try the loop stands half a minute in `the worker
+/// to take the api-retry@v1 act`, and the tab said `next try` for that check
+/// while the true next rung was minutes off). Every wait the real policy
+/// makes at an API error or an overload is one of the two kinds: the retry's
+/// (the ladder's rungs, the Down hold, a cut-off's, the server's, an
+/// overload's) is a next try; the check that the worker took the act, and a
+/// person typing, are not.
+#[test]
+fn only_a_retrys_wait_is_the_next_try() {
+    let why = |a: &TurnEndAction| match a {
+        TurnEndAction::WaitUntil { why, .. } => why.clone(),
+        other => panic!("a wait: {other:?}"),
+    };
+    let t = t0();
+    let unreachable = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Unreachable,
+    };
+    let cut = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::CutOff,
+    };
+    let server = WallKind::ApiError {
+        code: Some(503),
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    // The rungs: the first wait at each wall, and the hold when measured Down.
+    for (name, kind, reach, worked) in [
+        ("unreachable", unreachable, Reach::Unknown, Some(3 * MIN)),
+        (
+            "down hold",
+            unreachable,
+            Reach::Down { since: t },
+            Some(3 * MIN),
+        ),
+        ("server", server, Reach::Unknown, Some(3 * MIN)),
+        (
+            "overloaded",
+            WallKind::Overloaded,
+            Reach::Unknown,
+            Some(3 * MIN),
+        ),
+        ("cut off, met again", cut, Reach::Unknown, Some(MIN)),
+    ] {
+        let mut st = TurnEndState::default();
+        let r = TurnEndReading {
+            reach,
+            ..walled(kind, "API Error", worked)
+        };
+        // The point read again and again: the first act may be at once (a
+        // cut-off's), so read the wait the SECOND time a rung stands.
+        let mut a = at(&mut st, &r, t);
+        if !matches!(a, TurnEndAction::WaitUntil { .. }) {
+            st.acted(&a, &r, t);
+            a = at(
+                &mut st,
+                &TurnEndReading {
+                    worked: Some(MIN),
+                    ..r.clone()
+                },
+                t + Duration::from_secs(1),
+            );
+        }
+        let w = why(&a);
+        assert!(is_retry_wait(&w), "{name}: {w}");
+    }
+    // NOT a try: the check that the worker took the act just typed.
+    let mut st = TurnEndState::default();
+    let r = walled(unreachable, "API Error", Some(3 * MIN));
+    st.observe(&r, t);
+    let typed = act(
+        &mut st,
+        &TurnEndReading {
+            worked: None,
+            ..r.clone()
+        },
+        t + MIN,
+    );
+    assert!(matches!(typed, TurnEndAction::Type { .. }), "{typed:?}");
+    let check = at(
+        &mut st,
+        &TurnEndReading {
+            worked: None,
+            ..r.clone()
+        },
+        t + MIN + Duration::from_secs(1),
+    );
+    let w = why(&check);
+    assert!(w.contains("the worker to take"), "{w}");
+    assert!(!is_retry_wait(&w), "{w}");
+    // NOT a try: a person typing, a reset, a model picker's box.
+    for other in [
+        "a person is typing",
+        "a person stopped the turn with Esc",
+        "usage-session resets",
+        "the /model picker's next box, or its leaving",
+        "context still full after /compact (1)",
+    ] {
+        assert!(!is_retry_wait(other), "{other}");
+    }
+}

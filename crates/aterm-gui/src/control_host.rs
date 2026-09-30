@@ -404,6 +404,7 @@ mod tests {
             human_input: Default::default(),
             generation_look: Default::default(),
             reset_lane: Default::default(),
+            update_parked: Default::default(),
         });
         SessionHandle {
             sid,

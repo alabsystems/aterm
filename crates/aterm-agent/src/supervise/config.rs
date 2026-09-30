@@ -11,11 +11,20 @@
 //! every key the owner can write takes power away:
 //!
 //! * a key missing is its default — full power;
-//! * a known key with a value this reader cannot take is set to that key's
-//!   LIMITING value ([`SupervisorConfig::limit`]) and reported — the owner
-//!   evidently meant to limit it;
+//! * ONLY AN EXPLICIT SETTING TAKES POWER AWAY (owner ruling, 2026-09-25:
+//!   "all such dialogs must be approved by default unless there is a setting
+//!   added later by the user explicitly to NOT do this"). A switch reads
+//!   `true`/`false` and the owner's other plain spellings of them (`"yes"`/
+//!   `"no"`, `"on"`/`"off"`, `1`/`0`, any case); `approve` reads `all`,
+//!   `safe`, `none` (any case) and an off spelling as `none`. A known key
+//!   with a value that is NEITHER its own nor an off (`approve = "maybe"`,
+//!   `enabled = 2.5`, a table) KEEPS ITS DEFAULT and is reported — until the
+//!   ruling it was set to its limit ("the owner evidently meant to limit
+//!   it"), so `approve = "everything"` stopped every box being answered;
 //! * an unknown key is reported and changes nothing — it cannot say what to
 //!   limit;
+//! * `harness` written as an off itself (`harness = false`) is the master
+//!   switch off; any other value that is not a table is ignored;
 //! * `harness.<key>` written under another table (`[theme]` then
 //!   `harness.enabled = false`) still limits, and only limits — a kill switch
 //!   must not stop working because of where in the file it was written;
@@ -102,8 +111,10 @@ impl Approve {
         if cap.rank() < self.rank() { cap } else { self }
     }
 
+    /// `all`, `safe` or `none`, in any case; an off spelling is `none` only
+    /// by [`SupervisorConfig::set`]'s rule for every key ([`spells_off`]).
     fn parse(v: &str) -> Option<Self> {
-        match v.trim() {
+        match v.trim().to_ascii_lowercase().as_str() {
             "all" => Some(Self::All),
             "safe" => Some(Self::Safe),
             "none" => Some(Self::None),
@@ -212,8 +223,9 @@ pub struct SupervisorConfig {
     /// worker's questions, `aterm drive answer`), `recommended` answers them
     /// where the table's switch is off. On by default; off where a limit is
     /// not the table's to be overridden by a session: a loop's own
-    /// `--no-answer`, and an `answer_questions` value the reader could not
-    /// take (read as its limit). Not a `[harness]` key.
+    /// `--no-answer`. (An `answer_questions` value the reader could not take
+    /// took it away too until the owner ruling of 2026-09-25; such a value is
+    /// no setting now, and changes nothing.) Not a `[harness]` key.
     pub session_questions: bool,
 }
 
@@ -267,24 +279,32 @@ impl Default for SupervisorConfig {
 }
 
 impl SupervisorConfig {
-    /// Set one key from its value's text — `true`/`false` for a switch, a
-    /// decimal for a count, the string for a text, a path or `approve`, and
-    /// for `trust_roots` the array's elements joined by `,`. A malformed value
-    /// for a known key sets that key to its LIMITING value ([`Self::limit`])
-    /// and says so in the `Err`; an unknown key changes nothing and says so.
+    /// Set one key from its value's text — an on/off ([`switch_word`]) for a
+    /// switch, a decimal for a count, the string for a text, a path or
+    /// `approve`, and for `trust_roots` the array's elements joined by `,`.
+    /// A value that is not the key's own: an explicit off ([`spells_off`]) is
+    /// that key's LIMITING value ([`Self::limit`]); anything else leaves the
+    /// key at its default (owner ruling of 2026-09-25) — both said in the
+    /// `Err`. An unknown key changes nothing and says so.
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let v = value.trim();
+        // An off limits a key it is not the key's own value for — except a
+        // count, where "off" could as well mean "no cap" or "no grace" (more
+        // power): there it is no setting either.
+        let counts = matches!(key, "continue_per_hour" | "human_grace_s");
         let bad = |this: &mut Self, what: &str| {
-            this.misread(key);
-            Err(format!(
-                "harness.{key}: expected {what}, got {:?} — read as its limit",
-                value.trim()
-            ))
+            if spells_off(v) && !counts {
+                this.limit(key);
+                Err(format!(
+                    "harness.{key}: expected {what}, got {v:?} — an off, read as its limit"
+                ))
+            } else {
+                Err(format!(
+                    "harness.{key}: expected {what}, got {v:?} — no setting, so {key} keeps its default"
+                ))
+            }
         };
-        let flag = match value.trim() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        };
+        let flag = switch_word(v);
         let text = {
             let v = value.trim();
             (!v.is_empty()).then(|| v.to_string())
@@ -326,11 +346,19 @@ impl SupervisorConfig {
             }
             "answer_text" => match text {
                 Some(t) => self.answer_text = t,
-                None => return bad(self, "a non-empty text"),
+                None => {
+                    return Err(format!(
+                        "harness.{key}: expected a non-empty text — {key} keeps its default"
+                    ));
+                }
             },
             "continue_text" => match text {
                 Some(t) => self.continue_text = t,
-                None => return bad(self, "a non-empty text"),
+                None => {
+                    return Err(format!(
+                        "harness.{key}: expected a non-empty text — {key} keeps its default"
+                    ));
+                }
             },
             "continue_per_hour" => match value.trim().parse() {
                 Ok(n) => self.continue_per_hour = n,
@@ -340,6 +368,22 @@ impl SupervisorConfig {
                 Ok(n) => self.human_grace_s = n,
                 Err(_) => return bad(self, "a count of seconds"),
             },
+            // An off (`false`, `"none"`, `""`) is no path and no model: the
+            // fallback goes, never a model named "false". An on-word names no
+            // model or file either: no setting, never a model named "true".
+            "rules_file" | "model_fallback" if flag == Some(true) => {
+                return Err(format!(
+                    "harness.{key}: expected a name, got {v:?} — no setting, so {key} keeps its \
+                     default"
+                ));
+            }
+            "rules_file" | "model_fallback" if spells_off(v) || v.eq_ignore_ascii_case("none") => {
+                if key == "rules_file" {
+                    self.rules_file = None;
+                } else {
+                    self.model_fallback = None;
+                }
+            }
             "stall_term_after_s" => match value.trim().parse() {
                 Ok(n) => self.stall_term_after_s = n,
                 Err(_) => return bad(self, "a count of seconds (0: never)"),
@@ -347,7 +391,10 @@ impl SupervisorConfig {
             "rules_file" => self.rules_file = text.map(PathBuf::from),
             "model_fallback" => self.model_fallback = text,
             retired if RETIRED_KEYS.contains(&retired) => {
-                return Err(self.retired(retired, flag != Some(true)));
+                return Err(match retired_reading(v) {
+                    Some(on) => self.retired(retired, !on),
+                    None => retired_no_setting(retired),
+                });
             }
             other => return Err(unknown_key(other)),
         }
@@ -355,9 +402,9 @@ impl SupervisorConfig {
     }
 
     /// A RETIRED key ([`RETIRED_KEYS`]) read as what 0.93.0 made it mean,
-    /// and the note that says so. `limits` (written `false`, or a value
-    /// that is no switch — its limit, as for any key) applies the limit it
-    /// named:
+    /// and the note that says so. `limits` (written as an off —
+    /// [`retired_reading`]; a value that is no on or off is no setting and
+    /// never reaches here) applies the limit it named:
     ///
     /// * `approve_all`: `approve` at most `safe` (its rules answer);
     /// * `auto_reads`: `approve = "none"` (not even a read is answered);
@@ -443,17 +490,6 @@ impl SupervisorConfig {
         }
     }
 
-    /// `key` written with a value this reader cannot take: its LIMIT
-    /// ([`Self::limit`]) — and a misread `answer_questions` gives no session's
-    /// `questions` word a say either ([`Self::session_questions`]): the owner
-    /// evidently meant to limit the answers.
-    fn misread(&mut self, key: &str) {
-        self.limit(key);
-        if key == "answer_questions" {
-            self.session_questions = false;
-        }
-    }
-
     /// THE reader of aterm.toml's `[harness]` table (module doc): the policy
     /// and one line per key it refused, could not take, or found outside the
     /// root table. `text` is the whole file.
@@ -469,10 +505,19 @@ impl SupervisorConfig {
         match aterm_toml::from_str::<aterm_toml::Value>(text) {
             Ok(doc) => {
                 if let Some(h) = doc.get("harness").filter(|h| h.as_table().is_none()) {
-                    notes.push(format!(
-                        "harness: not a table (a TOML {}) — ignored",
-                        h.type_str()
-                    ));
+                    if one_value_text(h).is_some_and(|t| spells_off(&t)) {
+                        cfg.enabled = false;
+                        notes.push(
+                            "harness: written off itself — the master switch is off (write \
+                             `enabled = false` under [harness])"
+                                .to_string(),
+                        );
+                    } else {
+                        notes.push(format!(
+                            "harness: not a table (a TOML {}) — ignored",
+                            h.type_str()
+                        ));
+                    }
                 }
                 let mut misplaced = Vec::new();
                 harness_tables(&doc, String::new(), &mut misplaced);
@@ -499,6 +544,16 @@ impl SupervisorConfig {
                         notes.push(misplaced_note(&at, key, limits, refused));
                     }
                 }
+                // `harness = false` filed under another table: the master
+                // switch written off, which limits wherever it was written.
+                let mut scalars = Vec::new();
+                harness_scalars(&doc, String::new(), &mut scalars);
+                for (at, value) in scalars {
+                    if one_value_text(value).is_some_and(|t| spells_off(&t)) {
+                        cfg.enabled = false;
+                        notes.push(misplaced_note(&at, "enabled", true, None));
+                    }
+                }
             }
             Err(e) => {
                 notes.push(format!(
@@ -512,17 +567,34 @@ impl SupervisorConfig {
                         path.last().is_some_and(|key| RETIRED_KEYS.contains(key))
                     });
                 for (path, value) in current.into_iter().chain(retired) {
-                    let [head @ .., "harness", key] = path.as_slice() else {
-                        continue;
+                    // `harness = false`: the master switch written off — at the
+                    // root the key `enabled`, said once (a later `enabled =
+                    // true` is then a repeat that may only limit); under
+                    // another header a misplaced one, which limits.
+                    let (head, key, one_value): (&[&str], &str, String) = match path.as_slice() {
+                        [head @ .., "harness"] if !value.trim_start().starts_with(['[', '{']) => {
+                            if !spells_off(&unquote(value)) {
+                                continue;
+                            }
+                            (head, "enabled", "false".to_string())
+                        }
+                        [head @ .., "harness", key] => (head, key, unquote(value)),
+                        _ => continue,
                     };
+                    let quoted = value.trim_start().starts_with(['"', '\'']);
                     let before = cfg.clone();
-                    let refused = cfg.set(key, &unquote(value)).err();
+                    let refused = if value.trim_start().starts_with('[') && key != "trust_roots" {
+                        Some(no_shape(key, "array"))
+                    } else {
+                        cfg.set_scalar(key, &one_value, quoted || key == "trust_roots")
+                            .err()
+                    };
                     // A key said twice — which may be why the file is not
                     // TOML — or said under another header may only limit.
                     let limits = cfg.limits(&before);
-                    let repeat = head.is_empty() && seen.contains(key);
+                    let repeat = head.is_empty() && seen.contains(&key);
                     if head.is_empty() {
-                        seen.push(*key);
+                        seen.push(key);
                     }
                     if !(limits || head.is_empty() && !repeat) {
                         cfg = before;
@@ -552,8 +624,10 @@ impl SupervisorConfig {
         let Some(path) = path else {
             return (Self::default(), Vec::new());
         };
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::from_aterm_toml(&text),
+        // Bytes, decoded lossily: a stray non-UTF-8 byte in a comment must not
+        // hide the explicit off beside it (the file is then read line by line).
+        match std::fs::read(path) {
+            Ok(bytes) => Self::from_aterm_toml(&String::from_utf8_lossy(&bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), Vec::new()),
             Err(e) => (
                 Self::default(),
@@ -566,21 +640,39 @@ impl SupervisorConfig {
     }
 
     /// [`Self::set`] from a parsed TOML value: a value of a shape no key
-    /// takes (a table, a float, a date) is its key's limit, as a malformed
-    /// text is.
+    /// takes (a table, a float, a date) is no setting — it changes nothing,
+    /// as any value that is neither the key's own nor an off (owner ruling of
+    /// 2026-09-25; it was the key's limit until then).
     fn set_value(&mut self, key: &str, value: &aterm_toml::Value) -> Result<(), String> {
-        match scalar_text(value) {
-            Some(text) => self.set(key, &text),
-            None if RETIRED_KEYS.contains(&key) => Err(self.retired(key, true)),
-            None if KEYS.contains(&key) => {
-                self.misread(key);
-                Err(format!(
-                    "harness.{key}: a TOML {} is not a value it takes — read as its limit",
-                    value.type_str()
-                ))
+        use aterm_toml::Value;
+        match value {
+            Value::String(text) => self.set_scalar(key, text, true),
+            Value::Boolean(_) | Value::Integer(_) => {
+                self.set_scalar(key, &scalar_text(value).unwrap_or_default(), false)
             }
-            None => Err(unknown_key(key)),
+            // An array is `trust_roots`' shape alone.
+            Value::Array(_) if key == "trust_roots" => match scalar_text(value) {
+                Some(text) => self.set(key, &text),
+                None => Err(no_shape(key, value.type_str())),
+            },
+            _ if RETIRED_KEYS.contains(&key) => Err(retired_no_setting(key)),
+            _ if KEYS.contains(&key) => Err(no_shape(key, value.type_str())),
+            _ => Err(unknown_key(key)),
         }
+    }
+
+    /// [`Self::set`] for a one-value text whose TOML shape is known: `quoted`
+    /// (a string) or a bare boolean or number. A bare boolean or number is no
+    /// text — `continue_text = false` is not the word "false" typed into a
+    /// worker — while a quoted string is always one, `"yes"` included.
+    fn set_scalar(&mut self, key: &str, text: &str, quoted: bool) -> Result<(), String> {
+        if !quoted && matches!(key, "answer_text" | "continue_text") {
+            return Err(format!(
+                "harness.{key}: expected a text, got a bare {text} — no setting, so {key} keeps \
+                 its default"
+            ));
+        }
+        self.set(key, text)
     }
 
     /// Whether `self` is `before` with power taken away and none given: some
@@ -788,13 +880,133 @@ pub fn is_retired_key_note(note: &str) -> bool {
 }
 
 /// What the reader says of the retired `[harness] <key>` written `value`
-/// (`None`: a value that is no switch, read as its limit): the words the
-/// window's config language shows on that line.
+/// (`None`: a value that is no switch — no setting, which changes nothing):
+/// the words the window's config language shows on that line.
 #[must_use]
 pub fn retired_key_note(key: &str, value: Option<bool>) -> Option<String> {
-    RETIRED_KEYS
-        .contains(&key)
-        .then(|| SupervisorConfig::default().retired(key, value != Some(true)))
+    RETIRED_KEYS.contains(&key).then(|| match value {
+        Some(on) => SupervisorConfig::default().retired(key, !on),
+        None => retired_no_setting(key),
+    })
+}
+
+/// [`retired_key_note`] from the value's one-value text (`None`: a shape
+/// that has none — a table, an array, a float), read by the reader's own
+/// rule ([`retired_reading`]) so the config language and the reader never
+/// disagree on what the line did.
+#[must_use]
+pub fn retired_key_note_text(key: &str, text: Option<&str>) -> Option<String> {
+    retired_key_note(key, text.and_then(retired_reading))
+}
+
+/// A retired key's value as an on or an off: an on-word ([`switch_word`]) is
+/// on, any off spelling ([`spells_off`] — `"disabled"` too, as for every
+/// key) is off, and anything else is no setting.
+#[must_use]
+pub fn retired_reading(value: &str) -> Option<bool> {
+    if spells_off(value) {
+        Some(false)
+    } else {
+        switch_word(value)
+    }
+}
+
+/// The note for a retired key whose value is no on or off.
+fn retired_no_setting(key: &str) -> String {
+    format!(
+        "harness.{key}: {RETIRED_KEY} ({RETIRED_IN}), and its value is no on or off — no \
+         setting, so it changes nothing; remove it"
+    )
+}
+
+/// The note for a known key whose value is of a shape it does not take.
+fn no_shape(key: &str, shape: &str) -> String {
+    format!(
+        "harness.{key}: a TOML {shape} is not a value it takes — no setting, so it changes nothing"
+    )
+}
+
+/// A TOML value's text when it is ONE value — a boolean, an integer or a
+/// string — and `None` for every other shape (an array is no switch).
+fn one_value_text(v: &aterm_toml::Value) -> Option<String> {
+    use aterm_toml::Value;
+    match v {
+        Value::Boolean(_) | Value::Integer(_) | Value::String(_) => scalar_text(v),
+        _ => None,
+    }
+}
+
+/// Every NON-table `harness` value in `v` below its root, with the dotted
+/// path of the table that holds it (`[x]` then `harness = false`).
+fn harness_scalars<'a>(
+    v: &'a aterm_toml::Value,
+    at: String,
+    out: &mut Vec<(String, &'a aterm_toml::Value)>,
+) {
+    let join = |seg: &str| {
+        if at.is_empty() || seg.starts_with('[') {
+            format!("{at}{seg}")
+        } else {
+            format!("{at}.{seg}")
+        }
+    };
+    match v {
+        aterm_toml::Value::Table(t) => {
+            for (k, v) in t {
+                if k == "harness" && !at.is_empty() && v.as_table().is_none() {
+                    out.push((at.clone(), v));
+                } else if k != "harness" || !at.is_empty() {
+                    harness_scalars(v, join(k), out);
+                }
+            }
+        }
+        aterm_toml::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                harness_scalars(v, join(&format!("[{i}]")), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A value's text as an EXPLICIT on or off: `true`/`false`, `yes`/`no`,
+/// `on`/`off`, `1`/`0` (and TOML's other spellings of the integers 0 and 1:
+/// `+0`, `0x1`, `0b0`…), in any case; `None` for anything else — no setting.
+#[must_use]
+pub fn switch_word(value: &str) -> Option<bool> {
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "true" | "yes" | "on" => return Some(true),
+        "false" | "no" | "off" => return Some(false),
+        _ => {}
+    }
+    let digits = v.replace('_', "");
+    let digits = digits.strip_prefix(['+', '-']).unwrap_or(&digits);
+    let (radix, body) = [("0x", 16), ("0o", 8), ("0b", 2)]
+        .into_iter()
+        .find_map(|(p, r)| digits.strip_prefix(p).map(|b| (r, b)))
+        .unwrap_or((10, digits));
+    if body.is_empty() || !body.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    match u64::from_str_radix(body, radix).ok()? {
+        0 => Some(false),
+        1 if !v.starts_with('-') => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether a value's text says OFF for any key: a switch's off
+/// ([`switch_word`]), or `none` / `never` / `disabled` — the one kind of
+/// value that limits a key it is not the key's own value for (owner ruling
+/// of 2026-09-25: only an explicit setting takes power away).
+#[must_use]
+pub fn spells_off(value: &str) -> bool {
+    switch_word(value) == Some(false)
+        || matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "none" | "never" | "disabled"
+        )
 }
 
 /// Whether `note` (one of [`SupervisorConfig::from_aterm_toml`]'s) says a
@@ -884,8 +1096,10 @@ fn scalar_text(v: &aterm_toml::Value) -> Option<String> {
 /// Every one-line spelling TOML gives a key is read — dotted (spaces around a
 /// dot allowed), quoted segments, and one-line inline tables (`harness = {
 /// enabled = false }`, flattened into their keys) — cutting a line only where
-/// TOML would ([`top_level`]), `#` comments ignored. No multi-line string or
-/// array is followed.
+/// TOML would ([`top_level`]), `#` comments ignored. A multi-line string
+/// (`"""`/`'''`) or array is SKIPPED whole, its lines never read as keys or
+/// headers: a `[harness]` or an `enabled = false` quoted inside an
+/// `answer_text` is no setting (the review of 2026-09-26).
 pub(crate) fn assignments(text: &str) -> Vec<(Vec<&str>, &str)> {
     fn flatten<'a>(path: Vec<&'a str>, value: &'a str, out: &mut Vec<(Vec<&'a str>, &'a str)>) {
         let value = value.trim();
@@ -904,7 +1118,20 @@ pub(crate) fn assignments(text: &str) -> Vec<(Vec<&str>, &str)> {
     let mut out = Vec::new();
     // The table path the next keys belong to.
     let mut header: Vec<&str> = Vec::new();
+    // Inside a multi-line string (its closing quotes) or array (its depth).
+    let mut in_string: Option<&str> = None;
+    let mut array_depth = 0i32;
     for raw in text.strip_prefix('\u{feff}').unwrap_or(text).lines() {
+        if let Some(q) = in_string {
+            if raw.contains(q) {
+                in_string = None;
+            }
+            continue;
+        }
+        if array_depth > 0 {
+            array_depth += open_brackets(raw);
+            continue;
+        }
         let line = top_level(raw, '#')[0].trim();
         if let Some(h) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             header = match h.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
@@ -918,12 +1145,49 @@ pub(crate) fn assignments(text: &str) -> Vec<(Vec<&str>, &str)> {
             continue;
         }
         if let [lhs, rhs] = top_level(line, '=')[..] {
+            let value = rhs.trim();
+            if let Some(q) = ["\"\"\"", "'''"].into_iter().find(|q| value.starts_with(q)) {
+                if !value[3..].contains(q) {
+                    in_string = Some(q);
+                }
+                continue;
+            }
+            let depth = open_brackets(value);
+            if value.starts_with('[') && depth > 0 {
+                array_depth = depth;
+                continue;
+            }
             let mut path = header.clone();
             path.extend(key_path(lhs));
             flatten(path, rhs, &mut out);
         }
     }
     out
+}
+
+/// How many `[` a line leaves open, counted where TOML would: outside quoted
+/// strings and after a `#` comment's cut.
+fn open_brackets(line: &str) -> i32 {
+    let (mut depth, mut quote, mut escaped) = (0i32, None, false);
+    for c in top_level(line, '#')[0].chars() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
 }
 
 /// A one-line TOML value's text as [`SupervisorConfig::set`] reads it: a
@@ -1034,29 +1298,119 @@ mod tests {
         assert!(!full.limits(&c));
     }
 
+    /// THE OWNER RULING OF 2026-09-25: only an explicit setting takes power
+    /// away. A value that is neither the key's own nor an off — a word it
+    /// cannot read, a float, a table — KEEPS the key's default and is named;
+    /// until the ruling it was the key's limit, so `approve = "everything"`
+    /// stopped every box being answered and `enabled = "yes"` turned the
+    /// harness off. An off, however it is spelled, is still the limit, and an
+    /// unknown key changes nothing.
     #[test]
-    fn a_malformed_value_is_its_limit_and_an_unknown_key_changes_nothing() {
+    fn a_value_it_cannot_read_keeps_its_default_and_only_an_off_limits() {
+        let full = SupervisorConfig::default();
         let (c, notes) = SupervisorConfig::from_aterm_toml(
             "[harness]\ncontinue = \"no\"\napprove = \"everything\"\ncontinu = false\n",
         );
-        assert!(!c.continue_policy, "malformed switch → off");
-        assert_eq!(c.approve, Approve::None, "malformed approve → none");
-        assert_eq!(notes.len(), 3, "{notes:?}");
-        assert!(notes.iter().any(|n| n.contains("continu:")), "{notes:?}");
-        assert_eq!(notes.iter().filter(|n| is_unknown_key_note(n)).count(), 1);
-        let rest = SupervisorConfig {
-            continue_policy: true,
-            approve: Approve::All,
-            ..c
-        };
-        assert_eq!(rest, SupervisorConfig::default(), "nothing else moved");
-        // A value of a shape no key takes is its key's limit too; a table
-        // under the root one is an unknown key.
-        let (c, notes) = SupervisorConfig::from_aterm_toml(
-            "[harness]\ncontinue_per_hour = 2.5\nupgrade = 0\n[harness.sub]\nupgrade = false\n",
+        assert!(!c.continue_policy, "an explicit `no` is an off");
+        assert_eq!(
+            c.approve,
+            Approve::All,
+            "an unreadable approve keeps its default"
         );
-        assert_eq!(c.continue_per_hour, 1);
-        assert!(!c.upgrade, "`0` is not a switch: off");
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("approve:") && n.contains("keeps its default")),
+            "{notes:?}"
+        );
+        assert_eq!(notes.iter().filter(|n| is_unknown_key_note(n)).count(), 1);
+        assert_eq!(
+            SupervisorConfig {
+                continue_policy: true,
+                ..c
+            },
+            full,
+            "nothing else moved"
+        );
+        // No setting at all: every one of these is the full default.
+        for text in [
+            "[harness]\napprove = \"maybe\"\n",
+            "[harness]\nenabled = \"sometimes\"\n",
+            "[harness]\nenabled = 2.5\n",
+            "[harness]\nupgrade = [false]\n",
+            "[harness]\nrelaunch = { on = false }\n",
+            "[harness]\ncontinue_per_hour = 2.5\n",
+            "[harness]\ncontinue_per_hour = \"off\"\n",
+            "[harness]\nhuman_grace_s = \"off\"\n",
+            "[harness]\ncontinue_text = false\n",
+            "[harness]\nanswer_text = 1\n",
+            "[harness]\nanswer_text = \"\"\n",
+            "[harness]\nmodel_fallback = true\n",
+            "[harness]\nmodel_fallback = \"yes\"\n",
+            "[harness]\nrules_file = 1\n",
+            "[harness]\nenabled = [\"no\"]\n",
+            "[harness]\napprove = [\"none\"]\n",
+            "[harness]\nrm_breakr = false\nsome_future_key = true\n",
+            "harness = 5\n",
+            "harness = [\"off\"]\n",
+        ] {
+            let (c, notes) = SupervisorConfig::from_aterm_toml(text);
+            assert_eq!(c, full, "{text:?} took power away: {notes:?}");
+            assert!(!notes.is_empty(), "{text:?} is said");
+        }
+        // The owner's explicit spellings, in any case, are read as written.
+        for (text, want) in [
+            ("[harness]\napprove = \"ALL\"\n", Approve::All),
+            ("[harness]\napprove = \"Safe\"\n", Approve::Safe),
+            ("[harness]\napprove = \"none\"\n", Approve::None),
+            ("[harness]\napprove = \"no\"\n", Approve::None),
+            ("[harness]\napprove = false\n", Approve::None),
+            ("[harness]\napprove = \"disabled\"\n", Approve::None),
+        ] {
+            assert_eq!(read(text).approve, want, "{text:?}");
+        }
+        for (text, on) in [
+            ("[harness]\nenabled = \"yes\"\n", true),
+            ("[harness]\nenabled = \"ON\"\n", true),
+            ("[harness]\nenabled = 1\n", true),
+            ("[harness]\nenabled = \"off\"\n", false),
+            ("[harness]\nenabled = 0\n", false),
+            ("[harness]\nenabled = 0x0\n", false),
+            ("[harness]\nenabled = \"False\"\n", false),
+        ] {
+            assert_eq!(read(text).enabled, on, "{text:?}");
+        }
+        // A quoted string is a text, whatever it says.
+        assert_eq!(
+            read("[harness]\ncontinue_text = \"yes\"\n").continue_text,
+            "yes"
+        );
+        assert_eq!(read("[harness]\nanswer_text = \"1\"\n").answer_text, "1");
+        // An off is no model and no path, never a model named "false"; the
+        // whole table written off is the master switch, wherever it is filed.
+        assert_eq!(
+            read("[harness]\nmodel_fallback = false\n").model_fallback,
+            None
+        );
+        assert_eq!(
+            read("[harness]\nmodel_fallback = \"none\"\n").model_fallback,
+            None
+        );
+        assert_eq!(read("[harness]\nrules_file = false\n").rules_file, None);
+        let (c, notes) = SupervisorConfig::from_aterm_toml("harness = false\n");
+        assert!(
+            !c.enabled && notes[0].contains("master switch is off"),
+            "{notes:?}"
+        );
+        let (c, notes) = SupervisorConfig::from_aterm_toml("[x]\nharness = \"off\"\n");
+        assert!(!c.enabled, "{notes:?}");
+        assert!(notes[0].contains("`x.harness.enabled`"), "{notes:?}");
+        // A table under the root one is an unknown key.
+        let (c, notes) = SupervisorConfig::from_aterm_toml(
+            "[harness]\nupgrade = 0\n[harness.sub]\nupgrade = false\n",
+        );
+        assert!(!c.upgrade, "`0` is an off");
         assert!(
             notes
                 .iter()
@@ -1196,6 +1550,38 @@ mod tests {
         // header, and a switch set ON there is ON.
         assert!(!read(&format!("\u{feff}[harness]\nenabled = false\n{TYPO}")).enabled);
         assert!(read(&format!("{TYPO}[harness]\nupgrade = true\n")).upgrade);
+        // The whole table written off is off there too; a value that is no
+        // setting is none there either (owner ruling of 2026-09-25).
+        assert!(!read(&format!("{TYPO}harness = false\n")).enabled);
+        assert!(!read(&format!("{TYPO}[x]\nharness = false\n")).enabled);
+        // The whole table off, then a `[harness]` saying `enabled = true` (a
+        // redefinition, which is why TOML refuses the file): the later line
+        // is a repeat of the master switch and may only limit.
+        let redefined = "harness = false\n[harness]\nenabled = true\n";
+        assert!(aterm_toml::from_str::<aterm_toml::Value>(redefined).is_err());
+        assert!(!read(redefined).enabled);
+        // A multi-line string or array is skipped whole: the `[harness]` and
+        // the off quoted inside it are no setting.
+        for text in [
+            "[other]\nnote = \"\"\"\n[harness]\nenabled = false\n\"\"\"\n",
+            "[other]\nnote = '''\nharness.approve = \"none\"\n'''\n",
+            "[other]\nlist = [\n  \"[harness]\",\n]\nenabled = false\n",
+        ] {
+            let text = format!("{TYPO}{text}");
+            let c = read(&text);
+            assert!(c.enabled && c.approve == Approve::All, "{text:?}");
+        }
+        // A multi-line array is not taken, the lines after it still are.
+        let c = read(&format!(
+            "{TYPO}[harness]\ntrust_roots = [\n  \"/x\",\n]\nupgrade = false\n"
+        ));
+        assert!(!c.upgrade && c.trust_roots == SupervisorConfig::default().trust_roots);
+        assert_eq!(
+            read(&format!(
+                "{TYPO}[harness]\napprove = \"maybe\"\nenabled = \"sometimes\"\n"
+            )),
+            SupervisorConfig::default()
+        );
     }
 
     #[test]
@@ -1347,8 +1733,8 @@ read_outside_cwd = false
 trust_dialog = false
 ");
         assert_eq!((c.approve, c.trust_roots.len()), (Approve::Safe, 0));
-        // Each limits, and only limits; a value that is no switch is its
-        // limit, as for any key; a misplaced one still limits.
+        // Each limits, and only limits — written `false` or any off spelling;
+        // a misplaced one still limits.
         for key in RETIRED_KEYS {
             for text in [
                 format!("[harness]\n{key} = false\n"),
@@ -1361,6 +1747,37 @@ trust_dialog = false
             let (c, note) = one(&format!("[harness]\n{key} = true\n"));
             assert_eq!(c, full, "{key} = true changes nothing");
             assert!(note.contains("changes nothing"), "{note}");
+            // A value that is no on or off is no setting: it changes nothing
+            // (owner ruling of 2026-09-25; it was the limit until then).
+            for text in [
+                format!("[harness]\n{key} = \"maybe\"\n"),
+                format!("[harness]\n{key} = 2.5\n"),
+                format!("[harness]\n{key} = [false]\n"),
+            ] {
+                let (c, note) = one(&text);
+                assert_eq!(c, full, "{text}");
+                assert!(note.contains("changes nothing"), "{note}");
+            }
+            assert!(
+                retired_key_note(key, None).is_some_and(|n| n.contains("changes nothing")),
+                "{key}"
+            );
+            // Any off spelling limits — and the config language, reading the
+            // same text, says the reader's own words for it.
+            for off in ["false", "\"no\"", "0", "\"disabled\""] {
+                let (c, note) = one(&format!("[harness]\n{key} = {off}\n"));
+                assert!(c.limits(&full), "{key} = {off}");
+                assert_eq!(
+                    retired_key_note_text(key, Some(off.trim_matches('"'))).as_deref(),
+                    Some(note.as_str()),
+                    "{key} = {off}"
+                );
+            }
+            assert!(
+                retired_key_note_text(key, Some("maybe"))
+                    .is_some_and(|n| n.contains("changes nothing")),
+                "{key}"
+            );
             assert_eq!(
                 retired_key_note(key, Some(false)).as_deref(),
                 Some(one(&format!("[harness]\n{key} = false\n")).1.as_str()),
@@ -1393,19 +1810,20 @@ trust_dialog = false
         assert_eq!(retired_key_note("approve_al", Some(false)), None);
     }
 
-    /// A SESSION'S `questions` word speaks only over a switch the owner wrote
-    /// (2026-09-25): an `answer_questions` value the reader cannot take is
-    /// its limit, and gives no session's word a say either. NEGATIVE
-    /// CONTROL: the switch spelled right, on or off, or absent, leaves the
-    /// session's word its say — and an unknown key changes nothing.
+    /// A SESSION'S `questions` word keeps its say unless a loop's own flag
+    /// takes it (2026-09-25): an `answer_questions` value the reader cannot
+    /// take is no setting (owner ruling of 2026-09-25) — the switch keeps its
+    /// default and the sessions their word; until the ruling it silenced both.
+    /// NEGATIVE CONTROL: the switch spelled right, on or off, or absent, or an
+    /// unknown key, leaves the session's word its say too.
     #[test]
-    fn a_misread_question_switch_silences_every_sessions_word() {
+    fn a_misread_question_switch_changes_nothing() {
         for text in [
             "[harness]\nanswer_questions = \"sometimes\"\n",
             "[harness]\nanswer_questions = 2.5\n",
         ] {
             let c = read(text);
-            assert!(!c.answer_questions && !c.session_questions, "{text}");
+            assert!(c.answer_questions && c.session_questions, "{text}");
         }
         for text in [
             "[harness]\nanswer_questions = true\n",
@@ -1433,6 +1851,11 @@ trust_dialog = false
         );
         std::fs::write(&toml, "[harness]\nenabled = false\n").expect("write");
         assert!(!SupervisorConfig::from_path(Some(&toml)).0.enabled);
+        // A stray non-UTF-8 byte hides no explicit off.
+        std::fs::write(&toml, b"# caf\xe9\n[harness]\nenabled = false\n").expect("write");
+        assert!(!SupervisorConfig::from_path(Some(&toml)).0.enabled);
+        std::fs::write(&toml, b"# caf\xe9\n[harness]\nenabled = true\n").expect("write");
+        assert!(SupervisorConfig::from_path(Some(&toml)).0.enabled);
         // A path that exists and cannot be read as a file: the defaults, said.
         let (c, notes) = SupervisorConfig::from_path(Some(&dir));
         assert_eq!(c, SupervisorConfig::default());

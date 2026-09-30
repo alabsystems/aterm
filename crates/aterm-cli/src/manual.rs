@@ -588,9 +588,13 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   upgrade [true]           the live upgrade below
   human_grace_s [120]      after a person types, clicks or scrolls in a session, the
                            supervisor keeps its hands off it this many seconds
-  A value it cannot take is that key's limit, and is named; an unknown key is named
-  and changes nothing; `harness.<key>` written below another table's header still
-  limits. A change takes effect without a restart.
+  Only an explicit setting takes power away (owner ruling, 2026-09-25): an off
+  (false, "no", "off", 0, "none") is that key's limit — a count takes a number, so
+  an off there is no setting, and a text takes any quoted string; a value that is
+  neither the key's own nor an off keeps its default, and is named; an unknown key
+  is named and changes nothing; `harness = false` is the master switch off;
+  `harness.<key>` written below another table's header still limits. A change takes
+  effect without a restart.
 
   NOTHING IS INSTALLED INTO THE AGENT. The hook bridge this command used to carry —
   `hook`, `statusline`, `install`, `uninstall` — is retired: `install` and `uninstall`
@@ -1738,14 +1742,14 @@ toolchain there (targo, tippy, trustfmt and trustdoc are not rustup proxies; `at
 rust` measures it per directory). A Trust pin, the default, adds nothing.
 
 NOTHING HERE REFUSES AN AGENT'S OWN COMMAND. A stub answers a NAME looked up on PATH, so
-it cannot tell a command an agent typed from one a tool spawned by name — aterm's own
-`xtask gate web` and `gate linux` spawn stock `cargo` with RUSTUP_TOOLCHAIN=<stable> by
-design, and every child inherits the agent's environment — so it announces and runs. And
-aterm installs nothing into an agent (decision "B"), so no hook of aterm's refuses one
-either. What CAN see an agent's own command is its text: `aterm pkg lane` reads one command
-line the way the shell runs it and exits 2 with the Trust spelling when it runs stock Rust
-at command position (`ATERM_STOCK_REASON='<why>'` in front lets it through) — the reader a
-guard you wire yourself calls (`aterm help pkg`).
+it cannot tell a command an agent typed from one a tool spawned by name — a build script,
+a Makefile, a project's own stock-toolchain lane — and every child inherits the agent's
+environment, so it announces and runs. And aterm installs nothing into an agent (decision
+"B"), so no hook of aterm's refuses one either. What CAN see an agent's own command is its
+text: `aterm pkg lane` reads one command line the way the shell runs it and exits 2 with
+the Trust spelling when it runs stock Rust at command position
+(`ATERM_STOCK_REASON='<why>'` in front lets it through) — the reader a guard you wire
+yourself calls (`aterm help pkg`).
 
 EXIT CODES
   The exec'd tool's own (a DIRECT row, a SIGNPOST row, an escape, a `+toolchain`
@@ -4809,6 +4813,12 @@ BROADCAST — ONE RECORD, HOWEVER MANY READERS
                     (two nodes claim the sid) or `undeliverable`. The row is dead, no
                     bridge drains it again, and re-posting is the right move once the
                     address is right. Report it as that reason, never as queued.
+                    A queued post an aterm self-update could not carry (past its size
+                    budget) is retired the same way, `reason=not-carried` — the
+                    session's `timeline` says `post-landed <id> off=- reason=not-carried`:
+                    re-post it.
+  An aterm SELF-UPDATE carries the queued posts, the owed receipts and the ids: the
+  new instance drains the same outbox, and inbox, post and timeline ids go on rising.
 
 WHEN TO READ YOUR MAIL
   When the line `Inbox: task @<off>` is typed into your terminal (a manager's `aterm
@@ -5707,21 +5717,26 @@ mod tests {
     }
 
     /// The probe helper is BOUNDED: a command that never exits cannot wedge the
-    /// manual. `sleep 5` against a 200 ms limit must come back `None` quickly.
+    /// manual. `sleep 120` against a 200 ms limit must come back `None` long
+    /// before it would exit — the 60 s bound sits half the sleep's life below
+    /// it, so a helper that waits the probe out fails however loaded the box.
     #[test]
     fn bounded_first_line_kills_a_wedged_probe() {
         let t0 = std::time::Instant::now();
-        let got = bounded_first_line("sleep", &["5"], std::time::Duration::from_millis(200));
+        let got = bounded_first_line("sleep", &["120"], std::time::Duration::from_millis(200));
         assert!(
             got.is_none(),
             "a wedged probe must answer None, got {got:?}"
         );
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(3),
-            "the bound did not hold"
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "the bound did not hold: {:?}",
+            t0.elapsed()
         );
+        // A probe that exits is answered as soon as it does; the limit is only
+        // the hang detector (a loaded box can take seconds to start `echo`).
         assert_eq!(
-            bounded_first_line("echo", &["hello"], std::time::Duration::from_secs(2)).as_deref(),
+            bounded_first_line("echo", &["hello"], std::time::Duration::from_secs(60)).as_deref(),
             Some("hello")
         );
     }

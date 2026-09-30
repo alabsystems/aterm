@@ -1263,7 +1263,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         }
         let _ = writeln!(
             log,
-            "gate mainloop: FAILED — {failures} obligation violation(s) ({hazard_hits} \
+            "main-loop census: FAILED — {failures} obligation violation(s) ({hazard_hits} \
              unbounded-work site(s)). This census blocks BOTH \
              `targo --unverified run -p aterm-census -- --mainloop` and the build of \
              tools/freeze-safety-gate."
@@ -1595,6 +1595,14 @@ mod tests {
         assert!(
             out.log.contains("HOW TO REPAIR"),
             "the diagnostic must carry the repair options; log:\n{}",
+            out.log
+        );
+        // The verdict names the census as its GREEN line does, and the hand-run
+        // spelling that exists (the `xtask gate mainloop` verb was retired).
+        let runner = "`targo --unverified run -p aterm-census -- --mainloop`";
+        assert!(
+            out.log.contains("main-loop census: FAILED — ") && out.log.contains(runner),
+            "the verdict line must name the census and its runner; log:\n{}",
             out.log
         );
     }

@@ -493,6 +493,21 @@ fn open_pty_pair_cloexec(
     Ok((master, slave))
 }
 
+/// A bare PTY pair `(master, slave)`, BOTH ends close-on-exec from birth
+/// ([`open_pty_pair_cloexec`], with no termios or winsize applied) — for a
+/// caller that needs a pair and no child, such as the seamless handoff's test
+/// fixture. `openpty(3)` followed by `fcntl(FD_CLOEXEC)` leaves a window in
+/// which a fork on any other thread takes an exec-surviving copy of the
+/// master; that copy keeps the master open after its owner closes it, which is
+/// exactly what a test reading the slave's EOF as "the master is closed"
+/// cannot tell from a leak.
+///
+/// # Errors
+/// The OS error from whichever step failed; no descriptor escapes on error.
+pub fn open_pty_pair() -> io::Result<(i32, i32)> {
+    open_pty_pair_cloexec(None, None)
+}
+
 /// The termios a NULL-termios `openpty`/`forkpty` gives the slave — the kernel's
 /// compiled-in defaults — probed ONCE per process via a throwaway PTY pair and
 /// cached. Probing (instead of hardcoding `TTYDEF_*`) guarantees "identical to
@@ -2454,9 +2469,9 @@ pub fn reap_shell(identity: ShellIdentity) {
     // ~2 s budget: poll every 10 ms (200 ticks). A SIGHUP-ignoring holdout is
     // SIGKILLed at ~250 ms, so the common case returns on the first poll and the
     // pathological case is still bounded.
-    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
-    const KILL_AT: u32 = 25;
-    const DEADLINE: u32 = 200;
+    const POLL: std::time::Duration = REAP_POLL;
+    const KILL_AT: u32 = REAP_KILL_AT;
+    const DEADLINE: u32 = REAP_DEADLINE;
     let mut status: libc::c_int = 0;
     for tick in 0..DEADLINE {
         if !identity.verify() {
@@ -2479,9 +2494,42 @@ pub fn reap_shell(identity: ShellIdentity) {
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
+            #[cfg(test)]
+            REAP_KILL_TICK.with(|t| t.set(Some(tick)));
         }
+        #[cfg(test)]
+        REAP_POLLS.with(|n| n.set(n.get() + 1));
         std::thread::sleep(POLL);
     }
+}
+
+/// [`reap_shell`]'s poll period.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+/// The [`reap_shell`] tick that SIGKILLs a SIGHUP-ignoring holdout (~250 ms).
+const REAP_KILL_AT: u32 = 25;
+/// The [`reap_shell`] tick at which it gives up (~2 s).
+const REAP_DEADLINE: u32 = 200;
+
+#[cfg(test)]
+thread_local! {
+    /// How many [`REAP_POLL`] waits [`reap_shell`] has taken on this thread: a
+    /// test's census of the loop, counted in the product's own ticks, so a
+    /// descheduled test thread cannot move it the way it moves a stopwatch.
+    static REAP_POLLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The tick at which [`reap_shell`] last sent its SIGKILL on this thread.
+    static REAP_KILL_TICK: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// This thread's [`REAP_POLLS`] reading.
+#[cfg(test)]
+fn reap_polls() -> u32 {
+    REAP_POLLS.with(std::cell::Cell::get)
+}
+
+/// This thread's [`REAP_KILL_TICK`], cleared as it is read.
+#[cfg(test)]
+fn take_reap_kill_tick() -> Option<u32> {
+    REAP_KILL_TICK.with(std::cell::Cell::take)
 }
 
 /// Build the `sandbox-exec`-wrapped `(exec_target, argv)` for an OS-sandboxed
@@ -3594,6 +3642,29 @@ thread_local! {
     static BRIDGE_POLLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+// A test's own hot budget for the gathers THIS thread runs — tests only, and
+// only for a test whose subject is the park primitive, not the budget: the
+// 1 ms [`HOT_BATCH_BUDGET`] is a wall clock started before the first read, so
+// a gather preempted for a millisecond on a loaded machine delivers on the
+// budget before it ever reaches the dry gap the test is about (the merge gate
+// at load 100-170 read `filled` 2048 of 4096 there, and `parks` 1 of 2). The
+// budget itself keeps its own tests, which run on the shipped value.
+#[cfg(test)]
+thread_local! {
+    static HOT_BUDGET_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The batch budget while a keystroke is pending: [`HOT_BATCH_BUDGET`], or a
+/// test's own ([`HOT_BUDGET_FOR_TEST`]) in a test build.
+fn hot_batch_budget() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = HOT_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return budget;
+    }
+    HOT_BATCH_BUDGET
+}
+
 /// Park for the writer's next refill: one bounded poll on `[master, wake_rd]`.
 /// A pending wake byte is deliberately NOT consumed — [`read_or_wake`] owns the
 /// wake protocol and must observe it after the batch is delivered.
@@ -3827,7 +3898,11 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                 // is the SHORT budget while a keystroke is pending: a byte that
                 // is this human's echo must not ride the streaming program's
                 // 3 ms batch schedule.
-                let budget = if hot { HOT_BATCH_BUDGET } else { BATCH_BUDGET };
+                let budget = if hot {
+                    hot_batch_budget()
+                } else {
+                    BATCH_BUDGET
+                };
                 if filled < SATURATED || start.elapsed() >= budget {
                     break;
                 }
@@ -4033,8 +4108,9 @@ mod tests {
         assert!(
             // A genuine failure blocks FOREVER on a full pipe with no reader, so any
             // finite bound catches it. 20ms sits inside one scheduler quantum and was
-            // measuring preemption, not the never-blocks property.
-            started.elapsed() < std::time::Duration::from_secs(5),
+            // measuring preemption, not the never-blocks property; a minute is the
+            // hang detector the house rule names.
+            started.elapsed() < std::time::Duration::from_secs(60),
             "a redundant wake against a full pipe must return promptly"
         );
         close_fd(rd);
@@ -4084,8 +4160,10 @@ mod tests {
         // Fire the wake: the reader must return `Wake` promptly even though `master_rd`
         // never saw data or EOF (`master_wr` is still open).
         wake(wake_wr);
+        // A hang detector for a handoff that must happen: the reader thread
+        // returns the moment it is scheduled after the wake byte lands.
         let got_wake = rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(60))
             .expect("reader must unblock promptly once the wake pipe fires");
         assert!(got_wake, "the wake pipe must yield ReadOutcome::Wake");
 
@@ -4101,6 +4179,14 @@ mod tests {
     /// Direct-read drain (O_NONBLOCK gather): an interactive-sized burst (< one
     /// outq) must be delivered on the FIRST quiet read — no spin bridge, no
     /// parking — and gather exactly the bytes written.
+    ///
+    /// Read without a clock. A drain that skipped the first-quiet-read
+    /// delivery parks ONE 1 ms bridge poll and is then capped by its 3 ms
+    /// `BATCH_BUDGET`, so no wall-clock bound can tell it apart; the minute
+    /// bound this test used to carry passed it (measured 2026-09-29 with the
+    /// `filled < SATURATED` cutoff deleted). The park seam `at_gap` fires
+    /// immediately before every park and the bridge-poll census counts the
+    /// parks themselves: a first-quiet-read delivery reaches neither.
     #[test]
     fn drain_more_nonblocking_delivers_interactive_burst_on_first_quiet_read() {
         let mut m = [0i32; 2];
@@ -4113,21 +4199,23 @@ mod tests {
         let mut buf = [0u8; 65_536];
         let n = read(rd, &mut buf[..1]); // stand-in for the read_or_wake first chunk
         assert_eq!(n, 1);
-        let t0 = std::time::Instant::now();
-        let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, None, never_hot, &mut |_| false);
-        assert_eq!(filled, 4, "must gather the whole burst");
-        assert_eq!(&buf[..4], b"echo");
-        assert!(
-            // Failure bound only: the regressed path parks (unbounded), so any finite
-            // deadline discriminates. 50ms sits inside a single scheduler quantum on a
-            // loaded box and was measuring preemption, not the latency property. The
-            // structural assertions beside this one (byte counts, wake-byte
-            // preservation) are what actually prove the behaviour.
-            t0.elapsed() < std::time::Duration::from_secs(2),
-            "interactive drain must return on the first quiet read, not spin/park"
-        );
+        let polls_before = super::BRIDGE_POLLS.with(std::cell::Cell::get);
+        let mut gaps = 0u32;
+        let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, None, never_hot, &mut |_| {
+            gaps += 1;
+            false
+        });
+        let polls = super::BRIDGE_POLLS.with(std::cell::Cell::get) - polls_before;
         close_fd(rd);
         close_fd(wr);
+        assert_eq!(filled, 4, "must gather the whole burst");
+        assert_eq!(&buf[..4], b"echo");
+        assert_eq!(
+            (gaps, polls),
+            (0, 0),
+            "interactive drain must return on the first quiet read, not bridge \
+             the gap: (dry gaps parked at, bridge polls taken)"
+        );
     }
 
     /// The host hint "a human is waiting on the UI thread", pinned OFF: the
@@ -4206,6 +4294,13 @@ mod tests {
         // read 943 µs against the 1 ms bound — every one of three ~80 µs gathers
         // had been stretched tenfold by scheduling — and a gather costs ~100 µs,
         // so nine samples buy the margin for nothing.
+        // The subject is the PARK, not the 1 ms hot budget: a gather preempted
+        // for a millisecond before its first dry gap delivers on the budget and
+        // never reaches the park (3 of 200 runs beside 72 spinners read
+        // `filled` 2048 or `parks` 1). The budget is a clock that measures the
+        // load here, so this thread's gathers run under one no preemption
+        // reaches; the budget's own tests keep the shipped value.
+        super::HOT_BUDGET_FOR_TEST.with(|b| b.set(Some(std::time::Duration::from_secs(60))));
         let mut best_held = std::time::Duration::MAX;
         for _ in 0..9 {
             let polls_before = super::BRIDGE_POLLS.with(std::cell::Cell::get);
@@ -4232,6 +4327,7 @@ mod tests {
         // property, and a wall-clock reading of a ~100 µs gather is the load's
         // (best of nine still read 943 µs against 1 ms once — the load-sensitive
         // test audit of 2026-09-27 found the bound one quantum from red).
+        super::HOT_BUDGET_FOR_TEST.with(|b| b.set(None));
         eprintln!("P05 busy-parser hot gather: best of nine held {best_held:?}");
     }
 
@@ -4886,114 +4982,208 @@ mod tests {
     /// Hysteresis + teardown: a wake byte pending when the idle wait parks
     /// must deliver promptly WITHOUT consuming the byte — [`read_or_wake`]
     /// owns the wake protocol (same contract as the busy-parser bridge poll).
+    ///
+    /// The idle wait is armed LONGER than the minute hang detector, so a park
+    /// that ignored the wake fd could only end on its own timeout, past the
+    /// detector. At the 100 ms this test used to pass, a drain that dropped the
+    /// wake fd from its `select` parked 100 ms, delivered, and passed (measured
+    /// 2026-09-29, the wake fd deleted from `idle_refill_wait`'s set). The park
+    /// must also actually be REACHED: the gather's 3 ms `BATCH_BUDGET` runs
+    /// from entry, so a reader descheduled that long before its first dry gap
+    /// delivers without parking and proves nothing. `at_gap` fires immediately
+    /// before the park; an attempt that never reached it is judged only when it
+    /// took less than that budget (then a cutoff that no longer parks is the
+    /// only explanation), and retried otherwise.
     #[test]
     fn drain_more_nonblocking_idle_wait_yields_to_wake_and_leaves_the_byte() {
         use std::sync::atomic::AtomicUsize;
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        let (rd, wr) = (m[0], m[1]);
-        set_nonblocking(rd, true).expect("nonblock read end");
-        let payload = [0x9Cu8; 4096];
-        // SAFETY: bounded write to this test's live pipe end.
-        assert_eq!(
-            unsafe { libc::write(wr, payload.as_ptr().cast(), payload.len()) },
-            payload.len() as isize
+        use std::time::Duration;
+        /// The gather's `BATCH_BUDGET` (a const local to its body).
+        const GATHER_BUDGET: Duration = Duration::from_millis(3);
+        /// The house hang detector.
+        const HANG: Duration = Duration::from_secs(60);
+        /// Past [`HANG`]: a wait that ignored the wake ends only after it.
+        const IDLE_WAIT_US: u32 = 90_000_000;
+        let mut starved = Vec::new();
+        for _ in 0..12 {
+            let mut m = [0i32; 2];
+            // SAFETY: valid 2-int out-array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+            let (rd, wr) = (m[0], m[1]);
+            set_nonblocking(rd, true).expect("nonblock read end");
+            let payload = [0x9Cu8; 4096];
+            // SAFETY: bounded write to this test's live pipe end.
+            assert_eq!(
+                unsafe { libc::write(wr, payload.as_ptr().cast(), payload.len()) },
+                payload.len() as isize
+            );
+            let mut wk = [0i32; 2];
+            // SAFETY: valid 2-int out-array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(wk.as_mut_ptr()) }, 0, "wake pipe");
+            let (wake_rd, wake_wr) = (wk[0], wk[1]);
+            wake(wake_wr); // teardown byte queued BEFORE the idle wait parks
+            let idle = AtomicUsize::new(0);
+            let mut buf = [0u8; 65_536];
+            let n = read(rd, &mut buf[..1024]);
+            assert!(n > 0);
+            let mut gaps = 0u32;
+            let t0 = std::time::Instant::now();
+            let filled = drain_more_nonblocking_with_idle_wait_after_gap(
+                rd,
+                &mut buf,
+                n as usize,
+                wake_rd,
+                Some(&idle),
+                never_hot,
+                IDLE_WAIT_US,
+                |_| {
+                    gaps += 1;
+                    false
+                },
+            );
+            let took = t0.elapsed();
+            assert_eq!(filled, payload.len(), "keeps the drained burst");
+            let mut b = [0u8; 4];
+            // Non-blocking: a CONSUMED wake byte must fail the assert below, not
+            // hang this read forever.
+            set_nonblocking(wake_rd, true).expect("nonblock wake read end");
+            // SAFETY: bounded read from this test's live wake pipe end.
+            let wn = unsafe { libc::read(wake_rd, b.as_mut_ptr().cast(), 4) };
+            close_fd(rd);
+            close_fd(wr);
+            close_fd(wake_rd);
+            close_fd(wake_wr);
+            assert_eq!(wn, 1, "idle wait must NOT consume the wake byte");
+            if gaps == 1 {
+                // The park was reached with the wake byte queued: only the wake
+                // can have ended it before the detector.
+                assert!(
+                    took < HANG,
+                    "a queued wake must deliver promptly, not park the full idle wait: \
+                     {took:?}"
+                );
+                return;
+            }
+            assert_eq!(gaps, 0, "the wake ends the batch at its first park");
+            assert!(
+                took >= GATHER_BUDGET,
+                "the gather must reach its idle wait: it delivered in {took:?}, inside \
+                 its {GATHER_BUDGET:?} budget, without ever parking"
+            );
+            starved.push(took);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "every attempt spent the gather's {GATHER_BUDGET:?} budget before its first \
+             dry gap, so none reached the idle wait: {starved:?}"
         );
-        let mut wk = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(wk.as_mut_ptr()) }, 0, "wake pipe");
-        let (wake_rd, wake_wr) = (wk[0], wk[1]);
-        wake(wake_wr); // teardown byte queued BEFORE the idle wait parks
-        let idle = AtomicUsize::new(0);
-        let mut buf = [0u8; 65_536];
-        let n = read(rd, &mut buf[..1024]);
-        assert!(n > 0);
-        let t0 = std::time::Instant::now();
-        let filled = drain_more_nonblocking_with_idle_wait(
-            rd,
-            &mut buf,
-            n as usize,
-            wake_rd,
-            Some(&idle),
-            never_hot,
-            100_000,
-        );
-        assert_eq!(filled, payload.len(), "keeps the drained burst");
-        assert!(
-            // Failure bound only: the regressed path parks (unbounded), so any finite
-            // deadline discriminates. 50ms sits inside a single scheduler quantum on a
-            // loaded box and was measuring preemption, not the latency property. The
-            // structural assertions beside this one (byte counts, wake-byte
-            // preservation) are what actually prove the behaviour.
-            t0.elapsed() < std::time::Duration::from_secs(2),
-            "a queued wake must deliver promptly, not park the full idle wait"
-        );
-        let mut b = [0u8; 4];
-        // Non-blocking: a CONSUMED wake byte must fail the assert below, not
-        // hang this read forever.
-        set_nonblocking(wake_rd, true).expect("nonblock wake read end");
-        // SAFETY: bounded read from this test's live wake pipe end.
-        let wn = unsafe { libc::read(wake_rd, b.as_mut_ptr().cast(), 4) };
-        assert_eq!(wn, 1, "idle wait must NOT consume the wake byte");
-        close_fd(rd);
-        close_fd(wr);
-        close_fd(wake_rd);
-        close_fd(wake_wr);
     }
 
     /// Producer death mid-bridge: the write end closing while the drain is
-    /// parked in the bridge poll must deliver promptly with what it has
-    /// (via the POLLHUP Deliver arm, or the read()==0 EOF break one syscall
-    /// later — both protocol-safe), never stall against a dead producer.
+    /// parked in the bridge poll must deliver with what it has (via the POLLHUP
+    /// Deliver arm, or the read()==0 EOF break one syscall later — both
+    /// protocol-safe), never stall against a dead producer.
+    ///
+    /// Read by census, not by a stopwatch. A drain that kept bridging a dead
+    /// producer is still capped by its 3 ms `BATCH_BUDGET`, so the minute bound
+    /// this test used to carry could not see it, and one that spun on the EOF
+    /// without end hung the suite before any bound was read. Now the write end
+    /// is closed from `at_gap`, immediately before the park, and the drain must
+    /// end at that park: one gap, one bridge poll, nothing after. (Which arm
+    /// delivers is not observable: the 1 ms poll's quiet timeout delivers the
+    /// same batch after the same poll. What is observable is that nothing
+    /// follows it.) The gather runs on its own thread, so a drain that never
+    /// ends fails at the minute hang detector instead of hanging the suite. An
+    /// attempt whose budget ran out before its first dry gap never parks and
+    /// proves nothing: it is judged only when it took less than that budget,
+    /// and retried otherwise, as the idle-wait tests above do.
     #[test]
     fn drain_more_nonblocking_delivers_promptly_on_writer_hup() {
         use std::sync::atomic::AtomicUsize;
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        let (rd, wr) = (m[0], m[1]);
-        set_nonblocking(rd, true).expect("nonblock read end");
-        let chunk = [0x11u8; 2048];
-        // SAFETY: bounded write to this test's live pipe end.
-        assert_eq!(
-            unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
-            chunk.len() as isize
-        );
-        let closer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_micros(300));
-            close_fd(wr); // HUP lands while the drain bridges the dry gap
+        use std::time::Duration;
+        /// The gather's `BATCH_BUDGET` (a const local to its body).
+        const GATHER_BUDGET: Duration = Duration::from_millis(3);
+        /// The house hang detector.
+        const HANG: Duration = Duration::from_secs(60);
+        const CHUNK_LEN: usize = 2048;
+        /// One gather whose producer dies at its first park: (bytes gathered,
+        /// dry gaps parked at, bridge polls taken, wall held).
+        fn gather() -> (usize, u32, u32, Duration) {
+            let mut m = [0i32; 2];
+            // SAFETY: valid 2-int out-array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+            let (rd, wr) = (m[0], m[1]);
+            set_nonblocking(rd, true).expect("nonblock read end");
+            let chunk = [0x11u8; CHUNK_LEN];
+            // SAFETY: bounded write to this test's live pipe end.
+            assert_eq!(
+                unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+                chunk.len() as isize
+            );
+            let busy = AtomicUsize::new(1); // busy parser: the bridge parks
+            let mut buf = [0u8; 65_536];
+            let n = read(rd, &mut buf[..1024]);
+            assert!(n > 0);
+            let polls_before = super::BRIDGE_POLLS.with(std::cell::Cell::get);
+            let mut gaps = 0u32;
+            let t0 = std::time::Instant::now();
+            let filled = drain_more_nonblocking(
+                rd,
+                &mut buf,
+                n as usize,
+                -1,
+                Some(&busy),
+                never_hot,
+                &mut |_| {
+                    gaps += 1;
+                    if gaps == 1 {
+                        close_fd(wr); // the producer dies as the drain parks
+                    }
+                    false
+                },
+            );
+            let took = t0.elapsed();
+            let polls = super::BRIDGE_POLLS.with(std::cell::Cell::get) - polls_before;
+            if gaps == 0 {
+                close_fd(wr);
+            }
+            close_fd(rd);
+            (filled, gaps, polls, took)
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut starved = Vec::new();
+            for _ in 0..12 {
+                let (filled, gaps, polls, took) = gather();
+                if gaps > 0 || took < GATHER_BUDGET {
+                    let _ = tx.send(Ok((filled, gaps, polls, took)));
+                    return;
+                }
+                starved.push(took);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = tx.send(Err(starved));
         });
-        let busy = AtomicUsize::new(1); // busy parser: the bridge parks
-        let mut buf = [0u8; 65_536];
-        let n = read(rd, &mut buf[..1024]);
-        assert!(n > 0);
-        let t0 = std::time::Instant::now();
-        let filled = drain_more_nonblocking(
-            rd,
-            &mut buf,
-            n as usize,
-            -1,
-            Some(&busy),
-            never_hot,
-            &mut |_| false,
-        );
-        // Sample BEFORE the join: the join waits on a thread that sleeps 300us, so
-        // reading `elapsed` after it folded another thread's scheduling into the
-        // number this assertion is about.
-        let drain_elapsed = t0.elapsed();
-        closer.join().unwrap();
-        assert_eq!(filled, chunk.len(), "keeps what was drained before HUP");
+        let (filled, gaps, polls, took) = match rx.recv_timeout(HANG) {
+            Ok(Ok(r)) => r,
+            Ok(Err(starved)) => panic!(
+                "every attempt spent the gather's {GATHER_BUDGET:?} budget before its \
+                 first dry gap, so none parked: {starved:?}"
+            ),
+            Err(_) => panic!("a drain against a dead producer did not end within {HANG:?}"),
+        };
+        assert_eq!(filled, CHUNK_LEN, "keeps what was drained before HUP");
         assert!(
-            // Failure bound only: the regressed path parks (unbounded), so any finite
-            // deadline discriminates. 50ms sits inside a single scheduler quantum on a
-            // loaded box and was measuring preemption, not the latency property. The
-            // structural assertions beside this one (byte counts, wake-byte
-            // preservation) are what actually prove the behaviour.
-            drain_elapsed < std::time::Duration::from_secs(2),
-            "a dead producer must deliver promptly, not stall the batch"
+            gaps > 0,
+            "a busy-parser gather over one outq must park: it delivered in {took:?}, \
+             inside its {GATHER_BUDGET:?} budget, without a gap"
         );
-        close_fd(rd);
+        assert_eq!(
+            (gaps, polls),
+            (1, 1),
+            "a dead producer must end the batch at the park it died in, not bridge on: \
+             (dry gaps parked at, bridge polls taken), held {took:?}"
+        );
     }
 
     /// Blocking-emulated write on an O_NONBLOCK description: a full queue must
@@ -5128,9 +5318,18 @@ mod tests {
             "wakeless fallback must return Idle on a quiet master, never block or read"
         );
         // It returned via the bounded poll timeout, not by parking indefinitely.
+        // Two halves, because a bound scaled to the constant moves with it: at
+        // 40x `WAKELESS_POLL_TIMEOUT_MS` a constant regressed to 15 s passed in
+        // 15.00 s (measured 2026-09-29). The constant's own range is pinned at
+        // compile time (the doc's "reclaimed promptly": at most a second), and
+        // the fixed bound below — 10x that cap, 40x the shipping 250 ms, so a
+        // descheduled test thread is not read as a park — catches a call site
+        // that stops honouring the constant.
+        const _: () = assert!(WAKELESS_POLL_TIMEOUT_MS > 0 && WAKELESS_POLL_TIMEOUT_MS <= 1_000);
+        const BOUND: Duration = Duration::from_secs(10);
         assert!(
-            elapsed < Duration::from_secs(2),
-            "fallback must return within the poll timeout, not hang"
+            elapsed < BOUND,
+            "fallback must return within the poll timeout, not hang: {elapsed:?} >= {BOUND:?}"
         );
 
         // SAFETY: closing the two pipe fds this test owns.
@@ -5144,6 +5343,22 @@ mod tests {
     /// syscalls: a PTY master survives `execve` IFF `FD_CLOEXEC` is cleared. Opens a
     /// real pty pair, and forks+execs a child that reports whether the inherited fd is
     /// open — the exact "the shell's master survives the seamless re-exec" contract.
+    /// The public bare pair hands back BOTH ends close-on-exec, as
+    /// [`open_pty_pair_cloexec`] opens them, so a caller has no `fcntl` of its
+    /// own to race another thread's fork with (the seamless fixture's window).
+    #[test]
+    fn open_pty_pair_hands_back_both_ends_close_on_exec() {
+        let (master, slave) = open_pty_pair().expect("pty pair");
+        for (end, fd) in [("master", master), ("slave", slave)] {
+            // SAFETY: F_GETFD on a descriptor this test just opened.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "{end} flags");
+            assert_ne!(flags & libc::FD_CLOEXEC, 0, "{end} is close-on-exec");
+        }
+        close_fd(slave);
+        close_fd(master);
+    }
+
     #[test]
     fn cloexec_controls_master_survival_across_exec() {
         // A real pty pair (no shell), from the seam's own opener rather than
@@ -5412,19 +5627,32 @@ mod tests {
         }
     }
 
-    /// Does a byte written into `slave` come out of `master`?
+    /// [`byte_crosses`]'s budget for a byte that MUST cross.
+    const CROSS_MUST: std::time::Duration = std::time::Duration::from_secs(60);
+    /// [`byte_crosses`]'s window for a byte that must NOT cross.
+    const CROSS_MUST_NOT: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Does a byte written into `slave` come out of `master` within `budget`?
     ///
     /// The ONLY observation that separates a real pty pair from two
     /// correctly-flagged descriptors onto DIFFERENT terminals. Bounded by a
-    /// poll, so a broken pairing fails the test instead of hanging it.
-    fn byte_crosses(slave: libc::c_int, master: libc::c_int, byte: u8) -> bool {
+    /// poll, so a broken pairing fails the test instead of hanging it. A
+    /// POSITIVE check passes [`CROSS_MUST`] (a hang detector: the poll returns
+    /// the moment the byte lands); a NEGATIVE control passes [`CROSS_MUST_NOT`],
+    /// a window that can only go vacuous under load, never red.
+    fn byte_crosses(
+        slave: libc::c_int,
+        master: libc::c_int,
+        byte: u8,
+        budget: std::time::Duration,
+    ) -> bool {
         // SAFETY: `slave` is a live pts fd the caller owns; `write` reads
         // exactly the one byte living at `byte`'s address.
         let wrote = unsafe { libc::write(slave, ptr::from_ref(&byte).cast(), 1) };
         if wrote != 1 {
             return false;
         }
-        if poll_revents(master, std::time::Duration::from_millis(500)) & libc::POLLIN == 0 {
+        if poll_revents(master, budget) & libc::POLLIN == 0 {
             return false;
         }
         let mut buf = [0u8; 16];
@@ -5779,9 +6007,9 @@ mod tests {
         let (other_master, other_slave) =
             open_pty_pair_cloexec(None, None).expect("second pty pair");
 
-        let paired = byte_crosses(slave, master, b'A');
+        let paired = byte_crosses(slave, master, b'A', CROSS_MUST);
         // NEGATIVE CONTROL: an unrelated pair's slave must not reach this master.
-        let crossed = byte_crosses(other_slave, master, b'B');
+        let crossed = byte_crosses(other_slave, master, b'B', CROSS_MUST_NOT);
 
         // Close BEFORE asserting so a failure cannot leak descriptors.
         for fd in [master, slave, other_master, other_slave] {
@@ -5851,7 +6079,7 @@ mod tests {
         let slave = open_pts_slave(master).expect("the slave must open by SOME route");
         let slave_flags = fd_flags(slave, "pts slave");
         let slave_is_tty = fd_is_tty(slave);
-        let slave_is_peer = byte_crosses(slave, master, b'P');
+        let slave_is_peer = byte_crosses(slave, master, b'P', CROSS_MUST);
 
         // Close BEFORE asserting so a failure cannot leak descriptors.
         for fd in [master, slave, pipe_fds[0], pipe_fds[1]] {
@@ -5962,10 +6190,13 @@ mod tests {
             .filter_map(|n| n.parse::<libc::c_int>().ok())
             .collect();
 
-        // Drain whatever reached our terminal.
+        // Drain whatever reached our terminal. A hang detector for the POSITIVE
+        // control (the helper has exited, so LEAKMARK is already queued and the
+        // loop leaves the moment it is read); the negatives below read the same
+        // bytes, which the helper wrote before it could exit.
         set_nonblocking(master, true).expect("nonblocking master");
         let mut seen = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             let mut buf = [0u8; 256];
             let n = read(master, &mut buf);
@@ -6335,8 +6566,18 @@ mod tests {
             "a suppressed EOF must expire as `NoVerdict` (which the seam turns \
              into a fail-closed error), got {status:?}"
         );
+        // Ended BY THE BUDGET: never before it, and not by anything later —
+        // the unbounded read would park for the stranger's 30 s life (and
+        // `stranger_alive` would fail with it), a wait that ignored `budget` for
+        // the shipping `EXEC_STATUS_BUDGET` would take 10 s. The upper bound is
+        // that shipping budget, and it is exact against that defect:
+        // `wait_for_exec_status` leaves only once `now >= deadline`, so a wait
+        // that ignored `budget` always reads 10 s or more. The accepted loss:
+        // an overshoot of the 400 ms budget by anything under ~9.6 s now
+        // passes (the old `BUDGET * 8` caught one past 2.8 s) — the price of
+        // not reading a descheduled test thread as a defect.
         assert!(
-            waited >= BUDGET && waited < BUDGET * 8,
+            waited >= BUDGET && waited < EXEC_STATUS_BUDGET,
             "the wait must be ended BY THE BUDGET: expected ~{BUDGET:?}, took \
              {waited:?}"
         );
@@ -6359,7 +6600,11 @@ mod tests {
     /// claim is false and the test had merely timed out into the right answer.
     #[test]
     fn a_pre_exec_failure_is_still_detected_while_a_stranger_holds_the_write_end() {
-        const BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
+        // Long enough that a quarter of it (the bound below) outlasts a
+        // descheduled test thread, and below the stranger's 30 s life, so a
+        // byte only seen at expiry still comes back while the stranger holds
+        // the write end and takes four times the bound.
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
         let (rd, wr) = racy_status_pipe();
         // SAFETY: `wr` is live; `dup` copies it WITHOUT FD_CLOEXEC.
@@ -6947,7 +7192,9 @@ mod tests {
 
         set_nonblocking(sh.master, true).expect("nonblocking master");
         let mut seen = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // A hang detector for the spawned probe's one line (a fresh shell exec
+        // on a loaded machine); the loop leaves the moment the line is in.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline && !seen.ends_with(b"\n") {
             let mut buf = [0u8; 256];
             let n = read(sh.master, &mut buf);
@@ -7018,7 +7265,9 @@ mod tests {
 
         set_nonblocking(sh.master, true).expect("nonblocking master");
         let mut seen = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // A hang detector for the probe's line; it breaks as soon as the line
+        // is complete, and the child parks in `sleep` only AFTER printing it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             let mut buf = [0u8; 512];
             let n = read(sh.master, &mut buf);
@@ -7141,7 +7390,8 @@ mod tests {
 
         set_nonblocking(sh.master, true).expect("nonblocking master");
         let mut alive = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // A hang detector for `UP` (the child parks only after printing it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             let mut buf = [0u8; 64];
             let n = read(sh.master, &mut buf);
@@ -7157,7 +7407,9 @@ mod tests {
         // Now end it, exactly as teardown does.
         hangup(sh.pid);
         reap(sh.pid);
-        let after_death = poll_revents(sh.master, Duration::from_secs(5));
+        // A hang detector: the hangup must be reported, and the poll returns the
+        // moment it is. (`while_alive` above is the negative window; it stays.)
+        let after_death = poll_revents(sh.master, Duration::from_secs(60));
 
         // SAFETY: closing the master this test owns.
         unsafe { libc::close(sh.master) };
@@ -8582,9 +8834,18 @@ mod tests {
 
     // Default (no-wrap) spawn is byte-identical: passing `sandbox_wrap = None` must
     // NOT change the exec target — it stays `$SHELL`, never `sandbox-exec`. We
-    // assert this through the SAME `-e` echo path used elsewhere: with no wrap, a
-    // `-e /bin/echo MARKER` runs `/bin/echo` directly (argv[0] == the program), so
-    // the PTY shows exactly "MARKER" with no sandbox-exec banner/argv mutation.
+    // assert this through the SAME `-e` path used elsewhere: with no wrap, a
+    // `-e /usr/bin/yes MARKER` runs `/usr/bin/yes` directly (argv[0] == the
+    // program), so the PTY shows "MARKER" lines with no sandbox-exec banner/argv
+    // mutation.
+    //
+    // `yes`, not `echo`: a program that writes and EXITS races this reader. macOS
+    // keeps an exited child's unread pty output for about half a second, then the
+    // master reads EOF with the bytes gone (measured 2026-09-29: a first read 500 ms
+    // after the spawn saw the marker, 600 ms and 1 s read `0` and nothing), and a
+    // test thread descheduled that long on a loaded gate failed with "echo output
+    // not seen". `yes` writes until this test closes the master, so a late reader
+    // still finds the marker; a mangled argv prints `y` lines and still fails.
     #[test]
     fn no_wrap_spawn_runs_program_directly_unchanged() {
         // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
@@ -8592,7 +8853,7 @@ mod tests {
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
         let cmd = vec![
-            String::from("/bin/echo"),
+            String::from("/usr/bin/yes"),
             String::from("ATERM-NOWRAP-MARKER"),
         ];
         // sandbox_wrap = None → no wrap, byte-identical spawn.
@@ -8632,7 +8893,7 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(
             s.contains("ATERM-NOWRAP-MARKER"),
-            "echo output not seen: {s:?}"
+            "yes output not seen: {s:?}"
         );
         assert!(
             !s.contains("sandbox-exec"),
@@ -9040,7 +9301,9 @@ mod shell_identity_tests {
         .expect("the parked session must spawn");
         set_nonblocking(sh.master, true).expect("nonblocking master");
         let mut seen = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // A hang detector: the session parks only after printing `UP`, and the
+        // loop leaves the moment it arrives.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && !String::from_utf8_lossy(&seen).contains("UP") {
             let mut buf = [0u8; 64];
             let n = read(sh.master, &mut buf);
@@ -9116,9 +9379,9 @@ mod shell_identity_tests {
         let verified = stale.verify();
 
         let hung = hangup_shell(&stale, sh.master);
-        let started = Instant::now();
+        let polls_before = reap_polls();
         reap_shell(stale);
-        let reap_took = started.elapsed();
+        let reap_polls_taken = reap_polls() - polls_before;
         // Past the old SIGKILL tick (250 ms), with margin.
         std::thread::sleep(Duration::from_millis(400));
         let still_running = matches!(bystander.try_wait(), Ok(None));
@@ -9138,10 +9401,14 @@ mod shell_identity_tests {
             "the dead shell left no foreground group on its PTY, so nothing may be \
              hung up — least of all the recycled pid"
         );
-        assert!(
-            reap_took < Duration::from_millis(100),
+        // COUNTED, not timed: "at once" is the loop's first verify returning
+        // before a single poll wait. A stopwatch of 100 ms read a descheduled
+        // test thread as a loop; the loop that does not give up waits every one
+        // of its ticks, and each one is counted here.
+        assert_eq!(
+            reap_polls_taken, 0,
             "reap_shell must give up at once on a pid that is no longer the shell \
-             (took {reap_took:?})"
+             (it waited {reap_polls_taken} poll periods)"
         );
     }
 
@@ -9184,9 +9451,13 @@ mod shell_identity_tests {
         let identity = record_adopted_shell(sh.pid, sh.master);
         assert!(identity.verify(), "the live leader verifies");
         let hung = hangup_shell(&identity, sh.master);
+        let polls_before = reap_polls();
+        let _ = take_reap_kill_tick();
         let started = Instant::now();
         reap_shell(identity);
         let took = started.elapsed();
+        let polls = reap_polls() - polls_before;
+        let kill_tick = take_reap_kill_tick();
         // Recorded the ADOPTED way, `reap_shell` stops at the corpse (launchd
         // reaps an adopted shell's), so the test — its real parent — collects it
         // here and reads HOW it died.
@@ -9207,9 +9478,26 @@ mod shell_identity_tests {
             "the HUP-ignoring shell must have died by the SIGKILL escalation \
              (waitpid={collected}, status=0x{status:x})"
         );
+        // It outlived SIGHUP: the loop cannot reach the kill tick before
+        // `REAP_KILL_AT` poll waits, each at least `REAP_POLL`, so this lower
+        // bound holds at any load. And it died at the ~250 ms ESCALATION, which
+        // is COUNTED in the loop's own ticks — the SIGKILL went out at the kill
+        // tick, and the loop saw the death before its give-up tick — rather
+        // than timed: a descheduled test thread stretches the ticks, never
+        // their number, and it outlasted the old 1.5 s stopwatch.
         assert!(
-            took >= Duration::from_millis(200) && took < Duration::from_millis(1500),
-            "it outlived SIGHUP and died at the ~250 ms escalation (took {took:?})"
+            took >= REAP_POLL * REAP_KILL_AT,
+            "it outlived SIGHUP (took {took:?})"
+        );
+        assert_eq!(
+            kill_tick,
+            Some(REAP_KILL_AT),
+            "the SIGKILL escalation goes out at the ~250 ms tick"
+        );
+        assert!(
+            polls > REAP_KILL_AT && polls < REAP_DEADLINE,
+            "the escalation, not the give-up, ended the wait \
+             ({polls} poll waits, kill at {REAP_KILL_AT}, give-up at {REAP_DEADLINE})"
         );
     }
 
@@ -9224,7 +9512,8 @@ mod shell_identity_tests {
         assert!(identity.birth.is_some() && identity.own_child);
         // SAFETY: signalling the test's own child.
         unsafe { libc::kill(sh.pid, libc::SIGKILL) };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // A hang detector for the SIGKILL to land (the zombie reads no birth).
+        let deadline = Instant::now() + Duration::from_secs(60);
         while process_birth(sh.pid).is_some() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }

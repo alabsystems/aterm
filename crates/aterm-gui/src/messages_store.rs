@@ -442,6 +442,39 @@ impl Writer {
             let _ = landed.recv();
         }
     }
+
+    /// [`Self::flush`], waiting no longer than `within` for the lines to land
+    /// — the seamless parent's last write before Commit, which the person
+    /// sits through frozen (design law L5: no wait without a deadline).
+    /// `true` when everything appended so far is on disk; `false` when the
+    /// thread is still behind at the deadline (the lines it holds may die
+    /// with the process — the caller says so).
+    pub(crate) fn flush_within(&self, within: std::time::Duration) -> bool {
+        let Some(tx) = &self.tx else {
+            return true;
+        };
+        let (done, landed) = mpsc::sync_channel::<()>(1);
+        let deadline = std::time::Instant::now() + within;
+        // A full channel is a thread behind by a queue's worth: wait for a
+        // slot only until the deadline.
+        let mut job = Job::Flush(done);
+        loop {
+            match tx.try_send(job) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return true,
+                Err(TrySendError::Full(back)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    job = back;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        landed
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_ok()
+    }
 }
 
 impl Drop for Writer {

@@ -32,6 +32,13 @@
 //!   the frames behind its first claim wait for the same turn; the keeper
 //!   still reads them before the death, and the quit hangs both shells up.
 //!   NEGATIVE CONTROL: the same end without the BYE keeps both as orphans.
+//! * A REPLY TO THE DEAD: the same end with an ADOPT after the first claim,
+//!   whose WELCOME the dead window cannot read; the failed write ends only
+//!   the keeper's writing, and the claim and BYE behind it are still read.
+//!   NEGATIVE CONTROL: without the BYE, both claims read, both shells kept.
+//! * A DEAD PEER HOLDS NOTHING: a window quits while another has died but is
+//!   not yet judged (unreaped, its connection still open); the holder scan
+//!   reads the dead one as holding nothing, and the quit hangs its shell up.
 //!
 //! Every wait is on a causal event — a status line, a kernel exit status, a
 //! line from a child — with a minute's hang detector, never a sleep. Every
@@ -201,6 +208,9 @@ fn rdev_of(fd: &OwnedFd) -> u64 {
 /// with the keeper, keep the primary, report, then wait. With
 /// `ATERM_KEEPER_TEST_ROLE=window-holder`, also start a process that holds a
 /// second duplicate of the master (an update successor's shape) and report it.
+/// Told "bye", it says BYE and exits 0 (a quit); told "poke", it writes one
+/// frame that earns no answer, says so (`<talk>.poked`) and waits to be
+/// killed; told anything else, it exits 0.
 fn window_role(holder: bool) -> ! {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
     let (master, leader) = pty_with_leader();
@@ -226,10 +236,16 @@ fn window_role(holder: bool) -> ! {
     let mut line = format!("leader={} rdev={rdev}", leader.id());
     if holder {
         // A non-close-on-exec duplicate at a high number, inherited by a
-        // `sleep` that holds it for as long as it lives.
+        // `sleep` that holds it for as long as it lives. The floor sits under
+        // 256, macOS's default soft `RLIMIT_NOFILE`: `F_DUPFD` at or above
+        // the soft limit fails `EINVAL`.
         // SAFETY: F_DUPFD on a descriptor we own; the result is inherited.
-        let raw = unsafe { fcntl(master.as_raw_fd(), F_DUPFD, 300) };
-        assert!(raw >= 300);
+        let raw = unsafe { fcntl(master.as_raw_fd(), F_DUPFD, 200) };
+        assert!(
+            raw >= 200,
+            "F_DUPFD at 200: {}",
+            std::io::Error::last_os_error()
+        );
         let held = Command::new("/bin/sleep")
             .arg("600")
             .stdin(Stdio::null())
@@ -242,8 +258,20 @@ fn window_role(holder: bool) -> ! {
     }
     report(&line);
     std::mem::forget(leader);
-    // Wait to be killed; the primary master stays open until then.
-    await_go();
+    // Wait to be killed or told; the primary master stays open until then.
+    match await_go().as_str() {
+        "bye" => client.send(&Frame::Bye, None).expect("bye"),
+        "poke" => {
+            client.send(&Frame::RestartWhenSafe, None).expect("a frame");
+            note("poked");
+            let started = Instant::now();
+            loop {
+                assert!(started.elapsed() < HANG * 5, "never killed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        _ => {}
+    }
     drop(master);
     std::process::exit(0)
 }
@@ -311,8 +339,10 @@ fn marked_window_role(named: bool) -> ! {
 }
 
 /// The next window: HELLO, report the offers, wait for "go", then claim them
-/// all, say BYE (unless `bye` is false: a lost BYE) and exit 0 (a quit).
-fn next_window_role(bye: bool) -> ! {
+/// all, say BYE (unless `bye` is false: a lost BYE) and exit 0 (a quit). With
+/// `adopt`, an ADOPT follows the first claim — a frame the keeper answers
+/// (WELCOME), and this window never reads the answer: it has exited by then.
+fn next_window_role(bye: bool, adopt: bool) -> ! {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
     let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
     let offers = client.hello_app("test").expect("hello");
@@ -331,10 +361,13 @@ fn next_window_role(bye: bool) -> ! {
         rdevs.join(",")
     ));
     await_go();
-    for o in &offers {
+    for (i, o) in offers.iter().enumerate() {
         client
             .register(&o.master, o.header, o.tag.clone())
             .expect("claim");
+        if adopt && i == 0 {
+            client.send(&Frame::Adopt, None).expect("adopt");
+        }
     }
     if bye {
         client.send(&Frame::Bye, None).expect("bye");
@@ -351,12 +384,22 @@ fn report(line: &str) {
     std::fs::rename(&tmp, talk.with_extension("out")).expect("publish the report");
 }
 
-/// Wait for the test's "go" (a hang detector bounds it; a window waiting to be
-/// killed waits the whole minute and is killed long before).
-fn await_go() {
+/// A role's note to the test that something happened (`<talk>.<what>`).
+fn note(what: &str) {
+    let talk = PathBuf::from(std::env::var(TALK).expect("talk"));
+    std::fs::write(talk.with_extension(what), what).expect("note");
+}
+
+/// Wait for the test's "go" and return what it said (a hang detector bounds
+/// it; a window waiting to be killed waits the whole minute and is killed long
+/// before).
+fn await_go() -> String {
     let go = PathBuf::from(std::env::var(TALK).expect("talk")).with_extension("go");
     let started = Instant::now();
-    while !go.exists() {
+    loop {
+        if let Ok(what) = std::fs::read_to_string(&go) {
+            return what;
+        }
         assert!(started.elapsed() < HANG * 5, "never told to go");
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -368,10 +411,15 @@ fn dispatch_role() {
         Some("keeper-stepped") => stepped_keeper_role(),
         Some("window") => window_role(false),
         Some("window-holder") => window_role(true),
-        // Whether BYE is said is the role this child was launched as — read, not
-        // a literal (aterm-spec's foreign_facts_are_observed).
-        Some(role @ ("next-window" | "next-window-no-bye")) => {
-            next_window_role(role == "next-window");
+        // Whether BYE and ADOPT are said is the role this child was launched
+        // as — read, not a literal (aterm-spec's foreign_facts_are_observed).
+        Some(
+            role @ ("next-window"
+            | "next-window-no-bye"
+            | "next-window-adopt"
+            | "next-window-adopt-no-bye"),
+        ) => {
+            next_window_role(!role.ends_with("-no-bye"), role.contains("-adopt"));
         }
         Some("marked-window") => marked_window_role(true),
         Some("unmarked-window") => marked_window_role(false),
@@ -464,8 +512,12 @@ impl Scratch {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    fn say(&mut self, kid: usize, _what: &str) {
-        std::fs::write(self.dir.join(format!("kid-{kid}.go")), b"go").expect("go");
+    /// Tell the role `kid` to go on; `what` is what it is told (published
+    /// whole, by a rename).
+    fn say(&mut self, kid: usize, what: &str) {
+        let tmp = self.dir.join(format!("kid-{kid}.say"));
+        std::fs::write(&tmp, what).expect("say");
+        std::fs::rename(&tmp, self.dir.join(format!("kid-{kid}.go"))).expect("go");
     }
     /// Park the stepped keeper `kid` between two of its turns: returns once it
     /// has finished its turn and runs none until [`Self::resume`].
@@ -474,9 +526,10 @@ impl Scratch {
         self.await_note(kid, "paused");
     }
     /// Let the parked keeper `kid` go on; returns once it has run one turn,
-    /// with no connection of this test open during it (the keeper's holder
-    /// scan reads every peer's descriptor table, and a peer whose table is
-    /// churning — this multi-threaded test process — reads as "unknown").
+    /// with no connection of this test open during it, so the turn's holder
+    /// scans meet only the roles as peers. (A peer's churning table — this
+    /// multi-threaded test process's — no longer reads as "unknown": a
+    /// descriptor closed mid-scan is not held, `aterm_uds::holders`.)
     fn resume(&mut self, kid: usize) {
         std::fs::write(self.dir.join(format!("kid-{kid}.resume")), b"resume").expect("resume");
         self.await_note(kid, "turned");
@@ -486,9 +539,9 @@ impl Scratch {
         let started = Instant::now();
         while !note.exists() {
             if let Ok(Some(status)) = self.kids[kid].try_wait() {
-                panic!("the keeper ended ({status}) before it {what}");
+                panic!("role {kid} ended ({status}) before it {what}");
             }
-            assert!(started.elapsed() < HANG, "the keeper never {what}");
+            assert!(started.elapsed() < HANG, "role {kid} never {what}");
             std::thread::sleep(Duration::from_millis(5));
         }
         std::fs::remove_file(&note).expect("take the note");
@@ -812,7 +865,8 @@ struct Overtaken {
 /// recorded — a claim read after it is refused, and its master goes back to
 /// Orphaned with the keeper's copy kept and its shell never hung up (the
 /// 2026-09-29 gate flake, in which the keeper was the master's only holder).
-fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, bye: bool) -> Overtaken {
+/// `role` is the next window's: `next-window[-adopt][-no-bye]`.
+fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) -> Overtaken {
     let keeper = s.spawn(test, "keeper-stepped", &[]);
     s.line(keeper, "ready");
     let keeper_pid = s.kids[keeper].id();
@@ -832,11 +886,6 @@ fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, bye: bool) -> 
         let _ = s.kids[w].wait();
     }
     s.await_status("orphaned", |t| t.contains("orphaned=2"));
-    let role = if bye {
-        "next-window"
-    } else {
-        "next-window-no-bye"
-    };
     let next = s.spawn(test, role, &[]);
     let got = s.line(next, "offers=");
     assert!(got.starts_with("offers=2 "), "both masters offered: {got}");
@@ -898,7 +947,7 @@ const T_OVERTAKE: &str = "a_quit_whose_exit_overtakes_its_claims_hangs_both_shel
 fn a_quit_whose_exit_overtakes_its_claims_hangs_both_shells_up() {
     dispatch_role();
     let mut s = Scratch::new("overtake");
-    let o = an_exit_that_overtakes_its_frames(&mut s, T_OVERTAKE, true);
+    let o = an_exit_that_overtakes_its_frames(&mut s, T_OVERTAKE, "next-window");
     let st = &o.status;
     assert!(
         st.contains("masters=0"),
@@ -931,7 +980,7 @@ const T_OVERTAKE_CONTROL: &str = "without_a_bye_an_overtaken_claim_keeps_both_sh
 fn without_a_bye_an_overtaken_claim_keeps_both_shells() {
     dispatch_role();
     let mut s = Scratch::new("overtake-ctl");
-    let o = an_exit_that_overtakes_its_frames(&mut s, T_OVERTAKE_CONTROL, false);
+    let o = an_exit_that_overtakes_its_frames(&mut s, T_OVERTAKE_CONTROL, "next-window-no-bye");
     let st = &o.status;
     assert!(st.contains("orphaned=2"), "{st}");
     assert!(st.contains("custody_copies=2"), "{st}");
@@ -943,6 +992,136 @@ fn without_a_bye_an_overtaken_claim_keeps_both_shells() {
     for w in &o.leaders {
         assert_eq!(w.exit_status(), None, "the leader lives:\n{st}");
     }
+}
+
+/// One `key=value` line of the status.
+fn status_count(status: &str, key: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{key} in\n{status}"))
+}
+
+const T_REPLY: &str = "a_reply_the_dead_window_cannot_read_loses_none_of_its_frames";
+
+/// A REPLY TO THE DEAD: the overtaken end again, with an ADOPT after the first
+/// claim. The keeper reads the ADOPT after the window has died, and its
+/// WELCOME cannot be written; that failure must end only the keeper's writing,
+/// never its reading — the second claim and the BYE behind the ADOPT are still
+/// read, and the quit hangs both shells up. (A connection dropped on the
+/// failed write lost them: one master orphaned by a "crash", the other back to
+/// Orphaned from its dead recipient, both shells kept.)
+#[test]
+fn a_reply_the_dead_window_cannot_read_loses_none_of_its_frames() {
+    dispatch_role();
+    let mut s = Scratch::new("reply");
+    let o = an_exit_that_overtakes_its_frames(&mut s, T_REPLY, "next-window-adopt");
+    let st = &o.status;
+    assert!(
+        st.contains("masters=0"),
+        "every frame behind the unwritable reply read, then the quit:\n{st}"
+    );
+    assert!(st.contains("custody_copies=0"), "{st}");
+    assert_eq!(ends(st, "quit"), 2, "{st}");
+    assert_eq!(o.crashes, 0, "{st}");
+    // Not vacuous: the reply to the dead window was not written.
+    assert!(status_count(st, "replies_lost") >= 1, "{st}");
+    for w in &o.leaders {
+        assert_eq!(await_exit(w), 1, "the leader was hung up (SIGHUP)");
+    }
+}
+
+const T_REPLY_CONTROL: &str = "without_a_bye_a_reply_lost_to_the_dead_keeps_both_shells";
+
+/// NEGATIVE CONTROL: the same unwritable reply with no BYE behind it — both
+/// claims are still read (both judged a crash, not one), and both shells are
+/// kept: the hang-up above is the BYE's, read behind the reply.
+#[test]
+fn without_a_bye_a_reply_lost_to_the_dead_keeps_both_shells() {
+    dispatch_role();
+    let mut s = Scratch::new("reply-ctl");
+    let o = an_exit_that_overtakes_its_frames(&mut s, T_REPLY_CONTROL, "next-window-adopt-no-bye");
+    let st = &o.status;
+    assert!(st.contains("orphaned=2"), "{st}");
+    assert!(st.contains("custody_copies=2"), "{st}");
+    assert_eq!(o.crashes, 2, "both claims read, then judged a crash:\n{st}");
+    assert!(status_count(st, "replies_lost") >= 1, "{st}");
+    for w in &o.leaders {
+        assert_eq!(w.exit_status(), None, "the leader lives:\n{st}");
+    }
+}
+
+const T_DEAD_PEER: &str = "a_quit_beside_a_dead_unjudged_peer_hangs_its_shell_up";
+
+/// A DEAD PEER HOLDS NOTHING. Two windows, one master each, with the keeper
+/// parked between two turns: the window with the higher pid writes one frame
+/// and is SIGKILLed, left unreaped (a zombie: still in the kernel's process
+/// list, its descriptors closed at its exit); the other says BYE and exits 0.
+/// The turn reads one frame of each, then the exits in pid order, so the quit
+/// is judged while the killed window's connection is still open — a peer —
+/// and the holder scan for the quitter's master meets the killed window's
+/// table. That table is gone, not unreadable: the quit closes its master and
+/// hangs its shell up. (Read as unknown, the dead peer made the quit a
+/// handoff: held, then orphaned — the shell kept.) The killed window itself
+/// is still a crash, its shell kept as an orphan.
+#[test]
+fn a_quit_beside_a_dead_unjudged_peer_hangs_its_shell_up() {
+    dispatch_role();
+    let mut s = Scratch::new("dead-peer");
+    let keeper = s.spawn(T_DEAD_PEER, "keeper-stepped", &[]);
+    s.line(keeper, "ready");
+    let mut windows = Vec::new();
+    for _ in 0..2 {
+        let w = s.spawn(T_DEAD_PEER, "window", &[]);
+        let reg = s.line(w, "leader=");
+        let leader = field(&reg, "leader") as u32;
+        s.pids.push(leader);
+        let watch = ExitWatch::watch(leader).expect("watch the leader");
+        windows.push((s.kids[w].id(), w, watch));
+    }
+    s.await_status("registered", |t| t.contains("claimed=2"));
+    // The keeper reads exits in pid order: the quitter's is read first.
+    windows.sort_by_key(|(pid, _, _)| *pid);
+    let (killed, quitter) = (windows.pop().expect("two"), windows.pop().expect("two"));
+    let (killed_pid, killed_kid, killed_leader) = killed;
+    let (_, quitter_kid, quitter_leader) = quitter;
+
+    s.pause(keeper);
+    s.say(killed_kid, "poke");
+    s.await_note(killed_kid, "poked");
+    let watch = ExitWatch::watch(killed_pid).expect("watch the killed window");
+    sigkill(killed_pid);
+    await_exit(&watch);
+    assert!(
+        aterm_uds::process::pid_alive(killed_pid),
+        "unreaped: still in the process list"
+    );
+    s.say(quitter_kid, "bye");
+    let ended = s.kids[quitter_kid].wait().expect("the quitter's status");
+    assert!(ended.success(), "the quitter exited 0: {ended}");
+    s.resume(keeper);
+
+    let st = s.await_status("both ends judged", |t| {
+        t.contains("windows=0") && t.contains("claimed=0")
+    });
+    assert_eq!(ends(&st, "handoff"), 0, "no successor holds it:\n{st}");
+    assert_eq!(ends(&st, "quit"), 1, "{st}");
+    assert_eq!(
+        await_exit(&quitter_leader),
+        1,
+        "the quit hung its shell up (SIGHUP)"
+    );
+    assert_eq!(ends(&st, "crash"), 1, "{st}");
+    assert!(
+        st.contains("masters=1") && st.contains("orphaned=1"),
+        "{st}"
+    );
+    assert_eq!(
+        killed_leader.exit_status(),
+        None,
+        "the killed window's shell lives"
+    );
 }
 
 #[test]

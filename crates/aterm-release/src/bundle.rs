@@ -587,29 +587,40 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
 pub fn handoff_policy_for_cut(
     repo_root: &Path,
 ) -> Result<(String, aterm_update_core::handoff_policy::HandoffPolicy), String> {
-    use aterm_update_core::handoff_policy::{HandoffPolicy, MAX_POLICY_BYTES, SOURCE_PATH};
-    let path = repo_root.join(SOURCE_PATH);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "read {}: {e} — every release seals a handoff policy into its bundle (empty is \
-             `schema = 1` alone)",
-            path.display()
-        )
-    })?;
+    let path = repo_root.join(aterm_update_core::handoff_policy::SOURCE_PATH);
+    let shown = path.display().to_string();
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| handoff_policy_unreadable(&format!("read {shown}: {e}")))?;
+    let policy = handoff_policy_of_text(&text, &shown)?;
+    Ok((text, policy))
+}
+
+/// The strict read [`handoff_policy_for_cut`] applies, over the policy's TEXT;
+/// `shown` names where it came from in a refusal. `ship check` feeds it the
+/// blob a commit holds (`gates::handoff_policy_gate_at`), so the check, the
+/// pre-claim gate and the bundle step judge by one rule.
+pub fn handoff_policy_of_text(
+    text: &str,
+    shown: &str,
+) -> Result<aterm_update_core::handoff_policy::HandoffPolicy, String> {
+    use aterm_update_core::handoff_policy::{HandoffPolicy, MAX_POLICY_BYTES};
     if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_POLICY_BYTES {
         return Err(format!(
-            "{} is {} bytes; producers ignore a policy over {MAX_POLICY_BYTES}",
-            path.display(),
+            "{shown} is {} bytes; producers ignore a policy over {MAX_POLICY_BYTES}",
             text.len()
         ));
     }
-    let policy = HandoffPolicy::parse_for_cut(&text).map_err(|why| {
-        format!(
-            "{} is not a policy producers can follow: {why}",
-            path.display()
-        )
-    })?;
-    Ok((text, policy))
+    HandoffPolicy::parse_for_cut(text)
+        .map_err(|why| format!("{shown} is not a policy producers can follow: {why}"))
+}
+
+/// A policy that could not be read at all (`why`), with what every release
+/// needs instead.
+pub fn handoff_policy_unreadable(why: &str) -> String {
+    format!(
+        "{why} — every release seals a handoff policy into its bundle (empty is `schema = 1` \
+         alone)"
+    )
 }
 
 /// Write the checked-in handoff policy into the bundle at

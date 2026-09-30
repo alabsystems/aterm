@@ -1259,16 +1259,16 @@ pub(super) const SKY_BED_CHORDS: usize = CHORD_LOOP.len();
 const BED_WEIGHT: [f32; 3] = [1.0, 0.80, 0.65];
 /// THE PAD NEVER STEPS. Portamento between chords, long enough that no
 /// crossing is a step and short enough that a fast run through the words is
-/// audibly moving. (`bed_chord_drift` uses 1.2 s against a 7.5 s bar; the sky
-/// moves once per WORD, so it needs longer.)
+/// audibly moving. (The retired chord-drift bed used 1.2 s against a 7.5 s
+/// bar; the sky moves once per WORD, so it needs longer.)
 const BED_GLIDE_TAU_S: f32 = 2.6;
 /// The pad's level. Air, not a drone: noticed when it stops, never when it
-/// starts. THE PRISM's number; on the audition harness (`bed_audition.rs`,
-/// vol 0.4, the 20 s script) it read a bed RMS of about −44 dBFS, ≈ 8 dB
+/// starts. THE PRISM's number; on the since-retired bed-audition harness
+/// (vol 0.4, a 20 s script) it read a bed RMS of about −44 dBFS, ≈ 8 dB
 /// under the melody, and cleared the harness's −50 dBFS audibility line in
-/// most 50 ms windows while typing — the measured figures are in the step's
-/// report and in `target/bed-audition/c5-rainbow-sky.metrics.json`. The
-/// owner sets it from here by ear.
+/// most 50 ms windows while typing — the measured figures are in
+/// `docs/measured/prism-sound-2026-09-08.md` §5. The owner sets it from here
+/// by ear.
 ///
 /// **−3 dB ON THE PANEL'S Q6 RULING (2026-09-09; §9).** With the bed now on
 /// by default it was isolated under the derived line by subtraction (bed-on
@@ -3192,12 +3192,6 @@ pub struct MelodyV2 {
     run_theme_pos: u8,
     /// Which phrase of [`SONG_FORM`] `run_theme_pos` is inside.
     run_phrase: u8,
-    /// AUDIT CENSUS (streaming cascade, 2026-09-12): `on_jump`'s three
-    /// answers — HEAD, top-note RE-STRIKE, SWALLOWED by the 60 ms floor —
-    /// counted where they are decided.
-    cascade_heads: u32,
-    cascade_restrikes: u32,
-    cascade_swallowed: u32,
     /// Keys since the last keyed Enter — [`ENTER_PICKUP_MIN_KEYS`] decides
     /// whether a Return is a cadence or a bare tonic dyad.
     keys_since_enter: u8,
@@ -3312,9 +3306,6 @@ impl MelodyV2 {
             cascade_restrike_ms: 0,
             run_theme_pos: 0,
             run_phrase: 0,
-            cascade_heads: 0,
-            cascade_restrikes: 0,
-            cascade_swallowed: 0,
             keys_since_enter: 0,
             last_enter_ms: 0,
             seen_enter: false,
@@ -3359,17 +3350,6 @@ impl MelodyV2 {
     #[must_use]
     pub fn walk(&self) -> i8 {
         self.walk
-    }
-
-    /// AUDIT CENSUS: `[heads, restrikes, swallowed]` — what `on_jump` answered
-    /// to every line feed of this session.
-    #[must_use]
-    pub fn cascade_census(&self) -> [u32; 3] {
-        [
-            self.cascade_heads,
-            self.cascade_restrikes,
-            self.cascade_swallowed,
-        ]
     }
 
     /// HOW MANY KEYSTROKES HAVE MOVED THE MELODY (test / introspection hook).
@@ -4618,11 +4598,11 @@ impl MelodyV2 {
     /// stands (`709b4c91d`); the second and later line feeds of a RUN — one
     /// within [`CASCADE_RUN_MS`] of the last — walk [`SONG_THEME`]'s phrase
     /// edges as v0.76.0 did (§10.4's "accent step"). Measured on the same
-    /// 6 s stream at 5 / 12 / 25 lines/s (`examples/stream_cascade.rs`): the
-    /// rate law is identical to the unit between v0.76.0 and the frozen walk
-    /// — 30 heads, or 1 head + 71 re-strikes, RMS within 0.3 dB — and the
-    /// frozen walk's whole difference was one figure at one pitch, looped:
-    /// the owner's "doo doo doo doo" of 2026-09-12.
+    /// 6 s stream at 5 / 12 / 25 lines/s (the since-retired `stream_cascade`
+    /// audit example): the rate law is identical to the unit between v0.76.0
+    /// and the frozen walk — 30 heads, or 1 head + 71 re-strikes, RMS within
+    /// 0.3 dB — and the frozen walk's whole difference was one figure at one
+    /// pitch, looped: the owner's "doo doo doo doo" of 2026-09-12.
     fn on_jump(&mut self, at: u32) -> Option<bool> {
         let in_run = self.seen_jump && at.saturating_sub(self.cascade_at) < CASCADE_RUN_MS;
         if in_run {
@@ -4671,14 +4651,11 @@ impl MelodyV2 {
         self.cascade_at = at;
         if head {
             self.cascade_restrike_ms = at;
-            self.cascade_heads = self.cascade_heads.saturating_add(1);
             Some(true)
         } else if at.saturating_sub(self.cascade_restrike_ms) >= CASCADE_RESTRIKE_MS {
             self.cascade_restrike_ms = at;
-            self.cascade_restrikes = self.cascade_restrikes.saturating_add(1);
             Some(false)
         } else {
-            self.cascade_swallowed = self.cascade_swallowed.saturating_add(1);
             None
         }
     }
@@ -6889,8 +6866,7 @@ impl TrailSynth {
                 // field so four fast notes read as a run, not a chord.
                 let pan = if k % 2 == 0 { ev.pan } else { -ev.pan };
                 let gain = ev.gain * KEY_TINE_TRIM * CASCADE_LEVELS[k];
-                let admitted = self.v2_spawn(voice, gain, pan).is_some();
-                self.log_cascade(at, f, true, admitted);
+                self.v2_spawn(voice, gain, pan);
             }
         } else {
             let f = penta(TINE_BASE_HZ, base + CASCADE_RESTRIKE_DEG);
@@ -6904,8 +6880,7 @@ impl TrailSynth {
             );
             voice.lane = LANE_CASCADE;
             let gain = ev.gain * KEY_TINE_TRIM * CASCADE_RESTRIKE_LEVEL;
-            let admitted = self.v2_spawn(voice, gain, ev.pan).is_some();
-            self.log_cascade(at, f, false, admitted);
+            self.v2_spawn(voice, gain, ev.pan);
         }
     }
 
@@ -7702,46 +7677,34 @@ impl TrailSynth {
 // The palette entry
 // ===========================================================================
 
-/// **THE MUSIC BOX**, as a [`Palette`] roster entry.
+/// **THE MUSIC BOX**, as a [`Palette`] roster entry: its bed and its
+/// register, which the bed mixer and the kind-level gestures read through
+/// `palette_for`.
 ///
-/// v2 does not use the palette dispatch: [`TrailSynth::push_meta`] routes a v2
-/// event to [`TrailSynth::push_v2`] before `design_trail` is ever reached, and
-/// that is the structural claim §16 row 9 makes ("no shared function's
-/// arithmetic is edited"). This impl exists so the registry stays total and so
-/// a hand-built event that somehow arrives at the dispatch still sounds like
-/// the tine rather than falling through to another style's timbre.
+/// v2 does not use the palette's `design` dispatch: [`TrailSynth::push_meta`]
+/// routes a v2 event to [`TrailSynth::push_v2`] before `design_trail` is ever
+/// reached, and v2 calls `design_trail` only for the kind-level terminal
+/// designers (poof, word poof, swoosh, cloud), which return before the
+/// palette dispatch. That is the structural claim §16 row 9 makes ("no shared
+/// function's arithmetic is edited"), so `design` is empty.
 pub struct RainbowKittyV2Palette;
 
 impl Palette for RainbowKittyV2Palette {
     fn design(
         &self,
-        s: &mut TrailSynth,
-        ev: &SoundEvent,
+        _s: &mut TrailSynth,
+        _ev: &SoundEvent,
         _kind: SoundKind,
-        g: f32,
-        deg: i32,
+        _g: f32,
+        _deg: i32,
         _col_off: i32,
     ) {
-        let ioi_s = s.v2.ioi_ms * 0.001;
-        let arc = if s.v2.stops.hue { hue_arc(ev.hue) } else { 0.0 };
-        let voice = tine(
-            penta(TINE_BASE_HZ, deg),
-            Touch::Step,
-            tau_v_s(ioi_s),
-            roof_hz(1.0 / ioi_s, false, ev.heat, arc, Touch::Step),
-            false,
-            s.v2.flow,
-        );
-        s.spawn(voice, g * KEY_TINE_TRIM, ev.pan);
     }
 
-    /// THE RAINBOW SKY (THE PRISM §3.2) — the same body the tournament's
-    /// `BedVariant::RainbowSky` renders, so what the owner auditions as
-    /// `c5-rainbow-sky` is byte for byte what the knob turns on. §9.7's "no
-    /// bed by default" was overruled by the owner on 2026-09-09 ("turn it on
-    /// and let me see it"): the `trail_sound_bed` setting ships ON. With it
-    /// off, `push_v2` feeds this nothing and it is never reached
-    /// (`bed_sample`'s level floor).
+    /// THE RAINBOW SKY (THE PRISM §3.2). §9.7's "no bed by default" was
+    /// overruled by the owner on 2026-09-09 ("turn it on and let me see it"):
+    /// the `trail_sound_bed` setting ships ON. With it off, `push_v2` feeds
+    /// this nothing and it is never reached (`bed_sample`'s level floor).
     fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
         s.bed_rainbow_sky(dt, lvl)
     }
@@ -7757,11 +7720,11 @@ impl Palette for RainbowKittyV2Palette {
 
 impl TrailSynth {
     /// One stereo sample `(mid, side)` of the sky pad (THE PRISM §3.2), the
-    /// body behind both `BedVariant::RainbowSky` and the music box's palette
-    /// bed. The caller has floored `bed.level` and folded level × gain into
-    /// `lvl`; the result lands in the ducked mix sum like every other bed.
+    /// body behind the music box's palette bed. The caller has floored
+    /// `bed.level` and folded level × gain into `lvl`; the result lands in the
+    /// ducked mix sum like every other bed.
     ///
-    /// Modelled on `bed_chord_drift`'s proven arithmetic — seed-at-target,
+    /// Modelled on the retired chord-drift bed's arithmetic — seed-at-target,
     /// one-pole portamento on the oscillator frequencies, weighted sum — with
     /// three differences that are the design: the bar is the LIVE chord
     /// (`v2.chord`, which `on_space` advances once per word) instead of a
@@ -7769,7 +7732,7 @@ impl TrailSynth {
     /// for the hue to tilt; and the hue's arc (`bed.hue_s`) drives the tilt
     /// and the top tone's twin detune — and never a pitch, so no amount of
     /// hue motion can take the pad out of key. Sample-driven throughout, no
-    /// rng: a candidate render is bit-replayable from (events, seed).
+    /// rng: a render is bit-replayable from (events, seed).
     pub(super) fn bed_rainbow_sky(&mut self, dt: f32, lvl: f32) -> (f32, f32) {
         let degs = sky_bed_degrees(usize::from(self.v2.chord));
         let mut tgt = [0.0f32; 3];
@@ -7811,8 +7774,7 @@ impl TrailSynth {
         let k = (cut * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (m - b.lp1);
         // THE BREATH: a raised cosine on the whole pad, on its own phase
-        // (`ph3`, which nothing else in the music box's bed uses), so the
-        // body is the same on the tournament clock and the palette path.
+        // (`ph3`, which nothing else in the music box's bed uses).
         b.ph3 = (b.ph3 + BED_BREATH_HZ * dt).fract();
         let breath = 1.0 - BED_BREATH_DEPTH * (0.5 - 0.5 * super::sin01((b.ph3 + 0.25).fract()));
         (b.lp1 * breath * lvl * BED_LEVEL, 0.0)
@@ -8045,8 +8007,7 @@ mod tests {
             (k.bed.energy - 0.3).abs() < 1e-6,
             "a key kicks the bed by v1's 0.3"
         );
-        // The pad is actually in the output while the notes are up (the
-        // palette path, not only the tournament's)…
+        // The pad is actually in the output while the notes are up…
         let mut sounding = synth();
         sounding.push(SoundEvent {
             bed: true,
@@ -16326,14 +16287,15 @@ for it up front.\n\
     /// THE RUN WALKS THE THEME, THE LONE LINE FEED STANDS (audit 2026-09-12).
     /// Owner report on v0.82.0: while a program streams, "a looping sound,
     /// doo doo doo doo, up and down". Measured against v0.76.0 on one 6 s
-    /// stream (`examples/stream_cascade.rs`): D18's rate law was identical to
-    /// the unit — 30 heads at 5 lines/s, 1 head + 71 re-strikes at 12, RMS
-    /// within 0.3 dB — and only the CONTOUR differed: v0.76.0 walked the
-    /// authored theme one phrase edge per line feed (`523 1308 1046 523 654
-    /// 654 523 1570` Hz, a 1.6 s cycle, 20 turns in 30), the frozen walk
-    /// played `523 654 785 1046` every 200 ms, 0 turns. `709b4c91d` froze
-    /// the walk for the typed line's sake and took the line feed with it. A
-    /// lone line feed keeps that commit's law; a run gets v0.76.0's back.
+    /// stream (the since-retired `stream_cascade` audit example): D18's rate
+    /// law was identical to the unit — 30 heads at 5 lines/s, 1 head + 71
+    /// re-strikes at 12, RMS within 0.3 dB — and only the CONTOUR differed:
+    /// v0.76.0 walked the authored theme one phrase edge per line feed
+    /// (`523 1308 1046 523 654 654 523 1570` Hz, a 1.6 s cycle, 20 turns in 30),
+    /// the frozen walk played `523 654 785 1046` every 200 ms, 0 turns.
+    /// `709b4c91d` froze the walk for the typed line's sake and took the line
+    /// feed with it. A lone line feed keeps that commit's law; a run gets
+    /// v0.76.0's back.
     #[test]
     fn a_line_feed_run_walks_the_theme_and_a_lone_line_feed_stands() {
         let base_hz = |v: &Voice| v.p[0].f0;

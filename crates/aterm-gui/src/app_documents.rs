@@ -1023,45 +1023,37 @@ impl App {
                         workspace.execute(store, buffer, EditorCommand::DeleteBackward)
                     }
                 }
-                AppEvent::TextInput(TextInputEvent::Delete) => {
+                AppEvent::TextInput(
+                    input @ (TextInputEvent::Delete
+                    | TextInputEvent::Left { .. }
+                    | TextInputEvent::Right { .. }
+                    | TextInputEvent::Undo
+                    | TextInputEvent::Redo),
+                ) => {
                     if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
                         Ok(effects)
                     } else {
-                        workspace.execute(store, buffer, EditorCommand::DeleteForward)
-                    }
-                }
-                AppEvent::TextInput(TextInputEvent::Left { extend }) => {
-                    if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
-                        Ok(effects)
-                    } else {
-                        let anchors = buffer
-                            .selections
-                            .iter()
-                            .map(|selection| selection.anchor)
-                            .collect::<Vec<_>>();
-                        let result = workspace.execute(store, buffer, EditorCommand::MoveBackward);
-                        if *extend {
-                            for (selection, anchor) in buffer.selections.iter_mut().zip(anchors) {
-                                selection.anchor = anchor;
+                        let (command, extend) = match input {
+                            TextInputEvent::Left { extend } => {
+                                (EditorCommand::MoveBackward, *extend)
                             }
-                        }
-                        result
-                    }
-                }
-                AppEvent::TextInput(TextInputEvent::Right { extend }) => {
-                    if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
-                        Ok(effects)
-                    } else {
-                        let anchors = buffer
-                            .selections
-                            .iter()
-                            .map(|selection| selection.anchor)
-                            .collect::<Vec<_>>();
-                        let result = workspace.execute(store, buffer, EditorCommand::MoveForward);
-                        if *extend {
-                            for (selection, anchor) in buffer.selections.iter_mut().zip(anchors) {
-                                selection.anchor = anchor;
+                            TextInputEvent::Right { extend } => {
+                                (EditorCommand::MoveForward, *extend)
                             }
+                            TextInputEvent::Undo => (EditorCommand::Undo, false),
+                            TextInputEvent::Redo => (EditorCommand::Redo, false),
+                            // `Delete`, the one input of this arm left.
+                            _ => (EditorCommand::DeleteForward, false),
+                        };
+                        // A shift-extended move keeps every selection's anchor.
+                        let anchors = if extend {
+                            buffer.selections.iter().map(|s| s.anchor).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let result = workspace.execute(store, buffer, command);
+                        for (selection, anchor) in buffer.selections.iter_mut().zip(anchors) {
+                            selection.anchor = anchor;
                         }
                         result
                     }
@@ -1081,20 +1073,6 @@ impl App {
                         }];
                         buffer.primary = 0;
                         Ok(Vec::new())
-                    }
-                }
-                AppEvent::TextInput(TextInputEvent::Undo) => {
-                    if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
-                        Ok(effects)
-                    } else {
-                        workspace.execute(store, buffer, EditorCommand::Undo)
-                    }
-                }
-                AppEvent::TextInput(TextInputEvent::Redo) => {
-                    if let Some(effects) = workspace.minibuffer_blocks_document_input(buffer) {
-                        Ok(effects)
-                    } else {
-                        workspace.execute(store, buffer, EditorCommand::Redo)
                     }
                 }
                 AppEvent::TextInput(TextInputEvent::Submit) => {
@@ -3243,6 +3221,22 @@ impl App {
         crate::tab_model::AppInstanceId,
         crate::tab_model::ViewId,
     )> {
+        self.native_views_where(|instance| {
+            self.native_runtime.document_id(instance) == Some(document)
+        })
+    }
+
+    /// Every native leaf, in every tab of every window, whose app instance
+    /// `keep` accepts.
+    fn native_views_where(
+        &self,
+        keep: impl Fn(crate::tab_model::AppInstanceId) -> bool,
+    ) -> Vec<(
+        WindowId,
+        crate::tab_model::AppInstanceId,
+        crate::tab_model::ViewId,
+    )> {
+        let keep = &keep;
         self.windows
             .iter()
             .flat_map(|(wid, ws)| {
@@ -3253,8 +3247,7 @@ impl App {
                         else {
                             return None;
                         };
-                        (self.native_runtime.document_id(native.instance) == Some(document))
-                            .then_some((*wid, native.instance, view))
+                        keep(native.instance).then_some((*wid, native.instance, view))
                     })
                 })
             })
@@ -3273,29 +3266,9 @@ impl App {
         if changed.is_empty() {
             return;
         }
-        let view_store = &self.view_store;
-        let changed_instances = &changed;
-        let views = self
-            .windows
-            .iter()
-            .flat_map(|(window, state)| {
-                state.tab_set.tabs().iter().flat_map(move |tab| {
-                    tab.root.leaves().into_iter().filter_map(move |view| {
-                        let crate::tab_model::View::Native(native) =
-                            view_store.get(view).copied()?
-                        else {
-                            return None;
-                        };
-                        changed_instances.contains(&native.instance).then_some((
-                            *window,
-                            native.instance,
-                            view,
-                        ))
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        for (window, instance, view) in views {
+        for (window, instance, view) in
+            self.native_views_where(|instance| changed.contains(&instance))
+        {
             self.refresh_native_presentation(window, instance, view);
             self.request_native_redraw(window);
         }

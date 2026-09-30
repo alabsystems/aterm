@@ -127,13 +127,26 @@ pub fn gui_domain() -> String {
     format!("gui/{}", aterm_uds::peer::our_uid())
 }
 
-/// The argv of `launchctl submit` for `label` running `program args…`.
+/// The file a keeper job's stderr goes to: beside its socket, the socket's
+/// whole name plus `.log`, so it is never the socket itself nor a sibling
+/// such as `server.log` beside a `--sock server.sock`.
 #[must_use]
-pub fn submit_argv(label: &str, program: &str, args: &[&str]) -> Vec<String> {
+pub fn log_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_owned();
+    name.push(".log");
+    PathBuf::from(name)
+}
+
+/// The argv of `launchctl submit` for `label` running `program args…`, its
+/// stderr sent to `stderr` (without it, launchd sends it to `/dev/null`).
+#[must_use]
+pub fn submit_argv(label: &str, program: &str, args: &[&str], stderr: &Path) -> Vec<String> {
     let mut argv = vec![
         "submit".to_string(),
         "-l".to_string(),
         label.to_string(),
+        "-e".to_string(),
+        stderr.to_string_lossy().into_owned(),
         "--".to_string(),
         program.to_string(),
     ];
@@ -141,13 +154,14 @@ pub fn submit_argv(label: &str, program: &str, args: &[&str]) -> Vec<String> {
     argv
 }
 
-/// Submit a transient KeepAlive job. P2 calls this only from a test, with a
-/// [`TEST_LABEL_PREFIX`] label it removes.
+/// Submit a transient KeepAlive job (`aterm keeper start`, or a test with a
+/// [`TEST_LABEL_PREFIX`] label), its stderr sent to `stderr`, whose
+/// directory must exist.
 ///
 /// # Errors
 /// `launchctl` failing to run or refusing.
-pub fn submit(label: &str, program: &str, args: &[&str]) -> io::Result<()> {
-    run_launchctl(&submit_argv(label, program, args))
+pub fn submit(label: &str, program: &str, args: &[&str], stderr: &Path) -> io::Result<()> {
+    run_launchctl(&submit_argv(label, program, args, stderr))
 }
 
 /// End a submitted job (launchd sends it SIGTERM) and forget it.
@@ -250,18 +264,38 @@ mod tests {
     #[test]
     fn the_submit_argv_is_plain() {
         assert_eq!(
-            submit_argv("l", "/bin/sleep", &["600"]),
-            ["submit", "-l", "l", "--", "/bin/sleep", "600"]
+            submit_argv("l", "/bin/sleep", &["600"], Path::new("/p/k.log")),
+            [
+                "submit",
+                "-l",
+                "l",
+                "-e",
+                "/p/k.log",
+                "--",
+                "/bin/sleep",
+                "600"
+            ]
+        );
+        assert_eq!(
+            log_path(Path::new("/p/keeper-dev-0123abcd.sock")),
+            Path::new("/p/keeper-dev-0123abcd.sock.log")
+        );
+        assert_eq!(
+            log_path(Path::new("/p/k.log")),
+            Path::new("/p/k.log.log"),
+            "never the socket itself"
         );
     }
 
     /// M1's route, measured again as a test: a TEST-labelled job is submitted
-    /// into the GUI domain, launchd runs it, `remove` ends it, and launchd then
-    /// knows no such job. The installed label is never touched. A guard removes
-    /// the job if an assertion fails midway.
+    /// into the GUI domain, launchd runs it with its stderr in the log `start`
+    /// names, `remove` ends it, and launchd then knows no such job. The
+    /// installed label is never touched. A guard removes the job if an
+    /// assertion fails midway.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_test_job_is_submitted_and_removed_without_a_trace() {
+        use std::os::unix::fs::DirBuilderExt as _;
         struct Guard(String);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -271,8 +305,21 @@ mod tests {
         let label = format!("{TEST_LABEL_PREFIX}.{}.jobtest", std::process::id());
         assert_ne!(label, INSTALLED_LABEL);
         assert_eq!(state(&label).expect("launchctl"), JobState::Absent);
+        let dir = std::env::temp_dir().join(format!("akj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("dir");
+        let log = log_path(&dir.join("k.sock"));
         let guard = Guard(label.clone());
-        submit(&label, "/bin/sleep", &["600"]).expect("submit");
+        submit(
+            &label,
+            "/bin/sh",
+            &["-c", "echo keeper-job-stderr >&2; exec /bin/sleep 600"],
+            &log,
+        )
+        .expect("submit");
         // launchd starts the job asynchronously; a minute is a hang detector.
         let started = std::time::Instant::now();
         let pid = loop {
@@ -283,6 +330,16 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(aterm_uds::process::pid_alive(pid));
+        // What the job writes to stderr reaches the log, not /dev/null.
+        let started = std::time::Instant::now();
+        while !std::fs::read_to_string(&log).is_ok_and(|t| t.contains("keeper-job-stderr")) {
+            assert!(
+                started.elapsed().as_secs() < 60,
+                "the job's stderr never reached {}",
+                log.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         remove(&label).expect("remove");
         assert_eq!(state(&label).expect("launchctl"), JobState::Absent, "gone");
         std::mem::forget(guard);
@@ -295,5 +352,6 @@ mod tests {
             );
             std::thread::yield_now();
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

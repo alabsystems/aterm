@@ -1086,10 +1086,17 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "the fake launchd reaped the broker"
     );
     let pid: i32 = managed_pid.parse().expect("pid");
-    let gone = (0..200).any(|_| {
+    // A hang detector for the killed broker to go: it ends the moment it has.
+    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let gone = loop {
+        if !harness::alive(pid) {
+            break true;
+        }
+        if std::time::Instant::now() >= gone_by {
+            break false;
+        }
         std::thread::sleep(std::time::Duration::from_millis(25));
-        !harness::alive(pid)
-    });
+    };
     assert!(gone, "the managed broker {pid} must be dead after off");
 }
 
@@ -1249,8 +1256,10 @@ fn review_off_names_a_session_the_fleet_holds() {
             if status.header().contains(" hold=1 ") {
                 break started.elapsed();
             }
+            // A hang detector (the hold is printed as a measurement, never
+            // bounded), so the harness's minute.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(20),
+                started.elapsed() < std::time::Duration::from_secs(60),
                 "the bridge never held the session: {}",
                 status.header()
             );

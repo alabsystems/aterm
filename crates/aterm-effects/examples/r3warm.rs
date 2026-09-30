@@ -4,10 +4,11 @@
 //! R3-perceptual probe: the arc at the bed's fixed luminance, measured in
 //! perceptual coordinates (L*, C*ab, hue, Helmholtz-Kohlrausch), the trough
 //! census, and the owner's own band.
+use aterm_effects::color_math::relative_luminance;
 use aterm_effects::rainbow_kitty::meteor::tri;
 use aterm_effects::rainbow_kitty::ribbon::{
     BODY_COLD_SHARE, HOT_EDGE_COV_MAX, UNDER_COV_CAP, bed_ink, bed_luma_budget, hot_edge_ink,
-    relative_luminance, walk_t,
+    walk_t,
 };
 use aterm_effects::spectrum::spectrum;
 use aterm_render::{over_premul, premul_rgb};

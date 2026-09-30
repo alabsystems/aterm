@@ -102,6 +102,11 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     // in its sealed Info.plist: `chunks1`, so it claims `ATRZ2C`
     // (`crates/aterm-gui/src/handoff_rendezvous.rs`). Never set for any other child.
     "ATERM_HANDOFF_GRANT_CAPS",
+    // The parent → its launched successor: the advisory warm hint (font zoom, window
+    // and session counts, window 0's grid) the prologue builds its backend at before
+    // the dial (`crates/aterm-gui/src/handoff_warm_hint.rs`). Never authenticated and
+    // never folded into a digest; a stale one costs only a warm miss.
+    "ATERM_HANDOFF_WARM_HINT",
     // The fork-lane parent → its successor: the launcher's own soft RLIMIT_NOFILE, so
     // the successor's shells get what the launcher gave (a forked successor inherits
     // the parent's RAISED limit and never claims): `ENV_LAUNCHER_NOFILE`

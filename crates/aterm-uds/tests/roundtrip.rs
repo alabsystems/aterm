@@ -186,7 +186,7 @@ fn shutdown_unblocks_blocked_read() {
     std::thread::sleep(Duration::from_millis(100));
     clone.shutdown(std::net::Shutdown::Both).expect("shutdown");
     let res = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(60))
         .expect("shutdown must unblock the parked read within the deadline");
     // An `Err` also unblocks the relay loop — acceptable; EOF must be clean.
     if let Ok(n) = res {
@@ -215,8 +215,10 @@ fn read_timeout_returns_would_block() {
         err.kind()
     );
     let waited = start.elapsed();
+    // The ceiling is a hang detector: a timeout that is ignored, or read in the
+    // wrong unit (150 s), fails it; a loaded box's scheduling does not.
     assert!(
-        waited >= Duration::from_millis(50) && waited < Duration::from_secs(5),
+        waited >= Duration::from_millis(50) && waited < Duration::from_secs(60),
         "timeout must be roughly honored, waited {waited:?}"
     );
     // Data present before the deadline is delivered normally.
@@ -247,7 +249,7 @@ fn stale_socket_reads_not_live() {
 
     // Socket teardown can be asynchronous: poll (bounded) until the stale
     // verdict lands; never reaching it is the real regression.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut stale = false;
     while Instant::now() < deadline {
         match CtlStream::connect(&path) {

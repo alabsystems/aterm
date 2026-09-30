@@ -665,7 +665,7 @@ fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
             let (checkpoint, rung, cause) =
                 carry_for_wire(terminal, 5, MAX_HANDOFF_HISTORY_LINES, &mut cells, caps);
             assert_eq!(rung, CarryRung::StrippedLinks, "{at}: {cause:?}");
-            assert!(!rung.needs_repaint() && rung.keeps_control_carry(), "{at}");
+            assert!(!rung.needs_repaint() && rung.keeps_differ_state(), "{at}");
             let cause = cause.expect("a rung below Full names its cause");
             assert!(
                 cause.contains(&format!(
@@ -1535,7 +1535,7 @@ fn a_policy_ceiling_only_ever_lowers_the_carry() {
                 }
                 CarryCeiling::Repaint => {
                     assert_eq!((&checkpoint, rung), (&blank.0, CarryRung::Repaint), "{at}");
-                    assert!(rung.needs_repaint() && !rung.keeps_control_carry(), "{at}");
+                    assert!(rung.needs_repaint() && !rung.keeps_differ_state(), "{at}");
                 }
             }
             assert_wire_admits(&at, &checkpoint);

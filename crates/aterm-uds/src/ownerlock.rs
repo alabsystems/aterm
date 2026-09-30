@@ -32,9 +32,22 @@ pub enum Owner {
 /// Probe `path`'s owner lock without waiting. See the module docs.
 #[must_use]
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-// Skip: bottoms out at the `open`/`flock`/`close` FFI calls.
+// Skip: the body is `probe_while_locked`'s, which bottoms out at FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn probe(path: &Path) -> Owner {
+    probe_while_locked(path, || {})
+}
+
+/// [`probe`], running `while_locked` at the one moment the probe's own
+/// descriptor holds the lock: after its `flock` took it, before its `LOCK_UN`
+/// (never, when the lock was not free). The shipped probe runs nothing there.
+/// The tests fork there, which is the only way to put a child between `fork`
+/// and `exec` holding a copy of the probe's descriptor on every run, and so the
+/// only way a test can see that the `LOCK_UN` is there (module docs).
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+// Skip: bottoms out at the `open`/`flock`/`close` FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+fn probe_while_locked(path: &Path, while_locked: impl FnOnce()) -> Owner {
     use std::os::unix::ffi::OsStrExt as _;
     unsafe extern "C" {
         fn open(path: *const core::ffi::c_char, flags: i32, ...) -> i32;
@@ -70,6 +83,7 @@ pub fn probe(path: &Path) -> Owner {
     let locked = unsafe { flock(fd, LOCK_EX | LOCK_NB) } == 0;
     let err = std::io::Error::last_os_error().raw_os_error();
     if locked {
+        while_locked();
         // SAFETY: `fd` is the descriptor opened above; LOCK_UN never waits.
         unsafe { flock(fd, LOCK_UN) };
     }
@@ -91,9 +105,14 @@ pub fn probe(_path: &Path) -> Owner {
     Owner::Unknown
 }
 
-#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
+// Two attributes, not `cfg(all(test, ..))`: the wasm-process census (OB-12)
+// masks unshipped items by the exact spelling `#[cfg(test)]`, and this module
+// spawns a thread, which that census refuses anywhere it cannot see is test-only.
+#[cfg(test)]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
 
     unsafe extern "C" {
         fn flock(fd: i32, op: i32) -> i32;
@@ -116,20 +135,121 @@ mod tests {
         drop(file);
     }
 
+    /// What the parked child execs once it is let go: the POSIX shell, told to
+    /// exit 0. `/bin/sh` is where every unix this module is wired for (macOS,
+    /// Linux — NixOS included, which has no `/usr/bin/true`) keeps it, and the
+    /// crate's other spawning tests use it too.
+    const SHELL: &str = "/bin/sh";
+
+    /// A CHILD PARKED BETWEEN `fork` AND `exec`, holding a copy of every
+    /// descriptor this process had open when it forked — the state every
+    /// sibling test that spawns through `pre_exec` puts this process in for up
+    /// to milliseconds at a time (`spawnfd`'s inheritance strip walks up to
+    /// 65 536 descriptors there). Parking one makes that interleaving a test's
+    /// every run instead of its occasional one.
+    ///
+    /// Letting it go is unconditional: [`Parked::release`] does it and returns
+    /// the child's exit status, and `Drop` does it on every other path — a
+    /// failed assertion unwinding past a parked child lets it exec and exit at
+    /// once instead of holding every descriptor for its 10 s read timeout. The
+    /// child only ever ends by exiting: it execs `/bin/sh -c 'exit 0'` whether
+    /// it was answered, reached end of file, or timed out, and nothing here
+    /// makes its write raise `SIGPIPE` (its socket's peer is never shut for
+    /// reading, and the child holds a copy of that peer itself).
+    struct Parked {
+        ours: std::os::unix::net::UnixStream,
+        spawner: Option<std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>>,
+    }
+
+    impl Parked {
+        /// Fork a child and return once it is parked. The child writes one
+        /// byte, then waits for one. The read timeout is on the socket both
+        /// processes share, so even a parent that dies cannot strand the child
+        /// in `pre_exec` past 10 s.
+        fn park() -> Self {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::process::CommandExt as _;
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
+            theirs
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .expect("timeout");
+            let theirs_fd = theirs.as_raw_fd();
+            let spawner = std::thread::spawn(move || {
+                let mut cmd = std::process::Command::new(SHELL);
+                cmd.args(["-c", "exit 0"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                // SAFETY: runs in the forked child before `exec` and calls only
+                // `write(2)` and `read(2)` on a descriptor the parent keeps open
+                // (`theirs`, alive until `status` returns), both
+                // async-signal-safe.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        let mut byte = 0u8;
+                        write(theirs_fd, (&raw const byte).cast(), 1);
+                        read(theirs_fd, (&raw mut byte).cast(), 1);
+                        Ok(())
+                    });
+                }
+                let status = cmd.status();
+                drop(theirs);
+                status
+            });
+            // Built before the wait, so a child that never parks is still
+            // let go and joined by `Drop` when the wait panics.
+            let mut parked = Self {
+                ours,
+                spawner: Some(spawner),
+            };
+            let mut byte = [0u8];
+            parked
+                .ours
+                .read_exact(&mut byte)
+                .expect("the child parked between fork and exec");
+            parked
+        }
+
+        /// Let the child exec and exit, and return how it exited.
+        fn release(mut self) -> std::process::ExitStatus {
+            self.let_go();
+            let spawner = self.spawner.take().expect("released once");
+            match spawner.join().expect("the spawner thread") {
+                Ok(status) => status,
+                Err(e) => panic!(
+                    "spawning `{SHELL} -c 'exit 0'` for the parked child failed: {e} \
+                     (the child forks and parks before its exec, so this is the exec)"
+                ),
+            }
+        }
+
+        /// Answer the child's read, then end the stream so a read that missed
+        /// the byte sees end of file. Errors are ignored: a child that already
+        /// exited needs nothing.
+        fn let_go(&mut self) {
+            let _ = self.ours.write_all(b"g");
+            let _ = self.ours.shutdown(std::net::Shutdown::Write);
+        }
+    }
+
+    impl Drop for Parked {
+        fn drop(&mut self) {
+            if let Some(spawner) = self.spawner.take() {
+                self.let_go();
+                let _ = spawner.join();
+            }
+        }
+    }
+
     /// A lock this process holds through another open is LIVE; once released
     /// it is DEAD; a missing file and a symlink are UNKNOWN.
     ///
     /// The release runs while a child this process forked is parked between
-    /// `fork` and `exec` holding a copy of the holder's descriptor — the state
-    /// every sibling test that spawns through `pre_exec` puts this process in
-    /// for up to milliseconds at a time (`spawnfd`'s inheritance strip walks up
-    /// to 65 536 descriptors there). Parking one here makes that interleaving
-    /// the test's every run instead of its occasional one.
+    /// `fork` and `exec` holding a copy of the holder's descriptor
+    /// ([`Parked`]).
     #[test]
     fn the_probe_reads_the_owner_lock() {
-        use std::io::{Read as _, Write as _};
         use std::os::fd::AsRawFd as _;
-        use std::os::unix::process::CommandExt as _;
         let dir = std::env::temp_dir().join(format!("ownerlock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -139,50 +259,46 @@ mod tests {
         assert_eq!(unsafe { flock(file.as_raw_fd(), 2 | 4) }, 0);
         assert_eq!(probe(&path), Owner::Live, "held through another open");
 
-        // PARK A CHILD between fork and exec: it writes one byte, then waits for
-        // one. The read timeout is on the socket both processes share, so a
-        // parent that never answers cannot strand the child in `pre_exec`.
-        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
-        theirs
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .expect("timeout");
-        let theirs_fd = theirs.as_raw_fd();
-        let spawner = std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new("/usr/bin/true");
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            // SAFETY: runs in the forked child before `exec` and calls only
-            // `write(2)` and `read(2)` on a descriptor the parent keeps open
-            // (`theirs`, alive until `status` returns), both async-signal-safe.
-            unsafe {
-                cmd.pre_exec(move || {
-                    let mut byte = 0u8;
-                    write(theirs_fd, (&raw const byte).cast(), 1);
-                    read(theirs_fd, (&raw mut byte).cast(), 1);
-                    Ok(())
-                });
-            }
-            let status = cmd.status();
-            drop(theirs);
-            status
-        });
-        let mut parked = [0u8];
-        ours.read_exact(&mut parked).expect("the child parked");
+        let parked = Parked::park();
         release(file);
-        // Read now, assert after the child is let go: a failed assertion here
-        // must not leave it parked.
-        let after_release = probe(&path);
-        ours.write_all(b"g").expect("let the child exec");
-        let status = spawner.join().expect("spawner").expect("spawn");
+        assert_eq!(probe(&path), Owner::Dead, "the holder released it");
+        let status = parked.release();
         assert!(status.success(), "{status}");
-        assert_eq!(after_release, Owner::Dead, "the holder released it");
 
         assert_eq!(probe(&path), Owner::Dead, "the probe released its own lock");
         assert_eq!(probe(&dir.join("absent.log")), Owner::Unknown);
         let link = dir.join("link.log");
         std::os::unix::fs::symlink(&path, &link).expect("symlink");
         assert_eq!(probe(&link), Owner::Unknown, "a symlink is never followed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE PROBE LETS GO OF ITS OWN LOCK BEFORE IT CLOSES (module docs). A
+    /// child forked while the probe holds the lock keeps a copy of the probe's
+    /// open file description until it execs, and a probe that only closed would
+    /// leave the lock held on that copy: the next probe would read a marker no
+    /// process holds as LIVE. The fork lands at exactly that moment here — from
+    /// inside the probe, between its `flock` and its `LOCK_UN` — and the next
+    /// probe runs while the child is still parked holding the copy.
+    #[test]
+    fn a_child_forked_mid_probe_does_not_keep_the_probes_lock() {
+        let dir = std::env::temp_dir().join(format!("ownerlock-mid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("m.log");
+        drop(std::fs::File::create(&path).expect("create"));
+
+        let mut parked = None;
+        let first = probe_while_locked(&path, || parked = Some(Parked::park()));
+        assert_eq!(first, Owner::Dead, "nobody holds it");
+        let parked = parked.expect("the probe took the free lock and forked holding it");
+        assert_eq!(
+            probe(&path),
+            Owner::Dead,
+            "the child forked mid-probe kept the probe's lock: the probe closed without LOCK_UN"
+        );
+        let status = parked.release();
+        assert!(status.success(), "{status}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

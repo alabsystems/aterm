@@ -109,9 +109,9 @@ fn nonblocking_sink(master: i32) -> SinkWriter {
 
 /// Probe until `done` holds (the drainer runs on its own thread, so the
 /// kernel's count moves under the test), panicking with the last reading
-/// after five seconds.
+/// after a minute — a hang detector, never a latency budget.
 fn settle(sink: &SinkWriter, done: impl Fn(&InputBacklog) -> bool) -> InputBacklog {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let b = sink.input_backlog().expect("a pty master is measured");
         if done(&b) {
@@ -148,10 +148,15 @@ fn raw_unread_input_is_counted_and_dated() {
     assert_eq!(empty.spilled, Some(0));
     assert_eq!(empty.output_backlog, Some(0));
 
+    // Fresh bytes are dated no earlier than their write: their wait cannot
+    // exceed the time since just before it. (It was `< 300 ms`, which a
+    // descheduled probe could overrun and a date that is merely too old
+    // could pass.)
+    let before_write = Instant::now();
     assert_eq!(sink.write_frame(b"abc").expect("write"), 3);
     let fresh = sink.input_backlog().expect("measured");
     assert_eq!(fresh.queued, 3);
-    assert!(fresh.wait < Duration::from_millis(300), "{fresh:?}");
+    assert!(fresh.wait <= before_write.elapsed(), "{fresh:?}");
 
     thread::sleep(Duration::from_millis(300));
     let aged = sink.input_backlog().expect("measured");
@@ -325,8 +330,9 @@ fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
 /// (`InputLedger::oldest_unread_at` dates them from its birth), so a paste
 /// into a frozen program was dated by whenever the SESSION started, not by
 /// the paste. The sink is aged first so the two dates are far apart: the
-/// parked paste must read at least the time it has been parked, and less
-/// than the sink's age.
+/// parked paste must read at least the time it has been parked, and no more
+/// than the time since its paster was spawned — the sink's birth is `AGE`
+/// older than that.
 #[test]
 fn a_metered_paste_is_dated_by_its_own_write() {
     const AGE: Duration = Duration::from_millis(1500);
@@ -337,6 +343,7 @@ fn a_metered_paste_is_dated_by_its_own_write() {
     thread::sleep(AGE);
 
     let meter = Arc::new(BulkMeter::new());
+    let spawned_at = Instant::now();
     let paster = {
         let (sink, meter) = (Arc::clone(&sink), Arc::clone(&meter));
         thread::spawn(move || {
@@ -350,7 +357,7 @@ fn a_metered_paste_is_dated_by_its_own_write() {
     // the paster's start latency, under PARKED whenever the new thread
     // started later than the sleep overshot. A write around the ledger (the
     // regression) is dated from the sink's birth, so this returns at once and
-    // the `wait < AGE` bound below still fails on it.
+    // the `since_spawn` bound below still fails on it.
     let _ = first_write_dated(&sink);
     thread::sleep(PARKED);
     assert!(
@@ -358,10 +365,17 @@ fn a_metered_paste_is_dated_by_its_own_write() {
         "the paste must be parked on a full queue"
     );
     let parked = sink.input_backlog().expect("measured while parked");
+    let since_spawn = spawned_at.elapsed();
     assert!(parked.queued > 0, "{parked:?}");
+    // The upper bound is the paste's own age, not a fixed `AGE`: the write
+    // came after `spawned_at`, so no correct date is older than that, and a
+    // date from the sink's birth is older by all of `AGE`. (`wait < AGE`
+    // went red whenever the probe ran more than AGE - PARKED after the first
+    // dated bytes.)
     assert!(
-        parked.wait >= PARKED && parked.wait < AGE,
-        "dated by the metered write, not by the sink's birth: {parked:?}"
+        parked.wait >= PARKED && parked.wait <= since_spawn,
+        "dated by the metered write, not by the sink's birth: {parked:?}, \
+         {since_spawn:?} since the paster was spawned"
     );
 
     let got = read_exactly(slave, PASTE);
@@ -371,7 +385,7 @@ fn a_metered_paste_is_dated_by_its_own_write() {
     close_pair(master, slave);
 }
 
-/// Wait up to two seconds for the slave to have input, then read what is
+/// Wait up to a minute for the slave to have input, then read what is
 /// there — so a wedged sink fails the test instead of hanging it.
 fn read_within(fd: i32, max: usize) -> Vec<u8> {
     let mut p = libc::pollfd {
@@ -380,8 +394,8 @@ fn read_within(fd: i32, max: usize) -> Vec<u8> {
         revents: 0,
     };
     // SAFETY: `p` is a live pollfd on this stack; nfds == 1.
-    let ready = unsafe { libc::poll(&mut p, 1, 2000) };
-    assert_eq!(ready, 1, "nothing reached the program within 2 s");
+    let ready = unsafe { libc::poll(&mut p, 1, 60_000) };
+    assert_eq!(ready, 1, "nothing reached the program within 60 s");
     let mut out = vec![0u8; max];
     // SAFETY: a bounded read into `out`, which is `max` bytes long.
     let n = unsafe { libc::read(fd, out.as_mut_ptr().cast(), max) };
@@ -451,7 +465,7 @@ fn a_discard_ends_a_writer_parked_mid_frame() {
     );
 
     assert_eq!(sink.discard_unread_input(Discard::Restart), Some(1022));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !paster.is_finished() {
         assert!(
             Instant::now() < deadline,

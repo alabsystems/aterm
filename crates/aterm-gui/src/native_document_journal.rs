@@ -3218,6 +3218,13 @@ mod tests {
     #[test]
     fn cross_process_same_journal_generation_has_one_winner() {
         const CHILD: &str = "ATERM_JOURNAL_COMMIT_TEST_CHILD";
+        // Every wait below is for something that must happen — a child test
+        // process of this whole binary starting (seconds of exec under a
+        // loaded gate), the parent's go, the peer's lock hold ending — so each
+        // is a hang detector, never a latency budget (they were 10 s and 3 s,
+        // and all three cross-process tests went red together under a 24-way
+        // CPU load on 2026-09-29).
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
         const URI: &str = "file:///tmp/cross-process-draft.md";
         if let Ok(role) = std::env::var(CHILD) {
             let path = PathBuf::from(std::env::var("ATERM_JOURNAL_COMMIT_TEST_PATH").unwrap());
@@ -3237,7 +3244,7 @@ mod tests {
             plan.expected_image = Some(ContentFingerprint::of(&fs::read(&path).unwrap()));
             fs::write(root.join(format!("ready-{role}")), b"ready").unwrap();
             let go = root.join("go");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + HANG;
             while !go.exists() {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -3245,7 +3252,7 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let retry_deadline = std::time::Instant::now() + HANG;
             let verdict = loop {
                 match execute_journal_append(&path, key, &plan, JournalLockPatience::Worker) {
                     JournalAppendResult::Committed(_) => break "committed",
@@ -3289,7 +3296,7 @@ mod tests {
                     .unwrap(),
             );
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + HANG;
         while ["one", "two"]
             .iter()
             .any(|role| !root.join(format!("ready-{role}")).exists())

@@ -149,7 +149,9 @@ running, normally every thirty minutes with shared retry backoff. By default
 they replace only the on-disk executable; open windows and PTYs keep running
 their existing binary. The next start of the new build that comes up healthy (a
 window, `--headless`, or an interactive session) confirms it; a build whose window
-fails still rolls back. `[update] auto_apply = false` leaves a verified
+fails still rolls back. Update checks and applies wait until the new build is
+confirmed or rolls back; when the previous copy can't come back, three failed
+starts end the wait instead. `[update] auto_apply = false` leaves a verified
 stage for explicit `aterm update apply`. `aterm update status` and Settings
 distinguish a Linux stage, an installed trial and a failed check; Linux does not
 pretend to use the macOS live-session handoff. `[update] enabled = false` disables
@@ -165,22 +167,23 @@ stages or applies one. To update a copy you built, pull and rebuild it as in
 ### Build from source
 
 This repository is a snapshot of the private development line, cut with each
-release, and pins a stock Rust toolchain. On macOS with the Xcode Command Line
-Tools installed:
+release, and pins the same Trust toolchain (`rust-toolchain.toml`). Install
+aterm as above and atpkg installs Trust (`aterm pkg install trust` does it by
+hand). On macOS with the Xcode Command Line Tools installed:
 
 ```sh
 git clone https://github.com/alabsystems/aterm.git
 cd aterm
-cargo build --locked -p aterm
+targo --unverified build --locked -p aterm
 ./target/debug/aterm --window
 ```
 
 `./target/debug/aterm --version` should agree with `[workspace.package]
 version` in the root `Cargo.toml`. Build from the workspace — aterm's crates are
-not on crates.io, so there is nothing to `cargo install`. Linux and Windows
-build from source too. The public source snapshot uses its stock compiler pin;
-private development and the native Linux release worker use the pinned Trust
-toolchain. A source build is a real aterm,
+not on crates.io, so there is nothing to `cargo install`. atpkg ships Trust for
+Apple-silicon macOS today; Linux and Windows build from source too, with Trust
+built from [source](https://github.com/alabsystems/trust). A source build is a
+real aterm,
 not a byte-identical signed release, and is not automatically enrolled for
 replacement. Linux release availability and enrollment are described above.
 
@@ -471,7 +474,7 @@ and bundled display faces.
 
 A Linux build publishes the AccessKit tree, so a screen reader reads the grid and
 Settings. macOS releases and Windows builds ship without one; build it with
-`cargo build --locked -p aterm --features aterm-gui/a11y-accesskit` (or, on
+`targo --unverified build --locked -p aterm --features aterm-gui/a11y-accesskit` (or, on
 macOS, `aterm-gui/a11y-appkit`, aterm's own VoiceOver publisher).
 
 ## The ALab toolchain
@@ -636,7 +639,7 @@ public issue.
 Bounded protocols and state machines are written once as Rust-derived models —
 hundreds of them — that generate both a checkable specification and an executable
 interpreter. An embedded exhaustive checker verifies their invariants,
-deadlock-freedom, and transitions on every `cargo test` (a handful of
+deadlock-freedom, and transitions on every test run (a handful of
 function-valued models can only be checked by `ty`, and say so); where `ty` is
 installed the same obligations get a second, independent check, and `ay`
 re-checks the development line's hand-encoded SMT certificate bundles. A missing
@@ -658,8 +661,8 @@ catch.
 The development line — and the Apple-silicon slice of every release — is compiled
 by the Trust toolchain (`trustc`/`targo`), but in-compilation verification is not
 yet enabled workspace-wide, so "compiled by a verifying compiler" is not
-"verified": that campaign ratchets crate by crate. The public snapshot builds on
-stock Rust and carries the embedded exhaustive checker, the conformance,
+"verified": that campaign ratchets crate by crate. The public snapshot pins the
+same Trust toolchain and carries the embedded exhaustive checker, the conformance,
 property, and fuzz tests, the CPU/GPU parity suites, and the differential oracle
 against `alacritty_terminal` (the `ay` bundles stay internal). These prove or
 test named, bounded contracts — not the whole emulator, renderer, or OS.
@@ -670,8 +673,8 @@ in this snapshot; [CONTRIBUTING.md](CONTRIBUTING.md) says what you can run here.
 
 aterm makes no aggregate performance claim. The reproducible cross-engine
 measurements are engine-only and in-process — throughput via
-`cargo bench -p aterm-bench --bench comparative` and retained heap via
-`cargo test -p aterm-bench --test memory`, aterm vs `alacritty_terminal`, no
+`targo --unverified bench -p aterm-bench --bench comparative` and retained heap via
+`targo --unverified test -p aterm-bench --test memory`, aterm vs `alacritty_terminal`, no
 rendering or GPU. No on-glass head-to-head has yet been run on a shipped build
 under a protocol fit to publish, so none is quoted. `aterm ctl metrics` exists so
 you can measure render and latency on the workload that matters to you.

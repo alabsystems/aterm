@@ -1694,8 +1694,11 @@ mod tests {
             err.contains("nextDrawable returned nil"),
             "the failure is named, not swallowed: {err}"
         );
+        // A hang detector: the deviceless nil arm returns in microseconds and a
+        // parked thread never returns at all, so a minute separates them as
+        // well as 8 s did without reading a descheduled test as a hang.
         assert!(
-            waited < 8.0,
+            waited < 60.0,
             "the failure is BOUNDED — {waited:.2}s is not a parked thread \
              (wgpu-hal's allowsNextDrawableTimeout=NO would sit here forever)"
         );
@@ -2128,8 +2131,10 @@ mod tests {
             let got = sc.raw_next_drawable();
             // SAFETY: as above.
             let waited = unsafe { CACurrentMediaTime() } - t0;
+            // A hang detector (a vend is milliseconds, a nil is Apple's ~1 s
+            // timeout, a parked thread is forever), not a latency budget.
             assert!(
-                waited < 8.0,
+                waited < 60.0,
                 "acquire {i} took {waited:.2}s — the bounded-wait contract is dead"
             );
             let pair = got.unwrap_or_else(|| {
@@ -2451,8 +2456,10 @@ mod tests {
                     .unwrap_or_else(|e| panic!("cycle {cycle} step {i}: acquire: {e}"));
                 // SAFETY: as above.
                 let waited = unsafe { CACurrentMediaTime() } - t0;
+                // A hang detector: a starved pool answers nil at Apple's ~1 s
+                // timeout (the `unwrap_or_else` above), never a slow vend.
                 assert!(
-                    waited < 8.0,
+                    waited < 60.0,
                     "cycle {cycle} step {i}: acquire took {waited:.2}s — the storm \
                      starved the pool"
                 );
@@ -3603,7 +3610,9 @@ mod tests {
                 .expect("present");
             assert_eq!(ticket.wait_outcome(), CbOutcome::Completed);
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // A hang detector: the presented handler fires on the compositor's
+        // thread, and the loop returns the moment the last sample lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while delivered() < before + PRESENTS && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

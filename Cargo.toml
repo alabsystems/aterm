@@ -80,7 +80,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.99.0"
+version = "0.100.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -377,7 +377,8 @@ atpkg = { path = "crates/atpkg" }
 atpkg-keys = { path = "crates/atpkg-keys" }
 aterm-sixel = { path = "crates/aterm-sixel" }
 # The main-loop completeness census (L0 whole-Mac-freeze class): ONE shared
-# implementation consumed by `xtask gate mainloop` (manual verb) AND
+# implementation consumed by its own hand-run binary (`targo --unverified run -p
+# aterm-census`), aterm-forge (the scan-set classifier) AND
 # tools/freeze-safety-gate/build.rs (the automatic, build-blocking obligation).
 aterm-census = { path = "crates/aterm-census" }
 # The merge gate's own crate. Depended on ONLY for its toolchain resolution
@@ -497,14 +498,12 @@ debug = "line-tables-only"
 # aterm-census is a DEV-ONLY lexical scanner (11k lines of pure std over the
 # 1425 .rs files under crates/) that never ships — nothing in `expose` or
 # `bundle` depends on it. It is also on the critical path of every local gate
-# run: `cargo test -p aterm-census` runs 98 tests that each walk the real tree,
-# and `targo --unverified run -p xtask -- gate mainloop` is one of the three verbs
-# `tools/verify.sh` executes. Unoptimized, that scanning dominates both.
+# run: its tests each walk the real tree. Unoptimized, that scanning dominates.
 #
 # Measured on this tree, arms alternated ABBA across 3 rounds, 98/98 tests
 # passing in both:
 #   cargo test -p aterm-census   2.98 s -> 0.65 s   (-2.33 s per verify.sh run)
-#   xtask gate mainloop census   0.77 s -> 0.14 s   (-0.63 s per verify.sh run)
+#   the main-loop census walk    0.77 s -> 0.14 s   (then `xtask gate mainloop`)
 # Cost side, measured the same way (3 cold builds per arm, alternated):
 # +1.64 s of codegen, paid only when this crate is recompiled, not per run.
 #

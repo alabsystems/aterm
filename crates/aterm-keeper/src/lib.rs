@@ -30,7 +30,7 @@
 //!   satisfies this build's designated requirement.
 //! * [`job`] — the launchd label (`com.aterm.aterm.keeper`), the socket, and
 //!   `launchctl submit|remove|print`.
-//! * [`cli`] — `aterm keeper serve|status`.
+//! * [`cli`] — `aterm keeper serve|status|start|stop`.
 //!
 //! It links no AppKit, CoreGraphics or winit (`tools/grep_guard.sh` B19): the
 //! keeper outlives the window precisely because it is not a GUI process.

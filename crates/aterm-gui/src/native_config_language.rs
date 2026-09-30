@@ -3143,10 +3143,17 @@ fn warn_unknown_item(
         }
         return;
     }
-    if let Some(message) = path
-        .strip_prefix("harness.")
-        .and_then(|key| aterm_agent::supervise::config::retired_key_note(key, item.as_bool()))
-    {
+    // The value's one-value text, read by the reader's own rule for a retired
+    // key (`"no"`, `0` and `"disabled"` are offs there too), so the line and
+    // the reader never tell two stories.
+    let one_value = item
+        .as_bool()
+        .map(|b| b.to_string())
+        .or_else(|| item.as_str().map(str::to_string))
+        .or_else(|| item.as_integer().map(|n| n.to_string()));
+    if let Some(message) = path.strip_prefix("harness.").and_then(|key| {
+        aterm_agent::supervise::config::retired_key_note_text(key, one_value.as_deref())
+    }) {
         // RETIRED, not unknown (D9, 2026-09-25): 0.93.0's approval switches
         // still LIMIT when written `false` — the supervisor's one reader
         // takes each as the limit it named — so "unknown to this build" would
@@ -4592,7 +4599,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
         }
         crate::prefs::EDIT_DESKTOP_ALERTS => {
-            " · aterm's OWN alerts (the menu bar's escalations, the operator, update health) as system notifications — macOS through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon; none on other platforms · off keeps every one in the message band, the menu bar and messages.log · program notifications (OSC 9/99/777) are allow_notifications'"
+            " · aterm's OWN alerts (the menu bar's escalations, macOS permissions, the operator, update health) as system notifications — macOS through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon (not update health); none on other platforms · off keeps them in the message band, the menu bar and messages.log, the operator's only in aterm fleet status and next · program notifications (OSC 9/99/777) are allow_notifications'"
         }
         crate::prefs::EDIT_ALLOW_OSC52_QUERY => {
             if cfg!(target_os = "linux") {
@@ -7245,13 +7252,15 @@ expect_nonce = "pin"
             help_for("allow_notifications")
                 .contains("desktop delivery is implemented on macOS and Windows")
         );
-        // `desktop_alerts` says whose alerts it governs, what off keeps, and
-        // that a program's are the other key's.
+        // `desktop_alerts` says whose alerts it governs, what off keeps (the
+        // operator's nowhere but its queue), and that a program's are the
+        // other key's.
         let alerts = help_for("desktop_alerts");
         for needle in [
             "aterm's OWN alerts",
             "Script Editor",
             "messages.log",
+            "aterm fleet status and next",
             "allow_notifications",
         ] {
             assert!(alerts.contains(needle), "{needle:?} in {alerts}");

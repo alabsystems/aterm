@@ -49,7 +49,7 @@ use crate::companion::{CompanionOwner, ContrastFallback, GlowOwnership, PetFacts
 use crate::cursor_fx::{CursorFx, CursorFxInput, compose_caret_style_override};
 use crate::cursor_glow::{Geom, GlowConfig, GlowStyle};
 use crate::cursor_momentum::MOMENTUM_GLOW_TAU_S;
-use crate::cursor_trail::{TrailConfig, TypingCadence};
+use crate::cursor_trail::TrailConfig;
 #[cfg(test)]
 use crate::host::Wake;
 use crate::host::{
@@ -62,6 +62,7 @@ use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainClock, RainConfig, RainFrame, RainHue,
     RainLatches, RainScan, RainTickInput, RainVisibility,
 };
+use crate::motion::{MotionEffect, MotionMode, MotionPolicy};
 use crate::output_streak::{MAX_COMETS, OutputStreak, StreakConfig, TAIL_MAX, TAIL_MIN};
 use crate::rainbow_kitty::TypedClass;
 use crate::word_decorations::{DecoConfig, EffectGeom, Resolved, SelView, WordDecorations};
@@ -748,13 +749,12 @@ impl EffectsPipeline {
             // amplitude demotion. A host may refocus without an intervening
             // `apply`; retaining resident light or an exact candidate across
             // that gap would resurrect old geometry/provenance on the same
-            // generation.
+            // generation. The block bodies, the momentum rate and the cadence
+            // go with the aurora: a body left charged would report the page
+            // active and ask for display frames it cannot show.
             self.cursor.glow.reset();
-            self.cursor.trail.reset();
-            self.cursor.glow_scratch.clear();
-            self.cursor.trail_scratch.clear();
+            self.cursor.retire_bodies();
             self.pending_keys = 0;
-            self.cursor.cadence = TypingCadence::default();
             // The resident pet retires its coordinate space on the same edge
             // (the native presentability edge, `lib.rs` Focused(false) —
             // SURFACE ONLY: the terminal under it is the same one, so the
@@ -1129,10 +1129,12 @@ impl EffectsPipeline {
     }
 
     /// THE MOTION POLICY, general: the host's STABLE reduce-motion preference
-    /// for every effect — sparkle words go static, rain stands down, the pet
-    /// is pinned at its station (drawn, but no chase, no gait, no arc). Never
-    /// a load-shed term: a shed is a request to spend less time drawing, and
-    /// raising this on a walking cat welds it to the caret.
+    /// for every effect — the cursor family draws nothing (amplitude 0 and no
+    /// comet, the window's `MotionPolicy` law), sparkle words go static, rain
+    /// stands down, the pet is pinned at its station (drawn, but no chase, no
+    /// gait, no arc). Never a load-shed term: a shed is a request to spend
+    /// less time drawing, and raising this on a walking cat welds it to the
+    /// caret.
     /// [`Self::set_sparkle_reduced_motion`] and
     /// [`Self::set_matrix_rain_reduced_motion`] are aliases of this setter.
     pub fn set_reduced_motion(&mut self, on: bool) {
@@ -1921,12 +1923,22 @@ impl EffectsPipeline {
         if !live_viewport {
             input.cursor_visible = false;
         }
+        // THE MOTION POLICY, the window's law ([`MotionPolicy::resolve`]): the
+        // page's reduce-motion preference stands where the OS flag does, and
+        // an unfocused page is a still. Reduced motion zeroes the cursor
+        // family's amplitude (the aurora, every body, the momentum glow) and
+        // switches the comet off, as it does natively. A page sheds no load,
+        // so no envelope stacks on it.
+        let cursor_motion =
+            MotionPolicy::resolve(MotionMode::Auto, self.deco_cfg.reduced_motion, self.focused);
+        let motion_amp = cursor_motion.amplitude(MotionEffect::CursorGlow);
+        let animate = cursor_motion.animate(MotionEffect::CursorGlow);
         // Cursor-owned state is in active-grid coordinates. History is a
         // distinct viewport, so the cursor family's history fence retires the
         // engines (Rainbow Kitty's band hides instead, its clocks running) —
         // the native law, through the one step both hosts run
-        // ([`CursorFx::begin`]). An unfocused page does not animate.
-        self.cursor.begin(live_viewport, self.focused);
+        // ([`CursorFx::begin`]).
+        self.cursor.begin(live_viewport, animate);
         let cur = (live_viewport && input.cursor_visible)
             .then_some((input.cursor_row as u16, input.cursor_col as u16));
         // Fire/Water/Vapor choose additive-vs-contrast treatment from the
@@ -1996,12 +2008,6 @@ impl EffectsPipeline {
                 .observe_row(row, col, &self.row_probe_scratch, now);
         }
 
-        // Why: native suppresses unfocused animation with a motion-policy
-        // AMPLITUDE fold (app_render: `intensity *=` / `enabled &=`) that the web
-        // path never ported, so visible-unfocused split panes animated at full
-        // strength. A page sheds no load, so no envelope stacks on it.
-        let motion_amp: f32 = if self.focused { 1.0 } else { 0.0 };
-
         // THE CURSOR FAMILY'S ONE FRAME STEP ([`CursorFx::tick`], the code the
         // native window runs): the aurora, every block-cursor body, the comet
         // and the caret's one owner. Exactly one of the aurora and the comet is
@@ -2010,9 +2016,10 @@ impl EffectsPipeline {
         //
         // The comet's config is a COPY of the stored one, its colour already
         // following the live cursor above; the step stamps its ignition from
-        // the typing cadence. An unfocused page emits no comet.
+        // the typing cadence. A still page (unfocused or reduced) emits no
+        // comet.
         let mut trail_cfg = self.trail_cfg;
-        trail_cfg.enabled &= self.focused;
+        trail_cfg.enabled &= animate;
         // Window-space layout under the embedder's chrome (set_chrome). The
         // default 0/0 chrome degenerates to the identity layout (origin 0,
         // win == grid extents), so window-absolute emissions coincide with the
@@ -2053,7 +2060,6 @@ impl EffectsPipeline {
                 geom: glow_geom,
                 focused: self.focused,
                 amplitude: motion_amp,
-                animate: self.focused,
                 // A page has no load-shed latch.
                 shed_envelope: 1.0,
                 body_allowed: !self.serious,
@@ -2154,7 +2160,7 @@ impl EffectsPipeline {
             // THE MOTION POLICY ONLY — the host's stable preference, with
             // focus folded in (an unfocused page is a still, as an unfocused
             // native window is). Never a load term.
-            reduced_motion: self.deco_cfg.reduced_motion || !self.focused,
+            reduced_motion: !animate,
             // The one Serious Mode input: the pet leaves the glass with the
             // caret's bodies.
             serious: self.serious,
@@ -2757,6 +2763,7 @@ mod tests {
         assert_eq!(p.glow_cfg.radius, 0.0);
     }
 
+    use crate::cursor_trail::TypingCadence;
     use aterm_core::render::FreeSprite;
     use aterm_core::terminal::TerminalBuilder;
 
@@ -4207,14 +4214,35 @@ mod tests {
         assert!(!matches!(p.wake(), Wake::Frames));
     }
 
+    /// The torn-space law, pinned against an independent statement of it: a
+    /// changed cell grid, cell metric or chrome origin retires the aurora and
+    /// the comet, and the frame it draws — and every frame after — is the
+    /// frame of a cursor family holding NO geometry of the old space: every
+    /// body fresh, the aurora curtained, only the hand's momentum and cadence
+    /// kept. The oracle builds that family by struct update over
+    /// `CursorFx::default()`, not through `retire_body_geometry`'s list, so a
+    /// body the fence forgets draws a different frame. Every style runs. The
+    /// negative control keeps the bodies' geometry (the fence bypassed, the
+    /// aurora and comet retired by hand): the droplet and the comet nucleus
+    /// hold pixels of the old space, so their frames must differ, or the
+    /// equality proves nothing. (Until 2026-09-29 this pin accepted any quad
+    /// within two cells of the new caret, which a survivor passed.)
     #[test]
     fn pipeline_rows_metrics_and_chrome_changes_reset_seeded_geometry() {
-        for case in ["rows", "cell-metrics", "chrome-origin"] {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Prep {
+            Subject,
+            FreshFamily,
+            KeepBodies,
+        }
+        type Frames = Vec<(Vec<GlowQuad>, Vec<TrailCell>)>;
+        let run = |style: &str, case: &str, prep: Prep| -> (EffectsPipeline, Frames) {
+            let label = format!("{style}/{case}");
             let mut term = Terminal::new(5, 16);
             let mut pipeline = EffectsPipeline::new();
             pipeline.set_cursor_glow(
                 true,
-                "lumen",
+                style,
                 None,
                 None,
                 400,
@@ -4227,9 +4255,26 @@ mod tests {
             let (mut input, _) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
             assert!(
                 pipeline.cursor.trail.is_active() && pipeline.cursor.glow.is_active(),
-                "{case}: fixture owns retained geometry"
+                "{label}: fixture owns retained geometry"
             );
-
+            let now = pipeline.now();
+            match prep {
+                Prep::Subject => {}
+                Prep::FreshFamily => {
+                    let old = std::mem::take(&mut pipeline.cursor);
+                    pipeline.cursor = crate::cursor_fx::CursorFx {
+                        glow: old.glow,
+                        momentum: old.momentum,
+                        cadence: old.cadence,
+                        ..Default::default()
+                    };
+                    pipeline.cursor.glow.curtain(now);
+                }
+                Prep::KeepBodies => {
+                    pipeline.cursor.glow.curtain(now);
+                    pipeline.cursor.trail.reset();
+                }
+            }
             let (cell_w, cell_h) = match case {
                 "rows" => {
                     term.resize(6, 16);
@@ -4243,33 +4288,67 @@ mod tests {
                 }
                 _ => unreachable!(),
             };
-            pipeline.apply(&mut term, &mut input, cell_w, cell_h);
-            assert!(
-                !pipeline.cursor.trail.is_active()
-                    && !pipeline.cursor.glow.is_active()
-                    && input.cursor_trail.is_empty(),
-                "{case}: changed coordinate space retained a seeded survivor"
-            );
-            // What light remains is this frame's BLOCK BODY (lumen's charged
-            // emitter) drawn fresh at the caret in the NEW space — never a
-            // survivor of the old one: every quad lies within the body's
-            // reach of the caret cell under the new geometry.
-            let (pad, head) = (pipeline.chrome_pad, pipeline.chrome_head);
-            let (x0, y0) = (
-                i32::from(pad) + input.cursor_col as i32 * cell_w as i32,
-                i32::from(pad) + i32::from(head) + input.cursor_row as i32 * cell_h as i32,
-            );
-            let reach = 2 * cell_w.max(cell_h) as i32;
-            for q in &input.cursor_glow_add {
-                let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
-                let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
+            if prep == Prep::KeepBodies {
+                pipeline.cursor_coordinate_space = Some(CursorCoordinateSpace {
+                    rows: input.rows,
+                    cols: input.cols,
+                    cell_w,
+                    cell_h,
+                    chrome_pad: pipeline.chrome_pad,
+                    chrome_head: pipeline.chrome_head,
+                });
+            }
+            let mut frames = Frames::new();
+            for frame in 0..6 {
+                if frame > 0 {
+                    pipeline.advance(16.0);
+                    let (rows, cols) = (input.rows, input.cols);
+                    term.cell_frame_into(&mut input, rows, cols);
+                }
+                pipeline.apply(&mut term, &mut input, cell_w, cell_h);
+                frames.push((input.cursor_glow_add.clone(), input.cursor_trail.clone()));
+            }
+            (pipeline, frames)
+        };
+        let styles = [
+            "lumen",
+            "phaser",
+            "rainbow kitty",
+            "sparkle",
+            "fire",
+            "laser",
+            "beam",
+            "water",
+            "comet",
+            "classic",
+        ];
+        for case in ["rows", "cell-metrics", "chrome-origin"] {
+            for style in styles {
+                let (subject, drawn) = run(style, case, Prep::Subject);
+                let (_, fresh) = run(style, case, Prep::FreshFamily);
+                // Rainbow Kitty's band leaves through its 0.24 s curtain,
+                // which the fresh family draws too; every other aurora resets.
                 assert!(
-                    qx1 >= x0 - reach
-                        && qx0 <= x0 + cell_w as i32 + reach
-                        && qy1 >= y0 - reach
-                        && qy0 <= y0 + cell_h as i32 + reach,
-                    "{case}: a quad far from the caret survived the space change: {q:?}"
+                    !subject.cursor.trail.is_active()
+                        && (style == "rainbow kitty" || !subject.cursor.glow.is_active()),
+                    "{style}/{case}: changed coordinate space retained a seeded survivor"
                 );
+                assert!(
+                    !fresh[0].0.is_empty(),
+                    "{style}/{case}: fixture — the fresh family draws the caret's body"
+                );
+                assert!(
+                    drawn == fresh,
+                    "{style}/{case}: the frames after the space change are not a fresh family's"
+                );
+                if matches!(style, "water" | "comet") {
+                    let (_, kept) = run(style, case, Prep::KeepBodies);
+                    assert!(
+                        kept != fresh,
+                        "{style}/{case}: control — a body that kept its geometry must draw \
+                         differently"
+                    );
+                }
             }
             validate_pipeline_layout_prepare(case);
         }
@@ -5284,6 +5363,82 @@ mod tests {
             0
         );
         assert!(p.cursor.glow_scratch.is_empty() && p.cursor.trail_scratch.is_empty());
+    }
+
+    /// A page in `style`, typed into fast (ten witnessed keys) with the
+    /// page's reduce-motion preference as given, and whether any frame lit
+    /// the cursor family (a caret owner, a glow quad, a caret-shape override
+    /// or a comet cell).
+    fn typed_page(style: &str, reduced: bool) -> (EffectsPipeline, bool) {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_glow(
+            true,
+            style,
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        p.set_reduced_motion(reduced);
+        let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+        let mut lit = false;
+        for ch in b"abcdefghij" {
+            commit_ascii(&mut p, &mut term, &mut input, &[*ch], 30.0);
+            lit |= p.cursor_block_fill().is_some()
+                || !input.cursor_glow_add.is_empty()
+                || input.cursor_effect_style_override.is_some()
+                || !input.cursor_trail.is_empty();
+        }
+        (p, lit)
+    }
+
+    const BODY_STYLES: [&str; 4] = ["rainbow kitty", "water", "lumen", "comet"];
+
+    /// The page's reduce-motion preference turns the WHOLE cursor family off,
+    /// as Reduce Motion does in a window (`MotionPolicy`: amplitude exactly
+    /// 0, no comet): no glow, no body owning the caret, no momentum halo, no
+    /// caret-shape override. Before the fold only focus reached the step, so
+    /// the bodies the page gained in Phase 3 animated at full strength under
+    /// `prefers-reduced-motion`. Each style's unreduced run is the control.
+    #[test]
+    fn reduced_motion_turns_off_the_page_cursor_family() {
+        for style in BODY_STYLES {
+            let (_, lit) = typed_page(style, false);
+            assert!(lit, "{style}: control — a fast hand lights the family");
+            let (p, lit) = typed_page(style, true);
+            assert!(!lit, "{style}: reduced motion lit the cursor family");
+            assert!(
+                !p.cursor.bodies_active(),
+                "{style}: reduced motion left a body animating"
+            );
+        }
+    }
+
+    /// Hiding the page retires the block bodies, the momentum rate and the
+    /// cadence with the aurora, before any `apply`: a body left charged kept
+    /// `is_active()` true with no deadline — a request for display frames a
+    /// hidden page cannot show. The typed page before the edge is the control.
+    #[test]
+    fn hidden_visibility_retires_the_bodies_before_the_next_apply() {
+        for style in BODY_STYLES {
+            let (mut p, _) = typed_page(style, false);
+            assert!(
+                p.cursor.bodies_active(),
+                "{style}: control — the typed page has a live body"
+            );
+            p.set_effects_visibility("hidden");
+            assert!(
+                !p.cursor.bodies_active(),
+                "{style}: a hidden page kept a live body"
+            );
+            assert!(!p.is_active(), "{style}: a hidden page asked for frames");
+        }
     }
 
     /// Refocus must not fire a comet across the ground the cursor covered while

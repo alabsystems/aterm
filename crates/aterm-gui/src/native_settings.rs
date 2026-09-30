@@ -21578,8 +21578,14 @@ impl MessagesBody {
         let measure = |label: &str| {
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px) + 24.0
         };
-        // The FIRST button offered is the Primary (ruling 265): an intent
-        // whose moment passed is not offered at all, so the next one leads.
+        // The Primary is the engine's (ruling 407; the lines carry it as
+        // `primary=`): the FIRST button offered while a press can still
+        // perform it (ruling 265); past a dead one — which stays, plain and
+        // disabled (day ten, D2; ruling 401) — the first later intent a press
+        // can perform that is not a decline (ruling 403); none such, none
+        // leads. A POSITION in the offered intents, not an `ActionIndex`
+        // (ruling 408): `k`, never `action.index`.
+        let lead = aterm_messages::page::primary_index(&entry.actions);
         let mut buttons: Vec<MessagesButton> = entry
             .actions
             .iter()
@@ -21590,7 +21596,7 @@ impl MessagesBody {
                     key: format!("{key}/action/{}", action.index),
                     width: measure(&label).min(text_width),
                     label,
-                    primary: k == 0,
+                    primary: Some(k) == lead,
                     enabled: action.still_actionable,
                 }
             })
@@ -28410,15 +28416,30 @@ mod tests {
 
     /// A child that exits promptly is reported by its real exit code — the
     /// ceiling is a ceiling, not a delay.
+    ///
+    /// The ceiling HERE is a hang detector, not the product's
+    /// [`RESET_INVOCATION_CEILING`]: what is proved is that the exit code of
+    /// a child that exits comes back, and a `/usr/bin/true` that a loaded gate
+    /// takes more than that 1 s to exec and reap is killed and reads `None`
+    /// (red under a 24-way CPU load, 2026-09-29). "Not a delay" is asserted
+    /// against it: a wait that sat out its ceiling before looking would take
+    /// the whole minute.
     #[test]
     fn a_prompt_invocation_is_reported_by_its_own_exit_code() {
+        const CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
         let mut ok = exiting_child(0).spawn().expect("spawn the exit-0 child");
-        assert_eq!(wait_bounded(&mut ok, RESET_INVOCATION_CEILING), Some(0));
+        assert_eq!(wait_bounded(&mut ok, CEILING), Some(0));
 
         let mut bad = exiting_child(1).spawn().expect("spawn the exit-1 child");
-        let code = wait_bounded(&mut bad, RESET_INVOCATION_CEILING);
+        let code = wait_bounded(&mut bad, CEILING);
         assert!(matches!(code, Some(n) if n != 0), "got {code:?}");
         assert!(!ResetAttempt::from_exit_status(Folder::Desktop, code).is_reset());
+        let took = started.elapsed();
+        assert!(
+            took < CEILING / 2,
+            "two prompt children took {took:?}: the ceiling was spent as a delay"
+        );
     }
 
     /// §3.7's fence, which the design asks for and which no other file owns:
@@ -49211,6 +49232,7 @@ enabled = true
             index,
             label,
             still_actionable,
+            declines: false,
         };
         let mut entries = vec![
             entry(
@@ -50312,6 +50334,251 @@ enabled = true
                 .semantic(&UiKey::new("settings/messages/row/39/meta/0"))
                 .is_none(),
             "folded back"
+        );
+    }
+
+    /// THE PRIMARY IS THE FIRST INTENT A PRESS CAN STILL PERFORM (round 38,
+    /// day ten, D2; ruling 401). #39's `Install now` names a build no longer
+    /// staged: it stays, disabled (ruling 265: an intent that can come back),
+    /// and it was drawn in the accent beside a plain `Open Software Update`
+    /// that could be pressed — ruling 265's own complaint ("A dead `Stop
+    /// paste` drawn as the accent Primary read as the thing to do.") about
+    /// an intent it keeps. The accent, and a bare Return (`default_action`:
+    /// the first ENABLED Primary), go to the first later intent that can act
+    /// and is not a decline (ruling 403). The controls: #40's `Open log`,
+    /// pressable and first, leads as before; a card with nothing pressable
+    /// has no Primary, and Copy is never one.
+    #[test]
+    fn the_primary_is_the_first_intent_a_press_can_still_perform() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx();
+        let button = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .and_then(|node| match &node.content {
+                    UiContent::Button(control) => Some((control.style, control.state.enabled)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{key} paints a button"))
+        };
+        messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/row/39/title",
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(
+            button(&compiled, "settings/messages/row/39/action/0"),
+            (StyleRef::Secondary, false),
+            "a dead Install now is not drawn as the thing to do"
+        );
+        assert_eq!(
+            button(&compiled, "settings/messages/row/39/action/1"),
+            (StyleRef::Primary, true)
+        );
+        assert_eq!(
+            button(&compiled, "settings/messages/row/39/copy"),
+            (StyleRef::Secondary, true)
+        );
+        assert_eq!(
+            compiled
+                .default_action
+                .as_ref()
+                .map(|(key, _)| key.as_str()),
+            Some("settings/messages/row/39/action/1"),
+            "Return presses the intent that can act"
+        );
+        messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/row/40/title",
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(
+            button(&compiled, "settings/messages/row/40/action/0"),
+            (StyleRef::Primary, true),
+            "the control: a first intent that can act leads"
+        );
+        let state = sample_messages();
+        let dead = |index: u8, label: &'static str| crate::messages_host::MessageActionView {
+            index,
+            label,
+            still_actionable: false,
+            declines: false,
+        };
+        let entry = MessageView {
+            actions: vec![dead(0, "Install now"), dead(1, "Open log")],
+            ..state.entries[1].clone()
+        };
+        let body = MessagesBody::of(&entry, 560.0, 0, state.now_unix_ms);
+        assert_eq!(body.footer.iter().flatten().count(), 3, "both, and Copy");
+        assert!(
+            body.footer.iter().flatten().all(|b| !b.primary),
+            "nothing pressable leads"
+        );
+    }
+
+    /// A DECLINE IS NEVER PROMOTED TO THE PRIMARY (round 38's review,
+    /// findings 2 and 6; ruling 403). Ruling 401 moved the Primary past a
+    /// first intent a press cannot perform, and on an upgrade card whose
+    /// `Upgrade now` went dead it handed the accent, and a bare Return
+    /// (`default_action`), to `Skip version`: a decision drawn as the thing
+    /// to do, and pressed by a Return that did nothing there before. The
+    /// band never paints a decline in the accent (`Intent::is_consequential`).
+    /// Now a dead first intent hands the Primary only to a later intent that
+    /// is not a decline; with none, nothing leads and Return stays inert.
+    /// The controls: a dead `Install now` still hands it to `Open Software
+    /// Update` (ruling 401), and a first `Not today` a press can perform
+    /// keeps it (ruling 265: the reporter's order leads).
+    #[test]
+    fn a_decline_is_never_promoted_to_the_primary() {
+        use crate::messages_host::MessageActionView;
+        let act = |index: u8, label: &'static str, still_actionable: bool, declines: bool| {
+            MessageActionView {
+                index,
+                label,
+                still_actionable,
+                declines,
+            }
+        };
+        let cx = view_cx();
+        let card = |actions: Vec<MessageActionView>| {
+            let (mut runtime, instance, view) = setup();
+            let mut state = sample_messages();
+            assert_eq!(state.entries[1].id, 39);
+            state.entries[1].actions = actions;
+            assert!(runtime.replace_settings_messages(state, 7));
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: route_action(SettingsRoute::Messages),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            messages_action(
+                &mut runtime,
+                instance,
+                view,
+                "settings/messages/row/39/title",
+            );
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let styles = (0..2)
+                .map(|k| {
+                    let key = format!("settings/messages/row/39/action/{k}");
+                    compiled
+                        .paint
+                        .iter()
+                        .find(|node| node.key.as_str() == key)
+                        .and_then(|node| match &node.content {
+                            UiContent::Button(control) => {
+                                Some((control.style, control.state.enabled))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("{key} paints a button"))
+                })
+                .collect::<Vec<_>>();
+            let default = compiled
+                .default_action
+                .as_ref()
+                .map(|(key, _)| key.as_str().to_string());
+            (styles, default)
+        };
+        for decline in ["Skip version", "Not today"] {
+            assert_eq!(
+                card(vec![
+                    act(0, "Upgrade now", false, false),
+                    act(1, decline, true, true),
+                ]),
+                (
+                    vec![(StyleRef::Secondary, false), (StyleRef::Secondary, true)],
+                    None
+                ),
+                "a dead Upgrade now does not hand {decline} the accent, nor Return"
+            );
+        }
+        assert_eq!(
+            card(vec![
+                act(0, "Install now", false, false),
+                act(1, "Software Update", true, false),
+            ]),
+            (
+                vec![(StyleRef::Secondary, false), (StyleRef::Primary, true)],
+                Some("settings/messages/row/39/action/1".to_string())
+            ),
+            "the control: a navigation still leads past a dead first intent"
+        );
+        assert_eq!(
+            card(vec![
+                act(0, "Not today", true, true),
+                act(1, "Skip version", true, true),
+            ]),
+            (
+                vec![(StyleRef::Primary, true), (StyleRef::Secondary, true)],
+                Some("settings/messages/row/39/action/0".to_string())
+            ),
+            "the control: a first decline a press can perform keeps its place"
+        );
+    }
+
+    /// THE FOOTER'S PRIMARY IS A POSITION IN THE OFFERED INTENTS, NOT AN
+    /// `ActionIndex` (the round-39 review; ruling 408): the engine's
+    /// `primary_index` answers a position in `entry.actions`, while each
+    /// button's key keeps the intent's own index, and an intent whose moment
+    /// passed is not offered (ruling 265), so the offered indices can start
+    /// past 0. Every other fixture has index equal to position. Here: the
+    /// first offered intent (`action/1`) leads, and past a dead `action/1` the
+    /// pressable `action/2` does, never the dead one.
+    #[test]
+    fn the_footer_primary_is_a_position_in_the_offered_intents() {
+        use crate::messages_host::MessageActionView;
+        let act = |index: u8, label: &'static str, still_actionable: bool| MessageActionView {
+            index,
+            label,
+            still_actionable,
+            declines: false,
+        };
+        let state = sample_messages();
+        let footer = |actions: Vec<MessageActionView>| {
+            let entry = MessageView {
+                actions,
+                ..state.entries[1].clone()
+            };
+            MessagesBody::of(&entry, 560.0, 0, state.now_unix_ms)
+                .footer
+                .into_iter()
+                .flatten()
+                .map(|button| (button.key, button.primary, button.enabled))
+                .collect::<Vec<_>>()
+        };
+        let row = format!("settings/messages/row/{}", state.entries[1].id);
+        assert_eq!(
+            footer(vec![act(1, "Show tab 2", true), act(2, "Settings", true)]),
+            [
+                (format!("{row}/action/1"), true, true),
+                (format!("{row}/action/2"), false, true),
+                (format!("{row}/copy"), false, true),
+            ],
+            "the first offered intent leads, whatever its index"
+        );
+        assert_eq!(
+            footer(vec![
+                act(1, "Install now", false),
+                act(2, "Software Update", true),
+            ]),
+            [
+                (format!("{row}/action/1"), false, false),
+                (format!("{row}/action/2"), true, true),
+                (format!("{row}/copy"), false, true),
+            ],
+            "past a dead first, the pressable one leads, never the dead one"
         );
     }
 

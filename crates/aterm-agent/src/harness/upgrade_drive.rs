@@ -57,8 +57,8 @@ use aterm_types::control_verbs::ScreenGen;
 
 use super::relaunch::{
     Launch, NoPlan, Plan, PromptMark, Relaunch, RelaunchLineError, STALE_S, await_new, carry_on,
-    confirm, expired, fallback_carried, fallback_origin, fallback_record, last_permission_mode,
-    plan, relaunch, relaunch_of, screen_mode, type_relaunch_line_with, unplanned, wait_until,
+    confirm, expired, fallback_carried, fallback_origin, plan, recorded, relaunch, relaunch_of,
+    resume_mode, screen_mode, type_relaunch_line_with, unplanned, wait_until,
 };
 use super::upgrade::{self, Candidate, Facts, Phase, Request, SessionFile, Source, Step, Version};
 use super::upgrade_catalog::{self as catalog, Baked};
@@ -2381,17 +2381,12 @@ fn model_judge(
 }
 
 /// THE MODEL THAT RIDES A RESTART MADE FOR ANOTHER REASON — a relaunch on
-/// exit, the restart in place (THE MODEL LADDER wired into every restart
-/// ours makes): the model the rule moves the conversation to — the newest
-/// of its own family, else the list's ([`models::model_due`]) — when a move
-/// is DUE for this conversation (`sf`, launched with `argv`), taken now
-/// because the restart happens regardless ([`models::model_moves_now`]'s
-/// `build-restart`: the switch re-reads a history the restart re-reads
-/// anyway). `None` when
-/// nothing is due, or the move is not the harness's to make. The caller
-/// records it as asked for before the one act ([`record_asked`]). Judged
-/// against `mctx` ([`restart_models`] reads it; a test reads its own list
-/// through it).
+/// exit, the restart in place: the model the rule moves the conversation
+/// (`sf`, launched with `argv`) to ([`models::model_due`]) when a move is
+/// DUE, taken now because the restart happens regardless
+/// ([`models::model_moves_now`]'s `build-restart`). `None` when nothing is
+/// due, or the move is not the harness's to make. Judged against `mctx`; the
+/// caller records it as asked for before the one act ([`record_asked`]).
 pub(super) fn riding_model_in(
     opts: &Opts,
     sf: &SessionFile,
@@ -2399,28 +2394,29 @@ pub(super) fn riding_model_in(
     mctx: &ModelCtx,
 ) -> Option<String> {
     let launch = upgrade::launch_model(argv);
-    // A restart is rare: read which build this session runs, so a native
-    // session is judged by the native build's own catalog — off the process,
-    // else (it has exited: the relaunch on exit) the program it ran,
-    // `argv[0]`, which is what that relaunch runs again.
-    let native = exe_of(sf.pid)
-        .or_else(|| argv.first().map(PathBuf::from))
-        .is_some_and(|e| e.starts_with(native_root(&opts.home)));
+    // A native session is judged by the native build's own catalog.
+    let native = runs_native(opts, Some(sf.pid), argv);
     let mread = model_read_for(opts, sf, launch.as_deref(), mctx, native);
     models::model_to(None, &mread.verdict, mread.cold, true, mread.due_for_s)
 }
 
-/// THE MODELS A RESTART MADE FOR ANOTHER REASON CARRIES — a memory
-/// banner's restart in place, an exit's relaunch — of the conversation
-/// `session`, launched with `argv`: the model riding it ([`riding_model_in`];
-/// only when `ride`, and only off the live record `sf`), and the model a
-/// person chose by hand with `/model` ([`hand_model_in`]), which the line asks
-/// for when nothing rides it. The process's start is the record's, else
-/// `start` — its kernel start as `ps` renders it ([`kernel_start`]), what the
-/// host kept of an agent whose record is gone: with none, a `/model` of a
-/// process before it read as this one's. One read of the catalog for both,
-/// and none when neither can be asked (nothing rides and the launch named no
-/// model).
+/// Whether the build the process `pid` runs is a native one — read off the
+/// process, else (it has exited: the relaunch on exit) off the program it
+/// ran, `argv[0]`, which is what that relaunch runs again.
+fn runs_native(opts: &Opts, pid: Option<u32>, argv: &[String]) -> bool {
+    pid.and_then(exe_of)
+        .or_else(|| argv.first().map(PathBuf::from))
+        .is_some_and(|e| e.starts_with(native_root(&opts.home)))
+}
+
+/// THE MODELS A RESTART MADE FOR ANOTHER REASON CARRIES — a memory banner's
+/// restart in place, an exit's relaunch — of `session`, launched with
+/// `argv`: the model riding it ([`riding_model_in`]; only when `ride`, and
+/// only off the live record `sf`), and the `/model` a person chose by hand
+/// ([`hand_model_in`]), asked for when nothing rides. The process started at
+/// the record's start, else at `start` (its `ps` start, [`kernel_start`]:
+/// with none, a `/model` of a process before it read as this one's). One
+/// read of the catalog for both, and none when neither can be asked.
 pub(super) fn restart_models(
     opts: &Opts,
     sf: Option<&SessionFile>,
@@ -2437,10 +2433,7 @@ pub(super) fn restart_models(
     let riding = sf
         .filter(|_| ride)
         .and_then(|sf| riding_model_in(opts, sf, argv, &mctx));
-    let native = sf
-        .and_then(|sf| exe_of(sf.pid))
-        .or_else(|| argv.first().map(PathBuf::from))
-        .is_some_and(|e| e.starts_with(native_root(&opts.home)));
+    let native = runs_native(opts, sf.map(|sf| sf.pid), argv);
     let started = sf
         .and_then(|sf| models::parse_lstart(&sf.proc_start))
         .or_else(|| models::parse_lstart(start));
@@ -2448,14 +2441,12 @@ pub(super) fn restart_models(
     (riding, hand)
 }
 
-/// THE MODEL A PERSON CHOSE BY HAND for the conversation `session`, launched
-/// with `argv` by a process started at `started_s` ([`models::hand_model`]):
-/// what it runs now off its transcript's tail ([`models::live_model_at`], a
-/// `/model` display — and a launch alias — read through the catalog of the
-/// build it runs, `native`), against the `/model` choice its record
-/// remembers. `None` when
-/// the launch named no model — Claude's `/model` then saved the choice as the
-/// default the relaunch starts on — or nobody chose one by hand.
+/// THE MODEL A PERSON CHOSE BY HAND for `session`, launched with `argv` by a
+/// process started at `started_s` ([`models::hand_model`]), read through the
+/// catalog of the build it runs (`native`) against the `/model` choice its
+/// record remembers. `None` when the launch named no model — Claude's
+/// `/model` then saved the choice as the default the relaunch starts on — or
+/// nobody chose one by hand.
 pub(super) fn hand_model_in(
     opts: &Opts,
     session: &str,
@@ -2734,8 +2725,12 @@ pub(super) struct Unsent {
     markers: Vec<String>,
     /// [`St::fallback_from`] as it stood: a restart that carries a hand
     /// choice makes that the origin ([`restart`]), and one never sent did not.
-    fallback_from: String,
+    fallback_from: Option<String>,
 }
+
+/// [`St::fallback_from`] on disk for a fallback whose launch named no model.
+/// Never a model id.
+const FALLBACK_NO_MODEL: &str = "-";
 
 /// What the sweep remembers about one conversation's upgrade. Everything a
 /// relaunch needs is written here BEFORE the agent is signalled, so a sweep that
@@ -2820,19 +2815,16 @@ pub(super) struct St {
     /// the launch's own `--model` (or names none): what the outcome says
     /// decided the model after.
     pub(super) model_list: String,
-    /// The model the launch named before a bucket's fallback relaunch
-    /// replaced it (empty: no fallback stands;
-    /// [`super::relaunch::FALLBACK_NO_MODEL`]: one stands and the launch
-    /// named none) — what the way back at the bucket's reset returns to
-    /// ([`super::relaunch::fallback_origin`]). Set by the fallback's restart,
-    /// carried over every restart made for another reason while the
-    /// fallback runs (a memory banner, an exit, the upgrade's record) — made
-    /// the model a person chose by hand since, where that restart carries
-    /// one, which the way back would otherwise undo — and cleared by the way
-    /// back: the fallback's own
-    /// record was the only one that kept it, and a memory restart saved over
-    /// it left the way back nothing to return to.
-    pub(super) fallback_from: String,
+    /// THE FALLBACK ORIGIN: the model the launch named before a bucket's
+    /// fallback relaunch replaced it — `None`: no fallback stands; `Some("")`:
+    /// one stands and the launch named none — what the way back at the
+    /// bucket's reset returns to ([`super::relaunch::fallback_origin`]). Set
+    /// by the fallback's restart, carried over every restart made for another
+    /// reason while it stands (a memory banner, an exit, the upgrade's record;
+    /// replaced by a hand choice that restart carries, which the way back
+    /// would otherwise undo), and cleared by the way back. Kept on disk as
+    /// empty, [`FALLBACK_NO_MODEL`], or the model.
+    pub(super) fallback_from: Option<String>,
     /// Set once the continuation is typed while the resumed session's first
     /// answer is still to be read ([`super::relaunch::confirm`]): the second (since the epoch)
     /// past which a sweep that still finds none records the model as
@@ -3247,7 +3239,7 @@ impl St {
             Some(mut old) if matches!(old.phase, Phase::Pending | Phase::Announced { .. }) => {
                 old.owe_release("retargeted");
                 let pending_since = old.behind_since();
-                let fallback_from = fallback_record(fallback_origin(Some(&old)).as_deref());
+                let fallback_from = fallback_origin(&old);
                 let (request, request_tab, request_at) = match old.request {
                     Request::Skip(_) => (Request::None, String::new(), 0),
                     kept => (kept, old.request_tab, old.request_at),
@@ -3291,7 +3283,7 @@ impl St {
                     && Version::parse(&old.from).as_ref() == Some(from) =>
             {
                 let pending_since = old.behind_since();
-                let fallback_from = fallback_record(fallback_origin(Some(&old)).as_deref());
+                let fallback_from = fallback_origin(&old);
                 let (request, request_tab, request_at) = match old.request {
                     Request::Skip(_) => (Request::None, String::new(), 0),
                     kept => (kept, old.request_tab, old.request_at),
@@ -3313,7 +3305,7 @@ impl St {
                 }
             }
             Some(old) => St {
-                fallback_from: fallback_record(fallback_origin(Some(&old)).as_deref()),
+                fallback_from: fallback_origin(&old),
                 release: old.release,
                 asked: old.asked,
                 tab: old.tab,
@@ -3548,7 +3540,14 @@ impl St {
             ("model_before", &self.model_before),
             ("launch_model", &self.launch_model),
             ("model_list", &self.model_list),
-            ("fallback_from", &self.fallback_from),
+            (
+                "fallback_from",
+                match self.fallback_from.as_deref() {
+                    None => "",
+                    Some("") => FALLBACK_NO_MODEL,
+                    Some(m) => m,
+                },
+            ),
             ("resumed_on", &self.resumed_on),
             ("wait", &self.wait),
             ("request", &self.request.word()),
@@ -3688,7 +3687,11 @@ impl St {
             mark: n("mark"),
             launch_model: s("launch_model"),
             model_list: s("model_list"),
-            fallback_from: s("fallback_from"),
+            fallback_from: match s("fallback_from") {
+                m if m.is_empty() => None,
+                m if m == FALLBACK_NO_MODEL => Some(String::new()),
+                m => Some(m),
+            },
             confirm_by: n("confirm_by"),
             resumed_on: s("resumed_on"),
             resumed_pid: small("resumed_pid"),
@@ -3929,7 +3932,7 @@ impl St {
         self.noted.clear();
         // A fallback's own record an older build wrote kept its origin in
         // its cause alone: kept past the cause.
-        self.fallback_from = fallback_record(fallback_origin(Some(self)).as_deref());
+        self.fallback_from = fallback_origin(self);
         self.cause.clear();
         self.hold_since_s = 0;
         self.hold_seen_s = 0;
@@ -6671,11 +6674,9 @@ fn visit_models(
             if let Err(why) = require_unique_owner(&opts.home, sf) {
                 return said(r, format!("wait:{why}"));
             }
-            // The mode the look's pill showed — the live one, which Claude
-            // writes to its transcript only when it re-appends its metadata —
-            // else the transcript's. No read of its own: the upgrade's
-            // exchanges with the host are fenced and counted.
-            let mode = resumed_mode(opts, &sf.session_id, shown_mode.as_deref());
+            // The look's pill: no read of its own, the upgrade's exchanges
+            // with the host are fenced and counted.
+            let mode = resume_mode(opts, &sf.session_id, shown_mode.clone());
             let model = model_to.clone().or_else(hand_model);
             let planned = proven.map_or(Err(NoPlan::Wait("ids")), |shell| {
                 plan(
@@ -7881,21 +7882,6 @@ fn announce(
     }
 }
 
-/// The permission mode the upgrade's relaunch resumes `session` in: the mode
-/// the visit's look read off the tab's pill (`shown`, [`screen_mode`]) — the
-/// live one, exactly the person's choice — else the transcript's newest
-/// `permission-mode` row ([`last_permission_mode`]). Claude writes that row
-/// only when it re-appends its session metadata (about every 32 KiB of
-/// transcript, a compaction, a resume, its exit), so a mode chosen at idle —
-/// a session launched in bypass and left in auto, plan left for auto — is on
-/// the screen long before it is in the file, and a relaunch on the file's
-/// alone brought it back in the mode the person had left.
-fn resumed_mode(opts: &Opts, session: &str, shown: Option<&str>) -> Option<String> {
-    shown
-        .map(str::to_owned)
-        .or_else(|| last_permission_mode(&opts.home, session))
-}
-
 /// What the upgrade's relaunch line is made from: the live session's
 /// conversation and directory, its argv, the target build, the model the
 /// conversation moves to, if any, the permission mode it last ran in, and
@@ -8191,11 +8177,9 @@ fn restart(
     };
     // The model the list moves it to, else a model a person chose by hand
     // since the launch: its `--model` would undo that `/model`.
-    let model = (!st.model_list.is_empty())
-        .then(|| st.model_list.clone())
-        .or_else(|| hand_model.map(str::to_owned));
-    let mode = resumed_mode(opts, &sf.session_id, shown_mode);
-    let launch = launch_of(sf, argv, target, model.as_deref(), mode.as_deref(), !fresh);
+    let model = recorded(&st.model_list).or(hand_model);
+    let mode = resume_mode(opts, &sf.session_id, shown_mode.map(str::to_owned));
+    let launch = launch_of(sf, argv, target, model, mode.as_deref(), !fresh);
     let Plan { shell, line, .. } = match plan(opts, &launch, proven, t) {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, st, no),
@@ -8246,16 +8230,10 @@ fn restart(
         if fresh {
             super::relaunch::CAUSE_UPGRADE_FRESH.clone_into(&mut st.cause);
         }
-        // A fallback standing whose relaunch carries a model a person chose
-        // by hand since: that `/model` is what the person has now, and the
-        // way back at the bucket's reset returns to it, never undoes it
-        // ([`fallback_carried`]). Put back with the rest if the signal is
-        // never sent.
-        st.fallback_from = fallback_carried(
-            fallback_origin(Some(st)).as_deref(),
-            (!st.model_list.is_empty()).then_some(st.model_list.as_str()),
-            hand_model,
-        );
+        // The fallback origin this restart carries ([`fallback_carried`]):
+        // put back with the rest if the signal is never sent.
+        st.fallback_from =
+            fallback_carried(fallback_origin(st), recorded(&st.model_list), hand_model);
         save(opts, &sf.session_id, st);
         // A second owner, a job-control change, or a moved terminal during
         // the state write must veto the signal. Re-read the current session

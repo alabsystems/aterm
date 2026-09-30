@@ -148,11 +148,17 @@ struct Supervisor {
     armed: Option<Vec<String>>,
     /// The command the instance was launched with, if any.
     configured: Option<Vec<String>>,
+    /// The argv a SEAMLESS UPDATE's outgoing process was armed with by `fabric
+    /// attach` (round seven of the update audit, finding 7), put here by the
+    /// successor's intake ([`carry_attached`]) and taken by [`spawn_supervisor`]
+    /// when no `[fabric] command` is configured.
+    carried: Option<Vec<String>>,
 }
 
 static SUPERVISOR: Mutex<Supervisor> = Mutex::new(Supervisor {
     armed: None,
     configured: None,
+    carried: None,
 });
 
 fn supervisor() -> std::sync::MutexGuard<'static, Supervisor> {
@@ -208,9 +214,29 @@ pub(crate) fn status() -> SupervisorStatus {
 /// bare `attach` answers `ERR fabric no command` from.
 pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
     let configured = configured_command(config);
-    supervisor().configured = configured.clone();
-    let Some(argv) = configured else {
-        return false;
+    let carried = {
+        let mut g = supervisor();
+        g.configured = configured.clone();
+        g.carried.take()
+    };
+    // A BRIDGE ARMED AT RUNTIME COMES BACK AFTER AN UPDATE (round seven of the
+    // update audit, finding 7): with no command configured, the argv the
+    // outgoing process was attached to (`fabric attach`) is armed here, as that
+    // process would have been by its own attach. Before this carry the
+    // successor came up `fabric=absent`, mail stopped, and every carried
+    // `origin=fleet` hold — which only a reconnecting bridge lifts — stood for
+    // good, with nothing said. The configured command, when there is one, is
+    // still the instance's.
+    let argv = match (configured, carried) {
+        (Some(argv), _) => argv,
+        (None, Some(argv)) => {
+            aterm_log::info!(
+                "fabric bridge supervisor: re-arming the command the outgoing process was \
+                 attached to (`fabric attach`) across the update"
+            );
+            argv
+        }
+        (None, None) => return false,
     };
     match arm(argv) {
         Ok(()) => true,
@@ -347,6 +373,29 @@ pub(crate) fn reset_for_tests() {
     let mut g = supervisor();
     g.armed = None;
     g.configured = None;
+    g.carried = None;
+}
+
+/// What a seamless update's manifest carries of the supervisor
+/// ([`crate::session_store::SessionHandoff::fabric_attached`]): the armed argv
+/// when `fabric attach` armed it — it differs from the configured command, or
+/// none was configured — and nothing when the configuration armed it (the
+/// successor reads the same configuration) or nothing is armed.
+pub(crate) fn handoff_attached() -> Vec<String> {
+    let g = supervisor();
+    match &g.armed {
+        Some(argv) if g.configured.as_ref() != Some(argv) => argv.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The successor's intake of [`handoff_attached`]: kept for
+/// [`spawn_supervisor`], which arms it when no command is configured. An empty
+/// argv is nothing.
+pub(crate) fn carry_attached(argv: Vec<String>) {
+    if !argv.is_empty() {
+        supervisor().carried = Some(argv);
+    }
 }
 
 /// Launch, wait, back off, launch again — forever, because the fabric is a
@@ -928,6 +977,63 @@ mod tests {
                 assert_eq!(s.configured, Some(want.clone()));
                 assert_eq!(s.armed, Some(want));
                 assert!(crate::fabric::bridge_supervised());
+            });
+        });
+    }
+
+    /// ROUND SEVEN OF THE UPDATE AUDIT, FINDING 7: a bridge armed at runtime
+    /// with `fabric attach` rides the handoff manifest and is armed again by the
+    /// successor, which has no command configured — before the carry it came up
+    /// `fabric=absent` with its carried fleet holds unliftable. NEGATIVE
+    /// CONTROLS: a bridge the CONFIGURATION armed is not carried (the successor
+    /// reads the same configuration), and a configured command wins over a
+    /// carried one.
+    ///
+    /// FAILS WITHOUT THE FIX: the manifest has no field and the successor's
+    /// `status().armed` is `None`.
+    #[test]
+    fn a_runtime_attached_bridge_is_armed_again_after_an_update() {
+        use crate::session_store::{SessionHandoff, SessionStore};
+        crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
+            let argv = vec![true_program(), "serve".to_string(), "--fleet".to_string()];
+            // The producer: launched with no command, then `fabric attach`.
+            let wire = crate::fabric::with_link_reset(|| {
+                assert!(!spawn_supervisor(&Config::default()));
+                arm(argv.clone()).expect("the attach arms");
+                assert_eq!(handoff_attached(), argv);
+                let manifest = SessionHandoff::from_store(&SessionStore::default());
+                assert_eq!(manifest.fabric_attached, argv);
+                manifest.to_toml().expect("serializes")
+            });
+            // The successor: its intake keeps the argv, its control server's
+            // supervisor start arms it.
+            crate::fabric::with_link_reset(|| {
+                let read = SessionHandoff::from_toml(&wire).expect("the successor reads it");
+                carry_attached(read.fabric_attached);
+                assert!(spawn_supervisor(&Config::default()));
+                let s = status();
+                assert_eq!(s.armed, Some(argv.clone()), "the attached bridge is back");
+                assert_eq!(s.configured, None);
+                assert!(crate::fabric::bridge_supervised());
+                // …and it rides the next handoff too.
+                assert_eq!(handoff_attached(), argv);
+            });
+            // A configured bridge is the configuration's: nothing is carried.
+            crate::fabric::with_link_reset(|| {
+                let program = true_program();
+                assert!(spawn_supervisor(&with_command(Some(&format!(
+                    "{program} serve"
+                )))));
+                assert!(handoff_attached().is_empty());
+            });
+            // A configured command wins over a carried one.
+            crate::fabric::with_link_reset(|| {
+                carry_attached(vec!["/nonexistent/carried".to_string()]);
+                let program = true_program();
+                assert!(spawn_supervisor(&with_command(Some(&format!(
+                    "{program} serve"
+                )))));
+                assert_eq!(status().armed, Some(vec![program, "serve".to_string()]));
             });
         });
     }

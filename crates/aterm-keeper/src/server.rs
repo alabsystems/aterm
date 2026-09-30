@@ -65,6 +65,9 @@ pub struct ServeConfig {
 struct Conn {
     stream: CtlStream,
     pid: u32,
+    /// A frame to this peer could not be written ([`Server::send`]): nothing
+    /// more is written to it, and its frames are still read through its EOF.
+    unwritable: bool,
 }
 
 /// The server. [`Server::run`] is the keeper; [`Server::step`] is one turn of
@@ -88,11 +91,18 @@ pub struct Server {
     /// Frames read after their writer's exit had already arrived, before the
     /// exit was recorded ([`Server::drain_pid`]).
     frames_behind_exit: u64,
+    /// Frames the keeper could not write to their peer ([`Server::send`]).
+    replies_lost: u64,
+    /// A TEST SEAM (unit tests only): the next OFFER's duplicate fails as
+    /// `EMFILE` would.
+    #[cfg(test)]
+    test_fail_next_dup: bool,
 }
 
 /// A per-connection receive/send budget: once a frame's header has arrived,
-/// the rest must follow within this, or the connection is dropped (one slow
-/// peer cannot stall the loop).
+/// the rest must follow within this, or the connection is dropped; a frame the
+/// peer does not take within it is the last one written to it
+/// ([`Server::send`]). One slow peer cannot stall the loop.
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// The loop's clock tick when nothing is readable.
 const TICK_MS: i32 = 250;
@@ -111,7 +121,10 @@ impl KeeperEnv for Env<'_> {
     fn holders(&mut self, rdev: Rdev) -> Holders {
         match aterm_uds::holders::scan_rdev_holders(rdev, &[self.own_pid]) {
             Ok(scan) if !scan.holders.is_empty() => Holders::Held(scan.holders),
-            // A peer of ours whose table could not be read may hold it.
+            // A peer of ours whose table could not be read may hold it. A
+            // peer that has died is not one of them, judged or not: the scan
+            // reads an exited process as holding nothing (`ESRCH`: the kernel
+            // closed its descriptors at the exit).
             Ok(scan) if scan.unreadable.iter().any(|p| self.peer_pids.contains(p)) => {
                 Holders::Unknown
             }
@@ -232,6 +245,9 @@ impl Server {
             own_pid: std::process::id(),
             refused_dials: 0,
             frames_behind_exit: 0,
+            replies_lost: 0,
+            #[cfg(test)]
+            test_fail_next_dup: false,
         })
     }
 
@@ -353,7 +369,14 @@ impl Server {
             {
                 self.watches.insert(pid, w);
             }
-            self.conns.insert(id, Conn { stream, pid });
+            self.conns.insert(
+                id,
+                Conn {
+                    stream,
+                    pid,
+                    unwritable: false,
+                },
+            );
         }
     }
 
@@ -570,9 +593,15 @@ impl Server {
                         .get(&rdev)
                         .map(|f| f.as_fd().try_clone_to_owned())
                     {
+                        #[cfg(test)]
+                        let fd = if std::mem::take(&mut self.test_fail_next_dup) {
+                            Err(io::Error::from_raw_os_error(24))
+                        } else {
+                            fd
+                        };
                         match fd {
                             Ok(fd) => self.send(conn, &frame, Some(&fd)),
-                            Err(_) => self.send_raw_fail(conn),
+                            Err(_) => self.end_writing(conn),
                         }
                     }
                 }
@@ -586,20 +615,43 @@ impl Server {
         }
     }
 
-    fn send_raw_fail(&mut self, conn: ConnId) {
-        // A duplicate could not be made (EMFILE): the recipient cannot be told
-        // the truth frame by frame, so its connection ends and the offer
-        // returns to Orphaned with its death.
-        self.drop_conn(conn);
-    }
-
+    /// Write one frame to `conn`. A write that fails — the peer has died or
+    /// closed its end, or took nothing for [`IO_TIMEOUT`] — ends the keeper's
+    /// WRITING to that connection, never its READING: what the peer wrote
+    /// before is still read, in order, through its EOF (§5.3 step 4). A dead
+    /// peer's frames are read after its death (`drain_pid`), so the answer to
+    /// one of them — the WELCOME for a HELLO or an ADOPT — cannot be written,
+    /// and dropping the connection then lost every frame behind it: a claim,
+    /// the BYE. The write half is shut, so a live peer reads EOF and
+    /// reconnects; a gone peer's EOF follows its last frame, and that EOF is
+    /// what drops the connection.
     fn send(&mut self, conn: ConnId, frame: &Frame, fd: Option<&OwnedFd>) {
         let Some(c) = self.conns.get(&conn) else {
             return;
         };
-        if write_frame(&c.stream, frame, fd.map(|f| f.as_fd())).is_err() {
-            self.drop_conn(conn);
+        if c.unwritable || write_frame(&c.stream, frame, fd.map(|f| f.as_fd())).is_err() {
+            self.end_writing(conn);
         }
+    }
+
+    /// One frame for `conn` was not written: a write failed ([`Self::send`]),
+    /// or an OFFER's duplicate of the custody copy could not be made
+    /// (`EMFILE`), so its frame cannot tell the recipient the truth. Either
+    /// way the WRITING to `conn` ends — its write half is shut, so a live peer
+    /// reads EOF and reconnects — and its READING goes on through its EOF:
+    /// dropping the connection here lost every frame the peer wrote behind
+    /// the one being answered (a claim, the BYE). An offer not written stays
+    /// Offered to `conn` until the core judges its end, and returns to
+    /// Orphaned then.
+    fn end_writing(&mut self, conn: ConnId) {
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        if !c.unwritable {
+            c.unwritable = true;
+            let _ = c.stream.shutdown(std::net::Shutdown::Write);
+        }
+        self.replies_lost += 1;
     }
 
     fn relaunch_now(&mut self) {
@@ -635,6 +687,7 @@ impl Server {
             format!("custody_copies={}", self.custody.len()),
             format!("refused_dials={}", self.refused_dials),
             format!("frames_behind_exit={}", self.frames_behind_exit),
+            format!("replies_lost={}", self.replies_lost),
         ];
         lines.extend(self.core.status_lines());
         let mut text = lines.join("\n");
@@ -663,7 +716,7 @@ impl Drop for Server {
 
 /// Create `dir` if missing (0700) and require it to be a real directory of
 /// ours that no one else can write.
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     match std::fs::symlink_metadata(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -696,4 +749,352 @@ fn prove_socket_is_ours(dir: &Path, path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tests {
+    use super::*;
+    use crate::core::RecordState;
+    use crate::wire::{CAP_SENDS_BYE, PeerClass};
+
+    /// A WRITE THAT FAILS ENDS THE WRITING, NEVER THE READING. A peer that
+    /// wrote HELLO, a claim and BYE and then closed its end before the keeper
+    /// read any of them: the WELCOME for the HELLO cannot be written, and the
+    /// claim and the BYE behind it are still read. Its EOF then drops the
+    /// connection — none is kept for a peer that is gone. (The peer is this
+    /// test process, alive, so its end is an EOF and not a death: the claim
+    /// stays, with the BYE recorded.)
+    #[test]
+    fn a_failed_write_ends_the_writing_never_the_reading() {
+        let dir = std::env::temp_dir().join(format!("akk-unit-{}-unwritable", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Server::bind(ServeConfig {
+            socket: dir.join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+        let client = CtlStream::connect(server.socket()).expect("connect");
+        // The accept (the kernel names the peer only while it is connected).
+        server.step(0).expect("turn");
+        assert_eq!(server.conns.len(), 1, "accepted");
+        let null = std::fs::File::open("/dev/null").expect("a character device");
+        let rdev = null.metadata().expect("stat").rdev();
+        let me = std::process::id();
+        let frames = [
+            Frame::Hello {
+                proto: PROTO,
+                class: PeerClass::App,
+                caps: CAP_SENDS_BYE,
+                build: "test".into(),
+                marker: None,
+            },
+            Frame::Register {
+                header: MasterHeader {
+                    rdev,
+                    shell_pid: me,
+                    shell_birth: born(me).expect("our birth"),
+                    local_id: 1,
+                },
+                tag: b"sid=s-unit".to_vec(),
+            },
+            Frame::Bye,
+        ];
+        for frame in &frames {
+            let fd = matches!(frame, Frame::Register { .. }).then(|| null.as_fd());
+            write_frame(&client, frame, fd).expect("write");
+        }
+        drop(client);
+        // The peer's end is closed only when every copy of it is: a child a
+        // sibling test thread has forked and not yet exec'd holds one for a
+        // while, and a write still succeeds until then (measured 2026-09-29,
+        // a flake under load). Wait for the kernel's hang-up, not the drop.
+        let fd = server
+            .conns
+            .values()
+            .next()
+            .expect("the connection")
+            .stream
+            .as_raw_fd();
+        let started = Instant::now();
+        loop {
+            let mut pfd = [PollFd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            }];
+            let _ = sys::poll(&mut pfd, 0);
+            if pfd[0].revents & POLLHUP != 0 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(60), "never hung up");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // One frame per connection per turn: HELLO, REGISTER, BYE, then EOF.
+        for _ in 0..4 {
+            server.step(0).expect("turn");
+        }
+        assert_eq!(server.replies_lost, 1, "the WELCOME was not written");
+        let (conn, peer) = server
+            .core()
+            .peers()
+            .iter()
+            .next()
+            .expect("the peer, alive, is remembered");
+        assert!(peer.bye, "the BYE behind the unwritable WELCOME was read");
+        let rec = server
+            .core()
+            .records()
+            .get(&rdev)
+            .expect("the claim behind it was read");
+        assert_eq!(rec.claimants, vec![*conn]);
+        assert!(server.holds(rdev), "and its descriptor kept");
+        assert!(server.conns.is_empty(), "the EOF dropped the connection");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh PTY master (a device no other process holds) and its rdev.
+    /// Opened close-on-exec (std's `open` always is): a child a sibling test
+    /// spawns must not inherit it, or that child holds it for its life and
+    /// the keeper rightly offers it to no one.
+    fn a_pty_master() -> (OwnedFd, Rdev) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const O_NOCTTY: i32 = 0x20000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOCTTY)
+            .open("/dev/ptmx")
+            .expect("a fresh PTY master");
+        let rdev = file.metadata().expect("fstat").rdev();
+        (OwnedFd::from(file), rdev)
+    }
+
+    fn hello_app() -> Frame {
+        Frame::Hello {
+            proto: PROTO,
+            class: PeerClass::App,
+            caps: CAP_SENDS_BYE,
+            build: "test".into(),
+            marker: None,
+        }
+    }
+
+    fn claim(rdev: Rdev, local_id: u64) -> Frame {
+        let me = std::process::id();
+        Frame::Register {
+            header: MasterHeader {
+                rdev,
+                shell_pid: me,
+                shell_birth: born(me).expect("our birth"),
+                local_id,
+            },
+            tag: b"sid=s-unit".to_vec(),
+        }
+    }
+
+    /// Turn until the one connection's EOF drops it. The peer's end is closed
+    /// only when every copy of it is: a child a sibling test thread has
+    /// forked and not yet exec'd holds one for a while.
+    fn until_its_eof(server: &mut Server) {
+        let started = Instant::now();
+        while !server.conns.is_empty() {
+            assert!(started.elapsed() < HANG, "no EOF");
+            server.step(10).expect("turn");
+        }
+    }
+
+    const HANG: Duration = Duration::from_secs(60);
+
+    /// What the second window of [`offer_to_a_second_window`] saw and left.
+    struct OfferSeen {
+        /// The frames it read, in order, up to the keeper's EOF (or the second
+        /// frame after the WELCOME), with each OFFER's descriptor's rdev.
+        read: Vec<(Frame, Option<Rdev>)>,
+        /// The master window A left orphaned.
+        orphan_rdev: Rdev,
+        bye_read: bool,
+        claim_read: bool,
+        /// The orphan is Orphaned again after B's EOF: an offer is made to a
+        /// connection, and returns when that connection is gone (round-seven
+        /// update audit, finding 65).
+        returned_at_eof: bool,
+        replies_lost: u64,
+        dropped_at_eof: bool,
+    }
+
+    /// Window A claims a master and crashes; window B says HELLO — offered
+    /// A's master — then claims its own and says BYE, all written before the
+    /// keeper reads any of it. `fail_dup` makes the OFFER's duplicate fail.
+    fn offer_to_a_second_window(fail_dup: bool) -> OfferSeen {
+        let me = std::process::id();
+        let dir =
+            std::env::temp_dir().join(format!("akk-unit-{me}-undupable-{}", u8::from(fail_dup)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Server::bind(ServeConfig {
+            socket: dir.join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+
+        // Window A: HELLO and a claim, then its EOF (one frame per turn).
+        let (orphan, orphan_rdev) = a_pty_master();
+        let a = CtlStream::connect(server.socket()).expect("connect A");
+        server.step(0).expect("accept A");
+        write_frame(&a, &hello_app(), None).expect("hello A");
+        write_frame(&a, &claim(orphan_rdev, 1), Some(orphan.as_fd())).expect("claim A");
+        for _ in 0..2 {
+            server.step(0).expect("turn");
+        }
+        drop(a);
+        until_its_eof(&mut server);
+        // A's exit as its watch reports it: killed (SIGKILL). The peer is this
+        // process, which does not exit, so the watch's report is handed to
+        // the core the way `read_watch` hands it.
+        let now = server.now();
+        let mut env = server.env();
+        let outs = server.core.peer_exit(me, 9, now, &mut env);
+        server.apply(outs);
+        // A crashed: its master is an orphan. (A sibling test's child, between
+        // its fork and its exec, holds every descriptor of this process for a
+        // moment; seen by the death's holder scan it makes the death a
+        // handoff, and the hold's rescan orphans the master once it is gone.)
+        let started = Instant::now();
+        while server.core().records()[&orphan_rdev].state != RecordState::Orphaned {
+            assert!(started.elapsed() < HANG, "A's master never orphaned");
+            server.step(10).expect("turn");
+        }
+
+        // Window B: HELLO, its own claim, BYE — all written before any read.
+        // The same moment's holder, seen by the offer's scan, leaves the orphan
+        // unoffered: such a window is void, and the next one tries again.
+        let started = Instant::now();
+        let (b, b_id, own_rdev) = loop {
+            assert!(started.elapsed() < HANG, "the orphan was never offered");
+            let b = CtlStream::connect(server.socket()).expect("connect B");
+            b.set_read_timeout(Some(HANG)).expect("B's hang detector");
+            server.step(0).expect("accept B");
+            let b_id = *server.conns.keys().next_back().expect("B accepted");
+            let (own, own_rdev) = a_pty_master();
+            write_frame(&b, &hello_app(), None).expect("hello B");
+            write_frame(&b, &claim(own_rdev, 1), Some(own.as_fd())).expect("claim B");
+            write_frame(&b, &Frame::Bye, None).expect("bye B");
+            server.test_fail_next_dup = fail_dup;
+            // HELLO (answered: WELCOME, OFFER), REGISTER, BYE.
+            for _ in 0..3 {
+                server.step(0).expect("turn");
+            }
+            let offered = server
+                .core()
+                .records()
+                .get(&orphan_rdev)
+                .is_some_and(|r| r.state == RecordState::Offered { to: b_id });
+            if offered {
+                break (b, b_id, own_rdev);
+            }
+            server.test_fail_next_dup = false;
+            drop(b);
+            until_its_eof(&mut server);
+        };
+        assert!(!server.test_fail_next_dup, "the OFFER's duplicate was made");
+        let mut read = Vec::new();
+        while read.len() < 2 {
+            match read_frame(&b).expect("B reads") {
+                Some(Incoming { frame, fd }) => {
+                    let rdev =
+                        fd.map(|fd| std::fs::File::from(fd).metadata().expect("fstat").rdev());
+                    read.push((frame, rdev));
+                }
+                None => break,
+            }
+        }
+        let peer = server.core().peers().get(&b_id);
+        let seen = OfferSeen {
+            read,
+            orphan_rdev,
+            bye_read: peer.is_some_and(|p| p.bye),
+            claim_read: server
+                .core()
+                .records()
+                .get(&own_rdev)
+                .is_some_and(|r| r.claimants == vec![b_id]),
+            returned_at_eof: false,
+            replies_lost: server.replies_lost,
+            dropped_at_eof: false,
+        };
+        let open_before_eof = server.conns.contains_key(&b_id);
+        drop(b);
+        until_its_eof(&mut server);
+        let seen = OfferSeen {
+            dropped_at_eof: open_before_eof,
+            returned_at_eof: server
+                .core()
+                .records()
+                .get(&orphan_rdev)
+                .is_some_and(|r| r.state == RecordState::Orphaned),
+            ..seen
+        };
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+        seen
+    }
+
+    /// AN OFFER THAT CANNOT BE DUPLICATED ENDS THE WRITING, NEVER THE READING.
+    /// The keeper cannot make the descriptor an OFFER carries (`EMFILE`): its
+    /// recipient reads the WELCOME and then EOF, and the frames it wrote
+    /// behind the HELLO being answered — its claim, its BYE — are still read;
+    /// the connection is dropped at its EOF, not before, and the offer
+    /// returns to Orphaned at that EOF (finding 65: nothing registers on a
+    /// connection that is gone). Dropping the connection at the
+    /// failed duplicate lost the claim and the BYE: a quit then reads as a
+    /// crash, its shells kept.
+    /// NEGATIVE CONTROL: the same run with the duplicate made delivers the
+    /// OFFER, carrying the orphan's master, after the WELCOME.
+    #[test]
+    fn an_offer_that_cannot_be_duplicated_ends_the_writing_never_the_reading() {
+        let failed = offer_to_a_second_window(true);
+        assert!(
+            failed.claim_read,
+            "the claim behind the unwritten OFFER was read"
+        );
+        assert!(
+            failed.bye_read,
+            "the BYE behind the unwritten OFFER was read"
+        );
+        assert!(failed.dropped_at_eof, "the connection lived until its EOF");
+        assert!(
+            failed.returned_at_eof,
+            "the offer returns to Orphaned at B's EOF, never left with a dead link"
+        );
+        assert_eq!(failed.replies_lost, 1, "the OFFER was not written");
+        assert!(
+            matches!(
+                failed.read.as_slice(),
+                [(Frame::Welcome { offers: 1, .. }, None)]
+            ),
+            "B read the WELCOME, then EOF: {:?}",
+            failed.read
+        );
+
+        let control = offer_to_a_second_window(false);
+        assert!(control.claim_read && control.bye_read && control.dropped_at_eof);
+        assert_eq!(control.replies_lost, 0);
+        assert!(
+            matches!(
+                control.read.as_slice(),
+                [
+                    (Frame::Welcome { offers: 1, .. }, None),
+                    (Frame::Offer { .. }, Some(r))
+                ] if *r == control.orphan_rdev
+            ),
+            "the control's OFFER carries a descriptor: {:?}",
+            control.read
+        );
+    }
 }

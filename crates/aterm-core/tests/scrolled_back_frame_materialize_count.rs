@@ -7,7 +7,7 @@
 //! # Why this file exists at all
 //!
 //! The perf campaign that produced SCR-1 landed ~20 measured wins. What
-//! protects them is `xtask gate perf`, which is a TIMING gate: it needs a
+//! protects them is `xtask perf`, which is a TIMING gate: it needs a
 //! release build of several harnesses and it is not in the merge contract,
 //! because a per-push timing gate on this box cannot resolve anything smaller
 //! than a couple of milliseconds (the paired-round noise floor) and a hook slow

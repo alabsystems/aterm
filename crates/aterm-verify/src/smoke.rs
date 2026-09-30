@@ -398,20 +398,36 @@ mod tests {
         assert!(!ok, "exit 7 is not something this teardown caused");
     }
 
+    /// The budget is TERM, two seconds, then KILL; the bound only has to tell
+    /// that from waiting the child out, so it is a minute — half the life of
+    /// the `sleep` the child execs, which ignores TERM (the disposition
+    /// survives the exec) and so ends only by the KILL or by itself.
+    ///
+    /// The TERM must land AFTER the trap. Sent at once, it killed the shell
+    /// before the shell ignored anything, the KILL was never reached, and the
+    /// test passed with the KILL removed (sweep 4, 2026-09-29). So the child
+    /// says when it is ignoring TERM, and only then is it retired.
     #[test]
     fn a_child_that_ignores_term_is_killed_within_the_budget() {
+        use std::io::BufRead as _;
         let mut child = Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; sleep 30"])
-            .stdout(Stdio::null())
+            .args(["-c", "trap '' TERM; echo ignoring; exec sleep 120"])
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn");
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("piped stdout"))
+            .read_line(&mut ready)
+            .expect("read the child's word");
+        assert_eq!(ready, "ignoring\n", "the child set its trap");
         let start = std::time::Instant::now();
         let (ok, _) = retire_smoke_child(&mut child);
         assert!(ok, "KILL after the budget is still a retirement we caused");
         assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "the gate is never hung by teardown"
+            start.elapsed() < Duration::from_secs(60),
+            "the gate is never hung by teardown: {:?}",
+            start.elapsed()
         );
     }
 

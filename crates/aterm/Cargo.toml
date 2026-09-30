@@ -47,7 +47,7 @@ aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket clie
 aterm-control = { path = "../aterm-control" }
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
-# `aterm keeper serve|status` — the PTY keeper (inert until P3).
+# `aterm keeper start|stop|status|serve` — the PTY keeper (opt-in).
 aterm-keeper = { path = "../aterm-keeper" }
 # `aterm link` — the fabric bridge — is a UNIX-ONLY dependency; see the
 # `[target.'cfg(unix)'.dependencies]` table below and the `Link` arms in

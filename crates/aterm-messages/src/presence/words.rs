@@ -520,13 +520,19 @@ pub fn words<V: Host>(slot: &Slot<V>, now: Instant, watermark: u64) -> Words {
                 spoken.clone_from(&word);
                 (word, clauses, spoken)
             }
-            AgentPhase::Wall { reset, until, .. } => {
+            AgentPhase::Wall { kind, reset, until } => {
                 // `limited → 19:30 · 1d 22h`: the reset the notice named, then
                 // the time TO it (design §1; the mock counts down) — never the
                 // time since the limit began, which is the story's to tell.
+                // A wall the harness retries prints its NEXT TRY the same way
+                // (`can't reach the API → 14:05 · 3m`) and speaks it as one.
                 if let Some(r) = reset {
                     clauses.push(format!("\u{2192} {r}"));
-                    spoken = format!("{word}, resets {r}");
+                    spoken = if V::wall_retries(*kind) {
+                        format!("{word}, next try {r}")
+                    } else {
+                        format!("{word}, resets {r}")
+                    };
                 }
                 if let Some(left) = until
                     .map(|u| u.saturating_duration_since(now))

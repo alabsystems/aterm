@@ -310,6 +310,22 @@ pub const RULE_API_CUTOFF: &str = "api-cutoff@v1";
 const CARRY_ON: &str = "Carry on from where you stopped; if the result of your last step is \
 missing, check whether it ran before you repeat it.";
 
+/// Whether `why` — a [`TurnEndAction::WaitUntil`]'s reason — is the wait of a
+/// WALL'S RETRY: the ladder's rung between two tries at an API error or an
+/// overload, or the hold while the API is measured down. Only such a wait is
+/// the harness's NEXT TRY, which a tab may say (`IdleHost::waiting`: `can't
+/// reach the API → 09:04`). The other waits a point can stand in — the check
+/// that the worker took the try just typed (`the worker to take the … act`,
+/// half a minute after every try), a person typing, a reset, a model picker —
+/// are not a try at the wall, and the true next rung is not known until they
+/// end. Built beside the reasons themselves (the ladder's `api-error …` and
+/// `<kind> retry <n>` in [`decide_turn_end`]'s API branch), and pinned to
+/// them by a test that runs the real policy at every such branch.
+#[must_use]
+pub fn is_retry_wait(why: &str) -> bool {
+    why.starts_with("api-error") || why.starts_with("overloaded retry")
+}
+
 /// What is typed at an API wall's act: the vendor's own line, quoted — so
 /// the words cannot say more than the screen did — and what follows from
 /// it. `rule` is the act's ([`RULE_API_BACK`], [`RULE_API_CUTOFF`],

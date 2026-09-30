@@ -92,6 +92,16 @@ impl aterm_messages::presence::Host for Native {
         api_cause_words(kind).unwrap_or_else(|| crate::status_item::wall_words(kind.name()))
     }
 
+    /// An API error or an overload the harness retries on its own clock
+    /// (not a rate limit, which names its own reset).
+    fn wall_retries(kind: aterm_phase::WallKind) -> bool {
+        !kind.reads_limited()
+            && matches!(
+                kind,
+                aterm_phase::WallKind::ApiError { .. } | aterm_phase::WallKind::Overloaded
+            )
+    }
+
     fn stall_since(stall: &crate::input_stall::InputStallFact) -> aterm_messages::Instant {
         stall.since
     }
@@ -176,12 +186,30 @@ pub(crate) fn install_proxy(proxy: EventLoopProxy<Wake>) {
 /// cooperative `lease` was acquired or released. `submitted` marks the moment a
 /// turn's submit keypress verifiably landed: the one edge the rim ripples on.
 pub(crate) fn post_lease_changed(session: &SessionId, submitted: bool) {
+    #[cfg(test)]
+    LEASE_WAKES.with(|w| w.borrow_mut().push((session.clone(), submitted)));
     if let Some(proxy) = PROXY.get() {
         let _ = proxy.send_event(Wake::LeaseChanged {
             session: session.clone(),
             submitted,
         });
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEASE_WAKES: std::cell::RefCell<Vec<(SessionId, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Every lease-changed wake posted ON THIS THREAD since the last take, in
+/// order: `(session, submitted)`. A headless test App installs no proxy, so
+/// the wake itself goes nowhere; this is what a control verb run on the test's
+/// own thread asked the event loop to deliver. Thread-local for the same
+/// reason as [`classifier_calls`]: the suite runs tests in parallel.
+#[cfg(test)]
+pub(crate) fn take_lease_wakes() -> Vec<(SessionId, bool)> {
+    LEASE_WAKES.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
 /// A session's fabric endpoint changed — a delivery, a hold transition, a post
@@ -301,6 +329,49 @@ pub(crate) fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static st
         },
         _ => None,
     }
+}
+
+/// THE LOOP'S NEXT TRY laid on an API wall's reading (the tab retry plan,
+/// 2026-09-29): a wall the harness retries ([`Native::wall_retries`]) that
+/// names no time of its own gets the loop's deadline — `until` for the
+/// countdown and, where the zone is known, the local `HH:MM` as its `reset`
+/// — so the row reads `can't reach the API → 14:05 · 3m`. Only a plan still
+/// AHEAD counts (a past one is a try already made), only a wall with neither
+/// `reset` nor `until` (a usage limit keeps its own), and nothing else about
+/// the reading moves: the wall's kind, its band word and `status agent=` are
+/// the screen's. `zone` is asked only when a plan is laid on.
+pub(crate) fn with_retry_plan(
+    agent: Option<AgentReading>,
+    at_unix: Option<i64>,
+    now_unix: i64,
+    now: Instant,
+    zone: impl FnOnce() -> Option<i64>,
+) -> Option<AgentReading> {
+    let Some(at) = at_unix else {
+        return agent;
+    };
+    let mut agent = agent?;
+    let ahead = at - now_unix;
+    let AgentPhase::Wall {
+        kind,
+        reset: None,
+        until: until @ None,
+    } = &mut agent.phase
+    else {
+        return Some(agent);
+    };
+    if ahead <= 0 || !<Native as aterm_messages::presence::Host>::wall_retries(*kind) {
+        return Some(agent);
+    }
+    *until = now.checked_add(Duration::from_secs(ahead.unsigned_abs()));
+    let clock = zone().map(|offset| {
+        let local = (at + offset).rem_euclid(86_400);
+        format!("{:02}:{:02}", local / 3600, (local % 3600) / 60)
+    });
+    if let AgentPhase::Wall { reset, .. } = &mut agent.phase {
+        *reset = clock;
+    }
+    Some(agent)
 }
 
 /// `wall:<kind>` for a wall kind — `status agent=`'s spelling, `wall:` and
@@ -1530,6 +1601,126 @@ mod tests {
             .band_word(),
             "API error"
         );
+    }
+
+    /// THE TAB RETRY PLAN (2026-09-29): the loop's next try is laid on an API
+    /// wall's reading — `until` for the countdown and, the zone known, the
+    /// local `HH:MM` as its `reset` — and the row PRINTS `→ 08:58 · 3m00s` and
+    /// SPEAKS `next try 08:58`, never `resets`. CONTROLS, each leaving the
+    /// reading exactly as it was: a plan in the past or now (a try already
+    /// made), none, a wall that names its own time (a usage limit, a reset
+    /// already read), a phase that is no wall, and no reading at all. An
+    /// overload takes it too; an unknown zone gives the countdown alone; and
+    /// the zone is asked only when a plan is laid on.
+    #[test]
+    fn a_retry_plan_is_laid_on_an_api_wall_and_nothing_else() {
+        use aterm_phase::{ApiCause, WallKind};
+        const NOW_UNIX: i64 = 1_789_660_500; // 2026-09-17T15:55:00Z, 08:55 in PDT
+        const PDT: i64 = -7 * 3600;
+        let now = t0();
+        let wall = |kind: WallKind, reset: Option<&str>| {
+            Some(AgentReading {
+                phase: AgentPhase::Wall {
+                    kind,
+                    reset: reset.map(str::to_string),
+                    until: None,
+                },
+                context_pct: Some(40),
+            })
+        };
+        let unreachable = WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Unreachable,
+        };
+        let lay = |agent: Option<AgentReading>, at: Option<i64>, zone: Option<i64>| {
+            with_retry_plan(agent, at, NOW_UNIX, now, || zone)
+        };
+        // Laid on: 3 minutes ahead, the local clock at the try.
+        let got = lay(wall(unreachable, None), Some(NOW_UNIX + 180), Some(PDT)).unwrap();
+        assert_eq!(got.context_pct, Some(40), "nothing else moves");
+        let AgentPhase::Wall { kind, reset, until } = got.phase else {
+            panic!("still a wall");
+        };
+        assert_eq!(kind, unreachable, "the wall's kind is the screen's");
+        assert_eq!(reset.as_deref(), Some("08:58"));
+        assert_eq!(until, now.checked_add(Duration::from_secs(180)));
+        // An overload takes it; an unknown zone gives the countdown alone.
+        let got = lay(wall(WallKind::Overloaded, None), Some(NOW_UNIX + 60), None).unwrap();
+        let AgentPhase::Wall { reset, until, .. } = got.phase else {
+            panic!("still a wall");
+        };
+        assert_eq!((reset, until.is_some()), (None, true));
+        // CONTROLS: the reading is returned as it was.
+        for (name, agent, at) in [
+            ("past", wall(unreachable, None), Some(NOW_UNIX - 5)),
+            ("now", wall(unreachable, None), Some(NOW_UNIX)),
+            ("no plan", wall(unreachable, None), None),
+            (
+                "its own reset",
+                wall(unreachable, Some("7:30pm")),
+                Some(NOW_UNIX + 60),
+            ),
+            (
+                "a usage limit",
+                wall(WallKind::UsageSession, None),
+                Some(NOW_UNIX + 60),
+            ),
+            (
+                "not a wall",
+                Some(AgentReading {
+                    phase: AgentPhase::Idle,
+                    context_pct: None,
+                }),
+                Some(NOW_UNIX + 60),
+            ),
+        ] {
+            assert_eq!(lay(agent.clone(), at, Some(PDT)), agent, "{name}");
+        }
+        assert_eq!(lay(None, Some(NOW_UNIX + 60), Some(PDT)), None);
+        // The zone is asked only when a plan is laid on.
+        let asked = std::cell::Cell::new(0);
+        let count = |zone| {
+            asked.set(asked.get() + 1);
+            zone
+        };
+        let _ = with_retry_plan(
+            wall(unreachable, None),
+            Some(NOW_UNIX - 1),
+            NOW_UNIX,
+            now,
+            || count(Some(PDT)),
+        );
+        assert_eq!(asked.get(), 0, "a past plan asks nothing");
+        let _ = with_retry_plan(
+            wall(unreachable, None),
+            Some(NOW_UNIX + 9),
+            NOW_UNIX,
+            now,
+            || count(Some(PDT)),
+        );
+        assert_eq!(asked.get(), 1);
+
+        // What the row prints and speaks (the shared words engine).
+        let mut slot = Slot::new(now);
+        slot.agent = lay(wall(unreachable, None), Some(NOW_UNIX + 180), Some(PDT));
+        let said = words(&slot, now, 0);
+        assert_eq!(said.phase, "can't reach the API");
+        assert_eq!(
+            said.since,
+            vec!["\u{2192} 08:58".to_string(), "3m00s".to_string()],
+            "{said:?}"
+        );
+        assert!(
+            said.sentence.contains("next try 08:58"),
+            "{}",
+            said.sentence
+        );
+        assert!(!said.sentence.contains("resets"), "{}", said.sentence);
+        // CONTROL: a usage limit still speaks `resets`.
+        slot.agent = wall(WallKind::UsageSession, Some("7:30pm"));
+        let said = words(&slot, now, 0);
+        assert!(said.sentence.contains("resets 7:30pm"), "{}", said.sentence);
     }
 
     /// A TALL PANE, A SHORT TRANSCRIPT (a real render of 2026-09-28: Claude

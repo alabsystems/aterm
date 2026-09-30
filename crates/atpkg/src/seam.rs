@@ -425,6 +425,19 @@ struct BinPlan {
     stock: Vec<(&'static str, &'static str)>,
 }
 
+impl BinPlan {
+    /// What [`refresh_view`] reports for `build` when this is its `bin/` plan.
+    fn refreshed(self, build: PathBuf, changed: bool, deferred: Option<Deferred>) -> Refreshed {
+        Refreshed {
+            build,
+            tools: self.tools,
+            stock: self.stock,
+            changed,
+            deferred,
+        }
+    }
+}
+
 fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
     let mut entries = std::collections::BTreeMap::new();
     let mut tools = 0usize;
@@ -459,22 +472,18 @@ fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
 /// build's `bin/` at `src_bin`: one clone per [`BinPlan`] entry, so each tool is a clone of
 /// the store's file and each stock name a clone of its Trust tool — byte-identical to it,
 /// which is what bundle 8595's tippy asks of a `rustc` beside its `trustc`. A stock-name
-/// copy the bundle shipped is never cloned. Returns the tool count and the stock names.
+/// copy the bundle shipped is never cloned. Returns the [`BinPlan`] it laid.
 ///
 /// # Errors
 /// The build's `bin/` cannot be listed, or a clone cannot be made — the store on another
 /// volume, and it refuses rather than byte-copying the toolchain.
-fn lay_bin(
-    layout: &Layout,
-    src_bin: &Path,
-    dst_bin: &Path,
-) -> io::Result<(usize, Vec<(&'static str, &'static str)>)> {
+fn lay_bin(layout: &Layout, src_bin: &Path, dst_bin: &Path) -> io::Result<BinPlan> {
     let plan = bin_plan(src_bin)?;
     layout.ensure_dir(dst_bin)?;
     for (name, src) in &plan.entries {
         crate::clone::clone_file(src, &dst_bin.join(name))?;
     }
-    Ok((plan.tools, plan.stock))
+    Ok(plan)
 }
 
 /// Lay a complete view of `build` at `dest`, which must not exist: each of [`VIEW_DIRS`]
@@ -828,27 +837,13 @@ pub(crate) fn refresh_view_with(
     layout.ensure_dir(&views_root(layout))?;
     layout.ensure_dir(&view)?;
     if view_matches(&build, &view, Depth::Deep) {
-        let plan = bin_plan(&src_bin)?;
-        return Ok(Refreshed {
-            build,
-            tools: plan.tools,
-            stock: plan.stock,
-            changed: false,
-            deferred: None,
-        });
+        return Ok(bin_plan(&src_bin)?.refreshed(build, false, None));
     }
     // A BUILD RUNNING FROM THE VIEW KEEPS IT ([`Deferred`]). After the match, so a current
     // view reads no table; before the first rename, so a deferred view is never left
     // half-swapped.
     if let Some(deferred) = relay_blocked(layout, name, &view, running) {
-        let plan = bin_plan(&src_bin)?;
-        return Ok(Refreshed {
-            build,
-            tools: plan.tools,
-            stock: plan.stock,
-            changed: false,
-            deferred: Some(deferred),
-        });
+        return Ok(bin_plan(&src_bin)?.refreshed(build, false, Some(deferred)));
     }
     let pid = std::process::id().to_string();
     for dir in VIEW_DIRS {
@@ -878,18 +873,11 @@ pub(crate) fn refresh_view_with(
     let live = view.join("bin");
     let stock_differed = stock_bytes_mismatch(&build, &view).is_some();
     if bin_mismatch(&build, &view).is_none() && !stock_differed {
-        let plan = bin_plan(&src_bin)?;
-        return Ok(Refreshed {
-            build,
-            tools: plan.tools,
-            stock: plan.stock,
-            changed: false,
-            deferred: None,
-        });
+        return Ok(bin_plan(&src_bin)?.refreshed(build, false, None));
     }
     let staged = view.join(format!(".bin.tmp-{pid}"));
     let _ = std::fs::remove_dir_all(&staged);
-    let (tools, stock) = lay_bin(layout, &src_bin, &staged)?;
+    let plan = lay_bin(layout, &src_bin, &staged)?;
     // A live `bin/` that did not match is always replaced, even one presenting the same
     // name -> file map (the hard links a view held before clones, which `bin_mismatch`
     // rejects so they are retired). `changed` says only whether what the view presents is
@@ -898,13 +886,7 @@ pub(crate) fn refresh_view_with(
     let old = view.join(format!(".bin.old-{pid}"));
     let _ = std::fs::remove_dir_all(&old);
     swap_in(layout, &view, &staged, &live, &old)?;
-    Ok(Refreshed {
-        build,
-        tools,
-        stock,
-        changed,
-        deferred: None,
-    })
+    Ok(plan.refreshed(build, changed, None))
 }
 
 /// Put the staged part `staged` in the view at `at`, and remove what stood there — through
@@ -1205,22 +1187,10 @@ fn refresh_linked_view(
     let src_bin = checkout.join("bin");
     let plan = bin_plan(&src_bin)?;
     if linked_view_matches(checkout, &view, &plan) {
-        return Ok(Refreshed {
-            build: checkout.to_path_buf(),
-            tools: plan.tools,
-            stock: plan.stock,
-            changed: false,
-            deferred: None,
-        });
+        return Ok(plan.refreshed(checkout.to_path_buf(), false, None));
     }
     if let Some(deferred) = relay_blocked(layout, name, &view, running) {
-        return Ok(Refreshed {
-            build: checkout.to_path_buf(),
-            tools: plan.tools,
-            stock: plan.stock,
-            changed: false,
-            deferred: Some(deferred),
-        });
+        return Ok(plan.refreshed(checkout.to_path_buf(), false, Some(deferred)));
     }
     let pid = std::process::id().to_string();
     let mut changed = false;
@@ -1243,13 +1213,7 @@ fn refresh_linked_view(
     }
     let live = view.join("bin");
     if is_real_dir(&live) && bin_holds_exactly(&live, &plan) {
-        return Ok(Refreshed {
-            build: checkout.to_path_buf(),
-            tools: plan.tools,
-            stock: plan.stock,
-            changed,
-            deferred: None,
-        });
+        return Ok(plan.refreshed(checkout.to_path_buf(), changed, None));
     }
     let staged = view.join(format!(".bin.tmp-{pid}"));
     let _ = std::fs::remove_dir_all(&staged);
@@ -1263,13 +1227,7 @@ fn refresh_linked_view(
         std::fs::rename(&staged, &live)?;
         changed = true;
     }
-    Ok(Refreshed {
-        build: checkout.to_path_buf(),
-        tools: plan.tools,
-        stock: plan.stock,
-        changed,
-        deferred: None,
-    })
+    Ok(plan.refreshed(checkout.to_path_buf(), changed, None))
 }
 
 /// Whether two `bin/` directories present the same name -> file map, a file judged by its

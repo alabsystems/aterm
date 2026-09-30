@@ -1515,13 +1515,8 @@ mod tests {
         // --- XTMODKEYS (xterm keyboard) ---
         t.process(b"\x1b[>4;2m");
 
-        // --- taskbar progress (ConEmu OSC 9;4): this engine has NO byte-stream
-        //     handler for OSC 9;4 (handle_osc_9 explicitly ignores `9;4;...`;
-        //     the field is otherwise only cleared by reset). It is a host-set
-        //     leaf, so we set it directly to guarantee a non-default captured
-        //     value and exercise its capture/restore path. Honest note: this
-        //     field round-trips by value but is not driver-reachable today. ---
-        t.taskbar_progress = Some(TaskbarProgress::Normal(42));
+        // --- taskbar progress (ConEmu OSC 9;4, `handle_osc_9`) ---
+        t.process(b"\x1b]9;4;1;42\x07");
 
         // --- secure keyboard entry: also host-set (no OSC); use the setter ---
         t.set_secure_keyboard_entry(true);
@@ -1581,7 +1576,11 @@ mod tests {
         // Sanity: we actually captured non-default state.
         assert!(t.modes.alternate_screen, "alt screen active at capture");
         assert!(t.secure_keyboard_entry, "secure input captured");
-        assert!(t.taskbar_progress.is_some(), "taskbar captured");
+        assert_eq!(
+            t.taskbar_progress,
+            Some(TaskbarProgress::Normal(42)),
+            "taskbar captured"
+        );
         assert!(t.current_working_directory.is_some(), "cwd captured");
         assert!(
             t.alt_grid.is_some(),

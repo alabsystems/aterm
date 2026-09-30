@@ -2461,8 +2461,8 @@ fn capture_flying_companion_enabled(
 /// custody law as application-present: in pet mode the full resident keeps
 /// every frame, through a song and its wind-down, and no replacement head is
 /// admitted. The resident's own half of the custody is its owner's.
-fn capture_flying_alpha(pet_mode: bool, kitty_enabled: bool, cat_alpha: u8, sing: f32) -> u8 {
-    if kitty_enabled && aterm_effects::companion::flying_kitty_admitted(pet_mode, sing) {
+fn capture_flying_alpha(pet_mode: bool, kitty_enabled: bool, cat_alpha: u8) -> u8 {
+    if kitty_enabled && !pet_mode {
         cat_alpha
     } else {
         0
@@ -3214,8 +3214,7 @@ impl App {
             cat_frame.collection_hello,
             cat_frame.sing,
         );
-        let kitty_alpha =
-            capture_flying_alpha(pet_mode, kitty_enabled, cat_frame.alpha, cat_frame.sing);
+        let kitty_alpha = capture_flying_alpha(pet_mode, kitty_enabled, cat_frame.alpha);
         let (pane_rows, pane_cols, pane_origin) =
             panes.get(focus_index).map_or((0, 0, (0, 0)), |(r, _)| {
                 (
@@ -3599,8 +3598,7 @@ impl App {
             cat_frame.collection_hello,
             cat_frame.sing,
         );
-        let kitty_alpha =
-            capture_flying_alpha(pet_mode, kitty_enabled, cat_frame.alpha, cat_frame.sing);
+        let kitty_alpha = capture_flying_alpha(pet_mode, kitty_enabled, cat_frame.alpha);
         let effect_geom = crate::word_decorations::EffectGeom {
             cell_w: cell_w as u16,
             cell_h: cell_h as u16,
@@ -4839,6 +4837,9 @@ impl App {
                 cur: (cursor_visible && display_offset == 0).then_some((cpos.row, cpos.col)),
                 live_viewport: display_offset == 0,
                 cursor_visible,
+                // Honest, and inert here: `cur` above already withholds a
+                // hidden caret.
+                frame_unfinished: term.sync_frame_unfinished(),
                 cursor_style: term.cursor_style(),
                 blink_phase: ws.blink_phase,
                 live_cursor_rgb: crate::app_render::terminal_cursor_rgb(&term),
@@ -15577,20 +15578,18 @@ mod headless_cursor_fx_tests {
     /// own half is its owner's, pinned in `aterm_effects::companion`.)
     #[test]
     fn capture_flying_alpha_yields_every_song_phase_to_the_resident() {
-        for sing in [0.0, 1.0, 0.49, 0.329] {
-            assert_eq!(
-                capture_flying_alpha(true, true, 211, sing),
-                0,
-                "pet mode admits no head at sing {sing}"
-            );
-        }
         assert_eq!(
-            capture_flying_alpha(false, true, 211, 0.0),
+            capture_flying_alpha(true, true, 211),
+            0,
+            "pet mode admits no head"
+        );
+        assert_eq!(
+            capture_flying_alpha(false, true, 211),
             211,
             "classic mode admits its earned flying kitty"
         );
         assert_eq!(
-            capture_flying_alpha(false, false, 211, 0.0),
+            capture_flying_alpha(false, false, 211),
             0,
             "an unearned head is never admitted"
         );

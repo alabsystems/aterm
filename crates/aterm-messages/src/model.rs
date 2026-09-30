@@ -593,6 +593,27 @@ impl Intent {
         )
     }
 
+    /// A DECLINE — `Not now`, an upgrade's `Not today` or `Skip version`: a
+    /// press that answers by putting the work off, which the glass paints as
+    /// the quiet Secondary chip ([`Intent::is_consequential`]) and the page
+    /// never promotes to its Primary past a first intent a press cannot
+    /// perform (design ruling 403).
+    #[must_use]
+    pub const fn is_decline(&self) -> bool {
+        matches!(
+            self,
+            Self::NotNow { .. }
+                | Self::AgentUpgrade {
+                    word: UpgradeWord::NotToday | UpgradeWord::Skip,
+                    ..
+                }
+                | Self::AgentUpgradeTabs {
+                    word: UpgradeWord::NotToday | UpgradeWord::Skip,
+                    ..
+                }
+        )
+    }
+
     /// A press that STOPS the row's own work in flight (`StopPaste`, design
     /// ruling 232): the one decision a progress row may carry. The glass
     /// rule ([`Intent::is_consequential`]) paints it as the accent chip;
@@ -1790,6 +1811,17 @@ mod tests {
             assert!(
                 !(intent.is_consequential() && intent.closes_row()),
                 "{intent:?}: a consequential press never closes its row"
+            );
+            // A decline (ruling 403) is the three words that put the work
+            // off, and never the accent chip.
+            assert_eq!(
+                intent.is_decline(),
+                matches!(intent.label(), "Not now" | "Not today" | "Skip version"),
+                "{intent:?}"
+            );
+            assert!(
+                !(intent.is_decline() && intent.is_consequential()),
+                "{intent:?}"
             );
         }
         assert!(

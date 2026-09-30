@@ -77,8 +77,8 @@ pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
     ATTENTION_OWNER, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl, CtlReply,
     EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Fold, Guard, HostStep, IdleHost,
-    Interrupter, NoLane, ReportBrief, Session, SuperviseOpts, Turn, UNBOUNDED, WorkerSource,
-    event_line, exit_reason, render_phase, render_phase_and_survey, render_result,
+    Interrupter, NoLane, ReportBrief, Session, SuperviseOpts, Turn, UNBOUNDED, WaitPlan,
+    WorkerSource, event_line, exit_reason, render_phase, render_phase_and_survey, render_result,
     render_result_mail, reported_event_line,
 };
 pub use transport::{Endpoint, RelayCtl, Transport};

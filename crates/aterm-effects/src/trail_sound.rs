@@ -88,7 +88,7 @@ mod rainbow_kitty_v2;
 pub use rainbow_kitty_v2::{MelodyV2, RainbowKittyV2Palette, TimbreStops};
 
 use rainbow_kitty_v2::{
-    LANE_AGE_GUARD_S, LANE_CASCADE, LANE_FADE_STEAL_S, LANE_NONE, lane_cap, lane_drops_the_newcomer,
+    LANE_AGE_GUARD_S, LANE_FADE_STEAL_S, LANE_NONE, lane_cap, lane_drops_the_newcomer,
 };
 
 use crate::cursor_glow::GlowStyle;
@@ -3309,17 +3309,13 @@ struct Bed {
     /// Beam power-down: smoothed droop factor that bends the hum flat as the
     /// energy dies, the aural twin of the tube thinning to a hairline.
     droop: f32,
-    /// TOURNAMENT-candidate state (used only while [`BedVariant`] ≠
-    /// `Current`; dead weight otherwise — `Default`-zeroed, never read by the
-    /// shipping palette beds, so the pinned paths cannot observe it):
-    /// oscillator phases (turns), portamento'd oscillator frequencies (Hz;
-    /// `<= 0` means "not yet seeded"), and the variant's own slow clock in
-    /// seconds (chord bars, breath cycles, shimmer LFOs all derive from it —
-    /// samples-driven like every other clock here, so candidates replay
-    /// bit-exactly).
+    /// THE RAINBOW SKY's pad state (`rainbow_kitty_v2::bed_rainbow_sky`;
+    /// `Default`-zeroed and never read by the other palette beds, so their
+    /// pinned paths cannot observe it): oscillator phases (turns) and
+    /// portamento'd oscillator frequencies (Hz; `<= 0` means "not yet
+    /// seeded").
     var_ph: [f32; 4],
     var_f: [f32; 4],
-    var_t: f32,
     /// THE SKY'S COLOUR (THE PRISM §3.2): the rainbow hue's ARC position
     /// (`rainbow_kitty_v2::hue_arc`, 0 at the red end, 1 at the cyan end)
     /// through a one-pole with τ = `BED_HUE_TAU_S`, slewed per v2 event. The
@@ -3330,130 +3326,6 @@ struct Bed {
     /// touch it.
     hue_s: f32,
 }
-
-// ---------------------------------------------------------------------------
-// Ambient-bed TOURNAMENT — candidate variants behind the audition seam
-// ---------------------------------------------------------------------------
-
-/// One AMBIENT-BED TOURNAMENT candidate. Beds sit behind `trail_sound_bed`
-/// (default ON since the owner's 2026-09-09 ruling), and the redesign of the
-/// low drone runs as a judged tournament: each candidate is a complete
-/// alternative continuous-bed design, rendered and measured by
-/// `examples/bed_audition.rs` against the real melody.
-///
-/// Selection is an ENGINE-LEVEL seam ([`TrailSynth::set_bed_variant`]), not a
-/// host setting: no config path reaches it, the default is [`Current`]
-/// (`BedVariant::Current`), and with the default selected the palette beds
-/// render through the exact pre-tournament code path — the shipping sound
-/// stays byte-pinned while the challengers live beside it.
-///
-/// Candidate DSP obeys the same two laws as everything else in this module:
-/// - CONSONANCE — every candidate pitch is drawn through
-///   [`TrailSynth::melody_hz`] at integer lattice degrees, so whatever tone
-///   table the melody is in, bed tones sit ON that table (mutual consonance
-///   inherited structurally, proven by
-///   `bed_variant_pitches_stay_on_the_active_lattice_for_every_tone`);
-/// - LOUDNESS — candidates ride the same energy/level/gain machinery as the
-///   shipping beds (fed per event, governor-smoothed, master-ducked), so the
-///   flood law holds per candidate (`flood_is_ducked`'s bed rows).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum BedVariant {
-    /// C0 — the incumbent-in-code: the per-palette `Palette::bed_sample`/
-    /// `bed_grain` units. The default, and the only variant hosts can ever
-    /// reach.
-    #[default]
-    Current,
-    /// C1 — SLOW CHORD DRIFT: three bed tones stacked on the pentatonic
-    /// lattice walk a four-bar triad progression over a ~30 s cycle,
-    /// portamento gliding between bars — never static, never stepping.
-    ChordDrift,
-    /// C2 — BREATHING PAD: a lattice pad whose amplitude swells 0.05→0.2 on
-    /// a ~12 s raised cosine while a lowpass tilt opens and closes with the
-    /// same breath — the bed inhales and exhales instead of holding a note.
-    Breathing,
-    /// C3 — SHIMMER WASH: four very quiet HIGH lattice partials (nothing
-    /// below ~4× the palette anchor — no low fundamental at all) fading in
-    /// and out on slow incommensurate LFOs; air, not floor.
-    Shimmer,
-    /// C4 — SILENCE: no bed. The `trail_sound_bed = false` experience (the
-    /// shipped default until the owner's 2026-09-09 ruling) as an explicit
-    /// tournament entrant, so
-    /// "keep no bed" is judged with the same artifacts as every challenger.
-    /// Contributes literally zero samples
-    /// (`silence_candidate_contributes_exact_zero_bed_samples`).
-    Silence,
-    /// C5 — THE RAINBOW SKY (THE PRISM §3.2): the music box's own pad. Three
-    /// lattice tones two octaves under the tine, voiced from the LIVE
-    /// chord's lit degrees (so the pad IS the harmony the derived melody is
-    /// snapped to, and nothing it plays can be out of key against it),
-    /// gliding once per WORD rather than on a timer; a 12 s breath; and the
-    /// rainbow's hue on its TILT and its WIDTH — never on a pitch. Body in
-    /// `rainbow_kitty_v2::TrailSynth::bed_rainbow_sky`, which the music box's
-    /// palette bed shares.
-    RainbowSky,
-}
-
-impl BedVariant {
-    /// Every tournament entrant, C0..C5 — the audition harness and the
-    /// variant proofs iterate this so a new candidate is automatically
-    /// rendered and law-checked.
-    #[cfg(test)]
-    pub const ALL: [BedVariant; 6] = [
-        BedVariant::Current,
-        BedVariant::ChordDrift,
-        BedVariant::Breathing,
-        BedVariant::Shimmer,
-        BedVariant::Silence,
-        BedVariant::RainbowSky,
-    ];
-}
-
-/// C1 chord cycle: total walk length in seconds (four bars of ~7.5 s — slow
-/// enough to read as weather, fast enough that a 30 s listen hears motion).
-const CHORD_DRIFT_CYCLE_S: f32 = 30.0;
-
-/// C1 bar roots, in pentatonic-lattice degrees. A I → IV-ish → ii-ish →
-/// V-ish walk that ends a step above home so the cycle leans back into bar
-/// one — "never static" as a structural property of the progression, not a
-/// tuning accident.
-const CHORD_DRIFT_ROOTS: [i32; 4] = [0, 3, 1, 4];
-
-/// C1 chord stack on each root: the pentatonic root triad (degrees 0/2/4 of
-/// the active table — under the major table that is 1 : 5/4 : 5/3). Same-
-/// table stacking is what makes consonance structural: every chord tone is a
-/// lattice degree, and lattice-degree pairs are proven outside the bonk's
-/// rub zones for every tone table.
-const CHORD_DRIFT_STACK: [i32; 3] = [0, 2, 4];
-
-/// C1 portamento time constant (seconds) between bar targets. ~1.2 s: long
-/// enough that bar changes read as the pad LEANING to the next chord, short
-/// enough that the glide (the only moment bed pitch is off-lattice) is a
-/// transition, not a state.
-const CHORD_DRIFT_GLIDE_TAU: f32 = 1.2;
-
-/// C2 breath period in seconds, and the swell-law endpoints: the
-/// pad's amplitude factor rides `0.05..=0.2` on a raised cosine — even at
-/// the top of the breath the bed stays a texture, and at the bottom it all
-/// but disappears without ever gating.
-const BREATH_CYCLE_S: f32 = 12.0;
-const BREATH_SWELL_MIN: f32 = 0.05;
-const BREATH_SWELL_MAX: f32 = 0.2;
-
-/// C2 pad voicing: root triad + octave root (lattice degrees on the active
-/// table, one octave under the palette anchor — the same register the
-/// shipping beds hum in).
-const BREATH_DEGREES: [i32; 4] = [0, 2, 4, 5];
-
-/// C3 wash voicing: HIGH lattice degrees on the palette anchor itself —
-/// degree 10 is 4× the anchor (≈2.1 kHz on the rainbow kitty chip register), 15 is
-/// 8×. Nothing lower exists in this candidate; "no low fundamental" is the
-/// voicing, not a filter.
-const SHIMMER_DEGREES: [i32; 4] = [10, 12, 14, 15];
-
-/// C3 per-partial shimmer LFO rates in Hz. Mutually incommensurate-ish so
-/// the four fades never phase-lock into a loop the ear can count — the wash
-/// glitters instead of pulsing.
-const SHIMMER_RATES: [f32; 4] = [0.13, 0.19, 0.29, 0.23];
 
 /// THE BED'S ENERGY KICK per admitted trail gesture — the table v1's trail
 /// arm has always used, hoisted so the music box's `push_v2` feeds the bed
@@ -3554,10 +3426,6 @@ pub struct TrailSynth {
     /// events, so the bed texture follows the `trail_sound_style` override
     /// exactly like it follows the visual style.
     bed_voice: SoundVoice,
-    /// Which AMBIENT-BED design the bed mixer renders — the tournament seam.
-    /// Always [`BedVariant::Current`] outside the audition harness (no host
-    /// path sets it), so the shipping palette beds stay byte-pinned.
-    bed_variant: BedVariant,
     /// Smoothed event rate (events/second) for the governor.
     rate: f32,
     /// Seconds since the last ADMITTED discrete voice (min-gap thinning).
@@ -3743,15 +3611,11 @@ pub struct TrailSynth {
     /// is audible as a clipped tail, so a bench that reports a nonzero count
     /// is reporting a real mix defect rather than a statistic.
     steals: u32,
-    /// AUDIT CENSUS (streaming cascade, 2026-09-12): per-lane voice births,
-    /// lane-cap refusals at claim, and onset-census drops, indexed by lane.
+    /// TEST-ONLY: voice births per lane, the witness
+    /// `a_run_of_spaces_is_one_downbeat_and_a_rising_figure` counts a held
+    /// spacebar's `LANE_GLINT` steps with.
+    #[cfg(test)]
     lane_births: [u32; 16],
-    lane_refused: [u32; 16],
-    lane_onset_dropped: [u32; 16],
-    /// `(at_ms, f0_hz, head, admitted)` of every cascade voice the music box
-    /// asked for — a ring the bench drains every block.
-    cascade_log: [(u32, f32, bool, bool); 32],
-    cascade_log_n: u8,
     /// RAINBOW KITTY's MELODY STATE (§10.1) — the time-gated verse, the
     /// pure-fifth chord loop, the re-strike ladder, the undo stack. Inert
     /// (and never read) until the first music-box event
@@ -3955,7 +3819,7 @@ fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
         // that the one number the v2 ladder rests on lives beside the tine it
         // scales. This arm — and the rainbow kitty look's arm below, which is
         // the same instrument — is the unity identity for the (unreachable,
-        // see `palette_for`) v1-dispatch fall-through.
+        // see `RainbowKittyV2Palette`) v1-dispatch fall-through.
         SoundVoice::RainbowKittyV2 => 1.0,
         SoundVoice::Style => match style {
             GlowStyle::Lumen | GlowStyle::Custom => 0.95,
@@ -4036,7 +3900,6 @@ impl TrailSynth {
             bed: Bed::default(),
             bed_style: GlowStyle::Lumen,
             bed_voice: SoundVoice::Style,
-            bed_variant: BedVariant::default(),
             rate: 0.0,
             since_voice: 1.0,
             since_event: 1.0,
@@ -4078,11 +3941,8 @@ impl TrailSynth {
             sing_hold: 0.0,
             last_riff_sig: None,
             steals: 0,
+            #[cfg(test)]
             lane_births: [0; 16],
-            lane_refused: [0; 16],
-            lane_onset_dropped: [0; 16],
-            cascade_log: [(0, 0.0, false, false); 32],
-            cascade_log_n: 0,
             v2: MelodyV2::new(),
             born_seq: 0,
             clock_s: 0.0,
@@ -4176,40 +4036,6 @@ impl TrailSynth {
         self.bus_limiter = on;
     }
 
-    /// AUDIT CENSUS: `[births, refused_at_claim, onset_dropped]` for one lane.
-    #[must_use]
-    pub fn lane_census(&self, lane: u8) -> [u32; 3] {
-        let l = usize::from(lane).min(15);
-        [
-            self.lane_births[l],
-            self.lane_refused[l],
-            self.lane_onset_dropped[l],
-        ]
-    }
-
-    /// AUDIT CENSUS: the cascade lane's number, so a bench need not know it.
-    #[must_use]
-    pub fn cascade_lane() -> u8 {
-        LANE_CASCADE
-    }
-
-    /// AUDIT CENSUS: drain `(at_ms, f0_hz, head, admitted)` of every cascade
-    /// voice asked for since the last drain (ring of 32 — drain every block).
-    pub fn drain_cascade_log(&mut self, out: &mut Vec<(u32, f32, bool, bool)>) {
-        for i in 0..usize::from(self.cascade_log_n) {
-            out.push(self.cascade_log[i]);
-        }
-        self.cascade_log_n = 0;
-    }
-
-    pub(crate) fn log_cascade(&mut self, at: u32, f: f32, head: bool, admitted: bool) {
-        let n = usize::from(self.cascade_log_n);
-        if n < self.cascade_log.len() {
-            self.cascade_log[n] = (at, f, head, admitted);
-            self.cascade_log_n += 1;
-        }
-    }
-
     /// RAINBOW KITTY's MELODY STATE, read-only (test / bench introspection).
     ///
     /// The census in `keyboard_song_ab` reads the melody's own account of
@@ -4226,18 +4052,6 @@ impl TrailSynth {
     /// Diagnostic: (bed energy, bed level) — demo/tuning hook.
     pub fn debug_bed(&self) -> (f32, f32) {
         (self.bed.energy, self.bed.level)
-    }
-
-    /// Select which AMBIENT-BED TOURNAMENT candidate the bed mixer renders —
-    /// the audition seam (`examples/bed_audition.rs`). Intended to be set
-    /// once, right after construction: candidates share the [`Bed`] state
-    /// fields, so a mid-stream switch is well-defined (worst case a brief
-    /// portamento from the previous variant's frequencies) but is nothing
-    /// the tournament measures. Hosts never call this — the default,
-    /// [`BedVariant::Current`], renders the shipping palette beds through
-    /// their exact pre-tournament path.
-    pub fn set_bed_variant(&mut self, variant: BedVariant) {
-        self.bed_variant = variant;
     }
 
     // -- event intake -------------------------------------------------------
@@ -4901,15 +4715,6 @@ impl TrailSynth {
     /// live)". Running the census here would make the meteor's thump evict
     /// the word's downbeat `T` before the thump itself spoke.
     fn claim_lane(&mut self, lane: u8, deferred: bool) -> Option<usize> {
-        let got = self.claim_lane_inner(lane, deferred);
-        if got.is_none() {
-            let l = usize::from(lane).min(15);
-            self.lane_refused[l] = self.lane_refused[l].saturating_add(1);
-        }
-        got
-    }
-
-    fn claim_lane_inner(&mut self, lane: u8, deferred: bool) -> Option<usize> {
         if lane == LANE_NONE {
             return Some(self.claim());
         }
@@ -5034,6 +4839,7 @@ impl TrailSynth {
         // thump itself spoke). The census runs in `render` on its first
         // sounding sample instead — see `lane_onset_steal`.
         let idx = self.claim_lane(proto.lane, proto.delay > 0.0)?;
+        #[cfg(test)]
         {
             let l = usize::from(proto.lane).min(15);
             self.lane_births[l] = self.lane_births[l].saturating_add(1);
@@ -6733,8 +6539,6 @@ impl TrailSynth {
                 // for anything that has already sounded once.
                 if !v.env_run && v.lane != LANE_NONE && v.delay > 0.0 && self.lane_onset_steal(vi) {
                     self.voices[vi].on = false;
-                    let l = usize::from(self.voices[vi].lane).min(15);
-                    self.lane_onset_dropped[l] = self.lane_onset_dropped[l].saturating_add(1);
                     continue;
                 }
                 let v = &mut self.voices[vi];
@@ -7011,11 +6815,6 @@ impl TrailSynth {
     /// Block-rate bed upkeep: energy decay, level slew, stochastic grains
     /// (grain design is per-palette — [`Palette::bed_grain`]).
     fn tick_bed(&mut self, dt: f32) {
-        // Grains belong to the SHIPPING bed designs (sparkle's chimes,
-        // water's plips, fire's pops): a tournament candidate is judged on
-        // its own texture alone, so grain arming is gated to `Current`.
-        // Hoisted before the borrow; trivially true on the default path.
-        let grains_live = self.bed_variant == BedVariant::Current;
         let b = &mut self.bed;
         // Below ~-34 dB the bed is already imperceptible: hurry the tail so
         // the host's queue pause engages within ~a second of audibility
@@ -7045,7 +6844,7 @@ impl TrailSynth {
         b.droop += (dying - b.droop) * (1.0 - (-dt / 0.4).exp());
 
         // Stochastic grains for the textures that live on scarcity.
-        if grains_live && b.level > 0.02 {
+        if b.level > 0.02 {
             b.timer -= dt;
             if b.timer <= 0.0 {
                 let style = self.bed_style;
@@ -7064,14 +6863,6 @@ impl TrailSynth {
         if self.bed.level < 1e-4 {
             return (0.0, 0.0);
         }
-        // Tournament dispatch BEFORE the palette prologue: a candidate owns
-        // its whole texture (LFOs included, run off the variant clock), and
-        // the shipping path below must not share state with it. On the
-        // default (`Current`) this branch is never taken, so the palette
-        // beds render through the exact pre-tournament code.
-        if self.bed_variant != BedVariant::Current {
-            return self.bed_variant_sample(dt);
-        }
         let lvl = self.bed.level * self.bed.gain;
         // Shared slow LFOs (used as undulation / vibrato per style).
         self.bed.lfo1 = (self.bed.lfo1 + 0.23 * dt).fract();
@@ -7083,140 +6874,6 @@ impl TrailSynth {
             palette_for(self.bed_voice, self.bed_style).bed_sample(self, dt, lvl, u1, u2);
         // `side` widens beds slightly; kept tiny to stay mono-compatible.
         (m + side, m - side)
-    }
-
-    // -- ambient-bed tournament candidates ----------------------------------
-
-    /// One stereo sample of the selected non-`Current` tournament candidate.
-    /// Same contract as the palette [`Palette::bed_sample`] path: the caller
-    /// has already floored `bed.level`, and the result lands in the DUCKED
-    /// mix sum, so the bonk/sing duck and the master chain apply to
-    /// candidates exactly as they do to the shipping beds (the loudness law
-    /// is inherited, not re-implemented). All randomness-free: candidates
-    /// derive every modulation from the sample-driven variant clock, so a
-    /// candidate render is bit-replayable from (events, seed, variant).
-    fn bed_variant_sample(&mut self, dt: f32) -> (f32, f32) {
-        let lvl = self.bed.level * self.bed.gain;
-        // The palette's own melodic register anchors every candidate — the
-        // same "wrong against the melody actually playing" logic as the
-        // bonk anchor, reused for the opposite purpose (being RIGHT under
-        // that melody).
-        let anchor = palette_for(self.bed_voice, self.bed_style).anchor_hz();
-        self.bed.var_t += dt;
-        let (m, side) = match self.bed_variant {
-            // Structurally unreachable (the caller dispatches `Current` to
-            // the palette path) — but this is the audio hot path, so the
-            // defensive arm is silence, never a panic.
-            BedVariant::Current => (0.0, 0.0),
-            BedVariant::ChordDrift => self.bed_chord_drift(dt, lvl, anchor),
-            BedVariant::Breathing => self.bed_breathing(dt, lvl, anchor),
-            BedVariant::Shimmer => self.bed_shimmer(dt, lvl, anchor),
-            // C4: the bed layer contributes literal zeros — the "no bed"
-            // incumbent rendered through the identical harness so its
-            // artifacts are comparable.
-            BedVariant::Silence => (0.0, 0.0),
-            // C5: the music box's own sky, on its own register (it ignores
-            // the palette anchor — its base is derived from the tine's).
-            BedVariant::RainbowSky => self.bed_rainbow_sky(dt, lvl),
-        };
-        (m + side, m - side)
-    }
-
-    /// C1 — SLOW CHORD DRIFT. Three sines stacked on the active lattice
-    /// ([`CHORD_DRIFT_STACK`] over the walking [`CHORD_DRIFT_ROOTS`]), one
-    /// octave under the palette anchor, portamento-gliding between bars so
-    /// the pad is never static and never steps. Pitch TARGETS are always
-    /// `melody_hz` lattice degrees — consonance with whatever the melody is
-    /// doing is inherited from the table invariant.
-    fn bed_chord_drift(&mut self, dt: f32, lvl: f32, anchor: f32) -> (f32, f32) {
-        let bar_s = CHORD_DRIFT_CYCLE_S / CHORD_DRIFT_ROOTS.len() as f32;
-        let bar = ((self.bed.var_t / bar_s) as usize) % CHORD_DRIFT_ROOTS.len();
-        let root = CHORD_DRIFT_ROOTS[bar];
-        let mut tgt = [0.0f32; 3];
-        for (t, off) in tgt.iter_mut().zip(CHORD_DRIFT_STACK) {
-            *t = self.melody_hz(anchor * 0.5, root + off);
-        }
-        let b = &mut self.bed;
-        let glide = 1.0 - (-dt / CHORD_DRIFT_GLIDE_TAU).exp();
-        // Voicing balance: root carries, upper tones color. Static weights —
-        // the MOTION lives in pitch, which is the candidate's thesis.
-        const WEIGHT: [f32; 3] = [1.0, 0.8, 0.65];
-        let mut m = 0.0;
-        for i in 0..3 {
-            if b.var_f[i] <= 0.0 {
-                // First sample: seed at target so the pad enters ON the
-                // chord instead of sweeping up from 0 Hz.
-                b.var_f[i] = tgt[i];
-            }
-            b.var_f[i] += (tgt[i] - b.var_f[i]) * glide;
-            b.var_ph[i] = (b.var_ph[i] + b.var_f[i] * dt).fract();
-            m += sin01(b.var_ph[i]) * WEIGHT[i];
-        }
-        // A whisper of amplitude undulation (~0.09 Hz off the variant
-        // clock) so held bars still breathe a little.
-        let und = 0.85 + 0.15 * sin01((b.var_t * 0.09).fract());
-        (m * und * lvl * 0.014, 0.0)
-    }
-
-    /// C2 — BREATHING PAD. The [`BREATH_DEGREES`] lattice pad under the
-    /// swell law (amplitude factor 0.05→0.2 on a ~12 s raised
-    /// cosine) with the spectral tilt animating on the same breath: a
-    /// one-pole lowpass opens toward ~2.6 kHz at the top of the inhale and
-    /// closes to ~250 Hz at the bottom, so the pad brightens as it swells —
-    /// breath, not tremolo.
-    fn bed_breathing(&mut self, dt: f32, lvl: f32, anchor: f32) -> (f32, f32) {
-        let mut freq = [0.0f32; 4];
-        for (f, d) in freq.iter_mut().zip(BREATH_DEGREES) {
-            *f = self.melody_hz(anchor * 0.5, d);
-        }
-        let b = &mut self.bed;
-        // Raised cosine in turns: sin01(x + 0.25) == cos(2πx).
-        let breath = 0.5 - 0.5 * sin01(((b.var_t / BREATH_CYCLE_S).fract() + 0.25).fract());
-        let swell = BREATH_SWELL_MIN + (BREATH_SWELL_MAX - BREATH_SWELL_MIN) * breath;
-        const WEIGHT: [f32; 4] = [1.0, 0.7, 0.55, 0.4];
-        let mut m = 0.0;
-        for i in 0..4 {
-            b.var_ph[i] = (b.var_ph[i] + freq[i] * dt).fract();
-            m += sin01(b.var_ph[i]) * WEIGHT[i];
-        }
-        // Tilt rides breath² so the top octave only speaks near full
-        // inhale — the animation is spectral, not just louder.
-        let cut = 250.0 + 2350.0 * breath * breath;
-        let k = (cut * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
-        b.lp1 += k * (m - b.lp1);
-        (b.lp1 * swell * lvl * 0.16, 0.0)
-    }
-
-    /// C3 — SHIMMER WASH. Four very quiet HIGH lattice partials
-    /// ([`SHIMMER_DEGREES`] on the anchor itself — no low fundamental
-    /// exists), each fading on its own slow LFO ([`SHIMMER_RATES`],
-    /// incommensurate) with alternating-side placement for a gentle width.
-    /// The candidate that tests "does a bed even need a floor?".
-    fn bed_shimmer(&mut self, dt: f32, lvl: f32, anchor: f32) -> (f32, f32) {
-        let mut freq = [0.0f32; 4];
-        for (f, d) in freq.iter_mut().zip(SHIMMER_DEGREES) {
-            *f = self.melody_hz(anchor, d);
-        }
-        let b = &mut self.bed;
-        const WEIGHT: [f32; 4] = [0.9, 0.8, 0.7, 0.5];
-        let (mut m, mut side) = (0.0f32, 0.0f32);
-        for i in 0..4 {
-            b.var_ph[i] = (b.var_ph[i] + freq[i] * dt).fract();
-            // Fade 0.3..1.0 — partials recede, never gate (the wash must
-            // shimmer, not blink). Phase-offset per partial so the four
-            // fades never align.
-            let fade_ph = (b.var_t * SHIMMER_RATES[i] + i as f32 * 0.37).fract();
-            let fade = 0.65 + 0.35 * sin01(fade_ph);
-            let x = sin01(b.var_ph[i]) * WEIGHT[i] * fade;
-            m += x;
-            // Alternate partials lean left/right a touch.
-            side += if i % 2 == 0 { x * 0.18 } else { -(x * 0.18) };
-        }
-        // 0.015: tuned by the audition metrics — "very quiet" (≈ −50 dBFS
-        // bed RMS, ~10 dB under the melody) yet still crossing the −50 dBFS
-        // audibility line during typing, so the wash is an entrant rather
-        // than an inaudible no-op.
-        (m * lvl * 0.015, side * lvl * 0.015)
     }
 }
 
@@ -7266,8 +6923,7 @@ trait Palette {
     /// - the curse BONK clashes here, so the wrong note is wrong AGAINST the
     ///   melody actually playing;
     /// - the MOVEMENT family (Glide/Sweep, [`TrailSynth::design_cursor`]) sings
-    ///   here, so scrubbing is the typing's relative;
-    /// - the bed's tournament candidates stack their lattice here.
+    ///   here, so scrubbing is the typing's relative.
     ///
     /// Default: the Lumen mid register (also right for unpitched palettes like
     /// Fire). Renamed from `bonk_anchor_hz` when the movement family joined the
@@ -7295,10 +6951,8 @@ fn palette_for(voice: SoundVoice, style: GlowStyle) -> &'static dyn Palette {
         SoundVoice::Typewriter => &TypewriterPalette,
         SoundVoice::Marimba => &MarimbaPalette,
         SoundVoice::Felt => &FeltPalette,
-        // v2 never reaches the palette dispatch on its own account (`push`
-        // routes it to `push_v2` first). The arm exists so a hand-built event
-        // that somehow arrives here still sounds like the music box's tine
-        // rather than falling through to another style's timbre.
+        // The music box's bed and register; its `design` is never dispatched
+        // (`push` routes v2 to `push_v2` first).
         SoundVoice::RainbowKittyV2 => &RainbowKittyV2Palette,
         SoundVoice::Of(s) => palette_for(SoundVoice::Style, s),
         SoundVoice::Style => match style {
@@ -10832,11 +10486,11 @@ mod tests {
     /// the governor's whole job — and never approaches the clip ceiling. One
     /// row per palette, each with its own seed and key rhythm:
     ///
-    /// * every style palette, and (the TOURNAMENT LOUDNESS LAW) every bed
-    ///   candidate under the rainbow kitty — each rides the shared
-    ///   energy/level/gain bed machinery — hold the RELATIVE bound against a
-    ///   single event of the same palette (peak here is texture + bed, capped
-    ///   well under the soft-clip knee) as well as the absolute one;
+    /// * every look's palette, the music box's included — each rides the
+    ///   shared energy/level/gain bed machinery — holds the RELATIVE bound
+    ///   against a single event of the same palette (peak here is texture +
+    ///   bed, capped well under the soft-clip knee) as well as the absolute
+    ///   one;
     /// * the mech override and each new instrument hold the absolute ceiling
     ///   (their flood pushes one key every 80 ms of render).
     #[test]
@@ -10844,19 +10498,17 @@ mod tests {
         struct Flood {
             label: String,
             event: SoundEvent,
-            bed: Option<BedVariant>,
             seed: u32,
             /// 960-frame blocks rendered after each key.
             blocks_per_key: usize,
-            /// Sweep the pan across the flood (the style/bed rows).
+            /// Sweep the pan across the flood (the look rows).
             pan_sweep: bool,
             /// Also hold the flood to a single event's peak.
             relative: bool,
         }
-        let palette = |label: String, event: SoundEvent, bed: Option<BedVariant>| Flood {
+        let palette = |label: String, event: SoundEvent| Flood {
             label,
             event,
-            bed,
             seed: 3,
             blocks_per_key: 2, // 2×960 frames = 40 ms per key
             pan_sweep: true,
@@ -10865,31 +10517,20 @@ mod tests {
         let voice = |v: SoundVoice| Flood {
             label: format!("{v:?}"),
             event: voiced(v, GlowStyle::Lumen, SoundKind::Typed),
-            bed: None,
             seed: 7,
             blocks_per_key: 4,
             pan_sweep: false,
             relative: false,
         };
-        let mut rows: Vec<Flood> = STYLES
+        let mut rows: Vec<Flood> = LOOKS
             .iter()
-            .map(|&st| palette(format!("{st:?}"), ev(st, SoundKind::Typed), None))
+            .map(|&st| palette(format!("{st:?}"), ev(st, SoundKind::Typed)))
             .collect();
-        for variant in BedVariant::ALL {
-            let e = ev(GlowStyle::RainbowKitty, SoundKind::Typed);
-            rows.push(palette(format!("{variant:?}"), e, Some(variant)));
-        }
         rows.push(voice(SoundVoice::Mech));
         rows.extend(NEW_VOICES.map(voice));
         for row in rows {
             let label = &row.label;
-            let synth = || {
-                let mut s = TrailSynth::new(48_000.0, row.seed);
-                if let Some(variant) = row.bed {
-                    s.set_bed_variant(variant);
-                }
-                s
-            };
+            let synth = || TrailSynth::new(48_000.0, row.seed);
             let mut buf = [0.0f32; 960];
             // A 3-second 25 cps flood.
             let mut s = synth();
@@ -11132,32 +10773,22 @@ mod tests {
         }
     }
 
-    /// TOURNAMENT CONSONANCE LAW: every bed-candidate pitch is an integer
-    /// degree on the ACTIVE tone lattice, so for every tone table, every
-    /// (bed tone × bed tone) and (bed tone × melody-walk note) interval —
-    /// octave-reduced, inversions included — stays outside the bonk's
-    /// minor-second and tritone rub zones. The zone predicate is the shared
-    /// `assert_outside_bonk_zones`, as in
+    /// THE SKY'S CONSONANCE LAW: every pitch of the music box's bed is an
+    /// integer degree on the ACTIVE tone lattice, so for every tone table,
+    /// every (bed tone × bed tone) and (bed tone × melody-walk note)
+    /// interval — octave-reduced, inversions included — stays outside the
+    /// bonk's minor-second and tritone rub zones. The zone predicate is the
+    /// shared `assert_outside_bonk_zones`, as in
     /// `tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash` (that
     /// test also proves the zones non-vacuous via the bonk's own ratios).
-    /// Plus the C3 voicing pin: SHIMMER truly has no low fundamental.
     #[test]
-    fn bed_variant_pitches_stay_on_the_active_lattice_for_every_tone() {
-        // Union of every candidate's lattice degrees (C1 chords, C2 pad,
-        // C3 wash, C5 sky — C0/C4 have no candidate pitches).
+    fn sky_bed_pitches_stay_on_the_active_lattice_for_every_tone() {
+        // The sky voices the live chord's lit degrees, chord by chord.
         let mut bed_degrees: Vec<i32> = Vec::new();
-        for root in CHORD_DRIFT_ROOTS {
-            for off in CHORD_DRIFT_STACK {
-                bed_degrees.push(root + off);
-            }
-        }
-        bed_degrees.extend(BREATH_DEGREES);
-        bed_degrees.extend(SHIMMER_DEGREES);
-        // C5 voices the live chord's lit degrees, chord by chord.
         for chord in 0..rainbow_kitty_v2::SKY_BED_CHORDS {
             bed_degrees.extend(rainbow_kitty_v2::sky_bed_degrees(chord));
         }
-        // Melody notes the beds must sit under: the walk's clamped range
+        // Melody notes the bed must sit under: the walk's clamped range
         // (0..=8 across all tones) plus the ±2 column offset.
         let melody_degrees: Vec<i32> = (-2..=10).collect();
         for tone in Tone::ALL {
@@ -11171,117 +10802,39 @@ mod tests {
                     assert_outside_bonk_zones(2.0 / reduce(r), &format!("{ctx} (inversion)"));
                 }
             }
-            // C3's thesis is structural: its lowest partial sits ≥ 4× the
-            // palette anchor — there is no low fundamental at all.
-            for d in SHIMMER_DEGREES {
-                assert!(
-                    s.melody_hz(330.0, d) >= 330.0 * 3.9,
-                    "{tone:?}: shimmer degree {d} dips into fundamental territory"
-                );
-            }
         }
     }
 
-    /// HARNESS DETERMINISM at the engine level, per candidate: the same
-    /// (seed, events, variant) script renders bit-identically — every
-    /// candidate modulation runs off the sample-driven variant clock, no
-    /// extra rng draws — and every candidate decays to EXACT silence like
-    /// the shipping beds (same energy/level floor snap), so `is_quiet`
-    /// still lets the host pause the queue under any bed design.
+    /// THE MUSIC BOX'S BED replays bit-exactly from the same (seed, events)
+    /// script — every modulation runs off sample-driven clocks, no extra rng
+    /// draws — and decays to EXACT silence like every bed (the same
+    /// energy/level floor snap), so `is_quiet` still lets the host pause the
+    /// queue.
     #[test]
-    fn bed_variants_render_deterministically_and_decay_to_exact_silence() {
-        for variant in BedVariant::ALL {
-            let run = || {
-                let mut s = TrailSynth::new(48_000.0, 0xBED_5EED);
-                s.set_bed_variant(variant);
-                let mut acc = 0u64;
-                let mut buf = [0.0f32; 512];
-                for i in 0..40 {
-                    if i % 2 == 0 {
-                        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
-                    }
-                    s.render(&mut buf);
-                    for &x in &buf {
-                        acc = acc.rotate_left(7).wrapping_add(u64::from(x.to_bits()));
-                    }
-                }
-                // 6 s tail: the audibility test's proven decay bound.
-                for _ in 0..(6 * 48_000 * 2 / 512) {
-                    s.render(&mut buf);
-                }
-                assert!(s.is_quiet(), "{variant:?} never decayed to silence");
-                s.render(&mut buf);
-                assert!(
-                    buf.iter().all(|&x| x == 0.0),
-                    "{variant:?} quiet but nonzero"
-                );
-                acc
-            };
-            assert_eq!(run(), run(), "{variant:?} must replay bit-exactly");
-        }
-    }
-
-    /// The tournament is non-vacuous: the candidates are pairwise
-    /// distinct textures under an identical melody script (bit-hash over
-    /// the mixed render — the only degree of freedom is the bed design).
-    #[test]
-    fn bed_candidates_are_pairwise_distinct_textures() {
-        let render_hash = |variant: BedVariant| {
-            let mut s = TrailSynth::new(48_000.0, 0xD15C);
-            s.set_bed_variant(variant);
+    fn the_bed_renders_deterministically_and_decays_to_exact_silence() {
+        let run = || {
+            let mut s = TrailSynth::new(48_000.0, 0xBED_5EED);
             let mut acc = 0u64;
             let mut buf = [0.0f32; 512];
             for i in 0..40 {
                 if i % 2 == 0 {
-                    s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+                    s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
                 }
                 s.render(&mut buf);
                 for &x in &buf {
                     acc = acc.rotate_left(7).wrapping_add(u64::from(x.to_bits()));
                 }
             }
+            // 6 s tail: the audibility test's proven decay bound.
+            for _ in 0..(6 * 48_000 * 2 / 512) {
+                s.render(&mut buf);
+            }
+            assert!(s.is_quiet(), "the bed never decayed to silence");
+            s.render(&mut buf);
+            assert!(buf.iter().all(|&x| x == 0.0), "quiet but nonzero");
             acc
         };
-        let hashes: Vec<(BedVariant, u64)> = BedVariant::ALL
-            .into_iter()
-            .map(|v| (v, render_hash(v)))
-            .collect();
-        for (i, &(va, ha)) in hashes.iter().enumerate() {
-            for &(vb, hb) in &hashes[i + 1..] {
-                assert_ne!(
-                    ha, hb,
-                    "{va:?} and {vb:?} rendered identically — a candidate is a no-op"
-                );
-            }
-        }
-    }
-
-    /// C4's contract is exact: with the bed layer fully energised, the
-    /// SILENCE candidate's bed mixer returns literal (0.0, 0.0) — zero
-    /// samples contributed, so "no bed" is judged from the identical
-    /// harness rather than a differently-plumbed control render.
-    #[test]
-    fn silence_candidate_contributes_exact_zero_bed_samples() {
-        let mut s = TrailSynth::new(48_000.0, 7);
-        s.set_bed_variant(BedVariant::Silence);
-        let mut buf = [0.0f32; 960];
-        for _ in 0..10 {
-            s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
-            s.render(&mut buf);
-        }
-        let (energy, level) = s.debug_bed();
-        assert!(
-            energy > 0.0 && level > 1e-3,
-            "precondition: the bed layer must be energised (energy {energy}, level {level})"
-        );
-        let dt = 1.0 / 48_000.0;
-        for _ in 0..64 {
-            assert_eq!(
-                s.bed_sample(dt),
-                (0.0, 0.0),
-                "the SILENCE candidate leaked bed samples"
-            );
-        }
+        assert_eq!(run(), run(), "the bed must replay bit-exactly");
     }
 
     /// Deterministic: same (seed, events) script ⇒ bit-identical output,

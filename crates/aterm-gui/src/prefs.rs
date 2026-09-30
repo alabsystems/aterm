@@ -3196,7 +3196,8 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         }
         // Short on purpose (the "This Mac" note above says why).
         "Notifications" => {
-            "Off, aterm's own alerts stay in the message band, the menu bar and Messages."
+            "Off, aterm's own alerts stay in the message band, the menu bar and Messages; \
+             the operator's only in aterm fleet status and next."
         }
         "Window padding" => {
             "Top padding cannot exceed all-edge padding; constrained values show their effective size."
@@ -6792,8 +6793,9 @@ mod edit_tests {
     /// restarts every supervised session's worker on the reload). This row is
     /// "the setting added later": writing `safe` is decision 1's proven rules,
     /// `none` hands every box to the owner, clearing it is full power again.
-    /// NEGATIVE CONTROL: a value the reader cannot take seeds as the limit it
-    /// was read as (`none`), never `all`.
+    /// NEGATIVE CONTROLS: an off spelling (`"no"`) seeds `none`, and a value
+    /// that is no level (`"most"`) seeds `all` — no setting, so the default
+    /// (owner ruling of 2026-09-25: only an explicit setting takes power away).
     #[test]
     fn the_approve_row_round_trips_through_set_and_unset() {
         use aterm_agent::supervise::config::Approve;
@@ -6869,17 +6871,24 @@ mod edit_tests {
             "the master switch survived: {cleared}"
         );
 
-        // NEGATIVE CONTROL: a value the reader cannot take is read as its
-        // limit, and the row says so.
-        let refused = Config::parse("[harness]\napprove = \"most\"\n").unwrap();
-        assert_eq!(refused.harness_approve(), "none");
-        assert_eq!(
-            editable_fields(&refused)
+        // NEGATIVE CONTROLS: an off spelling is `none`; a value that is no
+        // level keeps `all`, and the row says what the supervisor reads.
+        let seed = |text: &str| {
+            let c = Config::parse(text).unwrap();
+            let seeded = editable_fields(&c)
                 .into_iter()
                 .find(|f| f.key == key)
-                .and_then(|f| f.seed),
-            Some("none".to_string()),
-            "a refused approve never shows all"
+                .and_then(|f| f.seed);
+            (c.harness_approve(), seeded)
+        };
+        assert_eq!(
+            seed("[harness]\napprove = \"no\"\n"),
+            ("none", Some("none".to_string()))
+        );
+        assert_eq!(
+            seed("[harness]\napprove = \"most\"\n"),
+            ("all", None),
+            "an unreadable approve is the default, shown as the blank default row"
         );
     }
 
@@ -6890,8 +6899,9 @@ mod edit_tests {
     /// workers on the reload), and found by "question", "answer" and the
     /// tool's name. Writing it `false` hands every question over and leaves
     /// the approval level as it was; clearing it answers again. NEGATIVE
-    /// CONTROL: a refused value seeds OFF — its limit, as the reader takes
-    /// it.
+    /// CONTROLS: an explicit off spelled `0` seeds OFF, and a value that is no
+    /// on or off (`"sometimes"`) seeds ON — no setting, as the reader takes it
+    /// (owner ruling of 2026-09-25).
     #[test]
     fn the_answer_questions_row_round_trips_through_set_and_unset() {
         let key = super::EDIT_HARNESS_ANSWER_QUESTIONS;
@@ -6951,8 +6961,11 @@ mod edit_tests {
                 .find(|f| f.key == key)
                 .and_then(|f| f.seed),
             Some("false".to_string()),
-            "a refused answer_questions never shows ON"
+            "an explicit 0 is an off"
         );
+        let unread =
+            Config::parse("[harness]\nanswer_questions = \"sometimes\"\n").expect("parses");
+        assert!(unread.harness.policy.answer_questions, "no setting: ON");
     }
 
     /// The `[packages]` switches (2026-09-23: TWO, Automatic updates and the one install

@@ -1032,7 +1032,9 @@ pub const VERBS: &[VerbSpec] = &[
          no clause; a key is 1-40 of a-z 0-9 . _ - and lives as wire.<key>; the toolchain, \
          update and harness tags are aterm's own; at most 3 wire rows are live (the band's \
          three), 60 new messages and 16 KiB of words a minute, 10 presses a minute (`ERR busy \
-         notice: \u{2026} retry_ms=<ms>`). No button can be authored from the socket.",
+         notice: \u{2026} retry_ms=<ms>`); while aterm is switching to a new version every \
+         notice is `ERR busy notice: aterm is switching to its new version retry_ms=1000`, and \
+         the retry reaches the new version. No button can be authored from the socket.",
     ),
     // `story` is the WRITE face of the PRESENCE band (round 19): a watcher's
     // decision, told to the session's window. Owner-only (a child edge must not
@@ -1191,7 +1193,9 @@ pub const VERBS: &[VerbSpec] = &[
          is the alt-screen archive's mark when the turn started, for `offscreen since=`. An aterm \
          self-update carries the ledger and the id count to the new instance when it can: ids \
          keep rising, and the carried records print carried=1 before text= (their started_ms and \
-         seq are the old instance's)",
+         seq are the old instance's); a ledger it could not carry whole adds unheld_below=<id> \
+         to the OK header when that floor is above since= and above the oldest record held \
+         (records below it may be gone)",
     ),
     // `meta` reads/writes the USER-settable session metadata. Base op-class Read
     // (the bare form is a pure metadata readout); the `meta set`/`meta unset`
@@ -1254,8 +1258,9 @@ pub const VERBS: &[VerbSpec] = &[
     ),
     // `status` is the READ-ONLY Subject+Status record (RFC: Tab Subject &
     // Status §8) — what a session IS and what it is DOING, classified entirely
-    // locally. Versioned because a later interpretation tier consumes the same
-    // record; there is no write sub-form, so it takes no `escalated_op` entry.
+    // locally. Versioned so any consumer (a script, an agent, the harness) can
+    // reject a schema it does not know; there is no write sub-form, so it takes
+    // no `escalated_op` entry.
     v(
         "status",
         Read,
@@ -1499,7 +1504,8 @@ pub const VERBS: &[VerbSpec] = &[
          kinds the same ring records (hold/inbox/inbox-seen/post/fetch/post-landed/topic), and \
          `render` — the resize ledger entering or leaving `desync-risk` (`desync-risk run=<r> \
          displaced=<+-k> net=zero at=<ms>` / `healed run=<r> after_ms=<ms>`, see `resizes`; a \
-         healthy resize records nothing here) — monotonic ids, drop-oldest \
+         healthy resize records nothing here) — monotonic ids, rising on across an aterm \
+         self-update (whose successor's first row is `handoff`), drop-oldest \
          ring. The two rows a session records as it is retired — `closing reason= by=` and the \
          final `state-change state=closed` — cannot be asked for here after the close: the sid \
          stops resolving in the same store write (only a request that resolved the session just \
@@ -2506,9 +2512,14 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "await <idle|seq|match|gone|block|inbox|consent|momentum|agent> [args] [timeout=<ms>]: wait",
-        "Full grammar: `await idle <ms>` (no output for that long), `await seq [<n>]` (the \
+        "Full grammar: `await idle <ms>` (no output for that long — measured only while aterm is \
+         reading the session: while an update has its reader parked the clock is held, and a \
+         whole <ms> is counted again once output flows; `ready` and a `turn`'s idle settle alike), \
+         `await seq [<n>]` (the \
          content sequence passed <n>; bare = the next change, so `await seq <n> timeout=0` is the \
-         cheap dirty check), `await match <re> [rows <a> <b>]` (a visible row matches), `await \
+         cheap dirty check; a <n> ABOVE the current sequence — read off another grid, or off the \
+         instance an update replaced, whose successor counts afresh — answers at once, `OK seq \
+         <current>`, the anchor to use next), `await match <re> [rows <a> <b>]` (a visible row matches), `await \
          gone <re> [rows <a> <b>]` (NO visible row matches — the inverse of match, for a turn \
          whose end is a row LEAVING: a coding agent keeps its composer glyph on screen while it \
          thinks and can sit static for seconds mid-turn, so neither `match` on the prompt nor \
@@ -2527,7 +2538,9 @@ pub const VERBS: &[VerbSpec] = &[
          session no window hosts reads 0.00 at once; `await inbox since=<id> [kinds=<k,...>]` — the FABRIC predicate: \
          it latches on an inbox row with id > `since` of an accepted kind (default: every kind \
          but `note`), or on a `hold` transition when `hold` is one of the listed kinds. Monotone, \
-         so a row the agent chose to ignore cannot latch the same wait twice. `await inbox \
+         so a row the agent chose to ignore cannot latch the same wait twice; the ids keep rising \
+         across an aterm self-update, and a `since=` above every id the session has handed out \
+         is `ERR bad since high=<n>` — re-read `inbox` and take its newest id. `await inbox \
          re=<off> [since=<id>] [kinds=<k,...>]` narrows it to THE REPLIES TO ONE POST — a row \
          carrying that `re=` of any kind: an `answer`, a `report`, the recipient's receipt \
          (`ack … verdict=`), the asker's own bridge's `expired` — and `since=` may then be \
@@ -3235,7 +3248,8 @@ pub const VERBS: &[VerbSpec] = &[
          produced today: quit ends the process, ledger included, and deregisters nothing), \
          oldest-first, monotonic ids, \
          drop-oldest ring (`OK 0` = none retained); `<n>` keeps the newest n, `since=<id>` keeps \
-         ids strictly greater (page with the last id you saw); the ring is MEMORY-ONLY and \
+         ids strictly greater (page with the last id you saw; the ids go on rising across an \
+         aterm self-update, though the rows before it stay behind); the ring is MEMORY-ONLY and \
          per instance - nothing is written to disk, so a `close` that retires the LAST session \
          of the LAST window ends the process and takes the whole ledger with it (read it \
          before that close, not after); `t=` is the `timeline`/`history` \

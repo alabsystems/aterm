@@ -1253,9 +1253,11 @@ mod tests {
             tx.send(second).expect("executor accepts second row");
         });
 
-        let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Hang detectors for a producer thread's two sends, each of which
+        // lands the moment that thread is scheduled.
+        let first = rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert!(matches!(first, Notice::Record(0, 41, subject, _) if subject == "first"));
-        let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(60)).unwrap();
         assert!(matches!(second, Notice::Record(0, 42, subject, _) if subject == "second"));
         producer.join().unwrap();
     }

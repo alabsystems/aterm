@@ -118,6 +118,18 @@ pub(super) struct TransientState {
     /// parser queries/no-ops count too, so the exceptional close+reopen present
     /// license fails closed rather than risking a torn frame.
     pub(super) sync_open_dirty: bool,
+    /// Whether the PROGRAM's synchronized-output bracket is still open by its
+    /// own account: set by the `?2026h` that opens it, cleared only by what
+    /// the program itself (or a reset) says ends it — `?2026l`, DECSTR, RIS.
+    /// Unlike `modes.synchronized_output` it SURVIVES the terminal's
+    /// timeout force-clear, because the program has not finished its frame
+    /// just because the terminal stopped waiting for it. Read through
+    /// [`Terminal::sync_frame_unfinished`](super::Terminal::sync_frame_unfinished).
+    pub(super) app_sync_open: bool,
+    /// Whether the program's open bracket (`app_sync_open`) has accepted any
+    /// complete PTY action since it opened — the program-view twin of
+    /// `sync_open_dirty`, which a timeout does not retire either.
+    pub(super) app_sync_dirty: bool,
     /// Logical "now" for the current `process_at()` batch — the single
     /// timestamp every state-affecting time read in the pipeline observes.
     ///
@@ -313,6 +325,8 @@ impl TransientState {
             full_clears: 0,
             screen_replaced: 0,
             sync_open_dirty: false,
+            app_sync_open: false,
+            app_sync_dirty: false,
             // Placeholders; overwritten at the top of every process_at() before
             // any reader runs, so this value is never observed as state.
             // aterm_time::Instant::now(): std on native, JS clock on wasm (std panics there).
@@ -378,6 +392,8 @@ impl TransientState {
         self.screen_replaced = self.screen_replaced.wrapping_add(1);
         self.sync_start = None;
         self.sync_open_dirty = false;
+        self.app_sync_open = false;
+        self.app_sync_dirty = false;
         self.sgr_stack.clear();
         self.pipeline_timestamps = PipelineTimestamps::default();
         self.last_combining_was_zwj = false;

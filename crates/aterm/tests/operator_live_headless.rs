@@ -56,6 +56,36 @@ use headless_boot::Instance;
 /// Every client call is bounded: a hung server is a failure, not a hung run.
 const CLIENT_DEADLINE: Duration = Duration::from_secs(90);
 
+/// How long a wait for something that MUST happen may take before it is read
+/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
+const HANG: Duration = Duration::from_secs(60);
+
+/// Every successor's `next` must be served within this of being asked, its
+/// client's spawn included: a hang detector with room for a spawn on a loaded
+/// gate. It is not what catches a lost peer probe: without the probe the dead
+/// predecessor keeps the slot, and the successor is REFUSED once the 1 s
+/// handover grace (`operator_host.rs`'s `NEXT_HANDOVER_GRACE`) runs out,
+/// which `next` fails on at once. A handover slow on every cycle (a slower
+/// release under a longer grace) is caught by [`SUCCESSOR_PROMPTLY`].
+const SUCCESSOR_SERVED: Duration = Duration::from_secs(15);
+
+/// The FASTEST successor of the crash cycles is served within this: the peer
+/// probe frees a dead waiter's slot within 250 ms (`NEXT_PEER_PROBE`), so a
+/// handover is a spawn and a moment. One slow spawn on a loaded gate is one
+/// cycle of ten; a handover that is slow every time is slow in the fastest.
+const SUCCESSOR_PROMPTLY: Duration = Duration::from_secs(3);
+
+/// How long a guarded submit may spend in the service: `control.rs` runs one
+/// proposal's turn with `timeout=9000` ("one proposal occupies an ordinary
+/// control lane for at most nine seconds of turn orchestration"), and a target
+/// that never settles spends all of it.
+const TURN_ORCHESTRATION: Duration = Duration::from_secs(9);
+
+/// Room past [`TURN_ORCHESTRATION`] for `aterm ctl`'s spawn and the
+/// proposal's validation on a loaded gate (a submit spent 13 s under a 4 s
+/// stall; the bound was 12 s all told).
+const SUBMIT_SLACK: Duration = Duration::from_secs(10);
+
 /// The control server's worker pool (`control.rs` `CONTROL_WORKERS`): the crash
 /// cycles run past it, so a waiter a dead client leaked would starve the server.
 const CONTROL_WORKERS: usize = 8;
@@ -197,7 +227,7 @@ fn op_ok(inst: &Instance, args: &[&str]) -> String {
 
 /// Poll `ready` (bounded) until it holds.
 fn wait_until(inst: &Instance, what: &str, ready: impl Fn(&Instance) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + HANG;
     while !ready(inst) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(100));
@@ -325,7 +355,7 @@ fn manage(inst: &Instance, sid: &str) {
         op_ok(inst, &["manage", sid]).trim(),
         "OK managed=true changed=1"
     );
-    let baseline = next_for(inst, sid, "changed", Duration::from_secs(20));
+    let baseline = next_for(inst, sid, "changed", HANG);
     assert_eq!(ack(inst, &baseline, "no-action").trim(), "OK resolved");
 }
 
@@ -337,7 +367,7 @@ fn manage(inst: &Instance, sid: &str) {
 /// prompt.
 fn ready_event(inst: &Instance, sid: &str) -> Event {
     type_line(inst, sid, "PS1='❯ '");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + HANG;
     loop {
         assert!(Instant::now() < deadline, "no ready event for {sid}");
         match next(inst, 3000) {
@@ -376,22 +406,47 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
     );
 
     // The CONTROL: a waiter whose client is alive keeps the slot, and a
-    // second `next` is refused (after the handover grace).
+    // second `next` is refused (after the handover grace). The parked client
+    // has to spawn, connect and register first — a moment alone, seconds on a
+    // loaded gate, where a fixed 500 ms read a slot not yet taken as the
+    // refusal missing — so a probe that finds the slot FREE (served `OK
+    // timeout`) is asked again while the parked client lives. A waiter that
+    // does not keep its slot is never refused against: that fails at the hang
+    // detector, and a parked client that ends first fails at once.
     let mut live = client(&inst, &["operator", "next", "timeout=30000"])
         .spawn()
         .expect("spawn the parked next");
-    std::thread::sleep(Duration::from_millis(500));
-    let refused = ctl(&inst, &["operator", "next", "timeout=0"]);
+    let parked_by = Instant::now() + HANG;
+    loop {
+        let probe = ctl(&inst, &["operator", "next", "timeout=0"]);
+        let (body, err) = text(&probe);
+        if err.contains("already waiting") {
+            break;
+        }
+        assert!(
+            probe.status.code() == Some(124) && body.trim() == "OK timeout",
+            "a probe of the free slot is served, and nothing is queued: {body} {err}"
+        );
+        assert!(
+            live.try_wait().expect("poll").is_none(),
+            "the parked next ended before a probe was refused against it"
+        );
+        assert!(
+            Instant::now() < parked_by,
+            "a live waiter keeps the slot: no probe was refused within {HANG:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(
-        text(&refused).1.contains("already waiting"),
-        "a live waiter keeps the slot: {:?}",
-        text(&refused)
+        live.try_wait().expect("poll").is_none(),
+        "the refusal was the live waiter's: it is still parked"
     );
     live.kill().expect("kill");
     live.wait().expect("reap");
 
     // Crash cycles past the worker pool: each client dies parked, and the next
     // one is served at once.
+    let mut fastest = Duration::MAX;
     for cycle in 0..CONTROL_WORKERS + 2 {
         let mut parked = client(&inst, &["operator", "next", "timeout=30000"])
             .spawn()
@@ -405,12 +460,20 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
         parked.wait().expect("reap");
         let asked = Instant::now();
         assert!(next(&inst, 0).is_none(), "cycle {cycle}: nothing is queued");
+        let waited = asked.elapsed();
         assert!(
-            asked.elapsed() < Duration::from_secs(5),
-            "cycle {cycle}: the successor waited {:?}",
-            asked.elapsed()
+            waited < SUCCESSOR_SERVED,
+            "cycle {cycle}: the successor waited {waited:?}"
         );
+        fastest = fastest.min(waited);
     }
+    eprintln!("the fastest successor was served in {fastest:?}");
+    assert!(
+        fastest < SUCCESSOR_PROMPTLY,
+        "no successor of {} was served within {SUCCESSOR_PROMPTLY:?}: the fastest waited \
+         {fastest:?}",
+        CONTROL_WORKERS + 2
+    );
     let status = op_ok(&inst, &["status"]);
     assert_eq!(field_num(&status, "queued"), Some(0), "{status}");
     assert_eq!(field_num(&status, "unresolved"), Some(0), "{status}");
@@ -428,7 +491,7 @@ fn crash_cycles_leave_no_waiter_no_event_and_no_fault() {
             .status()
             .expect("kill");
         assert!(st.success());
-        let exit = Instant::now() + Duration::from_secs(30);
+        let exit = Instant::now() + HANG;
         while inst.child.try_wait().expect("poll").is_none() {
             assert!(
                 Instant::now() < exit,
@@ -470,7 +533,7 @@ fn a_cold_restart_redelivers_the_unresolved_event_under_a_new_token() {
         op_ok(&first, &["manage", &sid]).trim(),
         "OK managed=true changed=1"
     );
-    let delivered = next_for(&first, &sid, "changed", Duration::from_secs(20));
+    let delivered = next_for(&first, &sid, "changed", HANG);
     assert_eq!(delivered.redelivery, 0);
     // Mid-run: delivered, unresolved — and the process dies.
     let mut first = first;
@@ -482,7 +545,7 @@ fn a_cold_restart_redelivers_the_unresolved_event_under_a_new_token() {
     let status = op_ok(&second, &["status"]);
     assert!(status.contains("\"in_doubt_event_ids\":[]"), "{status}");
     assert_eq!(field_num(&status, "unresolved"), Some(1), "{status}");
-    let again = next_for(&second, &sid, "changed", Duration::from_secs(20));
+    let again = next_for(&second, &sid, "changed", HANG);
     assert_eq!(again.id, delivered.id, "the same event");
     assert_ne!(again.token, delivered.token, "a new claim");
     assert!(again.redelivery >= 1, "{again:?}");
@@ -600,7 +663,7 @@ fn operating_a_repository_adds_no_files_to_it() {
     let (ok, reply) = propose(&inst, &ready.proposal("true"));
     assert!(ok, "the guarded turn: {reply}");
     // Its own settle: the shell ran `true` and drew its prompt again.
-    let after = next_for(&inst, &sid, "ready", Duration::from_secs(30));
+    let after = next_for(&inst, &sid, "ready", HANG);
     ack(&inst, &after, "no-action");
 
     assert_eq!(porcelain(&repo), status_before, "git status moved");
@@ -634,15 +697,21 @@ fn an_approval_surfaces_within_the_bound_while_another_target_is_busy() {
     manage(&inst, &a);
     manage(&inst, &b);
 
-    // A: a guarded submit that returns while its target stays busy.
+    // A: a guarded submit that returns while its target stays busy. The
+    // service spends at most its [`TURN_ORCHESTRATION`] (A never settles, so
+    // it spends all of it) and never waits out the proposal's 300 s
+    // `deadline_ms`. This is the one test of that budget: a turn that ran
+    // longer, or a submit that waited for A's turn to end, fails it, and a
+    // loaded gate's spawn has [`SUBMIT_SLACK`] (it was 12 s all told).
     let ready = ready_event(&inst, &a);
     let submitted = Instant::now();
     let (ok, reply) = propose(&inst, &ready.proposal("while :; do date; sleep 0.1; done"));
     assert!(ok, "A's guarded turn: {reply}");
+    let took = submitted.elapsed();
     assert!(
-        submitted.elapsed() < Duration::from_secs(12),
-        "the submit returned in {:?}",
-        submitted.elapsed()
+        took < TURN_ORCHESTRATION + SUBMIT_SLACK,
+        "the submit returned in {took:?}: past the service's {TURN_ORCHESTRATION:?} of \
+         turn orchestration and {SUBMIT_SLACK:?} of spawn"
     );
 
     // B raises an approval while A prints on.
@@ -689,7 +758,7 @@ fn a_fake_approval_with_injected_text_gets_no_keystroke() {
     let sid = first_sid(&inst);
     manage(&inst, &sid);
     type_line(&inst, &sid, &format!("clear; cat {}", fake.display()));
-    let event = next_for(&inst, &sid, "approval-required", Duration::from_secs(30));
+    let event = next_for(&inst, &sid, "approval-required", HANG);
     let at = format!("@{sid}");
     let screen = text(&ctl(&inst, &[&at, "text"])).0;
     assert!(screen.contains("Do you want to proceed?"), "{screen}");
